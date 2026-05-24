@@ -1,8 +1,9 @@
 ---
 sidebar_label: Overview
-description: Index of QueryFlux architecture docs — system design, SQL translation, routing, observability, and adding engine support.
+title: Architecture Overview
+description: Index of QueryFlux architecture docs — system design, SQL translation, routing, observability, and extending engine support.
+image: img/queryflux-hero-banner.png
 ---
-
 # QueryFlux architecture documentation
 
 This section describes how QueryFlux is put together: why it exists, how SQL is translated, and how traffic is routed to **cluster groups** and individual **clusters**.

@@ -1,7 +1,8 @@
 ---
-description: Query parameters — typed positional bindings that flow from frontend clients through dispatch to backend engines via native prepared-statement APIs.
+title: Query Parameters
+description: Typed positional ? placeholders from Snowflake and other frontends through dispatch to native backend binding.
+image: img/queryflux-hero-banner.png
 ---
-
 # Query parameters
 
 Query parameters let clients send **typed positional values** separately from SQL text, using `?` as placeholders. QueryFlux reads them from the frontend wire protocol, carries them through the dispatch pipeline, and delivers them to each backend engine using that engine's native binding mechanism — or falls back to safe string interpolation for engines that do not have one.

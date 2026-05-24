@@ -1,8 +1,9 @@
 ---
 sidebar_position: 7
-description: QueryFlux project roadmap — shipped features, in-progress work, and planned additions for routing, auth, and engine support.
+title: Roadmap
+description: QueryFlux project roadmap — shipped features, near-term priorities, and planned additions for routing and engine support.
+image: img/queryflux-hero-banner.png
 ---
-
 # Roadmap
 
 QueryFlux is under active development. This page tracks what is shipped, what is in progress, and where the project is headed.

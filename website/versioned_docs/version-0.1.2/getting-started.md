@@ -1,9 +1,10 @@
 ---
 sidebar_position: 1
 sidebar_label: Getting started
-description: Run QueryFlux with Docker Compose, connect SQL clients, and verify routing in minutes.
+title: Getting Started
+description: Run QueryFlux with Docker Compose, connect SQL clients, smoke-test Trino HTTP routing, and open Studio in minutes.
+image: img/queryflux-hero-banner.png
 ---
-
 # Getting started
 
 The fastest path is a **Docker Compose** example under [`examples/`](https://github.com/lakeops-org/queryflux/tree/main/examples). Run commands **from that example directory** so paths like `./config.yaml` resolve.

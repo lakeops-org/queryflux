@@ -1,7 +1,8 @@
 ---
-description: End-to-end system map of QueryFlux — protocol frontends, dispatch, routing, SQL translation, engine adapters, and result streaming.
+title: System Map
+description: End-to-end QueryFlux architecture — frontends, router chain, cluster manager, translation, engine adapters, and persistence.
+image: img/queryflux-hero-banner.png
 ---
-
 # QueryFlux — Architecture Overview
 
 QueryFlux is a universal SQL query proxy and router. It accepts queries from clients over multiple protocols (Trino HTTP, PostgreSQL wire, MySQL wire, Arrow Flight SQL, and others), routes them to the appropriate backend engine, optionally translates the SQL dialect, and streams results back in the client's native format.

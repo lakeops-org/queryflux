@@ -1,7 +1,8 @@
 ---
-description: QueryFlux authentication and authorization design — two-credential model, passthrough auth, and per-cluster RBAC.
+title: Auth & Authorization Design
+description: Authentication providers, authorization policies, backend identity resolution, and the two-credential security model.
+image: img/queryflux-hero-banner.png
 ---
-
 # QueryFlux Auth/AuthZ Design
 
 ## The Two-Credential Model (Core Principle)

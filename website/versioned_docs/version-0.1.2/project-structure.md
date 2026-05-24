@@ -1,8 +1,9 @@
 ---
 sidebar_position: 3
-description: High-level layout of the QueryFlux repository — crate responsibilities, directories, and runnable examples.
+title: Project Structure
+description: QueryFlux repository layout — Rust workspace crates, Studio UI, Docker examples, and documentation directories.
+image: img/queryflux-hero-banner.png
 ---
-
 # Project structure
 
 High-level layout of the QueryFlux repository. Crate responsibilities also appear in **[Development](/docs/development)**; runnable stacks are in **[Getting started](/docs/getting-started)**.

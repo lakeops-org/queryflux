@@ -1,9 +1,10 @@
 ---
 sidebar_position: 2
 sidebar_label: QueryFlux Studio
-description: QueryFlux Studio — web management UI, admin API authentication, and password management.
+title: QueryFlux Studio
+description: Web UI for clusters, query history, routing, and admin security. Connects to the QueryFlux Admin API on port 9000.
+image: img/queryflux-hero-banner.png
 ---
-
 # QueryFlux Studio
 
 QueryFlux Studio is the built-in web management UI. It connects to the **Admin REST API** (default port `9000`) and lets you monitor clusters, browse query history, manage routing rules, cluster groups, and security settings.

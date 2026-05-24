@@ -1,8 +1,9 @@
 ---
 sidebar_position: 6
-description: Contribution guidelines for QueryFlux — branching, PR conventions, code style, and licensing requirements.
+title: Contributing
+description: Contribution guidelines for QueryFlux — PR conventions, code style, tests, documentation updates, and Apache 2.0 license.
+image: img/queryflux-hero-banner.png
 ---
-
 # Contributing to QueryFlux
 
 Thank you for helping improve QueryFlux. This document describes how we expect contributions to look so reviews stay fast and the codebase stays consistent.

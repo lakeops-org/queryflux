@@ -1,0 +1,117 @@
+{
+  "DEFAULT_OG_IMAGE": "img/queryflux-hero-banner.png",
+  "DOC_SEO": {
+    "intro": {
+      "title": "Documentation Overview",
+      "description": "QueryFlux docs — multi-engine SQL proxy for Trino, PostgreSQL, MySQL, Snowflake, and Flight. Routing, dialect translation, and observability in one place."
+    },
+    "getting-started": {
+      "title": "Getting Started",
+      "description": "Run QueryFlux with Docker Compose, connect SQL clients, smoke-test Trino HTTP routing, and open Studio in minutes."
+    },
+    "studio": {
+      "title": "QueryFlux Studio",
+      "description": "Web UI for clusters, query history, routing, and admin security. Connects to the QueryFlux Admin API on port 9000."
+    },
+    "configuration": {
+      "title": "YAML Configuration Reference",
+      "description": "Complete config.yaml reference — frontends, cluster groups, routing rules, persistence, translation, and admin API settings."
+    },
+    "architecture/overview": {
+      "title": "Architecture Overview",
+      "description": "Index of QueryFlux architecture docs — system design, SQL translation, routing, observability, and extending engine support."
+    },
+    "architecture/motivation-and-goals": {
+      "title": "Motivation & Goals",
+      "description": "Why QueryFlux exists — fragmented engines, cost-aware routing, queueing at the proxy, and compute interoperability for lakehouses."
+    },
+    "architecture/system-map": {
+      "title": "System Map",
+      "description": "End-to-end QueryFlux architecture — frontends, router chain, cluster manager, translation, engine adapters, and persistence."
+    },
+    "architecture/query-translation": {
+      "title": "Query Translation",
+      "description": "How QueryFlux converts SQL between dialects with sqlglot — when translation runs, supported dialects, and bypass rules."
+    },
+    "architecture/routing-and-clusters": {
+      "title": "Routing & Cluster Groups",
+      "description": "Router chain, routingFallback, cluster groups, load-balancing strategies, concurrency limits, and proxy-side queueing."
+    },
+    "architecture/query-tags": {
+      "title": "Query Tags",
+      "description": "Attach key/value metadata to queries for routing, Prometheus metrics, observability, and backend forwarding."
+    },
+    "architecture/query-params": {
+      "title": "Query Parameters",
+      "description": "Typed positional ? placeholders from Snowflake and other frontends through dispatch to native backend binding."
+    },
+    "architecture/observability": {
+      "title": "Observability",
+      "description": "Prometheus metrics, Grafana dashboards, QueryFlux Studio, and the Admin REST API for operational visibility."
+    },
+    "architecture/adding-engine-support": {
+      "title": "Adding Engine Support",
+      "description": "Extend QueryFlux with new backend engines or client protocol frontends — overview and links to detailed guides."
+    },
+    "architecture/auth-authz-design": {
+      "title": "Auth & Authorization Design",
+      "description": "Authentication providers, authorization policies, backend identity resolution, and the two-credential security model."
+    },
+    "architecture/frontends/overview": {
+      "title": "Frontends Overview",
+      "description": "QueryFlux client protocols — Trino HTTP, PostgreSQL wire, MySQL wire, Flight SQL, and Snowflake on a shared dispatch path."
+    },
+    "architecture/frontends/trino-http": {
+      "title": "Trino HTTP Frontend",
+      "description": "Trino-compatible HTTP frontend — async polling, nextUri rewriting, session headers, tags, and mixed-engine groups."
+    },
+    "architecture/frontends/postgres-wire": {
+      "title": "PostgreSQL Wire Frontend",
+      "description": "PostgreSQL v3 wire protocol frontend — startup, simple query flow, session context, and psql compatibility."
+    },
+    "architecture/frontends/mysql-wire": {
+      "title": "MySQL Wire Frontend",
+      "description": "MySQL wire protocol frontend — handshake, COM_QUERY, session variables, schema switching, and mysql client support."
+    },
+    "architecture/frontends/flight-sql": {
+      "title": "Arrow Flight SQL Frontend",
+      "description": "Arrow Flight SQL gRPC frontend — implemented RPCs, metadata passthrough, and Flight SQL client examples."
+    },
+    "architecture/frontends/snowflake": {
+      "title": "Snowflake Frontend",
+      "description": "Snowflake HTTP wire and SQL API v2 on one port — SnowSQL, Python connector, and JDBC without a Snowflake account."
+    },
+    "architecture/adding-support/overview": {
+      "title": "Extending QueryFlux Overview",
+      "description": "Add a backend engine adapter or a new client protocol — Rust crates, Studio UI, and documentation checklist."
+    },
+    "architecture/adding-support/frontend": {
+      "title": "Add a Frontend Protocol",
+      "description": "Step-by-step guide to adding a new client protocol listener, dispatch integration, and routing in QueryFlux."
+    },
+    "architecture/adding-support/backend": {
+      "title": "Add a Backend Engine",
+      "description": "Step-by-step guide to adding a query backend — Rust adapter, engine registration, persistence, and Studio UI."
+    },
+    "development": {
+      "title": "Development Guide",
+      "description": "Set up the Rust workspace, Python/sqlglot sidecar, Docker dependencies, and Makefile commands for QueryFlux development."
+    },
+    "contribute": {
+      "title": "Contributing",
+      "description": "Contribution guidelines for QueryFlux — PR conventions, code style, tests, documentation updates, and Apache 2.0 license."
+    },
+    "benchmarks": {
+      "title": "Proxy Benchmarks",
+      "description": "QueryFlux proxy overhead benchmarks — mock-backend latency for Trino HTTP and MySQL wire paths (~0.35 ms p50)."
+    },
+    "project-structure": {
+      "title": "Project Structure",
+      "description": "QueryFlux repository layout — Rust workspace crates, Studio UI, Docker examples, and documentation directories."
+    },
+    "roadmap": {
+      "title": "Roadmap",
+      "description": "QueryFlux project roadmap — shipped features, near-term priorities, and planned additions for routing and engine support."
+    }
+  }
+}

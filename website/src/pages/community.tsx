@@ -3,6 +3,7 @@ import clsx from 'clsx';
 import Link from '@docusaurus/Link';
 import Layout from '@theme/Layout';
 import Heading from '@theme/Heading';
+import PageSeo from '@site/src/components/PageSeo';
 import styles from './community.module.css';
 
 /** Slack workspace invite (Queryflux / query-flux). */
@@ -32,9 +33,16 @@ const GitHubGlyph = (): ReactNode => (
   </svg>
 );
 
+const COMMUNITY_PAGE_TITLE = 'Community';
+
 export default function Community(): ReactNode {
   return (
-    <Layout title="Community" description={COMMUNITY_DESCRIPTION}>
+    <Layout title={COMMUNITY_PAGE_TITLE} description={COMMUNITY_DESCRIPTION}>
+      <PageSeo
+        title={COMMUNITY_PAGE_TITLE}
+        description={COMMUNITY_DESCRIPTION}
+        pathname="/community"
+      />
       <div className={styles.page}>
         <header className={styles.hero}>
           <div className={styles.heroGlow} aria-hidden />

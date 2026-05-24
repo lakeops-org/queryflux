@@ -19,7 +19,7 @@ The search bar appears in the navbar after a **production build**. It does **not
 
 ## SEO
 
-Global metadata, JSON-LD, and `static/robots.txt` follow [Docusaurus SEO](https://docusaurus.io/docs/seo). If you change `url`, `baseUrl`, or hosting domain, update **`static/robots.txt`** `Sitemap:` to match (preset-classic already emits `sitemap.xml`).
+Global metadata, JSON-LD, and `static/robots.txt` follow [Docusaurus SEO](https://docusaurus.io/docs/seo). **`seoConfig.ts`** sets `noIndex` on the **Next** draft and all **older** doc versions (everything in `versions.json` except the first entry). Only the **latest release** at `/docs/` is indexable; the sitemap plugin omits `noIndex` pages automatically. At build time, **`robotsTxtPlugin`** writes `build/robots.txt` with `Sitemap:` derived from `url` + `baseUrl` in `docusaurus.config.ts` (update those if the domain changes). Per-page titles, descriptions, and OG images live in **`seo/docSeo.json`** — run **`npm run seo:apply-doc-meta`** after adding docs.
 
 ## Versioning
 
@@ -31,7 +31,9 @@ When a release is ready to freeze:
 npm run docs:version 0.2.0   # example; use your semver
 ```
 
-Then edit **`sidebars.ts`** only for **Next**; for an older release, edit **`versioned_sidebars/version-X-sidebars.json`** and files under **`versioned_docs/version-X/`**. Keep **`sidebars.ts`** and **`version-0.1.0-sidebars.json`** in sync (same categories: Guides, Reference, Architecture, Frontends, Extending, Project).
+Prepend the new version to `versions.json` automatically. On the next **`npm run build`**, the previous latest moves under `/docs/<version>/` and gets **`noIndex`** — no manual SEO edits needed.
+
+Then edit **`sidebars.ts`** only for **Next**; for an older release, edit **`versioned_sidebars/version-X-sidebars.json`** and files under **`versioned_docs/version-X/`**. Keep **`sidebars.ts`** and versioned sidebars in sync (same categories: Guides, Reference, Architecture, Frontends, Extending, Project).
 
 ## Deployment URL
 

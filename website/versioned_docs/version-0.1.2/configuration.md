@@ -1,9 +1,10 @@
 ---
 sidebar_position: 1
 sidebar_label: YAML reference
-description: Complete reference for config.yaml — frontends, cluster groups, routing rules, concurrency limits, and observability settings.
+title: YAML Configuration Reference
+description: Complete config.yaml reference — frontends, cluster groups, routing rules, persistence, translation, and admin API settings.
+image: img/queryflux-hero-banner.png
 ---
-
 # Configuration
 
 Copy `config.example.yaml` in the repository root and adjust for your environment.

@@ -1,7 +1,8 @@
 ---
-description: Trino HTTP frontend — async query polling, nextUri rewriting, session headers, tags, and mixed-engine group support.
+title: Trino HTTP Frontend
+description: Trino-compatible HTTP frontend — async polling, nextUri rewriting, session headers, tags, and mixed-engine groups.
+image: img/queryflux-hero-banner.png
 ---
-
 # Trino HTTP
 
 The Trino HTTP frontend lets any Trino-compatible client (Trino CLI, JDBC, Python `trino`, DBeaver, etc.) connect to QueryFlux as if it were a Trino coordinator. QueryFlux accepts the standard `/v1/statement` API, routes the query, and returns Trino-shaped JSON responses — including `nextUri` polling for async engines.

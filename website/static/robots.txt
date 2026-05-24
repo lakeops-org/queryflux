@@ -1,5 +1,6 @@
+# Dev/fallback copy — production build overwrites build/robots.txt via seoConfig.ts
 # https://docusaurus.io/docs/seo#robots-file
 User-agent: *
 Disallow:
 
-Sitemap: https://lakeops-org.github.io/queryflux/sitemap.xml
+Sitemap: https://queryflux.dev/sitemap.xml

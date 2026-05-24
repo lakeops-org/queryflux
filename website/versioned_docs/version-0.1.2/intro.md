@@ -1,15 +1,14 @@
 ---
 sidebar_position: 1
 sidebar_label: Overview
-description:
-  QueryFlux documentation — universal SQL proxy for Trino, PostgreSQL, MySQL, Snowflake HTTP, and Flight;
-  routing, dialect translation, and one place to run queries against many engines.
+title: Documentation Overview
+description: QueryFlux docs — multi-engine SQL proxy for Trino, PostgreSQL, MySQL, Snowflake, and Flight. Routing, dialect translation, and observability in one place.
+image: img/queryflux-hero-banner.png
 keywords:
   - QueryFlux
   - SQL proxy
   - documentation
 ---
-
 # QueryFlux documentation
 
 QueryFlux is a **high-performance, protocol-aware SQL proxy** for analytical and operational engines. Clients connect with the drivers they already use (Trino HTTP, PostgreSQL wire, MySQL wire, Snowflake HTTP wire and SQL API v2, Arrow Flight). QueryFlux routes each query to the right backend, translates SQL dialects when needed, and exposes a single observability surface — so you stop wiring **N clients × M engines** by hand.

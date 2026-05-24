@@ -1,8 +1,9 @@
 ---
 sidebar_position: 5
-description: Set up the Rust workspace, Python/sqlglot sidecar, and Docker dependencies for local QueryFlux development.
+title: Development Guide
+description: Set up the Rust workspace, Python/sqlglot sidecar, Docker dependencies, and Makefile commands for QueryFlux development.
+image: img/queryflux-hero-banner.png
 ---
-
 # Development guide
 
 This guide is for working on the QueryFlux **Rust workspace** and its local dependencies (Python/sqlglot, Docker).

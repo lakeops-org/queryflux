@@ -1,7 +1,8 @@
 ---
-description: Query tags — attaching metadata to queries for routing, observability, and backend forwarding across all frontend protocols.
+title: Query Tags
+description: Attach key/value metadata to queries for routing, Prometheus metrics, observability, and backend forwarding.
+image: img/queryflux-hero-banner.png
 ---
-
 # Query tags
 
 Query tags are key/value metadata that clients attach to their sessions. QueryFlux reads them to make routing decisions, records them in query history, emits them as Prometheus metrics, and forwards them to backend engines.
