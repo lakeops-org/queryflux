@@ -68,9 +68,10 @@ queryflux/
 │   ├── queryflux-metrics/          # PrometheusMetrics, BufferedMetricsStore, MultiMetricsStore
 │   ├── queryflux-translation/      # TranslatorTrait + SqlglotTranslator (PyO3)
 │   ├── queryflux-auth/             # Authentication providers, authorization, identity resolution
+│   ├── queryflux-fingerprint/      # Query fingerprinting (AST-based deduplication)
 │   ├── queryflux-bench/            # Proxy overhead benchmarks (mock backends)
 │   └── queryflux-e2e-tests/        # Integration tests
-├── ui/queryflux-studio/            # Next.js management UI (cluster monitoring, query history)
+├── queryflux-studio/               # Next.js management UI (cluster monitoring, query history)
 ├── prometheus/                     # Prometheus scrape config
 ├── grafana/                        # Grafana provisioning + dashboards
 ├── docker/                         # Docker Compose files
@@ -168,7 +169,7 @@ pub trait RouterTrait: Send + Sync {
 | PostgreSQL wire | **Done** | 5432 |
 | MySQL wire | **Done** | 3306 |
 | Arrow Flight SQL | **Done** (query execution) | — |
-| Snowflake HTTP wire + SQL API | Planned | — |
+| Snowflake HTTP wire + SQL API v2 | **Done** | configurable (e.g. 8443) |
 | Admin / Prometheus metrics | **Done** | 9000 |
 | ClickHouse HTTP | Planned | 8123 |
 
@@ -199,7 +200,7 @@ pub trait RouterTrait: Send + Sync {
 | `protocolBased` | Which frontend protocol the client used |
 | `header` | HTTP header value (Trino HTTP only) |
 | `queryRegex` | Regex patterns against SQL text |
-| `clientTags` | Trino `X-Trino-Client-Tags` header |
+| `tags` | Query tag key/value conditions (AND logic within a rule) |
 | `pythonScript` | Custom Python function (`def route(query, ctx) -> str | None`) — see [routing-and-clusters.md](routing-and-clusters.md#python-script-router-pythonscript) |
 | `compound` | Multiple conditions combined with `all` (AND) or `any` (OR) logic |
 
@@ -326,8 +327,10 @@ make setup
 # Export Python path for PyO3
 export PYO3_PYTHON=$(pwd)/.venv/bin/python3
 
-# Start Trino + Postgres + Prometheus + Grafana, then run the proxy
-make dev
+# Start backing services (Trino, Postgres, etc.)
+make env
+# In a separate terminal, run the proxy
+make server
 ```
 
 ### Services
@@ -366,7 +369,7 @@ curl -s -X POST http://localhost:8080/v1/statement \
 | P1 | PostgreSQL wire frontend | **Done** |
 | P1 | MySQL wire frontend + StarRocks backend | **Done** |
 | P1 | Arrow Flight SQL frontend | **Done** |
-| P1 | Snowflake HTTP wire + SQL API frontend | Planned |
+| P1 | Snowflake HTTP wire + SQL API v2 frontend | **Done** |
 | P1 | QueryFlux Studio — management UI | **Done** |
 | P1 | Athena backend | **Done** |
 | P1 | Authentication / authorization (`queryflux-auth`) | **Done** |

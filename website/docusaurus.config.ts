@@ -130,6 +130,11 @@ const config: Config = {
           className: 'navbar-item-docs-mobile',
         },
         {
+          href: 'https://lakeops.dev/blog/category/queryflux',
+          label: 'Blog',
+          position: 'left',
+        },
+        {
           to: '/community',
           label: 'Community',
           position: 'left',
@@ -184,6 +189,10 @@ const config: Config = {
             {
               label: 'Issues',
               href: 'https://github.com/lakeops-org/queryflux/issues',
+            },
+            {
+              label: 'Discussions',
+              href: 'https://github.com/lakeops-org/queryflux/discussions',
             },
           ],
         },

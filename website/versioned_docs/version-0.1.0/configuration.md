@@ -15,35 +15,39 @@ queryflux:
     trinoHttp:
       enabled: true
       port: 8080
-    flightSql:
-      enabled: false
-      port: 50051
+    snowflakeHttp:
+      enabled: true
+      port: 8445
   persistence:
     type: inMemory  # or: postgres
 
+clusters:
+  trino-1:
+    engine: trino
+    endpoint: http://trino-host:8080
+    enabled: true
+    auth:
+      type: basic
+      username: user
+      password: pass
+  duckdb-1:
+    engine: duckDb
+    enabled: true
+    databasePath: /tmp/queryflux.duckdb
+
 clusterGroups:
   trino-default:
-    engine: trino
     maxRunningQueries: 100
-    clusters:
-      - name: trino-1
-        endpoint: http://trino-host:8080
-        auth:
-          type: basic
-          username: user
-          password: pass
-
+    members: [trino-1]
   duckdb-local:
-    engine: duckDb
     maxRunningQueries: 4
-    clusters:
-      - name: duckdb-1
-        databasePath: /tmp/queryflux.duckdb
+    members: [duckdb-1]
 
 routers:
   - type: protocolBased
     trinoHttp: trino-default
-    flightSql: trino-default
+    snowflakeHttp: trino-default
+    snowflakeSqlApi: trino-default
 
   - type: header
     headerName: x-target-engine

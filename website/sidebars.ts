@@ -74,6 +74,11 @@ const sidebars: SidebarsConfig = {
         'roadmap',
       ],
     },
+    {
+      type: 'link',
+      label: 'Routing AI Agents',
+      href: 'https://github.com/lakeops-org/queryflux/discussions/51',
+    },
   ],
 };
 

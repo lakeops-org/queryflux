@@ -39,7 +39,7 @@ scrape_configs:
     metrics_path: /metrics
 ```
 
-When running via `make dev`, Prometheus starts in Docker and reaches QueryFlux on the host via `host.docker.internal`. On Linux, the `docker-compose.yml` adds `extra_hosts: ["host.docker.internal:host-gateway"]` to bridge this.
+When running via `make env`, Prometheus starts in Docker and reaches QueryFlux on the host via `host.docker.internal`. On Linux, the `docker-compose.yml` adds `extra_hosts: ["host.docker.internal:host-gateway"]` to bridge this.
 
 ---
 
@@ -77,9 +77,9 @@ Grafana is auto-configured via two provisioning files:
 
 QueryFlux Studio is a Next.js web UI served separately from the proxy. It talks to the Admin REST API on port 9000.
 
-**Start:** `cd ui/queryflux-studio && npm run dev` (or build and serve for production)
+**Start:** `cd queryflux-studio && npm run dev` (or build and serve for production)
 
-**Default URL:** http://localhost:3001
+**Default URL:** http://localhost:3000
 
 ### Pages
 

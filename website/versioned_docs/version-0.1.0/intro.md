@@ -107,7 +107,7 @@ Use these when you already know what you are looking for:
 
 | Page | Purpose |
 | --- | --- |
-| **[Development](/docs/development)** | Build from source, venv, `make dev`, tests |
+| **[Development](/docs/development)** | Build from source, venv, `make env`, tests |
 | **[Contribute](/docs/contribute)** | PRs, issues, community |
 | **[Project structure](/docs/project-structure)** | Repository layout |
 | **[Roadmap](/docs/roadmap)** | Shipped vs planned features |

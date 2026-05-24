@@ -298,6 +298,7 @@ html[data-theme='dark'] .navbar {
   padding: 0.6875rem 0.9375rem;
   display: inline-flex;
   align-items: center;
+  gap: 0.25rem;
   transition: color 0.18s ease;
 }
 
@@ -336,6 +337,32 @@ html[data-theme='dark'] .navbar__link:hover {
     display: flex;
     align-items: center;
     padding: 0;
+  }
+
+  .navbar__items:not(.navbar__items--right) {
+    gap: 0.625rem;
+  }
+
+  .navbar__link {
+    padding: 0.6875rem 1rem;
+  }
+
+  /* Separate primary nav (Docs / Blog / Community) from utilities */
+  .navbar__items:not(.navbar__items--right) > .navbar__item.dropdown {
+    margin-left: 0.75rem;
+  }
+
+  .navbar__items:not(.navbar__items--right) .dsla-search-wrapper,
+  .navbar__items:not(.navbar__items--right) [class*='navbarSearchContainer'] {
+    margin-left: 0.375rem;
+  }
+
+  /* External-link icon (Blog) — compact, aligned with label */
+  .navbar__link:not(.navbar-link-github) svg {
+    flex-shrink: 0;
+    width: 0.75rem;
+    height: 0.75rem;
+    opacity: 0.7;
   }
 
   .qf-mobile-toggle-wrap {
@@ -657,8 +684,7 @@ footer.footer {
   --qf-footer-cols-gap-y: 2rem;
   --qf-footer-links-mb: 2.25rem;
   --qf-footer-bottom-pt: 1.875rem;
-  /* Fixed stack between LakeOps wordmark and mascot (px = stable across zoom rounding) */
-  --qf-footer-lakeops-stack: 10px;
+
 
   border-top: 1px solid rgba(148, 163, 184, 0.14);
   padding: var(--qf-footer-pt) 0 var(--qf-footer-pb);
@@ -956,35 +982,33 @@ html[data-theme='dark'] .admonition {
 
 .footer__lakeops-brand {
   display: flex;
-  flex-direction: column;
   align-items: center;
-  justify-content: flex-start;
-  gap: var(--qf-footer-lakeops-stack);
+  justify-content: center;
   width: 100%;
-  max-width: 9.5rem;
+  max-width: 12rem;
   margin: 0;
   padding: 0;
   box-sizing: border-box;
   border: none;
-  border-radius: 0;
+  border-radius: 1.25rem;
   text-decoration: none;
   color: inherit;
   cursor: pointer;
   background: transparent;
   box-shadow: none;
-  transition: color 0.18s ease, opacity 0.18s ease;
+  transition: transform 0.3s ease, filter 0.3s ease;
 }
 
 .footer__lakeops-brand:hover {
   text-decoration: none;
   background: transparent;
   box-shadow: none;
-  transform: none;
-  opacity: 1;
+  transform: scale(1.04);
+  filter: brightness(1.12);
 }
 
 .footer__lakeops-brand:active {
-  transform: none;
+  transform: scale(0.97);
   box-shadow: none;
   background: transparent;
 }
@@ -998,55 +1022,31 @@ html[data-theme='dark'] .footer__lakeops-brand:active {
 .footer__lakeops-brand:focus-visible {
   outline: 2px solid var(--ifm-color-primary);
   outline-offset: 4px;
-  border-radius: 2px;
+  border-radius: 1.25rem;
 }
 
-.footer__lakeops-wordmark {
-  display: block;
+.footer__lakeops-logo {
   width: 100%;
-  margin: 0;
-  padding: 0;
-  text-align: center;
-  font-size: 1.0625rem;
-  font-weight: 700;
-  letter-spacing: -0.02em;
-  line-height: 1.15;
-  color: var(--lo-violet-600);
-  transition: color 0.18s ease;
-}
-
-html[data-theme='dark'] .footer__lakeops-wordmark {
-  color: var(--ifm-color-primary-light);
-}
-
-.footer__lakeops-brand:hover .footer__lakeops-wordmark {
-  color: var(--lo-violet-700);
-}
-
-html[data-theme='dark'] .footer__lakeops-brand:hover .footer__lakeops-wordmark {
-  color: var(--ifm-color-primary-lighter);
-}
-
-.footer__lakeops-mascot {
-  width: 6.25rem;
+  max-width: 12rem;
   height: auto;
   display: block;
   margin: 0 auto;
   flex-shrink: 0;
   object-fit: contain;
-  transition: opacity 0.18s ease, filter 0.18s ease;
+  border-radius: 1.25rem;
   pointer-events: none;
+  mask-image:
+    radial-gradient(ellipse 80% 75% at 50% 46%, #000 40%, transparent 72%);
+  -webkit-mask-image:
+    radial-gradient(ellipse 80% 75% at 50% 46%, #000 40%, transparent 72%);
 }
 
-.footer__lakeops-brand:hover .footer__lakeops-mascot {
-  transform: none;
-  opacity: 0.9;
-  filter: brightness(1.04);
-}
-
-.footer__lakeops-brand:active .footer__lakeops-mascot {
-  transform: none;
-  opacity: 0.88;
+html[data-theme='light'] .footer__lakeops-logo {
+  filter: saturate(0.85) brightness(0.95);
+  mask-image:
+    radial-gradient(ellipse 72% 68% at 50% 46%, #000 35%, transparent 65%);
+  -webkit-mask-image:
+    radial-gradient(ellipse 72% 68% at 50% 46%, #000 35%, transparent 65%);
 }
 
 .footer__link-external-icon {
