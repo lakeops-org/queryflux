@@ -111,4 +111,4 @@ For production deployments:
 
 - Set `QUERYFLUX_ADMIN_USER` and `QUERYFLUX_ADMIN_PASSWORD` to non-default values in your deployment environment, **or** change the password via the UI immediately after first boot.
 - Run Studio behind a reverse proxy (nginx, Caddy, …) with TLS — the Admin API cookie is `SameSite=Strict` but is not `Secure`-flagged by default.
-- The Admin API does not yet support OIDC/SSO. Future releases will add pluggable auth providers.
+- The Admin API/Studio UI login does not yet support OIDC/SSO — it uses HTTP Basic authentication only. Note that QueryFlux's *query-path* authentication already supports OIDC providers (see [Auth & Authorization Design](./architecture/auth-authz-design.md)); this limitation applies only to the Studio management interface. Future releases will add pluggable auth providers for Studio as well.
