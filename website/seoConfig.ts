@@ -63,7 +63,12 @@ export function buildSitemapConfig(): Partial<SitemapPluginOptions> {
     createSitemapItems: async (params) => {
       const items = await params.defaultCreateSitemapItems(params);
       return items.map((item) => {
-        const pathname = new URL(item.url).pathname.replace(/\/$/, '') || '/';
+        let pathname: string;
+        try {
+          pathname = new URL(item.url).pathname.replace(/\/$/, '') || '/';
+        } catch {
+          pathname = item.url.replace(/\/$/, '') || '/';
+        }
         let priority = 0.7;
         if (pathname === '/') {
           priority = 1.0;

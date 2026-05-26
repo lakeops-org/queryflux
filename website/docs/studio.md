@@ -82,6 +82,12 @@ Environment variables take precedence over YAML:
 
 Once a DB record exists it is always used, regardless of what the YAML or env vars say. To reset to bootstrap credentials you must delete the `admin_credentials` key from the `proxy_settings` table.
 
+:::caution Emergency use only
+
+This resets authentication to the default `admin`/`admin` credentials. Only run this if you have lost access and cannot recover the password through other means. Change the password immediately after regaining access.
+
+:::
+
 ```sql
 DELETE FROM proxy_settings WHERE key = 'admin_credentials';
 ```

@@ -82,6 +82,16 @@ QueryFlux Studio is a Next.js web UI served separately from the proxy. It talks 
 
 **Default URL:** http://localhost:3000
 
+:::tip Avoid port conflict with Grafana
+
+Grafana (above) also binds to port 3000. If you run both simultaneously, either start Studio on a different port:
+
+```bash
+PORT=3001 npm run dev
+```
+
+or remap Grafana in `docker-compose.yml` (`ports: ["3001:3000"]`).
+
 ### Pages
 
 | Page | What it shows |
