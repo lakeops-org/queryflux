@@ -195,6 +195,7 @@ mod snowflake_frontend {
         let live_config = LiveConfig {
             router_chain: RouterChain::new(vec![protocol_router], group.clone()),
             guard_chain: None,
+            group_guard_chains: HashMap::new(),
             cluster_manager: Arc::new(SimpleClusterGroupManager::new(group_states)),
             adapters,
             health_check_targets: vec![],

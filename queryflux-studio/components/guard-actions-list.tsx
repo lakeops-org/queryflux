@@ -1,5 +1,5 @@
 import type { GuardAction } from "@/lib/api-types";
-import { ShieldCheck, ShieldAlert, ShieldX, Shield } from "lucide-react";
+import { ShieldCheck, ShieldAlert, ShieldX } from "lucide-react";
 
 export function GuardBadge({ action }: { action: "allow" | "warn" | "deny" | string }) {
   if (action === "deny") {

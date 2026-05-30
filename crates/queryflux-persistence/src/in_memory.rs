@@ -323,6 +323,8 @@ impl QueryHistoryStore for InMemoryPersistence {
     async fn list_conversations(
         &self,
         _agent_id: Option<&str>,
+        _limit: i64,
+        _offset: i64,
     ) -> Result<Vec<ConversationSummary>> {
         Ok(vec![])
     }

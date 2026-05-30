@@ -277,6 +277,7 @@ impl TestHarness {
         let live_config = LiveConfig {
             router_chain,
             guard_chain: None,
+            group_guard_chains: HashMap::new(),
             cluster_manager,
             adapters,
             health_check_targets: vec![],

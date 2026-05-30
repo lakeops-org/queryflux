@@ -31,9 +31,12 @@ use crate::snowflake::http::session_store::SnowflakeSessionStore;
 /// task can atomically swap the whole bundle on each reload tick.
 pub struct LiveConfig {
     pub router_chain: RouterChain,
-    /// Guard chain: global guards first, per-group guards appended at dispatch time.
-    /// `None` means guardrails are not configured — all queries pass through.
+    /// Global guard chain — runs for every query regardless of cluster group.
+    /// `None` means no global guardrails are configured.
     pub guard_chain: Option<Arc<GuardChain>>,
+    /// Per-group guard chains — appended after the global chain for queries routed
+    /// to that group. Missing entry means no group-specific guards for that group.
+    pub group_guard_chains: HashMap<String, Arc<GuardChain>>,
     pub cluster_manager: Arc<dyn ClusterGroupManager>,
     /// cluster_name → adapter (one adapter per physical cluster, shared across groups).
     pub adapters: HashMap<String, AdapterKind>,

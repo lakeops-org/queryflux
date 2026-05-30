@@ -832,8 +832,15 @@ pub async fn get_executing_statement(
         },
         query_tags: effective_tags,
         query_params: vec![],
-        agent_context: session.agent_context.clone(),
+        agent_context: executing.agent_context.clone(),
     };
+
+    // Guard actions captured at submit time — injected into the final record_query call.
+    let submit_guard_actions: Vec<queryflux_persistence::GuardAction> = serde_json::from_value(
+        serde_json::Value::Array(executing.submitted_guard_actions.clone()),
+    )
+    .unwrap_or_default();
+    let submit_was_guard_blocked = executing.was_guard_blocked;
 
     match poll_result {
         QueryPollResult::Raw {
@@ -853,8 +860,8 @@ pub async fn get_executing_statement(
                         error: None,
                         routing_trace: None,
                         engine_stats,
-                        guard_actions: vec![],
-                        was_guard_blocked: false,
+                        guard_actions: submit_guard_actions,
+                        was_guard_blocked: submit_was_guard_blocked,
                     },
                 );
                 state
@@ -888,8 +895,8 @@ pub async fn get_executing_statement(
                     error: Some(message.clone()),
                     routing_trace: None,
                     engine_stats: None,
-                    guard_actions: vec![],
-                    was_guard_blocked: false,
+                    guard_actions: submit_guard_actions,
+                    was_guard_blocked: submit_was_guard_blocked,
                 },
             );
             let _ = cluster_manager

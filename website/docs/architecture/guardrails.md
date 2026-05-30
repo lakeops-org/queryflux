@@ -40,9 +40,8 @@ Blocks any statement that is not a `SELECT`, `WITH`, `SHOW`, `DESCRIBE`, or `EXP
 ```yaml
 guardrails:
   global:
-    plan:
-      - kind: built_in
-        name: read_only
+    - kind: built_in
+      name: read_only
 ```
 
 Error code on deny: `READ_ONLY_VIOLATION`
@@ -59,10 +58,9 @@ Requires the outermost query to have a `LIMIT` clause. Optionally enforces a max
 ```yaml
 guardrails:
   global:
-    plan:
-      - kind: built_in
-        name: row_limit
-        max_rows: 10000
+    - kind: built_in
+      name: row_limit
+      max_rows: 10000
 ```
 
 Error code on deny: `ROW_LIMIT_EXCEEDED`
@@ -80,12 +78,11 @@ Use `applies_to` to restrict the check to specific table name patterns (glob syn
 ```yaml
 guardrails:
   global:
-    plan:
-      - kind: built_in
-        name: require_predicate
-        applies_to:
-          - "fct_*"
-          - "events.*"
+    - kind: built_in
+      name: require_predicate
+      applies_to:
+        - "fct_*"
+        - "events.*"
 ```
 
 With an empty `applies_to` list (or omitted), the guard applies to **all** tables.
@@ -101,22 +98,19 @@ Per-group guards are appended after the global chain. This is useful for giving 
 ```yaml
 guardrails:
   global:
-    plan:
-      - kind: built_in
-        name: read_only
+    - kind: built_in
+      name: read_only
   groups:
     agents:
-      plan:
-        - kind: built_in
-          name: row_limit
-          max_rows: 5000
-        - kind: built_in
-          name: require_predicate
+      - kind: built_in
+        name: row_limit
+        max_rows: 5000
+      - kind: built_in
+        name: require_predicate
     analysts:
-      plan:
-        - kind: built_in
-          name: row_limit
-          max_rows: 100000
+      - kind: built_in
+        name: row_limit
+        max_rows: 100000
 ```
 
 Queries routed to the `agents` group run: `read_only` → `row_limit(5000)` → `require_predicate`.
@@ -126,19 +120,9 @@ Queries routed to the `analysts` group run: `read_only` → `row_limit(100000)`.
 
 ## Python script guards
 
-For logic that can't be expressed as a built-in rule, attach a Python script guard. The script receives the query context and must return a verdict dict.
+> **Note:** Python script guards are not yet executed at runtime. The guard kind is accepted in configuration and stored, but the script body is skipped during dispatch. Use built-in guards or HTTP webhook guards for production safety rules.
 
-```yaml
-guardrails:
-  global:
-    plan:
-      - kind:
-          python_script:
-            script_id: 42
-            timeout_ms: 2000
-```
-
-Scripts are managed through the QueryFlux Studio **Guardrails** page or the Admin API. The script receives a `ctx` dict with `sql`, `translated_sql`, `engine_type`, `cluster_group`, `user`, and `agent_context` fields, and must return:
+For logic that can't be expressed as a built-in rule, Python script guards can be authored through the QueryFlux Studio **Guardrails** page. The script receives a `ctx` dict with `sql`, `translated_sql`, `engine_type`, `cluster_group`, `user`, and `agent_context` fields, and must return:
 
 ```python
 # allow
@@ -155,17 +139,17 @@ return {"action": "deny", "reason": "cross-region query blocked", "code": "CROSS
 
 ## HTTP webhook guards
 
+> **Note:** HTTP webhook guards are not yet executed at runtime. The guard kind is accepted in configuration, but the webhook is not called during dispatch.
+
 Delegate guard decisions to an external service:
 
 ```yaml
 guardrails:
   global:
-    plan:
-      - kind:
-          http_webhook:
-            url: "https://hooks.example.com/guard"
-            timeout_ms: 5000
-            fail_behavior: deny   # or: allow
+    - kind: http_webhook
+      url: "https://hooks.example.com/guard"
+      timeout_ms: 5000
+      fail_behavior: deny   # or: allow
 ```
 
 QueryFlux POSTs the query context as JSON and expects the same `{action, reason?, code?}` response shape. `fail_behavior` controls what happens if the webhook is unreachable or times out — `deny` (default) is the safer choice for production.

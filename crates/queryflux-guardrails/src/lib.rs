@@ -12,23 +12,26 @@ use queryflux_persistence::GuardAction;
 /// Convert a `GuardResult` into a `GuardAction` for audit recording.
 pub fn result_to_action(guard_name: &str, result: &GuardResult) -> GuardAction {
     match result {
-        GuardResult::Allow { metadata: _ } => GuardAction {
+        GuardResult::Allow { metadata } => GuardAction {
             guard: guard_name.to_string(),
             action: "allow".to_string(),
             reason: None,
             code: None,
+            metadata: metadata.clone(),
         },
         GuardResult::Warn { reason } => GuardAction {
             guard: guard_name.to_string(),
             action: "warn".to_string(),
             reason: Some(reason.clone()),
             code: None,
+            metadata: None,
         },
         GuardResult::Deny { reason, code } => GuardAction {
             guard: guard_name.to_string(),
             action: "deny".to_string(),
             reason: Some(reason.clone()),
             code: code.clone(),
+            metadata: None,
         },
     }
 }

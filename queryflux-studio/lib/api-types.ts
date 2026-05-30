@@ -67,6 +67,8 @@ export interface GuardAction {
   action: "allow" | "warn" | "deny";
   reason: string | null;
   code: string | null;
+  /** Free-form key/value metadata returned by the guard (e.g. matched rule, estimated rows). */
+  metadata?: Record<string, string> | null;
 }
 
 export interface QueryHistoryRecord {

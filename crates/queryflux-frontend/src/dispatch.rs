@@ -127,8 +127,8 @@ pub async fn dispatch_query(
         )));
     }
 
-    // Clone the manager, group translation fixups, default tags, and guard chain in one snapshot.
-    let (cluster_manager, group_fixups, group_default_tags, guard_chain) = {
+    // Clone the manager, group translation fixups, default tags, and guard chains in one snapshot.
+    let (cluster_manager, group_fixups, group_default_tags, guard_chain, group_guard_chain) = {
         let live = state.live.read().await;
         (
             live.cluster_manager.clone(),
@@ -141,6 +141,7 @@ pub async fn dispatch_query(
                 .cloned()
                 .unwrap_or_default(),
             live.guard_chain.clone(),
+            live.group_guard_chains.get(&group.0).cloned(),
         )
     };
     let effective_tags = merge_tags(&group_default_tags, &session.tags().clone());
@@ -229,29 +230,90 @@ pub async fn dispatch_query(
     };
 
     // Guard chain: runs after translation (SQL is final), before engine submission.
-    if let Some(chain) = &guard_chain {
-        let resolved_agent_ctx = session.resolved_agent_context();
-        let guard_ctx = GuardContext {
-            sql: &original_sql,
-            translated_sql: &sql,
-            engine_type: &adapter.engine_type(),
-            cluster_group: &group,
-            user: session.user(),
-            agent_context: resolved_agent_ctx.as_ref(),
-            query_tags: &effective_tags,
-        };
-        let (guard_actions, was_blocked) = chain.run(&guard_ctx, GuardLayer::Plan).await;
-        if was_blocked {
-            state.metrics.on_query_finished(&group.0, &cluster_name.0);
-            let _ = cluster_manager.release_cluster(&group, &cluster_name).await;
-            let deny_reason = guard_actions
+    // Global guards run first; per-group guards are appended after.
+    let resolved_agent_ctx = session.resolved_agent_context();
+    let mut all_guard_actions: Vec<queryflux_persistence::GuardAction> = Vec::new();
+
+    let guard_ctx = GuardContext {
+        sql: &original_sql,
+        translated_sql: &sql,
+        engine_type: &adapter.engine_type(),
+        cluster_group: &group,
+        user: session.user(),
+        agent_context: resolved_agent_ctx.as_ref(),
+        query_tags: &effective_tags,
+    };
+
+    macro_rules! guard_deny {
+        ($actions:expr) => {{
+            let deny_reason = $actions
                 .iter()
                 .find(|a| a.action == "deny")
                 .and_then(|a| a.reason.clone())
                 .unwrap_or_else(|| "query blocked by guardrail".to_string());
+            let ctx = QueryContext {
+                query_id: query_id.clone(),
+                sql: original_sql.clone(),
+                session: session.clone(),
+                protocol: protocol.clone(),
+                group: group.clone(),
+                cluster: cluster_name.clone(),
+                cluster_group_config_id,
+                cluster_config_id,
+                engine_type: adapter.engine_type(),
+                src_dialect: src_dialect.clone(),
+                tgt_dialect: tgt_dialect.clone(),
+                was_translated,
+                translated_sql: if was_translated {
+                    Some(sql.clone())
+                } else {
+                    None
+                },
+                query_tags: effective_tags.clone(),
+                query_params: vec![],
+                agent_context: resolved_agent_ctx.clone(),
+            };
+            state.record_query(
+                &ctx,
+                QueryOutcome {
+                    backend_query_id: None,
+                    status: QueryStatus::Failed,
+                    execution_ms: 0,
+                    rows: None,
+                    error: Some(deny_reason.clone()),
+                    routing_trace: None,
+                    engine_stats: None,
+                    guard_actions: $actions,
+                    was_guard_blocked: true,
+                },
+            );
+            state.metrics.on_query_finished(&group.0, &cluster_name.0);
+            let _ = cluster_manager.release_cluster(&group, &cluster_name).await;
             return Err(QueryFluxError::Engine(deny_reason));
+        }};
+    }
+
+    if let Some(chain) = &guard_chain {
+        let (actions, was_blocked) = chain.run(&guard_ctx, GuardLayer::Plan).await;
+        all_guard_actions.extend(actions);
+        if was_blocked {
+            guard_deny!(std::mem::take(&mut all_guard_actions));
         }
     }
+
+    if let Some(chain) = &group_guard_chain {
+        let (actions, was_blocked) = chain.run(&guard_ctx, GuardLayer::Plan).await;
+        all_guard_actions.extend(actions);
+        if was_blocked {
+            guard_deny!(std::mem::take(&mut all_guard_actions));
+        }
+    }
+
+    // Serialize guard actions for storage in ExecutingQuery (retrieved at poll time).
+    let submitted_guard_actions: Vec<serde_json::Value> = all_guard_actions
+        .iter()
+        .filter_map(|a| serde_json::to_value(a).ok())
+        .collect();
 
     let execution = match adapter
         .submit_query(
@@ -300,6 +362,9 @@ pub async fn dispatch_query(
         creation_time: now,
         last_accessed: now,
         query_tags: effective_tags,
+        agent_context: resolved_agent_ctx,
+        submitted_guard_actions,
+        was_guard_blocked: false,
     };
     // Single write per query — no updates needed between polls.
     // Any QueryFlux instance can serve subsequent polls using this record.
@@ -465,16 +530,26 @@ async fn finalize_trino_async_terminal_on_submit(
         },
         query_tags: executing.query_tags.clone(),
         query_params: vec![],
-        agent_context: session.resolved_agent_context(),
+        agent_context: executing.agent_context.clone(),
     };
 
     let engine_stats = adapter.terminal_stats_from_body(body);
-    let (outcome, warn_msg) = trino_submit_terminal_outcome(
+    let (mut outcome, warn_msg) = trino_submit_terminal_outcome(
         body,
         elapsed_ms,
         executing.backend_query_id.0.clone(),
         engine_stats,
     );
+
+    // Inject guard actions captured at submit time into the final audit record.
+    let stored_actions: Vec<queryflux_persistence::GuardAction> = serde_json::from_value(
+        serde_json::Value::Array(executing.submitted_guard_actions.clone()),
+    )
+    .unwrap_or_default();
+    if !stored_actions.is_empty() {
+        outcome.guard_actions = stored_actions;
+        outcome.was_guard_blocked = executing.was_guard_blocked;
+    }
 
     if let Some(msg) = warn_msg {
         warn!(proxy_id = %executing.id, "{msg}");
@@ -1169,7 +1244,13 @@ pub async fn execute_to_sink(
         return sink.on_error(&msg).await;
     }
 
-    let guard_chain = state.live.read().await.guard_chain.clone();
+    let (guard_chain, group_guard_chain) = {
+        let live = state.live.read().await;
+        (
+            live.guard_chain.clone(),
+            live.group_guard_chains.get(&group.0).cloned(),
+        )
+    };
 
     let mut setup = match setup_sync_query(
         state,
@@ -1189,8 +1270,8 @@ pub async fn execute_to_sink(
     };
 
     // Guard chain: runs after translation (SQL is final) and after routing (group is known),
-    // before submitting to the engine.
-    if let Some(chain) = &guard_chain {
+    // before submitting to the engine. Global guards run first; per-group guards are appended.
+    {
         let ctx = &setup.ctx;
         let guard_ctx = GuardContext {
             sql: &ctx.sql,
@@ -1201,33 +1282,43 @@ pub async fn execute_to_sink(
             agent_context: ctx.agent_context.as_ref(),
             query_tags: &ctx.query_tags,
         };
-        let (guard_actions, was_blocked) = chain.run(&guard_ctx, GuardLayer::Plan).await;
-        if was_blocked {
-            let deny_reason = guard_actions
-                .iter()
-                .find(|a| a.action == "deny")
-                .and_then(|a| a.reason.clone())
-                .unwrap_or_else(|| "query blocked by guardrail".to_string());
-            setup.slot.release().await;
-            state.record_query(
-                ctx,
-                QueryOutcome {
-                    backend_query_id: None,
-                    status: QueryStatus::Failed,
-                    execution_ms: setup.start.elapsed().as_millis() as u64,
-                    rows: None,
-                    error: Some(deny_reason.clone()),
-                    routing_trace: None,
-                    engine_stats: None,
-                    guard_actions,
-                    was_guard_blocked: true,
-                },
-            );
-            return sink.on_error(&deny_reason).await;
+
+        let mut all_actions: Vec<queryflux_persistence::GuardAction> = Vec::new();
+
+        for chain in [guard_chain.as_ref(), group_guard_chain.as_ref()]
+            .into_iter()
+            .flatten()
+        {
+            let (actions, was_blocked) = chain.run(&guard_ctx, GuardLayer::Plan).await;
+            all_actions.extend(actions);
+            if was_blocked {
+                let deny_reason = all_actions
+                    .iter()
+                    .find(|a| a.action == "deny")
+                    .and_then(|a| a.reason.clone())
+                    .unwrap_or_else(|| "query blocked by guardrail".to_string());
+                setup.slot.release().await;
+                state.record_query(
+                    ctx,
+                    QueryOutcome {
+                        backend_query_id: None,
+                        status: QueryStatus::Failed,
+                        execution_ms: setup.start.elapsed().as_millis() as u64,
+                        rows: None,
+                        error: Some(deny_reason.clone()),
+                        routing_trace: None,
+                        engine_stats: None,
+                        guard_actions: all_actions,
+                        was_guard_blocked: true,
+                    },
+                );
+                return sink.on_error(&deny_reason).await;
+            }
         }
+
         // Attach non-blocking guard actions (allow/warn) to the setup context so they
         // flow into record_query at the normal exit point below.
-        setup.guard_actions = guard_actions;
+        setup.guard_actions = all_actions;
     }
 
     // Native path: skip Arrow when backend connection format matches frontend protocol.

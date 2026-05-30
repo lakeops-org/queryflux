@@ -243,7 +243,12 @@ impl QueryHistoryStore for PostgresStore {
         .map_err(|e| QueryFluxError::Persistence(format!("list_agents: {e}")))
     }
 
-    async fn list_conversations(&self, agent_id: Option<&str>) -> Result<Vec<ConversationSummary>> {
+    async fn list_conversations(
+        &self,
+        agent_id: Option<&str>,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<ConversationSummary>> {
         sqlx::query_as::<_, ConversationSummary>(
             r#"SELECT
                    conversation_id,
@@ -256,9 +261,12 @@ impl QueryHistoryStore for PostgresStore {
                WHERE conversation_id IS NOT NULL
                  AND ($1::text IS NULL OR agent_id = $1)
                GROUP BY conversation_id, agent_id
-               ORDER BY last_seen DESC"#,
+               ORDER BY last_seen DESC
+               LIMIT $2 OFFSET $3"#,
         )
         .bind(agent_id)
+        .bind(limit)
+        .bind(offset)
         .fetch_all(&self.pool)
         .await
         .map_err(|e| QueryFluxError::Persistence(format!("list_conversations: {e}")))

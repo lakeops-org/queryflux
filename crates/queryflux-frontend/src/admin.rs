@@ -871,7 +871,15 @@ async fn list_conversations_handler(
             .into_response();
     };
     let agent_id = params.get("agent_id").map(|s| s.as_str());
-    match pg.list_conversations(agent_id).await {
+    let limit = params
+        .get("limit")
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(50);
+    let offset = params
+        .get("offset")
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(0);
+    match pg.list_conversations(agent_id, limit, offset).await {
         Ok(rows) => Json::<Vec<ConversationSummary>>(rows).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }

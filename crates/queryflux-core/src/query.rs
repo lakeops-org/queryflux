@@ -267,6 +267,17 @@ pub struct ExecutingQuery {
     /// Stored here because poll requests don't repeat the original client headers.
     #[serde(default)]
     pub query_tags: crate::tags::QueryTags,
+    /// Agent identity captured at submit time. Poll requests don't re-send agent headers.
+    #[serde(default)]
+    pub agent_context: Option<crate::session::AgentContext>,
+    /// Guard actions collected when the guard chain ran at submit time.
+    /// Stored as raw JSON to avoid a core→persistence dependency.
+    /// Deserialized back to `Vec<GuardAction>` at poll time.
+    #[serde(default)]
+    pub submitted_guard_actions: Vec<serde_json::Value>,
+    /// True when a guard blocked this query at submit time.
+    #[serde(default)]
+    pub was_guard_blocked: bool,
 }
 
 // --- Query execution result model ---

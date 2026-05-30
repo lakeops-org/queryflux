@@ -93,8 +93,13 @@ pub trait QueryHistoryStore: Send + Sync {
     /// Distinct agents that have run queries, with aggregate stats.
     async fn list_agents(&self, limit: i64, offset: i64) -> Result<Vec<AgentSummary>>;
 
-    /// Conversations for a given agent (or all agents if `agent_id` is None).
-    async fn list_conversations(&self, agent_id: Option<&str>) -> Result<Vec<ConversationSummary>>;
+    /// Conversations for a given agent (or all agents if `agent_id` is None), paginated.
+    async fn list_conversations(
+        &self,
+        agent_id: Option<&str>,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<ConversationSummary>>;
 
     /// All query records belonging to a conversation, ordered by step_index.
     async fn get_conversation(&self, conversation_id: &str) -> Result<Vec<QuerySummary>>;

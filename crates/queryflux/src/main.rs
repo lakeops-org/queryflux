@@ -700,16 +700,21 @@ async fn main() -> Result<()> {
         HashMap::new()
     };
 
-    // --- Build guard chain: DB-stored config (UI-managed) takes precedence over YAML ---
-    let guard_chain = if let Some(pg) = &pg_store {
+    // --- Build guard chains: DB-stored config (UI-managed) takes precedence over YAML ---
+    let (guard_chain, group_guard_chains) = if let Some(pg) = &pg_store {
         match pg.get_proxy_setting("guardrails_config").await {
             Ok(Some(v)) => {
-                build_guard_chain_from_db_value(&v).or_else(|| build_guard_chain(&config))
+                let (db_global, db_groups) = build_guard_chains_from_db_value(&v);
+                if db_global.is_some() || !db_groups.is_empty() {
+                    (db_global, db_groups)
+                } else {
+                    build_guard_chains(&config)
+                }
             }
-            _ => build_guard_chain(&config),
+            _ => build_guard_chains(&config),
         }
     } else {
-        build_guard_chain(&config)
+        build_guard_chains(&config)
     };
 
     // --- Wrap hot-reloadable fields in LiveConfig ---
@@ -722,6 +727,7 @@ async fn main() -> Result<()> {
     let live_config = LiveConfig {
         router_chain,
         guard_chain,
+        group_guard_chains,
         cluster_manager,
         adapters,
         health_check_targets,
@@ -1029,10 +1035,15 @@ async fn main() -> Result<()> {
                 if let Some(store) = admin {
                     match store.get_proxy_setting("guardrails_config").await {
                         Ok(Some(v)) => {
-                            live.write().await.guard_chain = build_guard_chain_from_db_value(&v);
+                            let (global, groups) = build_guard_chains_from_db_value(&v);
+                            let mut w = live.write().await;
+                            w.guard_chain = global;
+                            w.group_guard_chains = groups;
                         }
                         Ok(None) => {
-                            live.write().await.guard_chain = None;
+                            let mut w = live.write().await;
+                            w.guard_chain = None;
+                            w.group_guard_chains = HashMap::new();
                         }
                         Err(e) => tracing::warn!("Guard chain reload failed: {e}"),
                     }
@@ -1594,6 +1605,7 @@ async fn build_live_config(
     Ok(LiveConfig {
         router_chain,
         guard_chain: None,
+        group_guard_chains: HashMap::new(),
         cluster_manager,
         adapters: cache.adapters.clone(),
         health_check_targets,
@@ -1682,23 +1694,24 @@ async fn reload_live_config(
     )
     .await?;
 
-    // Load guardrails from DB (UI-managed). Overrides any YAML-configured guard chain.
+    // Load guardrails from DB (UI-managed). Overrides any YAML-configured guard chains.
     if let Ok(Some(v)) = pg.get_proxy_setting("guardrails_config").await {
-        live.guard_chain = build_guard_chain_from_db_value(&v);
+        let (global, groups) = build_guard_chains_from_db_value(&v);
+        live.guard_chain = global;
+        live.group_guard_chains = groups;
     }
 
     Ok(live)
 }
 
-/// Build a `GuardChain` from the YAML `guardrails:` section.
-/// Returns `None` when the section is absent (guardrails disabled).
-fn build_guard_chain(config: &queryflux_core::config::ProxyConfig) -> Option<Arc<GuardChain>> {
+/// Build YAML guard specs into a `GuardChain`. Returns `None` when the list is empty
+/// or contains only unrecognised/unimplemented entries.
+fn build_chain_from_yaml_specs(
+    specs: &[queryflux_core::config::GuardSpecConfig],
+) -> Option<Arc<GuardChain>> {
     use queryflux_core::config::GuardKindConfig;
-
-    let cfg = config.guardrails.as_ref()?;
     let mut guards: Vec<Box<dyn Guard>> = Vec::new();
-
-    for spec in &cfg.global {
+    for spec in specs {
         match &spec.kind {
             GuardKindConfig::BuiltIn => {
                 let name = spec.name.as_deref().unwrap_or("");
@@ -1718,63 +1731,61 @@ fn build_guard_chain(config: &queryflux_core::config::ProxyConfig) -> Option<Arc
             }
         }
     }
-
     if guards.is_empty() {
-        return None;
+        None
+    } else {
+        Some(Arc::new(GuardChain::new(guards)))
     }
-
-    Some(Arc::new(GuardChain::new(guards)))
 }
 
-/// Build a `GuardChain` from the flat JSON format stored by the Studio UI.
-///
-/// The DB format mirrors `GuardrailsConfig` from the TypeScript API types:
-/// `{ global: GuardSpecDto[], groups: Record<string, GuardSpecDto[]> }`.
-/// Only the `global` array is used here; per-group dispatch is not yet implemented.
-fn build_guard_chain_from_db_value(v: &serde_json::Value) -> Option<Arc<GuardChain>> {
-    #[allow(dead_code)]
+/// Build global + per-group guard chains from the YAML `guardrails:` section.
+fn build_guard_chains(
+    config: &queryflux_core::config::ProxyConfig,
+) -> (Option<Arc<GuardChain>>, HashMap<String, Arc<GuardChain>>) {
+    let Some(cfg) = config.guardrails.as_ref() else {
+        return (None, HashMap::new());
+    };
+    let global = build_chain_from_yaml_specs(&cfg.global);
+    let groups = cfg
+        .groups
+        .iter()
+        .filter_map(|(name, specs)| {
+            build_chain_from_yaml_specs(specs).map(|chain| (name.clone(), chain))
+        })
+        .collect();
+    (global, groups)
+}
+
+/// Build DB guard specs (kind string format) into a `GuardChain`.
+fn build_chain_from_db_specs(specs: &serde_json::Value) -> Option<Arc<GuardChain>> {
     struct DbGuardSpec {
         kind: String,
         name: Option<String>,
         max_rows: Option<u64>,
         applies_to: Option<Vec<String>>,
     }
-    struct DbGuardrailsConfig {
-        global: Vec<DbGuardSpec>,
-    }
-
-    // Manual deserialization to avoid needing a `use serde::Deserialize` import.
-    let cfg: DbGuardrailsConfig = {
-        let obj = v.as_object()?;
-        let global = obj
-            .get("global")
-            .and_then(|g| g.as_array())
-            .map(|arr| {
+    fn parse_spec(item: &serde_json::Value) -> Option<DbGuardSpec> {
+        let o = item.as_object()?;
+        Some(DbGuardSpec {
+            kind: o.get("kind")?.as_str()?.to_string(),
+            name: o
+                .get("name")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
+            max_rows: o.get("max_rows").and_then(|v| v.as_u64()),
+            applies_to: o.get("applies_to").and_then(|v| v.as_array()).map(|arr| {
                 arr.iter()
-                    .filter_map(|item| {
-                        let o = item.as_object()?;
-                        Some(DbGuardSpec {
-                            kind: o.get("kind")?.as_str()?.to_string(),
-                            name: o
-                                .get("name")
-                                .and_then(|v| v.as_str())
-                                .map(|s| s.to_string()),
-                            max_rows: o.get("max_rows").and_then(|v| v.as_u64()),
-                            applies_to: o.get("applies_to").and_then(|v| v.as_array()).map(|arr| {
-                                arr.iter()
-                                    .filter_map(|s| s.as_str().map(|s| s.to_string()))
-                                    .collect()
-                            }),
-                        })
-                    })
+                    .filter_map(|s| s.as_str().map(|s| s.to_string()))
                     .collect()
-            })
-            .unwrap_or_default();
-        DbGuardrailsConfig { global }
-    };
-
+            }),
+        })
+    }
+    let arr = specs.as_array()?;
     let mut guards: Vec<Box<dyn Guard>> = Vec::new();
-    for spec in &cfg.global {
+    for item in arr {
+        let Some(spec) = parse_spec(item) else {
+            continue;
+        };
         match spec.kind.as_str() {
             "built_in" => {
                 let name = spec.name.as_deref().unwrap_or("");
@@ -1784,7 +1795,7 @@ fn build_guard_chain_from_db_value(v: &serde_json::Value) -> Option<Arc<GuardCha
                         max_rows: spec.max_rows,
                     })),
                     "require_predicate" => guards.push(Box::new(RequirePredicateGuard {
-                        applies_to: spec.applies_to.clone().unwrap_or_default(),
+                        applies_to: spec.applies_to.unwrap_or_default(),
                     })),
                     other => tracing::warn!(name = other, "Unknown built-in guard name; skipping"),
                 }
@@ -1796,9 +1807,41 @@ fn build_guard_chain_from_db_value(v: &serde_json::Value) -> Option<Arc<GuardCha
             other => tracing::warn!(kind = other, "Unknown guard kind; skipping"),
         }
     }
-
     if guards.is_empty() {
-        return None;
+        None
+    } else {
+        Some(Arc::new(GuardChain::new(guards)))
     }
-    Some(Arc::new(GuardChain::new(guards)))
+}
+
+/// Build global + per-group guard chains from the flat JSON format stored by the Studio UI.
+///
+/// The DB format mirrors `GuardrailsConfig` from the TypeScript API types:
+/// `{ global: GuardSpecDto[], groups: Record<string, GuardSpecDto[]> }`.
+fn build_guard_chains_from_db_value(
+    v: &serde_json::Value,
+) -> (Option<Arc<GuardChain>>, HashMap<String, Arc<GuardChain>>) {
+    let Some(obj) = v.as_object() else {
+        return (None, HashMap::new());
+    };
+    let global_val = obj
+        .get("global")
+        .cloned()
+        .unwrap_or(serde_json::Value::Array(vec![]));
+    let global = build_chain_from_db_specs(&global_val);
+
+    let groups = obj
+        .get("groups")
+        .and_then(|g| g.as_object())
+        .map(|groups_obj| {
+            groups_obj
+                .iter()
+                .filter_map(|(name, specs)| {
+                    build_chain_from_db_specs(specs).map(|chain| (name.clone(), chain))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    (global, groups)
 }

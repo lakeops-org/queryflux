@@ -19,6 +19,10 @@ pub struct GuardAction {
     pub action: String,
     pub reason: Option<String>,
     pub code: Option<String>,
+    /// Free-form key/value metadata returned by the guard (e.g. matched rule name,
+    /// estimated row count). Omitted from JSON when `None`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<std::collections::HashMap<String, String>>,
 }
 
 /// A record of one completed (or failed/cancelled) query execution.
