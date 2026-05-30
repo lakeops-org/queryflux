@@ -65,7 +65,7 @@ SELECT region, COUNT(*) FROM orders WHERE date > DATE '2026-01-01' GROUP BY 1;
 
 Pass the parameters in the connection string as startup parameters. Most clients support extra parameters via the `options` field or named parameters:
 
-```
+```text
 postgresql://host:5432/db?agent_id=my-agent-v2&conversation_id=conv-7f3a9b&step_index=4&query_intent=aggregation
 ```
 

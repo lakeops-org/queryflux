@@ -77,8 +77,9 @@ export function ConversationTable({ conversations }: { conversations: Conversati
                   onClick={() => setQuery("")}
                   className="absolute right-2 top-1/2 -translate-y-1/2 p-1 rounded-md text-slate-400 hover:text-slate-600 hover:bg-slate-100 transition-colors"
                   title="Clear"
+                  aria-label="Clear search"
                 >
-                  <X size={14} />
+                  <X size={14} aria-hidden="true" />
                 </button>
               )}
             </div>

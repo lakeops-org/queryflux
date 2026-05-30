@@ -256,14 +256,6 @@ function ConversationCard({
 // ---------------------------------------------------------------------------
 
 export function ConversationList({ conversations }: { conversations: ConversationSummary[] }) {
-  if (conversations.length === 0) {
-    return (
-      <div className="bg-white rounded-xl border border-slate-200 px-6 py-16 text-center w-full">
-        <p className="text-sm text-slate-400">No conversations recorded for this agent.</p>
-      </div>
-    );
-  }
-
   const [query, setQuery] = useState("");
   const [sortKey, setSortKey] = useState<SortKey>("last_seen");
   const [blockedFilter, setBlockedFilter] = useState<BlockedFilter>("all");
@@ -292,6 +284,14 @@ export function ConversationList({ conversations }: { conversations: Conversatio
 
     return next;
   }, [blockedFilter, conversations, query, sortKey]);
+
+  if (conversations.length === 0) {
+    return (
+      <div className="bg-white rounded-xl border border-slate-200 px-6 py-16 text-center w-full">
+        <p className="text-sm text-slate-400">No conversations recorded for this agent.</p>
+      </div>
+    );
+  }
 
   const allExpanded =
     filtered.length > 0 && filtered.every((c) => expandedIds.has(c.conversation_id));

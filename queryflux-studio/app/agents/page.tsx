@@ -10,7 +10,8 @@ interface Props {
 
 export default async function AgentsPage({ searchParams }: Props) {
   const params = await searchParams;
-  const page = Math.max(1, parseInt(params.page ?? "1"));
+  const parsedPage = parseInt(params.page ?? "1", 10);
+  const page = Number.isNaN(parsedPage) ? 1 : Math.max(1, parsedPage);
   const limit = 50;
   const offset = (page - 1) * limit;
 

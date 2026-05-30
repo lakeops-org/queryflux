@@ -1714,7 +1714,10 @@ fn build_chain_from_yaml_specs(
     for spec in specs {
         match &spec.kind {
             GuardKindConfig::BuiltIn => {
-                let name = spec.name.as_deref().unwrap_or("");
+                let Some(name) = spec.name.as_deref() else {
+                    tracing::error!("built_in guard is missing required field \"name\"; skipping");
+                    continue;
+                };
                 match name {
                     "read_only" => guards.push(Box::new(ReadOnlyGuard)),
                     "row_limit" => guards.push(Box::new(RowLimitGuard {

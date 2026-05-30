@@ -1572,6 +1572,19 @@ async fn get_guardrails_config_handler(State(state): State<Arc<AdminState>>) -> 
     Json(serde_json::json!({ "global": [], "groups": {} })).into_response()
 }
 
+/// Validates that the body matches the guardrails wire format used by Studio and the DB:
+/// `{ global: GuardSpecDto[], groups: Record<string, GuardSpecDto[]> }`.
+/// This is intentionally separate from `queryflux_guardrails::GuardChainConfig`, which
+/// uses a nested `{ plan: [...] }` structure that differs from the Studio/DB flat format.
+#[derive(Deserialize)]
+#[allow(dead_code)]
+struct GuardrailsConfigDto {
+    #[serde(default)]
+    global: Vec<serde_json::Value>,
+    #[serde(default)]
+    groups: HashMap<String, Vec<serde_json::Value>>,
+}
+
 async fn put_guardrails_config_handler(
     State(state): State<Arc<AdminState>>,
     Json(body): Json<serde_json::Value>,
@@ -1583,6 +1596,13 @@ async fn put_guardrails_config_handler(
         )
             .into_response();
     };
+    if let Err(e) = serde_json::from_value::<GuardrailsConfigDto>(body.clone()) {
+        return (
+            StatusCode::BAD_REQUEST,
+            format!("invalid guardrails config: {e}"),
+        )
+            .into_response();
+    }
     match store.set_proxy_setting("guardrails_config", body).await {
         Ok(()) => {
             notify_live_config_reload(&state);

@@ -12,6 +12,22 @@ pub struct GuardChainConfig {
     pub groups: HashMap<String, GuardGroupConfig>,
 }
 
+impl GuardChainConfig {
+    /// Validates all guard specs in the config. Returns the first error found.
+    pub fn validate(&self) -> Result<(), String> {
+        for spec in &self.global.plan {
+            spec.validate()?;
+        }
+        for (group, cfg) in &self.groups {
+            for spec in &cfg.plan {
+                spec.validate()
+                    .map_err(|e| format!("group \"{group}\": {e}"))?;
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Guard config for one layer (currently only Plan / L2 for Phase 1B).
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct GuardLayerConfig {
@@ -36,6 +52,17 @@ pub struct GuardSpec {
     /// Guard-specific parameters (e.g. max_rows, applies_to patterns).
     #[serde(default, flatten)]
     pub params: GuardParams,
+}
+
+impl GuardSpec {
+    /// Returns an error when `kind` is `BuiltIn` but `name` is absent, since the name
+    /// is required to resolve which built-in guard to instantiate.
+    pub fn validate(&self) -> Result<(), String> {
+        if matches!(self.kind, GuardKind::BuiltIn) && self.name.is_none() {
+            return Err("built_in guard is missing required field \"name\"".to_string());
+        }
+        Ok(())
+    }
 }
 
 /// Which kind of guard this is.

@@ -161,7 +161,7 @@ impl AppState {
             .agent_context
             .as_ref()
             .and_then(|a| a.step_index)
-            .map(|s| s as i32);
+            .map(|s| i32::try_from(s).unwrap_or(i32::MAX));
         let tool_call_id = ctx
             .agent_context
             .as_ref()
