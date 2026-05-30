@@ -1,7 +1,8 @@
 ---
-description: Step-by-step guide to adding a new query backend (engine) to QueryFlux — Rust adapter, registration, Studio UI.
+title: Add a Backend Engine
+description: Step-by-step guide to adding a query backend — Rust adapter, engine registration, persistence, and Studio UI.
+image: img/queryflux-hero-banner.png
 ---
-
 # Adding a new backend (engine)
 
 This page is for contributors who want QueryFlux to **route SQL to a new database or engine** (for example a new OLAP system). It is **not** about adding a new **client protocol** (Trino HTTP, Postgres wire, etc.); for that, see **[Frontend](frontend.md)** and **[Frontends](../frontends/overview.md)**.

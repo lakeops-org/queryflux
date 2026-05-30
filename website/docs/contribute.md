@@ -1,8 +1,9 @@
 ---
 sidebar_position: 6
-description: Contribution guidelines for QueryFlux — branching, PR conventions, code style, and licensing requirements.
+title: Contributing
+description: Contribution guidelines for QueryFlux — PR conventions, code style, tests, documentation updates, and Apache 2.0 license.
+image: img/queryflux-hero-banner.png
 ---
-
 # Contributing to QueryFlux
 
 Thank you for helping improve QueryFlux. This document describes how we expect contributions to look so reviews stay fast and the codebase stays consistent.
@@ -21,9 +22,9 @@ By contributing, you agree that your contributions will be licensed under the sa
 1. **Keep changes focused.** One logical change per PR is easier to review than a large refactor mixed with a feature fix.
 2. **Match existing style.** Rust: same patterns as surrounding code, `rustfmt`-compatible formatting, and no new Clippy warnings (see checks below).
 3. **Test your change.**
-   - Run `make check` (Clippy with `-D warnings` + unit tests; no Docker required).
+   - Run `make lint` (Clippy with `-D warnings`) and `make test` (unit tests); no Docker required.
    - If you touch integration behavior (routing, Trino HTTP, adapters), run `make test-e2e` when you can (Docker required).
-4. **Update docs when behavior changes.** Config keys, router types, or public HTTP/admin behavior should be reflected in `README.md`, `docs/`, `website/docs/`, or `config.example.yaml` as appropriate.
+4. **Update docs when behavior changes.** Config keys, router types, or public HTTP/admin behavior should be reflected in `README.md`, `website/docs/`, or `config.example.yaml` as appropriate.
 
 ## Code review expectations
 

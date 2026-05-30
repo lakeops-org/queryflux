@@ -1,8 +1,9 @@
 ---
 sidebar_label: Overview
-description: How to extend QueryFlux — new backend engines (Rust + Studio) vs new frontend client protocols, with links to detailed guides.
+title: Extending QueryFlux Overview
+description: Add a backend engine adapter or a new client protocol — Rust crates, Studio UI, and documentation checklist.
+image: img/queryflux-hero-banner.png
 ---
-
 # Extending QueryFlux
 
 This guide separates two ideas that are easy to conflate:

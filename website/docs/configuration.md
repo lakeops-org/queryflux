@@ -1,9 +1,10 @@
 ---
 sidebar_position: 1
 sidebar_label: YAML reference
-description: Complete reference for config.yaml — frontends, cluster groups, routing rules, concurrency limits, and observability settings.
+title: YAML Configuration Reference
+description: Complete config.yaml reference — frontends, cluster groups, routing rules, persistence, translation, and admin API settings.
+image: img/queryflux-hero-banner.png
 ---
-
 # Configuration
 
 Copy `config.example.yaml` in the repository root and adjust for your environment.
@@ -21,24 +22,27 @@ queryflux:
   persistence:
     type: inMemory  # or: postgres
 
+clusters:
+  trino-1:
+    engine: trino
+    endpoint: http://trino-host:8080
+    enabled: true
+    auth:
+      type: basic
+      username: user
+      password: pass
+  duckdb-1:
+    engine: duckDb
+    enabled: true
+    databasePath: /tmp/queryflux.duckdb
+
 clusterGroups:
   trino-default:
-    engine: trino
     maxRunningQueries: 100
-    clusters:
-      - name: trino-1
-        endpoint: http://trino-host:8080
-        auth:
-          type: basic
-          username: user
-          password: pass
-
+    members: [trino-1]
   duckdb-local:
-    engine: duckDb
     maxRunningQueries: 4
-    clusters:
-      - name: duckdb-1
-        databasePath: /tmp/queryflux.duckdb
+    members: [duckdb-1]
 
 routers:
   - type: protocolBased

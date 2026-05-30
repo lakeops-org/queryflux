@@ -12,6 +12,7 @@ import HomepageUseCases from '@site/src/components/HomepageUseCases';
 import HomepageBenefits from '@site/src/components/HomepageBenefits';
 import HomepageNextSteps from '@site/src/components/HomepageNextSteps';
 import StatsStrip from '@site/src/components/StatsStrip';
+import PageSeo from '@site/src/components/PageSeo';
 import styles from './index.module.css';
 
 function HomepageHeader(): ReactNode {
@@ -68,9 +69,14 @@ const HOME_DESCRIPTION =
 const HOME_PAGE_TITLE = 'Multi-engine SQL query routing proxy';
 
 export default function Home(): ReactNode {
-  const {siteConfig} = useDocusaurusContext();
   return (
     <Layout title={HOME_PAGE_TITLE} description={HOME_DESCRIPTION}>
+      <PageSeo
+        title={HOME_PAGE_TITLE}
+        description={HOME_DESCRIPTION}
+        pathname="/"
+        image="img/queryflux-hero-banner.png"
+      />
       <HomepageHeader />
       <main className={styles.mainBelowFold}>
         <StatsStrip />

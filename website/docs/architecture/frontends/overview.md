@@ -1,8 +1,9 @@
 ---
 sidebar_label: Overview
-description: How QueryFlux frontends work — protocol listeners, shared dispatch, session context, and the available client protocols.
+title: Frontends Overview
+description: QueryFlux client protocols — Trino HTTP, PostgreSQL wire, MySQL wire, Flight SQL, and Snowflake on a shared dispatch path.
+image: img/queryflux-hero-banner.png
 ---
-
 # Frontends
 
 A **frontend** is the entry point for client traffic into QueryFlux. Each frontend speaks a specific wire or HTTP protocol, parses incoming SQL, builds a `SessionContext`, and hands the query to the shared dispatch layer. The client never knows which backend engine actually runs the query — the frontend translates results back into its native format before responding.

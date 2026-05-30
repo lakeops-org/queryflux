@@ -1,7 +1,8 @@
 ---
-description: MySQL wire protocol frontend — handshake, COM_QUERY, session variables, schema switching, and connecting with mysql clients.
+title: MySQL Wire Frontend
+description: MySQL wire protocol frontend — handshake, COM_QUERY, session variables, schema switching, and mysql client support.
+image: img/queryflux-hero-banner.png
 ---
-
 # MySQL wire
 
 The MySQL wire frontend lets standard MySQL clients (`mysql` CLI, JDBC, Python `mysql-connector`, Go `go-sql-driver/mysql`, etc.) connect to QueryFlux over the MySQL wire protocol. This is the natural entry point when routing traffic to MySQL-protocol backends like StarRocks.

@@ -1,11 +1,15 @@
 import {themes as prismThemes} from 'prism-react-renderer';
 import type {Config} from '@docusaurus/types';
 import type * as Preset from '@docusaurus/preset-classic';
+import {
+  buildDocsVersionConfig,
+  buildSitemapConfig,
+  robotsTxtPlugin,
+} from './seoConfig';
 
 const siteUrl = 'https://queryflux.dev';
 const siteCanonicalUrl = siteUrl;
-const socialPreviewTitle = 'QueryFlux — Multi-engine query routing proxy';
-const socialPreviewDescription =
+const siteDescription =
   'Universal SQL query proxy and router in Rust. One endpoint for Trino, PostgreSQL, MySQL, Snowflake HTTP, Flight, and more — with routing, queueing, and observability.';
 
 const config: Config = {
@@ -74,6 +78,7 @@ const config: Config = {
 
   // https://docusaurus.io/docs/search#using-local-search — offline index, no Algolia
   plugins: [
+    robotsTxtPlugin,
     [
       '@cmfcmf/docusaurus-search-local',
       {
@@ -93,15 +98,11 @@ const config: Config = {
           editUrl:
             'https://github.com/lakeops-org/queryflux/tree/main/website/',
           // https://docusaurus.io/docs/versioning — latest = first entry in versions.json
-          versions: {
-            current: {
-              label: 'Next',
-              path: 'next',
-              banner: 'unreleased',
-            },
-          },
+          // SEO: only latest is indexable; see seoConfig.ts (reads versions.json each build)
+          versions: buildDocsVersionConfig(),
         },
         blog: false,
+        sitemap: buildSitemapConfig(),
         theme: {
           customCss: './src/css/custom.css',
         },
@@ -128,6 +129,11 @@ const config: Config = {
           position: 'left',
           label: 'Docs',
           className: 'navbar-item-docs-mobile',
+        },
+        {
+          href: 'https://lakeops.dev/blog/category/queryflux',
+          label: 'Blog',
+          position: 'left',
         },
         {
           to: '/community',
@@ -185,6 +191,10 @@ const config: Config = {
               label: 'Issues',
               href: 'https://github.com/lakeops-org/queryflux/issues',
             },
+            {
+              label: 'Discussions',
+              href: 'https://github.com/lakeops-org/queryflux/discussions',
+            },
           ],
         },
         {
@@ -200,7 +210,7 @@ const config: Config = {
       darkTheme: prismThemes.dracula,
       additionalLanguages: ['rust', 'yaml', 'bash', 'python'],
     },
-    // https://docusaurus.io/docs/seo#global-metadata
+    // https://docusaurus.io/docs/seo#global-metadata — site-wide defaults; per-page title/description/OG come from Layout or doc frontmatter
     metadata: [
       {
         name: 'keywords',
@@ -209,7 +219,7 @@ const config: Config = {
       },
       {
         name: 'description',
-        content: socialPreviewDescription,
+        content: siteDescription,
       },
       {
         name: 'robots',
@@ -220,14 +230,12 @@ const config: Config = {
         content: 'index, follow, max-image-preview:large, max-snippet:-1, max-video-preview:-1',
       },
       {property: 'og:site_name', content: 'QueryFlux'},
-      {property: 'og:title', content: socialPreviewTitle},
-      {property: 'og:description', content: socialPreviewDescription},
+      {property: 'og:type', content: 'website'},
+      {property: 'og:locale', content: 'en_US'},
       {property: 'og:image:alt', content: 'QueryFlux multi-engine query routing overview'},
       {name: 'twitter:card', content: 'summary_large_image'},
-      {name: 'twitter:title', content: socialPreviewTitle},
-      {name: 'twitter:description', content: socialPreviewDescription},
+      {name: 'twitter:site', content: '@lakeops'},
       {name: 'twitter:image:alt', content: 'QueryFlux multi-engine query routing overview'},
-      {property: 'og:type', content: 'website'},
       {property: 'og:image:width', content: '1024'},
       {property: 'og:image:height', content: '682'},
     ],

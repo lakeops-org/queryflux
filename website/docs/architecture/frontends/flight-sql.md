@@ -1,7 +1,8 @@
 ---
-description: Arrow Flight SQL frontend — gRPC service, implemented RPCs, metadata passthrough, and connecting with Flight SQL clients.
+title: Arrow Flight SQL Frontend
+description: Arrow Flight SQL gRPC frontend — implemented RPCs, metadata passthrough, and Flight SQL client examples.
+image: img/queryflux-hero-banner.png
 ---
-
 # Arrow Flight SQL
 
 The Flight SQL frontend exposes a gRPC-based [Arrow Flight SQL](https://arrow.apache.org/docs/format/FlightSql.html) service. Clients that speak Flight SQL (e.g. the JDBC Flight SQL driver, ADBC, DuckDB's `ATTACH` over Flight) can connect to QueryFlux and run SQL queries with results streamed as native Arrow record batches — zero serialization overhead for columnar consumers.

@@ -1,7 +1,8 @@
 ---
-description: PostgreSQL wire protocol frontend — startup, simple query, session context, and connecting with psql or any Postgres driver.
+title: PostgreSQL Wire Frontend
+description: PostgreSQL v3 wire protocol frontend — startup, simple query flow, session context, and psql compatibility.
+image: img/queryflux-hero-banner.png
 ---
-
 # PostgreSQL wire
 
 The PostgreSQL wire frontend lets Postgres clients that work in **simple-query mode** (`psql`, many JDBC/Python drivers in autocommit/simple mode, etc.) connect to QueryFlux over the PostgreSQL v3 wire protocol. Queries are executed synchronously — the TCP connection stays open while the result streams back as standard Postgres wire messages.

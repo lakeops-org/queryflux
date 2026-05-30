@@ -1,9 +1,10 @@
 ---
 sidebar_position: 1
 sidebar_label: Getting started
-description: Run QueryFlux with Docker Compose, connect SQL clients, and verify routing in minutes.
+title: Getting Started
+description: Run QueryFlux with Docker Compose, connect SQL clients, smoke-test Trino HTTP routing, and open Studio in minutes.
+image: img/queryflux-hero-banner.png
 ---
-
 # Getting started
 
 The fastest path is a **Docker Compose** example under [`examples/`](https://github.com/lakeops-org/queryflux/tree/main/examples). Run commands **from that example directory** so paths like `./config.yaml` resolve.
@@ -12,7 +13,7 @@ See the **[examples README](https://github.com/lakeops-org/queryflux/blob/main/e
 
 :::tip Same ports in some examples
 
-[`minimal`](https://github.com/lakeops-org/queryflux/tree/main/examples/minimal) and [`minimal-inmemory`](https://github.com/lakeops-org/queryflux/tree/main/examples/minimal-inmemory) both publish **8080**, **8081**, **3000**, and **9000**. Only run one at a time, or change published ports in `docker-compose.yml`.
+[`minimal-trino`](https://github.com/lakeops-org/queryflux/tree/main/examples/minimal-trino) and [`minimal-inmemory`](https://github.com/lakeops-org/queryflux/tree/main/examples/minimal-inmemory) both publish **8080**, **8081**, **3000**, and **9000**. Only run one at a time, or change published ports in `docker-compose.yml`.
 
 [`with-prometheus-grafana`](https://github.com/lakeops-org/queryflux/tree/main/examples/with-prometheus-grafana) uses **3000 for Grafana** (not Studio). Do not run it alongside an example that uses 3000 for Studio unless you remap a port.
 
@@ -41,14 +42,14 @@ docker compose up -d --wait
 | Studio | http://localhost:3000 (login **admin** / **admin**) |
 | Postgres (from host) | `localhost:5433` — user `queryflux`, password `queryflux`, database `queryflux` |
 
-**Next steps:** Trino CLI from the host or from inside the `trino` container, verifying traffic goes through QueryFlux — full walkthrough in **[`examples/minimal/README.md`](https://github.com/lakeops-org/queryflux/blob/main/examples/minimal/README.md)** (including Studio **Queries** and the port/hostname cheat sheet).
+**Next steps:** Trino CLI from the host or from inside the `trino` container, verifying traffic goes through QueryFlux — full walkthrough in **[`examples/minimal-trino/README.md`](https://github.com/lakeops-org/queryflux/blob/main/examples/minimal-trino/README.md)** (including Studio **Queries** and the port/hostname cheat sheet).
 
 ## Example: minimal in-memory
 
 **Best for:** fastest local tryout; **no Postgres**. Routing/clusters come from [`config.yaml`](https://github.com/lakeops-org/queryflux/blob/main/examples/minimal-inmemory/config.yaml); **restart QueryFlux** after edits. Studio pages that need Postgres may **503** — see **[`examples/minimal-inmemory/README.md`](https://github.com/lakeops-org/queryflux/blob/main/examples/minimal-inmemory/README.md)**.
 
 ```bash
-cd queryflux/examples/minimal-trino-inmemory
+cd queryflux/examples/minimal-inmemory
 docker compose up -d --wait
 ```
 
@@ -114,7 +115,8 @@ For the full Rust workspace, Python/sqlglot, and the compose stack under `docker
 
 ```bash
 make setup    # Python venv + sqlglot (for translation)
-make dev      # backing services + run QueryFlux per Makefile
+make env      # backing services (Docker)
+make server   # run QueryFlux per Makefile
 ```
 
 Typical URLs (see your `Makefile` / `docker/docker-compose.yml` if you customize ports):
@@ -131,7 +133,8 @@ Typical URLs (see your `Makefile` / `docker/docker-compose.yml` if you customize
 ```bash
 make stop     # stop services
 make logs     # container logs
-make check    # clippy + unit tests (no Docker)
+make lint     # clippy (no Docker)
+make test     # unit tests (no Docker)
 make clean    # artifacts + volumes
 ```
 

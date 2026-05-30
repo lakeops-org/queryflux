@@ -1,7 +1,8 @@
 ---
-description: Snowflake frontend — wire protocol (HTTP Form 1) and SQL REST API v2 (Form 2) on a single port, connecting SnowSQL, Python connector, and Snowflake JDBC to QueryFlux.
+title: Snowflake Frontend
+description: Snowflake HTTP wire and SQL API v2 on one port — SnowSQL, Python connector, and JDBC without a Snowflake account.
+image: img/queryflux-hero-banner.png
 ---
-
 # Snowflake
 
 The Snowflake frontend lets Snowflake clients (SnowSQL CLI, Python `snowflake-connector-python`, JDBC) connect to QueryFlux as if it were a Snowflake account. QueryFlux terminates the Snowflake wire protocol entirely — no Snowflake account or warehouse is required. SQL is dispatched to whatever backend engine (Trino, StarRocks, DuckDB, etc.) is configured for the incoming session.

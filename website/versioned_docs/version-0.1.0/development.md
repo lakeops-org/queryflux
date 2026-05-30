@@ -11,7 +11,7 @@ This guide is for working on the QueryFlux **Rust workspace** and its local depe
 
 - **Rust** (stable toolchain), `cargo`, `rustfmt`, `clippy`
 - **Python 3.10+** (3.13 is used in some Makefile `PYTHONPATH` examples; adjust paths if your venv uses another minor version)
-- **Docker** and **Docker Compose** (for `make dev`, `make test-e2e`, and the full stack)
+- **Docker** and **Docker Compose** (for `make env`, `make test-e2e`, and the full stack)
 
 ## First-time setup
 
@@ -36,17 +36,19 @@ Adjust `PYTHONPATH` if your venv’s `lib/pythonX.Y` differs.
 | Goal | Command |
 |------|---------|
 | Format (if you use rustfmt manually) | `cargo fmt --all` |
-| Lint + unit tests (no Docker) | `make check` |
+| Clippy lints (no Docker) | `make lint` |
+| Unit tests (no Docker) | `make test` |
 | Release build | `make build` |
 | E2E tests (Docker: Trino, StarRocks, Lakekeeper) | `make test-e2e` |
-| Start backing services (Docker) | `make dev` |
-| Stop Docker stack | `make stop` |
+| Start backing services (Docker) | `make env` |
+| Run QueryFlux locally | `make server` |
+| Stop Docker stack + QueryFlux | `make stop` |
 | Follow container logs | `make logs` |
 | Clean build + Docker volumes | `make clean` |
 
 ## Running QueryFlux locally
 
-`make dev` brings up dependencies via `docker compose` (see `Makefile` for the exact services). After containers are healthy, run the binary from the repo root with your config, for example:
+`make env` brings up dependencies via `docker compose` (see `Makefile` for the exact services). After containers are healthy, run the binary from the repo root with your config (or use `make server`), for example:
 
 ```bash
 export PYO3_PYTHON="$(pwd)/.venv/bin/python3"
@@ -71,8 +73,12 @@ The Cargo workspace lives under `crates/`. Common places to touch code:
 | `queryflux-routing` | `RouterTrait` implementations and `RouterChain` |
 | `queryflux-cluster-manager` | Group capacity, strategies, `acquire_cluster` / `release_cluster` |
 | `queryflux-translation` | sqlglot / `TranslationService` |
-| `queryflux-engine-adapters` | Trino, DuckDB, StarRocks, … |
+| `queryflux-engine-adapters` | Trino, DuckDB, StarRocks, Athena, ADBC, … |
 | `queryflux-persistence` | In-memory and PostgreSQL stores |
+| `queryflux-metrics` | Prometheus instrumentation, buffered metrics |
+| `queryflux-auth` | Auth providers, authorization, identity resolution |
+| `queryflux-fingerprint` | Query fingerprinting (AST-based deduplication) |
+| `queryflux-bench` | Proxy overhead benchmarks (mock backends) |
 | `queryflux-e2e-tests` | Integration tests behind Docker |
 
 Architecture narrative: **[System map](/docs/architecture/system-map)** and the **[architecture documentation overview](/docs/architecture/overview)**.

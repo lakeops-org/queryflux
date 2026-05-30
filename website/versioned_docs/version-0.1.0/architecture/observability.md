@@ -76,9 +76,19 @@ Grafana is auto-configured via two provisioning files:
 
 QueryFlux Studio is a Next.js web UI served separately from the proxy. It talks to the Admin REST API on port 9000.
 
-**Start:** `cd ui/queryflux-studio && npm run dev` (or build and serve for production)
+**Start:** `cd queryflux-studio && npm run dev` (or build and serve for production)
 
-**Default URL:** http://localhost:3001
+**Default URL:** http://localhost:3000
+
+:::tip Avoid port conflict with Grafana
+
+Grafana (above) also binds to port 3000. If you run both simultaneously, either start Studio on a different port:
+
+```bash
+PORT=3001 npm run dev
+```
+
+or remap Grafana in `docker-compose.yml` (`ports: ["3001:3000"]`).
 
 ### Pages
 

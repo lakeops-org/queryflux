@@ -20,7 +20,7 @@ function isLakeOpsBrandColumn(column: ColumnType): boolean {
 }
 
 function LakeOpsFooterColumn(): ReactNode {
-  const mascotUrl = useBaseUrl('/img/lakeops-mascot.png');
+  const logoUrl = useBaseUrl('/img/lakeops-logo.png');
 
   return (
     <div
@@ -36,13 +36,12 @@ function LakeOpsFooterColumn(): ReactNode {
         aria-label="LakeOps — visit lakeops.dev"
         target="_blank"
         rel="noopener noreferrer">
-        <span className="footer__lakeops-wordmark">LakeOps</span>
         <img
-          className="footer__lakeops-mascot"
-          src={mascotUrl}
-          alt=""
-          width={120}
-          height={75}
+          className="footer__lakeops-logo"
+          src={logoUrl}
+          alt="LakeOps"
+          width={180}
+          height={180}
           loading="lazy"
           decoding="async"
         />

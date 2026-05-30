@@ -1,11 +1,12 @@
 ---
 sidebar_position: 4
-description: QueryFlux proxy overhead benchmarks — mock-backend latency numbers for Trino HTTP and MySQL wire paths.
+title: Proxy Benchmarks
+description: QueryFlux proxy overhead benchmarks — mock-backend latency for Trino HTTP and MySQL wire paths (~0.35 ms p50).
+image: img/queryflux-hero-banner.png
 ---
-
 # Benchmark (proxy overhead)
 
-End-to-end overhead is measured by `queryflux-bench` (`cargo run --bin queryflux-bench` after `cargo build --bin queryflux`). It uses **mock** backends (Trino HTTP + MySQL wire for StarRocks), **50** warmup queries per path, then **500** timed iterations of `SELECT 1` — direct to the mock vs the same request through QueryFlux (Trino HTTP frontend). Numbers vary by machine; CI can track trends via `.github/workflows/benchmark.yml`.
+End-to-end overhead is measured by `queryflux-bench` (`cargo run --bin queryflux-bench` after `cargo build --bin queryflux`). It uses **mock** backends (Trino HTTP + MySQL wire for StarRocks), **50** warmup queries per path, then **500** timed iterations of `SELECT 1` — direct to the mock vs the same request through QueryFlux (Trino HTTP frontend). Numbers vary by machine.
 
 ## Trino (mock HTTP coordinator)
 

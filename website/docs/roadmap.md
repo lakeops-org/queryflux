@@ -1,8 +1,9 @@
 ---
 sidebar_position: 7
-description: QueryFlux project roadmap — shipped features, in-progress work, and planned additions for routing, auth, and engine support.
+title: Roadmap
+description: QueryFlux project roadmap — shipped features, near-term priorities, and planned additions for routing and engine support.
+image: img/queryflux-hero-banner.png
 ---
-
 # Roadmap
 
 QueryFlux is under active development. This page tracks what is shipped, what is in progress, and where the project is headed.
@@ -19,12 +20,14 @@ Everything below is implemented and available on the `main` branch.
 | | PostgreSQL wire protocol (port 5432) |
 | | MySQL wire protocol (port 3306) |
 | | Arrow Flight SQL (gRPC) |
+| | Snowflake HTTP wire + SQL API v2 (configurable port) |
 | | Admin REST API + OpenAPI / Swagger UI (port 9000) |
 | **Backends** | Trino — async HTTP polling, transparent `nextUri` proxying |
 | | DuckDB — embedded, in-process, Arrow result sets |
 | | StarRocks — MySQL wire, sync Arrow path |
 | | Athena — AWS SDK async, `StartQueryExecution` → `GetQueryResults` |
-| **Routing** | `protocolBased`, `header`, `queryRegex`, `clientTags`, `pythonScript`, `compound` routers |
+| | ADBC — generic Arrow Database Connectivity driver (Trino, DuckDB, and more) |
+| **Routing** | `protocolBased`, `header`, `queryRegex`, `tags`, `pythonScript`, `compound` routers |
 | | Router chain with ordered evaluation and `routingFallback` |
 | | `route_with_trace` for per-request routing debug traces |
 | **Cluster management** | Per-group concurrency limits (`maxRunningQueries`) |
@@ -44,7 +47,7 @@ Everything below is implemented and available on the `main` branch.
 | | QueryFlux Studio — Next.js UI: clusters, query history, engine registry |
 | | Buffered + multi-store metrics pipeline |
 | **Ops** | Dynamic config reload from Postgres (configurable interval + immediate on write) |
-| | Per-example Docker Compose stacks (`minimal`, `minimal-inmemory`, `with-prometheus-grafana`, `full-stack`) |
+| | Per-example Docker Compose stacks (`minimal-trino`, `minimal-inmemory`, `quickstart`, `with-prometheus-grafana`, `full-stack`) |
 | | Proxy overhead benchmarks (`queryflux-bench`): ~0.35 ms p50 added latency |
 
 ---

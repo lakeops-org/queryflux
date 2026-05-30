@@ -1,7 +1,8 @@
 ---
-description: Step-by-step guide to adding a new client protocol (frontend) to QueryFlux — listener, dispatch, routing, admin.
+title: Add a Frontend Protocol
+description: Step-by-step guide to adding a new client protocol listener, dispatch integration, and routing in QueryFlux.
+image: img/queryflux-hero-banner.png
 ---
-
 # Adding a new frontend (client protocol)
 
 This page is for contributors who want **clients to connect to QueryFlux using a new wire or HTTP protocol** (ingress). It is **not** about adding a **backend engine** that runs SQL; for that, see **[Backend](backend.md)**.
