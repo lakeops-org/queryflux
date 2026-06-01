@@ -12,7 +12,7 @@ spec:
     {{- toYaml .Values.podSecurityContext | nindent 4 }}
   containers:
     - name: wget
-      image: busybox:1.36
+      image: busybox:1.37.0
       securityContext:
         {{- toYaml .Values.securityContext | nindent 8 }}
       command:

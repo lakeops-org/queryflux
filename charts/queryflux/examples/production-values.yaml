@@ -27,8 +27,9 @@ config:
           port: 8080
       persistence:
         type: postgres
-        # Demo value only — see the note above; do not commit real credentials.
-        url: postgres://queryflux:queryflux@postgres.queryflux.svc.cluster.local:5432/queryflux
+        # Placeholder — replace USERNAME/PASSWORD/HOST. Prefer config.existingSecret
+        # (see note above) so credentials are not stored in plaintext.
+        url: postgres://USERNAME:PASSWORD@postgres.queryflux.svc.cluster.local:5432/queryflux
       adminApi:
         port: 9000
       queryHistoryRetentionDays: 30

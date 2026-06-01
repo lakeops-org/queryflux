@@ -20,7 +20,3 @@ service:
   ports:
     studio:
       enabled: false
-      name: studio
-      port: 3000
-      targetPort: 3000
-      protocol: TCP

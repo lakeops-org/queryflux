@@ -53,8 +53,9 @@ python3 -m json.tool "$CHART_DIR/values.schema.json" >/dev/null 2>&1 \
 
 # Admin Secret must use configurable key names rather than hardcoded ones.
 grep -q '{{ .Values.existingSecret.usernameKey }}' "$CHART_DIR/templates/secret.yaml" \
-  && grep -q '{{ .Values.existingSecret.passwordKey }}' "$CHART_DIR/templates/secret.yaml" \
-  || fail "templates/secret.yaml must use configurable admin Secret key names"
+  || fail "templates/secret.yaml must use configurable admin Secret usernameKey"
+grep -q '{{ .Values.existingSecret.passwordKey }}' "$CHART_DIR/templates/secret.yaml" \
+  || fail "templates/secret.yaml must use configurable admin Secret passwordKey"
 
 # Security defaults that the chart promises in its values.
 grep -q 'runAsNonRoot: true' "$CHART_DIR/values.yaml" || fail "values.yaml must set runAsNonRoot: true"

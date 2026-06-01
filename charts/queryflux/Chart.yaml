@@ -3,7 +3,7 @@ name: queryflux
 description: Universal SQL multi-engine query router and proxy.
 type: application
 version: 0.1.0
-appVersion: "latest"
+appVersion: "0.1.2"
 home: https://queryflux.dev/
 sources:
   - https://github.com/lakeops-org/queryflux

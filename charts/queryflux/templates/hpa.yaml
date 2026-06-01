@@ -12,6 +12,9 @@ spec:
     name: {{ include "queryflux.fullname" . }}
   minReplicas: {{ .Values.autoscaling.minReplicas }}
   maxReplicas: {{ .Values.autoscaling.maxReplicas }}
+  {{- if and (not .Values.autoscaling.targetCPUUtilizationPercentage) (not .Values.autoscaling.targetMemoryUtilizationPercentage) }}
+  {{- fail "autoscaling.enabled requires autoscaling.targetCPUUtilizationPercentage or autoscaling.targetMemoryUtilizationPercentage to be set" }}
+  {{- end }}
   metrics:
     {{- if .Values.autoscaling.targetCPUUtilizationPercentage }}
     - type: Resource
