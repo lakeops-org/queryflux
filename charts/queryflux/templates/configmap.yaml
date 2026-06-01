@@ -1,0 +1,11 @@
+{{- if .Values.config.create }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "queryflux.configMapName" . }}
+  labels:
+    {{- include "queryflux.labels" . | nindent 4 }}
+data:
+  {{ .Values.config.fileName }}: |
+{{ tpl (toYaml .Values.config.data) . | nindent 4 }}
+{{- end }}

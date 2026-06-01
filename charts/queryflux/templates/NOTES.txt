@@ -1,0 +1,18 @@
+QueryFlux has been installed.
+
+Admin API:
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "queryflux.fullname" . }} {{ .Values.service.ports.admin.port }}:{{ .Values.service.ports.admin.port }}
+
+Trino HTTP frontend:
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "queryflux.fullname" . }} {{ .Values.service.ports.trinoHttp.port }}:{{ .Values.service.ports.trinoHttp.port }}
+
+Studio:
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "queryflux.fullname" . }} {{ .Values.service.ports.studio.port }}:{{ .Values.service.ports.studio.port }}
+
+Admin credentials are stored in:
+  Secret: {{ include "queryflux.secretName" . }}
+  Username key: {{ .Values.existingSecret.usernameKey }}
+  Password key: {{ .Values.existingSecret.passwordKey }}
+
+Read the generated password with:
+  kubectl -n {{ .Release.Namespace }} get secret {{ include "queryflux.secretName" . }} -o jsonpath='{.data.{{ .Values.existingSecret.passwordKey }}}' | base64 --decode

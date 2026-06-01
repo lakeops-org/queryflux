@@ -170,6 +170,17 @@ curl -X POST http://localhost:8080/v1/statement \
   -d "SELECT 42"
 ```
 
+### Kubernetes
+
+QueryFlux includes a provider-neutral Helm chart:
+
+```bash
+helm install queryflux ./charts/queryflux
+kubectl port-forward svc/queryflux 3000:3000 8080:8080 9000:9000
+```
+
+See [`charts/queryflux/README.md`](charts/queryflux/README.md) for production values, external config, existing secrets, ingress, autoscaling, network policy, and Prometheus ServiceMonitor options.
+
 ### Build
 
 ```bash

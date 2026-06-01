@@ -1,0 +1,22 @@
+# Use this when another system owns QueryFlux config and admin credentials.
+config:
+  create: false
+  existingConfigMap: queryflux-config
+  fileName: config.yaml
+
+existingSecret:
+  name: queryflux-admin
+  usernameKey: QUERYFLUX_ADMIN_USER
+  passwordKey: QUERYFLUX_ADMIN_PASSWORD
+
+image:
+  tag: latest-slim
+
+service:
+  ports:
+    studio:
+      enabled: false
+      name: studio
+      port: 3000
+      targetPort: 3000
+      protocol: TCP

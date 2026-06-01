@@ -1,0 +1,19 @@
+apiVersion: v2
+name: queryflux
+description: Universal SQL multi-engine query router and proxy.
+type: application
+version: 0.1.0
+appVersion: "latest"
+home: https://queryflux.dev/
+sources:
+  - https://github.com/lakeops-org/queryflux
+keywords:
+  - sql
+  - query
+  - trino
+  - duckdb
+  - proxy
+  - routing
+maintainers:
+  - name: LakeOps
+    url: https://github.com/lakeops-org/queryflux
