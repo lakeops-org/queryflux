@@ -2,6 +2,10 @@
 config:
   create: false
   existingConfigMap: queryflux-config
+  # If the config contains secrets (e.g. a Postgres URL with a password), put
+  # config.yaml in a Secret instead and set existingSecret; it takes precedence
+  # over existingConfigMap:
+  #   existingSecret: queryflux-config
   fileName: config.yaml
 
 existingSecret:

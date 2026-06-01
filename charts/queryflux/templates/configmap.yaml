@@ -1,4 +1,4 @@
-{{- if .Values.config.create }}
+{{- if and .Values.config.create (not .Values.config.existingSecret) }}
 apiVersion: v1
 kind: ConfigMap
 metadata:

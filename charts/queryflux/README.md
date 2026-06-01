@@ -50,6 +50,18 @@ config:
 
 To manage config outside Helm, set `config.create=false` and `config.existingConfigMap` to a ConfigMap containing `config.yaml`.
 
+QueryFlux mounts `config.yaml` verbatim and does **not** interpolate environment variables into it, so any secret in the config (for example a Postgres URL with a password) ends up in plaintext when stored in a ConfigMap. To keep such values out of a ConfigMap, put the full `config.yaml` in a Secret and set `config.existingSecret`, which takes precedence over `config.existingConfigMap` and `config.create`:
+
+```yaml
+config:
+  create: false
+  existingSecret: queryflux-config   # Secret with a config.yaml key
+```
+
+### Persistence and replicas
+
+The default config uses `persistence.type: inMemory`, which is per-pod. Running more than one replica (`replicaCount > 1` or `autoscaling.enabled`) with in-memory persistence causes state to diverge across pods. For multi-replica deployments, configure Postgres persistence under `config.data.queryflux.persistence`.
+
 ## Secrets
 
 By default the chart creates a Secret for `QUERYFLUX_ADMIN_USER` and `QUERYFLUX_ADMIN_PASSWORD`. For production, provide a password explicitly or reference a pre-created Secret:
@@ -81,7 +93,10 @@ The chart also supports `env`, `envFrom`, `extraVolumes`, `extraVolumeMounts`, `
 Run the repository chart check:
 
 ```bash
-ruby scripts/check-helm-chart.rb
+make helm-check
+# or directly:
+scripts/check-helm-chart.sh
 ```
 
-If Helm is installed locally, the script also runs `helm lint` and `helm template`.
+The script requires `helm` and runs `helm lint` and `helm template` against the
+default values and every file under `examples/`.

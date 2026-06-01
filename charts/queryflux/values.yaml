@@ -53,7 +53,14 @@ existingSecret:
 
 config:
   create: true
+  # Mount config.yaml from a pre-created ConfigMap (set create: false).
   existingConfigMap: ""
+  # Mount config.yaml from a pre-created Secret instead of a ConfigMap. Use this
+  # when the config contains sensitive values (e.g. a Postgres URL with a
+  # password), since the rendered config is mounted verbatim and QueryFlux does
+  # not interpolate environment variables into the config file. Takes precedence
+  # over existingConfigMap and config.create.
+  existingSecret: ""
   mountPath: /etc/queryflux
   fileName: config.yaml
   data:
@@ -79,12 +86,6 @@ config:
       - type: protocolBased
         trinoHttp: duckdb-local
     routingFallback: duckdb-local
-
-persistence:
-  type: inMemory
-  postgres:
-    existingSecret: ""
-    urlKey: DATABASE_URL
 
 service:
   type: ClusterIP

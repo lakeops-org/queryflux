@@ -9,6 +9,14 @@ adminCredentials:
   username: admin
   password: change-this-before-installing
 
+# NOTE: config.data is rendered into a ConfigMap, so any secret embedded here
+# (such as the Postgres password in persistence.url) is stored in plaintext.
+# QueryFlux does not interpolate environment variables into the config file, so
+# for production put the full config (including the Postgres URL) into a Secret
+# and reference it instead:
+#   config:
+#     create: false
+#     existingSecret: queryflux-config   # Secret with a config.yaml key
 config:
   data:
     queryflux:
@@ -19,6 +27,7 @@ config:
           port: 8080
       persistence:
         type: postgres
+        # Demo value only — see the note above; do not commit real credentials.
         url: postgres://queryflux:queryflux@postgres.queryflux.svc.cluster.local:5432/queryflux
       adminApi:
         port: 9000

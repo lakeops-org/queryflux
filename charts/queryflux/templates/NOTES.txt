@@ -15,4 +15,12 @@ Admin credentials are stored in:
   Password key: {{ .Values.existingSecret.passwordKey }}
 
 Read the generated password with:
-  kubectl -n {{ .Release.Namespace }} get secret {{ include "queryflux.secretName" . }} -o jsonpath='{.data.{{ .Values.existingSecret.passwordKey }}}' | base64 --decode
+  kubectl -n {{ .Release.Namespace }} get secret {{ include "queryflux.secretName" . }} -o jsonpath="{.data['{{ .Values.existingSecret.passwordKey }}']}" | base64 --decode
+{{- $persistence := dig "data" "queryflux" "persistence" "type" "inMemory" .Values.config }}
+{{- if and (eq $persistence "inMemory") (or .Values.autoscaling.enabled (gt (int .Values.replicaCount) 1)) }}
+
+WARNING: persistence.type is "inMemory" but you are running more than one replica
+(replicaCount > 1 or autoscaling enabled). In-memory state is per-pod and will
+diverge across replicas. Configure Postgres persistence under
+config.data.queryflux.persistence for multi-replica deployments.
+{{- end }}

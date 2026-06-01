@@ -13,9 +13,9 @@ spec:
       {{- include "queryflux.selectorLabels" . | nindent 6 }}
   template:
     metadata:
-      {{- if or .Values.config.create (not .Values.existingSecret.name) .Values.podAnnotations }}
+      {{- if or (and .Values.config.create (not .Values.config.existingSecret)) (not .Values.existingSecret.name) .Values.podAnnotations }}
       annotations:
-        {{- if .Values.config.create }}
+        {{- if and .Values.config.create (not .Values.config.existingSecret) }}
         checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
         {{- end }}
         {{- if not .Values.existingSecret.name }}
@@ -104,11 +104,19 @@ spec:
         {{- end }}
       volumes:
         - name: queryflux-config
+          {{- if .Values.config.existingSecret }}
+          secret:
+            secretName: {{ .Values.config.existingSecret }}
+            items:
+              - key: {{ .Values.config.fileName }}
+                path: {{ .Values.config.fileName }}
+          {{- else }}
           configMap:
             name: {{ include "queryflux.configMapName" . }}
             items:
               - key: {{ .Values.config.fileName }}
                 path: {{ .Values.config.fileName }}
+          {{- end }}
         - name: tmp
           emptyDir: {}
         {{- with .Values.extraVolumes }}

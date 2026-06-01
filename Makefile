@@ -61,9 +61,9 @@ lint: clippy
 clippy:
 	$(CARGO) clippy --all-targets --all-features -- -D warnings
 
-## Validate the Helm chart structure and run Helm checks when Helm is installed.
+## Validate the Helm chart structure and run helm lint/template.
 helm-check:
-	ruby scripts/check-helm-chart.rb
+	scripts/check-helm-chart.sh
 
 ## Run unit/integration tests (no external services needed).
 ## Same command as CI `.github/workflows/ci.yml` (`make test`).
