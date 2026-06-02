@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.2.0](https://github.com/lakeops-org/queryflux/compare/queryflux-v0.1.2...queryflux-v0.2.0) (2026-06-02)
+
+
+### Features
+
+* support agentic ai + gaurd rails  ([#72](https://github.com/lakeops-org/queryflux/issues/72)) ([6aa5adb](https://github.com/lakeops-org/queryflux/commit/6aa5adbff5dfb622d32f5d4a12c59db6577ff405))
+
+
+### Bug Fixes
+
+* **deployment:** admin api auth ([#61](https://github.com/lakeops-org/queryflux/issues/61)) ([5bc377a](https://github.com/lakeops-org/queryflux/commit/5bc377ae0c5c76ac63c06f2c5b49dedbb585c762))
+
 ## [0.1.2](https://github.com/lakeops-org/queryflux/compare/queryflux-v0.1.1...queryflux-v0.1.2) (2026-04-15)
 
 
