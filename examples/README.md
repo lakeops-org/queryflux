@@ -10,6 +10,7 @@ Several stacks for **QueryFlux** + **Trino** (and optional add-ons). Run command
 | [`minimal-inmemory/`](minimal-inmemory/) | No | Fastest local tryout; config only in `config.yaml`; no shared query history |
 | [`with-prometheus-grafana/`](with-prometheus-grafana/) | Yes | Same workload as minimal + **Prometheus** + **Grafana** (repo [`grafana/`](../grafana/), local scrape config); **no Studio** |
 | [`full-stack/`](full-stack/) | Yes (host **5433**) | Trino + StarRocks + Iceberg/Lakekeeper + MinIO + TPCH loader |
+| [`full-stack-with-prometheus-grafana/`](full-stack-with-prometheus-grafana/) | Yes (host **5433**) | **`full-stack`** + **Prometheus** + **Grafana**; Grafana on **3001** |
 
 `minimal/` and `minimal-inmemory/` use the **same host ports** (8080, 8081, 3000, 9000); **`minimal/`** also maps Postgres to **`localhost:5433`**. **`with-prometheus-grafana`** also uses **3000 for Grafana** (not Studio) — run it alone or change the published Grafana port.
 
@@ -95,6 +96,31 @@ The loader uses [`docker/fixtures/init.docker-network.sql`](../docker/fixtures/i
 | Lakekeeper REST | http://localhost:8181 |
 
 QueryFlux Postgres is exposed on **localhost:5433** (same as the main dev compose convention).
+
+---
+
+## Full stack + Prometheus + Grafana (`full-stack-with-prometheus-grafana/`)
+
+Everything in **`full-stack`**, plus **Prometheus** and **Grafana** from [`with-prometheus-grafana/`](with-prometheus-grafana/). Grafana mounts [`grafana/`](../grafana/) from the repo root; Prometheus uses [`full-stack-with-prometheus-grafana/prometheus.yml`](full-stack-with-prometheus-grafana/prometheus.yml) to scrape `queryflux:9000`. **Grafana** is on **3001** so **Studio** keeps **3000**. Details: [`full-stack-with-prometheus-grafana/README.md`](full-stack-with-prometheus-grafana/README.md).
+
+```bash
+cd examples/full-stack-with-prometheus-grafana
+docker compose up -d --wait
+docker compose --profile loader run --rm -T data-loader
+docker compose --profile loader run --rm -T starrocks-catalog-setup
+```
+
+| Service | URL |
+|---------|-----|
+| Trino via QueryFlux | http://localhost:8080 |
+| MySQL wire (StarRocks via QueryFlux) | `mysql` client → **localhost:3306** |
+| Studio | http://localhost:3000 |
+| Trino (direct) | http://localhost:8081 |
+| Admin + `/metrics` | http://localhost:9000 |
+| Prometheus | http://localhost:9090 |
+| Grafana | http://localhost:3001 |
+| MinIO console | http://localhost:19001 |
+| Lakekeeper REST | http://localhost:8181 |
 
 ---
 

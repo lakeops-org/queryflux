@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useEffect, useState } from "react";
+import React, { useState } from "react";
 import { Code2, Pencil, Plus, ShieldCheck, Trash2 } from "lucide-react";
 import {
   createUserScript,

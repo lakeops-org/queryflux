@@ -52,6 +52,7 @@ export function GroupFormDialog({
   const [translationScriptIds, setTranslationScriptIds] = useState<number[]>([]);
   const [scriptLibrary, setScriptLibrary] = useState<UserScriptRecord[]>([]);
   const [addScriptId, setAddScriptId] = useState<string>("");
+  const [tagRows, setTagRows] = useState<{ key: string; value: string }[]>([]);
   const [guardRows, setGuardRows] = useState<GuardRow[]>([]);
   const [guardrailsFull, setGuardrailsFull] = useState<GuardrailsConfig | null>(null);
   const [guardScripts, setGuardScripts] = useState<UserScriptRecord[]>([]);
@@ -69,6 +70,7 @@ export function GroupFormDialog({
     setWeightedJson("{}");
     setTranslationScriptIds([]);
     setAddScriptId("");
+    setTagRows([]);
     setGuardRows([]);
     setGuardrailsFull(null);
     setGuardScripts([]);
@@ -89,6 +91,9 @@ export function GroupFormDialog({
         initial.maxQueuedQueries != null ? String(initial.maxQueuedQueries) : "",
       );
       setTranslationScriptIds([...initial.translationScriptIds]);
+      setTagRows(
+        Object.entries(initial.defaultTags ?? {}).map(([k, v]) => ({ key: k, value: v ?? "" })),
+      );
       {
         const p = parseStrategyRecord(initial.strategy);
         setStrategyKind(p.kind);
@@ -218,6 +223,13 @@ export function GroupFormDialog({
     }
     const members = [...memberOrder];
 
+    const defaultTags: Record<string, string | null> = {};
+    for (const { key, value } of tagRows) {
+      const k = key.trim();
+      if (!k) continue;
+      defaultTags[k] = value.trim() === "" ? null : value.trim();
+    }
+
     const body: UpsertClusterGroupConfig = {
       enabled,
       members,
@@ -228,6 +240,7 @@ export function GroupFormDialog({
       allowGroups: mode === "edit" && initial ? [...initial.allowGroups] : [],
       allowUsers: mode === "edit" && initial ? [...initial.allowUsers] : [],
       translationScriptIds,
+      defaultTags,
     };
 
     const pathName = mode === "create" ? nameTrim : nameTrim || (initial?.name ?? "").trim();
@@ -675,6 +688,68 @@ export function GroupFormDialog({
                 </p>
               </div>
             ) : null}
+          </div>
+
+          <div className="rounded-xl border border-slate-200 bg-slate-50/60 p-4 space-y-3">
+            <div>
+              <p className="text-[11px] font-semibold text-slate-600 uppercase tracking-wide">
+                Default tags (optional)
+              </p>
+              <p className="text-[10px] text-slate-500 mt-1 leading-relaxed">
+                Tags attached to every query routed to this group. Session tags override on the same key.
+                Leave the value empty for a key-only tag.
+              </p>
+            </div>
+            {tagRows.length > 0 ? (
+              <ul className="space-y-1.5">
+                {tagRows.map((row, idx) => (
+                  <li key={idx} className="flex items-center gap-2">
+                    <input
+                      value={row.key}
+                      onChange={(e) =>
+                        setTagRows((prev) =>
+                          prev.map((r, i) => (i === idx ? { ...r, key: e.target.value } : r)),
+                        )
+                      }
+                      placeholder="key"
+                      disabled={saving}
+                      className="w-28 text-sm font-mono border border-slate-200 rounded-lg px-2.5 py-1.5 focus:outline-none focus:ring-2 focus:ring-indigo-300 disabled:opacity-50"
+                    />
+                    <span className="text-slate-400 text-xs select-none">=</span>
+                    <input
+                      value={row.value}
+                      onChange={(e) =>
+                        setTagRows((prev) =>
+                          prev.map((r, i) => (i === idx ? { ...r, value: e.target.value } : r)),
+                        )
+                      }
+                      placeholder="value (empty = key-only)"
+                      disabled={saving}
+                      className="flex-1 text-sm font-mono border border-slate-200 rounded-lg px-2.5 py-1.5 focus:outline-none focus:ring-2 focus:ring-indigo-300 disabled:opacity-50"
+                    />
+                    <button
+                      type="button"
+                      disabled={saving}
+                      onClick={() => setTagRows((prev) => prev.filter((_, i) => i !== idx))}
+                      className="p-1 rounded text-red-400 hover:bg-red-50 disabled:opacity-40"
+                      title="Remove tag"
+                    >
+                      <X size={16} />
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            ) : (
+              <p className="text-xs text-slate-400">No default tags.</p>
+            )}
+            <button
+              type="button"
+              disabled={saving}
+              onClick={() => setTagRows((prev) => [...prev, { key: "", value: "" }])}
+              className="text-xs font-semibold px-3 py-1.5 rounded-lg border border-slate-200 text-slate-600 bg-white hover:bg-slate-50 disabled:opacity-40"
+            >
+              + Add tag
+            </button>
           </div>
 
           <div className="rounded-xl border border-slate-200 bg-slate-50/60 p-4 space-y-3">

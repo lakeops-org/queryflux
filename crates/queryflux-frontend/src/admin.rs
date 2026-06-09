@@ -92,6 +92,36 @@ pub struct ClusterStateDto {
         get_engine_stats_handler,
         get_group_stats_handler,
         frontends_status_handler,
+        // Persisted cluster config CRUD
+        list_cluster_configs_handler,
+        get_cluster_config_handler,
+        upsert_cluster_config_handler,
+        rename_cluster_config_handler,
+        delete_cluster_config_handler,
+        test_cluster_config_handler,
+        // Persisted cluster group config CRUD
+        list_group_configs_handler,
+        get_group_config_handler,
+        upsert_group_config_handler,
+        rename_group_config_handler,
+        delete_group_config_handler,
+        // User scripts
+        list_user_scripts_handler,
+        create_user_script_handler,
+        get_user_script_handler,
+        update_user_script_handler,
+        delete_user_script_handler,
+        // Security / routing / guardrails config
+        get_security_config_handler,
+        put_security_config_handler,
+        get_routing_config_handler,
+        put_routing_config_handler,
+        get_guardrails_config_handler,
+        put_guardrails_config_handler,
+        // Agents & conversations
+        list_agents_handler,
+        list_conversations_handler,
+        get_conversation_handler,
     ),
     components(schemas(
         ClusterStateDto,
@@ -104,9 +134,17 @@ pub struct ClusterStateDto {
         UpsertUserScript,
         ProtocolFrontendDto,
         FrontendsStatusDto,
+        queryflux_persistence::cluster_config::ClusterConfigRecord,
+        queryflux_persistence::cluster_config::UpsertClusterConfig,
+        queryflux_persistence::cluster_config::ClusterGroupConfigRecord,
+        queryflux_persistence::cluster_config::UpsertClusterGroupConfig,
+        queryflux_persistence::cluster_config::RenameConfigRequest,
+        queryflux_persistence::query_history::AgentSummary,
+        queryflux_persistence::query_history::ConversationSummary,
     )),
     tags(
         (name = "admin", description = "Cluster and query management"),
+        (name = "config", description = "Persisted cluster / group / script configuration"),
         (name = "metrics", description = "Prometheus metrics endpoint"),
     )
 )]
@@ -391,7 +429,7 @@ impl RoutingConfigDto {
 }
 
 /// Request body for PUT /admin/config/security
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize, ToSchema)]
 pub struct UpsertSecurityConfig {
     pub auth_provider: String,
     pub auth_required: bool,
@@ -403,7 +441,7 @@ pub struct UpsertSecurityConfig {
 }
 
 /// Request body for PUT /admin/config/routing
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize, ToSchema)]
 pub struct UpsertRoutingConfig {
     /// Accept `routingFallback` (canonical) or legacy `routing_fallback` from older clients.
     #[serde(rename = "routingFallback", alias = "routing_fallback", default)]
@@ -833,6 +871,20 @@ async fn list_queries_handler(
 }
 
 /// Distinct agents that have run queries, with aggregate stats.
+#[utoipa::path(
+    get,
+    path = "/admin/agents",
+    tag = "admin",
+    params(
+        ("limit" = Option<i64>, Query, description = "Page size (default 50)"),
+        ("offset" = Option<i64>, Query, description = "Page offset (default 0)"),
+    ),
+    responses(
+        (status = 200, description = "Agent summaries", body = Vec<queryflux_persistence::query_history::AgentSummary>),
+        (status = 503, description = "Postgres persistence not configured", body = str),
+        (status = 500, description = "Internal error", body = str),
+    )
+)]
 async fn list_agents_handler(
     State(state): State<Arc<AdminState>>,
     Query(params): Query<std::collections::HashMap<String, String>>,
@@ -859,6 +911,21 @@ async fn list_agents_handler(
 }
 
 /// Conversations grouped by conversation_id. Filter by agent_id via ?agent_id=.
+#[utoipa::path(
+    get,
+    path = "/admin/conversations",
+    tag = "admin",
+    params(
+        ("agent_id" = Option<String>, Query, description = "Filter by agent id"),
+        ("limit" = Option<i64>, Query, description = "Page size (default 50)"),
+        ("offset" = Option<i64>, Query, description = "Page offset (default 0)"),
+    ),
+    responses(
+        (status = 200, description = "Conversation summaries", body = Vec<queryflux_persistence::query_history::ConversationSummary>),
+        (status = 503, description = "Postgres persistence not configured", body = str),
+        (status = 500, description = "Internal error", body = str),
+    )
+)]
 async fn list_conversations_handler(
     State(state): State<Arc<AdminState>>,
     Query(params): Query<std::collections::HashMap<String, String>>,
@@ -886,6 +953,17 @@ async fn list_conversations_handler(
 }
 
 /// All query steps for a conversation, ordered by step_index.
+#[utoipa::path(
+    get,
+    path = "/admin/conversations/{id}",
+    tag = "admin",
+    params(("id" = String, Path, description = "Conversation id")),
+    responses(
+        (status = 200, description = "Query steps for this conversation", body = Vec<QuerySummary>),
+        (status = 503, description = "Postgres persistence not configured", body = str),
+        (status = 500, description = "Internal error", body = str),
+    )
+)]
 async fn get_conversation_handler(
     State(state): State<Arc<AdminState>>,
     Path(conversation_id): Path<String>,
@@ -1123,6 +1201,17 @@ fn rename_persistence_error_status(e: &queryflux_core::error::QueryFluxError) ->
     }
 }
 
+/// List all persisted cluster configurations.
+#[utoipa::path(
+    get,
+    path = "/admin/config/clusters",
+    tag = "config",
+    responses(
+        (status = 200, description = "All cluster config records", body = Vec<queryflux_persistence::cluster_config::ClusterConfigRecord>),
+        (status = 503, description = "Postgres persistence not configured", body = str),
+        (status = 500, description = "Internal error", body = str),
+    )
+)]
 async fn list_cluster_configs_handler(State(state): State<Arc<AdminState>>) -> impl IntoResponse {
     let pg = require_pg!(state);
     match pg.list_cluster_configs().await {
@@ -1131,6 +1220,19 @@ async fn list_cluster_configs_handler(State(state): State<Arc<AdminState>>) -> i
     }
 }
 
+/// Get a single cluster configuration by name.
+#[utoipa::path(
+    get,
+    path = "/admin/config/clusters/{name}",
+    tag = "config",
+    params(("name" = String, Path, description = "Cluster name")),
+    responses(
+        (status = 200, description = "Cluster config record", body = queryflux_persistence::cluster_config::ClusterConfigRecord),
+        (status = 404, description = "Not found", body = str),
+        (status = 503, description = "Postgres persistence not configured", body = str),
+        (status = 500, description = "Internal error", body = str),
+    )
+)]
 async fn get_cluster_config_handler(
     State(state): State<Arc<AdminState>>,
     Path(name): Path<String>,
@@ -1143,6 +1245,19 @@ async fn get_cluster_config_handler(
     }
 }
 
+/// Create or fully replace a cluster configuration.
+#[utoipa::path(
+    put,
+    path = "/admin/config/clusters/{name}",
+    tag = "config",
+    params(("name" = String, Path, description = "Cluster name")),
+    request_body = queryflux_persistence::cluster_config::UpsertClusterConfig,
+    responses(
+        (status = 200, description = "Updated cluster config record", body = queryflux_persistence::cluster_config::ClusterConfigRecord),
+        (status = 503, description = "Postgres persistence not configured", body = str),
+        (status = 500, description = "Internal error", body = str),
+    )
+)]
 async fn upsert_cluster_config_handler(
     State(state): State<Arc<AdminState>>,
     Path(name): Path<String>,
@@ -1158,6 +1273,20 @@ async fn upsert_cluster_config_handler(
     }
 }
 
+/// Rename a cluster configuration.
+#[utoipa::path(
+    patch,
+    path = "/admin/config/clusters/{name}",
+    tag = "config",
+    params(("name" = String, Path, description = "Current cluster name")),
+    request_body = queryflux_persistence::cluster_config::RenameConfigRequest,
+    responses(
+        (status = 200, description = "Renamed cluster config record", body = queryflux_persistence::cluster_config::ClusterConfigRecord),
+        (status = 409, description = "Name already in use", body = str),
+        (status = 503, description = "Postgres persistence not configured", body = str),
+        (status = 500, description = "Internal error", body = str),
+    )
+)]
 async fn rename_cluster_config_handler(
     State(state): State<Arc<AdminState>>,
     Path(name): Path<String>,
@@ -1173,6 +1302,19 @@ async fn rename_cluster_config_handler(
     }
 }
 
+/// Delete a cluster configuration.
+#[utoipa::path(
+    delete,
+    path = "/admin/config/clusters/{name}",
+    tag = "config",
+    params(("name" = String, Path, description = "Cluster name")),
+    responses(
+        (status = 204, description = "Deleted"),
+        (status = 404, description = "Not found", body = str),
+        (status = 503, description = "Postgres persistence not configured", body = str),
+        (status = 500, description = "Internal error", body = str),
+    )
+)]
 async fn delete_cluster_config_handler(
     State(state): State<Arc<AdminState>>,
     Path(name): Path<String>,
@@ -1188,7 +1330,7 @@ async fn delete_cluster_config_handler(
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 struct TestClusterConfigRequest {
     engine_key: String,
     config: serde_json::Value,
@@ -1200,6 +1342,16 @@ struct TestClusterConfigResponse {
     message: String,
 }
 
+/// Test a cluster connection without persisting it.
+#[utoipa::path(
+    post,
+    path = "/admin/config/clusters/test",
+    tag = "config",
+    responses(
+        (status = 200, description = "Connection test result", body = str),
+        (status = 500, description = "Internal error", body = str),
+    )
+)]
 async fn test_cluster_config_handler(
     State(state): State<Arc<AdminState>>,
     Json(body): Json<TestClusterConfigRequest>,
@@ -1228,6 +1380,17 @@ async fn test_cluster_config_handler(
 // Persisted cluster group config CRUD
 // ---------------------------------------------------------------------------
 
+/// List all persisted cluster group configurations.
+#[utoipa::path(
+    get,
+    path = "/admin/config/groups",
+    tag = "config",
+    responses(
+        (status = 200, description = "All cluster group config records", body = Vec<queryflux_persistence::cluster_config::ClusterGroupConfigRecord>),
+        (status = 503, description = "Postgres persistence not configured", body = str),
+        (status = 500, description = "Internal error", body = str),
+    )
+)]
 async fn list_group_configs_handler(State(state): State<Arc<AdminState>>) -> impl IntoResponse {
     let pg = require_pg!(state);
     match pg.list_group_configs().await {
@@ -1236,6 +1399,19 @@ async fn list_group_configs_handler(State(state): State<Arc<AdminState>>) -> imp
     }
 }
 
+/// Get a single cluster group configuration by name.
+#[utoipa::path(
+    get,
+    path = "/admin/config/groups/{name}",
+    tag = "config",
+    params(("name" = String, Path, description = "Group name")),
+    responses(
+        (status = 200, description = "Cluster group config record", body = queryflux_persistence::cluster_config::ClusterGroupConfigRecord),
+        (status = 404, description = "Not found", body = str),
+        (status = 503, description = "Postgres persistence not configured", body = str),
+        (status = 500, description = "Internal error", body = str),
+    )
+)]
 async fn get_group_config_handler(
     State(state): State<Arc<AdminState>>,
     Path(name): Path<String>,
@@ -1248,6 +1424,19 @@ async fn get_group_config_handler(
     }
 }
 
+/// Create or fully replace a cluster group configuration.
+#[utoipa::path(
+    put,
+    path = "/admin/config/groups/{name}",
+    tag = "config",
+    params(("name" = String, Path, description = "Group name")),
+    request_body = queryflux_persistence::cluster_config::UpsertClusterGroupConfig,
+    responses(
+        (status = 200, description = "Updated cluster group config record", body = queryflux_persistence::cluster_config::ClusterGroupConfigRecord),
+        (status = 503, description = "Postgres persistence not configured", body = str),
+        (status = 500, description = "Internal error", body = str),
+    )
+)]
 async fn upsert_group_config_handler(
     State(state): State<Arc<AdminState>>,
     Path(name): Path<String>,
@@ -1263,6 +1452,20 @@ async fn upsert_group_config_handler(
     }
 }
 
+/// Rename a cluster group configuration.
+#[utoipa::path(
+    patch,
+    path = "/admin/config/groups/{name}",
+    tag = "config",
+    params(("name" = String, Path, description = "Current group name")),
+    request_body = queryflux_persistence::cluster_config::RenameConfigRequest,
+    responses(
+        (status = 200, description = "Renamed cluster group config record", body = queryflux_persistence::cluster_config::ClusterGroupConfigRecord),
+        (status = 409, description = "Name already in use", body = str),
+        (status = 503, description = "Postgres persistence not configured", body = str),
+        (status = 500, description = "Internal error", body = str),
+    )
+)]
 async fn rename_group_config_handler(
     State(state): State<Arc<AdminState>>,
     Path(name): Path<String>,
@@ -1278,6 +1481,20 @@ async fn rename_group_config_handler(
     }
 }
 
+/// Delete a cluster group configuration.
+#[utoipa::path(
+    delete,
+    path = "/admin/config/groups/{name}",
+    tag = "config",
+    params(("name" = String, Path, description = "Group name")),
+    responses(
+        (status = 204, description = "Deleted"),
+        (status = 404, description = "Not found", body = str),
+        (status = 409, description = "Still referenced by routing rules", body = str),
+        (status = 503, description = "Postgres persistence not configured", body = str),
+        (status = 500, description = "Internal error", body = str),
+    )
+)]
 async fn delete_group_config_handler(
     State(state): State<Arc<AdminState>>,
     Path(name): Path<String>,
@@ -1310,6 +1527,20 @@ struct UserScriptListQuery {
     kind: Option<String>,
 }
 
+/// List user scripts. Optional `?kind=translation_fixup` or `?kind=guard` filter.
+#[utoipa::path(
+    get,
+    path = "/admin/config/scripts",
+    tag = "config",
+    params(
+        ("kind" = Option<String>, Query, description = "Filter by kind: `translation_fixup` or `guard`")
+    ),
+    responses(
+        (status = 200, description = "Script records", body = Vec<UserScriptRecord>),
+        (status = 503, description = "Postgres persistence not configured", body = str),
+        (status = 500, description = "Internal error", body = str),
+    )
+)]
 async fn list_user_scripts_handler(
     State(state): State<Arc<AdminState>>,
     Query(q): Query<UserScriptListQuery>,
@@ -1322,6 +1553,18 @@ async fn list_user_scripts_handler(
     }
 }
 
+/// Create a new user script.
+#[utoipa::path(
+    post,
+    path = "/admin/config/scripts",
+    tag = "config",
+    request_body = UpsertUserScript,
+    responses(
+        (status = 201, description = "Created script record", body = UserScriptRecord),
+        (status = 503, description = "Postgres persistence not configured", body = str),
+        (status = 500, description = "Internal error", body = str),
+    )
+)]
 async fn create_user_script_handler(
     State(state): State<Arc<AdminState>>,
     Json(body): Json<UpsertUserScript>,
@@ -1336,6 +1579,19 @@ async fn create_user_script_handler(
     }
 }
 
+/// Get a user script by id.
+#[utoipa::path(
+    get,
+    path = "/admin/config/scripts/{id}",
+    tag = "config",
+    params(("id" = i64, Path, description = "Script id")),
+    responses(
+        (status = 200, description = "Script record", body = UserScriptRecord),
+        (status = 404, description = "Not found", body = str),
+        (status = 503, description = "Postgres persistence not configured", body = str),
+        (status = 500, description = "Internal error", body = str),
+    )
+)]
 async fn get_user_script_handler(
     State(state): State<Arc<AdminState>>,
     Path(id): Path<i64>,
@@ -1348,6 +1604,19 @@ async fn get_user_script_handler(
     }
 }
 
+/// Replace a user script by id.
+#[utoipa::path(
+    put,
+    path = "/admin/config/scripts/{id}",
+    tag = "config",
+    params(("id" = i64, Path, description = "Script id")),
+    request_body = UpsertUserScript,
+    responses(
+        (status = 200, description = "Updated script record", body = UserScriptRecord),
+        (status = 503, description = "Postgres persistence not configured", body = str),
+        (status = 500, description = "Internal error", body = str),
+    )
+)]
 async fn update_user_script_handler(
     State(state): State<Arc<AdminState>>,
     Path(id): Path<i64>,
@@ -1363,6 +1632,19 @@ async fn update_user_script_handler(
     }
 }
 
+/// Delete a user script by id.
+#[utoipa::path(
+    delete,
+    path = "/admin/config/scripts/{id}",
+    tag = "config",
+    params(("id" = i64, Path, description = "Script id")),
+    responses(
+        (status = 204, description = "Deleted"),
+        (status = 404, description = "Not found", body = str),
+        (status = 503, description = "Postgres persistence not configured", body = str),
+        (status = 500, description = "Internal error", body = str),
+    )
+)]
 async fn delete_user_script_handler(
     State(state): State<Arc<AdminState>>,
     Path(id): Path<i64>,
@@ -1382,6 +1664,15 @@ async fn delete_user_script_handler(
 // Security and routing config handlers
 // ---------------------------------------------------------------------------
 
+/// Get the current security configuration.
+#[utoipa::path(
+    get,
+    path = "/admin/config/security",
+    tag = "config",
+    responses(
+        (status = 200, description = "Security config JSON", body = str),
+    )
+)]
 async fn get_security_config_handler(State(state): State<Arc<AdminState>>) -> impl IntoResponse {
     if let Some(store) = &state.admin_store {
         if let Ok(Some(v)) = store.get_proxy_setting("security_config").await {
@@ -1403,6 +1694,16 @@ fn group_id_maps(
     (name_to_id, id_to_name)
 }
 
+/// Get the current routing configuration.
+#[utoipa::path(
+    get,
+    path = "/admin/config/routing",
+    tag = "config",
+    responses(
+        (status = 200, description = "Routing config JSON", body = str),
+        (status = 500, description = "Internal error", body = str),
+    )
+)]
 async fn get_routing_config_handler(State(state): State<Arc<AdminState>>) -> impl IntoResponse {
     if let Some(store) = &state.admin_store {
         match store.load_routing_config().await {
@@ -1434,6 +1735,17 @@ async fn get_routing_config_handler(State(state): State<Arc<AdminState>>) -> imp
     Json(state.routing_config.as_ref()).into_response()
 }
 
+/// Replace the security configuration.
+#[utoipa::path(
+    put,
+    path = "/admin/config/security",
+    tag = "config",
+    responses(
+        (status = 204, description = "Saved"),
+        (status = 503, description = "Postgres persistence not configured", body = str),
+        (status = 500, description = "Internal error", body = str),
+    )
+)]
 async fn put_security_config_handler(
     State(state): State<Arc<AdminState>>,
     Json(body): Json<UpsertSecurityConfig>,
@@ -1452,6 +1764,18 @@ async fn put_security_config_handler(
     }
 }
 
+/// Replace the routing configuration.
+#[utoipa::path(
+    put,
+    path = "/admin/config/routing",
+    tag = "config",
+    responses(
+        (status = 204, description = "Saved"),
+        (status = 400, description = "Invalid routing config", body = str),
+        (status = 503, description = "Postgres persistence not configured", body = str),
+        (status = 500, description = "Internal error", body = str),
+    )
+)]
 async fn put_routing_config_handler(
     State(state): State<Arc<AdminState>>,
     Json(body): Json<UpsertRoutingConfig>,
@@ -1563,6 +1887,15 @@ async fn swagger_ui_handler() -> impl IntoResponse {
     (StatusCode::OK, [("content-type", "text/html")], HTML)
 }
 
+/// Get the current guardrails configuration.
+#[utoipa::path(
+    get,
+    path = "/admin/config/guardrails",
+    tag = "config",
+    responses(
+        (status = 200, description = "Guardrails config JSON (`{ global: [...], groups: {...} }`)", body = str),
+    )
+)]
 async fn get_guardrails_config_handler(State(state): State<Arc<AdminState>>) -> impl IntoResponse {
     if let Some(store) = &state.admin_store {
         if let Ok(Some(v)) = store.get_proxy_setting("guardrails_config").await {
@@ -1585,6 +1918,18 @@ struct GuardrailsConfigDto {
     groups: HashMap<String, Vec<serde_json::Value>>,
 }
 
+/// Replace the guardrails configuration.
+#[utoipa::path(
+    put,
+    path = "/admin/config/guardrails",
+    tag = "config",
+    responses(
+        (status = 204, description = "Saved"),
+        (status = 400, description = "Invalid guardrails format", body = str),
+        (status = 503, description = "Persistence not configured", body = str),
+        (status = 500, description = "Internal error", body = str),
+    )
+)]
 async fn put_guardrails_config_handler(
     State(state): State<Arc<AdminState>>,
     Json(body): Json<serde_json::Value>,

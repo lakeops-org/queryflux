@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useMemo, useState } from "react";
 import type { ConfigField } from "@/lib/engine-registry";
 import { Plus, Trash2 } from "lucide-react";
 
@@ -100,16 +100,8 @@ export function DbKwargsField({
   driverHint: string;
   dbKwargsError: string | null;
 }) {
-  const [mode, setMode] = useState<"kv" | "json">(() =>
-    value.trim() ? inferInitialMode(value) : "kv",
-  );
-  const hydratedMode = useRef(false);
-
-  useEffect(() => {
-    if (hydratedMode.current || !value.trim()) return;
-    setMode(inferInitialMode(value));
-    hydratedMode.current = true;
-  }, [value]);
+  const [userMode, setUserMode] = useState<"kv" | "json" | null>(null);
+  const mode = userMode ?? (value.trim() ? inferInitialMode(value) : "kv");
 
   const rows = useMemo(() => parseKvRows(value), [value]);
 
@@ -141,11 +133,11 @@ export function DbKwargsField({
   );
 
   const switchToJson = useCallback(() => {
-    setMode("json");
+    setUserMode("json");
   }, []);
 
   const switchToKv = useCallback(() => {
-    setMode("kv");
+    setUserMode("kv");
   }, []);
 
   return (

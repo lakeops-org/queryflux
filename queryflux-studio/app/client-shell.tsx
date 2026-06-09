@@ -4,6 +4,7 @@ import React, { useCallback, useEffect, useState } from "react";
 import Link from "next/link";
 import {
   Bot,
+  BookOpen,
   FileCode,
   LayoutDashboard,
   List,
@@ -29,6 +30,7 @@ const nav = [
   { href: "/guardrails", label: "Guardrails", icon: ShieldCheck },
   { href: "/protocols", label: "Protocols", icon: Radio },
   { href: "/routing", label: "Routing", icon: Route },
+  { href: "/swagger", label: "API Reference", icon: BookOpen },
 ];
 
 export function ClientShell({ children }: { children: React.ReactNode }) {

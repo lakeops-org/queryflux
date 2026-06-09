@@ -6,7 +6,6 @@ import { getAuthStatus, putSecurityConfig } from "@/lib/api";
 import type { SecurityConfigDto, UpsertSecurityConfig, GroupAuthzDto } from "@/lib/api-types";
 import { Field, SectionHeader, TextInput, SaveBar } from "@/components/studio-settings";
 import {
-  ArrowRight,
   CheckCircle2,
   Key,
   Lock,
@@ -24,96 +23,6 @@ import {
 
 interface Props {
   initialSecurity: SecurityConfigDto | null;
-}
-
-// ---------------------------------------------------------------------------
-// Key-value map editor
-// ---------------------------------------------------------------------------
-
-function KvEditor({
-  value,
-  onChange,
-  keyPlaceholder,
-  valuePlaceholder,
-}: {
-  value: Record<string, string>;
-  onChange: (v: Record<string, string>) => void;
-  keyPlaceholder?: string;
-  valuePlaceholder?: string;
-}) {
-  const [newKey, setNewKey] = useState("");
-  const [newVal, setNewVal] = useState("");
-
-  const entries = Object.entries(value);
-
-  return (
-    <div className="space-y-2">
-      {entries.map(([k, v]) => (
-        <div key={k} className="flex items-center gap-2">
-          <input
-            className="flex-1 px-2.5 py-1.5 text-xs rounded-lg border border-slate-200 bg-white text-slate-900 font-mono focus:outline-none focus:ring-2 focus:ring-indigo-300"
-            value={k}
-            readOnly
-          />
-          <ArrowRight size={12} className="text-slate-300 flex-shrink-0" />
-          <input
-            className="flex-1 px-2.5 py-1.5 text-xs rounded-lg border border-slate-200 bg-white text-slate-900 font-mono focus:outline-none focus:ring-2 focus:ring-indigo-300"
-            value={v}
-            onChange={(e) => {
-              const next = { ...value, [k]: e.target.value };
-              onChange(next);
-            }}
-          />
-          <button
-            type="button"
-            onClick={() => {
-              const next = { ...value };
-              delete next[k];
-              onChange(next);
-            }}
-            className="p-1.5 rounded-lg text-slate-400 hover:text-red-500 hover:bg-red-50 transition-colors"
-          >
-            <Trash2 size={12} />
-          </button>
-        </div>
-      ))}
-      <div className="flex items-center gap-2">
-        <input
-          className="flex-1 px-2.5 py-1.5 text-xs rounded-lg border border-dashed border-slate-300 bg-slate-50 text-slate-900 font-mono focus:outline-none focus:ring-2 focus:ring-indigo-300"
-          placeholder={keyPlaceholder ?? "key"}
-          value={newKey}
-          onChange={(e) => setNewKey(e.target.value)}
-        />
-        <ArrowRight size={12} className="text-slate-300 flex-shrink-0" />
-        <input
-          className="flex-1 px-2.5 py-1.5 text-xs rounded-lg border border-dashed border-slate-300 bg-slate-50 text-slate-900 font-mono focus:outline-none focus:ring-2 focus:ring-indigo-300"
-          placeholder={valuePlaceholder ?? "value"}
-          value={newVal}
-          onChange={(e) => setNewVal(e.target.value)}
-          onKeyDown={(e) => {
-            if (e.key === "Enter" && newKey.trim()) {
-              onChange({ ...value, [newKey.trim()]: newVal });
-              setNewKey("");
-              setNewVal("");
-            }
-          }}
-        />
-        <button
-          type="button"
-          onClick={() => {
-            if (newKey.trim()) {
-              onChange({ ...value, [newKey.trim()]: newVal });
-              setNewKey("");
-              setNewVal("");
-            }
-          }}
-          className="p-1.5 rounded-lg text-indigo-600 hover:bg-indigo-50 border border-indigo-200 transition-colors"
-        >
-          <Plus size={12} />
-        </button>
-      </div>
-    </div>
-  );
 }
 
 // ---------------------------------------------------------------------------

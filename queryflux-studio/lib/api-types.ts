@@ -241,6 +241,8 @@ export interface ClusterGroupConfigRecord {
   allowUsers: string[];
   /** Ordered `user_scripts` ids (translation_fixup) applied after sqlglot for this group. */
   translationScriptIds: number[];
+  /** Default tags merged into every query in this group. `null` values are key-only tags. */
+  defaultTags: Record<string, string | null>;
   createdAt: string;
   updatedAt: string;
 }
@@ -255,6 +257,7 @@ export interface UpsertClusterGroupConfig {
   allowGroups?: string[];
   allowUsers?: string[];
   translationScriptIds?: number[];
+  defaultTags?: Record<string, string | null>;
 }
 
 /** Reusable Python snippet from `GET /admin/config/scripts`. */

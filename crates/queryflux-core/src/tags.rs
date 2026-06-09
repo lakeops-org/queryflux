@@ -198,4 +198,86 @@ mod tests {
         let merged = merge_tags(&base, &over);
         assert_eq!(merged.get("team"), Some(&Some("override".to_string())));
     }
+
+    // ---------------------------------------------------------------------------
+    // Group default tags — merge semantics
+    // ---------------------------------------------------------------------------
+
+    fn tags(pairs: &[(&str, Option<&str>)]) -> QueryTags {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.map(str::to_string)))
+            .collect()
+    }
+
+    #[test]
+    fn group_tags_only_all_present() {
+        let group = tags(&[("env", Some("prod")), ("batch", None)]);
+        let session: QueryTags = HashMap::new();
+        let effective = merge_tags(&group, &session);
+        assert_eq!(effective.get("env"), Some(&Some("prod".to_string())));
+        assert_eq!(effective.get("batch"), Some(&None));
+        assert_eq!(effective.len(), 2);
+    }
+
+    #[test]
+    fn session_tags_only_no_group() {
+        let group: QueryTags = HashMap::new();
+        let session = tags(&[("team", Some("eng"))]);
+        let effective = merge_tags(&group, &session);
+        assert_eq!(effective.get("team"), Some(&Some("eng".to_string())));
+    }
+
+    #[test]
+    fn group_and_session_no_overlap_both_present() {
+        let group = tags(&[("env", Some("prod"))]);
+        let session = tags(&[("team", Some("eng"))]);
+        let effective = merge_tags(&group, &session);
+        assert_eq!(effective.get("env"), Some(&Some("prod".to_string())));
+        assert_eq!(effective.get("team"), Some(&Some("eng".to_string())));
+        assert_eq!(effective.len(), 2);
+    }
+
+    #[test]
+    fn session_wins_on_key_conflict() {
+        let group = tags(&[("env", Some("prod")), ("cost_center", Some("701"))]);
+        let session = tags(&[("env", Some("staging"))]);
+        let effective = merge_tags(&group, &session);
+        // session overrides group value
+        assert_eq!(effective.get("env"), Some(&Some("staging".to_string())));
+        // group-only tag passes through
+        assert_eq!(effective.get("cost_center"), Some(&Some("701".to_string())));
+    }
+
+    #[test]
+    fn session_key_only_overrides_group_value() {
+        // Group set env=prod; session sets env as key-only (null) — session wins.
+        let group = tags(&[("env", Some("prod"))]);
+        let session = tags(&[("env", None)]);
+        let effective = merge_tags(&group, &session);
+        assert_eq!(effective.get("env"), Some(&None));
+    }
+
+    #[test]
+    fn group_key_only_passes_through_when_session_silent() {
+        let group = tags(&[("batch", None)]);
+        let session: QueryTags = HashMap::new();
+        let effective = merge_tags(&group, &session);
+        assert_eq!(effective.get("batch"), Some(&None));
+    }
+
+    #[test]
+    fn session_value_overrides_group_key_only() {
+        // Group set batch as key-only; session provides a value for it.
+        let group = tags(&[("batch", None)]);
+        let session = tags(&[("batch", Some("nightly"))]);
+        let effective = merge_tags(&group, &session);
+        assert_eq!(effective.get("batch"), Some(&Some("nightly".to_string())));
+    }
+
+    #[test]
+    fn both_empty_gives_empty() {
+        let effective = merge_tags(&HashMap::new(), &HashMap::new());
+        assert!(effective.is_empty());
+    }
 }

@@ -56,6 +56,19 @@ export function normalizeClusterGroupRecord(raw: unknown): ClusterGroupConfigRec
       .filter((x) => Number.isFinite(x));
   })();
 
+  const defaultTags = (() => {
+    const raw = r.defaultTags ?? r.default_tags;
+    if (raw !== null && typeof raw === "object" && !Array.isArray(raw)) {
+      return Object.fromEntries(
+        Object.entries(raw as Record<string, unknown>).map(([k, v]) => [
+          k,
+          typeof v === "string" ? v : null,
+        ]),
+      ) as Record<string, string | null>;
+    }
+    return {} as Record<string, string | null>;
+  })();
+
   return {
     id: typeof r.id === "number" ? r.id : Number(r.id) || 0,
     name: typeof r.name === "string" ? r.name : "",
@@ -67,6 +80,7 @@ export function normalizeClusterGroupRecord(raw: unknown): ClusterGroupConfigRec
     allowGroups: strArr("allowGroups", "allow_groups"),
     allowUsers: strArr("allowUsers", "allow_users"),
     translationScriptIds,
+    defaultTags,
     createdAt: strOrNull("createdAt", "created_at") || new Date().toISOString(),
     updatedAt: strOrNull("updatedAt", "updated_at") || new Date().toISOString(),
   };
@@ -92,5 +106,7 @@ export function clusterGroupRecordToUpsert(
       overrides.translationScriptIds !== undefined
         ? overrides.translationScriptIds
         : [...r.translationScriptIds],
+    defaultTags:
+      overrides.defaultTags !== undefined ? overrides.defaultTags : { ...r.defaultTags },
   };
 }

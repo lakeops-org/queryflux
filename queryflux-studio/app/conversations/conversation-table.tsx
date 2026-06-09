@@ -24,7 +24,7 @@ export function ConversationTable({ conversations }: { conversations: Conversati
 
   const filtered = useMemo(() => {
     const q = query.trim().toLowerCase();
-    let next = q
+    const next = q
       ? conversations.filter(
           (c) =>
             c.conversation_id.toLowerCase().includes(q) ||

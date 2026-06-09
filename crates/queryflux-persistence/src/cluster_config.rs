@@ -83,6 +83,11 @@ pub struct ClusterGroupConfigRecord {
     /// Ordered `user_scripts.id` values run as post-sqlglot translation fixups for this group.
     #[serde(default)]
     pub translation_script_ids: Vec<i64>,
+    /// Default tags merged into every query routed to this group (session tags win on key conflicts).
+    /// Stored as JSONB: `{"team": "eng", "batch": null}` — `null` values are key-only tags.
+    #[serde(default = "default_tags_value")]
+    #[schema(value_type = Object)]
+    pub default_tags: serde_json::Value,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -105,6 +110,11 @@ pub struct UpsertClusterGroupConfig {
     /// Ordered translation fixup script ids (`user_scripts.kind = translation_fixup`).
     #[serde(default)]
     pub translation_script_ids: Vec<i64>,
+    /// Default tags merged into every query in this group. `{"team": "eng", "batch": null}` style.
+    /// `null` values are key-only tags (Trino style). Omit or set to `{}` for no defaults.
+    #[serde(default = "default_tags_value")]
+    #[schema(value_type = Object)]
+    pub default_tags: serde_json::Value,
 }
 
 // ---------------------------------------------------------------------------
@@ -216,6 +226,9 @@ impl UpsertClusterGroupConfig {
             .as_ref()
             .and_then(|s| serde_json::to_value(s).ok());
 
+        let default_tags = serde_json::to_value(&cfg.default_tags)
+            .unwrap_or_else(|_| serde_json::Value::Object(serde_json::Map::default()));
+
         Self {
             enabled: cfg.enabled,
             members: cfg.members.clone(),
@@ -225,6 +238,7 @@ impl UpsertClusterGroupConfig {
             allow_groups: cfg.authorization.allow_groups.clone(),
             allow_users: cfg.authorization.allow_users.clone(),
             translation_script_ids: Vec::new(),
+            default_tags,
         }
     }
 }
@@ -247,6 +261,10 @@ impl ClusterGroupConfigRecord {
             .as_ref()
             .and_then(|v| serde_json::from_value::<StrategyConfig>(v.clone()).ok());
 
+        let default_tags =
+            serde_json::from_value::<queryflux_core::tags::QueryTags>(self.default_tags.clone())
+                .unwrap_or_default();
+
         ClusterGroupConfig {
             enabled: self.enabled,
             members: self.members.clone(),
@@ -257,11 +275,148 @@ impl ClusterGroupConfigRecord {
                 allow_groups: self.allow_groups.clone(),
                 allow_users: self.allow_users.clone(),
             },
-            default_tags: Default::default(),
+            default_tags,
         }
     }
 }
 
 fn default_true() -> bool {
     true
+}
+
+fn default_tags_value() -> serde_json::Value {
+    serde_json::Value::Object(serde_json::Map::default())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Utc;
+    use queryflux_core::tags::QueryTags;
+
+    fn make_record(default_tags: serde_json::Value) -> ClusterGroupConfigRecord {
+        ClusterGroupConfigRecord {
+            id: 1,
+            name: "test-group".to_string(),
+            enabled: true,
+            members: vec!["c1".to_string()],
+            max_running_queries: 10,
+            max_queued_queries: None,
+            strategy: None,
+            allow_groups: vec![],
+            allow_users: vec![],
+            translation_script_ids: vec![],
+            default_tags,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    fn make_core_group(tags: QueryTags) -> queryflux_core::config::ClusterGroupConfig {
+        queryflux_core::config::ClusterGroupConfig {
+            enabled: true,
+            members: vec!["c1".to_string()],
+            strategy: None,
+            max_running_queries: 10,
+            max_queued_queries: None,
+            authorization: queryflux_core::config::ClusterGroupAuthorizationConfig {
+                allow_groups: vec![],
+                allow_users: vec![],
+            },
+            default_tags: tags,
+        }
+    }
+
+    // --- to_core: JSONB → QueryTags ---
+
+    #[test]
+    fn to_core_key_value_tags() {
+        let json = serde_json::json!({"team": "eng", "cost_center": "701"});
+        let core = make_record(json).to_core();
+        assert_eq!(
+            core.default_tags.get("team"),
+            Some(&Some("eng".to_string()))
+        );
+        assert_eq!(
+            core.default_tags.get("cost_center"),
+            Some(&Some("701".to_string()))
+        );
+    }
+
+    #[test]
+    fn to_core_key_only_tags_deserialize_as_none() {
+        let json = serde_json::json!({"batch": null, "team": "eng"});
+        let core = make_record(json).to_core();
+        assert_eq!(core.default_tags.get("batch"), Some(&None));
+        assert_eq!(
+            core.default_tags.get("team"),
+            Some(&Some("eng".to_string()))
+        );
+    }
+
+    #[test]
+    fn to_core_empty_json_gives_empty_tags() {
+        let core = make_record(serde_json::json!({})).to_core();
+        assert!(core.default_tags.is_empty());
+    }
+
+    #[test]
+    fn to_core_malformed_json_falls_back_to_empty() {
+        // A non-object JSON value cannot deserialize as QueryTags — should not panic.
+        let core = make_record(serde_json::json!([1, 2, 3])).to_core();
+        assert!(core.default_tags.is_empty());
+    }
+
+    // --- from_core: QueryTags → JSONB ---
+
+    #[test]
+    fn from_core_key_value_tags_serialize_to_json() {
+        let tags: QueryTags = [
+            ("env".to_string(), Some("prod".to_string())),
+            ("cost_center".to_string(), Some("701".to_string())),
+        ]
+        .into();
+        let upsert = UpsertClusterGroupConfig::from_core(&make_core_group(tags));
+        let env = upsert.default_tags.get("env").unwrap();
+        assert_eq!(env, &serde_json::Value::String("prod".to_string()));
+    }
+
+    #[test]
+    fn from_core_key_only_tags_serialize_as_null() {
+        let tags: QueryTags = [("batch".to_string(), None)].into();
+        let upsert = UpsertClusterGroupConfig::from_core(&make_core_group(tags));
+        let batch = upsert.default_tags.get("batch").unwrap();
+        assert_eq!(batch, &serde_json::Value::Null);
+    }
+
+    #[test]
+    fn from_core_empty_tags_gives_empty_object() {
+        let upsert = UpsertClusterGroupConfig::from_core(&make_core_group(QueryTags::new()));
+        assert!(upsert.default_tags.is_object());
+        assert_eq!(upsert.default_tags.as_object().unwrap().len(), 0);
+    }
+
+    // --- roundtrip: core → upsert → record → core ---
+
+    #[test]
+    fn roundtrip_default_tags() {
+        let tags: QueryTags = [
+            ("env".to_string(), Some("prod".to_string())),
+            ("batch".to_string(), None),
+        ]
+        .into();
+        let core_in = make_core_group(tags);
+        let upsert = UpsertClusterGroupConfig::from_core(&core_in);
+
+        // Simulate what the DB would return: use the JSONB stored in upsert as the record's value.
+        let record = make_record(upsert.default_tags.clone());
+        let core_out = record.to_core();
+
+        assert_eq!(
+            core_out.default_tags.get("env"),
+            Some(&Some("prod".to_string()))
+        );
+        assert_eq!(core_out.default_tags.get("batch"), Some(&None));
+        assert_eq!(core_out.default_tags.len(), 2);
+    }
 }

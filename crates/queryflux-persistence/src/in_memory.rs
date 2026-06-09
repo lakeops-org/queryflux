@@ -454,6 +454,7 @@ impl ClusterConfigStore for InMemoryPersistence {
             allow_groups: cfg.allow_groups.clone(),
             allow_users: cfg.allow_users.clone(),
             translation_script_ids: cfg.translation_script_ids.clone(),
+            default_tags: cfg.default_tags.clone(),
             created_at: existing.as_ref().map(|r| r.created_at).unwrap_or(now),
             updated_at: now,
         };
@@ -758,4 +759,118 @@ fn mean(values: &[i64]) -> f64 {
         return 0.0;
     }
     values.iter().sum::<i64>() as f64 / values.len() as f64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ClusterConfigStore;
+
+    fn base_cluster_upsert() -> UpsertClusterConfig {
+        UpsertClusterConfig {
+            engine_key: "trino".to_string(),
+            enabled: true,
+            max_running_queries: None,
+            config: serde_json::json!({"endpoint": "http://localhost:8080"}),
+        }
+    }
+
+    fn group_upsert(tags: serde_json::Value) -> UpsertClusterGroupConfig {
+        UpsertClusterGroupConfig {
+            enabled: true,
+            members: vec!["c1".to_string()],
+            max_running_queries: 10,
+            max_queued_queries: None,
+            strategy: None,
+            allow_groups: vec![],
+            allow_users: vec![],
+            translation_script_ids: vec![],
+            default_tags: tags,
+        }
+    }
+
+    async fn store_with_cluster() -> InMemoryPersistence {
+        let store = InMemoryPersistence::new();
+        store
+            .upsert_cluster_config("c1", &base_cluster_upsert())
+            .await
+            .unwrap();
+        store
+    }
+
+    #[tokio::test]
+    async fn upsert_group_stores_default_tags() {
+        let store = store_with_cluster().await;
+        let tags = serde_json::json!({"env": "prod", "batch": null});
+        let record = store
+            .upsert_group_config("g1", &group_upsert(tags.clone()))
+            .await
+            .unwrap();
+
+        assert_eq!(record.default_tags, tags);
+        let fetched = store.get_group_config("g1").await.unwrap().unwrap();
+        assert_eq!(fetched.default_tags, tags);
+    }
+
+    #[tokio::test]
+    async fn upsert_group_empty_default_tags() {
+        let store = store_with_cluster().await;
+        let record = store
+            .upsert_group_config("g1", &group_upsert(serde_json::json!({})))
+            .await
+            .unwrap();
+        assert!(record.default_tags.as_object().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn update_group_replaces_default_tags() {
+        let store = store_with_cluster().await;
+
+        store
+            .upsert_group_config("g1", &group_upsert(serde_json::json!({"env": "staging"})))
+            .await
+            .unwrap();
+
+        let updated = store
+            .upsert_group_config(
+                "g1",
+                &group_upsert(serde_json::json!({"env": "prod", "team": "infra"})),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(updated.default_tags["env"], "prod");
+        assert_eq!(updated.default_tags["team"], "infra");
+        assert_eq!(updated.default_tags.as_object().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn to_core_propagates_tags_from_record() {
+        let store = store_with_cluster().await;
+        let tags = serde_json::json!({"team": "eng", "batch": null});
+        let record = store
+            .upsert_group_config("g1", &group_upsert(tags))
+            .await
+            .unwrap();
+
+        let core = record.to_core();
+        assert_eq!(
+            core.default_tags.get("team"),
+            Some(&Some("eng".to_string()))
+        );
+        assert_eq!(core.default_tags.get("batch"), Some(&None));
+    }
+
+    #[tokio::test]
+    async fn list_groups_preserves_default_tags() {
+        let store = store_with_cluster().await;
+        store
+            .upsert_group_config("g1", &group_upsert(serde_json::json!({"env": "prod"})))
+            .await
+            .unwrap();
+
+        let list = store.list_group_configs().await.unwrap();
+        let g = list.iter().find(|r| r.name == "g1").unwrap();
+        assert_eq!(g.default_tags["env"], "prod");
+    }
 }

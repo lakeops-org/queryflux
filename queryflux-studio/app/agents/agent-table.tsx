@@ -16,7 +16,7 @@ export function AgentTable({ agents }: { agents: AgentSummary[] }) {
 
   const filteredAgents = useMemo(() => {
     const q = query.trim().toLowerCase();
-    let next = q ? agents.filter((a) => a.agent_id.toLowerCase().includes(q)) : agents.slice();
+    const next = q ? agents.filter((a) => a.agent_id.toLowerCase().includes(q)) : agents.slice();
 
     next.sort((a, b) => {
       switch (sortKey) {

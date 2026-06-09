@@ -48,6 +48,7 @@ SELECT
     g.allow_groups,
     g.allow_users,
     g.translation_script_ids,
+    g.default_tags,
     g.created_at,
     g.updated_at
 FROM cluster_group_configs g
@@ -578,8 +579,8 @@ impl ClusterConfigStore for PostgresStore {
 
         sqlx::query(
             r#"INSERT INTO cluster_group_configs
-                   (name, enabled, members, max_running_queries, max_queued_queries, strategy, allow_groups, allow_users, translation_script_ids)
-               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+                   (name, enabled, members, max_running_queries, max_queued_queries, strategy, allow_groups, allow_users, translation_script_ids, default_tags)
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
                ON CONFLICT (name) DO UPDATE SET
                    enabled                = EXCLUDED.enabled,
                    members                = EXCLUDED.members,
@@ -589,6 +590,7 @@ impl ClusterConfigStore for PostgresStore {
                    allow_groups           = EXCLUDED.allow_groups,
                    allow_users            = EXCLUDED.allow_users,
                    translation_script_ids = EXCLUDED.translation_script_ids,
+                   default_tags           = EXCLUDED.default_tags,
                    updated_at             = now()"#,
         )
         .bind(name)
@@ -600,6 +602,7 @@ impl ClusterConfigStore for PostgresStore {
         .bind(&cfg.allow_groups)
         .bind(&cfg.allow_users)
         .bind(&cfg.translation_script_ids)
+        .bind(&cfg.default_tags)
         .execute(&mut *tx)
         .await
         .map_err(|e| QueryFluxError::Persistence(format!("upsert_group_config: {e}")))?;
