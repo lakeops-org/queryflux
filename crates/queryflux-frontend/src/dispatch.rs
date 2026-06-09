@@ -177,15 +177,8 @@ pub async fn dispatch_query(
         .resolve(auth_ctx, cluster_cfg.as_ref())
         .await;
 
-    let adapter = match state.adapter(&cluster_name.0).await {
-        Some(AdapterKind::Async(a)) => a,
-        Some(AdapterKind::Sync(_)) => {
-            state.metrics.on_query_finished(&group.0, &cluster_name.0);
-            let _ = cluster_manager.release_cluster(&group, &cluster_name).await;
-            return Err(QueryFluxError::SyncEngineRequired(format!(
-                "Sync engine on async dispatch path: {cluster_name}"
-            )));
-        }
+    let adapter_kind = match state.adapter(&cluster_name.0).await {
+        Some(a) => a,
         None => {
             state.metrics.on_query_finished(&group.0, &cluster_name.0);
             let _ = cluster_manager.release_cluster(&group, &cluster_name).await;
@@ -196,7 +189,8 @@ pub async fn dispatch_query(
     };
 
     let src_dialect = protocol.default_dialect();
-    let tgt_dialect = adapter.translation_target_dialect();
+    let tgt_dialect = adapter_kind.translation_target_dialect();
+    let engine_type = adapter_kind.engine_type();
     let original_sql = sql.clone();
     let sql = match state
         .translation
@@ -237,7 +231,7 @@ pub async fn dispatch_query(
     let guard_ctx = GuardContext {
         sql: &original_sql,
         translated_sql: &sql,
-        engine_type: &adapter.engine_type(),
+        engine_type: &engine_type,
         cluster_group: &group,
         user: session.user(),
         agent_context: resolved_agent_ctx.as_ref(),
@@ -260,7 +254,7 @@ pub async fn dispatch_query(
                 cluster: cluster_name.clone(),
                 cluster_group_config_id,
                 cluster_config_id,
-                engine_type: adapter.engine_type(),
+                engine_type: engine_type.clone(),
                 src_dialect: src_dialect.clone(),
                 tgt_dialect: tgt_dialect.clone(),
                 was_translated,
@@ -315,89 +309,212 @@ pub async fn dispatch_query(
         .filter_map(|a| serde_json::to_value(a).ok())
         .collect();
 
-    let execution = match adapter
-        .submit_query(
-            &sql,
-            &session,
-            &credentials,
-            &effective_tags,
-            &effective_params,
-        )
-        .await
-    {
-        Ok(e) => e,
-        Err(e) => {
+    match adapter_kind {
+        AdapterKind::Async(adapter) => {
+            let execution = match adapter
+                .submit_query(
+                    &sql,
+                    &session,
+                    &credentials,
+                    &effective_tags,
+                    &effective_params,
+                )
+                .await
+            {
+                Ok(e) => e,
+                Err(e) => {
+                    state.metrics.on_query_finished(&group.0, &cluster_name.0);
+                    let _ = cluster_manager.release_cluster(&group, &cluster_name).await;
+                    warn!(id = %query_id, "Submit error: {e}");
+                    return Err(e);
+                }
+            };
+
+            if already_queued {
+                let _ = state.persistence.delete_queued(&query_id).await;
+            }
+
+            let QueryExecution::Async {
+                backend_query_id,
+                next_uri,
+                initial_body,
+            } = execution;
+            let now = Utc::now();
+            let executing = ExecutingQuery {
+                id: query_id.clone(),
+                sql,
+                translated_sql: if was_translated {
+                    Some(original_sql)
+                } else {
+                    None
+                },
+                cluster_group: group.clone(),
+                cluster_name: cluster_name.clone(),
+                cluster_group_config_id,
+                cluster_config_id,
+                backend_query_id: backend_query_id.clone(),
+                trino_endpoint: adapter.base_url().to_string(),
+                creation_time: now,
+                last_accessed: now,
+                query_tags: effective_tags,
+                agent_context: resolved_agent_ctx,
+                submitted_guard_actions,
+                was_guard_blocked: false,
+            };
+            let _ = state.persistence.upsert(executing.clone()).await;
+            info!(id = %query_id, backend = %backend_query_id, cluster = %cluster_name, "Query submitted (async)");
+
+            if next_uri.is_none() {
+                if let Some(ref ib) = initial_body {
+                    if engine_type == EngineType::Trino {
+                        finalize_trino_async_terminal_on_submit(
+                            state,
+                            &cluster_manager,
+                            &executing,
+                            &adapter,
+                            &session,
+                            protocol,
+                            ib,
+                        )
+                        .await;
+                    }
+                }
+            }
+
+            let proxy_next_uri = next_uri
+                .as_deref()
+                .map(|uri| rewrite_trino_uri(uri, &state.external_address));
+            Ok(DispatchOutcome::Async {
+                initial_body,
+                proxy_next_uri,
+            })
+        }
+        AdapterKind::Sync(sync_adapter) => {
+            if already_queued {
+                let _ = state.persistence.delete_queued(&query_id).await;
+            }
+
+            info!(id = %query_id, cluster = %cluster_name, "Query executing (sync via dispatch)");
+            let start = Instant::now();
+
+            let mut sink = crate::trino_http::result_sink::TrinoHttpResultSink::new(&query_id.0);
+
+            debug!(id = %query_id, "sync dispatch: calling execute_as_arrow");
+            let (status, rows, error) = match sync_adapter
+                .execute_as_arrow(
+                    &sql,
+                    &session,
+                    &credentials,
+                    &effective_tags,
+                    &effective_params,
+                )
+                .await
+            {
+                Ok(execution) => {
+                    debug!(id = %query_id, "sync dispatch: execute_as_arrow returned stream");
+                    let mut stream = execution.stream;
+                    let mut schema_sent = false;
+                    let mut total_rows: u64 = 0;
+                    let mut stream_err: Option<String> = None;
+                    let mut batch_count: u64 = 0;
+
+                    while let Some(result) = stream.next().await {
+                        match result {
+                            Ok(batch) => {
+                                if !schema_sent {
+                                    debug!(id = %query_id, cols = batch.num_columns(), "sync dispatch: on_schema");
+                                    let _ = sink.on_schema(batch.schema_ref()).await;
+                                    schema_sent = true;
+                                }
+                                total_rows += batch.num_rows() as u64;
+                                batch_count += 1;
+                                debug!(id = %query_id, batch = batch_count, rows = batch.num_rows(), "sync dispatch: on_batch");
+                                let _ = sink.on_batch(&batch).await;
+                                debug!(id = %query_id, batch = batch_count, "sync dispatch: on_batch done");
+                            }
+                            Err(e) => {
+                                stream_err = Some(e.to_string());
+                                let _ = sink.on_error(stream_err.as_ref().unwrap()).await;
+                                break;
+                            }
+                        }
+                    }
+
+                    if !schema_sent {
+                        debug!(id = %query_id, "sync dispatch: empty schema");
+                        let _ = sink.on_schema(&Schema::empty()).await;
+                    }
+
+                    let elapsed_ms = start.elapsed().as_millis() as u64;
+                    let stats = QueryStats {
+                        execution_duration_ms: elapsed_ms,
+                        rows_returned: total_rows,
+                        ..Default::default()
+                    };
+                    debug!(id = %query_id, total_rows, "sync dispatch: on_complete");
+                    let _ = sink.on_complete(&stats).await;
+
+                    if let Some(err_msg) = stream_err {
+                        (QueryStatus::Failed, None, Some(err_msg))
+                    } else {
+                        (QueryStatus::Success, Some(total_rows), None)
+                    }
+                }
+                Err(e) => {
+                    let msg = e.to_string();
+                    warn!(id = %query_id, cluster = %cluster_name, "Sync execute_as_arrow failed: {msg}");
+                    let _ = sink.on_error(&msg).await;
+                    (QueryStatus::Failed, None, Some(msg))
+                }
+            };
+
+            let elapsed_ms = start.elapsed().as_millis() as u64;
+
+            let ctx = QueryContext {
+                query_id,
+                sql: original_sql,
+                session,
+                protocol,
+                group: group.clone(),
+                cluster: cluster_name.clone(),
+                cluster_group_config_id,
+                cluster_config_id,
+                engine_type,
+                src_dialect,
+                tgt_dialect,
+                was_translated,
+                translated_sql: if was_translated { Some(sql) } else { None },
+                query_tags: effective_tags,
+                query_params: effective_params,
+                agent_context: resolved_agent_ctx,
+            };
+            state.record_query(
+                &ctx,
+                QueryOutcome {
+                    backend_query_id: None,
+                    status,
+                    execution_ms: elapsed_ms,
+                    rows,
+                    error,
+                    routing_trace: None,
+                    engine_stats: None,
+                    guard_actions: all_guard_actions,
+                    was_guard_blocked: false,
+                },
+            );
+
             state.metrics.on_query_finished(&group.0, &cluster_name.0);
             let _ = cluster_manager.release_cluster(&group, &cluster_name).await;
-            warn!(id = %query_id, "Submit error: {e}");
-            return Err(e);
-        }
-    };
 
-    if already_queued {
-        // Delete synchronously before marking as executing — prevents re-dispatch on restart.
-        let _ = state.persistence.delete_queued(&query_id).await;
-    }
-
-    let QueryExecution::Async {
-        backend_query_id,
-        next_uri,
-        initial_body,
-    } = execution;
-    let now = Utc::now();
-    let executing = ExecutingQuery {
-        id: query_id.clone(),
-        sql,
-        translated_sql: if was_translated {
-            Some(original_sql)
-        } else {
-            None
-        },
-        cluster_group: group.clone(),
-        cluster_name: cluster_name.clone(),
-        cluster_group_config_id,
-        cluster_config_id,
-        backend_query_id: backend_query_id.clone(),
-        trino_endpoint: adapter.base_url().to_string(),
-        creation_time: now,
-        last_accessed: now,
-        query_tags: effective_tags,
-        agent_context: resolved_agent_ctx,
-        submitted_guard_actions,
-        was_guard_blocked: false,
-    };
-    // Single write per query — no updates needed between polls.
-    // Any QueryFlux instance can serve subsequent polls using this record.
-    let _ = state.persistence.upsert(executing.clone()).await;
-    info!(id = %query_id, backend = %backend_query_id, cluster = %cluster_name, "Query submitted (async)");
-
-    // Trino-specific: FINISHED on first POST with no nextUri. Other async engines must not run
-    // this path — it parses Trino JSON and would corrupt metrics / persistence if misapplied.
-    if next_uri.is_none() {
-        if let Some(ref ib) = initial_body {
-            if adapter.engine_type() == EngineType::Trino {
-                finalize_trino_async_terminal_on_submit(
-                    state,
-                    &cluster_manager,
-                    &executing,
-                    &adapter,
-                    &session,
-                    protocol,
-                    ib,
-                )
-                .await;
-            }
+            debug!(id = %ctx.query_id, "sync dispatch: calling into_bytes");
+            let body_bytes = sink.into_bytes();
+            debug!(id = %ctx.query_id, bytes = body_bytes.len(), "sync dispatch: into_bytes done");
+            Ok(DispatchOutcome::Async {
+                initial_body: Some(body_bytes),
+                proxy_next_uri: None,
+            })
         }
     }
-
-    // Rewrite nextUri: swap Trino host → QueryFlux external address, keep full path.
-    let proxy_next_uri = next_uri
-        .as_deref()
-        .map(|uri| rewrite_trino_uri(uri, &state.external_address));
-    Ok(DispatchOutcome::Async {
-        initial_body,
-        proxy_next_uri,
-    })
 }
 
 /// Determine the terminal `QueryOutcome` from a Trino submit response body.

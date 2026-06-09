@@ -80,8 +80,12 @@ CREATE TABLE lakekeeper.tpch.customer AS
 SELECT
     custkey AS c_custkey,
     name AS c_name,
+    address AS c_address,
     nationkey AS c_nationkey,
-    acctbal AS c_acctbal
+    phone AS c_phone,
+    acctbal AS c_acctbal,
+    mktsegment AS c_mktsegment,
+    comment AS c_comment
 FROM tpch.tiny.customer;
 
 CREATE TABLE lakekeeper.tpch.orders AS

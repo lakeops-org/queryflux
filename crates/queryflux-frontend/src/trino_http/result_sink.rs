@@ -11,6 +11,7 @@ use axum::{
     http::{Response, StatusCode},
 };
 use serde_json::{json, Value};
+use tracing::debug;
 
 use queryflux_core::{error::Result, query::QueryStats};
 use queryflux_engine_adapters::trino::api::{TrinoError, TrinoResponse, TrinoStats};
@@ -41,9 +42,32 @@ impl TrinoHttpResultSink {
         }
     }
 
+    /// Consume the sink and produce the serialized Trino JSON response as raw bytes.
+    pub fn into_bytes(self) -> bytes::Bytes {
+        debug!(query_id = %self.query_id, rows = self.rows.len(), cols = self.columns.len(), "into_bytes: building trino response");
+        let resp = self.build_trino_response();
+        debug!("into_bytes: serializing to JSON");
+        let bytes = bytes::Bytes::from(serde_json::to_vec(&resp).unwrap_or_default());
+        debug!(len = bytes.len(), "into_bytes: serialization done");
+        bytes
+    }
+
     /// Consume the sink and produce the final HTTP response.
     pub fn into_response(self) -> Response<Body> {
-        let resp = if let Some(msg) = self.error {
+        debug!(query_id = %self.query_id, rows = self.rows.len(), cols = self.columns.len(), "into_response: building trino response");
+        let resp = self.build_trino_response();
+        debug!("into_response: serializing to JSON");
+        let json = serde_json::to_vec(&resp).unwrap_or_default();
+        debug!(len = json.len(), "into_response: serialization done");
+        Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", "application/json")
+            .body(Body::from(json))
+            .unwrap()
+    }
+
+    fn build_trino_response(self) -> TrinoResponse {
+        if let Some(msg) = self.error {
             TrinoResponse {
                 id: self.query_id,
                 next_uri: None,
@@ -105,24 +129,19 @@ impl TrinoHttpResultSink {
                 update_count: None,
                 warnings: vec![],
             }
-        };
-
-        let json = serde_json::to_vec(&resp).unwrap_or_default();
-        Response::builder()
-            .status(StatusCode::OK)
-            .header("content-type", "application/json")
-            .body(Body::from(json))
-            .unwrap()
+        }
     }
 }
 
 #[async_trait]
 impl ResultSink for TrinoHttpResultSink {
     async fn on_schema(&mut self, schema: &Schema) -> Result<()> {
+        debug!(query_id = %self.query_id, num_fields = schema.fields().len(), "on_schema: start");
         self.columns = schema
             .fields()
             .iter()
             .map(|f| {
+                debug!(query_id = %self.query_id, field = %f.name(), dtype = ?f.data_type(), "on_schema: mapping field");
                 let type_name = arrow_type_to_trino_type(f.data_type());
                 json!({
                     "name": f.name(),
@@ -131,6 +150,7 @@ impl ResultSink for TrinoHttpResultSink {
                 })
             })
             .collect();
+        debug!(query_id = %self.query_id, "on_schema: done");
         Ok(())
     }
 

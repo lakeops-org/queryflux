@@ -215,17 +215,18 @@ impl AppState {
         };
         let metrics = self.metrics.clone();
         tokio::spawn(async move {
-            let fp = rich_fingerprint(
+            if let Some(fp) = rich_fingerprint(
                 &original_sql,
                 translated_sql_for_fp.as_deref(),
                 src_dialect.as_str(),
                 tgt_dialect.as_str(),
-            );
-            record.query_hash = Some(fp.query_hash as i64);
-            record.query_parameterized_hash = Some(fp.query_parameterized_hash as i64);
-            record.translated_query_hash = fp.translated_query_hash.map(|h| h as i64);
-            record.digest_text = Some(fp.digest_text);
-            record.translated_digest_text = fp.translated_digest_text;
+            ) {
+                record.query_hash = Some(fp.query_hash as i64);
+                record.query_parameterized_hash = Some(fp.query_parameterized_hash as i64);
+                record.translated_query_hash = fp.translated_query_hash.map(|h| h as i64);
+                record.digest_text = Some(fp.digest_text);
+                record.translated_digest_text = fp.translated_digest_text;
+            }
             let _ = metrics.record_query(record).await;
         });
     }

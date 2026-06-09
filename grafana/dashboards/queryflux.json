@@ -2,17 +2,93 @@
   "title": "QueryFlux",
   "uid": "queryflux-main",
   "schemaVersion": 38,
-  "version": 1,
+  "version": 2,
   "timezone": "browser",
   "refresh": "10s",
   "time": { "from": "now-1h", "to": "now" },
+  "tags": ["queryflux", "observability"],
+  "templating": {
+    "list": [
+      {
+        "name": "tag_key",
+        "type": "query",
+        "label": "Tag Key",
+        "datasource": { "type": "prometheus", "uid": "prometheus" },
+        "query": "label_values(queryflux_query_tags_total, tag_key)",
+        "refresh": 2,
+        "includeAll": true,
+        "allValue": ".*",
+        "current": { "text": "All", "value": "$__all" },
+        "sort": 1
+      },
+      {
+        "name": "cluster_group",
+        "type": "query",
+        "label": "Cluster Group",
+        "datasource": { "type": "prometheus", "uid": "prometheus" },
+        "query": "label_values(queryflux_queries_total, cluster_group)",
+        "refresh": 2,
+        "includeAll": true,
+        "allValue": ".*",
+        "current": { "text": "All", "value": "$__all" },
+        "sort": 1
+      },
+      {
+        "name": "engine_type",
+        "type": "query",
+        "label": "Engine",
+        "datasource": { "type": "prometheus", "uid": "prometheus" },
+        "query": "label_values(queryflux_queries_total, engine_type)",
+        "refresh": 2,
+        "includeAll": true,
+        "allValue": ".*",
+        "current": { "text": "All", "value": "$__all" },
+        "sort": 1
+      },
+      {
+        "name": "protocol",
+        "type": "query",
+        "label": "Protocol",
+        "datasource": { "type": "prometheus", "uid": "prometheus" },
+        "query": "label_values(queryflux_queries_total, protocol)",
+        "refresh": 2,
+        "includeAll": true,
+        "allValue": ".*",
+        "current": { "text": "All", "value": "$__all" },
+        "sort": 1
+      }
+    ]
+  },
+  "links": [
+    {
+      "title": "QueryFlux Studio",
+      "url": "http://localhost:3000/queries",
+      "type": "link",
+      "icon": "external link",
+      "targetBlank": true
+    },
+    {
+      "title": "Prometheus",
+      "url": "http://localhost:9090",
+      "type": "link",
+      "icon": "cloud",
+      "targetBlank": true
+    }
+  ],
   "panels": [
+    {
+      "id": 100,
+      "type": "row",
+      "title": "Overview",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 },
+      "collapsed": false
+    },
     {
       "id": 1,
       "type": "stat",
       "title": "Query Rate",
       "description": "Queries completed per minute (all statuses)",
-      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 0 },
+      "gridPos": { "h": 4, "w": 4, "x": 0, "y": 1 },
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "targets": [
         {
@@ -44,7 +120,7 @@
       "type": "stat",
       "title": "Error Rate",
       "description": "% of queries that failed in the last 5 minutes",
-      "gridPos": { "h": 4, "w": 6, "x": 6, "y": 0 },
+      "gridPos": { "h": 4, "w": 4, "x": 4, "y": 1 },
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "targets": [
         {
@@ -76,7 +152,7 @@
       "type": "stat",
       "title": "p95 Latency",
       "description": "95th-percentile query execution time over the last 5 minutes",
-      "gridPos": { "h": 4, "w": 6, "x": 12, "y": 0 },
+      "gridPos": { "h": 4, "w": 4, "x": 8, "y": 1 },
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "targets": [
         {
@@ -104,11 +180,75 @@
       "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "background", "textMode": "auto", "orientation": "auto" }
     },
     {
+      "id": 11,
+      "type": "stat",
+      "title": "Running Queries",
+      "description": "Queries currently executing across all clusters",
+      "gridPos": { "h": 4, "w": 4, "x": 12, "y": 1 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum(queryflux_running_queries)",
+          "legendFormat": "running",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "noValue": "0",
+          "color": { "mode": "thresholds" },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 10 },
+              { "color": "red", "value": 50 }
+            ]
+          }
+        }
+      },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "background", "textMode": "auto", "orientation": "auto" }
+    },
+    {
+      "id": 12,
+      "type": "stat",
+      "title": "Queued Queries",
+      "description": "Queries waiting for cluster capacity",
+      "gridPos": { "h": 4, "w": 4, "x": 16, "y": 1 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum(queryflux_queued_queries)",
+          "legendFormat": "queued",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "noValue": "0",
+          "color": { "mode": "thresholds" },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 5 },
+              { "color": "red", "value": 20 }
+            ]
+          }
+        }
+      },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "background", "textMode": "auto", "orientation": "auto" }
+    },
+    {
       "id": 4,
       "type": "stat",
       "title": "Translation Rate",
       "description": "% of queries that required SQL dialect translation",
-      "gridPos": { "h": 4, "w": 6, "x": 18, "y": 0 },
+      "gridPos": { "h": 4, "w": 4, "x": 20, "y": 1 },
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "targets": [
         {
@@ -128,10 +268,201 @@
       "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "value", "textMode": "auto", "orientation": "auto" }
     },
     {
+      "id": 13,
+      "type": "stat",
+      "title": "Total Queries",
+      "description": "Queries completed in the selected time range",
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 5 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum(increase(queryflux_queries_total[$__range]))",
+          "legendFormat": "total",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "noValue": "0",
+          "color": { "mode": "palette-classic" }
+        }
+      },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "value", "textMode": "auto", "orientation": "auto" }
+    },
+    {
+      "id": 14,
+      "type": "stat",
+      "title": "Successful Queries",
+      "description": "Successful queries in the selected time range",
+      "gridPos": { "h": 4, "w": 6, "x": 6, "y": 5 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum(increase(queryflux_queries_total{status=\"Success\"}[$__range]))",
+          "legendFormat": "success",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "noValue": "0",
+          "color": { "fixedColor": "green", "mode": "fixed" }
+        }
+      },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "value", "textMode": "auto", "orientation": "auto" }
+    },
+    {
+      "id": 15,
+      "type": "stat",
+      "title": "Failed Queries",
+      "description": "Failed queries in the selected time range",
+      "gridPos": { "h": 4, "w": 6, "x": 12, "y": 5 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum(increase(queryflux_queries_total{status=\"Failed\"}[$__range]))",
+          "legendFormat": "failed",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "noValue": "0",
+          "color": { "fixedColor": "red", "mode": "fixed" }
+        }
+      },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "value", "textMode": "auto", "orientation": "auto" }
+    },
+    {
+      "id": 16,
+      "type": "stat",
+      "title": "Cancelled Queries",
+      "description": "Cancelled queries in the selected time range",
+      "gridPos": { "h": 4, "w": 6, "x": 18, "y": 5 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum(increase(queryflux_queries_total{status=\"Cancelled\"}[$__range]))",
+          "legendFormat": "cancelled",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "noValue": "0",
+          "color": { "fixedColor": "orange", "mode": "fixed" }
+        }
+      },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "value", "textMode": "auto", "orientation": "auto" }
+    },
+    {
+      "id": 17,
+      "type": "piechart",
+      "title": "Query Share by Engine",
+      "description": "Distribution of completed queries by engine type in the selected time range",
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 9 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum by (engine_type) (increase(queryflux_queries_total[$__range]))",
+          "legendFormat": "{{engine_type}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": { "mode": "palette-classic" }
+        }
+      },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "right", "values": ["value", "percent"] },
+        "pieType": "donut",
+        "tooltip": { "mode": "single" },
+        "reduceOptions": { "calcs": ["lastNotNull"] }
+      }
+    },
+    {
+      "id": 18,
+      "type": "piechart",
+      "title": "Query Share by Protocol",
+      "description": "Client protocol used to reach QueryFlux",
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 9 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum by (protocol) (increase(queryflux_queries_total[$__range]))",
+          "legendFormat": "{{protocol}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": { "mode": "palette-classic" }
+        }
+      },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "right", "values": ["value", "percent"] },
+        "pieType": "donut",
+        "tooltip": { "mode": "single" },
+        "reduceOptions": { "calcs": ["lastNotNull"] }
+      }
+    },
+    {
+      "id": 19,
+      "type": "bargauge",
+      "title": "Query Share by Cluster Group",
+      "description": "Completed queries per cluster group in the selected time range",
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 9 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum by (cluster_group) (increase(queryflux_queries_total[$__range]))",
+          "legendFormat": "{{cluster_group}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": { "mode": "palette-classic" },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [{ "color": "blue", "value": null }]
+          }
+        }
+      },
+      "options": {
+        "displayMode": "gradient",
+        "orientation": "horizontal",
+        "reduceOptions": { "calcs": ["lastNotNull"] },
+        "showUnfilled": true
+      }
+    },
+    {
+      "id": 101,
+      "type": "row",
+      "title": "Throughput",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 17 },
+      "collapsed": false
+    },
+    {
       "id": 5,
       "type": "timeseries",
       "title": "Query Throughput by Status",
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 4 },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 18 },
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "targets": [
         {
@@ -144,11 +475,12 @@
       "fieldConfig": {
         "defaults": {
           "unit": "reqps",
-          "custom": { "fillOpacity": 10, "lineWidth": 2 }
+          "custom": { "fillOpacity": 10, "lineWidth": 2, "stacking": { "mode": "normal", "group": "A" } }
         },
         "overrides": [
           { "matcher": { "id": "byName", "options": "Failed" }, "properties": [{ "id": "color", "value": { "fixedColor": "red", "mode": "fixed" } }] },
-          { "matcher": { "id": "byName", "options": "Success" }, "properties": [{ "id": "color", "value": { "fixedColor": "green", "mode": "fixed" } }] }
+          { "matcher": { "id": "byName", "options": "Success" }, "properties": [{ "id": "color", "value": { "fixedColor": "green", "mode": "fixed" } }] },
+          { "matcher": { "id": "byName", "options": "Cancelled" }, "properties": [{ "id": "color", "value": { "fixedColor": "orange", "mode": "fixed" } }] }
         ]
       },
       "options": { "tooltip": { "mode": "multi" }, "legend": { "displayMode": "list", "placement": "bottom" } }
@@ -157,7 +489,7 @@
       "id": 6,
       "type": "timeseries",
       "title": "Query Throughput by Engine",
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 4 },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 18 },
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "targets": [
         {
@@ -176,10 +508,63 @@
       "options": { "tooltip": { "mode": "multi" }, "legend": { "displayMode": "list", "placement": "bottom" } }
     },
     {
+      "id": 20,
+      "type": "timeseries",
+      "title": "Query Throughput by Protocol",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 26 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum by (protocol) (rate(queryflux_queries_total[1m]))",
+          "legendFormat": "{{protocol}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": { "fillOpacity": 10, "lineWidth": 2 }
+        }
+      },
+      "options": { "tooltip": { "mode": "multi" }, "legend": { "displayMode": "list", "placement": "bottom" } }
+    },
+    {
+      "id": 9,
+      "type": "timeseries",
+      "title": "Query Throughput per Cluster",
+      "description": "Queries completed per second per cluster group and engine",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 26 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum by (cluster_group, engine_type) (rate(queryflux_queries_total[1m]))",
+          "legendFormat": "{{cluster_group}} ({{engine_type}})",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "min": 0,
+          "custom": { "fillOpacity": 20, "lineWidth": 2 }
+        }
+      },
+      "options": { "tooltip": { "mode": "multi" }, "legend": { "displayMode": "list", "placement": "bottom" } }
+    },
+    {
+      "id": 102,
+      "type": "row",
+      "title": "Latency",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 34 },
+      "collapsed": false
+    },
+    {
       "id": 7,
       "type": "timeseries",
       "title": "Latency Percentiles (p50 / p95 / p99)",
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 12 },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 35 },
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "targets": [
         {
@@ -215,47 +600,107 @@
       "options": { "tooltip": { "mode": "multi" }, "legend": { "displayMode": "list", "placement": "bottom" } }
     },
     {
-      "id": 8,
+      "id": 21,
       "type": "timeseries",
-      "title": "SQL Translations by Dialect Pair",
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 12 },
+      "title": "p95 Latency by Engine",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 35 },
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "prometheus" },
-          "expr": "sum by (src_dialect, tgt_dialect) (rate(queryflux_translated_queries_total[1m]))",
-          "legendFormat": "{{src_dialect}} → {{tgt_dialect}}",
+          "expr": "histogram_quantile(0.95, sum by (le, engine_type) (rate(queryflux_query_duration_seconds_bucket[5m])))",
+          "legendFormat": "{{engine_type}}",
           "refId": "A"
         }
       ],
       "fieldConfig": {
         "defaults": {
-          "unit": "reqps",
-          "custom": { "fillOpacity": 10, "lineWidth": 2 }
+          "unit": "s",
+          "custom": { "lineWidth": 2 }
         }
       },
       "options": { "tooltip": { "mode": "multi" }, "legend": { "displayMode": "list", "placement": "bottom" } }
     },
     {
-      "id": 9,
+      "id": 22,
       "type": "timeseries",
-      "title": "Query Throughput per Cluster",
-      "description": "Queries completed per second per cluster. For short-lived engines (DuckDB), in-flight count is not measurable via Prometheus scraping — throughput is the correct signal.",
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 20 },
+      "title": "p95 Latency by Cluster Group",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 43 },
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "prometheus" },
-          "expr": "sum by (cluster_group, engine_type) (rate(queryflux_queries_total[1m]))",
-          "legendFormat": "{{cluster_group}} ({{engine_type}})",
+          "expr": "histogram_quantile(0.95, sum by (le, cluster_group) (rate(queryflux_query_duration_seconds_bucket[5m])))",
+          "legendFormat": "{{cluster_group}}",
           "refId": "A"
         }
       ],
       "fieldConfig": {
         "defaults": {
-          "unit": "reqps",
+          "unit": "s",
+          "custom": { "lineWidth": 2 }
+        }
+      },
+      "options": { "tooltip": { "mode": "multi" }, "legend": { "displayMode": "list", "placement": "bottom" } }
+    },
+    {
+      "id": 23,
+      "type": "heatmap",
+      "title": "Query Duration Distribution",
+      "description": "Heatmap of query execution durations across all engines",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 43 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum by (le) (increase(queryflux_query_duration_seconds_bucket[$__rate_interval]))",
+          "legendFormat": "{{le}}",
+          "format": "heatmap",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "hideFrom": { "tooltip": false, "viz": false, "legend": false }
+          }
+        }
+      },
+      "options": {
+        "calculate": false,
+        "cellGap": 1,
+        "color": { "mode": "scheme", "scheme": "Spectral", "steps": 64 },
+        "yAxis": { "unit": "s" }
+      }
+    },
+    {
+      "id": 103,
+      "type": "row",
+      "title": "Capacity & Errors",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 51 },
+      "collapsed": false
+    },
+    {
+      "id": 24,
+      "type": "timeseries",
+      "title": "Running Queries per Cluster",
+      "description": "In-flight queries per cluster, reconciled from engine ground truth",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 52 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "queryflux_running_queries",
+          "legendFormat": "{{cluster_group}}/{{cluster_name}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
           "min": 0,
-          "custom": { "fillOpacity": 20, "lineWidth": 2 }
+          "custom": { "fillOpacity": 20, "lineWidth": 2 },
+          "color": { "mode": "palette-classic" }
         }
       },
       "options": { "tooltip": { "mode": "multi" }, "legend": { "displayMode": "list", "placement": "bottom" } }
@@ -264,7 +709,7 @@
       "id": 10,
       "type": "timeseries",
       "title": "Queued Queries per Cluster Group",
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 20 },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 52 },
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "targets": [
         {
@@ -291,6 +736,412 @@
         }
       },
       "options": { "tooltip": { "mode": "multi" }, "legend": { "displayMode": "list", "placement": "bottom" } }
+    },
+    {
+      "id": 25,
+      "type": "timeseries",
+      "title": "Error Rate by Engine",
+      "description": "% of queries that failed, broken down by engine type",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 60 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "100 * sum by (engine_type) (rate(queryflux_queries_total{status=\"Failed\"}[5m])) / sum by (engine_type) (rate(queryflux_queries_total[5m]))",
+          "legendFormat": "{{engine_type}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "min": 0,
+          "custom": { "lineWidth": 2 },
+          "color": { "mode": "palette-classic" }
+        }
+      },
+      "options": { "tooltip": { "mode": "multi" }, "legend": { "displayMode": "list", "placement": "bottom" } }
+    },
+    {
+      "id": 26,
+      "type": "timeseries",
+      "title": "Error Rate by Cluster Group",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 60 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "100 * sum by (cluster_group) (rate(queryflux_queries_total{status=\"Failed\"}[5m])) / sum by (cluster_group) (rate(queryflux_queries_total[5m]))",
+          "legendFormat": "{{cluster_group}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "min": 0,
+          "custom": { "lineWidth": 2 },
+          "color": { "mode": "palette-classic" }
+        }
+      },
+      "options": { "tooltip": { "mode": "multi" }, "legend": { "displayMode": "list", "placement": "bottom" } }
+    },
+    {
+      "id": 104,
+      "type": "row",
+      "title": "Translation & Tags",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 68 },
+      "collapsed": false
+    },
+    {
+      "id": 8,
+      "type": "timeseries",
+      "title": "SQL Translations by Dialect Pair",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 69 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum by (src_dialect, tgt_dialect) (rate(queryflux_translated_queries_total[1m]))",
+          "legendFormat": "{{src_dialect}} → {{tgt_dialect}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": { "fillOpacity": 10, "lineWidth": 2 }
+        }
+      },
+      "options": { "tooltip": { "mode": "multi" }, "legend": { "displayMode": "list", "placement": "bottom" } }
+    },
+    {
+      "id": 27,
+      "type": "timeseries",
+      "title": "Top Query Tags",
+      "description": "Query volume by tag key/value (from X-QueryFlux-Tags header or routing scripts)",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 69 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "topk(10, sum by (tag_key, tag_value) (rate(queryflux_query_tags_total[5m])))",
+          "legendFormat": "{{tag_key}}={{tag_value}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": { "fillOpacity": 10, "lineWidth": 2 }
+        }
+      },
+      "options": { "tooltip": { "mode": "multi" }, "legend": { "displayMode": "table", "placement": "right" } }
+    },
+    {
+      "id": 28,
+      "type": "table",
+      "title": "Query Tags Summary",
+      "description": "Total queries per tag in the selected time range",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 77 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "topk(20, sum by (tag_key, tag_value, cluster_group) (increase(queryflux_query_tags_total[$__range])))",
+          "legendFormat": "{{tag_key}}={{tag_value}} @ {{cluster_group}}",
+          "format": "table",
+          "instant": true,
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": { "align": "auto", "displayMode": "auto" }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "Value" },
+            "properties": [
+              { "id": "displayName", "value": "Queries" },
+              { "id": "custom.displayMode", "value": "gradient-gauge" }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "showHeader": true,
+        "sortBy": [{ "displayName": "Queries", "desc": true }]
+      },
+      "transformations": [
+        { "id": "organize", "options": { "excludeByName": { "Time": true }, "renameByName": { "tag_key": "Tag Key", "tag_value": "Tag Value", "cluster_group": "Cluster Group" } } }
+      ]
+    },
+    {
+      "id": 105,
+      "type": "row",
+      "title": "Usage Breakdown",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 85 },
+      "collapsed": false
+    },
+    {
+      "id": 30,
+      "type": "piechart",
+      "title": "Usage by Tag Value ($tag_key)",
+      "description": "Query share for the selected tag key — use the Tag Key dropdown to switch dimensions (team, cost_center, etc.)",
+      "gridPos": { "h": 9, "w": 8, "x": 0, "y": 86 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum by (tag_value) (increase(queryflux_query_tags_total{tag_key=~\"$tag_key\", cluster_group=~\"$cluster_group\"}[$__range]))",
+          "legendFormat": "{{tag_value}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": { "mode": "palette-classic" }
+        }
+      },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "right", "values": ["value", "percent"] },
+        "pieType": "donut",
+        "tooltip": { "mode": "single" },
+        "reduceOptions": { "calcs": ["lastNotNull"] }
+      }
+    },
+    {
+      "id": 31,
+      "type": "piechart",
+      "title": "Usage by Tag Value & Cluster Group ($tag_key)",
+      "description": "How tag values distribute across cluster groups",
+      "gridPos": { "h": 9, "w": 8, "x": 8, "y": 86 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum by (tag_value, cluster_group) (increase(queryflux_query_tags_total{tag_key=~\"$tag_key\"}[$__range]))",
+          "legendFormat": "{{tag_value}} → {{cluster_group}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": { "mode": "palette-classic" }
+        }
+      },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "right", "values": ["value", "percent"] },
+        "pieType": "donut",
+        "tooltip": { "mode": "single" },
+        "reduceOptions": { "calcs": ["lastNotNull"] }
+      }
+    },
+    {
+      "id": 32,
+      "type": "bargauge",
+      "title": "Top Tag Values ($tag_key)",
+      "description": "Ranked tag values by query volume",
+      "gridPos": { "h": 9, "w": 8, "x": 16, "y": 86 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "topk(15, sum by (tag_value) (increase(queryflux_query_tags_total{tag_key=~\"$tag_key\", cluster_group=~\"$cluster_group\"}[$__range])))",
+          "legendFormat": "{{tag_value}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": { "mode": "palette-classic" },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [{ "color": "blue", "value": null }]
+          }
+        }
+      },
+      "options": {
+        "displayMode": "gradient",
+        "orientation": "horizontal",
+        "reduceOptions": { "calcs": ["lastNotNull"] },
+        "showUnfilled": true
+      }
+    },
+    {
+      "id": 33,
+      "type": "timeseries",
+      "title": "Tag Usage Over Time ($tag_key)",
+      "description": "Query rate for each value of the selected tag key over time",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 95 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum by (tag_value) (rate(queryflux_query_tags_total{tag_key=~\"$tag_key\", cluster_group=~\"$cluster_group\"}[5m]))",
+          "legendFormat": "{{tag_value}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": { "fillOpacity": 15, "lineWidth": 2, "stacking": { "mode": "normal", "group": "A" } }
+        }
+      },
+      "options": { "tooltip": { "mode": "multi" }, "legend": { "displayMode": "table", "placement": "right", "calcs": ["sum", "mean"] } }
+    },
+    {
+      "id": 34,
+      "type": "timeseries",
+      "title": "Tag Usage by Cluster Group ($tag_key)",
+      "description": "Per-group query rate for the selected tag key",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 95 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum by (tag_value, cluster_group) (rate(queryflux_query_tags_total{tag_key=~\"$tag_key\"}[5m]))",
+          "legendFormat": "{{tag_value}} → {{cluster_group}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": { "fillOpacity": 15, "lineWidth": 2 }
+        }
+      },
+      "options": { "tooltip": { "mode": "multi" }, "legend": { "displayMode": "table", "placement": "right", "calcs": ["sum", "mean"] } }
+    },
+    {
+      "id": 35,
+      "type": "table",
+      "title": "Usage Matrix: Engine × Protocol × Group",
+      "description": "Multi-dimensional query breakdown filtered by the dropdowns. Shows query counts and average latency per combination.",
+      "gridPos": { "h": 10, "w": 24, "x": 0, "y": 103 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum by (engine_type, protocol, cluster_group) (increase(queryflux_queries_total{engine_type=~\"$engine_type\", protocol=~\"$protocol\", cluster_group=~\"$cluster_group\"}[$__range]))",
+          "legendFormat": "",
+          "format": "table",
+          "instant": true,
+          "refId": "queries"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum by (engine_type, cluster_group) (increase(queryflux_query_duration_seconds_sum{engine_type=~\"$engine_type\", cluster_group=~\"$cluster_group\"}[$__range])) / sum by (engine_type, cluster_group) (increase(queryflux_query_duration_seconds_count{engine_type=~\"$engine_type\", cluster_group=~\"$cluster_group\"}[$__range]))",
+          "legendFormat": "",
+          "format": "table",
+          "instant": true,
+          "refId": "avg_latency"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "100 * sum by (engine_type, cluster_group) (increase(queryflux_queries_total{status=\"Failed\", engine_type=~\"$engine_type\", cluster_group=~\"$cluster_group\"}[$__range])) / sum by (engine_type, cluster_group) (increase(queryflux_queries_total{engine_type=~\"$engine_type\", cluster_group=~\"$cluster_group\"}[$__range]))",
+          "legendFormat": "",
+          "format": "table",
+          "instant": true,
+          "refId": "error_pct"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": { "align": "auto", "displayMode": "auto" }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "Value #queries" },
+            "properties": [
+              { "id": "displayName", "value": "Queries" },
+              { "id": "unit", "value": "short" },
+              { "id": "custom.displayMode", "value": "gradient-gauge" },
+              { "id": "color", "value": { "mode": "continuous-blues" } }
+            ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "Value #avg_latency" },
+            "properties": [
+              { "id": "displayName", "value": "Avg Latency" },
+              { "id": "unit", "value": "s" },
+              { "id": "decimals", "value": 3 }
+            ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "Value #error_pct" },
+            "properties": [
+              { "id": "displayName", "value": "Error %" },
+              { "id": "unit", "value": "percent" },
+              { "id": "decimals", "value": 1 },
+              { "id": "custom.displayMode", "value": "color-background" },
+              { "id": "thresholds", "value": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "yellow", "value": 1 }, { "color": "red", "value": 5 }] } }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "showHeader": true,
+        "sortBy": [{ "displayName": "Queries", "desc": true }]
+      },
+      "transformations": [
+        {
+          "id": "merge",
+          "options": {}
+        },
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": { "Time": true },
+            "renameByName": { "engine_type": "Engine", "protocol": "Protocol", "cluster_group": "Cluster Group" }
+          }
+        }
+      ]
+    },
+    {
+      "id": 36,
+      "type": "table",
+      "title": "Tag Usage Matrix ($tag_key)",
+      "description": "Queries per tag value by cluster group, filtered by the Tag Key dropdown. Use for cost attribution, team usage tracking, or workload analysis.",
+      "gridPos": { "h": 10, "w": 24, "x": 0, "y": 113 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "topk(25, sum by (tag_key, tag_value, cluster_group) (increase(queryflux_query_tags_total{tag_key=~\"$tag_key\", cluster_group=~\"$cluster_group\"}[$__range])))",
+          "legendFormat": "",
+          "format": "table",
+          "instant": true,
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": { "align": "auto", "displayMode": "auto" }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "Value" },
+            "properties": [
+              { "id": "displayName", "value": "Queries" },
+              { "id": "custom.displayMode", "value": "gradient-gauge" },
+              { "id": "color", "value": { "mode": "continuous-blues" } }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "showHeader": true,
+        "sortBy": [{ "displayName": "Queries", "desc": true }]
+      },
+      "transformations": [
+        { "id": "organize", "options": { "excludeByName": { "Time": true }, "renameByName": { "tag_key": "Tag Key", "tag_value": "Tag Value", "cluster_group": "Cluster Group" } } }
+      ]
     }
   ]
 }

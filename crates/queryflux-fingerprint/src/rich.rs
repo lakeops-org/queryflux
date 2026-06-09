@@ -31,57 +31,59 @@ pub struct QueryFingerprint {
 
 /// Compute a rich fingerprint for `original_sql`.
 ///
-/// `translated_sql` is the dialect-translated SQL already stored in `QueryContext.translated_sql`.
-/// `src_dialect` / `tgt_dialect` are polyglot-sql dialect name strings (from `SqlDialect::polyglot_name()`).
-///
-/// This function is synchronous and takes ~10–100 μs. Call it inside `tokio::spawn`.
+/// Returns `None` if polyglot-sql fails to parse the SQL — callers should leave
+/// hash/digest fields unpopulated rather than writing unreliable data.
 pub fn rich_fingerprint(
     original_sql: &str,
     translated_sql: Option<&str>,
     src_dialect: &str,
     tgt_dialect: &str,
-) -> QueryFingerprint {
+) -> Option<QueryFingerprint> {
     let (query_hash, query_parameterized_hash, digest_text, is_deterministic) =
-        fingerprint_one(original_sql, src_dialect);
+        fingerprint_one(original_sql, src_dialect)?;
 
     let (translated_query_hash, translated_digest_text) = match translated_sql {
         Some(tsql) => {
-            let (_, hash, digest, _) = fingerprint_one(tsql, tgt_dialect);
+            let (_, hash, digest, _) = fingerprint_one(tsql, tgt_dialect)?;
             (Some(hash), Some(digest))
         }
         None => (None, None),
     };
 
-    QueryFingerprint {
+    Some(QueryFingerprint {
         query_hash,
         query_parameterized_hash,
         digest_text,
         translated_query_hash,
         translated_digest_text,
         is_deterministic,
-    }
+    })
 }
 
 /// Normalize and fingerprint a single SQL string using polyglot-sql.
-/// Returns `(query_hash, parameterized_hash, digest_text, is_deterministic)`.
-fn fingerprint_one(sql: &str, dialect: &str) -> (u64, u64, String, bool) {
-    match try_polyglot(sql, dialect) {
-        Ok(result) => result,
-        Err(e) => {
-            warn!(
-                dialect,
-                "polyglot-sql fingerprint failed, using fallback: {e}"
-            );
-            let (query_hash, parameterized_hash, digest_text) = fallback::fallback_fingerprint(sql);
-            let is_deterministic = !contains_nondeterministic_simple(sql);
-            (
-                query_hash,
-                parameterized_hash,
-                digest_text,
-                is_deterministic,
-            )
-        }
+/// Returns `None` if parsing fails or the thread overflows — no fallback.
+fn fingerprint_one(sql: &str, dialect: &str) -> Option<(u64, u64, String, bool)> {
+    let sql_owned = sql.to_string();
+    let dialect_owned = dialect.to_string();
+
+    // polyglot-sql is a recursive-descent parser (59K lines, 605 fns) that overflows the
+    // default tokio worker stack for complex SQL. Run it on a dedicated thread with an
+    // explicit 16MB stack. .ok() inside the closure converts the Result to Option so no
+    // non-Send error type crosses the thread boundary.
+    let result = std::thread::Builder::new()
+        .stack_size(16 * 1024 * 1024)
+        .spawn(move || try_polyglot(&sql_owned, &dialect_owned).ok())
+        .ok()
+        .and_then(|h| h.join().ok())
+        .flatten();
+
+    if result.is_none() {
+        warn!(
+            dialect,
+            "polyglot-sql fingerprint failed or overflowed — skipping"
+        );
     }
+    result
 }
 
 fn try_polyglot(
@@ -143,22 +145,4 @@ fn contains_nondeterministic_expr(expr: &polyglot_sql::expressions::Expression) 
         }
         _ => false,
     })
-}
-
-/// Simple string-based non-determinism check used in fallback path.
-fn contains_nondeterministic_simple(sql: &str) -> bool {
-    let lower = sql.to_lowercase();
-    [
-        "now(",
-        "random(",
-        "rand(",
-        "uuid(",
-        "getdate(",
-        "sysdate",
-        "current_timestamp",
-        "current_date",
-        "current_time",
-    ]
-    .iter()
-    .any(|p| lower.contains(p))
 }
