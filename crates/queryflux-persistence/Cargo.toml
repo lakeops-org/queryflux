@@ -13,6 +13,7 @@ dashmap = { workspace = true }
 sqlx = { version = "0.8.6", features = ["runtime-tokio-rustls", "postgres", "chrono", "uuid", "json", "migrate"] }
 chrono = { workspace = true }
 utoipa = { workspace = true }
+tracing = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "macros"] }

@@ -1336,7 +1336,7 @@ struct TestClusterConfigRequest {
     config: serde_json::Value,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 struct TestClusterConfigResponse {
     ok: bool,
     message: String,
@@ -1347,8 +1347,9 @@ struct TestClusterConfigResponse {
     post,
     path = "/admin/config/clusters/test",
     tag = "config",
+    request_body = TestClusterConfigRequest,
     responses(
-        (status = 200, description = "Connection test result", body = str),
+        (status = 200, description = "Connection test result", body = TestClusterConfigResponse),
         (status = 500, description = "Internal error", body = str),
     )
 )]
@@ -1670,7 +1671,7 @@ async fn delete_user_script_handler(
     path = "/admin/config/security",
     tag = "config",
     responses(
-        (status = 200, description = "Security config JSON", body = str),
+        (status = 200, description = "Security config JSON", body = serde_json::Value),
     )
 )]
 async fn get_security_config_handler(State(state): State<Arc<AdminState>>) -> impl IntoResponse {
@@ -1700,7 +1701,7 @@ fn group_id_maps(
     path = "/admin/config/routing",
     tag = "config",
     responses(
-        (status = 200, description = "Routing config JSON", body = str),
+        (status = 200, description = "Routing config JSON", body = serde_json::Value),
         (status = 500, description = "Internal error", body = str),
     )
 )]
@@ -1740,6 +1741,7 @@ async fn get_routing_config_handler(State(state): State<Arc<AdminState>>) -> imp
     put,
     path = "/admin/config/security",
     tag = "config",
+    request_body = UpsertSecurityConfig,
     responses(
         (status = 204, description = "Saved"),
         (status = 503, description = "Postgres persistence not configured", body = str),
@@ -1769,6 +1771,7 @@ async fn put_security_config_handler(
     put,
     path = "/admin/config/routing",
     tag = "config",
+    request_body = UpsertRoutingConfig,
     responses(
         (status = 204, description = "Saved"),
         (status = 400, description = "Invalid routing config", body = str),
@@ -1893,7 +1896,7 @@ async fn swagger_ui_handler() -> impl IntoResponse {
     path = "/admin/config/guardrails",
     tag = "config",
     responses(
-        (status = 200, description = "Guardrails config JSON (`{ global: [...], groups: {...} }`)", body = str),
+        (status = 200, description = "Guardrails config JSON (`{ global: [...], groups: {...} }`)", body = serde_json::Value),
     )
 )]
 async fn get_guardrails_config_handler(State(state): State<Arc<AdminState>>) -> impl IntoResponse {

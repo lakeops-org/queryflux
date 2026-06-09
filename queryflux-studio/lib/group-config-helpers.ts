@@ -60,10 +60,9 @@ export function normalizeClusterGroupRecord(raw: unknown): ClusterGroupConfigRec
     const raw = r.defaultTags ?? r.default_tags;
     if (raw !== null && typeof raw === "object" && !Array.isArray(raw)) {
       return Object.fromEntries(
-        Object.entries(raw as Record<string, unknown>).map(([k, v]) => [
-          k,
-          typeof v === "string" ? v : null,
-        ]),
+        Object.entries(raw as Record<string, unknown>)
+          .filter(([, v]) => typeof v === "string" || v === null)
+          .map(([k, v]) => [k, v as string | null]),
       ) as Record<string, string | null>;
     }
     return {} as Record<string, string | null>;

@@ -263,7 +263,15 @@ impl ClusterGroupConfigRecord {
 
         let default_tags =
             serde_json::from_value::<queryflux_core::tags::QueryTags>(self.default_tags.clone())
-                .unwrap_or_default();
+                .unwrap_or_else(|e| {
+                    tracing::warn!(
+                        group_id = self.id,
+                        group_name = %self.name,
+                        error = %e,
+                        "malformed default_tags in DB — using empty tag set"
+                    );
+                    Default::default()
+                });
 
         ClusterGroupConfig {
             enabled: self.enabled,

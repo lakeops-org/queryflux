@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { AlertCircle, ChevronDown, ChevronUp, Loader2, X } from "lucide-react";
 import { getGuardrailsConfig, listUserScripts, putGuardrailsConfig, renameGroupConfig, upsertGroupConfig } from "@/lib/api";
@@ -52,7 +52,9 @@ export function GroupFormDialog({
   const [translationScriptIds, setTranslationScriptIds] = useState<number[]>([]);
   const [scriptLibrary, setScriptLibrary] = useState<UserScriptRecord[]>([]);
   const [addScriptId, setAddScriptId] = useState<string>("");
-  const [tagRows, setTagRows] = useState<{ key: string; value: string }[]>([]);
+  const tagIdRef = useRef(0);
+  const nextTagId = () => ++tagIdRef.current;
+  const [tagRows, setTagRows] = useState<{ id: number; key: string; value: string }[]>([]);
   const [guardRows, setGuardRows] = useState<GuardRow[]>([]);
   const [guardrailsFull, setGuardrailsFull] = useState<GuardrailsConfig | null>(null);
   const [guardScripts, setGuardScripts] = useState<UserScriptRecord[]>([]);
@@ -92,7 +94,7 @@ export function GroupFormDialog({
       );
       setTranslationScriptIds([...initial.translationScriptIds]);
       setTagRows(
-        Object.entries(initial.defaultTags ?? {}).map(([k, v]) => ({ key: k, value: v ?? "" })),
+        Object.entries(initial.defaultTags ?? {}).map(([k, v]) => ({ id: nextTagId(), key: k, value: v ?? "" })),
       );
       {
         const p = parseStrategyRecord(initial.strategy);
@@ -702,13 +704,13 @@ export function GroupFormDialog({
             </div>
             {tagRows.length > 0 ? (
               <ul className="space-y-1.5">
-                {tagRows.map((row, idx) => (
-                  <li key={idx} className="flex items-center gap-2">
+                {tagRows.map((row) => (
+                  <li key={row.id} className="flex items-center gap-2">
                     <input
                       value={row.key}
                       onChange={(e) =>
                         setTagRows((prev) =>
-                          prev.map((r, i) => (i === idx ? { ...r, key: e.target.value } : r)),
+                          prev.map((r) => (r.id === row.id ? { ...r, key: e.target.value } : r)),
                         )
                       }
                       placeholder="key"
@@ -720,7 +722,7 @@ export function GroupFormDialog({
                       value={row.value}
                       onChange={(e) =>
                         setTagRows((prev) =>
-                          prev.map((r, i) => (i === idx ? { ...r, value: e.target.value } : r)),
+                          prev.map((r) => (r.id === row.id ? { ...r, value: e.target.value } : r)),
                         )
                       }
                       placeholder="value (empty = key-only)"
@@ -730,7 +732,7 @@ export function GroupFormDialog({
                     <button
                       type="button"
                       disabled={saving}
-                      onClick={() => setTagRows((prev) => prev.filter((_, i) => i !== idx))}
+                      onClick={() => setTagRows((prev) => prev.filter((r) => r.id !== row.id))}
                       className="p-1 rounded text-red-400 hover:bg-red-50 disabled:opacity-40"
                       title="Remove tag"
                     >
@@ -745,7 +747,7 @@ export function GroupFormDialog({
             <button
               type="button"
               disabled={saving}
-              onClick={() => setTagRows((prev) => [...prev, { key: "", value: "" }])}
+              onClick={() => setTagRows((prev) => [...prev, { id: nextTagId(), key: "", value: "" }])}
               className="text-xs font-semibold px-3 py-1.5 rounded-lg border border-slate-200 text-slate-600 bg-white hover:bg-slate-50 disabled:opacity-40"
             >
               + Add tag
