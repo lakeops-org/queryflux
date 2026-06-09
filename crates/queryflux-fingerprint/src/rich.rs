@@ -43,10 +43,10 @@ pub fn rich_fingerprint(
         fingerprint_one(original_sql, src_dialect)?;
 
     let (translated_query_hash, translated_digest_text) = match translated_sql {
-        Some(tsql) => {
-            let (_, hash, digest, _) = fingerprint_one(tsql, tgt_dialect)?;
-            (Some(hash), Some(digest))
-        }
+        Some(tsql) => match fingerprint_one(tsql, tgt_dialect) {
+            Some((_, hash, digest, _)) => (Some(hash), Some(digest)),
+            None => (None, None),
+        },
         None => (None, None),
     };
 
