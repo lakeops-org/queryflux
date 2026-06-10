@@ -468,6 +468,8 @@ export interface GuardSpecDto {
   url?: string;
   /** http_webhook / python_script: timeout in ms */
   timeout_ms?: number | null;
+  /** http_webhook: retries after the first failed attempt */
+  retry_count?: number | null;
   /** python_script: numeric id of a guard script (kind="guard") managed on the Guardrails page */
   script_id?: number;
   /** http_webhook: "deny" (default) | "allow" when the webhook is unreachable */

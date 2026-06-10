@@ -55,13 +55,32 @@ pub struct GuardSpec {
 }
 
 impl GuardSpec {
-    /// Returns an error when `kind` is `BuiltIn` but `name` is absent, since the name
-    /// is required to resolve which built-in guard to instantiate.
+    /// Returns an error when required fields are absent.
     pub fn validate(&self) -> Result<(), String> {
-        if matches!(self.kind, GuardKind::BuiltIn) && self.name.is_none() {
-            return Err("built_in guard is missing required field \"name\"".to_string());
+        match &self.kind {
+            GuardKind::BuiltIn => match self.name.as_deref() {
+                Some("read_only" | "row_limit" | "require_predicate") => Ok(()),
+                Some(other) => Err(format!("unsupported built_in guard name \"{other}\"")),
+                None => Err("built_in guard is missing required field \"name\"".to_string()),
+            },
+            GuardKind::PythonScript {
+                script_id, script, ..
+            } => {
+                if script.is_none() && script_id.is_none() {
+                    return Err(
+                        "python_script guard requires either \"script\" or \"script_id\""
+                            .to_string(),
+                    );
+                }
+                Ok(())
+            }
+            GuardKind::HttpWebhook { url, .. } => {
+                if url.trim().is_empty() {
+                    return Err("http_webhook guard is missing required field \"url\"".to_string());
+                }
+                Ok(())
+            }
         }
-        Ok(())
     }
 }
 
@@ -71,17 +90,20 @@ impl GuardSpec {
 pub enum GuardKind {
     BuiltIn,
     PythonScript {
-        script_id: i64,
+        script_id: Option<i64>,
+        script: Option<String>,
         timeout_ms: Option<u64>,
     },
     HttpWebhook {
         url: String,
         timeout_ms: Option<u64>,
+        retry_count: Option<u32>,
+        headers: Option<HashMap<String, String>>,
         fail_behavior: Option<FailBehavior>,
     },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum FailBehavior {
     #[default]
@@ -137,6 +159,8 @@ mod tests {
                         kind: GuardKind::HttpWebhook {
                             url: "https://hooks.example.com/guard".to_string(),
                             timeout_ms: Some(5000),
+                            retry_count: Some(1),
+                            headers: None,
                             fail_behavior: Some(FailBehavior::Allow),
                         },
                         name: None,
@@ -156,10 +180,14 @@ mod tests {
             GuardKind::HttpWebhook {
                 url,
                 timeout_ms,
+                retry_count,
+                headers,
                 fail_behavior,
             } => {
                 assert_eq!(url, "https://hooks.example.com/guard");
                 assert_eq!(*timeout_ms, Some(5000));
+                assert_eq!(*retry_count, Some(1));
+                assert!(headers.is_none());
                 assert!(matches!(fail_behavior, Some(FailBehavior::Allow)));
             }
             _ => panic!("expected HttpWebhook"),
@@ -203,12 +231,68 @@ mod tests {
         match &cfg.global.plan[0].kind {
             GuardKind::PythonScript {
                 script_id,
+                script,
                 timeout_ms,
             } => {
-                assert_eq!(*script_id, 42);
+                assert_eq!(*script_id, Some(42));
+                assert!(script.is_none());
                 assert_eq!(*timeout_ms, Some(2500));
             }
             _ => panic!("expected PythonScript"),
         }
+    }
+
+    #[test]
+    fn validate_accepts_external_guard_kinds() {
+        let script = GuardSpec {
+            kind: GuardKind::PythonScript {
+                script_id: Some(42),
+                script: None,
+                timeout_ms: Some(2500),
+            },
+            name: None,
+            params: GuardParams::default(),
+        };
+        script.validate().expect("python_script should validate");
+
+        let webhook = GuardSpec {
+            kind: GuardKind::HttpWebhook {
+                url: "https://hooks.example.com/guard".to_string(),
+                timeout_ms: Some(500),
+                retry_count: Some(1),
+                headers: None,
+                fail_behavior: Some(FailBehavior::Deny),
+            },
+            name: None,
+            params: GuardParams::default(),
+        };
+        webhook.validate().expect("http_webhook should validate");
+    }
+
+    #[test]
+    fn validate_rejects_missing_external_guard_fields() {
+        let script = GuardSpec {
+            kind: GuardKind::PythonScript {
+                script_id: None,
+                script: None,
+                timeout_ms: None,
+            },
+            name: None,
+            params: GuardParams::default(),
+        };
+        assert!(script.validate().unwrap_err().contains("script"));
+
+        let webhook = GuardSpec {
+            kind: GuardKind::HttpWebhook {
+                url: String::new(),
+                timeout_ms: None,
+                retry_count: None,
+                headers: None,
+                fail_behavior: None,
+            },
+            name: None,
+            params: GuardParams::default(),
+        };
+        assert!(webhook.validate().unwrap_err().contains("url"));
     }
 }

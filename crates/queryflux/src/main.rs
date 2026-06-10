@@ -30,6 +30,8 @@ use queryflux_frontend::{
 };
 use queryflux_guardrails::{
     built_in::{Guard, ReadOnlyGuard, RequirePredicateGuard, RowLimitGuard},
+    config::FailBehavior,
+    external::{HttpWebhookGuard, MisconfiguredGuard, PythonScriptGuard},
     GuardChain,
 };
 use queryflux_metrics::{
@@ -39,7 +41,7 @@ use queryflux_metrics::{
 use queryflux_persistence::cluster_config::{UpsertClusterConfig, UpsertClusterGroupConfig};
 use queryflux_persistence::{
     in_memory::InMemoryPersistence, postgres::PostgresStore, AdminStore, ClusterConfigStore,
-    ProxySettingsStore, RoutingConfigStore,
+    ProxySettingsStore, RoutingConfigStore, KIND_GUARD,
 };
 use queryflux_routing::{
     chain::RouterChain,
@@ -699,22 +701,24 @@ async fn main() -> Result<()> {
     } else {
         HashMap::new()
     };
+    let guard_script_bodies = load_guard_script_bodies(pg_store.as_deref()).await;
 
     // --- Build guard chains: DB-stored config (UI-managed) takes precedence over YAML ---
     let (guard_chain, group_guard_chains) = if let Some(pg) = &pg_store {
         match pg.get_proxy_setting("guardrails_config").await {
             Ok(Some(v)) => {
-                let (db_global, db_groups) = build_guard_chains_from_db_value(&v);
+                let (db_global, db_groups) =
+                    build_guard_chains_from_db_value(&v, &guard_script_bodies);
                 if db_global.is_some() || !db_groups.is_empty() {
                     (db_global, db_groups)
                 } else {
-                    build_guard_chains(&config)
+                    build_guard_chains(&config, &guard_script_bodies)
                 }
             }
-            _ => build_guard_chains(&config),
+            _ => build_guard_chains(&config, &guard_script_bodies),
         }
     } else {
-        build_guard_chains(&config)
+        build_guard_chains(&config, &guard_script_bodies)
     };
 
     // --- Wrap hot-reloadable fields in LiveConfig ---
@@ -1033,9 +1037,12 @@ async fn main() -> Result<()> {
                 live: &Arc<tokio::sync::RwLock<LiveConfig>>,
             ) {
                 if let Some(store) = admin {
+                    let guard_script_bodies =
+                        load_guard_script_bodies_from_admin(store.as_ref()).await;
                     match store.get_proxy_setting("guardrails_config").await {
                         Ok(Some(v)) => {
-                            let (global, groups) = build_guard_chains_from_db_value(&v);
+                            let (global, groups) =
+                                build_guard_chains_from_db_value(&v, &guard_script_bodies);
                             let mut w = live.write().await;
                             w.guard_chain = global;
                             w.group_guard_chains = groups;
@@ -1681,6 +1688,7 @@ async fn reload_live_config(
             tracing::warn!(error = %e, "reload: load_group_translation_bodies failed");
             HashMap::new()
         });
+    let guard_script_bodies = load_guard_script_bodies(Some(pg)).await;
 
     let mut live = build_live_config(
         &cluster_records,
@@ -1696,7 +1704,7 @@ async fn reload_live_config(
 
     // Load guardrails from DB (UI-managed). Overrides any YAML-configured guard chains.
     if let Ok(Some(v)) = pg.get_proxy_setting("guardrails_config").await {
-        let (global, groups) = build_guard_chains_from_db_value(&v);
+        let (global, groups) = build_guard_chains_from_db_value(&v, &guard_script_bodies);
         live.guard_chain = global;
         live.group_guard_chains = groups;
     }
@@ -1704,12 +1712,58 @@ async fn reload_live_config(
     Ok(live)
 }
 
+async fn load_guard_script_bodies(pg: Option<&PostgresStore>) -> HashMap<i64, String> {
+    let Some(pg) = pg else {
+        return HashMap::new();
+    };
+    load_guard_script_bodies_from_admin(pg).await
+}
+
+async fn load_guard_script_bodies_from_admin(admin: &dyn AdminStore) -> HashMap<i64, String> {
+    admin
+        .list_user_scripts(Some(KIND_GUARD))
+        .await
+        .map(|scripts| scripts.into_iter().map(|s| (s.id, s.body)).collect())
+        .unwrap_or_else(|e| {
+            tracing::warn!("Failed to load guard scripts from persistence: {e}");
+            HashMap::new()
+        })
+}
+
+fn resolve_python_guard_script(
+    inline_script: Option<String>,
+    script_id: Option<i64>,
+    timeout_ms: Option<u64>,
+    guard_script_bodies: &HashMap<i64, String>,
+) -> Box<dyn Guard> {
+    if let Some(script) = inline_script {
+        return Box::new(PythonScriptGuard { script, timeout_ms });
+    }
+    if let Some(script_id) = script_id {
+        if let Some(script) = guard_script_bodies.get(&script_id) {
+            return Box::new(PythonScriptGuard {
+                script: script.clone(),
+                timeout_ms,
+            });
+        }
+        return Box::new(MisconfiguredGuard {
+            guard_name: "python_script",
+            reason: format!("python_script guard references missing guard script id {script_id}"),
+        });
+    }
+    Box::new(MisconfiguredGuard {
+        guard_name: "python_script",
+        reason: "python_script guard requires either script or script_id".to_string(),
+    })
+}
+
 /// Build YAML guard specs into a `GuardChain`. Returns `None` when the list is empty
-/// or contains only unrecognised/unimplemented entries.
+/// or contains only unrecognised entries.
 fn build_chain_from_yaml_specs(
     specs: &[queryflux_core::config::GuardSpecConfig],
+    guard_script_bodies: &HashMap<i64, String>,
 ) -> Option<Arc<GuardChain>> {
-    use queryflux_core::config::GuardKindConfig;
+    use queryflux_core::config::{GuardFailBehaviorConfig, GuardKindConfig};
     let mut guards: Vec<Box<dyn Guard>> = Vec::new();
     for spec in specs {
         match &spec.kind {
@@ -1729,8 +1783,26 @@ fn build_chain_from_yaml_specs(
                     other => tracing::warn!(name = other, "Unknown built-in guard name; skipping"),
                 }
             }
-            GuardKindConfig::HttpWebhook { .. } => {
-                tracing::warn!("HttpWebhook guards not yet implemented; skipping");
+            GuardKindConfig::PythonScript => {
+                let guard = resolve_python_guard_script(
+                    spec.script.clone(),
+                    spec.script_id,
+                    spec.timeout_ms,
+                    guard_script_bodies,
+                );
+                guards.push(guard);
+            }
+            GuardKindConfig::HttpWebhook => {
+                guards.push(Box::new(HttpWebhookGuard {
+                    url: spec.url.clone().unwrap_or_default(),
+                    timeout_ms: spec.timeout_ms,
+                    retry_count: spec.retry_count.unwrap_or(0),
+                    fail_behavior: match spec.fail_behavior {
+                        Some(GuardFailBehaviorConfig::Allow) => FailBehavior::Allow,
+                        _ => FailBehavior::Deny,
+                    },
+                    headers: spec.headers.clone().unwrap_or_default(),
+                }));
             }
         }
     }
@@ -1744,28 +1816,40 @@ fn build_chain_from_yaml_specs(
 /// Build global + per-group guard chains from the YAML `guardrails:` section.
 fn build_guard_chains(
     config: &queryflux_core::config::ProxyConfig,
+    guard_script_bodies: &HashMap<i64, String>,
 ) -> (Option<Arc<GuardChain>>, HashMap<String, Arc<GuardChain>>) {
     let Some(cfg) = config.guardrails.as_ref() else {
         return (None, HashMap::new());
     };
-    let global = build_chain_from_yaml_specs(&cfg.global);
+    let global = build_chain_from_yaml_specs(&cfg.global, guard_script_bodies);
     let groups = cfg
         .groups
         .iter()
         .filter_map(|(name, specs)| {
-            build_chain_from_yaml_specs(specs).map(|chain| (name.clone(), chain))
+            build_chain_from_yaml_specs(specs, guard_script_bodies)
+                .map(|chain| (name.clone(), chain))
         })
         .collect();
     (global, groups)
 }
 
 /// Build DB guard specs (kind string format) into a `GuardChain`.
-fn build_chain_from_db_specs(specs: &serde_json::Value) -> Option<Arc<GuardChain>> {
+fn build_chain_from_db_specs(
+    specs: &serde_json::Value,
+    guard_script_bodies: &HashMap<i64, String>,
+) -> Option<Arc<GuardChain>> {
     struct DbGuardSpec {
         kind: String,
         name: Option<String>,
         max_rows: Option<u64>,
         applies_to: Option<Vec<String>>,
+        script_id: Option<i64>,
+        script: Option<String>,
+        url: Option<String>,
+        timeout_ms: Option<u64>,
+        retry_count: Option<u32>,
+        fail_behavior: Option<String>,
+        headers: Option<HashMap<String, String>>,
     }
     fn parse_spec(item: &serde_json::Value) -> Option<DbGuardSpec> {
         let o = item.as_object()?;
@@ -1779,6 +1863,23 @@ fn build_chain_from_db_specs(specs: &serde_json::Value) -> Option<Arc<GuardChain
             applies_to: o.get("applies_to").and_then(|v| v.as_array()).map(|arr| {
                 arr.iter()
                     .filter_map(|s| s.as_str().map(|s| s.to_string()))
+                    .collect()
+            }),
+            script_id: o.get("script_id").and_then(|v| v.as_i64()),
+            script: o.get("script").and_then(|v| v.as_str()).map(str::to_string),
+            url: o.get("url").and_then(|v| v.as_str()).map(str::to_string),
+            timeout_ms: o.get("timeout_ms").and_then(|v| v.as_u64()),
+            retry_count: o
+                .get("retry_count")
+                .and_then(|v| v.as_u64())
+                .and_then(|v| u32::try_from(v).ok()),
+            fail_behavior: o
+                .get("fail_behavior")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+            headers: o.get("headers").and_then(|v| v.as_object()).map(|obj| {
+                obj.iter()
+                    .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
                     .collect()
             }),
         })
@@ -1803,10 +1904,25 @@ fn build_chain_from_db_specs(specs: &serde_json::Value) -> Option<Arc<GuardChain
                     other => tracing::warn!(name = other, "Unknown built-in guard name; skipping"),
                 }
             }
-            "http_webhook" => tracing::warn!("HttpWebhook guards not yet implemented; skipping"),
-            "python_script" => tracing::warn!(
-                "PythonScript guards not yet implemented; skipping (body stored inline)"
-            ),
+            "http_webhook" => guards.push(Box::new(HttpWebhookGuard {
+                url: spec.url.unwrap_or_default(),
+                timeout_ms: spec.timeout_ms,
+                retry_count: spec.retry_count.unwrap_or(0),
+                fail_behavior: match spec.fail_behavior.as_deref() {
+                    Some("allow") => FailBehavior::Allow,
+                    _ => FailBehavior::Deny,
+                },
+                headers: spec.headers.unwrap_or_default(),
+            })),
+            "python_script" => {
+                let guard = resolve_python_guard_script(
+                    spec.script,
+                    spec.script_id,
+                    spec.timeout_ms,
+                    guard_script_bodies,
+                );
+                guards.push(guard);
+            }
             other => tracing::warn!(kind = other, "Unknown guard kind; skipping"),
         }
     }
@@ -1823,6 +1939,7 @@ fn build_chain_from_db_specs(specs: &serde_json::Value) -> Option<Arc<GuardChain
 /// `{ global: GuardSpecDto[], groups: Record<string, GuardSpecDto[]> }`.
 fn build_guard_chains_from_db_value(
     v: &serde_json::Value,
+    guard_script_bodies: &HashMap<i64, String>,
 ) -> (Option<Arc<GuardChain>>, HashMap<String, Arc<GuardChain>>) {
     let Some(obj) = v.as_object() else {
         return (None, HashMap::new());
@@ -1831,7 +1948,7 @@ fn build_guard_chains_from_db_value(
         .get("global")
         .cloned()
         .unwrap_or(serde_json::Value::Array(vec![]));
-    let global = build_chain_from_db_specs(&global_val);
+    let global = build_chain_from_db_specs(&global_val, guard_script_bodies);
 
     let groups = obj
         .get("groups")
@@ -1840,7 +1957,8 @@ fn build_guard_chains_from_db_value(
             groups_obj
                 .iter()
                 .filter_map(|(name, specs)| {
-                    build_chain_from_db_specs(specs).map(|chain| (name.clone(), chain))
+                    build_chain_from_db_specs(specs, guard_script_bodies)
+                        .map(|chain| (name.clone(), chain))
                 })
                 .collect()
         })

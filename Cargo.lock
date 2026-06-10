@@ -3738,9 +3738,11 @@ version = "0.2.0"
 dependencies = [
  "async-trait",
  "polyglot-sql 0.3.2",
+ "pyo3",
  "queryflux-core",
  "queryflux-persistence",
  "regex",
+ "reqwest 0.12.28",
  "serde",
  "serde_json",
  "tokio",

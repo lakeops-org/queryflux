@@ -90,6 +90,23 @@ pub struct GuardrailsConfig {
     pub groups: HashMap<String, Vec<GuardSpecConfig>>,
 }
 
+impl GuardrailsConfig {
+    /// Validate guardrails at config load time so unsupported kinds do not silently no-op.
+    pub fn validate(&self) -> std::result::Result<(), String> {
+        for (idx, spec) in self.global.iter().enumerate() {
+            spec.validate()
+                .map_err(|e| format!("guardrails.global[{idx}]: {e}"))?;
+        }
+        for (group, specs) in &self.groups {
+            for (idx, spec) in specs.iter().enumerate() {
+                spec.validate()
+                    .map_err(|e| format!("guardrails.groups.{group}[{idx}]: {e}"))?;
+            }
+        }
+        Ok(())
+    }
+}
+
 /// One guard entry in the config.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -97,6 +114,27 @@ pub struct GuardSpecConfig {
     pub kind: GuardKindConfig,
     #[serde(default)]
     pub name: Option<String>,
+    /// `python_script`: numeric id of a guard script.
+    #[serde(default)]
+    pub script_id: Option<i64>,
+    /// `python_script`: inline script body. Prefer `script_id` for Studio-managed configs.
+    #[serde(default)]
+    pub script: Option<String>,
+    /// `http_webhook`: endpoint URL.
+    #[serde(default)]
+    pub url: Option<String>,
+    /// `http_webhook` / `python_script`: timeout in milliseconds.
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
+    /// `http_webhook`: number of retries after the first failed attempt.
+    #[serde(default)]
+    pub retry_count: Option<u32>,
+    /// `http_webhook`: `deny` (default) or `allow` when the webhook cannot be reached.
+    #[serde(default)]
+    pub fail_behavior: Option<GuardFailBehaviorConfig>,
+    /// `http_webhook`: extra request headers sent with every call.
+    #[serde(default)]
+    pub headers: Option<HashMap<String, String>>,
     /// `row_limit`: maximum rows allowed (default: none).
     #[serde(default)]
     pub max_rows: Option<u64>,
@@ -105,16 +143,48 @@ pub struct GuardSpecConfig {
     pub applies_to: Option<Vec<String>>,
 }
 
+impl GuardSpecConfig {
+    pub fn validate(&self) -> std::result::Result<(), String> {
+        match &self.kind {
+            GuardKindConfig::BuiltIn => match self.name.as_deref() {
+                Some("read_only" | "row_limit" | "require_predicate") => Ok(()),
+                Some(other) => Err(format!("unsupported built_in guard name \"{other}\"")),
+                None => Err("built_in guard is missing required field \"name\"".to_string()),
+            },
+            GuardKindConfig::PythonScript => {
+                if self.script.is_none() && self.script_id.is_none() {
+                    return Err(
+                        "python_script guard requires either \"script\" or \"script_id\""
+                            .to_string(),
+                    );
+                }
+                Ok(())
+            }
+            GuardKindConfig::HttpWebhook => {
+                if self.url.as_deref().unwrap_or_default().trim().is_empty() {
+                    return Err("http_webhook guard is missing required field \"url\"".to_string());
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
 /// Which kind of guard this is.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GuardKindConfig {
     BuiltIn,
-    HttpWebhook {
-        url: String,
-        #[serde(default)]
-        timeout_ms: Option<u64>,
-    },
+    PythonScript,
+    HttpWebhook,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum GuardFailBehaviorConfig {
+    #[default]
+    Deny,
+    Allow,
 }
 
 // ---------------------------------------------------------------------------
@@ -904,7 +974,10 @@ pub struct StaticColumnDef {
 
 #[cfg(test)]
 mod tests {
-    use super::{PersistenceConfig, PostgresPersistenceConfig, ProxyConfig, RouterConfig};
+    use super::{
+        GuardKindConfig, GuardSpecConfig, PersistenceConfig, PostgresPersistenceConfig,
+        ProxyConfig, RouterConfig,
+    };
 
     #[test]
     fn router_config_deserializes_admin_style_json_routers_array() {
@@ -1010,6 +1083,74 @@ queryflux: {}
         assert!(cfg.cluster_groups.is_empty());
         assert!(cfg.routers.is_empty());
         assert!(cfg.routing_fallback.is_empty());
+    }
+
+    #[test]
+    fn guardrails_validation_accepts_external_guard_kinds() {
+        let python = GuardSpecConfig {
+            kind: GuardKindConfig::PythonScript,
+            name: None,
+            script_id: Some(42),
+            script: None,
+            url: None,
+            timeout_ms: Some(250),
+            retry_count: None,
+            fail_behavior: None,
+            headers: None,
+            max_rows: None,
+            applies_to: None,
+        };
+        python.validate().expect("python_script should validate");
+
+        let webhook = GuardSpecConfig {
+            kind: GuardKindConfig::HttpWebhook,
+            name: None,
+            script_id: None,
+            script: None,
+            url: Some("https://policy.example/guard".to_string()),
+            timeout_ms: Some(500),
+            retry_count: Some(1),
+            fail_behavior: Some(super::GuardFailBehaviorConfig::Deny),
+            headers: None,
+            max_rows: None,
+            applies_to: None,
+        };
+        webhook.validate().expect("http_webhook should validate");
+    }
+
+    #[test]
+    fn guardrails_yaml_python_script_parses_and_validates() {
+        let yaml = r#"
+queryflux: {}
+guardrails:
+  global:
+    - kind: python_script
+      script_id: 42
+      timeout_ms: 250
+"#;
+        let cfg: ProxyConfig = serde_yaml::from_str(yaml).expect("YAML shape should parse");
+        cfg.guardrails
+            .expect("guardrails")
+            .validate()
+            .expect("python_script is supported");
+    }
+
+    #[test]
+    fn guardrails_validation_requires_external_guard_fields() {
+        let yaml = r#"
+queryflux: {}
+guardrails:
+  global:
+    - kind: python_script
+    - kind: http_webhook
+"#;
+        let cfg: ProxyConfig = serde_yaml::from_str(yaml).expect("YAML shape should parse");
+        let err = cfg
+            .guardrails
+            .expect("guardrails")
+            .validate()
+            .expect_err("missing external fields should fail");
+        assert!(err.contains("script"));
     }
 
     #[test]

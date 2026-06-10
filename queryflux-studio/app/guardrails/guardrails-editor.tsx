@@ -172,8 +172,8 @@ export function GuardrailsEditor({ initialConfig, initialScripts }: GuardrailsEd
       <div>
         <h1 className="text-2xl font-bold text-slate-900 tracking-tight">Guardrails</h1>
         <p className="text-sm text-slate-500 mt-1">
-          Guards inspect the final SQL before it reaches the engine. Configure the global chain
-          first, then add Python scripts to the library and attach them globally or per cluster group.
+          Guards inspect the final SQL before it reaches the engine. Configure built-in guards,
+          Python scripts, or HTTP webhooks globally or per cluster group.
         </p>
       </div>
 
@@ -183,7 +183,7 @@ export function GuardrailsEditor({ initialConfig, initialScripts }: GuardrailsEd
         <div className="p-6 space-y-4">
           <p className="text-[11px] text-slate-500 leading-relaxed">
             These guards run for <strong>every query</strong>, regardless of cluster group. Supports
-            built-in guards, Python scripts (selected from the library below), and HTTP webhooks.
+            built-in guards, Python scripts selected from the library below, and HTTP webhooks.
             Per-group guards are configured in the cluster group editor.
           </p>
           <GuardList rows={global} onChange={setGlobal} guardScripts={guardScripts} />

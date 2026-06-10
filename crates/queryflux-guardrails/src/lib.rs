@@ -2,6 +2,7 @@ pub mod built_in;
 pub mod chain;
 pub mod config;
 pub mod context;
+pub mod external;
 
 pub use chain::GuardChain;
 pub use config::{GuardChainConfig, GuardGroupConfig, GuardKind, GuardLayerConfig};
