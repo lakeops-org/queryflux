@@ -1804,6 +1804,7 @@ fn build_chain_from_yaml_specs(
                             _ => FailBehavior::Deny,
                         },
                         headers: spec.headers.clone().unwrap_or_default(),
+                        client: reqwest::Client::new(),
                     }));
                 }
             }
@@ -1925,6 +1926,7 @@ fn build_chain_from_db_specs(
                             _ => FailBehavior::Deny,
                         },
                         headers: spec.headers.unwrap_or_default(),
+                        client: reqwest::Client::new(),
                     }));
                 }
             }

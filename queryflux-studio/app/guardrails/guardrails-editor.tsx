@@ -182,8 +182,8 @@ export function GuardrailsEditor({ initialConfig, initialScripts }: GuardrailsEd
         <SectionHeader icon={<ShieldCheck size={15} />} title="Global guards" />
         <div className="p-6 space-y-4">
           <p className="text-[11px] text-slate-500 leading-relaxed">
-            These guards run for <strong>every query</strong>, regardless of cluster group. Supports
-            built-in guards, Python scripts selected from the library below, and HTTP webhooks.
+            These guards run for <strong>every query</strong>, regardless of cluster group.
+            They support built-in guards, Python scripts selected from the library below, and HTTP webhooks.
             Per-group guards are configured in the cluster group editor.
           </p>
           <GuardList rows={global} onChange={setGlobal} guardScripts={guardScripts} />

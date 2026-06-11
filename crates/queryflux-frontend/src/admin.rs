@@ -1936,11 +1936,15 @@ impl GuardrailsConfigDto {
     }
 
     fn referenced_script_ids(&self) -> Vec<i64> {
-        self.global
+        let mut ids: Vec<i64> = self
+            .global
             .iter()
             .chain(self.groups.values().flatten())
             .filter_map(GuardSpecDto::script_id)
-            .collect()
+            .collect();
+        ids.sort_unstable();
+        ids.dedup();
+        ids
     }
 }
 
@@ -2010,10 +2014,19 @@ impl GuardSpecDto {
                 Ok(())
             }
             GuardSpecDto::HttpWebhook { url, .. } => {
-                if url.as_deref().unwrap_or_default().trim().is_empty() {
+                let raw = url.as_deref().unwrap_or_default().trim();
+                if raw.is_empty() {
                     return Err("http_webhook guard is missing required field \"url\"".to_string());
                 }
-                Ok(())
+                match url::Url::parse(raw) {
+                    Ok(parsed) => match parsed.scheme() {
+                        "http" | "https" => Ok(()),
+                        other => Err(format!(
+                            "http_webhook url must use http or https scheme, got \"{other}\""
+                        )),
+                    },
+                    Err(e) => Err(format!("http_webhook url is not a valid URL: {e}")),
+                }
             }
         }
     }
@@ -2080,13 +2093,11 @@ async fn put_guardrails_config_handler(
                     .into_response();
             }
             Ok(None) => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    format!(
-                        "invalid guardrails config: python_script guard references missing script id {script_id}"
-                    ),
-                )
-                    .into_response();
+                tracing::warn!(
+                    script_id,
+                    "python_script guard references missing script id; \
+                     saving config but guard will be inactive at runtime"
+                );
             }
             Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
         }
@@ -2184,5 +2195,20 @@ mod tests {
             result.is_err(),
             "typo in fail_behavior should be rejected by serde"
         );
+    }
+
+    #[test]
+    fn guardrails_dto_rejects_non_http_url_scheme() {
+        let file_url: GuardrailsConfigDto = serde_json::from_value(json!({
+            "global": [{ "kind": "http_webhook", "url": "file:///etc/passwd" }]
+        }))
+        .expect("shape should parse");
+        assert!(file_url.validate().unwrap_err().contains("http or https"));
+
+        let ftp_url: GuardrailsConfigDto = serde_json::from_value(json!({
+            "global": [{ "kind": "http_webhook", "url": "ftp://evil.example" }]
+        }))
+        .expect("shape should parse");
+        assert!(ftp_url.validate().unwrap_err().contains("http or https"));
     }
 }

@@ -472,6 +472,8 @@ export interface GuardSpecDto {
   retry_count?: number | null;
   /** python_script: numeric id of a guard script (kind="guard") managed on the Guardrails page */
   script_id?: number;
+  /** python_script: inline script body (mutually exclusive with script_id) */
+  script?: string | null;
   /** http_webhook: "deny" (default) | "allow" when the webhook is unreachable */
   fail_behavior?: "deny" | "allow" | null;
   /** http_webhook: extra request headers sent with every call */

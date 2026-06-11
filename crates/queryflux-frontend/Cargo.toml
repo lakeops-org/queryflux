@@ -25,6 +25,7 @@ tower-http = { workspace = true }
 bytes = { workspace = true }
 chrono = { workspace = true }
 reqwest = { workspace = true }
+url = { workspace = true }
 urlencoding = { workspace = true }
 utoipa = { workspace = true }
 arrow = { workspace = true }

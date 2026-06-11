@@ -27,6 +27,7 @@ pub struct HttpWebhookGuard {
     pub retry_count: u32,
     pub fail_behavior: FailBehavior,
     pub headers: HashMap<String, String>,
+    pub client: reqwest::Client,
 }
 
 #[derive(Debug, Clone)]
@@ -103,18 +104,12 @@ impl Guard for HttpWebhookGuard {
 
     async fn check(&self, ctx: &GuardContext<'_>) -> GuardResult {
         let timeout = bounded_timeout(self.timeout_ms);
-        let client = match reqwest::Client::builder().timeout(timeout).build() {
-            Ok(client) => client,
-            Err(e) => {
-                return self.fail_result(format!("failed to build webhook client: {e}"));
-            }
-        };
         let payload = guard_payload(ctx);
         let attempts = self.retry_count.saturating_add(1);
         let mut last_error = String::new();
 
         for attempt in 0..attempts {
-            let mut req = client.post(&self.url).json(&payload);
+            let mut req = self.client.post(&self.url).timeout(timeout).json(&payload);
             for (name, value) in &self.headers {
                 req = req.header(name, value);
             }
@@ -355,6 +350,7 @@ mod tests {
             retry_count: 0,
             fail_behavior: FailBehavior::Deny,
             headers: HashMap::new(),
+            client: reqwest::Client::new(),
         };
         let tc = TestCtx::new("SELECT 1");
         let result = guard.check(&tc.ctx()).await;

@@ -28,6 +28,7 @@ export interface GuardRow {
   timeoutMs: string;
   scriptId: string; // python_script: numeric script id stored as string, "" when unset
   scriptName: string; // python_script: display name resolved at load time
+  inlineScript: string; // python_script: inline script body, "" when unset
   failBehavior: "deny" | "allow"; // http_webhook: behavior on unreachable
   retryCount: string; // http_webhook: retries after the first failed attempt
   headers: Array<{ key: string; value: string }>; // http_webhook: extra request headers
@@ -52,6 +53,7 @@ export function dtoToRow(dto: GuardSpecDto, scripts?: UserScriptRecord[]): Guard
     timeoutMs: dto.timeout_ms != null ? String(dto.timeout_ms) : "",
     scriptId,
     scriptName,
+    inlineScript: dto.script ?? "",
     failBehavior: dto.fail_behavior === "allow" ? "allow" : "deny",
     retryCount: dto.retry_count != null ? String(dto.retry_count) : "",
     headers: dto.headers
@@ -75,11 +77,16 @@ export function rowToDto(row: GuardRow): GuardSpecDto {
     };
   }
   if (row.kind === "python_script") {
-    return {
+    const dto: GuardSpecDto = {
       kind: "python_script",
-      script_id: row.scriptId ? Number(row.scriptId) : undefined,
       timeout_ms: row.timeoutMs.trim() ? Number(row.timeoutMs) : null,
     };
+    if (row.scriptId) {
+      dto.script_id = Number(row.scriptId);
+    } else if (row.inlineScript.trim()) {
+      dto.script = row.inlineScript;
+    }
+    return dto;
   }
   const dto: GuardSpecDto = { kind: "built_in", name: row.name };
   if (row.name === "row_limit" && row.maxRows.trim()) {
@@ -196,6 +203,7 @@ function blankGuardRow(kind: GuardRow["kind"], name = "read_only"): GuardRow {
     timeoutMs: "",
     scriptId: "",
     scriptName: "",
+    inlineScript: "",
     failBehavior: "deny",
     retryCount: "",
     headers: [],
