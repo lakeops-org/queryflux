@@ -1751,6 +1751,31 @@ fn resolve_python_guard_script(
     })
 }
 
+fn make_http_webhook_guard(
+    url: String,
+    timeout_ms: Option<u64>,
+    retry_count: u32,
+    fail_behavior: FailBehavior,
+    headers: HashMap<String, String>,
+) -> Box<dyn Guard> {
+    if url.trim().is_empty() {
+        tracing::warn!("http_webhook guard has empty URL; using MisconfiguredGuard");
+        Box::new(MisconfiguredGuard {
+            guard_name: "http_webhook",
+            reason: "http_webhook guard is missing required field \"url\"".to_string(),
+        })
+    } else {
+        Box::new(HttpWebhookGuard {
+            url,
+            timeout_ms,
+            retry_count,
+            fail_behavior,
+            headers,
+            client: reqwest::Client::new(),
+        })
+    }
+}
+
 /// Build YAML guard specs into a `GuardChain`. Returns `None` when the list is empty
 /// or contains only unrecognised entries.
 fn build_chain_from_yaml_specs(
@@ -1787,26 +1812,16 @@ fn build_chain_from_yaml_specs(
                 guards.push(guard);
             }
             GuardKindConfig::HttpWebhook => {
-                let url = spec.url.clone().unwrap_or_default();
-                if url.trim().is_empty() {
-                    tracing::warn!("http_webhook guard has empty URL; using MisconfiguredGuard");
-                    guards.push(Box::new(MisconfiguredGuard {
-                        guard_name: "http_webhook",
-                        reason: "http_webhook guard is missing required field \"url\"".to_string(),
-                    }));
-                } else {
-                    guards.push(Box::new(HttpWebhookGuard {
-                        url,
-                        timeout_ms: spec.timeout_ms,
-                        retry_count: spec.retry_count.unwrap_or(0),
-                        fail_behavior: match spec.fail_behavior {
-                            Some(GuardFailBehaviorConfig::Allow) => FailBehavior::Allow,
-                            _ => FailBehavior::Deny,
-                        },
-                        headers: spec.headers.clone().unwrap_or_default(),
-                        client: reqwest::Client::new(),
-                    }));
-                }
+                guards.push(make_http_webhook_guard(
+                    spec.url.clone().unwrap_or_default(),
+                    spec.timeout_ms,
+                    spec.retry_count.unwrap_or(0),
+                    match spec.fail_behavior {
+                        Some(GuardFailBehaviorConfig::Allow) => FailBehavior::Allow,
+                        _ => FailBehavior::Deny,
+                    },
+                    spec.headers.clone().unwrap_or_default(),
+                ));
             }
         }
     }
@@ -1909,26 +1924,16 @@ fn build_chain_from_db_specs(
                 }
             }
             "http_webhook" => {
-                let url = spec.url.unwrap_or_default();
-                if url.trim().is_empty() {
-                    tracing::warn!("http_webhook guard has empty URL; using MisconfiguredGuard");
-                    guards.push(Box::new(MisconfiguredGuard {
-                        guard_name: "http_webhook",
-                        reason: "http_webhook guard is missing required field \"url\"".to_string(),
-                    }));
-                } else {
-                    guards.push(Box::new(HttpWebhookGuard {
-                        url,
-                        timeout_ms: spec.timeout_ms,
-                        retry_count: spec.retry_count.unwrap_or(0),
-                        fail_behavior: match spec.fail_behavior.as_deref() {
-                            Some("allow") => FailBehavior::Allow,
-                            _ => FailBehavior::Deny,
-                        },
-                        headers: spec.headers.unwrap_or_default(),
-                        client: reqwest::Client::new(),
-                    }));
-                }
+                guards.push(make_http_webhook_guard(
+                    spec.url.unwrap_or_default(),
+                    spec.timeout_ms,
+                    spec.retry_count.unwrap_or(0),
+                    match spec.fail_behavior.as_deref() {
+                        Some("allow") => FailBehavior::Allow,
+                        _ => FailBehavior::Deny,
+                    },
+                    spec.headers.unwrap_or_default(),
+                ));
             }
             "python_script" => {
                 let guard = resolve_python_guard_script(

@@ -2096,7 +2096,7 @@ async fn put_guardrails_config_handler(
                 tracing::warn!(
                     script_id,
                     "python_script guard references missing script id; \
-                     saving config but guard will be inactive at runtime"
+                     saving config but guard will DENY all queries at runtime via MisconfiguredGuard"
                 );
             }
             Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
