@@ -108,39 +108,128 @@ impl GuardrailsConfig {
 }
 
 /// One guard entry in the config.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// Supports both the current flat format (`kind: http_webhook`, `url: ...`) and
+/// the legacy nested format (`kind: { http_webhook: { url: ..., timeout_ms: ... } }`)
+/// that shipped before the Python/webhook guardrails refactor.
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub struct GuardSpecConfig {
     pub kind: GuardKindConfig,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     /// `python_script`: numeric id of a guard script.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub script_id: Option<i64>,
     /// `python_script`: inline script body. Prefer `script_id` for Studio-managed configs.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub script: Option<String>,
     /// `http_webhook`: endpoint URL.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
     /// `http_webhook` / `python_script`: timeout in milliseconds.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_ms: Option<u64>,
     /// `http_webhook`: number of retries after the first failed attempt.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retry_count: Option<u32>,
     /// `http_webhook`: `deny` (default) or `allow` when the webhook cannot be reached.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fail_behavior: Option<GuardFailBehaviorConfig>,
     /// `http_webhook`: extra request headers sent with every call.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub headers: Option<HashMap<String, String>>,
     /// `row_limit`: maximum rows allowed (default: none).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_rows: Option<u64>,
     /// `require_predicate`: table patterns this guard applies to.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub applies_to: Option<Vec<String>>,
+}
+
+impl<'de> Deserialize<'de> for GuardSpecConfig {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        // Intermediate struct that accepts both the new unit-variant `kind` and
+        // the legacy struct-variant `kind: { http_webhook: { url, timeout_ms } }`.
+        #[derive(Deserialize)]
+        #[serde(rename_all = "snake_case")]
+        struct Raw {
+            kind: serde_json::Value,
+            #[serde(default)]
+            name: Option<String>,
+            #[serde(default)]
+            script_id: Option<i64>,
+            #[serde(default)]
+            script: Option<String>,
+            #[serde(default)]
+            url: Option<String>,
+            #[serde(default)]
+            timeout_ms: Option<u64>,
+            #[serde(default)]
+            retry_count: Option<u32>,
+            #[serde(default)]
+            fail_behavior: Option<GuardFailBehaviorConfig>,
+            #[serde(default)]
+            headers: Option<HashMap<String, String>>,
+            #[serde(default)]
+            max_rows: Option<u64>,
+            #[serde(default)]
+            applies_to: Option<Vec<String>>,
+        }
+
+        let raw = Raw::deserialize(deserializer)?;
+
+        // Resolve `kind` — it can be a plain string or a legacy nested map.
+        let (kind, legacy_url, legacy_timeout) = match &raw.kind {
+            serde_json::Value::String(s) => {
+                let k: GuardKindConfig =
+                    serde_json::from_value(serde_json::Value::String(s.clone()))
+                        .map_err(serde::de::Error::custom)?;
+                (k, None, None)
+            }
+            serde_json::Value::Object(map) => {
+                if map.contains_key("http_webhook") {
+                    let inner = &map["http_webhook"];
+                    let url = inner
+                        .get("url")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string);
+                    let timeout = inner.get("timeout_ms").and_then(|v| v.as_u64());
+                    (GuardKindConfig::HttpWebhook, url, timeout)
+                } else if map.contains_key("built_in") {
+                    (GuardKindConfig::BuiltIn, None, None)
+                } else if map.contains_key("python_script") {
+                    (GuardKindConfig::PythonScript, None, None)
+                } else {
+                    return Err(serde::de::Error::custom(format!(
+                        "unrecognized guard kind: {map:?}"
+                    )));
+                }
+            }
+            other => {
+                return Err(serde::de::Error::custom(format!(
+                    "expected string or map for guard kind, got {other}"
+                )));
+            }
+        };
+
+        Ok(GuardSpecConfig {
+            kind,
+            name: raw.name,
+            script_id: raw.script_id,
+            script: raw.script,
+            url: raw.url.or(legacy_url),
+            timeout_ms: raw.timeout_ms.or(legacy_timeout),
+            retry_count: raw.retry_count,
+            fail_behavior: raw.fail_behavior,
+            headers: raw.headers,
+            max_rows: raw.max_rows,
+            applies_to: raw.applies_to,
+        })
+    }
 }
 
 impl GuardSpecConfig {
@@ -1177,6 +1266,28 @@ guardrails:
             applies_to: None,
         };
         assert!(both.validate().unwrap_err().contains("not both"));
+    }
+
+    #[test]
+    fn guardrails_yaml_legacy_http_webhook_parses_and_validates() {
+        let yaml = r#"
+queryflux: {}
+guardrails:
+  global:
+    - kind:
+        http_webhook:
+          url: "https://policy.internal/guard"
+          timeout_ms: 500
+"#;
+        let cfg: ProxyConfig = serde_yaml::from_str(yaml).expect("legacy YAML shape should parse");
+        let guardrails = cfg.guardrails.expect("guardrails section");
+        guardrails
+            .validate()
+            .expect("legacy http_webhook should validate");
+        let spec = &guardrails.global[0];
+        assert!(matches!(spec.kind, GuardKindConfig::HttpWebhook));
+        assert_eq!(spec.url.as_deref(), Some("https://policy.internal/guard"));
+        assert_eq!(spec.timeout_ms, Some(500));
     }
 
     #[test]

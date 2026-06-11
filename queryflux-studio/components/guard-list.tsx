@@ -228,7 +228,7 @@ export function AddGuardForm({
     form.kind === "http_webhook"
       ? form.url.trim() !== ""
       : form.kind === "python_script"
-      ? form.scriptId.trim() !== ""
+      ? form.scriptId.trim() !== "" || form.inlineScript.trim() !== ""
       : form.name !== "";
 
   return (
@@ -371,6 +371,19 @@ export function AddGuardForm({
                   placeholder="500"
                   value={form.timeoutMs}
                   onChange={(e) => setForm((f) => ({ ...f, timeoutMs: e.target.value }))}
+                />
+              </div>
+              <div className="w-20">
+                <label className="block text-[10px] font-semibold text-slate-400 uppercase tracking-widest mb-1">
+                  Retries
+                </label>
+                <input
+                  type="number"
+                  min={0}
+                  className={`w-full ${inputCls}`}
+                  placeholder="0"
+                  value={form.retryCount}
+                  onChange={(e) => setForm((f) => ({ ...f, retryCount: e.target.value }))}
                 />
               </div>
               <div className="flex-1">
