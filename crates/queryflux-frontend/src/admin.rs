@@ -1945,6 +1945,13 @@ impl GuardrailsConfigDto {
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum WebhookFailBehavior {
+    Deny,
+    Allow,
+}
+
+#[derive(Deserialize)]
 #[serde(rename_all = "snake_case", tag = "kind")]
 #[allow(dead_code)]
 enum GuardSpecDto {
@@ -1969,7 +1976,7 @@ enum GuardSpecDto {
         #[serde(default)]
         retry_count: Option<u32>,
         #[serde(default)]
-        fail_behavior: Option<String>,
+        fail_behavior: Option<WebhookFailBehavior>,
         #[serde(default)]
         headers: Option<HashMap<String, String>>,
     },
@@ -1986,7 +1993,15 @@ impl GuardSpecDto {
             GuardSpecDto::PythonScript {
                 script_id, script, ..
             } => {
-                if script_id.is_none() && script.as_deref().unwrap_or_default().is_empty() {
+                let has_script = script.as_ref().is_some_and(|s| !s.trim().is_empty());
+                let has_id = script_id.is_some();
+                if has_script && has_id {
+                    return Err(
+                        "python_script guard must set either \"script\" or \"script_id\", not both"
+                            .to_string(),
+                    );
+                }
+                if !has_script && !has_id {
                     return Err(
                         "python_script guard requires either \"script\" or \"script_id\""
                             .to_string(),
@@ -2140,5 +2155,34 @@ mod tests {
         }))
         .expect("shape should parse");
         assert!(webhook.validate().unwrap_err().contains("url"));
+    }
+
+    #[test]
+    fn guardrails_dto_rejects_blank_inline_script() {
+        let dto: GuardrailsConfigDto = serde_json::from_value(json!({
+            "global": [{ "kind": "python_script", "script": "  " }]
+        }))
+        .expect("shape should parse");
+        assert!(dto.validate().unwrap_err().contains("script"));
+    }
+
+    #[test]
+    fn guardrails_dto_rejects_both_script_and_id() {
+        let dto: GuardrailsConfigDto = serde_json::from_value(json!({
+            "global": [{ "kind": "python_script", "script_id": 1, "script": "def check(ctx): pass" }]
+        }))
+        .expect("shape should parse");
+        assert!(dto.validate().unwrap_err().contains("not both"));
+    }
+
+    #[test]
+    fn guardrails_dto_rejects_invalid_fail_behavior() {
+        let result = serde_json::from_value::<GuardrailsConfigDto>(json!({
+            "global": [{ "kind": "http_webhook", "url": "https://x.co/g", "fail_behavior": "typo" }]
+        }));
+        assert!(
+            result.is_err(),
+            "typo in fail_behavior should be rejected by serde"
+        );
     }
 }

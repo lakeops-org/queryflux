@@ -152,7 +152,15 @@ impl GuardSpecConfig {
                 None => Err("built_in guard is missing required field \"name\"".to_string()),
             },
             GuardKindConfig::PythonScript => {
-                if self.script.is_none() && self.script_id.is_none() {
+                let has_script = self.script.as_ref().is_some_and(|s| !s.trim().is_empty());
+                let has_id = self.script_id.is_some();
+                if has_script && has_id {
+                    return Err(
+                        "python_script guard must set either \"script\" or \"script_id\", not both"
+                            .to_string(),
+                    );
+                }
+                if !has_script && !has_id {
                     return Err(
                         "python_script guard requires either \"script\" or \"script_id\""
                             .to_string(),
@@ -1133,6 +1141,42 @@ guardrails:
             .expect("guardrails")
             .validate()
             .expect("python_script is supported");
+    }
+
+    #[test]
+    fn guardrails_validation_rejects_blank_inline_script() {
+        let blank = GuardSpecConfig {
+            kind: GuardKindConfig::PythonScript,
+            name: None,
+            script_id: None,
+            script: Some("  ".to_string()),
+            url: None,
+            timeout_ms: None,
+            retry_count: None,
+            fail_behavior: None,
+            headers: None,
+            max_rows: None,
+            applies_to: None,
+        };
+        assert!(blank.validate().unwrap_err().contains("script"));
+    }
+
+    #[test]
+    fn guardrails_validation_rejects_both_script_and_id() {
+        let both = GuardSpecConfig {
+            kind: GuardKindConfig::PythonScript,
+            name: None,
+            script_id: Some(1),
+            script: Some("def check(ctx): return {'action':'allow'}".to_string()),
+            url: None,
+            timeout_ms: None,
+            retry_count: None,
+            fail_behavior: None,
+            headers: None,
+            max_rows: None,
+            applies_to: None,
+        };
+        assert!(both.validate().unwrap_err().contains("not both"));
     }
 
     #[test]

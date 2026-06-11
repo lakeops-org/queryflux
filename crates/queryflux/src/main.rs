@@ -704,17 +704,11 @@ async fn main() -> Result<()> {
     let guard_script_bodies = load_guard_script_bodies(pg_store.as_deref()).await;
 
     // --- Build guard chains: DB-stored config (UI-managed) takes precedence over YAML ---
+    // When a persisted config exists in Postgres it is authoritative, even if it
+    // resolves to an empty chain (the user may have intentionally cleared guards).
     let (guard_chain, group_guard_chains) = if let Some(pg) = &pg_store {
         match pg.get_proxy_setting("guardrails_config").await {
-            Ok(Some(v)) => {
-                let (db_global, db_groups) =
-                    build_guard_chains_from_db_value(&v, &guard_script_bodies);
-                if db_global.is_some() || !db_groups.is_empty() {
-                    (db_global, db_groups)
-                } else {
-                    build_guard_chains(&config, &guard_script_bodies)
-                }
-            }
+            Ok(Some(v)) => build_guard_chains_from_db_value(&v, &guard_script_bodies),
             _ => build_guard_chains(&config, &guard_script_bodies),
         }
     } else {
@@ -1736,7 +1730,7 @@ fn resolve_python_guard_script(
     timeout_ms: Option<u64>,
     guard_script_bodies: &HashMap<i64, String>,
 ) -> Box<dyn Guard> {
-    if let Some(script) = inline_script {
+    if let Some(script) = inline_script.filter(|s| !s.trim().is_empty()) {
         return Box::new(PythonScriptGuard { script, timeout_ms });
     }
     if let Some(script_id) = script_id {
@@ -1793,16 +1787,25 @@ fn build_chain_from_yaml_specs(
                 guards.push(guard);
             }
             GuardKindConfig::HttpWebhook => {
-                guards.push(Box::new(HttpWebhookGuard {
-                    url: spec.url.clone().unwrap_or_default(),
-                    timeout_ms: spec.timeout_ms,
-                    retry_count: spec.retry_count.unwrap_or(0),
-                    fail_behavior: match spec.fail_behavior {
-                        Some(GuardFailBehaviorConfig::Allow) => FailBehavior::Allow,
-                        _ => FailBehavior::Deny,
-                    },
-                    headers: spec.headers.clone().unwrap_or_default(),
-                }));
+                let url = spec.url.clone().unwrap_or_default();
+                if url.trim().is_empty() {
+                    tracing::warn!("http_webhook guard has empty URL; using MisconfiguredGuard");
+                    guards.push(Box::new(MisconfiguredGuard {
+                        guard_name: "http_webhook",
+                        reason: "http_webhook guard is missing required field \"url\"".to_string(),
+                    }));
+                } else {
+                    guards.push(Box::new(HttpWebhookGuard {
+                        url,
+                        timeout_ms: spec.timeout_ms,
+                        retry_count: spec.retry_count.unwrap_or(0),
+                        fail_behavior: match spec.fail_behavior {
+                            Some(GuardFailBehaviorConfig::Allow) => FailBehavior::Allow,
+                            _ => FailBehavior::Deny,
+                        },
+                        headers: spec.headers.clone().unwrap_or_default(),
+                    }));
+                }
             }
         }
     }
@@ -1904,16 +1907,27 @@ fn build_chain_from_db_specs(
                     other => tracing::warn!(name = other, "Unknown built-in guard name; skipping"),
                 }
             }
-            "http_webhook" => guards.push(Box::new(HttpWebhookGuard {
-                url: spec.url.unwrap_or_default(),
-                timeout_ms: spec.timeout_ms,
-                retry_count: spec.retry_count.unwrap_or(0),
-                fail_behavior: match spec.fail_behavior.as_deref() {
-                    Some("allow") => FailBehavior::Allow,
-                    _ => FailBehavior::Deny,
-                },
-                headers: spec.headers.unwrap_or_default(),
-            })),
+            "http_webhook" => {
+                let url = spec.url.unwrap_or_default();
+                if url.trim().is_empty() {
+                    tracing::warn!("http_webhook guard has empty URL; using MisconfiguredGuard");
+                    guards.push(Box::new(MisconfiguredGuard {
+                        guard_name: "http_webhook",
+                        reason: "http_webhook guard is missing required field \"url\"".to_string(),
+                    }));
+                } else {
+                    guards.push(Box::new(HttpWebhookGuard {
+                        url,
+                        timeout_ms: spec.timeout_ms,
+                        retry_count: spec.retry_count.unwrap_or(0),
+                        fail_behavior: match spec.fail_behavior.as_deref() {
+                            Some("allow") => FailBehavior::Allow,
+                            _ => FailBehavior::Deny,
+                        },
+                        headers: spec.headers.unwrap_or_default(),
+                    }));
+                }
+            }
             "python_script" => {
                 let guard = resolve_python_guard_script(
                     spec.script,

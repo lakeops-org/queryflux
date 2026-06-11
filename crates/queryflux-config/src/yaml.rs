@@ -38,12 +38,12 @@ impl ConfigProvider for YamlFileConfigProvider {
         })?;
 
         if let Some(guardrails) = &config.guardrails {
-            guardrails.validate().map_err(|e| {
-                QueryFluxError::Config(format!(
-                    "Invalid guardrails config in {}: {e}",
+            if let Err(e) = guardrails.validate() {
+                tracing::warn!(
+                    "Invalid guardrails in {}: {e} — will be ignored if Postgres config overrides YAML",
                     self.path.display()
-                ))
-            })?;
+                );
+            }
         }
 
         Ok(config)

@@ -3604,6 +3604,7 @@ dependencies = [
  "queryflux-core",
  "serde_yaml",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

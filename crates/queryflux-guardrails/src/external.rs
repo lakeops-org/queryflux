@@ -65,13 +65,11 @@ impl Guard for PythonScriptGuard {
         let payload = guard_payload(ctx);
         let timeout = bounded_timeout(self.timeout_ms);
 
-        match tokio::time::timeout(
-            timeout,
-            tokio::task::spawn_blocking(move || run_python_guard(&script, payload)),
-        )
-        .await
-        {
-            Ok(Ok(Ok(result))) => result,
+        let handle = tokio::task::spawn_blocking(move || run_python_guard(&script, payload));
+        let abort_handle = handle.abort_handle();
+
+        match tokio::time::timeout(timeout, handle).await {
+            Ok(Ok(Ok(guard_result))) => guard_result,
             Ok(Ok(Err(e))) => {
                 GuardResult::deny(format!("python guard failed: {e}"), "PYTHON_GUARD_ERROR")
             }
@@ -79,10 +77,16 @@ impl Guard for PythonScriptGuard {
                 format!("python guard task failed: {e}"),
                 "PYTHON_GUARD_ERROR",
             ),
-            Err(_) => GuardResult::deny(
-                format!("python guard timed out after {}ms", timeout.as_millis()),
-                "PYTHON_GUARD_TIMEOUT",
-            ),
+            Err(_elapsed) => {
+                // Best-effort: abort the blocking task so it is dropped at the next
+                // yield/poll boundary. Cannot interrupt native/FFI code mid-flight;
+                // for truly untrusted scripts a subprocess boundary is needed.
+                abort_handle.abort();
+                GuardResult::deny(
+                    format!("python guard timed out after {}ms", timeout.as_millis()),
+                    "PYTHON_GUARD_TIMEOUT",
+                )
+            }
         }
     }
 }

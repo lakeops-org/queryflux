@@ -29,6 +29,7 @@ export interface GuardRow {
   scriptId: string; // python_script: numeric script id stored as string, "" when unset
   scriptName: string; // python_script: display name resolved at load time
   failBehavior: "deny" | "allow"; // http_webhook: behavior on unreachable
+  retryCount: string; // http_webhook: retries after the first failed attempt
   headers: Array<{ key: string; value: string }>; // http_webhook: extra request headers
 }
 
@@ -52,6 +53,7 @@ export function dtoToRow(dto: GuardSpecDto, scripts?: UserScriptRecord[]): Guard
     scriptId,
     scriptName,
     failBehavior: dto.fail_behavior === "allow" ? "allow" : "deny",
+    retryCount: dto.retry_count != null ? String(dto.retry_count) : "",
     headers: dto.headers
       ? Object.entries(dto.headers).map(([key, value]) => ({ key, value }))
       : [],
@@ -65,6 +67,7 @@ export function rowToDto(row: GuardRow): GuardSpecDto {
       kind: "http_webhook",
       url: row.url,
       timeout_ms: row.timeoutMs.trim() ? Number(row.timeoutMs) : null,
+      retry_count: row.retryCount.trim() ? Number(row.retryCount) : null,
       fail_behavior: row.failBehavior,
       headers: validHeaders.length > 0
         ? Object.fromEntries(validHeaders.map((h) => [h.key.trim(), h.value]))
@@ -194,6 +197,7 @@ function blankGuardRow(kind: GuardRow["kind"], name = "read_only"): GuardRow {
     scriptId: "",
     scriptName: "",
     failBehavior: "deny",
+    retryCount: "",
     headers: [],
   };
 }

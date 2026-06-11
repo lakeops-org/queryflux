@@ -66,7 +66,15 @@ impl GuardSpec {
             GuardKind::PythonScript {
                 script_id, script, ..
             } => {
-                if script.is_none() && script_id.is_none() {
+                let has_script = script.as_ref().is_some_and(|s| !s.trim().is_empty());
+                let has_id = script_id.is_some();
+                if has_script && has_id {
+                    return Err(
+                        "python_script guard must set either \"script\" or \"script_id\", not both"
+                            .to_string(),
+                    );
+                }
+                if !has_script && !has_id {
                     return Err(
                         "python_script guard requires either \"script\" or \"script_id\""
                             .to_string(),
@@ -294,5 +302,33 @@ mod tests {
             params: GuardParams::default(),
         };
         assert!(webhook.validate().unwrap_err().contains("url"));
+    }
+
+    #[test]
+    fn validate_rejects_blank_inline_script() {
+        let blank = GuardSpec {
+            kind: GuardKind::PythonScript {
+                script_id: None,
+                script: Some("   ".to_string()),
+                timeout_ms: None,
+            },
+            name: None,
+            params: GuardParams::default(),
+        };
+        assert!(blank.validate().unwrap_err().contains("script"));
+    }
+
+    #[test]
+    fn validate_rejects_both_script_and_id() {
+        let both = GuardSpec {
+            kind: GuardKind::PythonScript {
+                script_id: Some(1),
+                script: Some("def check(ctx): pass".to_string()),
+                timeout_ms: None,
+            },
+            name: None,
+            params: GuardParams::default(),
+        };
+        assert!(both.validate().unwrap_err().contains("not both"));
     }
 }
