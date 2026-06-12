@@ -8,7 +8,11 @@ on:
     paths-ignore:
       - "website/**"
       - "docs/**"
-      - "*.md"
+      - "**/*.md"
+      - ".github/ISSUE_TEMPLATE/**"
+      - ".github/DISCUSSION_TEMPLATE/**"
+      - ".github/PULL_REQUEST_TEMPLATE/**"
+      - "LICENSE*"
   workflow_dispatch:
 
 env:
