@@ -44,6 +44,7 @@ SELECT
     ) AS members,
     g.max_running_queries,
     g.max_queued_queries,
+    g.queue_timeout_ms,
     g.strategy,
     g.allow_groups,
     g.allow_users,
@@ -579,13 +580,14 @@ impl ClusterConfigStore for PostgresStore {
 
         sqlx::query(
             r#"INSERT INTO cluster_group_configs
-                   (name, enabled, members, max_running_queries, max_queued_queries, strategy, allow_groups, allow_users, translation_script_ids, default_tags)
-               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+                   (name, enabled, members, max_running_queries, max_queued_queries, queue_timeout_ms, strategy, allow_groups, allow_users, translation_script_ids, default_tags)
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
                ON CONFLICT (name) DO UPDATE SET
                    enabled                = EXCLUDED.enabled,
                    members                = EXCLUDED.members,
                    max_running_queries    = EXCLUDED.max_running_queries,
                    max_queued_queries     = EXCLUDED.max_queued_queries,
+                   queue_timeout_ms       = EXCLUDED.queue_timeout_ms,
                    strategy               = EXCLUDED.strategy,
                    allow_groups           = EXCLUDED.allow_groups,
                    allow_users            = EXCLUDED.allow_users,
@@ -598,6 +600,7 @@ impl ClusterConfigStore for PostgresStore {
         .bind(&member_ids)
         .bind(cfg.max_running_queries)
         .bind(cfg.max_queued_queries)
+        .bind(cfg.queue_timeout_ms)
         .bind(&cfg.strategy)
         .bind(&cfg.allow_groups)
         .bind(&cfg.allow_users)

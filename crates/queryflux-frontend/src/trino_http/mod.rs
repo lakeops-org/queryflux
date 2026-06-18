@@ -1,6 +1,7 @@
 pub mod handlers;
 pub mod result_sink;
 pub mod state;
+pub mod trino_dispatch;
 
 use std::sync::Arc;
 

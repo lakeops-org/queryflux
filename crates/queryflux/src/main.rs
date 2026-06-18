@@ -722,6 +722,12 @@ async fn main() -> Result<()> {
         .filter(|(_, g)| !g.default_tags.is_empty())
         .map(|(name, g)| (name.clone(), g.default_tags.clone()))
         .collect();
+    let group_queue_timeouts: HashMap<String, Option<u64>> = config
+        .cluster_groups
+        .iter()
+        .filter(|(_, g)| g.queue_timeout_ms.is_some())
+        .map(|(name, g)| (name.clone(), g.queue_timeout_ms))
+        .collect();
     let live_config = LiveConfig {
         router_chain,
         guard_chain,
@@ -734,6 +740,7 @@ async fn main() -> Result<()> {
         group_order,
         group_translation_scripts,
         group_default_tags,
+        group_queue_timeouts,
     };
     // Seed the reload cache. When Postgres is active, fingerprint `engine_key` + JSONB config
     // (same format as `build_live_config` on reload) so an engine change rebuilds adapters even
@@ -1603,6 +1610,12 @@ async fn build_live_config(
         .map(|(name, g)| (name.clone(), g.default_tags.clone()))
         .collect();
 
+    let group_queue_timeouts: HashMap<String, Option<u64>> = cluster_groups
+        .iter()
+        .filter(|(_, g)| g.queue_timeout_ms.is_some())
+        .map(|(name, g)| (name.clone(), g.queue_timeout_ms))
+        .collect();
+
     Ok(LiveConfig {
         router_chain,
         guard_chain: None,
@@ -1615,6 +1628,7 @@ async fn build_live_config(
         group_order,
         group_translation_scripts,
         group_default_tags,
+        group_queue_timeouts,
     })
 }
 

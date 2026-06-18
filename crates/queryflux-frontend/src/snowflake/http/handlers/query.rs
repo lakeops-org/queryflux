@@ -213,6 +213,7 @@ pub async fn query_request(
         session_ctx,
         FrontendProtocol::SnowflakeHttp,
         group,
+        None,
         &mut sink,
         &auth_ctx,
     )

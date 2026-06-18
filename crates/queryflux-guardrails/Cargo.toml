@@ -6,7 +6,6 @@ license.workspace = true
 
 [dependencies]
 queryflux-core = { workspace = true }
-queryflux-persistence = { workspace = true }
 async-trait = { workspace = true }
 polyglot-sql = { workspace = true }
 serde = { workspace = true }

@@ -204,6 +204,7 @@ mod snowflake_frontend {
             group_order: vec!["mock".to_string()],
             group_translation_scripts: HashMap::new(),
             group_default_tags: HashMap::new(),
+            group_queue_timeouts: HashMap::new(),
         };
 
         let app_state = Arc::new(AppState {

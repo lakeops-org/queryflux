@@ -23,8 +23,10 @@ use crate::{
 };
 
 // Re-export so callers can do `queryflux_persistence::MetricsStore` etc.
-pub use metrics_store::{ClusterSnapshot, GuardAction, MetricsStore, QueryRecord};
+pub use metrics_store::{ClusterSnapshot, MetricsStore, QueryRecord};
+// GuardAction now lives in queryflux-core; re-export for backward compatibility.
 pub use query_history::{AgentSummary, ConversationSummary, QuerySummary};
+pub use queryflux_core::query::GuardAction;
 pub use script_library::{
     is_valid_script_kind, UpsertUserScript, UserScriptRecord, KIND_GUARD, KIND_ROUTING,
     KIND_TRANSLATION_FIXUP,

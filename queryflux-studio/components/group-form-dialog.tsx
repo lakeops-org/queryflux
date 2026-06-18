@@ -46,6 +46,7 @@ export function GroupFormDialog({
   const [memberOrder, setMemberOrder] = useState<string[]>([]);
   const [maxRunning, setMaxRunning] = useState("10");
   const [maxQueued, setMaxQueued] = useState("");
+  const [queueTimeout, setQueueTimeout] = useState("");
   const [strategyKind, setStrategyKind] = useState<StrategyKind>("default");
   const [enginePreferenceCsv, setEnginePreferenceCsv] = useState("");
   const [weightedJson, setWeightedJson] = useState("{}");
@@ -67,6 +68,7 @@ export function GroupFormDialog({
     setMemberOrder([]);
     setMaxRunning("10");
     setMaxQueued("");
+    setQueueTimeout("");
     setStrategyKind("default");
     setEnginePreferenceCsv("");
     setWeightedJson("{}");
@@ -91,6 +93,9 @@ export function GroupFormDialog({
       setMaxRunning(String(initial.maxRunningQueries));
       setMaxQueued(
         initial.maxQueuedQueries != null ? String(initial.maxQueuedQueries) : "",
+      );
+      setQueueTimeout(
+        initial.queueTimeoutMs != null ? String(initial.queueTimeoutMs) : "",
       );
       setTranslationScriptIds([...initial.translationScriptIds]);
       setTagRows(
@@ -204,6 +209,17 @@ export function GroupFormDialog({
       maxQ = n;
     }
 
+    let qTimeout: number | null = null;
+    const qt = queueTimeout.trim();
+    if (qt !== "") {
+      const n = parseInt(qt, 10);
+      if (!Number.isFinite(n) || n < 1) {
+        setError("Queue timeout must be empty or a positive integer (ms).");
+        return;
+      }
+      qTimeout = n;
+    }
+
     let strategy: Record<string, unknown> | null;
     try {
       strategy = buildStrategyPayload(
@@ -237,6 +253,7 @@ export function GroupFormDialog({
       members,
       maxRunningQueries: maxR,
       maxQueuedQueries: maxQ,
+      queueTimeoutMs: qTimeout,
       strategy,
       // Group allow-lists are driven by routing / security config, not edited here.
       allowGroups: mode === "edit" && initial ? [...initial.allowGroups] : [],
@@ -383,7 +400,7 @@ export function GroupFormDialog({
             </button>
           </div>
 
-          <div className="grid grid-cols-2 gap-3">
+          <div className="grid grid-cols-3 gap-3">
             <div>
               <label className="block text-[11px] font-semibold text-slate-500 uppercase tracking-wide mb-1.5">
                 Max running queries <span className="text-red-500">*</span>
@@ -405,9 +422,25 @@ export function GroupFormDialog({
                 min={0}
                 value={maxQueued}
                 onChange={(e) => setMaxQueued(e.target.value)}
-                placeholder="optional"
+                placeholder="unlimited"
                 className="w-full text-sm border border-slate-200 rounded-lg px-3 py-2 font-mono focus:outline-none focus:ring-2 focus:ring-indigo-300"
               />
+            </div>
+            <div>
+              <label className="block text-[11px] font-semibold text-slate-500 uppercase tracking-wide mb-1.5">
+                Queue timeout (ms)
+              </label>
+              <input
+                type="number"
+                min={1}
+                value={queueTimeout}
+                onChange={(e) => setQueueTimeout(e.target.value)}
+                placeholder="unlimited"
+                className="w-full text-sm border border-slate-200 rounded-lg px-3 py-2 font-mono focus:outline-none focus:ring-2 focus:ring-indigo-300"
+              />
+              <p className="text-[10px] text-slate-400 mt-1">
+                Wire-protocol wait limit
+              </p>
             </div>
           </div>
 

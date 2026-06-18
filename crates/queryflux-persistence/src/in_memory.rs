@@ -450,6 +450,7 @@ impl ClusterConfigStore for InMemoryPersistence {
             members: cfg.members.clone(),
             max_running_queries: cfg.max_running_queries,
             max_queued_queries: cfg.max_queued_queries,
+            queue_timeout_ms: cfg.queue_timeout_ms,
             strategy: cfg.strategy.clone(),
             allow_groups: cfg.allow_groups.clone(),
             allow_users: cfg.allow_users.clone(),
@@ -781,6 +782,7 @@ mod tests {
             members: vec!["c1".to_string()],
             max_running_queries: 10,
             max_queued_queries: None,
+            queue_timeout_ms: None,
             strategy: None,
             allow_groups: vec![],
             allow_users: vec![],
@@ -820,6 +822,19 @@ mod tests {
             .await
             .unwrap();
         assert!(record.default_tags.as_object().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn upsert_group_stores_queue_timeout() {
+        let store = store_with_cluster().await;
+        let mut group = group_upsert(serde_json::json!({}));
+        group.queue_timeout_ms = Some(30_000);
+
+        let record = store.upsert_group_config("g1", &group).await.unwrap();
+
+        assert_eq!(record.queue_timeout_ms, Some(30_000));
+        let fetched = store.get_group_config("g1").await.unwrap().unwrap();
+        assert_eq!(fetched.queue_timeout_ms, Some(30_000));
     }
 
     #[tokio::test]

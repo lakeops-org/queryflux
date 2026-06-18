@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::time::SystemTime;
 
 use bytes::Bytes;
@@ -373,4 +374,19 @@ pub enum QueryStatus {
     Success,
     Failed,
     Cancelled,
+}
+
+// --- Guard actions ---
+
+/// A single guard evaluation result — stored as JSONB in `query_history.guard_actions`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GuardAction {
+    pub guard: String,
+    pub action: String,
+    pub reason: Option<String>,
+    pub code: Option<String>,
+    /// Free-form key/value metadata returned by the guard (e.g. matched rule name,
+    /// estimated row count). Omitted from JSON when `None`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<HashMap<String, String>>,
 }

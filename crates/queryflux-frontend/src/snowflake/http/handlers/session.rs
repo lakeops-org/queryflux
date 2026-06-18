@@ -12,6 +12,7 @@ use serde_json::{json, Value};
 use tracing::{info, warn};
 use uuid::Uuid;
 
+use crate::dispatch::resolve_route;
 use crate::snowflake::http::session_store::SnowflakeSession;
 use crate::state::AppState;
 
@@ -76,19 +77,16 @@ pub async fn login_request(
         extra: HashMap::new(),
         agent_context: None,
     };
-    let group = {
-        let live = state.live.read().await;
-        live.router_chain
-            .route(
-                "",
-                &session_ctx,
-                &FrontendProtocol::SnowflakeHttp,
-                Some(&auth_ctx),
-            )
-            .await
-    };
-    let group = match group {
-        Ok(g) => g,
+    let (group, _routing_trace) = match resolve_route(
+        &state,
+        "",
+        &session_ctx,
+        &FrontendProtocol::SnowflakeHttp,
+        &auth_ctx,
+    )
+    .await
+    {
+        Ok(r) => r,
         Err(e) => {
             warn!(user = %username, "Snowflake HTTP routing failed at login: {e}");
             return sf_error(

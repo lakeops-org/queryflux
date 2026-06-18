@@ -12,7 +12,8 @@ use queryflux_core::error::Result;
 // to depend on one crate.  Re-export them here so all existing call sites
 // (`use queryflux_metrics::{MetricsStore, QueryRecord, ...}`) continue to
 // compile without any changes.
-pub use queryflux_persistence::{ClusterSnapshot, GuardAction, MetricsStore, QueryRecord};
+pub use queryflux_core::query::GuardAction;
+pub use queryflux_persistence::{ClusterSnapshot, MetricsStore, QueryRecord};
 
 /// Fans out to multiple stores. Useful for combining Prometheus (real-time)
 /// with Postgres (historical) without changing callers.

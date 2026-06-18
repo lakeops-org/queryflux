@@ -41,7 +41,7 @@ use queryflux_core::{
     session::SessionContext,
 };
 
-use crate::dispatch::{execute_to_sink, ResultSink};
+use crate::dispatch::{route_and_execute, ResultSink};
 use crate::state::AppState;
 use crate::FrontendListenerTrait;
 
@@ -190,14 +190,6 @@ impl FlightSqlService for QueryFluxFlightSql {
             .await
             .map_err(|e| Status::unauthenticated(e.to_string()))?;
 
-        let routing_result = {
-            let live = self.state.live.read().await;
-            live.router_chain
-                .route_with_trace(&sql, &session, &protocol, Some(&auth_ctx))
-                .await
-        };
-        let (group, _trace) = routing_result.map_err(|e| Status::internal(e.to_string()))?;
-
         // Channel: sink sends RecordBatches; FlightDataEncoderBuilder encodes them.
         let (tx, rx) =
             tokio::sync::mpsc::unbounded_channel::<std::result::Result<RecordBatch, FlightError>>();
@@ -207,13 +199,12 @@ impl FlightSqlService for QueryFluxFlightSql {
         let sql2 = sql.clone();
 
         tokio::spawn(async move {
-            let _ = execute_to_sink(
+            let _ = route_and_execute(
                 &state2,
                 sql2,
                 vec![],
                 session,
                 protocol,
-                group,
                 &mut sink,
                 &auth_ctx,
             )

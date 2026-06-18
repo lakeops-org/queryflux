@@ -8,7 +8,7 @@ pub use chain::GuardChain;
 pub use config::{GuardChainConfig, GuardGroupConfig, GuardKind, GuardLayerConfig};
 pub use context::{GuardContext, GuardLayer, GuardResult};
 
-use queryflux_persistence::GuardAction;
+use queryflux_core::query::GuardAction;
 
 /// Convert a `GuardResult` into a `GuardAction` for audit recording.
 pub fn result_to_action(guard_name: &str, result: &GuardResult) -> GuardAction {

@@ -21,7 +21,7 @@ use serde_json::{json, Value};
 use tracing::warn;
 use uuid::Uuid;
 
-use crate::dispatch::{execute_to_sink, ResultSink};
+use crate::dispatch::{route_and_execute, ResultSink};
 use crate::snowflake::http::format::schema_to_rowtype;
 use crate::snowflake::http::handlers::bindings::bindings_to_params;
 use crate::snowflake::http::handlers::common::parse_snowflake_json_body;
@@ -218,38 +218,21 @@ pub async fn submit_statement(
         extra,
         agent_context: None,
     };
-    let group = {
-        let live = state.live.read().await;
-        live.router_chain
-            .route(
-                &sql,
-                &session_ctx,
-                &FrontendProtocol::SnowflakeSqlApi,
-                Some(&auth_ctx),
-            )
-            .await
-    };
-    let group = match group {
-        Ok(g) => g,
-        Err(e) => return sql_api_error(StatusCode::BAD_GATEWAY, "390000", &e.to_string()),
-    };
-
     let handle = Uuid::new_v4().to_string();
     let mut sink = SqlApiSink::new();
 
-    if let Err(e) = execute_to_sink(
+    if let Err(e) = route_and_execute(
         &state,
         sql,
         params,
         session_ctx,
         FrontendProtocol::SnowflakeSqlApi,
-        group,
         &mut sink,
         &auth_ctx,
     )
     .await
     {
-        warn!(handle = %handle, "SQL API execute_to_sink error: {e}");
+        warn!(handle = %handle, "SQL API route_and_execute error: {e}");
         sink.error = Some(e.to_string());
     }
 

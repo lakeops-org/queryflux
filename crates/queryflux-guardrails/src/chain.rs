@@ -3,7 +3,7 @@ use crate::{
     context::{GuardContext, GuardLayer},
     result_to_action,
 };
-use queryflux_persistence::GuardAction;
+use queryflux_core::query::GuardAction;
 
 /// Ordered chain of guards for a single layer.
 pub struct GuardChain {

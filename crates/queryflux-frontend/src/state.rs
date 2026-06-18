@@ -56,6 +56,9 @@ pub struct LiveConfig {
     /// group_name → default tags configured on the group.
     /// Merged with session tags at dispatch time; session tags win on key conflicts.
     pub group_default_tags: HashMap<String, QueryTags>,
+    /// group_name → max time (ms) a sync/wire query waits for a cluster slot.
+    /// `None` → wait indefinitely. Populated from `ClusterGroupConfig.queue_timeout_ms`.
+    pub group_queue_timeouts: HashMap<String, Option<u64>>,
 }
 
 /// Shared application state — passed to every handler via `axum::extract::State`.
@@ -83,6 +86,7 @@ pub struct AppState {
 /// Stable per-query metadata that does not change across the query's lifecycle.
 /// Built once (after cluster selection and SQL translation) and passed to every
 /// `record_query` call within the same dispatch function.
+#[derive(Clone)]
 pub struct QueryContext {
     pub query_id: ProxyQueryId,
     pub sql: String,
@@ -110,6 +114,7 @@ pub struct QueryOutcome {
     /// Backend engine query ID (Trino query ID, Athena execution ID, etc.).
     pub backend_query_id: Option<String>,
     pub status: QueryStatus,
+    pub queue_duration_ms: u64,
     pub execution_ms: u64,
     pub rows: Option<u64>,
     pub error: Option<String>,
@@ -193,7 +198,7 @@ impl AppState {
                 .routing_trace
                 .as_ref()
                 .and_then(|t| serde_json::to_value(t).ok()),
-            queue_duration_ms: 0,
+            queue_duration_ms: outcome.queue_duration_ms,
             execution_duration_ms: outcome.execution_ms,
             rows_returned: outcome.rows,
             error_message: outcome.error,

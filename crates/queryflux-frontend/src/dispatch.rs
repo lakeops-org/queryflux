@@ -16,17 +16,18 @@ use queryflux_core::{
     error::{QueryFluxError, Result},
     query::{
         ClusterGroupName, ClusterName, EngineType, ExecutingQuery, FrontendProtocol, ProxyQueryId,
-        QueryEngineStats, QueryExecution, QueryStats, QueryStatus, QueuedQuery,
+        QueryEngineStats, QueryExecution, QueryStats, QueryStatus, QueuedQuery, SqlDialect,
     },
     session::SessionContext,
 };
-use queryflux_engine_adapters::trino::api::TrinoResponse;
 use queryflux_engine_adapters::{AdapterKind, AsyncAdapter, ConnectionFormat, SyncAdapter};
-use queryflux_guardrails::{GuardContext, GuardLayer};
+use queryflux_guardrails::{GuardChain, GuardContext, GuardLayer};
 use queryflux_metrics::MetricsStore;
 use queryflux_translation::SchemaContext;
 
 use tracing::{debug, info, warn};
+
+use queryflux_routing::chain::RoutingTrace;
 
 use crate::state::{AppState, QueryContext, QueryOutcome};
 
@@ -74,12 +75,6 @@ pub enum DispatchOutcome {
     },
 }
 
-/// Rewrite a Trino-origin URL to point to QueryFlux instead, keeping the full path.
-/// `http://trino:8080/v1/statement/executing/{id}/{token}` →
-/// `http://queryflux:9000/v1/statement/executing/{id}/{token}`
-///
-/// Any instance can then reconstruct the Trino URL by looking up the stored
-/// `trino_endpoint` and re-joining it with the path.
 async fn cluster_db_ids(
     mgr: &std::sync::Arc<dyn ClusterGroupManager>,
     group: &ClusterGroupName,
@@ -91,17 +86,162 @@ async fn cluster_db_ids(
     }
 }
 
-pub fn rewrite_trino_uri(trino_uri: &str, external_address: &str) -> String {
-    // Find the path portion starting at /v1/
-    if let Some(path_start) = trino_uri.find("/v1/") {
-        format!(
-            "{}{}",
-            external_address.trim_end_matches('/'),
-            &trino_uri[path_start..]
+// ---------------------------------------------------------------------------
+// Shared query preparation helpers (used by both async and sync paths)
+// ---------------------------------------------------------------------------
+
+/// Snapshot of per-group live config needed for query preparation.
+struct GroupLiveConfig {
+    cluster_manager: Arc<dyn ClusterGroupManager>,
+    group_fixups: Vec<String>,
+    group_default_tags: QueryTags,
+    guard_chain: Option<Arc<GuardChain>>,
+    group_guard_chain: Option<Arc<GuardChain>>,
+    /// Max time (ms) a sync/wire query waits for a cluster slot. `None` → no limit.
+    queue_timeout_ms: Option<u64>,
+}
+
+/// Read the per-group live config snapshot from `AppState`.
+async fn read_group_live_config(state: &AppState, group: &str) -> GroupLiveConfig {
+    let live = state.live.read().await;
+    GroupLiveConfig {
+        cluster_manager: live.cluster_manager.clone(),
+        group_fixups: live
+            .group_translation_scripts
+            .get(group)
+            .cloned()
+            .unwrap_or_default(),
+        group_default_tags: live
+            .group_default_tags
+            .get(group)
+            .cloned()
+            .unwrap_or_default(),
+        guard_chain: live.guard_chain.clone(),
+        group_guard_chain: live.group_guard_chains.get(group).cloned(),
+        queue_timeout_ms: live.group_queue_timeouts.get(group).copied().flatten(),
+    }
+}
+
+/// Translate SQL and optionally interpolate parameters.
+///
+/// Shared by both the async (`dispatch_query`) and sync (`setup_sync_query`) paths.
+/// Returns `(translated_sql, was_translated, effective_params)`.
+async fn translate_and_prepare(
+    state: &AppState,
+    sql: &str,
+    params: QueryParams,
+    src_dialect: &SqlDialect,
+    tgt_dialect: &SqlDialect,
+    group_fixups: &[String],
+    supports_native_params: bool,
+) -> Result<(String, bool, QueryParams)> {
+    let translated = state
+        .translation
+        .maybe_translate(
+            sql,
+            src_dialect,
+            tgt_dialect,
+            &SchemaContext::default(),
+            group_fixups,
+        )
+        .await?;
+
+    let was_translated = translated != sql;
+
+    let (translated, effective_params) = if !params.is_empty() && !supports_native_params {
+        (
+            interpolate_params(&translated, &params, tgt_dialect)?,
+            vec![],
         )
     } else {
-        trino_uri.to_string()
+        (translated, params)
+    };
+
+    Ok((translated, was_translated, effective_params))
+}
+
+/// Centralized routing: resolve the target cluster group for a query.
+///
+/// Evaluates the router chain, applies authorization-aware fallback resolution, and returns
+/// the final group name along with the routing trace. All frontends should use this (or
+/// [`route_and_execute`]) instead of calling `router_chain.route_with_trace` directly.
+pub async fn resolve_route(
+    state: &Arc<AppState>,
+    sql: &str,
+    session: &SessionContext,
+    protocol: &FrontendProtocol,
+    auth_ctx: &AuthContext,
+) -> Result<(ClusterGroupName, RoutingTrace)> {
+    let routing_result = {
+        let live = state.live.read().await;
+        live.router_chain
+            .route_with_trace(sql, session, protocol, Some(auth_ctx))
+            .await
+    };
+    let (group, trace) = routing_result?;
+
+    // When the router chain fell back to the static default, honour it if the user is
+    // authorized. Otherwise find the first group the user can access (restrictive ACLs).
+    let group = if trace.used_fallback {
+        resolve_group_for_user(state, auth_ctx, group).await
+    } else {
+        group
+    };
+    Ok((group, trace))
+}
+
+/// Authorization-aware fallback resolution: if the user is authorized for the configured
+/// fallback group, use it. Otherwise scan groups in config order for the first allowed one.
+async fn resolve_group_for_user(
+    state: &AppState,
+    auth_ctx: &AuthContext,
+    fallback: ClusterGroupName,
+) -> ClusterGroupName {
+    if state.authorization.check(auth_ctx, &fallback.0).await {
+        return fallback;
     }
+    let group_order = state.live.read().await.group_order.clone();
+    for group_name in &group_order {
+        if state.authorization.check(auth_ctx, group_name).await {
+            return ClusterGroupName(group_name.clone());
+        }
+    }
+    fallback
+}
+
+/// Route a query and execute it to a sink in one call.
+///
+/// Combines [`resolve_route`] + [`execute_to_sink`] — the standard entry point for
+/// frontends that use the sink-based (sync/Arrow) execution path (MySQL wire, Postgres wire,
+/// FlightSQL). Trino HTTP uses [`resolve_route`] directly because it branches on async vs sync.
+///
+/// Routing errors are reported to the sink via [`ResultSink::on_error`] so the client always
+/// receives a protocol-native error message regardless of where the failure occurred.
+pub async fn route_and_execute(
+    state: &Arc<AppState>,
+    sql: String,
+    params: QueryParams,
+    session: SessionContext,
+    protocol: FrontendProtocol,
+    sink: &mut impl ResultSink,
+    auth_ctx: &AuthContext,
+) -> Result<()> {
+    let (group, trace) = match resolve_route(state, &sql, &session, &protocol, auth_ctx).await {
+        Ok(r) => r,
+        Err(e) => return sink.on_error(&e.to_string()).await,
+    };
+    execute_to_sink(
+        state,
+        sql,
+        params,
+        session,
+        protocol,
+        group,
+        Some(trace),
+        sink,
+        auth_ctx,
+    )
+    .await
 }
 
 /// Core dispatch logic shared across all frontend protocol implementations.
@@ -117,6 +257,7 @@ pub async fn dispatch_query(
     already_queued: bool,
     sequence: u64,
     auth_ctx: &AuthContext,
+    routing_trace: Option<RoutingTrace>,
 ) -> Result<DispatchOutcome> {
     // Authorization check — first gate before any resource acquisition.
     // Phase 1: AllowAllAuthorization always returns true (no behavior change).
@@ -127,24 +268,12 @@ pub async fn dispatch_query(
         )));
     }
 
-    // Clone the manager, group translation fixups, default tags, and guard chains in one snapshot.
-    let (cluster_manager, group_fixups, group_default_tags, guard_chain, group_guard_chain) = {
-        let live = state.live.read().await;
-        (
-            live.cluster_manager.clone(),
-            live.group_translation_scripts
-                .get(&group.0)
-                .cloned()
-                .unwrap_or_default(),
-            live.group_default_tags
-                .get(&group.0)
-                .cloned()
-                .unwrap_or_default(),
-            live.guard_chain.clone(),
-            live.group_guard_chains.get(&group.0).cloned(),
-        )
-    };
-    let effective_tags = merge_tags(&group_default_tags, &session.tags().clone());
+    let glc = read_group_live_config(state, &group.0).await;
+    let cluster_manager = &glc.cluster_manager;
+    let group_fixups = &glc.group_fixups;
+    let guard_chain = &glc.guard_chain;
+    let group_guard_chain = &glc.group_guard_chain;
+    let effective_tags = merge_tags(&glc.group_default_tags, &session.tags().clone());
 
     let cluster_name = match cluster_manager.acquire_cluster(&group).await? {
         Some(c) => c,
@@ -167,7 +296,7 @@ pub async fn dispatch_query(
     };
 
     let (cluster_group_config_id, cluster_config_id) =
-        cluster_db_ids(&cluster_manager, &group, &cluster_name).await;
+        cluster_db_ids(cluster_manager, &group, &cluster_name).await;
 
     state.metrics.on_query_started(&group.0, &cluster_name.0);
 
@@ -192,18 +321,20 @@ pub async fn dispatch_query(
     let tgt_dialect = adapter_kind.translation_target_dialect();
     let engine_type = adapter_kind.engine_type();
     let original_sql = sql.clone();
-    let sql = match state
-        .translation
-        .maybe_translate(
-            &sql,
-            &src_dialect,
-            &tgt_dialect,
-            &SchemaContext::default(),
-            &group_fixups,
-        )
-        .await
+
+    // Async adapters never support native params — always interpolate.
+    let (sql, was_translated, effective_params) = match translate_and_prepare(
+        state,
+        &sql,
+        params,
+        &src_dialect,
+        &tgt_dialect,
+        group_fixups,
+        false,
+    )
+    .await
     {
-        Ok(t) => t,
+        Ok(r) => r,
         Err(e) => {
             warn!(id = %query_id, "Translation error: {e}");
             state.metrics.on_query_finished(&group.0, &cluster_name.0);
@@ -211,22 +342,14 @@ pub async fn dispatch_query(
             return Err(e);
         }
     };
-    let was_translated = sql != original_sql;
     if was_translated {
         info!(id = %query_id, src = ?src_dialect, tgt = ?tgt_dialect, "SQL translated");
     }
 
-    // Fallback interpolation for async adapters that don't support native params.
-    let (sql, effective_params) = if !params.is_empty() {
-        (interpolate_params(&sql, &params, &tgt_dialect)?, vec![])
-    } else {
-        (sql, params)
-    };
-
     // Guard chain: runs after translation (SQL is final), before engine submission.
     // Global guards run first; per-group guards are appended after.
     let resolved_agent_ctx = session.resolved_agent_context();
-    let mut all_guard_actions: Vec<queryflux_persistence::GuardAction> = Vec::new();
+    let mut all_guard_actions: Vec<queryflux_core::query::GuardAction> = Vec::new();
 
     let guard_ctx = GuardContext {
         sql: &original_sql,
@@ -272,10 +395,11 @@ pub async fn dispatch_query(
                 QueryOutcome {
                     backend_query_id: None,
                     status: QueryStatus::Failed,
+                    queue_duration_ms: 0,
                     execution_ms: 0,
                     rows: None,
                     error: Some(deny_reason.clone()),
-                    routing_trace: None,
+                    routing_trace: routing_trace.clone(),
                     engine_stats: None,
                     guard_actions: $actions,
                     was_guard_blocked: true,
@@ -367,9 +491,9 @@ pub async fn dispatch_query(
             if next_uri.is_none() {
                 if let Some(ref ib) = initial_body {
                     if engine_type == EngineType::Trino {
-                        finalize_trino_async_terminal_on_submit(
+                        crate::trino_http::trino_dispatch::finalize_trino_async_terminal_on_submit(
                             state,
-                            &cluster_manager,
+                            cluster_manager,
                             &executing,
                             &adapter,
                             &session,
@@ -381,9 +505,9 @@ pub async fn dispatch_query(
                 }
             }
 
-            let proxy_next_uri = next_uri
-                .as_deref()
-                .map(|uri| rewrite_trino_uri(uri, &state.external_address));
+            let proxy_next_uri = next_uri.as_deref().map(|uri| {
+                crate::trino_http::trino_dispatch::rewrite_trino_uri(uri, &state.external_address)
+            });
             Ok(DispatchOutcome::Async {
                 initial_body,
                 proxy_next_uri,
@@ -393,6 +517,18 @@ pub async fn dispatch_query(
             if already_queued {
                 let _ = state.persistence.delete_queued(&query_id).await;
             }
+
+            // Wrap the already-acquired slot so Drop releases it on future cancellation
+            // (e.g. the Trino HTTP client times out and axum drops this request future).
+            // Without this guard, the running_queries counter for the sync cluster leaks
+            // upward on every client timeout until the cluster appears at-capacity and is
+            // excluded from round-robin selection.
+            let mut slot = ClusterSlotGuard::new(
+                cluster_manager.clone(),
+                group.clone(),
+                cluster_name.clone(),
+                state.metrics.clone(),
+            );
 
             info!(id = %query_id, cluster = %cluster_name, "Query executing (sync via dispatch)");
             let start = Instant::now();
@@ -493,18 +629,18 @@ pub async fn dispatch_query(
                 QueryOutcome {
                     backend_query_id: None,
                     status,
+                    queue_duration_ms: 0,
                     execution_ms: elapsed_ms,
                     rows,
                     error,
-                    routing_trace: None,
+                    routing_trace: routing_trace.clone(),
                     engine_stats: None,
                     guard_actions: all_guard_actions,
                     was_guard_blocked: false,
                 },
             );
 
-            state.metrics.on_query_finished(&group.0, &cluster_name.0);
-            let _ = cluster_manager.release_cluster(&group, &cluster_name).await;
+            slot.release().await;
 
             debug!(id = %ctx.query_id, "sync dispatch: calling into_bytes");
             let body_bytes = sink.into_bytes();
@@ -515,171 +651,6 @@ pub async fn dispatch_query(
             })
         }
     }
-}
-
-/// Determine the terminal `QueryOutcome` from a Trino submit response body.
-///
-/// Parses the body to determine success vs failure. `engine_stats` is passed in
-/// from `adapter.terminal_stats_from_body()` — Trino-specific stats parsing lives
-/// in the adapter, not here.
-///
-/// Returns `(outcome, Option<warn_log_message>)`.
-fn trino_submit_terminal_outcome(
-    body: &Bytes,
-    elapsed_ms: u64,
-    backend_id: String,
-    engine_stats: Option<QueryEngineStats>,
-) -> (QueryOutcome, Option<String>) {
-    let trino_resp: TrinoResponse = match serde_json::from_slice(body.as_ref()) {
-        Ok(r) => r,
-        Err(e) => {
-            let warn_msg = format!(
-                "trino submit terminal body JSON parse failed: {e}; releasing cluster + clearing persistence"
-            );
-            return (
-                QueryOutcome {
-                    backend_query_id: Some(backend_id),
-                    status: QueryStatus::Failed,
-                    execution_ms: elapsed_ms,
-                    rows: None,
-                    error: Some(format!("failed to parse Trino response: {e}")),
-                    routing_trace: None,
-                    engine_stats,
-                    guard_actions: vec![],
-                    was_guard_blocked: false,
-                },
-                Some(warn_msg),
-            );
-        }
-    };
-
-    let backend_id = Some(backend_id);
-
-    if let Some(err) = &trino_resp.error {
-        (
-            QueryOutcome {
-                backend_query_id: backend_id,
-                status: QueryStatus::Failed,
-                execution_ms: elapsed_ms,
-                rows: None,
-                error: Some(err.message.clone()),
-                routing_trace: None,
-                engine_stats,
-                guard_actions: vec![],
-                was_guard_blocked: false,
-            },
-            None,
-        )
-    } else if trino_resp.stats.state == "FAILED" {
-        (
-            QueryOutcome {
-                backend_query_id: backend_id,
-                status: QueryStatus::Failed,
-                execution_ms: elapsed_ms,
-                rows: None,
-                error: Some("Trino query FAILED".to_string()),
-                routing_trace: None,
-                engine_stats,
-                guard_actions: vec![],
-                was_guard_blocked: false,
-            },
-            None,
-        )
-    } else {
-        (
-            QueryOutcome {
-                backend_query_id: backend_id,
-                status: QueryStatus::Success,
-                execution_ms: elapsed_ms,
-                rows: None,
-                error: None,
-                routing_trace: None,
-                engine_stats,
-                guard_actions: vec![],
-                was_guard_blocked: false,
-            },
-            None,
-        )
-    }
-}
-
-/// Trino may return `FINISHED` with no `nextUri` on the initial POST `/v1/statement` response.
-/// Clients then never call GET `/v1/statement/...`, so `get_executing_statement` never runs —
-/// mirror its metrics, `record_query`, and persistence cleanup here.
-///
-/// Collapsed from 4 branches (including JSON parse error) to a single `record_query` call.
-async fn finalize_trino_async_terminal_on_submit(
-    state: &Arc<AppState>,
-    cluster_manager: &Arc<dyn ClusterGroupManager>,
-    executing: &ExecutingQuery,
-    adapter: &Arc<dyn AsyncAdapter>,
-    session: &SessionContext,
-    protocol: FrontendProtocol,
-    body: &Bytes,
-) {
-    let elapsed_ms = (Utc::now() - executing.creation_time)
-        .num_milliseconds()
-        .max(0) as u64;
-
-    let was_translated = executing.translated_sql.is_some();
-    let src_dialect = protocol.default_dialect();
-    let ctx = QueryContext {
-        query_id: executing.id.clone(),
-        sql: executing
-            .translated_sql
-            .as_deref()
-            .unwrap_or(&executing.sql)
-            .to_string(),
-        session: session.clone(),
-        protocol,
-        group: executing.cluster_group.clone(),
-        cluster: executing.cluster_name.clone(),
-        cluster_group_config_id: executing.cluster_group_config_id,
-        cluster_config_id: executing.cluster_config_id,
-        engine_type: adapter.engine_type(),
-        src_dialect,
-        tgt_dialect: adapter.translation_target_dialect(),
-        was_translated,
-        translated_sql: if was_translated {
-            Some(executing.sql.clone())
-        } else {
-            None
-        },
-        query_tags: executing.query_tags.clone(),
-        query_params: vec![],
-        agent_context: executing.agent_context.clone(),
-    };
-
-    let engine_stats = adapter.terminal_stats_from_body(body);
-    let (mut outcome, warn_msg) = trino_submit_terminal_outcome(
-        body,
-        elapsed_ms,
-        executing.backend_query_id.0.clone(),
-        engine_stats,
-    );
-
-    // Inject guard actions captured at submit time into the final audit record.
-    let stored_actions: Vec<queryflux_persistence::GuardAction> = serde_json::from_value(
-        serde_json::Value::Array(executing.submitted_guard_actions.clone()),
-    )
-    .unwrap_or_default();
-    if !stored_actions.is_empty() {
-        outcome.guard_actions = stored_actions;
-        outcome.was_guard_blocked = executing.was_guard_blocked;
-    }
-
-    if let Some(msg) = warn_msg {
-        warn!(proxy_id = %executing.id, "{msg}");
-    }
-
-    state
-        .metrics
-        .on_query_finished(&executing.cluster_group.0, &executing.cluster_name.0);
-    state.record_query(&ctx, outcome);
-    let _ = cluster_manager
-        .release_cluster(&executing.cluster_group, &executing.cluster_name)
-        .await;
-    let _ = state.persistence.delete(&executing.backend_query_id).await;
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -788,6 +759,59 @@ impl Drop for ClusterSlotGuard {
 }
 
 // ---------------------------------------------------------------------------
+// CancellationGuard — records a Cancelled query when a sync future is dropped
+// ---------------------------------------------------------------------------
+
+/// RAII guard that records a `Cancelled` query when the sync execution future is
+/// dropped (e.g. client disconnects). On the normal path the caller calls `disarm()`
+/// after `record_query` so the guard becomes a no-op on drop.
+struct CancellationGuard {
+    state: Arc<AppState>,
+    ctx: Option<QueryContext>,
+    start: Instant,
+}
+
+impl CancellationGuard {
+    fn new(state: Arc<AppState>, ctx: QueryContext, start: Instant) -> Self {
+        Self {
+            state,
+            ctx: Some(ctx),
+            start,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.ctx = None;
+    }
+}
+
+impl Drop for CancellationGuard {
+    fn drop(&mut self) {
+        if let Some(ctx) = self.ctx.take() {
+            let state = self.state.clone();
+            let elapsed = self.start.elapsed().as_millis() as u64;
+            tokio::spawn(async move {
+                state.record_query(
+                    &ctx,
+                    QueryOutcome {
+                        backend_query_id: None,
+                        status: QueryStatus::Cancelled,
+                        queue_duration_ms: 0,
+                        execution_ms: elapsed,
+                        rows: None,
+                        error: Some("Client disconnected".to_string()),
+                        routing_trace: None,
+                        engine_stats: None,
+                        guard_actions: vec![],
+                        was_guard_blocked: false,
+                    },
+                );
+            });
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Sync execution path — shared by MySQL wire, Postgres wire, Flight SQL
 // ---------------------------------------------------------------------------
 
@@ -867,7 +891,9 @@ struct SyncQuerySetup {
     /// Typed parameters — empty when the adapter interpolated them into `translated`.
     params: QueryParams,
     /// Guard actions collected by the guard chain (allow/warn). Merged into QueryOutcome.
-    guard_actions: Vec<queryflux_persistence::GuardAction>,
+    guard_actions: Vec<queryflux_core::query::GuardAction>,
+    /// Time spent waiting for a cluster slot (wire-protocol queueing).
+    queue_duration_ms: u64,
 }
 
 /// The outcome of executing a sync query — everything record_query needs.
@@ -886,6 +912,7 @@ impl From<SyncOutcome> for QueryOutcome {
         QueryOutcome {
             backend_query_id: None,
             status: o.status,
+            queue_duration_ms: 0,
             execution_ms: o.elapsed_ms,
             rows: o.rows,
             error: o.error,
@@ -917,52 +944,72 @@ async fn setup_sync_query(
 ) -> Result<SyncQuerySetup> {
     let query_id = ProxyQueryId::new();
 
-    let (cluster_manager, group_fixups, group_default_tags) = {
-        let live = state.live.read().await;
-        (
-            live.cluster_manager.clone(),
-            live.group_translation_scripts
-                .get(&group.0)
-                .cloned()
-                .unwrap_or_default(),
-            live.group_default_tags
-                .get(&group.0)
-                .cloned()
-                .unwrap_or_default(),
-        )
-    };
-    let effective_tags: QueryTags = merge_tags(&group_default_tags, &session.tags().clone());
+    let glc = read_group_live_config(state, &group.0).await;
+    let effective_tags: QueryTags = merge_tags(&glc.group_default_tags, &session.tags().clone());
 
-    // Queue loop: spin until a cluster slot is available.
+    // Queue loop: wait for a cluster slot with optional timeout.
+    let queue_start = Instant::now();
+    let timeout = glc.queue_timeout_ms.map(std::time::Duration::from_millis);
     let mut seq: u64 = 0;
+    let mut queued_metric_emitted = false;
+
     let (cluster_name, adapter) = loop {
-        match cluster_manager.acquire_cluster(&group).await? {
+        match glc.cluster_manager.acquire_cluster(&group).await? {
             Some(name) => match state.adapter(&name.0).await {
                 Some(AdapterKind::Sync(a)) => break (name, DispatchAdapter::Sync(a)),
                 Some(AdapterKind::Async(a)) => break (name, DispatchAdapter::Async(a)),
                 None => {
-                    let _ = cluster_manager.release_cluster(&group, &name).await;
+                    let _ = glc.cluster_manager.release_cluster(&group, &name).await;
                     return Err(QueryFluxError::Engine(format!(
                         "No adapter for {group}/{name}"
                     )));
                 }
             },
             None => {
+                if !queued_metric_emitted {
+                    info!(id = %query_id, group = %group, "Query queued — waiting for cluster slot");
+                    queued_metric_emitted = true;
+                }
+
+                if let Some(max_wait) = timeout {
+                    if queue_start.elapsed() >= max_wait {
+                        warn!(
+                            id = %query_id, group = %group,
+                            waited_ms = queue_start.elapsed().as_millis() as u64,
+                            "Queue timeout — no cluster slot available"
+                        );
+                        return Err(QueryFluxError::Engine(format!(
+                            "query timed out waiting for a free cluster slot in group '{}' \
+                             (waited {}ms, limit {}ms)",
+                            group.0,
+                            queue_start.elapsed().as_millis(),
+                            max_wait.as_millis()
+                        )));
+                    }
+                }
+
                 queued_backoff_delay(seq).await;
                 seq += 1;
             }
         }
     };
+    let queue_duration_ms = queue_start.elapsed().as_millis() as u64;
+    if queued_metric_emitted {
+        info!(
+            id = %query_id, group = %group,
+            queue_ms = queue_duration_ms,
+            "Query dequeued — cluster slot acquired"
+        );
+    }
 
     let (cluster_group_config_id, cluster_config_id) =
-        cluster_db_ids(&cluster_manager, &group, &cluster_name).await;
+        cluster_db_ids(&glc.cluster_manager, &group, &cluster_name).await;
 
-    // Fix Bug A: on_query_started was missing from the sync path.
     state.metrics.on_query_started(&group.0, &cluster_name.0);
     info!(id = %query_id, group = %group, cluster = %cluster_name, "Query executing (sync)");
 
     let mut slot = ClusterSlotGuard::new(
-        cluster_manager.clone(),
+        glc.cluster_manager.clone(),
         group.clone(),
         cluster_name.clone(),
         state.metrics.clone(),
@@ -973,20 +1020,18 @@ async fn setup_sync_query(
     let engine_type = adapter.engine_type();
     let start = Instant::now();
 
-    // Translate SQL. On failure: record the query, release the slot, propagate the error.
-    // The caller (execute_to_sink) will notify the sink via on_error.
-    let translated = match state
-        .translation
-        .maybe_translate(
-            &sql,
-            &src_dialect,
-            &tgt_dialect,
-            &SchemaContext::default(),
-            &group_fixups,
-        )
-        .await
+    let (translated, was_translated, effective_params) = match translate_and_prepare(
+        state,
+        &sql,
+        params.clone(),
+        &src_dialect,
+        &tgt_dialect,
+        &glc.group_fixups,
+        adapter.supports_native_params(),
+    )
+    .await
     {
-        Ok(t) => t,
+        Ok(r) => r,
         Err(e) => {
             let err_msg = e.to_string();
             warn!(id = %query_id, "Translation error: {err_msg}");
@@ -1013,6 +1058,7 @@ async fn setup_sync_query(
                 QueryOutcome {
                     backend_query_id: None,
                     status: QueryStatus::Failed,
+                    queue_duration_ms: 0,
                     execution_ms: start.elapsed().as_millis() as u64,
                     rows: None,
                     error: Some(err_msg),
@@ -1027,26 +1073,11 @@ async fn setup_sync_query(
         }
     };
 
-    let was_translated = translated != sql;
-
     let cluster_cfg = state.cluster_config_cloned(&cluster_name.0).await;
     let credentials = state
         .identity_resolver
         .resolve(auth_ctx, cluster_cfg.as_ref())
         .await;
-
-    // Fallback interpolation: when the adapter does not support native params,
-    // substitute `?` placeholders with typed literals now so the adapter receives
-    // a fully-resolved SQL string and empty params.
-    let (translated, effective_params) = if !params.is_empty() && !adapter.supports_native_params()
-    {
-        (
-            interpolate_params(&translated, &params, &tgt_dialect)?,
-            vec![],
-        )
-    } else {
-        (translated, params)
-    };
 
     let agent_context = session.resolved_agent_context();
     let ctx = QueryContext {
@@ -1081,6 +1112,7 @@ async fn setup_sync_query(
         credentials,
         params: effective_params,
         guard_actions: vec![],
+        queue_duration_ms,
     })
 }
 
@@ -1350,6 +1382,7 @@ pub async fn execute_to_sink(
     session: SessionContext,
     protocol: FrontendProtocol,
     group: ClusterGroupName,
+    routing_trace: Option<RoutingTrace>,
     sink: &mut impl ResultSink,
     auth_ctx: &AuthContext,
 ) -> Result<()> {
@@ -1400,7 +1433,7 @@ pub async fn execute_to_sink(
             query_tags: &ctx.query_tags,
         };
 
-        let mut all_actions: Vec<queryflux_persistence::GuardAction> = Vec::new();
+        let mut all_actions: Vec<queryflux_core::query::GuardAction> = Vec::new();
 
         for chain in [guard_chain.as_ref(), group_guard_chain.as_ref()]
             .into_iter()
@@ -1420,10 +1453,11 @@ pub async fn execute_to_sink(
                     QueryOutcome {
                         backend_query_id: None,
                         status: QueryStatus::Failed,
+                        queue_duration_ms: setup.queue_duration_ms,
                         execution_ms: setup.start.elapsed().as_millis() as u64,
                         rows: None,
                         error: Some(deny_reason.clone()),
-                        routing_trace: None,
+                        routing_trace: routing_trace.clone(),
                         engine_stats: None,
                         guard_actions: all_actions,
                         was_guard_blocked: true,
@@ -1437,6 +1471,11 @@ pub async fn execute_to_sink(
         // flow into record_query at the normal exit point below.
         setup.guard_actions = all_actions;
     }
+
+    // Cancellation safety: if the future is dropped from here on (client disconnect),
+    // the guard records the query as Cancelled so it appears in query history.
+    // Disarmed below after the normal-path record_query call.
+    let mut cancel_guard = CancellationGuard::new(state.clone(), setup.ctx.clone(), setup.start);
 
     // Native path: skip Arrow when backend connection format matches frontend protocol.
     // All other guarantees (slot release, record_query) are upheld by this function's
@@ -1455,12 +1494,15 @@ pub async fn execute_to_sink(
     // slot.release() is idempotent and sets released=true so Drop is a no-op.
     setup.slot.release().await;
     let mut final_outcome: QueryOutcome = outcome.into();
+    final_outcome.routing_trace = routing_trace;
+    final_outcome.queue_duration_ms = setup.queue_duration_ms;
     // Prepend guard actions (allow/warn) collected before execution.
     if !setup.guard_actions.is_empty() {
         setup.guard_actions.extend(final_outcome.guard_actions);
         final_outcome.guard_actions = setup.guard_actions;
     }
     state.record_query(&setup.ctx, final_outcome);
+    cancel_guard.disarm();
 
     sink_result
 }

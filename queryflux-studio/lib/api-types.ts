@@ -236,6 +236,8 @@ export interface ClusterGroupConfigRecord {
   members: string[];
   maxRunningQueries: number;
   maxQueuedQueries: number | null;
+  /** Max time (ms) a wire-protocol query waits for a free cluster slot. `null` = unlimited. */
+  queueTimeoutMs: number | null;
   strategy: Record<string, unknown> | null;
   allowGroups: string[];
   allowUsers: string[];
@@ -253,6 +255,8 @@ export interface UpsertClusterGroupConfig {
   members: string[];
   maxRunningQueries: number;
   maxQueuedQueries?: number | null;
+  /** Max time (ms) a wire-protocol query waits for a free cluster slot. `null` = unlimited. */
+  queueTimeoutMs?: number | null;
   strategy?: Record<string, unknown> | null;
   allowGroups?: string[];
   allowUsers?: string[];

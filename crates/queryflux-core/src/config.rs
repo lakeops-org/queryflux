@@ -722,6 +722,12 @@ pub struct ClusterGroupConfig {
     pub max_running_queries: u64,
     #[serde(default)]
     pub max_queued_queries: Option<u64>,
+    /// Maximum time (ms) a wire-protocol query will wait for a free cluster slot before
+    /// returning an error. `None` → wait indefinitely (legacy behavior).
+    /// Only affects MySQL wire, Postgres wire, FlightSQL, and Snowflake HTTP.
+    /// Trino HTTP uses its own persistent queue with client-driven polling.
+    #[serde(default)]
+    pub queue_timeout_ms: Option<u64>,
     /// Simple authorization policy (used when `authorization.provider: none`).
     /// If both lists are empty/absent, all authenticated users are allowed.
     #[serde(default)]

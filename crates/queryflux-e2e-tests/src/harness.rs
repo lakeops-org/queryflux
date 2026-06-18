@@ -286,6 +286,7 @@ impl TestHarness {
             group_order,
             group_translation_scripts: HashMap::new(),
             group_default_tags: HashMap::new(),
+            group_queue_timeouts: HashMap::new(),
         };
         let records = Arc::new(Mutex::new(Vec::<QueryRecord>::new()));
         let state = Arc::new(AppState {

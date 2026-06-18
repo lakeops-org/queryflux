@@ -9,7 +9,7 @@ use axum::{
 };
 use bytes::Bytes;
 use chrono::Utc;
-use queryflux_auth::{AuthContext, Credentials};
+use queryflux_auth::Credentials;
 use queryflux_core::{
     error::QueryFluxError,
     query::{BackendQueryId, FrontendProtocol, ProxyQueryId, QueryPollResult, QueryStatus},
@@ -23,7 +23,8 @@ use serde_json::{json, Value};
 use tracing::{info, warn};
 
 use super::result_sink::TrinoHttpResultSink;
-use crate::dispatch::{dispatch_query, execute_to_sink, rewrite_trino_uri, DispatchOutcome};
+use super::trino_dispatch::rewrite_trino_uri;
+use crate::dispatch::{dispatch_query, execute_to_sink, resolve_route, DispatchOutcome};
 use crate::state::{AppState, QueryContext, QueryOutcome};
 
 fn trino_error_response(query_id: &str, message: &str) -> Response<Body> {
@@ -400,30 +401,16 @@ pub async fn post_statement(
         }
     };
 
-    // 2. Route — first matching router wins.
-    // `route_with_trace` is CPU-bound (regex match, header lookup); holding the read lock
-    // across this call is fine since it's brief and read-locks don't block each other.
-    let routing_result = {
-        let live = state.live.read().await;
-        live.router_chain
-            .route_with_trace(&sql, &session, &protocol, Some(&auth_ctx))
-            .await
-    };
-    let (group, trace) = match routing_result {
+    // 2. Route — centralized routing + authorization-aware fallback resolution.
+    let (group, routing_trace) = match resolve_route(&state, &sql, &session, &protocol, &auth_ctx)
+        .await
+    {
         Ok(r) => r,
         Err(e) => {
             warn!("Routing error: {e}");
             let tmp_id = ProxyQueryId::new();
             return trino_error_response(&tmp_id.0, &format!("Routing error: {e}")).into_response();
         }
-    };
-
-    // 3. Authorization-aware first-fit when router chain fell back to static default.
-    // If the user is authorized for a more specific group, use it instead.
-    let group = if trace.used_fallback {
-        resolve_group_for_user(&state, &auth_ctx, group).await
-    } else {
-        group
     };
 
     let query_id = ProxyQueryId::new();
@@ -447,6 +434,7 @@ pub async fn post_statement(
             false,
             0,
             &auth_ctx,
+            Some(routing_trace.clone()),
         )
         .await
         {
@@ -460,6 +448,7 @@ pub async fn post_statement(
                     session,
                     protocol,
                     group,
+                    Some(routing_trace),
                     &mut sink,
                     &auth_ctx,
                 )
@@ -487,6 +476,7 @@ pub async fn post_statement(
             session,
             protocol,
             group,
+            Some(routing_trace),
             &mut sink,
             &auth_ctx,
         )
@@ -589,26 +579,6 @@ fn base64_decode(encoded: &str) -> Result<String, ()> {
     String::from_utf8(out).map_err(|_| ())
 }
 
-/// When the router chain fell back to the static default, check if the authenticated user
-/// is authorized for any specific group and return the first match.
-/// Falls back to the static `routingFallback` group if no authorized group found.
-async fn resolve_group_for_user(
-    state: &AppState,
-    auth_ctx: &AuthContext,
-    fallback: queryflux_core::query::ClusterGroupName,
-) -> queryflux_core::query::ClusterGroupName {
-    // Snapshot the group order under the read lock, then drop the lock before
-    // calling authorization.check (which may do async I/O, e.g. OpenFGA).
-    let group_order = state.live.read().await.group_order.clone();
-    for group_name in &group_order {
-        let group = queryflux_core::query::ClusterGroupName(group_name.clone());
-        if state.authorization.check(auth_ctx, group_name).await {
-            return group;
-        }
-    }
-    fallback
-}
-
 /// GET /v1/statement/qf/queued/{id}/{seq} — poll a query queued in QueryFlux.
 pub async fn get_queued_statement(
     State(state): State<Arc<AppState>>,
@@ -657,6 +627,7 @@ pub async fn get_queued_statement(
             true,
             seq,
             &auth_ctx,
+            None,
         )
         .await
         {
@@ -671,6 +642,7 @@ pub async fn get_queued_statement(
                     session,
                     protocol,
                     group,
+                    None,
                     &mut sink,
                     &auth_ctx,
                 )
@@ -695,6 +667,7 @@ pub async fn get_queued_statement(
             session,
             protocol,
             group,
+            None,
             &mut sink,
             &auth_ctx,
         )
@@ -836,7 +809,7 @@ pub async fn get_executing_statement(
     };
 
     // Guard actions captured at submit time — injected into the final record_query call.
-    let submit_guard_actions: Vec<queryflux_persistence::GuardAction> = serde_json::from_value(
+    let submit_guard_actions: Vec<queryflux_core::query::GuardAction> = serde_json::from_value(
         serde_json::Value::Array(executing.submitted_guard_actions.clone()),
     )
     .unwrap_or_default();
@@ -855,6 +828,7 @@ pub async fn get_executing_statement(
                     QueryOutcome {
                         backend_query_id: Some(backend_id.0.clone()),
                         status: QueryStatus::Success,
+                        queue_duration_ms: 0,
                         execution_ms: elapsed_ms,
                         rows: None,
                         error: None,
@@ -890,6 +864,7 @@ pub async fn get_executing_statement(
                 QueryOutcome {
                     backend_query_id: Some(backend_id.0.clone()),
                     status: QueryStatus::Failed,
+                    queue_duration_ms: 0,
                     execution_ms: elapsed_ms,
                     rows: None,
                     error: Some(message.clone()),

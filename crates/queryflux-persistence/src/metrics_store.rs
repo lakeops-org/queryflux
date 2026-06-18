@@ -1,29 +1,15 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use queryflux_core::{
     error::Result,
     query::{
-        ClusterGroupName, ClusterName, EngineType, FrontendProtocol, QueryEngineStats, QueryStatus,
-        SqlDialect,
+        ClusterGroupName, ClusterName, EngineType, FrontendProtocol, GuardAction, QueryEngineStats,
+        QueryStatus, SqlDialect,
     },
     tags::QueryTags,
 };
-
-/// A single guard evaluation result — stored as JSONB in `query_history.guard_actions`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GuardAction {
-    pub guard: String,
-    pub action: String,
-    pub reason: Option<String>,
-    pub code: Option<String>,
-    /// Free-form key/value metadata returned by the guard (e.g. matched rule name,
-    /// estimated row count). Omitted from JSON when `None`.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub metadata: Option<std::collections::HashMap<String, String>>,
-}
 
 /// A record of one completed (or failed/cancelled) query execution.
 /// Written to the metrics store at the end of every query, regardless of outcome.

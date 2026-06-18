@@ -75,6 +75,9 @@ pub struct ClusterGroupConfigRecord {
     pub members: Vec<String>,
     pub max_running_queries: i64,
     pub max_queued_queries: Option<i64>,
+    /// Max time (ms) a wire-protocol query waits for a free cluster slot.
+    /// `null` means wait indefinitely.
+    pub queue_timeout_ms: Option<i64>,
     /// Serialised `StrategyConfig`. `null` means RoundRobin (the default).
     #[schema(value_type = Option<Object>)]
     pub strategy: Option<serde_json::Value>,
@@ -101,6 +104,10 @@ pub struct UpsertClusterGroupConfig {
     pub members: Vec<String>,
     pub max_running_queries: i64,
     pub max_queued_queries: Option<i64>,
+    /// Max time (ms) a wire-protocol query waits for a free cluster slot.
+    /// `null` means wait indefinitely (default).
+    #[serde(default)]
+    pub queue_timeout_ms: Option<i64>,
     /// `null` = RoundRobin. Set to `{"type":"leastLoaded"}` etc. for other strategies.
     pub strategy: Option<serde_json::Value>,
     #[serde(default)]
@@ -234,6 +241,7 @@ impl UpsertClusterGroupConfig {
             members: cfg.members.clone(),
             max_running_queries: cfg.max_running_queries as i64,
             max_queued_queries: cfg.max_queued_queries.map(|v| v as i64),
+            queue_timeout_ms: cfg.queue_timeout_ms.map(|v| v as i64),
             strategy,
             allow_groups: cfg.authorization.allow_groups.clone(),
             allow_users: cfg.authorization.allow_users.clone(),
@@ -279,6 +287,7 @@ impl ClusterGroupConfigRecord {
             strategy,
             max_running_queries: self.max_running_queries as u64,
             max_queued_queries: self.max_queued_queries.map(|v| v as u64),
+            queue_timeout_ms: self.queue_timeout_ms.map(|v| v as u64),
             authorization: queryflux_core::config::ClusterGroupAuthorizationConfig {
                 allow_groups: self.allow_groups.clone(),
                 allow_users: self.allow_users.clone(),
@@ -310,6 +319,7 @@ mod tests {
             members: vec!["c1".to_string()],
             max_running_queries: 10,
             max_queued_queries: None,
+            queue_timeout_ms: None,
             strategy: None,
             allow_groups: vec![],
             allow_users: vec![],
@@ -327,6 +337,7 @@ mod tests {
             strategy: None,
             max_running_queries: 10,
             max_queued_queries: None,
+            queue_timeout_ms: None,
             authorization: queryflux_core::config::ClusterGroupAuthorizationConfig {
                 allow_groups: vec![],
                 allow_users: vec![],
@@ -402,6 +413,26 @@ mod tests {
         let upsert = UpsertClusterGroupConfig::from_core(&make_core_group(QueryTags::new()));
         assert!(upsert.default_tags.is_object());
         assert_eq!(upsert.default_tags.as_object().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn from_core_preserves_queue_timeout() {
+        let mut group = make_core_group(QueryTags::new());
+        group.queue_timeout_ms = Some(30_000);
+
+        let upsert = UpsertClusterGroupConfig::from_core(&group);
+
+        assert_eq!(upsert.queue_timeout_ms, Some(30_000));
+    }
+
+    #[test]
+    fn to_core_preserves_queue_timeout() {
+        let mut record = make_record(serde_json::json!({}));
+        record.queue_timeout_ms = Some(45_000);
+
+        let core = record.to_core();
+
+        assert_eq!(core.queue_timeout_ms, Some(45_000));
     }
 
     // --- roundtrip: core → upsert → record → core ---

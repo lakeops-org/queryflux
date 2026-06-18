@@ -109,6 +109,7 @@ export function GroupsConfigPanel({ groups, clusterNames }: Props) {
                 <th className="px-4 py-3 min-w-[140px]">Strategy</th>
                 <th className="px-4 py-3 w-24">Max run</th>
                 <th className="px-4 py-3 w-28">Max queue</th>
+                <th className="px-4 py-3 w-28">Queue timeout</th>
                 <th className="px-6 py-3 text-right w-40">Actions</th>
               </tr>
             </thead>
@@ -147,6 +148,9 @@ export function GroupsConfigPanel({ groups, clusterNames }: Props) {
                   </td>
                   <td className="px-4 py-3 font-mono text-xs text-slate-600">
                     {g.maxQueuedQueries ?? "—"}
+                  </td>
+                  <td className="px-4 py-3 font-mono text-xs text-slate-600">
+                    {g.queueTimeoutMs != null ? `${g.queueTimeoutMs}ms` : "—"}
                   </td>
                   <td className="px-6 py-3 text-right">
                     <div className="flex items-center justify-end gap-1">

@@ -31,7 +31,7 @@ use queryflux_core::{
     tags::parse_query_tags,
 };
 
-use crate::dispatch::{execute_to_sink, ResultSink};
+use crate::dispatch::{route_and_execute, ResultSink};
 use crate::state::AppState;
 use crate::FrontendListenerTrait;
 
@@ -294,21 +294,6 @@ async fn handle_simple_query<W: AsyncWriteExt + Unpin>(
         }
     };
 
-    let routing_result = {
-        let live = state.live.read().await;
-        live.router_chain
-            .route_with_trace(sql, session, &protocol, Some(&auth_ctx))
-            .await
-    };
-    let (group, _trace) = match routing_result {
-        Ok(r) => r,
-        Err(e) => {
-            write_error_response(writer, "42000", &e.to_string()).await?;
-            write_msg(writer, b'Z', b"I").await?;
-            return Ok(());
-        }
-    };
-
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
     let mut sink = PostgresResultSink::new(tx);
 
@@ -317,13 +302,12 @@ async fn handle_simple_query<W: AsyncWriteExt + Unpin>(
     let sql2 = sql.to_string();
 
     let exec_task = tokio::spawn(async move {
-        execute_to_sink(
+        route_and_execute(
             &state2,
             sql2,
             vec![],
             session2,
             protocol,
-            group,
             &mut sink,
             &auth_ctx,
         )

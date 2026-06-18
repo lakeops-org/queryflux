@@ -75,6 +75,7 @@ export function normalizeClusterGroupRecord(raw: unknown): ClusterGroupConfigRec
     members,
     maxRunningQueries: num("maxRunningQueries", "max_running_queries", 10),
     maxQueuedQueries: maybeNullNum("maxQueuedQueries", "max_queued_queries"),
+    queueTimeoutMs: maybeNullNum("queueTimeoutMs", "queue_timeout_ms"),
     strategy,
     allowGroups: strArr("allowGroups", "allow_groups"),
     allowUsers: strArr("allowUsers", "allow_users"),
@@ -97,6 +98,10 @@ export function clusterGroupRecordToUpsert(
       overrides.maxQueuedQueries !== undefined
         ? overrides.maxQueuedQueries
         : r.maxQueuedQueries,
+    queueTimeoutMs:
+      overrides.queueTimeoutMs !== undefined
+        ? overrides.queueTimeoutMs
+        : r.queueTimeoutMs,
     strategy:
       overrides.strategy !== undefined ? overrides.strategy : r.strategy,
     allowGroups: overrides.allowGroups ?? [...r.allowGroups],
