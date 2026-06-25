@@ -617,10 +617,13 @@ pub async fn get_queued_statement(
 ) -> impl IntoResponse {
     let creds = extract_credentials(&headers);
     let auth_provider = state.live.read().await.auth_provider.clone();
-    if let Err(e) = auth_provider.authenticate(&creds).await {
-        warn!("Queued poll auth failed: {e}");
-        return StatusCode::UNAUTHORIZED.into_response();
-    }
+    let auth_ctx = match auth_provider.authenticate(&creds).await {
+        Ok(ctx) => ctx,
+        Err(e) => {
+            warn!("Queued poll auth failed: {e}");
+            return StatusCode::UNAUTHORIZED.into_response();
+        }
+    };
 
     let query_id = ProxyQueryId(id);
 
@@ -724,19 +727,6 @@ pub async fn get_queued_statement(
     let session = queued.session.clone();
     let protocol = queued.frontend_protocol.clone();
     let group = queued.cluster_group.clone();
-
-    let creds = Credentials {
-        username: session.user().map(|s| s.to_string()),
-        ..Default::default()
-    };
-    let auth_provider = state.live.read().await.auth_provider.clone();
-    let auth_ctx = match auth_provider.authenticate(&creds).await {
-        Ok(ctx) => ctx,
-        Err(e) => {
-            warn!("Authentication failed for queued query: {e}");
-            return StatusCode::UNAUTHORIZED.into_response();
-        }
-    };
 
     let release_claim = |state: &Arc<AppState>, qid: &str| {
         let qc = state.queue_coordinator.clone();
@@ -853,6 +843,12 @@ pub async fn get_executing_statement(
 
     // trino_path = e.g. "queued/20260319_084733_00386_kqwci/1/token"
     //                 or "executing/20260319_084733_00386_kqwci/1/token"
+
+    // Reject path traversal: a ".." segment would escape /v1/statement/ on the backend.
+    if trino_path.split('/').any(|seg| seg == "..") {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+
     // Extract the Trino query ID (always the second segment).
     let trino_id = match trino_path.split('/').nth(1) {
         Some(id) => id.to_string(),
@@ -947,35 +943,11 @@ pub async fn get_executing_statement(
         let _ = state.persistence.upsert(refreshed).await;
     }
 
-    let poll_result = match adapter.poll_query(&backend_id, Some(&trino_url)).await {
-        Ok(r) => r,
-        Err(e) => {
-            if e.is_transient() {
-                warn!(id = %executing.id, "Transient poll error (will retry): {e}");
-                let next_uri = format!("{}/v1/statement/{}", state.external_address, trino_path);
-                let resp = queued_response(&executing.id.0, 0, next_uri);
-                return json_response(&resp).into_response();
-            }
-            error!(id = %executing.id, "Permanent poll error: {e}");
-            state
-                .release_query_slot(
-                    &executing.cluster_group,
-                    &executing.cluster_name,
-                    &executing.id.0,
-                )
-                .await;
-            if let Err(del_err) = state.persistence.delete(&backend_id).await {
-                warn!(id = %executing.id, "Failed to delete executing record after poll error: {del_err}");
-            }
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-        }
-    };
-
     let elapsed_ms = (Utc::now() - executing.creation_time)
         .num_milliseconds()
         .max(0) as u64;
 
-    // Build query context once — reused for both the success and failure record_query calls.
+    // Build query context once — reused for success, failure, and poll-error record_query calls.
     let was_translated = executing.translated_sql.is_some();
     let ctx = QueryContext {
         query_id: executing.id.clone(),
@@ -1016,6 +988,45 @@ pub async fn get_executing_statement(
         }
     };
     let submit_was_guard_blocked = executing.was_guard_blocked;
+
+    let poll_result = match adapter.poll_query(&backend_id, Some(&trino_url)).await {
+        Ok(r) => r,
+        Err(e) => {
+            if e.is_transient() {
+                warn!(id = %executing.id, "Transient poll error (will retry): {e}");
+                let next_uri = format!("{}/v1/statement/{}", state.external_address, trino_path);
+                let resp = queued_response(&executing.id.0, 0, next_uri);
+                return json_response(&resp).into_response();
+            }
+            error!(id = %executing.id, "Permanent poll error: {e}");
+            state.record_query(
+                &ctx,
+                QueryOutcome {
+                    backend_query_id: Some(backend_id.0.clone()),
+                    status: QueryStatus::Failed,
+                    execution_ms: elapsed_ms,
+                    rows: None,
+                    error: Some(e.to_string()),
+                    routing_trace: None,
+                    engine_stats: None,
+                    guard_actions: submit_guard_actions,
+                    was_guard_blocked: submit_was_guard_blocked,
+                    queue_duration_ms: 0,
+                },
+            );
+            state
+                .release_query_slot(
+                    &executing.cluster_group,
+                    &executing.cluster_name,
+                    &executing.id.0,
+                )
+                .await;
+            if let Err(del_err) = state.persistence.delete(&backend_id).await {
+                warn!(id = %executing.id, "Failed to delete executing record after poll error: {del_err}");
+            }
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
 
     match poll_result {
         QueryPollResult::Raw {
@@ -1144,6 +1155,11 @@ pub async fn delete_executing_statement(
             return StatusCode::UNAUTHORIZED.into_response();
         }
     };
+
+    // Reject path traversal before constructing the backend cancel URL.
+    if trino_path.split('/').any(|seg| seg == "..") {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
 
     let trino_id = match trino_path.split('/').nth(1) {
         Some(id) => id.to_string(),

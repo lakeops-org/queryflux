@@ -56,7 +56,10 @@ impl FrontendListenerTrait for TrinoHttpFrontend {
         let addr = format!("0.0.0.0:{}", self.port);
         info!("Trino HTTP frontend listening on {addr}");
         if let Some(limit) = self.max_connections.filter(|&l| l > 0) {
-            info!(max_connections = limit, "Connection limit enabled");
+            info!(
+                max_connections = limit,
+                "Concurrent request limit enabled (idle keep-alive clients do not count)"
+            );
         }
         let listener = TcpListener::bind(&addr)
             .await

@@ -93,17 +93,15 @@ impl PostgresStore {
         let timeout = std::time::Duration::from_secs(acquire_timeout_secs.unwrap_or(30));
         opts = opts.acquire_timeout(timeout);
 
-        if let Some(stmt_secs) = statement_timeout_secs {
-            let stmt_ms = stmt_secs.saturating_mul(1000);
-            opts = opts.after_connect(move |conn, _meta| {
-                Box::pin(async move {
-                    use sqlx::Executor;
-                    conn.execute(format!("SET statement_timeout = {stmt_ms}").as_str())
-                        .await?;
-                    Ok(())
-                })
-            });
-        }
+        let stmt_ms = statement_timeout_secs.unwrap_or(60).saturating_mul(1000);
+        opts = opts.after_connect(move |conn, _meta| {
+            Box::pin(async move {
+                use sqlx::Executor;
+                conn.execute(format!("SET statement_timeout = {stmt_ms}").as_str())
+                    .await?;
+                Ok(())
+            })
+        });
         let pool = opts.connect(database_url).await.map_err(|e| {
             QueryFluxError::Persistence(format!("Failed to connect to Postgres: {e}"))
         })?;

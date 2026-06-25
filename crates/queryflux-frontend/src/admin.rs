@@ -1262,6 +1262,10 @@ fn redact_cluster_config_secrets(config: &mut serde_json::Value) {
         for (_, val) in obj.iter_mut() {
             if val.is_object() {
                 redact_cluster_config_secrets(val);
+            } else if let Some(arr) = val.as_array_mut() {
+                for item in arr.iter_mut() {
+                    redact_cluster_config_secrets(item);
+                }
             }
         }
     }

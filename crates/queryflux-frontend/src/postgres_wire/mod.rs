@@ -110,6 +110,10 @@ impl FrontendListenerTrait for PostgresWireFrontend {
                 }
             }
         }
+        // Drain: wait for all in-flight connections to finish before returning.
+        while active.load(Ordering::Relaxed) > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
         Ok(())
     }
 }

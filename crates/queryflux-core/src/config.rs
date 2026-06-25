@@ -592,8 +592,10 @@ pub struct FrontendConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
     pub port: u16,
-    /// Maximum concurrent connections this frontend will accept. New connections
-    /// beyond this limit are rejected immediately. `None` or `0` = unlimited.
+    /// Maximum number of concurrent connections (TCP-based frontends) or concurrent in-flight
+    /// requests (HTTP-based frontends like Trino HTTP) this frontend will accept. For HTTP
+    /// frontends the limit is enforced via `tower::ConcurrencyLimitLayer`, so keep-alive clients
+    /// that are idle between requests do not count against it. `None` or `0` = unlimited.
     #[serde(default)]
     pub max_connections: Option<usize>,
 }
@@ -615,6 +617,9 @@ pub struct SnowflakeHttpFrontendConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
     pub port: u16,
+    /// Maximum number of concurrent in-flight HTTP requests this frontend will accept.
+    /// Enforced via `tower::ConcurrencyLimitLayer` — idle keep-alive clients do not count.
+    /// `None` or `0` = unlimited.
     #[serde(default)]
     pub max_connections: Option<usize>,
     /// Must be set to `true` when running multiple QueryFlux replicas to acknowledge that

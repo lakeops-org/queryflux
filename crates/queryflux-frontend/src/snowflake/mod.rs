@@ -83,20 +83,30 @@ impl FrontendListenerTrait for SnowflakeFrontend {
             .map_err(|e: std::net::AddrParseError| QueryFluxError::Other(e.into()))?;
 
         info!("Snowflake frontend (wire v1 + SQL API v2) listening on {addr}");
+        if let Some(limit) = self.cfg.max_connections.filter(|&l| l > 0) {
+            info!(
+                max_connections = limit,
+                "Concurrent request limit enabled (idle keep-alive clients do not count)"
+            );
+        }
 
         // Start background GC for expired sessions.
         self.sessions.spawn_gc();
 
-        axum::serve(
-            tokio::net::TcpListener::bind(addr)
-                .await
-                .map_err(|e| QueryFluxError::Other(e.into()))?,
-            self.router(),
-        )
-        .with_graceful_shutdown(async move {
-            let _ = shutdown.changed().await;
-        })
-        .await
-        .map_err(|e| QueryFluxError::Other(e.into()))
+        let listener = tokio::net::TcpListener::bind(addr)
+            .await
+            .map_err(|e| QueryFluxError::Other(e.into()))?;
+        let router = if let Some(limit) = self.cfg.max_connections.filter(|&l| l > 0) {
+            self.router()
+                .layer(tower::limit::ConcurrencyLimitLayer::new(limit))
+        } else {
+            self.router()
+        };
+        axum::serve(listener, router)
+            .with_graceful_shutdown(async move {
+                let _ = shutdown.changed().await;
+            })
+            .await
+            .map_err(|e| QueryFluxError::Other(e.into()))
     }
 }

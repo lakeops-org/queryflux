@@ -608,8 +608,18 @@ impl AsyncAdapter for TrinoAdapter {
                 initial_response, ..
             } => initial_response,
             QueryExecution::Completed {
-                initial_response, ..
-            } => initial_response,
+                status,
+                error,
+                initial_response,
+                ..
+            } => {
+                if status != QueryStatus::Success {
+                    return Err(QueryFluxError::Catalog(
+                        error.unwrap_or_else(|| "Trino DESCRIBE query failed".to_string()),
+                    ));
+                }
+                initial_response
+            }
         };
         if let Some(body) = initial_response {
             let resp: TrinoResponse = serde_json::from_slice(&body)
@@ -708,8 +718,18 @@ impl TrinoAdapter {
                 initial_response, ..
             } => initial_response,
             QueryExecution::Completed {
-                initial_response, ..
-            } => initial_response,
+                status,
+                error,
+                initial_response,
+                ..
+            } => {
+                if status != QueryStatus::Success {
+                    return Err(QueryFluxError::Catalog(
+                        error.unwrap_or_else(|| format!("Trino SHOW query failed: {sql}")),
+                    ));
+                }
+                initial_response
+            }
         };
         if let Some(body) = initial_response {
             let resp: TrinoResponse = serde_json::from_slice(&body)
