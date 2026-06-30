@@ -2,7 +2,6 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use clap::Parser;
 use queryflux_auth::{
     AllowAllAuthorization, BackendIdentityResolver, LdapAuthProvider, NoneAuthProvider,
     OidcAuthProvider, OpenFgaAuthorizationClient, SimpleAuthorizationPolicy, StaticAuthProvider,
@@ -53,16 +52,19 @@ use tracing::info;
 
 mod registered_engines;
 
-#[derive(Parser)]
-#[command(name = "queryflux", about = "Multi-engine SQL query proxy")]
-struct Cli {
-    #[arg(short, long, default_value = "config.yaml")]
-    config: String,
-}
-
 #[tokio::main]
 async fn main() -> Result<()> {
-    let cli = Cli::parse();
+    queryflux_cli::setup_env();
+
+    let cli = queryflux_cli::Cli::parse_args();
+
+    if cli.install_deps {
+        queryflux_cli::handle_install_deps();
+    }
+
+    if cli.validate {
+        queryflux_cli::handle_validation(&cli.config).await;
+    }
 
     // Load config before initializing the tracing subscriber so that
     // `otlpEndpoint` from the config file can feed the OTel layer.
@@ -527,7 +529,13 @@ async fn main() -> Result<()> {
     let translation = Arc::new(
         TranslationService::new_sqlglot(config.translation.python_scripts.clone()).unwrap_or_else(
             |e| {
-                tracing::warn!("sqlglot unavailable ({e}), translation disabled");
+                tracing::warn!(
+                    "sqlglot unavailable ({e}), translation disabled. \
+                     If you need SQL dialect translation, please ensure that: \
+                     1. Python 3.10+ is installed on the host. \
+                     2. 'sqlglot' is installed in your Python environment (run: pip install sqlglot). \
+                     3. PYO3_PYTHON is set if using a virtual environment (e.g. export PYO3_PYTHON=.venv/bin/python)."
+                );
                 TranslationService::disabled()
             },
         ),

@@ -6,13 +6,14 @@ Several stacks for **QueryFlux** + **Trino** (and optional add-ons). Run command
 
 | Example | Postgres | Best for |
 |--------|----------|----------|
+| [`cli-quickstart/`](cli-quickstart/) | No | Running QueryFlux as a plain CLI binary with embedded DuckDB; no Docker/containers required |
 | [`minimal/`](minimal-trino/) | Yes | Full Studio (query history, persisted clusters/groups/routing via API), production-like persistence |
 | [`minimal-inmemory/`](minimal-inmemory/) | No | Fastest local tryout; config only in `config.yaml`; no shared query history |
 | [`with-prometheus-grafana/`](with-prometheus-grafana/) | Yes | Same workload as minimal + **Prometheus** + **Grafana** (repo [`grafana/`](../grafana/), local scrape config); **no Studio** |
 | [`full-stack/`](full-stack/) | Yes (host **5433**) | Trino + StarRocks + Iceberg/Lakekeeper + MinIO + TPCH loader |
 | [`full-stack-with-prometheus-grafana/`](full-stack-with-prometheus-grafana/) | Yes (host **5433**) | **`full-stack`** + **Prometheus** + **Grafana**; Grafana on **3001** |
 
-`minimal/` and `minimal-inmemory/` use the **same host ports** (8080, 8081, 3000, 9000); **`minimal/`** also maps Postgres to **`localhost:5433`**. **`with-prometheus-grafana`** also uses **3000 for Grafana** (not Studio) — run it alone or change the published Grafana port.
+`cli-quickstart/` runs entirely on the host machine without container dependencies. `minimal/` and `minimal-inmemory/` use the **same host ports** (8080, 8081, 3000, 9000); **`minimal/`** also maps Postgres to **`localhost:5433`**. **`with-prometheus-grafana`** also uses **3000 for Grafana** (not Studio) — run it alone or change the published Grafana port.
 
 ---
 
@@ -121,6 +122,25 @@ docker compose --profile loader run --rm -T starrocks-catalog-setup
 | Grafana | http://localhost:3001 |
 | MinIO console | http://localhost:19001 |
 | Lakekeeper REST | http://localhost:8181 |
+
+---
+
+## CLI Quickstart (`cli-quickstart/`)
+
+Run QueryFlux entirely on your host machine as a plain CLI binary with an embedded in-memory **DuckDB** backend. No Docker/compose environment is required.
+
+```bash
+# Build the binary
+cargo build --release
+
+# Validate environment and configuration
+./target/release/queryflux --config examples/cli-quickstart/config.yaml --validate
+
+# Run QueryFlux
+./target/release/queryflux --config examples/cli-quickstart/config.yaml
+```
+
+See **[`cli-quickstart/README.md`](cli-quickstart/README.md)** for full details.
 
 ---
 

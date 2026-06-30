@@ -41,20 +41,24 @@ queryflux:
   # configReloadIntervalSecs: 60
   # queryHistoryRetentionDays: 90
 
+clusters:
+  # trino-1:
+  #   engine: trino
+  #   endpoint: http://localhost:8081
+  duckdb-1:
+    engine: duckDb
+    # databasePath: /tmp/queryflux.duckdb
+
 clusterGroups:
   # trino-default:
-  #   engine: trino
   #   maxRunningQueries: 100
-  #   clusters:
-  #     - name: trino-1
-  #       endpoint: http://localhost:8081
+  #   members:
+  #     - trino-1
 
   duckdb-local:
-    engine: duckDb
     maxRunningQueries: 4
-    clusters:
-      - name: duckdb-1
-        # databasePath: /tmp/queryflux.duckdb
+    members:
+      - duckdb-1
 
 translation:
   errorOnUnsupported: false

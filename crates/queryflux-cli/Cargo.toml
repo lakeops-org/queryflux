@@ -1,0 +1,12 @@
+[package]
+name = "queryflux-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+queryflux-core = { workspace = true }
+queryflux-config = { workspace = true }
+queryflux-translation = { workspace = true }
+clap = { version = "4", features = ["derive"] }
+tokio = { workspace = true }

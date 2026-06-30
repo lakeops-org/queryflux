@@ -170,6 +170,17 @@ curl -X POST http://localhost:8080/v1/statement \
   -d "SELECT 42"
 ```
 
+### CLI Quickstart (No Docker)
+
+You can run QueryFlux natively with an embedded DuckDB engine without any containers:
+
+```bash
+cargo build --release
+./target/release/queryflux --install-deps
+./target/release/queryflux --config examples/cli-quickstart/config.yaml --validate
+./target/release/queryflux --config examples/cli-quickstart/config.yaml
+```
+
 ### Kubernetes
 
 QueryFlux includes a provider-neutral Helm chart:

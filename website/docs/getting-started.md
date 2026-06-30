@@ -44,9 +44,29 @@ docker compose up -d --wait
 
 **Next steps:** Trino CLI from the host or from inside the `trino` container, verifying traffic goes through QueryFlux — full walkthrough in **[`examples/minimal-trino/README.md`](https://github.com/lakeops-org/queryflux/blob/main/examples/minimal-trino/README.md)** (including Studio **Queries** and the port/hostname cheat sheet).
 
+## Example: CLI quickstart (no Docker)
+
+**Best for:** running QueryFlux natively on your host machine without any containers. Uses the embedded in-process DuckDB engine.
+
+```bash
+# Build the binary
+cargo build --release
+
+# Automatically create a .venv and install Python dependencies (e.g., sqlglot)
+./target/release/queryflux --install-deps
+
+# Validate the config and environment
+./target/release/queryflux --config examples/cli-quickstart/config.yaml --validate
+
+# Start the proxy
+./target/release/queryflux --config examples/cli-quickstart/config.yaml
+```
+
+*Note: QueryFlux automatically detects the `.venv` directory at startup.*
+
 ## Example: minimal in-memory
 
-**Best for:** fastest local tryout; **no Postgres**. Routing/clusters come from [`config.yaml`](https://github.com/lakeops-org/queryflux/blob/main/examples/minimal-inmemory/config.yaml); **restart QueryFlux** after edits. Studio pages that need Postgres may **503** — see **[`examples/minimal-inmemory/README.md`](https://github.com/lakeops-org/queryflux/blob/main/examples/minimal-inmemory/README.md)**.
+**Best for:** fastest local Docker tryout; **no Postgres**. Routing/clusters come from [`config.yaml`](https://github.com/lakeops-org/queryflux/blob/main/examples/minimal-inmemory/config.yaml); **restart QueryFlux** after edits. Studio pages that need Postgres may **503** — see **[`examples/minimal-inmemory/README.md`](https://github.com/lakeops-org/queryflux/blob/main/examples/minimal-inmemory/README.md)**.
 
 ```bash
 cd queryflux/examples/minimal-inmemory

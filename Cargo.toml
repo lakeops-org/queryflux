@@ -17,6 +17,7 @@ members = [
     "crates/queryflux-metrics",
     "crates/queryflux-fingerprint",
     "crates/queryflux-guardrails",
+    "crates/queryflux-cli",
 ]
 
 [workspace.package]
@@ -88,6 +89,7 @@ queryflux-cache = { path = "crates/queryflux-cache" }
 opendal = { version = "0.53", features = ["services-fs", "services-s3", "services-gcs"] }
 xxhash-rust = { version = "0.8", features = ["xxh64"] }
 regex = "1"
+queryflux-cli = { path = "crates/queryflux-cli" }
 
 # Arrow ecosystem — version must match what duckdb uses (bundled duckdb crate pins arrow)
 arrow = { version = "58.1.0", features = ["ipc", "ipc_compression"] }

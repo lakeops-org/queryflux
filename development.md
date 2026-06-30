@@ -44,14 +44,17 @@ Adjust `PYTHONPATH` if your venv’s `lib/pythonX.Y` differs.
 `make dev` brings up dependencies via `docker compose` (see `Makefile` for the exact services). After containers are healthy, run the binary from the repo root with your config, for example:
 
 ```bash
-export PYO3_PYTHON="$(pwd)/.venv/bin/python3"
-export PYTHONPATH="$(pwd)/.venv/lib/python3.13/site-packages"  # version may vary
+# PYO3_PYTHON and PYTHONPATH are automatically detected if a `.venv` directory exists in the workspace.
+# You can manually export them to override this behavior:
+# export PYO3_PYTHON="$(pwd)/.venv/bin/python3"
+# export PYTHONPATH="$(pwd)/.venv/lib/python3.13/site-packages"
+
 cargo run --bin queryflux -- --config config.local.yaml
 ```
 
 Use `config.local.yaml` for the compose-oriented stack, or copy and edit `config.example.yaml` for your own layout.
 
-**Note:** If `sqlglot` is not importable, the process starts but **translation is disabled** and logs a warning; dialect mismatches may then fail on the backend.
+**Note:** If `sqlglot` is not importable (and auto-detection fails), the process starts but **translation is disabled** and logs a warning; dialect mismatches may then fail on the backend. You can run validation with `cargo run --bin queryflux -- --config config.local.yaml --validate` to verify your environment setup.
 
 ## Workspace layout
 
