@@ -1,3 +1,4 @@
+pub mod cache_store;
 pub mod cluster_config;
 pub mod in_memory;
 pub mod metrics_store;
@@ -25,6 +26,7 @@ use crate::{
 };
 
 // Re-export so callers can do `queryflux_persistence::MetricsStore` etc.
+pub use cache_store::{CacheEntryMeta, CacheEntryRef, CacheStore};
 pub use metrics_store::{ClusterSnapshot, GuardAction, MetricsStore, QueryRecord};
 pub use query_history::{AgentSummary, ConversationSummary, QuerySummary};
 pub use script_library::{
@@ -483,9 +485,9 @@ impl<
 /// blanket impl on [`DistributedBackendStore`] picks them up automatically.
 /// Startup code type-erases distributed backends as
 /// `Option<Arc<dyn DistributedBackendStore>>` separately from `BackendStore`.
-pub trait BackendStore: Persistence + MetricsStore + AdminStore + Send + Sync {}
+pub trait BackendStore: Persistence + MetricsStore + AdminStore + CacheStore + Send + Sync {}
 
-impl<T: Persistence + MetricsStore + AdminStore + Send + Sync> BackendStore for T {}
+impl<T: Persistence + MetricsStore + AdminStore + CacheStore + Send + Sync> BackendStore for T {}
 
 // ---------------------------------------------------------------------------
 // DistributedBackendStore — multi-replica coordination (optional layer)

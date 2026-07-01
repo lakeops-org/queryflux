@@ -40,6 +40,7 @@ const sidebars: SidebarsConfig = {
         'architecture/system-map',
         'architecture/query-translation',
         'architecture/routing-and-clusters',
+        'architecture/caching',
         'architecture/query-tags',
         'architecture/query-params',
         'architecture/guardrails',

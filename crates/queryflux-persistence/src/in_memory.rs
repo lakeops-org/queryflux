@@ -11,6 +11,7 @@ use queryflux_core::{
 };
 
 use crate::{
+    cache_store::{CacheEntryRef, CacheStore},
     cluster_config::{
         ClusterConfigRecord, ClusterGroupConfigRecord, UpsertClusterConfig,
         UpsertClusterGroupConfig,
@@ -61,6 +62,9 @@ pub struct InMemoryPersistence {
 
     // --- distributed-mode coordination (single-instance no-ops) ---
     config_revision: AtomicU64,
+
+    // --- cache entry metadata ---
+    cache_entries: DashMap<String, crate::cache_store::CacheEntryMeta>,
 }
 
 impl Default for InMemoryPersistence {
@@ -79,6 +83,7 @@ impl Default for InMemoryPersistence {
             next_script_id: AtomicI64::new(1),
             proxy_settings: std::sync::RwLock::new(std::collections::HashMap::new()),
             config_revision: AtomicU64::new(0),
+            cache_entries: DashMap::default(),
         }
     }
 }
@@ -135,6 +140,7 @@ impl InMemoryPersistence {
             query_intent: record.query_intent,
             guard_actions: serde_json::to_value(&record.guard_actions).ok(),
             was_guard_blocked: record.was_guard_blocked,
+            cache_hit: record.cache_hit,
         }
     }
 }
@@ -519,6 +525,7 @@ impl ClusterConfigStore for InMemoryPersistence {
             allow_users: cfg.allow_users.clone(),
             translation_script_ids: cfg.translation_script_ids.clone(),
             default_tags: cfg.default_tags.clone(),
+            cache: cfg.cache.clone(),
             created_at: existing.as_ref().map(|r| r.created_at).unwrap_or(now),
             updated_at: now,
         };
@@ -953,6 +960,84 @@ fn mean(values: &[i64]) -> f64 {
         return 0.0;
     }
     values.iter().sum::<i64>() as f64 / values.len() as f64
+}
+
+// ---------------------------------------------------------------------------
+// CacheStore — in-memory cache entry metadata
+// ---------------------------------------------------------------------------
+
+#[async_trait]
+impl CacheStore for InMemoryPersistence {
+    async fn cache_get_valid(
+        &self,
+        cache_key: &str,
+    ) -> Result<Option<crate::cache_store::CacheEntryMeta>> {
+        let now = Utc::now();
+        Ok(self
+            .cache_entries
+            .get(cache_key)
+            .filter(|e| e.expires_at > now)
+            .map(|e| e.value().clone()))
+    }
+
+    async fn cache_upsert(&self, entry: &crate::cache_store::CacheEntryMeta) -> Result<()> {
+        self.cache_entries
+            .insert(entry.cache_key.clone(), entry.clone());
+        Ok(())
+    }
+
+    async fn cache_delete_expired(&self) -> Result<Vec<CacheEntryRef>> {
+        let now = Utc::now();
+        let expired: Vec<_> = self
+            .cache_entries
+            .iter()
+            .filter(|e| e.expires_at <= now)
+            .map(|e| e.key().clone())
+            .collect();
+        let mut refs = Vec::with_capacity(expired.len());
+        for key in expired {
+            if let Some((_, entry)) = self.cache_entries.remove(&key) {
+                refs.push(CacheEntryRef {
+                    cache_key: entry.cache_key,
+                    group_name: entry.group_name,
+                });
+            }
+        }
+        Ok(refs)
+    }
+
+    async fn cache_delete_by_group(&self, group: &str) -> Result<Vec<CacheEntryRef>> {
+        let keys: Vec<_> = self
+            .cache_entries
+            .iter()
+            .filter(|e| e.group_name == group)
+            .map(|e| e.key().clone())
+            .collect();
+        let mut refs = Vec::with_capacity(keys.len());
+        for key in keys {
+            if let Some((_, entry)) = self.cache_entries.remove(&key) {
+                refs.push(CacheEntryRef {
+                    cache_key: entry.cache_key,
+                    group_name: entry.group_name,
+                });
+            }
+        }
+        Ok(refs)
+    }
+
+    async fn cache_delete_all(&self) -> Result<Vec<CacheEntryRef>> {
+        let all: Vec<_> = self.cache_entries.iter().map(|e| e.key().clone()).collect();
+        let mut refs = Vec::with_capacity(all.len());
+        for key in all {
+            if let Some((_, entry)) = self.cache_entries.remove(&key) {
+                refs.push(CacheEntryRef {
+                    cache_key: entry.cache_key,
+                    group_name: entry.group_name,
+                });
+            }
+        }
+        Ok(refs)
+    }
 }
 
 #[cfg(test)]

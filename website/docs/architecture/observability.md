@@ -25,6 +25,9 @@ QueryFlux exposes a `/metrics` endpoint (default port 9000) in standard Promethe
 | `queryflux_running_queries` | Gauge | `cluster_group`, `cluster_name` | Currently executing queries per cluster |
 | `queryflux_queued_queries` | Gauge | `cluster_group` | Queries waiting for a free cluster slot |
 | `queryflux_query_tags_total` | Counter | `tag_key`, `tag_value`, `cluster_group` | Per-tag counter — tracks which workloads (teams, cost centers, etc.) drive load per group. See [Query tags](./query-tags#prometheus). |
+| `queryflux_cache_hits_total` | Counter | `cluster_group` | Query result cache hits |
+| `queryflux_cache_misses_total` | Counter | `cluster_group` | Query result cache misses |
+| `queryflux_cache_writes_total` | Counter | `cluster_group` | Query results written to cache |
 
 The metrics pipeline uses `MultiMetricsStore` to fan out to Prometheus (real-time) and optionally Postgres (historical). `BufferedMetricsStore` wraps the Postgres store to avoid blocking query execution on I/O.
 
@@ -127,6 +130,8 @@ The admin API is served on port 9000 alongside `/metrics`. An OpenAPI spec is av
 | `GET` | `/admin/config/clusters` | List all persisted cluster configs |
 | `GET/PUT/DELETE` | `/admin/config/groups/{name}` | Cluster group config CRUD (Postgres required) |
 | `GET` | `/admin/config/groups` | List all persisted group configs |
+| `DELETE` | `/admin/cache` | Invalidate all cached query results |
+| `DELETE` | `/admin/cache/{group}` | Invalidate cached results for a group |
 | `GET` | `/openapi.json` | OpenAPI spec |
 | `GET` | `/docs` | Swagger UI |
 

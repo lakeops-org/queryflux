@@ -49,6 +49,11 @@ export function QueryTable({ queries }: { queries: QueryHistoryRecord[] }) {
                       {q.sql_preview || <span className="text-slate-300 italic">—</span>}
                     </span>
                     <div className="flex items-center gap-1.5 mt-0.5 flex-wrap">
+                      {q.cache_hit && (
+                        <span className="inline-flex items-center gap-0.5 text-[10px] font-semibold text-amber-600 bg-amber-50 px-1.5 py-0.5 rounded-md border border-amber-200">
+                          CACHED
+                        </span>
+                      )}
                       {q.was_translated && (
                         <span className="text-[10px] font-medium text-violet-500 flex items-center gap-0.5">
                           <span className="w-1 h-1 rounded-full bg-violet-400 inline-block"></span>

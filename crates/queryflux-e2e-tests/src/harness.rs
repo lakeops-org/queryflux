@@ -287,6 +287,7 @@ impl TestHarness {
             group_order,
             group_translation_scripts: HashMap::new(),
             group_default_tags: HashMap::new(),
+            group_cache_settings: HashMap::new(),
             auth_provider: Arc::new(NoneAuthProvider::new(false)) as Arc<dyn AuthProvider>,
             authorization: Arc::new(AllowAllAuthorization) as Arc<dyn AuthorizationChecker>,
         };
@@ -307,6 +308,7 @@ impl TestHarness {
                 .timeout(std::time::Duration::from_secs(30))
                 .build()
                 .expect("build shared http client"),
+            result_cache: Arc::new(queryflux_cache::noop::NoopResultCache),
         });
 
         let trino_fe = TrinoHttpFrontend::new(state.clone(), port, None);
@@ -510,6 +512,7 @@ impl WireTestHarness {
             group_order: vec![GROUP_DUCKDB.to_string()],
             group_translation_scripts: HashMap::new(),
             group_default_tags: HashMap::new(),
+            group_cache_settings: HashMap::new(),
             auth_provider: Arc::new(NoneAuthProvider::new(false)) as Arc<dyn AuthProvider>,
             authorization: Arc::new(AllowAllAuthorization) as Arc<dyn AuthorizationChecker>,
         };
@@ -528,6 +531,7 @@ impl WireTestHarness {
                 .timeout(std::time::Duration::from_secs(30))
                 .build()
                 .expect("build http client"),
+            result_cache: Arc::new(queryflux_cache::noop::NoopResultCache),
         });
 
         let snowflake_fe = SnowflakeFrontend::new(
@@ -641,6 +645,7 @@ impl WireTestHarness {
             group_order: vec![GROUP_STARROCKS.to_string()],
             group_translation_scripts: HashMap::new(),
             group_default_tags: HashMap::new(),
+            group_cache_settings: HashMap::new(),
             auth_provider: Arc::new(NoneAuthProvider::new(false)) as Arc<dyn AuthProvider>,
             authorization: Arc::new(AllowAllAuthorization) as Arc<dyn AuthorizationChecker>,
         };
@@ -659,6 +664,7 @@ impl WireTestHarness {
                 .timeout(std::time::Duration::from_secs(30))
                 .build()
                 .expect("build http client"),
+            result_cache: Arc::new(queryflux_cache::noop::NoopResultCache),
         });
 
         let snowflake_fe = SnowflakeFrontend::new(

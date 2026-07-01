@@ -88,6 +88,10 @@ pub struct ClusterGroupConfigRecord {
     #[serde(default = "default_tags_value")]
     #[schema(value_type = Object)]
     pub default_tags: serde_json::Value,
+    /// Query result cache settings for this group. `null` = caching disabled.
+    #[serde(default)]
+    #[schema(value_type = Option<Object>)]
+    pub cache: Option<serde_json::Value>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -115,6 +119,10 @@ pub struct UpsertClusterGroupConfig {
     #[serde(default = "default_tags_value")]
     #[schema(value_type = Object)]
     pub default_tags: serde_json::Value,
+    /// Query result cache configuration. `null` or omitted = caching disabled.
+    #[serde(default)]
+    #[schema(value_type = Option<Object>)]
+    pub cache: Option<serde_json::Value>,
 }
 
 // ---------------------------------------------------------------------------
@@ -229,6 +237,11 @@ impl UpsertClusterGroupConfig {
         let default_tags = serde_json::to_value(&cfg.default_tags)
             .unwrap_or_else(|_| serde_json::Value::Object(serde_json::Map::default()));
 
+        let cache = cfg
+            .cache
+            .as_ref()
+            .and_then(|c| serde_json::to_value(c).ok());
+
         Self {
             enabled: cfg.enabled,
             members: cfg.members.clone(),
@@ -239,6 +252,7 @@ impl UpsertClusterGroupConfig {
             allow_users: cfg.authorization.allow_users.clone(),
             translation_script_ids: Vec::new(),
             default_tags,
+            cache,
         }
     }
 }
@@ -273,6 +287,11 @@ impl ClusterGroupConfigRecord {
                     Default::default()
                 });
 
+        let cache = self
+            .cache
+            .as_ref()
+            .and_then(|v| serde_json::from_value(v.clone()).ok());
+
         ClusterGroupConfig {
             enabled: self.enabled,
             members: self.members.clone(),
@@ -284,6 +303,7 @@ impl ClusterGroupConfigRecord {
                 allow_users: self.allow_users.clone(),
             },
             default_tags,
+            cache,
         }
     }
 }
@@ -315,6 +335,7 @@ mod tests {
             allow_users: vec![],
             translation_script_ids: vec![],
             default_tags,
+            cache: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }
@@ -332,6 +353,7 @@ mod tests {
                 allow_users: vec![],
             },
             default_tags: tags,
+            cache: None,
         }
     }
 

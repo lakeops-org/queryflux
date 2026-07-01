@@ -6,6 +6,7 @@ members = [
     "crates/queryflux-e2e-tests",
     "crates/queryflux-core",
     "crates/queryflux-auth",
+    "crates/queryflux-cache",
     "crates/queryflux-persistence",
     "crates/queryflux-routing",
     "crates/queryflux-translation",
@@ -81,9 +82,15 @@ queryflux-config = { path = "crates/queryflux-config" }
 queryflux-metrics = { path = "crates/queryflux-metrics" }
 queryflux-fingerprint = { path = "crates/queryflux-fingerprint" }
 queryflux-guardrails = { path = "crates/queryflux-guardrails" }
+queryflux-cache = { path = "crates/queryflux-cache" }
+
+# OpenDAL — storage abstraction for cache backend
+opendal = { version = "0.53", features = ["services-fs", "services-s3"] }
+xxhash-rust = { version = "0.8", features = ["xxh64"] }
+regex = "1"
 
 # Arrow ecosystem — version must match what duckdb uses (bundled duckdb crate pins arrow)
-arrow = { version = "58.1.0", features = ["ipc"] }
+arrow = { version = "58.1.0", features = ["ipc", "ipc_compression"] }
 futures = "0.3.32"
 
 # Python interop for sqlglot translation + routing scripts

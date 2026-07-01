@@ -44,6 +44,12 @@ pub struct PrometheusMetrics {
     queue_rejections_total: CounterVec,
     /// queryflux_queue_duration_seconds{cluster_group}
     queue_duration_seconds: HistogramVec,
+    /// queryflux_cache_hits_total{cluster_group}
+    cache_hits_total: CounterVec,
+    /// queryflux_cache_misses_total{cluster_group}
+    cache_misses_total: CounterVec,
+    /// queryflux_cache_writes_total{cluster_group}
+    cache_writes_total: CounterVec,
     /// Tag keys that are excluded from `query_tags_total` to control cardinality.
     tags_deny_list: Vec<String>,
 }
@@ -147,6 +153,24 @@ impl PrometheusMetrics {
             &["cluster_group"],
         )?;
 
+        let cache_hits_total = CounterVec::new(
+            Opts::new("queryflux_cache_hits_total", "Query result cache hits"),
+            &["cluster_group"],
+        )?;
+
+        let cache_misses_total = CounterVec::new(
+            Opts::new("queryflux_cache_misses_total", "Query result cache misses"),
+            &["cluster_group"],
+        )?;
+
+        let cache_writes_total = CounterVec::new(
+            Opts::new(
+                "queryflux_cache_writes_total",
+                "Query results written to cache",
+            ),
+            &["cluster_group"],
+        )?;
+
         registry.register(Box::new(queries_total.clone()))?;
         registry.register(Box::new(query_duration_seconds.clone()))?;
         registry.register(Box::new(translated_total.clone()))?;
@@ -158,6 +182,9 @@ impl PrometheusMetrics {
         registry.register(Box::new(auth_failures_total.clone()))?;
         registry.register(Box::new(queue_rejections_total.clone()))?;
         registry.register(Box::new(queue_duration_seconds.clone()))?;
+        registry.register(Box::new(cache_hits_total.clone()))?;
+        registry.register(Box::new(cache_misses_total.clone()))?;
+        registry.register(Box::new(cache_writes_total.clone()))?;
 
         Ok(Self {
             registry,
@@ -172,6 +199,9 @@ impl PrometheusMetrics {
             auth_failures_total,
             queue_rejections_total,
             queue_duration_seconds,
+            cache_hits_total,
+            cache_misses_total,
+            cache_writes_total,
             tags_deny_list,
         })
     }
@@ -231,6 +261,24 @@ impl MetricsStore for PrometheusMetrics {
 
     fn on_queue_full(&self, cluster_group: &str) {
         self.queue_rejections_total
+            .with_label_values(&[cluster_group])
+            .inc();
+    }
+
+    fn on_cache_hit(&self, cluster_group: &str) {
+        self.cache_hits_total
+            .with_label_values(&[cluster_group])
+            .inc();
+    }
+
+    fn on_cache_miss(&self, cluster_group: &str) {
+        self.cache_misses_total
+            .with_label_values(&[cluster_group])
+            .inc();
+    }
+
+    fn on_cache_write(&self, cluster_group: &str) {
+        self.cache_writes_total
             .with_label_values(&[cluster_group])
             .inc();
     }

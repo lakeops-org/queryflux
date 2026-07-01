@@ -86,6 +86,41 @@ fn fingerprint_one(sql: &str, dialect: &str) -> Option<(u64, u64, String, bool)>
     result
 }
 
+/// AST-based determinism check using polyglot-sql.
+/// Returns `true` if the query is deterministic (safe to cache).
+/// Falls back to a conservative regex check if polyglot fails to parse.
+pub fn is_deterministic(sql: &str, dialect: &str) -> bool {
+    let sql_owned = sql.to_string();
+    let dialect_owned = dialect.to_string();
+
+    let result = std::thread::Builder::new()
+        .stack_size(16 * 1024 * 1024)
+        .spawn(move || try_determinism_check(&sql_owned, &dialect_owned))
+        .ok()
+        .and_then(|h| h.join().ok())
+        .flatten();
+
+    // If polyglot can't parse it, fall back to regex (conservative).
+    result.unwrap_or_else(|| !NON_DETERMINISTIC_FALLBACK.is_match(sql))
+}
+
+static NON_DETERMINISTIC_FALLBACK: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(
+    || {
+        regex::Regex::new(
+            r"(?i)\b(RAND|RANDOM|UUID|NOW|CURRENT_TIMESTAMP|CURRENT_DATE|CURRENT_TIME|SYSDATE|GETDATE|NEWID)\b\s*\("
+        ).unwrap()
+    },
+);
+
+fn try_determinism_check(sql: &str, dialect: &str) -> Option<bool> {
+    use polyglot_sql::parse_by_name;
+    let statements = parse_by_name(sql, dialect).ok()?;
+    if statements.is_empty() {
+        return None;
+    }
+    Some(!statements.iter().any(contains_nondeterministic_expr))
+}
+
 fn try_polyglot(
     sql: &str,
     dialect: &str,

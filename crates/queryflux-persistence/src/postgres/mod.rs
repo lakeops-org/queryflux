@@ -2,6 +2,7 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 
 use crate::{
+    cache_store::{CacheEntryMeta, CacheEntryRef, CacheStore},
     cluster_config::{
         ClusterConfigRecord, ClusterGroupConfigRecord, UpsertClusterConfig,
         UpsertClusterGroupConfig,
@@ -37,6 +38,7 @@ SELECT
     g.name,
     g.enabled,
     COALESCE(
+
         (
             SELECT array_agg(c.name ORDER BY u.ord)
             FROM unnest(g.members) WITH ORDINALITY AS u(cid, ord)
@@ -51,6 +53,7 @@ SELECT
     g.allow_users,
     g.translation_script_ids,
     g.default_tags,
+    g.cache,
     g.created_at,
     g.updated_at
 FROM cluster_group_configs g
@@ -229,7 +232,7 @@ impl QueryHistoryStore for PostgresStore {
                       qr.physical_input_bytes, qr.peak_memory_bytes, qr.spilled_bytes, qr.total_splits,
                       qr.query_tags, qr.query_hash, qr.query_parameterized_hash, qr.translated_query_hash,
                       qr.agent_id, qr.conversation_id, qr.step_index, qr.tool_call_id, qr.query_intent,
-                      qr.guard_actions, qr.was_guard_blocked
+                      qr.guard_actions, qr.was_guard_blocked, qr.cache_hit
                FROM query_records qr
                LEFT JOIN cluster_group_configs cg ON cg.id = qr.cluster_group_id
                LEFT JOIN cluster_configs cc ON cc.id = qr.cluster_id
@@ -684,8 +687,8 @@ impl ClusterConfigStore for PostgresStore {
 
         sqlx::query(
             r#"INSERT INTO cluster_group_configs
-                   (name, enabled, members, max_running_queries, max_queued_queries, strategy, allow_groups, allow_users, translation_script_ids, default_tags)
-               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+                   (name, enabled, members, max_running_queries, max_queued_queries, strategy, allow_groups, allow_users, translation_script_ids, default_tags, cache)
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
                ON CONFLICT (name) DO UPDATE SET
                    enabled                = EXCLUDED.enabled,
                    members                = EXCLUDED.members,
@@ -696,6 +699,7 @@ impl ClusterConfigStore for PostgresStore {
                    allow_users            = EXCLUDED.allow_users,
                    translation_script_ids = EXCLUDED.translation_script_ids,
                    default_tags           = EXCLUDED.default_tags,
+                   cache                  = EXCLUDED.cache,
                    updated_at             = now()"#,
         )
         .bind(name)
@@ -708,6 +712,7 @@ impl ClusterConfigStore for PostgresStore {
         .bind(&cfg.allow_users)
         .bind(&cfg.translation_script_ids)
         .bind(&cfg.default_tags)
+        .bind(&cfg.cache)
         .execute(&mut *tx)
         .await
         .map_err(|e| QueryFluxError::Persistence(format!("upsert_group_config: {e}")))?;
@@ -1476,10 +1481,10 @@ impl MetricsStore for PostgresStore {
                  cluster_group_id, cluster_id, query_tags,
                  query_hash, query_parameterized_hash, translated_query_hash,
                  agent_id, conversation_id, step_index, tool_call_id, query_intent,
-                 guard_actions, was_guard_blocked)
+                 guard_actions, was_guard_blocked, cache_hit)
                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,
                        $21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,
-                       $36,$37,$38,$39,$40,$41,$42)"#,
+                       $36,$37,$38,$39,$40,$41,$42,$43)"#,
         )
         .bind(&r.proxy_query_id)
         .bind(&r.backend_query_id)
@@ -1523,6 +1528,7 @@ impl MetricsStore for PostgresStore {
         .bind(&r.query_intent)
         .bind(guard_actions_json)
         .bind(r.was_guard_blocked)
+        .bind(r.cache_hit)
         .execute(&self.pool)
         .await
         .map_err(|e| QueryFluxError::Persistence(format!("Insert query_records: {e}")))?;
@@ -1919,6 +1925,119 @@ impl QueueCoordinator for PostgresStore {
             }
         }
         Ok(result)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// CacheStore — cache entry metadata
+// ---------------------------------------------------------------------------
+
+#[async_trait]
+impl CacheStore for PostgresStore {
+    async fn cache_get_valid(&self, cache_key: &str) -> Result<Option<CacheEntryMeta>> {
+        let row: Option<(
+            String,
+            String,
+            DateTime<Utc>,
+            DateTime<Utc>,
+            Option<i64>,
+            Option<i64>,
+        )> = sqlx::query_as(
+            r#"SELECT cache_key, group_name, created_at, expires_at, row_count, size_bytes
+                   FROM cache_entries
+                   WHERE cache_key = $1 AND expires_at > NOW()"#,
+        )
+        .bind(cache_key)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| QueryFluxError::Persistence(format!("cache_get_valid: {e}")))?;
+
+        Ok(row.map(
+            |(cache_key, group_name, created_at, expires_at, row_count, size_bytes)| {
+                CacheEntryMeta {
+                    cache_key,
+                    group_name,
+                    created_at,
+                    expires_at,
+                    row_count,
+                    size_bytes,
+                }
+            },
+        ))
+    }
+
+    async fn cache_upsert(&self, entry: &CacheEntryMeta) -> Result<()> {
+        sqlx::query(
+            r#"INSERT INTO cache_entries (cache_key, group_name, created_at, expires_at, row_count, size_bytes)
+               VALUES ($1, $2, $3, $4, $5, $6)
+               ON CONFLICT (cache_key) DO UPDATE SET
+                   group_name = EXCLUDED.group_name,
+                   created_at = EXCLUDED.created_at,
+                   expires_at = EXCLUDED.expires_at,
+                   row_count  = EXCLUDED.row_count,
+                   size_bytes = EXCLUDED.size_bytes"#,
+        )
+        .bind(&entry.cache_key)
+        .bind(&entry.group_name)
+        .bind(entry.created_at)
+        .bind(entry.expires_at)
+        .bind(entry.row_count)
+        .bind(entry.size_bytes)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| QueryFluxError::Persistence(format!("cache_upsert: {e}")))?;
+        Ok(())
+    }
+
+    async fn cache_delete_expired(&self) -> Result<Vec<CacheEntryRef>> {
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "DELETE FROM cache_entries WHERE expires_at < NOW() RETURNING cache_key, group_name",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| QueryFluxError::Persistence(format!("cache_delete_expired: {e}")))?;
+
+        Ok(rows
+            .into_iter()
+            .map(|(cache_key, group_name)| CacheEntryRef {
+                cache_key,
+                group_name,
+            })
+            .collect())
+    }
+
+    async fn cache_delete_by_group(&self, group: &str) -> Result<Vec<CacheEntryRef>> {
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "DELETE FROM cache_entries WHERE group_name = $1 RETURNING cache_key, group_name",
+        )
+        .bind(group)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| QueryFluxError::Persistence(format!("cache_delete_by_group: {e}")))?;
+
+        Ok(rows
+            .into_iter()
+            .map(|(cache_key, group_name)| CacheEntryRef {
+                cache_key,
+                group_name,
+            })
+            .collect())
+    }
+
+    async fn cache_delete_all(&self) -> Result<Vec<CacheEntryRef>> {
+        let rows: Vec<(String, String)> =
+            sqlx::query_as("DELETE FROM cache_entries RETURNING cache_key, group_name")
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|e| QueryFluxError::Persistence(format!("cache_delete_all: {e}")))?;
+
+        Ok(rows
+            .into_iter()
+            .map(|(cache_key, group_name)| CacheEntryRef {
+                cache_key,
+                group_name,
+            })
+            .collect())
     }
 }
 

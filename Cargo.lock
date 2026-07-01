@@ -322,6 +322,8 @@ dependencies = [
  "arrow-schema",
  "arrow-select",
  "flatbuffers",
+ "lz4_flex",
+ "zstd",
 ]
 
 [[package]]
@@ -1341,6 +1343,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "19d374276b40fb8bbdee95aef7c7fa6b5316ec764510eb64b8dd0e2ed0d7e7f5"
 
 [[package]]
+name = "crc32c"
+version = "0.6.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3a47af21622d091a8f0fb295b88bc886ac74efcc613efc19f5d0b21de5c89e47"
+dependencies = [
+ "rustc_version",
+]
+
+[[package]]
 name = "crc32fast"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1545,6 +1556,15 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.117",
+]
+
+[[package]]
+name = "dlv-list"
+version = "0.5.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "442039f5147480ba31067cb00ada1adae6892028e40e45fc5de7b7df6dcc1b5f"
+dependencies = [
+ "const-random",
 ]
 
 [[package]]
@@ -2812,6 +2832,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "lz4_flex"
+version = "0.13.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7ef0d4ed8669f8f8826eb00dc878084aa8f253506c4fd5e8f58f5bce72ddb97e"
+dependencies = [
+ "twox-hash",
+]
+
+[[package]]
 name = "matchers"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3122,6 +3151,35 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
+name = "opendal"
+version = "0.53.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f947c4efbca344c1a125753366033c8107f552b2e3f8251815ed1908f116ca3e"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "backon",
+ "base64 0.22.1",
+ "bytes",
+ "chrono",
+ "crc32c",
+ "futures",
+ "getrandom 0.2.17",
+ "http 1.4.0",
+ "http-body 1.0.1",
+ "log",
+ "md-5",
+ "percent-encoding",
+ "quick-xml",
+ "reqsign",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "opensrv-mysql"
 version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3215,6 +3273,16 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tokio-stream",
+]
+
+[[package]]
+name = "ordered-multimap"
+version = "0.7.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "49203cdcae0030493bad186b28da2fa25645fa276a51b6fec8010d281e02ef79"
+dependencies = [
+ "dlv-list",
+ "hashbrown 0.14.5",
 ]
 
 [[package]]
@@ -3641,6 +3709,7 @@ dependencies = [
  "opentelemetry-otlp",
  "opentelemetry_sdk",
  "queryflux-auth",
+ "queryflux-cache",
  "queryflux-cluster-manager",
  "queryflux-config",
  "queryflux-core",
@@ -3693,6 +3762,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "queryflux-cache"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "arrow",
+ "arrow-ipc",
+ "async-trait",
+ "chrono",
+ "opendal",
+ "queryflux-core",
+ "queryflux-fingerprint",
+ "queryflux-persistence",
+ "regex",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "xxhash-rust",
+]
+
+[[package]]
 name = "queryflux-cluster-manager"
 version = "0.2.0"
 dependencies = [
@@ -3740,6 +3829,7 @@ dependencies = [
  "base64 0.22.1",
  "futures",
  "queryflux-auth",
+ "queryflux-cache",
  "queryflux-cluster-manager",
  "queryflux-core",
  "queryflux-engine-adapters",
@@ -3815,6 +3905,7 @@ dependencies = [
  "futures",
  "prost 0.14.3",
  "queryflux-auth",
+ "queryflux-cache",
  "queryflux-cluster-manager",
  "queryflux-core",
  "queryflux-engine-adapters",
@@ -3908,6 +3999,16 @@ dependencies = [
  "queryflux-core",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "quick-xml"
+version = "0.37.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "331e97a1af0bf59823e6eadffe373d7b27f485be8748f71471c662c1f269b7fb"
+dependencies = [
+ "memchr",
+ "serde",
 ]
 
 [[package]]
@@ -4135,6 +4236,35 @@ dependencies = [
 ]
 
 [[package]]
+name = "reqsign"
+version = "0.16.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "43451dbf3590a7590684c25fb8d12ecdcc90ed3ac123433e500447c7d77ed701"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "base64 0.22.1",
+ "chrono",
+ "form_urlencoded",
+ "getrandom 0.2.17",
+ "hex",
+ "hmac",
+ "home",
+ "http 1.4.0",
+ "log",
+ "percent-encoding",
+ "quick-xml",
+ "rand 0.8.5",
+ "reqwest 0.12.28",
+ "rust-ini",
+ "serde",
+ "serde_json",
+ "sha1",
+ "sha2",
+ "tokio",
+]
+
+[[package]]
 name = "reqwest"
 version = "0.12.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4164,12 +4294,14 @@ dependencies = [
  "sync_wrapper",
  "tokio",
  "tokio-rustls 0.26.4",
+ "tokio-util",
  "tower",
  "tower-http",
  "tower-service",
  "url",
  "wasm-bindgen",
  "wasm-bindgen-futures",
+ "wasm-streams",
  "web-sys",
  "webpki-roots 1.0.6",
 ]
@@ -4272,6 +4404,16 @@ dependencies = [
  "spki",
  "subtle",
  "zeroize",
+]
+
+[[package]]
+name = "rust-ini"
+version = "0.21.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "796e8d2b6696392a43bea58116b667fb4c29727dc5abd27d6acf338bb4f688c7"
+dependencies = [
+ "cfg-if",
+ "ordered-multimap",
 ]
 
 [[package]]
@@ -5084,6 +5226,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "adb6935a6f5c20170eeceb1a3835a49e12e19d792f6dd344ccc76a985ca5a6ca"
 
 [[package]]
+name = "tempfile"
+version = "3.27.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
+dependencies = [
+ "fastrand",
+ "getrandom 0.4.2",
+ "once_cell",
+ "rustix",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "termcolor"
 version = "1.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5872,6 +6027,19 @@ dependencies = [
  "indexmap",
  "wasm-encoder",
  "wasmparser",
+]
+
+[[package]]
+name = "wasm-streams"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "15053d8d85c7eccdbefef60f06769760a563c7f0a9d6902a13d35c7800b0ad65"
+dependencies = [
+ "futures-util",
+ "js-sys",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
 ]
 
 [[package]]

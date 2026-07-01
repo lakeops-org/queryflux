@@ -64,6 +64,24 @@ impl MetricsStore for MultiMetricsStore {
         }
     }
 
+    fn on_cache_hit(&self, cluster_group: &str) {
+        for s in &self.stores {
+            s.on_cache_hit(cluster_group);
+        }
+    }
+
+    fn on_cache_miss(&self, cluster_group: &str) {
+        for s in &self.stores {
+            s.on_cache_miss(cluster_group);
+        }
+    }
+
+    fn on_cache_write(&self, cluster_group: &str) {
+        for s in &self.stores {
+            s.on_cache_write(cluster_group);
+        }
+    }
+
     async fn record_query(&self, record: QueryRecord) -> Result<()> {
         for s in &self.stores {
             if let Err(e) = s.record_query(record.clone()).await {

@@ -85,6 +85,8 @@ pub struct QueryRecord {
     pub guard_actions: Vec<GuardAction>,
     /// True if any guard returned Deny.
     pub was_guard_blocked: bool,
+    /// True when the result was served from the query result cache.
+    pub cache_hit: bool,
 }
 
 /// A periodic snapshot of one cluster's live utilization.
@@ -138,4 +140,13 @@ pub trait MetricsStore: Send + Sync {
 
     /// Called when a queue admission is rejected because `maxQueuedQueries` was reached.
     fn on_queue_full(&self, _cluster_group: &str) {}
+
+    /// Called on a query result cache hit.
+    fn on_cache_hit(&self, _cluster_group: &str) {}
+
+    /// Called on a query result cache miss.
+    fn on_cache_miss(&self, _cluster_group: &str) {}
+
+    /// Called when a query result is successfully written to cache.
+    fn on_cache_write(&self, _cluster_group: &str) {}
 }

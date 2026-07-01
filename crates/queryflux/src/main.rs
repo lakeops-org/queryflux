@@ -722,6 +722,16 @@ async fn main() -> Result<()> {
         .filter(|(_, g)| !g.default_tags.is_empty())
         .map(|(name, g)| (name.clone(), g.default_tags.clone()))
         .collect();
+    let group_cache_settings: HashMap<String, queryflux_core::config::GroupCacheConfig> = config
+        .cluster_groups
+        .iter()
+        .filter_map(|(name, g)| {
+            g.cache
+                .as_ref()
+                .filter(|c| c.enabled)
+                .map(|c| (name.clone(), c.clone()))
+        })
+        .collect();
     let live_config = LiveConfig {
         router_chain,
         guard_chain,
@@ -734,6 +744,7 @@ async fn main() -> Result<()> {
         group_order,
         group_translation_scripts,
         group_default_tags,
+        group_cache_settings,
         auth_provider,
         authorization,
     };
@@ -836,6 +847,36 @@ async fn main() -> Result<()> {
         .flatten();
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+    // Initialize the query result cache (startup-only, not hot-reloadable).
+    let result_cache: Arc<dyn queryflux_cache::QueryResultCache> = match &config
+        .queryflux
+        .cache_backend
+    {
+        Some(cache_cfg) => {
+            let cache_store: Arc<dyn queryflux_persistence::CacheStore> =
+                if let Some(b) = backend.clone() {
+                    b as Arc<dyn queryflux_persistence::CacheStore>
+                } else {
+                    mem_store
+                        .clone()
+                        .expect("mem_store must exist when no backend")
+                        as Arc<dyn queryflux_persistence::CacheStore>
+                };
+            match queryflux_cache::opendal_cache::OpenDalResultCache::new(cache_cfg, cache_store) {
+                Ok(c) => {
+                    tracing::info!("Query result cache enabled (scheme={})", cache_cfg.scheme);
+                    Arc::new(c)
+                }
+                Err(e) => {
+                    tracing::error!("Failed to initialize result cache: {e}; caching disabled");
+                    Arc::new(queryflux_cache::noop::NoopResultCache)
+                }
+            }
+        }
+        None => Arc::new(queryflux_cache::noop::NoopResultCache),
+    };
+
     let app_state = Arc::new(AppState {
         external_address: external_address.clone(),
         live: live.clone(),
@@ -850,6 +891,7 @@ async fn main() -> Result<()> {
             .timeout(std::time::Duration::from_secs(30))
             .build()
             .expect("build shared http client"),
+        result_cache,
     });
 
     // --- Start admin server (Prometheus /metrics + future /admin/* endpoints) ---
@@ -923,6 +965,7 @@ async fn main() -> Result<()> {
         admin_creds,
         test_cluster_fn,
         cors_origins,
+        app_state.result_cache.clone(),
     );
 
     // --- Start Trino HTTP frontend ---
@@ -1185,6 +1228,29 @@ async fn main() -> Result<()> {
             }
         }
     });
+
+    // Background task: periodically clean up expired cache entries.
+    {
+        let cache = app_state.result_cache.clone();
+        let interval_secs = config
+            .queryflux
+            .cache_backend
+            .as_ref()
+            .map(|c| c.cleanup_interval_secs)
+            .unwrap_or(300);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
+            interval.tick().await;
+            loop {
+                interval.tick().await;
+                match cache.cleanup_expired().await {
+                    Ok(0) => {}
+                    Ok(n) => tracing::info!(deleted = n, "Cache cleanup: removed expired entries"),
+                    Err(e) => tracing::warn!(error = %e, "Cache cleanup failed"),
+                }
+            }
+        });
+    }
 
     // Background task: enforce query_history_retention_days — runs hourly and deletes
     // query_records rows older than the configured retention window.
@@ -2129,6 +2195,17 @@ async fn build_live_config(
         .map(|(name, g)| (name.clone(), g.default_tags.clone()))
         .collect();
 
+    let group_cache_settings: HashMap<String, queryflux_core::config::GroupCacheConfig> =
+        cluster_groups
+            .iter()
+            .filter_map(|(name, g)| {
+                g.cache
+                    .as_ref()
+                    .filter(|c| c.enabled)
+                    .map(|c| (name.clone(), c.clone()))
+            })
+            .collect();
+
     // Referential integrity: routers must target groups that exist in this reload cycle,
     // and every declared group member must have a built adapter. A stale read (e.g. a
     // group deleted between the cluster read and the group read) would produce a live
@@ -2162,6 +2239,7 @@ async fn build_live_config(
         group_order,
         group_translation_scripts,
         group_default_tags,
+        group_cache_settings,
         auth_provider: Arc::new(NoneAuthProvider::new(false)),
         authorization: Arc::new(AllowAllAuthorization),
     })

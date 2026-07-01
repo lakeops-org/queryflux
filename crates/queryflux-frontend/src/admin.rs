@@ -6,7 +6,7 @@ use axum::{
     http::{header::AUTHORIZATION, Method, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
-    routing::{get, patch, post},
+    routing::{delete, get, patch, post},
     Json, Router,
 };
 use queryflux_auth::AdminCredentialsManager;
@@ -490,6 +490,8 @@ struct AdminState {
     admin_creds: Arc<AdminCredentialsManager>,
     /// Test a cluster config (build adapter + health_check) without persisting it.
     test_cluster_fn: TestClusterFn,
+    /// Query result cache for invalidation endpoints.
+    result_cache: Arc<dyn queryflux_cache::QueryResultCache>,
 }
 
 // ---------------------------------------------------------------------------
@@ -509,6 +511,7 @@ pub struct AdminFrontend {
     admin_creds: Arc<AdminCredentialsManager>,
     test_cluster_fn: TestClusterFn,
     cors_allowed_origins: Vec<String>,
+    result_cache: Arc<dyn queryflux_cache::QueryResultCache>,
 }
 
 impl AdminFrontend {
@@ -526,6 +529,7 @@ impl AdminFrontend {
         admin_creds: Arc<AdminCredentialsManager>,
         test_cluster_fn: TestClusterFn,
         cors_allowed_origins: Vec<String>,
+        result_cache: Arc<dyn queryflux_cache::QueryResultCache>,
     ) -> Self {
         Self {
             prometheus,
@@ -540,6 +544,7 @@ impl AdminFrontend {
             admin_creds,
             test_cluster_fn,
             cors_allowed_origins,
+            result_cache,
         }
     }
 
@@ -555,6 +560,7 @@ impl AdminFrontend {
             frontends_status: self.frontends_status.clone(),
             admin_creds: self.admin_creds.clone(),
             test_cluster_fn: self.test_cluster_fn.clone(),
+            result_cache: self.result_cache.clone(),
         });
 
         let spec_json =
@@ -641,6 +647,12 @@ impl AdminFrontend {
             .route(
                 "/admin/config/guardrails",
                 get(get_guardrails_config_handler).put(put_guardrails_config_handler),
+            )
+            // Cache invalidation endpoints
+            .route("/admin/cache", delete(invalidate_all_cache_handler))
+            .route(
+                "/admin/cache/{group}",
+                delete(invalidate_group_cache_handler),
             )
             // Auth management endpoints
             .route("/admin/auth/status", get(auth_status_handler))
@@ -2237,6 +2249,27 @@ async fn put_guardrails_config_handler(
             notify_live_config_reload(&state);
             StatusCode::NO_CONTENT.into_response()
         }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Cache invalidation handlers
+// ---------------------------------------------------------------------------
+
+async fn invalidate_all_cache_handler(State(state): State<Arc<AdminState>>) -> impl IntoResponse {
+    match state.result_cache.invalidate_all().await {
+        Ok(count) => Json(serde_json::json!({ "deleted": count })).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+async fn invalidate_group_cache_handler(
+    State(state): State<Arc<AdminState>>,
+    Path(group): Path<String>,
+) -> impl IntoResponse {
+    match state.result_cache.invalidate_group(&group).await {
+        Ok(count) => Json(serde_json::json!({ "deleted": count })).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }

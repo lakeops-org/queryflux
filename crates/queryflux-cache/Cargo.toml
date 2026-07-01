@@ -1,0 +1,24 @@
+[package]
+name = "queryflux-cache"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+queryflux-core = { workspace = true }
+queryflux-persistence = { workspace = true }
+queryflux-fingerprint = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+anyhow = { workspace = true }
+arrow = { workspace = true }
+arrow-ipc = "58.1.0"
+chrono = { workspace = true }
+opendal = { workspace = true }
+xxhash-rust = { workspace = true }
+regex = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util", "macros"] }
+tempfile = "3"

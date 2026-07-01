@@ -112,6 +112,8 @@ export interface QueryHistoryRecord {
   /** Guard actions collected during the query's guard chain evaluation. */
   guard_actions: GuardAction[] | null;
   was_guard_blocked: boolean;
+  /** True when the result was served from the query result cache. */
+  cache_hit: boolean;
 }
 
 export interface AgentSummary {
@@ -243,6 +245,8 @@ export interface ClusterGroupConfigRecord {
   translationScriptIds: number[];
   /** Default tags merged into every query in this group. `null` values are key-only tags. */
   defaultTags: Record<string, string | null>;
+  /** Per-group cache configuration. `null` when caching is not configured. */
+  cache: GroupCacheConfig | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -258,6 +262,14 @@ export interface UpsertClusterGroupConfig {
   allowUsers?: string[];
   translationScriptIds?: number[];
   defaultTags?: Record<string, string | null>;
+  cache?: GroupCacheConfig | null;
+}
+
+/** Per-group query result cache configuration. */
+export interface GroupCacheConfig {
+  enabled: boolean;
+  ttlSecs: number;
+  maxEntrySizeMb?: number | null;
 }
 
 /** Reusable Python snippet from `GET /admin/config/scripts`. */

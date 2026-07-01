@@ -54,6 +54,8 @@ pub struct LiveConfig {
     /// group_name → default tags configured on the group.
     /// Merged with session tags at dispatch time; session tags win on key conflicts.
     pub group_default_tags: HashMap<String, QueryTags>,
+    /// group_name → cache settings for groups that have caching enabled.
+    pub group_cache_settings: HashMap<String, queryflux_core::config::GroupCacheConfig>,
     /// Verifies client identity — hot-reloaded when security config changes via admin API.
     pub auth_provider: Arc<dyn AuthProvider>,
     /// Checks whether an authenticated user may access a cluster group — hot-reloaded
@@ -86,6 +88,8 @@ pub struct AppState {
     /// Pre-configured with a 30-second timeout; reusing the client avoids per-request
     /// connection-pool churn.
     pub http_client: reqwest::Client,
+    /// Query result cache — `NoopResultCache` when no cache backend is configured.
+    pub result_cache: Arc<dyn queryflux_cache::QueryResultCache>,
 }
 
 /// Stable per-query metadata that does not change across the query's lifecycle.
@@ -130,6 +134,8 @@ pub struct QueryOutcome {
     /// Milliseconds spent waiting in the proxy queue before dispatch.
     /// Zero for queries that were dispatched immediately.
     pub queue_duration_ms: u64,
+    /// True when the result was served from the query result cache.
+    pub cache_hit: bool,
 }
 
 impl AppState {
@@ -244,6 +250,7 @@ impl AppState {
             query_intent,
             guard_actions: outcome.guard_actions,
             was_guard_blocked: outcome.was_guard_blocked,
+            cache_hit: outcome.cache_hit,
         };
         let metrics = self.metrics.clone();
         tokio::spawn(async move {

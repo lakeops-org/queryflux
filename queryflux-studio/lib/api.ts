@@ -339,6 +339,22 @@ export async function deleteGroupConfig(name: string): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
+// Query result cache
+// ---------------------------------------------------------------------------
+
+export async function invalidateGroupCache(group: string): Promise<{ deleted: number }> {
+  const res = await adminFetch(`/admin/cache/${encodeURIComponent(group)}`, { method: "DELETE" });
+  if (!res.ok) throw new Error(`Cache invalidation failed: ${res.status}`);
+  return res.json();
+}
+
+export async function invalidateAllCache(): Promise<{ deleted: number }> {
+  const res = await adminFetch(`/admin/cache`, { method: "DELETE" });
+  if (!res.ok) throw new Error(`Cache invalidation failed: ${res.status}`);
+  return res.json();
+}
+
+// ---------------------------------------------------------------------------
 // User script library (`user_scripts` table)
 // ---------------------------------------------------------------------------
 

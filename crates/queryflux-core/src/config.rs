@@ -524,6 +524,10 @@ pub struct QueryFluxConfig {
     /// Requires the binary to be built with `--features otlp`.
     #[serde(default)]
     pub otlp_endpoint: Option<String>,
+    /// Storage backend for query result caching. Startup-only (not hot-reloadable).
+    /// Per-group cache settings live on each `ClusterGroupConfig.cache`.
+    #[serde(default)]
+    pub cache_backend: Option<CacheBackendConfig>,
 }
 
 impl QueryFluxConfig {
@@ -822,6 +826,9 @@ pub struct ClusterGroupConfig {
     /// Example: `{ team: analytics, cost_center: "701" }`
     #[serde(default, deserialize_with = "deserialize_config_tags")]
     pub default_tags: QueryTags,
+    /// Query result cache configuration for this group. Omit to disable caching.
+    #[serde(default)]
+    pub cache: Option<GroupCacheConfig>,
 }
 
 /// Simple allow-list authorization for a cluster group.
@@ -1158,6 +1165,77 @@ pub struct StaticColumnDef {
     pub data_type: String,
     #[serde(default = "default_true")]
     pub nullable: bool,
+}
+
+// ---------------------------------------------------------------------------
+// Cache configuration
+// ---------------------------------------------------------------------------
+
+/// Top-level cache backend config (startup-only, not hot-reloadable).
+/// Defines the storage backend and compression for Arrow IPC files.
+///
+/// Uses OpenDAL's generic `scheme` + `options` map, so any OpenDAL-supported
+/// service (fs, s3, gcs, azblob, etc.) can be used without code changes.
+///
+/// Example YAML:
+/// ```yaml
+/// cacheBackend:
+///   scheme: s3
+///   compression: lz4
+///   options:
+///     bucket: my-cache
+///     endpoint: http://localhost:19000
+///     region: us-east-1
+///     access_key_id: minio-root-user
+///     secret_access_key: minio-root-password
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CacheBackendConfig {
+    /// OpenDAL service scheme: `fs`, `s3`, `gcs`, `azblob`, etc.
+    #[serde(default = "default_cache_scheme")]
+    pub scheme: String,
+    #[serde(default)]
+    pub compression: CacheCompression,
+    /// Flat key-value options passed directly to `Operator::via_iter(scheme, options)`.
+    /// Keys are service-specific (see OpenDAL docs for each service).
+    #[serde(default)]
+    pub options: HashMap<String, String>,
+    #[serde(default = "default_cleanup_interval")]
+    pub cleanup_interval_secs: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum CacheCompression {
+    None,
+    #[default]
+    Lz4,
+    Zstd,
+}
+
+fn default_cache_scheme() -> String {
+    "fs".to_string()
+}
+
+fn default_cleanup_interval() -> u64 {
+    300
+}
+
+/// Per-group cache configuration (hot-reloadable via admin API / YAML).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct GroupCacheConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_cache_ttl")]
+    pub ttl_secs: u64,
+    #[serde(default)]
+    pub max_entry_size_mb: Option<u64>,
+}
+
+fn default_cache_ttl() -> u64 {
+    300
 }
 
 #[cfg(test)]

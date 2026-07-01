@@ -11,6 +11,7 @@ path = "src/lib.rs"
 [dependencies]
 # Internal crates — same set main.rs uses to build AppState
 queryflux-frontend = { workspace = true }
+queryflux-cache = { workspace = true }
 queryflux-engine-adapters = { workspace = true }
 queryflux-cluster-manager = { workspace = true }
 queryflux-core = { workspace = true }

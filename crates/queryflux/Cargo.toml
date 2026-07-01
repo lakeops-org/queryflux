@@ -20,6 +20,7 @@ queryflux-engine-adapters = { workspace = true }
 queryflux-frontend = { workspace = true }
 queryflux-cluster-manager = { workspace = true }
 queryflux-metrics = { workspace = true }
+queryflux-cache = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }

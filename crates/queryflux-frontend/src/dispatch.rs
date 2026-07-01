@@ -21,7 +21,7 @@ use queryflux_core::{
     session::SessionContext,
 };
 use queryflux_engine_adapters::{AdapterKind, AsyncAdapter, ConnectionFormat, SyncAdapter};
-use queryflux_guardrails::{GuardContext, GuardLayer};
+use queryflux_guardrails::{GuardChain, GuardContext, GuardLayer};
 use queryflux_metrics::MetricsStore;
 use queryflux_translation::SchemaContext;
 
@@ -362,6 +362,7 @@ pub async fn dispatch_query(
                     guard_actions: $actions,
                     was_guard_blocked: true,
                     queue_duration_ms: 0,
+                    cache_hit: false,
                 },
             );
             slot.release().await;
@@ -604,6 +605,7 @@ async fn finalize_async_terminal_on_submit(
         guard_actions: vec![],
         was_guard_blocked: false,
         queue_duration_ms,
+        cache_hit: false,
     };
     if !stored_actions.is_empty() {
         outcome.guard_actions = stored_actions;
@@ -1009,6 +1011,7 @@ impl From<SyncOutcome> for QueryOutcome {
             guard_actions: vec![],
             was_guard_blocked: false,
             queue_duration_ms: 0,
+            cache_hit: false,
         }
     }
 }
@@ -1166,6 +1169,7 @@ async fn setup_sync_query(
                     guard_actions: vec![],
                     was_guard_blocked: false,
                     queue_duration_ms: 0,
+                    cache_hit: false,
                 },
             );
             slot.release().await;
@@ -1506,12 +1510,13 @@ pub async fn execute_to_sink(
     sink: &mut impl ResultSink,
     auth_ctx: &AuthContext,
 ) -> Result<()> {
-    let (authorization, guard_chain, group_guard_chain) = {
+    let (authorization, guard_chain, group_guard_chain, cache_cfg) = {
         let live = state.live.read().await;
         (
             live.authorization.clone(),
             live.guard_chain.clone(),
             live.group_guard_chains.get(&group.0).cloned(),
+            live.group_cache_settings.get(&group.0).cloned(),
         )
     };
 
@@ -1523,6 +1528,183 @@ pub async fn execute_to_sink(
         return sink.on_error(&msg).await;
     }
 
+    // --- Query result cache: check for hit before acquiring a cluster slot ---
+    let cache_hint = queryflux_cache::extract_cache_hint(&sql, &session);
+    let effective_cache = cache_cfg.or_else(|| cache_hint.as_ref().map(|h| h.to_group_config()));
+    let cache_key = effective_cache
+        .as_ref()
+        .filter(|_| {
+            queryflux_cache::is_deterministic(
+                &sql,
+                &queryflux_fingerprint::polyglot_dialect(&protocol.default_dialect()),
+            )
+        })
+        .map(|_| queryflux_cache::CacheKey::new(&sql, &group.0, &session));
+
+    if let Some(ref key) = cache_key {
+        let mut cache_sink_adapter = SinkCacheAdapter(sink);
+        match state
+            .result_cache
+            .try_stream_cached(key, &mut cache_sink_adapter)
+            .await
+        {
+            Ok(Some(_stats)) => {
+                info!(cache_key = %key, rows = _stats.row_count, "Cache hit — serving from cache");
+                state.metrics.on_cache_hit(&group.0);
+
+                let effective_tags = {
+                    let live = state.live.read().await;
+                    let group_defaults = live
+                        .group_default_tags
+                        .get(&group.0)
+                        .cloned()
+                        .unwrap_or_default();
+                    merge_tags(&group_defaults, &session.tags().clone())
+                };
+
+                let ctx = QueryContext {
+                    query_id: ProxyQueryId::new(),
+                    sql: sql.chars().take(500).collect(),
+                    session: session.clone(),
+                    protocol: protocol.clone(),
+                    group: group.clone(),
+                    cluster: ClusterName("(cache)".to_string()),
+                    cluster_group_config_id: None,
+                    cluster_config_id: None,
+                    engine_type: queryflux_core::query::EngineType::Cache,
+                    src_dialect: queryflux_core::query::SqlDialect::Generic,
+                    tgt_dialect: queryflux_core::query::SqlDialect::Generic,
+                    was_translated: false,
+                    translated_sql: None,
+                    query_tags: effective_tags,
+                    query_params: vec![],
+                    agent_context: session.resolved_agent_context(),
+                };
+                state.record_query(
+                    &ctx,
+                    QueryOutcome {
+                        backend_query_id: None,
+                        status: QueryStatus::Success,
+                        execution_ms: 0,
+                        rows: Some(_stats.row_count),
+                        error: None,
+                        routing_trace: None,
+                        engine_stats: None,
+                        guard_actions: vec![],
+                        was_guard_blocked: false,
+                        queue_duration_ms: 0,
+                        cache_hit: true,
+                    },
+                );
+
+                let stats = queryflux_core::query::QueryStats {
+                    rows_returned: _stats.row_count,
+                    bytes_returned: Some(_stats.size_bytes),
+                    queue_duration_ms: 0,
+                    execution_duration_ms: 0,
+                };
+                return sink.on_complete(&stats).await;
+            }
+            Ok(None) => {
+                info!(cache_key = %key, "Cache miss");
+                state.metrics.on_cache_miss(&group.0);
+            }
+            Err(e) => {
+                warn!(cache_key = %key, error = %e, "Cache lookup failed; proceeding without cache");
+            }
+        }
+    }
+
+    // --- Cache miss path: wrap sink in TeeResultSink if caching is applicable ---
+    let cache_writer = if let (Some(ref key), Some(ref cfg)) = (&cache_key, &effective_cache) {
+        match state.result_cache.writer(key, cfg.ttl_secs).await {
+            Ok(w) => Some(w),
+            Err(e) => {
+                warn!(error = %e, "Failed to create cache writer; proceeding without caching");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    if let Some(writer) = cache_writer {
+        let max_bytes = effective_cache
+            .as_ref()
+            .and_then(|c| c.max_entry_size_mb)
+            .map(|mb| mb * 1024 * 1024);
+        let group_name = group.0.clone();
+        let mut tee = crate::tee_sink::TeeResultSink::new(sink, writer, max_bytes);
+        let result = execute_to_sink_inner(
+            state,
+            sql,
+            params,
+            session,
+            protocol,
+            group,
+            auth_ctx,
+            &mut tee,
+            guard_chain,
+            group_guard_chain,
+        )
+        .await;
+        tee.finalize_cache(result.is_ok()).await;
+        if result.is_ok() {
+            state.metrics.on_cache_write(&group_name);
+        }
+        result
+    } else {
+        execute_to_sink_inner(
+            state,
+            sql,
+            params,
+            session,
+            protocol,
+            group,
+            auth_ctx,
+            sink,
+            guard_chain,
+            group_guard_chain,
+        )
+        .await
+    }
+}
+
+/// Adapter to use a `ResultSink` as a `CacheSink` during cache replay.
+struct SinkCacheAdapter<'a, S: ResultSink + ?Sized>(&'a mut S);
+
+#[async_trait]
+impl<S: ResultSink + ?Sized> queryflux_cache::CacheSink for SinkCacheAdapter<'_, S> {
+    async fn on_schema(&mut self, schema: &arrow::datatypes::Schema) -> anyhow::Result<()> {
+        self.0
+            .on_schema(schema)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))
+    }
+    async fn on_batch(&mut self, batch: &arrow::record_batch::RecordBatch) -> anyhow::Result<()> {
+        self.0
+            .on_batch(batch)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))
+    }
+}
+
+/// Inner function that does the actual sync query execution (slot acquisition,
+/// guard chain, engine submission). Extracted so `execute_to_sink` can wrap it
+/// with `TeeResultSink` on cache-miss without duplicating logic.
+#[allow(clippy::too_many_arguments)]
+async fn execute_to_sink_inner(
+    state: &Arc<AppState>,
+    sql: String,
+    params: QueryParams,
+    session: SessionContext,
+    protocol: FrontendProtocol,
+    group: ClusterGroupName,
+    auth_ctx: &AuthContext,
+    sink: &mut impl ResultSink,
+    guard_chain: Option<Arc<GuardChain>>,
+    group_guard_chain: Option<Arc<GuardChain>>,
+) -> Result<()> {
     let mut setup = match setup_sync_query(
         state,
         sql,
@@ -1535,8 +1717,6 @@ pub async fn execute_to_sink(
     .await
     {
         Ok(s) => s,
-        // Setup failed (no adapter, or translation error already recorded inside).
-        // No slot is held at this point — just notify the sink.
         Err(e) => return sink.on_error(&e.to_string()).await,
     };
 
@@ -1582,6 +1762,7 @@ pub async fn execute_to_sink(
                         guard_actions: all_actions,
                         was_guard_blocked: true,
                         queue_duration_ms: 0,
+                        cache_hit: false,
                     },
                 );
                 return sink.on_error(&deny_reason).await;

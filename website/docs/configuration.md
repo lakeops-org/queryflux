@@ -74,6 +74,34 @@ Environment variables `QUERYFLUX_ADMIN_USER` and `QUERYFLUX_ADMIN_PASSWORD` over
 
 See **[Studio & Admin Auth](./studio)** for the full credential priority rules and password-change instructions.
 
+## Query Cache
+
+QueryFlux can cache deterministic query results to avoid repeated backend roundtrips. See the dedicated **[Caching](./architecture/caching)** page for full documentation.
+
+Quick example:
+
+```yaml
+queryflux:
+  cacheBackend:
+    scheme: s3
+    compression: lz4
+    options:
+      bucket: queryflux-cache
+      endpoint: http://localhost:19000
+      region: us-east-1
+      access_key_id: minio-root-user
+      secret_access_key: minio-root-password
+
+clusterGroups:
+  analytics:
+    members: [trino-1]
+    maxRunningQueries: 50
+    cache:
+      enabled: true
+      ttlSecs: 300
+      maxEntrySizeMb: 64
+```
+
 ---
 
 `config.example.yaml`, `config.local.yaml`, and the serde types in `queryflux-core` (`config.rs`) are the authoritative reference. For routing semantics and `clusterGroups`, see **[Routing and clusters](/docs/architecture/routing-and-clusters)**.

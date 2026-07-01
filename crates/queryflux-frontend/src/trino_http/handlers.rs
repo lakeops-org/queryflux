@@ -442,13 +442,18 @@ pub async fn post_statement(
     let query_id = ProxyQueryId::new();
     info!(id = %query_id, group = %group, user = %auth_ctx.user, "New query submitted");
 
-    // Trino backend: raw bytes forwarded, nextUri rewritten — zero Arrow.
-    // Non-Trino backend (DuckDB, StarRocks): Arrow path → single-page Trino JSON response.
-    //
-    // `group_supports_async` is a group-level heuristic; `dispatch_query` may still return
-    // `SyncEngineRequired` if round-robin selects a sync cluster in a mixed-engine group.
-    // In that case fall through to `execute_to_sink` exactly as for pure-sync groups.
-    if state.group_supports_async(&group.0).await {
+    // When caching is enabled for this group and the query is cacheable,
+    // force through the sync execute_to_sink path so the cache intercept works.
+    let use_cache_path = {
+        let live = state.live.read().await;
+        live.group_cache_settings.get(&group.0).is_some()
+            && queryflux_cache::is_deterministic(
+                &sql,
+                &queryflux_fingerprint::polyglot_dialect(&protocol.default_dialect()),
+            )
+    };
+
+    if !use_cache_path && state.group_supports_async(&group.0).await {
         match dispatch_query(
             &state,
             query_id.clone(),
@@ -738,7 +743,16 @@ pub async fn get_queued_statement(
         }
     };
 
-    if state.group_supports_async(&group.0).await {
+    let use_cache_path = {
+        let live = state.live.read().await;
+        live.group_cache_settings.get(&group.0).is_some()
+            && queryflux_cache::is_deterministic(
+                &sql,
+                &queryflux_fingerprint::polyglot_dialect(&protocol.default_dialect()),
+            )
+    };
+
+    if !use_cache_path && state.group_supports_async(&group.0).await {
         match dispatch_query(
             &state,
             query_id.clone(),
@@ -1012,6 +1026,7 @@ pub async fn get_executing_statement(
                     guard_actions: submit_guard_actions,
                     was_guard_blocked: submit_was_guard_blocked,
                     queue_duration_ms: 0,
+                    cache_hit: false,
                 },
             );
             state
@@ -1049,6 +1064,7 @@ pub async fn get_executing_statement(
                         guard_actions: submit_guard_actions,
                         was_guard_blocked: submit_was_guard_blocked,
                         queue_duration_ms: 0,
+                        cache_hit: false,
                     },
                 );
                 state
@@ -1085,6 +1101,7 @@ pub async fn get_executing_statement(
                     guard_actions: submit_guard_actions,
                     was_guard_blocked: submit_was_guard_blocked,
                     queue_duration_ms: 0,
+                    cache_hit: false,
                 },
             );
             state

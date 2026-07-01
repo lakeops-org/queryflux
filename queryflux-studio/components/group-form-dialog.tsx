@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { AlertCircle, ChevronDown, ChevronUp, Loader2, X } from "lucide-react";
-import { getGuardrailsConfig, listUserScripts, putGuardrailsConfig, renameGroupConfig, upsertGroupConfig } from "@/lib/api";
+import { getGuardrailsConfig, invalidateGroupCache, listUserScripts, putGuardrailsConfig, renameGroupConfig, upsertGroupConfig } from "@/lib/api";
 import type {
   ClusterGroupConfigRecord,
   GuardrailsConfig,
@@ -58,6 +58,10 @@ export function GroupFormDialog({
   const [guardRows, setGuardRows] = useState<GuardRow[]>([]);
   const [guardrailsFull, setGuardrailsFull] = useState<GuardrailsConfig | null>(null);
   const [guardScripts, setGuardScripts] = useState<UserScriptRecord[]>([]);
+  const [cacheEnabled, setCacheEnabled] = useState(false);
+  const [cacheTtl, setCacheTtl] = useState("300");
+  const [cacheMaxSize, setCacheMaxSize] = useState("");
+  const [clearingCache, setClearingCache] = useState(false);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -76,6 +80,9 @@ export function GroupFormDialog({
     setGuardRows([]);
     setGuardrailsFull(null);
     setGuardScripts([]);
+    setCacheEnabled(false);
+    setCacheTtl("300");
+    setCacheMaxSize("");
     setError(null);
   }, []);
 
@@ -101,6 +108,15 @@ export function GroupFormDialog({
         setStrategyKind(p.kind);
         setEnginePreferenceCsv(p.enginePreferenceCsv);
         setWeightedJson(p.weightedJson.trim() ? p.weightedJson : "{}");
+      }
+      if (initial.cache) {
+        setCacheEnabled(initial.cache.enabled);
+        setCacheTtl(String(initial.cache.ttlSecs));
+        setCacheMaxSize(initial.cache.maxEntrySizeMb != null ? String(initial.cache.maxEntrySizeMb) : "");
+      } else {
+        setCacheEnabled(false);
+        setCacheTtl("300");
+        setCacheMaxSize("");
       }
     }
   }, [open, mode, initial, reset]);
@@ -238,11 +254,17 @@ export function GroupFormDialog({
       maxRunningQueries: maxR,
       maxQueuedQueries: maxQ,
       strategy,
-      // Group allow-lists are driven by routing / security config, not edited here.
       allowGroups: mode === "edit" && initial ? [...initial.allowGroups] : [],
       allowUsers: mode === "edit" && initial ? [...initial.allowUsers] : [],
       translationScriptIds,
       defaultTags,
+      cache: cacheEnabled
+        ? {
+            enabled: true,
+            ttlSecs: parseInt(cacheTtl, 10) || 300,
+            maxEntrySizeMb: cacheMaxSize.trim() ? parseInt(cacheMaxSize, 10) || null : null,
+          }
+        : null,
     };
 
     const pathName = mode === "create" ? nameTrim : nameTrim || (initial?.name ?? "").trim();
@@ -752,6 +774,81 @@ export function GroupFormDialog({
             >
               + Add tag
             </button>
+          </div>
+
+          <div className="rounded-xl border border-amber-100 bg-amber-50/40 p-4 space-y-3">
+            <div className="flex items-center justify-between gap-4">
+              <div>
+                <p className="text-[11px] font-semibold text-slate-600 uppercase tracking-wide">
+                  Query result cache
+                </p>
+                <p className="text-[10px] text-slate-500 mt-1 leading-relaxed">
+                  Cache deterministic query results. Requires a cache backend configured in YAML.
+                </p>
+              </div>
+              <button
+                type="button"
+                role="switch"
+                aria-checked={cacheEnabled}
+                onClick={() => setCacheEnabled((v) => !v)}
+                className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-amber-400 flex-shrink-0 ${
+                  cacheEnabled ? "bg-amber-500" : "bg-slate-300"
+                }`}
+              >
+                <span
+                  className={`inline-block h-3.5 w-3.5 transform rounded-full bg-white shadow transition-transform ${
+                    cacheEnabled ? "translate-x-4.5" : "translate-x-0.5"
+                  }`}
+                />
+              </button>
+            </div>
+            {cacheEnabled && (
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="block text-[11px] font-semibold text-slate-500 uppercase tracking-wide mb-1.5">
+                    TTL (seconds)
+                  </label>
+                  <input
+                    type="number"
+                    min={1}
+                    value={cacheTtl}
+                    onChange={(e) => setCacheTtl(e.target.value)}
+                    className="w-full text-sm border border-slate-200 rounded-lg px-3 py-2 font-mono focus:outline-none focus:ring-2 focus:ring-amber-300"
+                  />
+                </div>
+                <div>
+                  <label className="block text-[11px] font-semibold text-slate-500 uppercase tracking-wide mb-1.5">
+                    Max entry size (MB)
+                  </label>
+                  <input
+                    type="number"
+                    min={1}
+                    value={cacheMaxSize}
+                    onChange={(e) => setCacheMaxSize(e.target.value)}
+                    placeholder="unlimited"
+                    className="w-full text-sm border border-slate-200 rounded-lg px-3 py-2 font-mono focus:outline-none focus:ring-2 focus:ring-amber-300"
+                  />
+                </div>
+                {mode === "edit" && initial && (
+                  <div className="col-span-2">
+                    <button
+                      type="button"
+                      disabled={saving || clearingCache}
+                      onClick={async () => {
+                        setClearingCache(true);
+                        try {
+                          await invalidateGroupCache(initial.name);
+                        } catch { /* non-fatal */ }
+                        setClearingCache(false);
+                      }}
+                      className="text-xs font-semibold px-3 py-1.5 rounded-lg border border-red-200 text-red-600 bg-white hover:bg-red-50 disabled:opacity-40"
+                    >
+                      {clearingCache ? "Clearing…" : "Clear cache for this group"}
+                    </button>
+                  </div>
+                )}
+              </div>
+            )}
           </div>
 
           <div className="rounded-xl border border-slate-200 bg-slate-50/60 p-4 space-y-3">

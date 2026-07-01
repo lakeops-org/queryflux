@@ -5,6 +5,7 @@ pub mod mysql_wire;
 pub mod postgres_wire;
 pub mod snowflake;
 pub mod state;
+pub mod tee_sink;
 pub mod trino_http;
 
 use async_trait::async_trait;
