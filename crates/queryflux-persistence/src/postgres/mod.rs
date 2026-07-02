@@ -418,7 +418,7 @@ impl QueryHistoryStore for PostgresStore {
                       qr.physical_input_bytes, qr.peak_memory_bytes, qr.spilled_bytes, qr.total_splits,
                       qr.query_tags, qr.query_hash, qr.query_parameterized_hash, qr.translated_query_hash,
                       qr.agent_id, qr.conversation_id, qr.step_index, qr.tool_call_id, qr.query_intent,
-                      qr.guard_actions, qr.was_guard_blocked
+                      qr.guard_actions, qr.was_guard_blocked, qr.cache_hit
                FROM query_records qr
                LEFT JOIN cluster_group_configs cg ON cg.id = qr.cluster_group_id
                LEFT JOIN cluster_configs cc ON cc.id = qr.cluster_id

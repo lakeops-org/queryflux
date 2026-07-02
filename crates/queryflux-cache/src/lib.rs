@@ -162,7 +162,8 @@ pub fn extract_cache_hint(sql: &str, session: &SessionContext) -> Option<CacheHi
     }
 
     // 3. SQL comment (first 200 chars only to avoid false positives in string literals)
-    let prefix = sql.get(..sql.len().min(200)).unwrap_or(sql);
+    let end = sql.floor_char_boundary(sql.len().min(200));
+    let prefix = &sql[..end];
     static CACHE_COMMENT: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
         regex::Regex::new(r"/\*\s*queryflux:cache(?::ttl=(\d+))?\s*\*/").unwrap()
     });
@@ -296,6 +297,15 @@ mod tests {
         s.extra.insert("x-queryflux-cache-ttl".into(), "600".into());
         let hint = extract_cache_hint("SELECT 1", &s).unwrap();
         assert_eq!(hint.ttl_secs, Some(600));
+    }
+
+    #[test]
+    fn hint_from_sql_comment_utf8_boundary() {
+        let s = SessionContext::default();
+        // 200-byte boundary falls inside a multi-byte UTF-8 character without floor_char_boundary.
+        let sql = format!("/* queryflux:cache:ttl=99 */ {}", "é".repeat(250));
+        let hint = extract_cache_hint(&sql, &s).unwrap();
+        assert_eq!(hint.ttl_secs, Some(99));
     }
 
     #[test]

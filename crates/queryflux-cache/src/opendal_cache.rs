@@ -14,6 +14,9 @@ use tracing::{debug, warn};
 
 use crate::{CacheHitStats, CacheKey, CacheSink, CacheWriter, QueryResultCache};
 
+/// Fail open to a cache miss if OpenDAL I/O takes longer than this.
+const CACHE_IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// OpenDAL-backed query result cache.
 ///
 /// Stores Arrow IPC streaming files in the configured backend (fs or S3).
@@ -69,10 +72,14 @@ impl QueryResultCache for OpenDalResultCache {
         };
 
         let path = key.storage_path();
-        let data = match self.operator.read(&path).await {
-            Ok(d) => d.to_vec(),
-            Err(e) => {
+        let data = match tokio::time::timeout(CACHE_IO_TIMEOUT, self.operator.read(&path)).await {
+            Ok(Ok(d)) => d.to_vec(),
+            Ok(Err(e)) => {
                 warn!(path = %path, "cache file read failed: {e}");
+                return Ok(None);
+            }
+            Err(_) => {
+                warn!(path = %path, "cache file read timed out");
                 return Ok(None);
             }
         };
@@ -233,10 +240,16 @@ impl CacheWriter for OpenDalCacheWriter {
         let size_bytes = buffer.len() as i64;
         let path = self.key.storage_path();
 
-        self.operator
-            .write(&path, buffer)
-            .await
-            .map_err(|e| anyhow::anyhow!("cache write to {path}: {e}"))?;
+        match tokio::time::timeout(CACHE_IO_TIMEOUT, self.operator.write(&path, buffer)).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => {
+                return Err(anyhow::anyhow!("cache write to {path}: {e}"));
+            }
+            Err(_) => {
+                warn!(path = %path, "cache write timed out");
+                return Ok(());
+            }
+        }
 
         let now = Utc::now();
         let entry = CacheEntryMeta {

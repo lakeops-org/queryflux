@@ -78,6 +78,7 @@ pub struct QuerySummary {
     pub was_guard_blocked: bool,
     /// True when the result was served from the query result cache.
     #[serde(default)]
+    #[sqlx(default)]
     pub cache_hit: bool,
 }
 
