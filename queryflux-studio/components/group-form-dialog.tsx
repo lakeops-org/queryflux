@@ -248,6 +248,30 @@ export function GroupFormDialog({
       defaultTags[k] = value.trim() === "" ? null : value.trim();
     }
 
+    let cacheBody: UpsertClusterGroupConfig["cache"] = null;
+    if (cacheEnabled) {
+      const ttl = parseInt(cacheTtl.trim(), 10);
+      if (!Number.isFinite(ttl) || ttl < 1) {
+        setError("Cache TTL must be a positive integer.");
+        return;
+      }
+      let maxEntrySizeMb: number | null = null;
+      const maxSize = cacheMaxSize.trim();
+      if (maxSize !== "") {
+        const n = parseInt(maxSize, 10);
+        if (!Number.isFinite(n) || n < 0) {
+          setError("Max entry size must be empty or a non-negative integer.");
+          return;
+        }
+        maxEntrySizeMb = n;
+      }
+      cacheBody = {
+        enabled: true,
+        ttlSecs: ttl,
+        maxEntrySizeMb,
+      };
+    }
+
     const body: UpsertClusterGroupConfig = {
       enabled,
       members,
@@ -258,13 +282,7 @@ export function GroupFormDialog({
       allowUsers: mode === "edit" && initial ? [...initial.allowUsers] : [],
       translationScriptIds,
       defaultTags,
-      cache: cacheEnabled
-        ? {
-            enabled: true,
-            ttlSecs: parseInt(cacheTtl, 10) || 300,
-            maxEntrySizeMb: cacheMaxSize.trim() ? parseInt(cacheMaxSize, 10) || null : null,
-          }
-        : null,
+      cache: cacheBody,
     };
 
     const pathName = mode === "create" ? nameTrim : nameTrim || (initial?.name ?? "").trim();

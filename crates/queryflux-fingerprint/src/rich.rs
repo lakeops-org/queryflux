@@ -101,13 +101,15 @@ pub fn is_deterministic(sql: &str, dialect: &str) -> bool {
         .flatten();
 
     // If polyglot can't parse it, fall back to regex (conservative).
-    result.unwrap_or_else(|| !NON_DETERMINISTIC_FALLBACK.is_match(sql))
+    // When polyglot succeeds, still require regex pass to catch keyword forms it may miss.
+    let regex_ok = !NON_DETERMINISTIC_FALLBACK.is_match(sql);
+    result.map(|p| p && regex_ok).unwrap_or(regex_ok)
 }
 
 static NON_DETERMINISTIC_FALLBACK: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(
     || {
         regex::Regex::new(
-            r"(?i)\b(RAND|RANDOM|UUID|NOW|CURRENT_TIMESTAMP|CURRENT_DATE|CURRENT_TIME|SYSDATE|GETDATE|NEWID)\b\s*\("
+            r"(?i)(?:\b(?:RAND|RANDOM|UUID|NOW|SYSDATE|GETDATE|NEWID)\b\s*\(|\b(?:CURRENT_TIMESTAMP|CURRENT_DATE|CURRENT_TIME)\b)"
         ).unwrap()
     },
 );

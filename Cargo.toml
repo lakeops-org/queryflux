@@ -85,7 +85,7 @@ queryflux-guardrails = { path = "crates/queryflux-guardrails" }
 queryflux-cache = { path = "crates/queryflux-cache" }
 
 # OpenDAL — storage abstraction for cache backend
-opendal = { version = "0.53", features = ["services-fs", "services-s3"] }
+opendal = { version = "0.53", features = ["services-fs", "services-s3", "services-gcs"] }
 xxhash-rust = { version = "0.8", features = ["xxh64"] }
 regex = "1"
 

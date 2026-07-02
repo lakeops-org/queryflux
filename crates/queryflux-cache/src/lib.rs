@@ -8,6 +8,7 @@ use arrow::datatypes::Schema;
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use queryflux_core::config::GroupCacheConfig;
+use queryflux_core::params::QueryParam;
 use queryflux_core::session::SessionContext;
 use xxhash_rust::xxh64::Xxh64;
 
@@ -67,12 +68,22 @@ pub struct CacheKey {
 }
 
 impl CacheKey {
-    pub fn new(sql: &str, group: &str, session: &SessionContext) -> Self {
+    pub fn new(
+        sql: &str,
+        group: &str,
+        session: &SessionContext,
+        user: &str,
+        params: &[QueryParam],
+    ) -> Self {
         let mut hasher = Xxh64::new(0);
         hasher.update(sql.as_bytes());
         hasher.update(group.as_bytes());
+        hasher.update(user.as_bytes());
         if let Some(db) = &session.database {
             hasher.update(db.as_bytes());
+        }
+        for param in params {
+            hash_param(&mut hasher, param);
         }
         let digest = hasher.digest();
         Self {
@@ -151,7 +162,7 @@ pub fn extract_cache_hint(sql: &str, session: &SessionContext) -> Option<CacheHi
     }
 
     // 3. SQL comment (first 200 chars only to avoid false positives in string literals)
-    let prefix = &sql[..sql.len().min(200)];
+    let prefix = sql.get(..sql.len().min(200)).unwrap_or(sql);
     static CACHE_COMMENT: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
         regex::Regex::new(r"/\*\s*queryflux:cache(?::ttl=(\d+))?\s*\*/").unwrap()
     });
@@ -173,6 +184,35 @@ pub fn is_deterministic(sql: &str, dialect: &str) -> bool {
     queryflux_fingerprint::is_deterministic(sql, dialect)
 }
 
+fn hash_param(hasher: &mut Xxh64, param: &QueryParam) {
+    match param {
+        QueryParam::Text(v) => {
+            hasher.update(b"T:");
+            hasher.update(v.as_bytes());
+        }
+        QueryParam::Numeric(v) => {
+            hasher.update(b"N:");
+            hasher.update(v.as_bytes());
+        }
+        QueryParam::Boolean(v) => {
+            hasher.update(if *v { b"B:1" } else { b"B:0" });
+        }
+        QueryParam::Date(v) => {
+            hasher.update(b"D:");
+            hasher.update(v.as_bytes());
+        }
+        QueryParam::Timestamp(v) => {
+            hasher.update(b"TS:");
+            hasher.update(v.as_bytes());
+        }
+        QueryParam::Time(v) => {
+            hasher.update(b"TM:");
+            hasher.update(v.as_bytes());
+        }
+        QueryParam::Null => hasher.update(b"NULL"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -180,16 +220,16 @@ mod tests {
     #[test]
     fn cache_key_deterministic() {
         let s = SessionContext::default();
-        let k1 = CacheKey::new("SELECT 1", "grp", &s);
-        let k2 = CacheKey::new("SELECT 1", "grp", &s);
+        let k1 = CacheKey::new("SELECT 1", "grp", &s, "alice", &[]);
+        let k2 = CacheKey::new("SELECT 1", "grp", &s, "alice", &[]);
         assert_eq!(k1.hex, k2.hex);
     }
 
     #[test]
     fn cache_key_different_group() {
         let s = SessionContext::default();
-        let k1 = CacheKey::new("SELECT 1", "grp_a", &s);
-        let k2 = CacheKey::new("SELECT 1", "grp_b", &s);
+        let k1 = CacheKey::new("SELECT 1", "grp_a", &s, "alice", &[]);
+        let k2 = CacheKey::new("SELECT 1", "grp_b", &s, "alice", &[]);
         assert_ne!(k1.hex, k2.hex);
     }
 
@@ -199,8 +239,36 @@ mod tests {
         s1.database = Some("db1".to_string());
         let mut s2 = SessionContext::default();
         s2.database = Some("db2".to_string());
-        let k1 = CacheKey::new("SELECT 1", "grp", &s1);
-        let k2 = CacheKey::new("SELECT 1", "grp", &s2);
+        let k1 = CacheKey::new("SELECT 1", "grp", &s1, "alice", &[]);
+        let k2 = CacheKey::new("SELECT 1", "grp", &s2, "alice", &[]);
+        assert_ne!(k1.hex, k2.hex);
+    }
+
+    #[test]
+    fn cache_key_different_user() {
+        let s = SessionContext::default();
+        let k1 = CacheKey::new("SELECT 1", "grp", &s, "alice", &[]);
+        let k2 = CacheKey::new("SELECT 1", "grp", &s, "bob", &[]);
+        assert_ne!(k1.hex, k2.hex);
+    }
+
+    #[test]
+    fn cache_key_different_params() {
+        let s = SessionContext::default();
+        let k1 = CacheKey::new(
+            "SELECT ?",
+            "grp",
+            &s,
+            "alice",
+            &[QueryParam::Numeric("1".into())],
+        );
+        let k2 = CacheKey::new(
+            "SELECT ?",
+            "grp",
+            &s,
+            "alice",
+            &[QueryParam::Numeric("2".into())],
+        );
         assert_ne!(k1.hex, k2.hex);
     }
 
@@ -209,6 +277,7 @@ mod tests {
         assert!(!is_deterministic("SELECT NOW()", "generic"));
         assert!(!is_deterministic("select random()", "generic"));
         assert!(!is_deterministic("SELECT uuid()", "generic"));
+        assert!(!is_deterministic("SELECT CURRENT_TIMESTAMP", "generic"));
     }
 
     #[test]

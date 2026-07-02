@@ -87,20 +87,23 @@ impl QueryResultCache for OpenDalResultCache {
         };
 
         let schema = reader.schema();
-        sink.on_schema(&schema).await?;
-
-        let mut row_count: u64 = 0;
+        let mut batches = Vec::new();
         for batch_result in reader.by_ref() {
             match batch_result {
-                Ok(batch) => {
-                    row_count += batch.num_rows() as u64;
-                    sink.on_batch(&batch).await?;
-                }
+                Ok(batch) => batches.push(batch),
                 Err(e) => {
                     warn!("cache IPC batch read error: {e}");
                     return Ok(None);
                 }
             }
+        }
+
+        sink.on_schema(&schema).await?;
+
+        let mut row_count: u64 = 0;
+        for batch in batches {
+            row_count += batch.num_rows() as u64;
+            sink.on_batch(&batch).await?;
         }
 
         debug!(
@@ -343,7 +346,7 @@ mod tests {
         let cache = OpenDalResultCache::new(&cfg, store).unwrap();
 
         let session = SessionContext::default();
-        let key = CacheKey::new("SELECT 1", "test-group", &session);
+        let key = CacheKey::new("SELECT 1", "test-group", &session, "test-user", &[]);
         let batch = test_batch();
 
         // Write
@@ -381,7 +384,7 @@ mod tests {
         let cache = OpenDalResultCache::new(&cfg, store).unwrap();
 
         let session = SessionContext::default();
-        let key = CacheKey::new("SELECT unknown", "grp", &session);
+        let key = CacheKey::new("SELECT unknown", "grp", &session, "test-user", &[]);
         let mut sink = CollectingSink::new();
         let result = cache.try_stream_cached(&key, &mut sink).await.unwrap();
         assert!(result.is_none(), "expected cache miss");
@@ -395,7 +398,7 @@ mod tests {
         let cache = OpenDalResultCache::new(&cfg, store).unwrap();
 
         let session = SessionContext::default();
-        let key = CacheKey::new("SELECT failed", "grp", &session);
+        let key = CacheKey::new("SELECT failed", "grp", &session, "test-user", &[]);
         let batch = test_batch();
 
         let mut writer = cache.writer(&key, 600).await.unwrap();
@@ -416,7 +419,7 @@ mod tests {
         let cache = OpenDalResultCache::new(&cfg, store).unwrap();
 
         let session = SessionContext::default();
-        let key = CacheKey::new("SELECT 1", "my-group", &session);
+        let key = CacheKey::new("SELECT 1", "my-group", &session, "test-user", &[]);
         let batch = test_batch();
 
         let mut writer = cache.writer(&key, 600).await.unwrap();
@@ -441,7 +444,7 @@ mod tests {
         let cache = OpenDalResultCache::new(&cfg, store).unwrap();
 
         let session = SessionContext::default();
-        let key = CacheKey::new("SELECT compressed", "grp", &session);
+        let key = CacheKey::new("SELECT compressed", "grp", &session, "test-user", &[]);
         let batch = test_batch();
 
         let mut writer = cache.writer(&key, 600).await.unwrap();
@@ -464,7 +467,7 @@ mod tests {
         let cache = OpenDalResultCache::new(&cfg, store).unwrap();
 
         let session = SessionContext::default();
-        let key = CacheKey::new("SELECT multi", "grp", &session);
+        let key = CacheKey::new("SELECT multi", "grp", &session, "test-user", &[]);
         let batch = test_batch();
 
         let mut writer = cache.writer(&key, 600).await.unwrap();
@@ -497,7 +500,7 @@ mod tests {
             "SELECT * FROM table_gamma",
         ];
         for sql in &sqls {
-            let key = CacheKey::new(sql, "grp", &session);
+            let key = CacheKey::new(sql, "grp", &session, "test-user", &[]);
             let mut writer = cache.writer(&key, 600).await.unwrap();
             writer.write_schema(batch.schema().as_ref()).await.unwrap();
             writer.write_batch(&batch).await.unwrap();
@@ -506,7 +509,7 @@ mod tests {
 
         // Verify all 3 are independently readable
         for sql in &sqls {
-            let key = CacheKey::new(sql, "grp", &session);
+            let key = CacheKey::new(sql, "grp", &session, "test-user", &[]);
             let mut sink = CollectingSink::new();
             let result = cache.try_stream_cached(&key, &mut sink).await.unwrap();
             assert!(
@@ -519,7 +522,7 @@ mod tests {
         assert_eq!(deleted, 3);
 
         // Verify all entries are gone
-        let key = CacheKey::new(sqls[0], "grp", &session);
+        let key = CacheKey::new(sqls[0], "grp", &session, "test-user", &[]);
         let mut sink = CollectingSink::new();
         let result = cache.try_stream_cached(&key, &mut sink).await.unwrap();
         assert!(result.is_none());
@@ -533,7 +536,7 @@ mod tests {
         let cache = OpenDalResultCache::new(&cfg, store).unwrap();
 
         let session = SessionContext::default();
-        let key = CacheKey::new("SELECT bytes", "grp", &session);
+        let key = CacheKey::new("SELECT bytes", "grp", &session, "test-user", &[]);
         let batch = test_batch();
 
         let mut writer = cache.writer(&key, 600).await.unwrap();

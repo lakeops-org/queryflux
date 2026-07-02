@@ -17,7 +17,7 @@ impl QueryResultCache for NoopResultCache {
     }
 
     async fn writer(&self, _key: &CacheKey, _ttl_secs: u64) -> Result<Box<dyn CacheWriter>> {
-        Ok(Box::new(NoopCacheWriter))
+        Err(anyhow::anyhow!("cache backend not configured"))
     }
 
     async fn invalidate_group(&self, _group: &str) -> Result<u64> {
@@ -30,26 +30,5 @@ impl QueryResultCache for NoopResultCache {
 
     async fn cleanup_expired(&self) -> Result<u64> {
         Ok(0)
-    }
-}
-
-struct NoopCacheWriter;
-
-#[async_trait]
-impl CacheWriter for NoopCacheWriter {
-    async fn write_schema(&mut self, _schema: &arrow::datatypes::Schema) -> Result<()> {
-        Ok(())
-    }
-
-    async fn write_batch(&mut self, _batch: &arrow::record_batch::RecordBatch) -> Result<()> {
-        Ok(())
-    }
-
-    async fn finalize(&mut self, _success: bool) -> Result<()> {
-        Ok(())
-    }
-
-    fn bytes_written(&self) -> u64 {
-        0
     }
 }

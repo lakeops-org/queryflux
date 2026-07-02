@@ -16,6 +16,7 @@ pub struct TeeResultSink<'a, S: ResultSink> {
     writer: Box<dyn CacheWriter>,
     max_bytes: Option<u64>,
     active: bool,
+    committed: bool,
 }
 
 impl<'a, S: ResultSink> TeeResultSink<'a, S> {
@@ -25,6 +26,7 @@ impl<'a, S: ResultSink> TeeResultSink<'a, S> {
             writer,
             max_bytes,
             active: true,
+            committed: false,
         }
     }
 
@@ -38,11 +40,17 @@ impl<'a, S: ResultSink> TeeResultSink<'a, S> {
 
     /// Finalize the cache entry. Call after on_complete or on failure.
     pub async fn finalize_cache(&mut self, success: bool) {
-        if self.active {
-            let _ = self.writer.finalize(success).await;
+        if self.active && success {
+            if self.writer.finalize(true).await.is_ok() {
+                self.committed = true;
+            }
         } else {
             let _ = self.writer.finalize(false).await;
         }
+    }
+
+    pub fn cache_committed(&self) -> bool {
+        self.committed
     }
 }
 

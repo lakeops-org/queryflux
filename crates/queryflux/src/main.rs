@@ -1238,18 +1238,23 @@ async fn main() -> Result<()> {
             .as_ref()
             .map(|c| c.cleanup_interval_secs)
             .unwrap_or(300);
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
-            interval.tick().await;
-            loop {
+        if interval_secs > 0 {
+            tokio::spawn(async move {
+                let mut interval =
+                    tokio::time::interval(std::time::Duration::from_secs(interval_secs));
                 interval.tick().await;
-                match cache.cleanup_expired().await {
-                    Ok(0) => {}
-                    Ok(n) => tracing::info!(deleted = n, "Cache cleanup: removed expired entries"),
-                    Err(e) => tracing::warn!(error = %e, "Cache cleanup failed"),
+                loop {
+                    interval.tick().await;
+                    match cache.cleanup_expired().await {
+                        Ok(0) => {}
+                        Ok(n) => {
+                            tracing::info!(deleted = n, "Cache cleanup: removed expired entries")
+                        }
+                        Err(e) => tracing::warn!(error = %e, "Cache cleanup failed"),
+                    }
                 }
-            }
-        });
+            });
+        }
     }
 
     // Background task: enforce query_history_retention_days — runs hourly and deletes

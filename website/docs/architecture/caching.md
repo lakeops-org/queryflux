@@ -13,7 +13,7 @@ Client → QueryFlux
                             └── TeeResultSink writes to cache + responds to client
 ```
 
-1. **Cache key** — computed from the exact SQL text, cluster group name, and current catalog/database. Queries differing only in literal values (e.g. `WHERE id = 1` vs `WHERE id = 2`) produce distinct cache keys.
+1. **Cache key** — computed from the exact SQL text, authenticated user, bind parameters, cluster group name, and current catalog/database. Queries differing only in literal values or parameters produce distinct cache keys.
 2. **Determinism guard** — queries containing non-deterministic functions (`NOW()`, `RAND()`, `UUID()`, `CURRENT_TIMESTAMP`, etc.) are never cached.
 3. **Arrow IPC storage** — results are stored as streaming Arrow IPC files with optional LZ4 or ZSTD compression.
 4. **TTL expiration** — each entry has a configurable time-to-live. A background cleanup task periodically removes expired entries.

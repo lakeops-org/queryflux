@@ -1491,6 +1491,46 @@ async fn execute_native_to_sink(
     (outcome, sink.on_complete(&stats).await)
 }
 
+async fn run_plan_guards(
+    guard_chain: &Option<Arc<GuardChain>>,
+    group_guard_chain: &Option<Arc<GuardChain>>,
+    sql: &str,
+    group: &ClusterGroupName,
+    session: &SessionContext,
+    effective_tags: &queryflux_core::tags::QueryTags,
+) -> Option<String> {
+    let engine_type = queryflux_core::query::EngineType::Cache;
+    let resolved_agent_ctx = session.resolved_agent_context();
+    let guard_ctx = GuardContext {
+        sql,
+        translated_sql: sql,
+        engine_type: &engine_type,
+        cluster_group: group,
+        user: session.user(),
+        agent_context: resolved_agent_ctx.as_ref(),
+        query_tags: effective_tags,
+    };
+
+    let mut all_actions = Vec::new();
+    for chain in [guard_chain.as_ref(), group_guard_chain.as_ref()]
+        .into_iter()
+        .flatten()
+    {
+        let (actions, was_blocked) = chain.run(&guard_ctx, GuardLayer::Plan).await;
+        all_actions.extend(actions);
+        if was_blocked {
+            return Some(
+                all_actions
+                    .iter()
+                    .find(|a| a.action == "deny")
+                    .and_then(|a| a.reason.clone())
+                    .unwrap_or_else(|| "query blocked by guardrail".to_string()),
+            );
+        }
+    }
+    None
+}
+
 /// Execute a query against any backend and stream RecordBatches to `sink`.
 ///
 /// Used by all non-Trino-HTTP frontends (MySQL wire, Postgres wire, Flight SQL).
@@ -1539,9 +1579,33 @@ pub async fn execute_to_sink(
                 &queryflux_fingerprint::polyglot_dialect(&protocol.default_dialect()),
             )
         })
-        .map(|_| queryflux_cache::CacheKey::new(&sql, &group.0, &session));
+        .map(|_| {
+            queryflux_cache::CacheKey::new(&sql, &group.0, &session, &auth_ctx.user, &params)
+        });
 
     if let Some(ref key) = cache_key {
+        let effective_tags = {
+            let live = state.live.read().await;
+            let group_defaults = live
+                .group_default_tags
+                .get(&group.0)
+                .cloned()
+                .unwrap_or_default();
+            merge_tags(&group_defaults, &session.tags().clone())
+        };
+        if let Some(deny_reason) = run_plan_guards(
+            &guard_chain,
+            &group_guard_chain,
+            &sql,
+            &group,
+            &session,
+            &effective_tags,
+        )
+        .await
+        {
+            return sink.on_error(&deny_reason).await;
+        }
+
         let mut cache_sink_adapter = SinkCacheAdapter(sink);
         match state
             .result_cache
@@ -1649,7 +1713,7 @@ pub async fn execute_to_sink(
         )
         .await;
         tee.finalize_cache(result.is_ok()).await;
-        if result.is_ok() {
+        if result.is_ok() && tee.cache_committed() {
             state.metrics.on_cache_write(&group_name);
         }
         result
