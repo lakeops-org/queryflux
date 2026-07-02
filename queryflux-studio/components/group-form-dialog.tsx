@@ -259,8 +259,8 @@ export function GroupFormDialog({
       const maxSize = cacheMaxSize.trim();
       if (maxSize !== "") {
         const n = parseInt(maxSize, 10);
-        if (!Number.isFinite(n) || n < 0) {
-          setError("Max entry size must be empty or a non-negative integer.");
+        if (!Number.isFinite(n) || n < 1) {
+          setError("Max entry size must be empty or a positive integer.");
           return;
         }
         maxEntrySizeMb = n;
