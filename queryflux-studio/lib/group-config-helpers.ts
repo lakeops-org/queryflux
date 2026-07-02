@@ -80,7 +80,7 @@ export function normalizeClusterGroupRecord(raw: unknown): ClusterGroupConfigRec
     allowUsers: strArr("allowUsers", "allow_users"),
     translationScriptIds,
     defaultTags,
-    cache: (r as Record<string, unknown>).cache as import("./api-types").GroupCacheConfig | null ?? null,
+    cache: ((r as Record<string, unknown>).cache as import("./api-types").GroupCacheConfig | null) ?? null,
     createdAt: strOrNull("createdAt", "created_at") || new Date().toISOString(),
     updatedAt: strOrNull("updatedAt", "updated_at") || new Date().toISOString(),
   };
