@@ -1498,7 +1498,7 @@ async fn run_plan_guards(
     group: &ClusterGroupName,
     session: &SessionContext,
     effective_tags: &queryflux_core::tags::QueryTags,
-) -> Option<String> {
+) -> std::result::Result<Vec<queryflux_persistence::GuardAction>, String> {
     let engine_type = queryflux_core::query::EngineType::Cache;
     let resolved_agent_ctx = session.resolved_agent_context();
     let guard_ctx = GuardContext {
@@ -1519,7 +1519,7 @@ async fn run_plan_guards(
         let (actions, was_blocked) = chain.run(&guard_ctx, GuardLayer::Plan).await;
         all_actions.extend(actions);
         if was_blocked {
-            return Some(
+            return Err(
                 all_actions
                     .iter()
                     .find(|a| a.action == "deny")
@@ -1528,7 +1528,7 @@ async fn run_plan_guards(
             );
         }
     }
-    None
+    Ok(all_actions)
 }
 
 /// Execute a query against any backend and stream RecordBatches to `sink`.
@@ -1591,7 +1591,7 @@ pub async fn execute_to_sink(
                 .unwrap_or_default();
             merge_tags(&group_defaults, &session.tags().clone())
         };
-        if let Some(deny_reason) = run_plan_guards(
+        let guard_actions = match run_plan_guards(
             &guard_chain,
             &group_guard_chain,
             &sql,
@@ -1601,8 +1601,9 @@ pub async fn execute_to_sink(
         )
         .await
         {
-            return sink.on_error(&deny_reason).await;
-        }
+            Ok(actions) => actions,
+            Err(deny_reason) => return sink.on_error(&deny_reason).await,
+        };
 
         let mut cache_sink_adapter = SinkCacheAdapter(sink);
         match state
@@ -1613,16 +1614,6 @@ pub async fn execute_to_sink(
             Ok(Some(_stats)) => {
                 info!(cache_key = %key, rows = _stats.row_count, "Cache hit — serving from cache");
                 state.metrics.on_cache_hit(&group.0);
-
-                let effective_tags = {
-                    let live = state.live.read().await;
-                    let group_defaults = live
-                        .group_default_tags
-                        .get(&group.0)
-                        .cloned()
-                        .unwrap_or_default();
-                    merge_tags(&group_defaults, &session.tags().clone())
-                };
 
                 let ctx = QueryContext {
                     query_id: ProxyQueryId::new(),
@@ -1652,7 +1643,7 @@ pub async fn execute_to_sink(
                         error: None,
                         routing_trace: None,
                         engine_stats: None,
-                        guard_actions: vec![],
+                        guard_actions,
                         was_guard_blocked: false,
                         queue_duration_ms: 0,
                         cache_hit: true,
