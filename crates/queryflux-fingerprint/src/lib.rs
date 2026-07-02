@@ -8,6 +8,7 @@
 
 pub mod fallback;
 pub mod fast;
+pub mod polyglot_pool;
 pub mod rich;
 
 pub use fast::fast_hash;

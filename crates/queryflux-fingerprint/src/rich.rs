@@ -66,16 +66,9 @@ fn fingerprint_one(sql: &str, dialect: &str) -> Option<(u64, u64, String, bool)>
     let sql_owned = sql.to_string();
     let dialect_owned = dialect.to_string();
 
-    // polyglot-sql is a recursive-descent parser (59K lines, 605 fns) that overflows the
-    // default tokio worker stack for complex SQL. Run it on a dedicated thread with an
-    // explicit 16MB stack. .ok() inside the closure converts the Result to Option so no
-    // non-Send error type crosses the thread boundary.
-    let result = std::thread::Builder::new()
-        .stack_size(16 * 1024 * 1024)
-        .spawn(move || try_polyglot(&sql_owned, &dialect_owned).ok())
-        .ok()
-        .and_then(|h| h.join().ok())
-        .flatten();
+    // polyglot-sql is a recursive-descent parser that overflows the default tokio worker
+    // stack for complex SQL. Run it on a pooled thread with a 16 MiB stack.
+    let result = crate::polyglot_pool::run(move || try_polyglot(&sql_owned, &dialect_owned).ok()).flatten();
 
     if result.is_none() {
         warn!(
@@ -93,12 +86,8 @@ pub fn is_deterministic(sql: &str, dialect: &str) -> bool {
     let sql_owned = sql.to_string();
     let dialect_owned = dialect.to_string();
 
-    let result = std::thread::Builder::new()
-        .stack_size(16 * 1024 * 1024)
-        .spawn(move || try_determinism_check(&sql_owned, &dialect_owned))
-        .ok()
-        .and_then(|h| h.join().ok())
-        .flatten();
+    let result =
+        crate::polyglot_pool::run(move || try_determinism_check(&sql_owned, &dialect_owned)).flatten();
 
     // If polyglot can't parse it, fall back to regex (conservative).
     // When polyglot succeeds, still require regex pass to catch keyword forms it may miss.
