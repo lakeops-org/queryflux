@@ -1519,13 +1519,11 @@ async fn run_plan_guards(
         let (actions, was_blocked) = chain.run(&guard_ctx, GuardLayer::Plan).await;
         all_actions.extend(actions);
         if was_blocked {
-            return Err(
-                all_actions
-                    .iter()
-                    .find(|a| a.action == "deny")
-                    .and_then(|a| a.reason.clone())
-                    .unwrap_or_else(|| "query blocked by guardrail".to_string()),
-            );
+            return Err(all_actions
+                .iter()
+                .find(|a| a.action == "deny")
+                .and_then(|a| a.reason.clone())
+                .unwrap_or_else(|| "query blocked by guardrail".to_string()));
         }
     }
     Ok(all_actions)

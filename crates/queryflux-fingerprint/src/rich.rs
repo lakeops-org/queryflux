@@ -68,7 +68,8 @@ fn fingerprint_one(sql: &str, dialect: &str) -> Option<(u64, u64, String, bool)>
 
     // polyglot-sql is a recursive-descent parser that overflows the default tokio worker
     // stack for complex SQL. Run it on a pooled thread with a 16 MiB stack.
-    let result = crate::polyglot_pool::run(move || try_polyglot(&sql_owned, &dialect_owned).ok()).flatten();
+    let result =
+        crate::polyglot_pool::run(move || try_polyglot(&sql_owned, &dialect_owned).ok()).flatten();
 
     if result.is_none() {
         warn!(
@@ -87,7 +88,8 @@ pub fn is_deterministic(sql: &str, dialect: &str) -> bool {
     let dialect_owned = dialect.to_string();
 
     let result =
-        crate::polyglot_pool::run(move || try_determinism_check(&sql_owned, &dialect_owned)).flatten();
+        crate::polyglot_pool::run(move || try_determinism_check(&sql_owned, &dialect_owned))
+            .flatten();
 
     // If polyglot can't parse it, fall back to regex (conservative).
     // When polyglot succeeds, still require regex pass to catch keyword forms it may miss.

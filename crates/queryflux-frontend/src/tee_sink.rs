@@ -81,9 +81,7 @@ impl<S: ResultSink> ResultSink for TeeResultSink<'_, S> {
     }
 
     async fn on_batch(&mut self, batch: &RecordBatch) -> Result<()> {
-        if self.active
-            && (self.writer.write_batch(batch).await.is_err() || self.check_size())
-        {
+        if self.active && (self.writer.write_batch(batch).await.is_err() || self.check_size()) {
             self.abandon_cache().await;
         }
         self.inner.on_batch(batch).await
