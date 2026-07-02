@@ -57,10 +57,8 @@ impl<'a, S: ResultSink> TeeResultSink<'a, S> {
 #[async_trait]
 impl<S: ResultSink> ResultSink for TeeResultSink<'_, S> {
     async fn on_schema(&mut self, schema: &Schema) -> Result<()> {
-        if self.active {
-            if self.writer.write_schema(schema).await.is_err() {
-                self.active = false;
-            }
+        if self.active && self.writer.write_schema(schema).await.is_err() {
+            self.active = false;
         }
         self.inner.on_schema(schema).await
     }

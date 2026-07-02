@@ -446,7 +446,7 @@ pub async fn post_statement(
     // force through the sync execute_to_sink path so the cache intercept works.
     let use_cache_path = {
         let live = state.live.read().await;
-        let caching_requested = live.group_cache_settings.get(&group.0).is_some()
+        let caching_requested = live.group_cache_settings.contains_key(&group.0)
             || queryflux_cache::extract_cache_hint(&sql, &session).is_some();
         caching_requested
             && queryflux_cache::is_deterministic(
@@ -747,7 +747,7 @@ pub async fn get_queued_statement(
 
     let use_cache_path = {
         let live = state.live.read().await;
-        let caching_requested = live.group_cache_settings.get(&group.0).is_some()
+        let caching_requested = live.group_cache_settings.contains_key(&group.0)
             || queryflux_cache::extract_cache_hint(&sql, &session).is_some();
         caching_requested
             && queryflux_cache::is_deterministic(
