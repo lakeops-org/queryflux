@@ -94,23 +94,33 @@ impl QueryResultCache for OpenDalResultCache {
         };
 
         let schema = reader.schema();
-        let mut batches = Vec::new();
+        let mut row_count: u64 = 0;
+        let mut started = false;
+
         for batch_result in reader.by_ref() {
             match batch_result {
-                Ok(batch) => batches.push(batch),
+                Ok(batch) => {
+                    if !started {
+                        sink.on_schema(&schema).await?;
+                        started = true;
+                    }
+                    row_count += batch.num_rows() as u64;
+                    sink.on_batch(&batch).await?;
+                }
                 Err(e) => {
                     warn!("cache IPC batch read error: {e}");
+                    if started {
+                        return Err(anyhow::anyhow!(
+                            "cache IPC batch read error after partial replay: {e}"
+                        ));
+                    }
                     return Ok(None);
                 }
             }
         }
 
-        sink.on_schema(&schema).await?;
-
-        let mut row_count: u64 = 0;
-        for batch in batches {
-            row_count += batch.num_rows() as u64;
-            sink.on_batch(&batch).await?;
+        if !started {
+            sink.on_schema(&schema).await?;
         }
 
         debug!(
