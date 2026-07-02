@@ -1065,6 +1065,7 @@ mod tests {
             allow_users: vec![],
             translation_script_ids: vec![],
             default_tags: tags,
+            cache: None,
         }
     }
 
