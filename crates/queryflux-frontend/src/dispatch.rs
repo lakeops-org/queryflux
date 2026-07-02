@@ -1579,9 +1579,7 @@ pub async fn execute_to_sink(
                 &queryflux_fingerprint::polyglot_dialect(&protocol.default_dialect()),
             )
         })
-        .map(|_| {
-            queryflux_cache::CacheKey::new(&sql, &group.0, &session, &auth_ctx.user, &params)
-        });
+        .map(|_| queryflux_cache::CacheKey::new(&sql, &group.0, &session, &auth_ctx.user, &params));
 
     if let Some(ref key) = cache_key {
         let effective_tags = {
