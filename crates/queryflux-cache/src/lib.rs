@@ -236,10 +236,14 @@ mod tests {
 
     #[test]
     fn cache_key_different_database() {
-        let mut s1 = SessionContext::default();
-        s1.database = Some("db1".to_string());
-        let mut s2 = SessionContext::default();
-        s2.database = Some("db2".to_string());
+        let s1 = SessionContext {
+            database: Some("db1".to_string()),
+            ..Default::default()
+        };
+        let s2 = SessionContext {
+            database: Some("db2".to_string()),
+            ..Default::default()
+        };
         let k1 = CacheKey::new("SELECT 1", "grp", &s1, "alice", &[]);
         let k2 = CacheKey::new("SELECT 1", "grp", &s2, "alice", &[]);
         assert_ne!(k1.hex, k2.hex);
