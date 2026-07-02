@@ -273,8 +273,8 @@ impl CacheWriter for OpenDalCacheWriter {
 
         if let Err(e) = self.store.cache_upsert(&entry).await {
             warn!(key = %self.key, "cache metadata upsert failed: {e}");
-            // Clean up the orphaned file
             let _ = self.operator.delete(&path).await;
+            return Err(anyhow::anyhow!("cache metadata upsert failed: {e}"));
         }
 
         debug!(
