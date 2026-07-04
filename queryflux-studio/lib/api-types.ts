@@ -200,6 +200,13 @@ export interface ClusterUpdateRequest {
 // Persisted cluster / group config (requires Postgres persistence)
 // ---------------------------------------------------------------------------
 
+/** One variant that expands a base cluster into an independent runtime cluster. */
+export interface ClusterVariant {
+  name: string;
+  overrides?: Record<string, unknown>;
+  maxRunningQueries?: number | null;
+}
+
 /** Matches QueryFlux Admin API JSON (`#[serde(rename_all = "camelCase")]` on the Rust structs). */
 export interface ClusterConfigRecord {
   /** Stable surrogate key; group members reference these ids in Postgres. */
@@ -211,6 +218,8 @@ export interface ClusterConfigRecord {
   maxRunningQueries?: number | null;
   /** All engine-specific connection details (endpoint, auth, TLS, region, …). */
   config: Record<string, unknown>;
+  /** Sub-resource variants that expand this config into multiple runtime clusters. */
+  variants?: ClusterVariant[];
   createdAt: string;
   updatedAt: string;
 }
@@ -222,6 +231,8 @@ export interface UpsertClusterConfig {
   maxRunningQueries?: number | null;
   /** Engine-specific connection details. Schema depends on engineKey. */
   config: Record<string, unknown>;
+  /** Sub-resource variants. Each variant expands into an independent runtime cluster. */
+  variants?: ClusterVariant[];
 }
 
 /** Body for PATCH `/admin/config/clusters/{name}` and `/admin/config/groups/{name}`. */

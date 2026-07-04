@@ -41,6 +41,10 @@ pub struct LiveConfig {
     /// One `(adapter, ClusterState)` per physical cluster (first group membership wins).
     /// Used by background health / reconcile tasks so they track the **current** reload generation.
     pub health_check_targets: Vec<(AdapterKind, Arc<ClusterState>)>,
+    /// cluster_name → custom SQL for health checks. If absent, use the adapter's default.
+    pub custom_health_queries: HashMap<String, String>,
+    /// cluster_name → custom SQL for reconciliation. If absent, use the adapter's default.
+    pub custom_reconcile_queries: HashMap<String, String>,
     /// Cluster configs keyed by cluster name — used by `BackendIdentityResolver` to
     /// look up `queryAuth` after a cluster is selected.
     pub cluster_configs: HashMap<String, ClusterConfig>,

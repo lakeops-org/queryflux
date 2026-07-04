@@ -74,6 +74,32 @@ Environment variables `QUERYFLUX_ADMIN_USER` and `QUERYFLUX_ADMIN_PASSWORD` over
 
 See **[Studio & Admin Auth](./studio)** for the full credential priority rules and password-change instructions.
 
+## Persistence and distributed mode
+
+```yaml
+queryflux:
+  persistence:
+    type: postgres
+    postgres:
+      url: postgres://queryflux:queryflux@localhost:5433/queryflux
+  # Optional — defaults to true when postgres persistence is configured
+  distributed: true
+  configReloadIntervalSecs: 30
+```
+
+With **Postgres persistence** and **`distributed: true`** (the default when Postgres is configured), multiple QueryFlux replicas coordinate through Postgres:
+
+| Concern | Mechanism |
+|---|---|
+| Config hot-reload | `configReloadIntervalSecs` + immediate reload on Admin API writes |
+| Fleet-wide `maxRunningQueries` | Capacity leases in `cluster_capacity_leases` (`try_acquire` / `release`) |
+| Engine running counts | Reconcile sweep publishes to `cluster_capacity_counters.running` |
+| Queued query dispatch | Claim columns on `queued_queries` — one replica per query |
+
+Set `distributed: false` to run Postgres-backed persistence without cross-replica coordination (single replica or explicit opt-out).
+
+Helm / Kubernetes: see **[charts/queryflux/README.md](https://github.com/lakeops-org/queryflux/blob/main/charts/queryflux/README.md#persistence-and-replicas)**. Full behavior: **[Cluster variants, health checks & reconciliation](./architecture/cluster-variants-and-health#distributed-mode-and-capacitystore)**.
+
 ## Query Cache
 
 QueryFlux can cache deterministic query results to avoid repeated backend roundtrips. See the dedicated **[Caching](./architecture/caching)** page for full documentation.
@@ -105,3 +131,44 @@ clusterGroups:
 ---
 
 `config.example.yaml`, `config.local.yaml`, and the serde types in `queryflux-core` (`config.rs`) are the authoritative reference. For routing semantics and `clusterGroups`, see **[Routing and clusters](/docs/architecture/routing-and-clusters)**.
+
+## Cluster variants (multi-warehouse)
+
+A single cluster config can define **`variants`**: named overrides that expand into separate runtime clusters at load time. Use this when one credential set targets multiple Snowflake warehouses, Databricks SQL warehouses, BigQuery projects, or similar.
+
+```yaml
+clusters:
+  my-snowflake:
+    engine: adbc
+    driver: snowflake
+    uri: svc_user@myaccount/mydb/myschema
+    auth:
+      type: keyPair
+      username: SVC_ACCOUNT
+      privateKeyPem: "..."
+    # Optional — leave empty to use built-in Snowflake introspection
+    healthCheckQuery: "SHOW WAREHOUSES LIKE '{{sub_resource}}'"
+    variants:
+      - name: analytics
+        overrides:
+          warehouse: ANALYTICS_WH
+      - name: etl
+        overrides:
+          warehouse: ETL_WH
+          maxRunningQueries: 5
+
+clusterGroups:
+  snowflake-pool:
+    maxRunningQueries: 20
+    members:
+      - my-snowflake::analytics
+      - my-snowflake::etl
+```
+
+**Rules:**
+
+- Runtime names are `{base}::{variant_name}` (for example `my-snowflake::analytics`).
+- A cluster **with** variants does not create a runtime cluster for the base name alone.
+- `healthCheckQuery` and `reconcileQuery` are set on the **base** config; `{{sub_resource}}` is substituted per variant.
+
+Full details: **[Cluster variants, health checks & reconciliation](./architecture/cluster-variants-and-health)**.

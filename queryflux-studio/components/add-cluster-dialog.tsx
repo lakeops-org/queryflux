@@ -9,7 +9,13 @@ import {
   type EngineDef,
 } from "@/components/engine-catalog";
 import { EngineIcon } from "@/components/engine-icon";
-import { EngineClusterConfig } from "@/components/cluster-config";
+import { AdbcHealthReconcileFields, AdbcSaasVariantsEditor, EngineClusterConfig } from "@/components/cluster-config";
+import {
+  isSaasVariantDriver,
+  rowsToVariants,
+  validateVariantRows,
+  type VariantRow,
+} from "@/lib/adbc-saas-variants";
 import {
   findEngineDescriptor,
   isClusterOnboardingSelectable,
@@ -98,6 +104,9 @@ export function AddClusterDialog({ open, onClose }: Props) {
   const [flat, setFlat] = useState<Record<string, string>>({});
   const [clusterEnabled, setClusterEnabled] = useState(true);
   const [clusterMaxRunning, setClusterMaxRunning] = useState("");
+  const [variantRows, setVariantRows] = useState<VariantRow[]>([]);
+  const [healthCheckQuery, setHealthCheckQuery] = useState("");
+  const [reconcileQuery, setReconcileQuery] = useState("");
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
   const [testing, setTesting] = useState(false);
@@ -116,6 +125,9 @@ export function AddClusterDialog({ open, onClose }: Props) {
     setFlat({});
     setClusterEnabled(true);
     setClusterMaxRunning("");
+    setVariantRows([]);
+    setHealthCheckQuery("");
+    setReconcileQuery("");
     setSaving(false);
     setSaveError(null);
     setTesting(false);
@@ -153,6 +165,9 @@ export function AddClusterDialog({ open, onClose }: Props) {
       initial.driver = selected.adbcDriver;
     }
     setFlat(initial);
+    setVariantRows([]);
+    setHealthCheckQuery("");
+    setReconcileQuery("");
     setStep(2);
   }
 
@@ -204,6 +219,14 @@ export function AddClusterDialog({ open, onClose }: Props) {
         return;
       }
     }
+    const adbcDriver = selected.adbcDriver ?? flat.driver ?? "";
+    if (isSaasVariantDriver(adbcDriver)) {
+      const variantErrs = validateVariantRows(variantRows, adbcDriver);
+      if (variantErrs.length > 0) {
+        setSaveError(variantErrs.join(" "));
+        return;
+      }
+    }
     setSaving(true);
     setSaveError(null);
     try {
@@ -212,6 +235,11 @@ export function AddClusterDialog({ open, onClose }: Props) {
         toUpsertBody(selected.engineKey, flat, {
           enabled: clusterEnabled,
           maxRunningQueriesInput: clusterMaxRunning,
+          variants: isSaasVariantDriver(adbcDriver)
+            ? rowsToVariants(variantRows, adbcDriver)
+            : undefined,
+          healthCheckQuery,
+          reconcileQuery,
         }),
       );
       reset();
@@ -233,6 +261,10 @@ export function AddClusterDialog({ open, onClose }: Props) {
       !descriptor ||
       !descriptor.implemented);
 
+  const adbcDriver = selected?.adbcDriver ?? flat.driver ?? "";
+  const saasAdbc = isSaasVariantDriver(adbcDriver);
+  const isAdbc = selected?.engineKey === "adbc";
+
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
       <div
@@ -246,7 +278,7 @@ export function AddClusterDialog({ open, onClose }: Props) {
         aria-modal
         aria-labelledby="add-cluster-title"
         className={`relative w-full ${
-          step === 1 ? "max-w-6xl" : "max-w-lg"
+          step === 1 ? "max-w-6xl" : isAdbc ? "max-w-2xl" : "max-w-lg"
         } max-h-[min(92vh,900px)] overflow-hidden flex flex-col bg-white rounded-2xl shadow-2xl border border-slate-200`}
       >
         {/* Header */}
@@ -560,6 +592,34 @@ export function AddClusterDialog({ open, onClose }: Props) {
                           setFlat((prev) => ({ ...prev, ...patch }))
                         }
                       />
+                    </div>
+                  ) : null}
+
+                  {isAdbc ? (
+                    <div className="space-y-2 pt-2 border-t border-slate-100">
+                      <p className="text-[10px] font-semibold text-slate-400 uppercase tracking-widest">
+                        {saasAdbc ? "Warehouses & health" : "Health & reconcile"}
+                      </p>
+                      <div className="bg-slate-50 rounded-xl border border-slate-100 divide-y divide-slate-100">
+                        {saasAdbc ? (
+                          <div className="flex flex-col px-4 py-3 gap-1.5">
+                            <AdbcSaasVariantsEditor
+                              driver={adbcDriver}
+                              baseClusterName={clusterName.trim()}
+                              rows={variantRows}
+                              onChange={setVariantRows}
+                              errors={validateVariantRows(variantRows, adbcDriver)}
+                            />
+                          </div>
+                        ) : null}
+                        <AdbcHealthReconcileFields
+                          driver={adbcDriver}
+                          healthCheckQuery={healthCheckQuery}
+                          reconcileQuery={reconcileQuery}
+                          onHealthCheckQueryChange={setHealthCheckQuery}
+                          onReconcileQueryChange={setReconcileQuery}
+                        />
+                      </div>
                     </div>
                   ) : null}
                 </>

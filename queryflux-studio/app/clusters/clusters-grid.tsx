@@ -20,7 +20,13 @@ import {
   validateEngineSpecific,
 } from "@/lib/cluster-persist-form";
 import { hiddenAdbcFieldKeysForDriver } from "@/lib/adbc-driver-spec";
-import { EngineClusterConfig } from "@/components/cluster-config";
+import {
+  isSaasVariantDriver,
+  rowsToVariants,
+  validateVariantRows,
+  variantsToRows,
+} from "@/lib/adbc-saas-variants";
+import { AdbcHealthReconcileFields, AdbcSaasVariantsEditor, EngineClusterConfig } from "@/components/cluster-config";
 import {
   findEngineDescriptor,
   validateClusterConfig,
@@ -485,6 +491,20 @@ function ClusterDialog({
     if (schemaErrs.length > 0) {
       setSaveError(schemaErrs.join(" "));
       return;
+    }
+
+    const driver =
+      editFlat.driver ??
+      String((persisted.config as Record<string, unknown>).driver ?? "");
+    if (isSaasVariantDriver(driver)) {
+      const variantErrs = validateVariantRows(
+        variantsToRows(persisted.variants, driver),
+        driver,
+      );
+      if (variantErrs.length > 0) {
+        setSaveError(variantErrs.join(" "));
+        return;
+      }
     }
 
     setSaving(true);
@@ -1227,6 +1247,12 @@ function EngineEditForm({
         )}
       </div>
 
+      <VariantsSection
+        persisted={persisted}
+        baseClusterName={editClusterName}
+        onPatchFlat={onPatchFlat}
+      />
+
       {saveError && (
         <p className="mt-2 text-xs text-red-500 flex items-center gap-1">
           <AlertCircle size={11} /> {saveError}
@@ -1251,6 +1277,132 @@ function EngineEditForm({
           {saving ? <Loader2 size={12} className="animate-spin" /> : null}
           {saving ? "Saving…" : "Save changes"}
         </button>
+      </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Variants & custom queries section (shown on ADBC clusters)
+// ---------------------------------------------------------------------------
+
+function VariantsSection({
+  persisted,
+  baseClusterName,
+  onPatchFlat: _onPatchFlat,
+}: {
+  persisted: ClusterConfigRecord;
+  baseClusterName: string;
+  onPatchFlat: (patch: Record<string, string>) => void;
+}) {
+  const isAdbc = persisted.engineKey === "adbc";
+  const driver = ((persisted.config as Record<string, unknown>).driver as string) ?? "";
+  const saasDriver = isSaasVariantDriver(driver);
+
+  const [variantRows, setVariantRows] = useState(() =>
+    saasDriver ? variantsToRows(persisted.variants, driver) : [],
+  );
+  const [variantsJson, setVariantsJson] = useState(() =>
+    !saasDriver && persisted.variants && (persisted.variants as unknown[]).length > 0
+      ? JSON.stringify(persisted.variants, null, 2)
+      : "",
+  );
+  const [healthCheckQuery, setHealthCheckQuery] = useState(
+    () => ((persisted.config as Record<string, unknown>).healthCheckQuery as string) ?? "",
+  );
+  const [reconcileQuery, setReconcileQuery] = useState(
+    () => ((persisted.config as Record<string, unknown>).reconcileQuery as string) ?? "",
+  );
+  const [variantsError, setVariantsError] = useState<string | null>(null);
+  const [variantFieldErrors, setVariantFieldErrors] = useState<string[]>([]);
+
+  function syncSaasVariants(rows: typeof variantRows) {
+    setVariantRows(rows);
+    const errors = validateVariantRows(rows, driver);
+    setVariantFieldErrors(errors);
+    persisted.variants = rowsToVariants(rows, driver);
+  }
+
+  useEffect(() => {
+    if (saasDriver) return;
+    if (variantsJson.trim()) {
+      try {
+        const parsed = JSON.parse(variantsJson);
+        if (!Array.isArray(parsed)) {
+          setVariantsError("Variants must be a JSON array");
+          return;
+        }
+        persisted.variants = parsed;
+        setVariantsError(null);
+      } catch {
+        setVariantsError("Invalid JSON");
+      }
+    } else {
+      persisted.variants = [];
+      setVariantsError(null);
+    }
+  }, [variantsJson, persisted, saasDriver]);
+
+  useEffect(() => {
+    const cfg = persisted.config as Record<string, unknown>;
+    if (healthCheckQuery.trim()) cfg.healthCheckQuery = healthCheckQuery.trim();
+    else delete cfg.healthCheckQuery;
+  }, [healthCheckQuery, persisted.config]);
+
+  useEffect(() => {
+    const cfg = persisted.config as Record<string, unknown>;
+    if (reconcileQuery.trim()) cfg.reconcileQuery = reconcileQuery.trim();
+    else delete cfg.reconcileQuery;
+  }, [reconcileQuery, persisted.config]);
+
+  if (!isAdbc) return null;
+
+  return (
+    <div className="mt-4 space-y-3">
+      <p className="text-[10px] font-semibold text-slate-400 uppercase tracking-widest">
+        {saasDriver ? "Warehouses & health" : "Variants & health"}
+      </p>
+
+      <div className="bg-slate-50 rounded-xl border border-slate-100 divide-y divide-slate-100">
+        <div className="flex flex-col px-4 py-3 gap-1.5">
+          {saasDriver ? (
+            <AdbcSaasVariantsEditor
+              driver={driver}
+              baseClusterName={baseClusterName.trim() || persisted.name}
+              rows={variantRows}
+              onChange={syncSaasVariants}
+              errors={variantFieldErrors}
+            />
+          ) : (
+            <>
+              <label className="text-[11px] text-slate-600 font-medium">
+                Variants (JSON)
+              </label>
+              <textarea
+                value={variantsJson}
+                onChange={(e) => setVariantsJson(e.target.value)}
+                placeholder={`[\n  { "name": "analytics", "overrides": { "warehouse": "ANALYTICS_WH" } }\n]`}
+                rows={4}
+                className="w-full text-xs font-mono bg-white border border-slate-200 rounded-lg px-2.5 py-1.5 focus:outline-none focus:ring-2 focus:ring-indigo-300 focus:border-indigo-400 resize-y"
+              />
+              {variantsError && (
+                <p className="text-[10px] text-red-500">{variantsError}</p>
+              )}
+              <p className="text-[10px] text-slate-400">
+                Each variant expands into a separate cluster named{" "}
+                <code className="font-mono">base::variant</code>.
+              </p>
+            </>
+          )}
+        </div>
+
+        <AdbcHealthReconcileFields
+          driver={driver}
+          healthCheckQuery={healthCheckQuery}
+          reconcileQuery={reconcileQuery}
+          onHealthCheckQueryChange={setHealthCheckQuery}
+          onReconcileQueryChange={setReconcileQuery}
+        />
       </div>
     </div>
   );

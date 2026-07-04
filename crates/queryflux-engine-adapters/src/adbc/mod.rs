@@ -23,6 +23,17 @@ use queryflux_core::engine_registry::{
     AuthType, ConfigField, ConnectionType, EngineDescriptor, FieldType,
 };
 
+mod bigquery;
+mod databricks;
+mod introspection;
+mod redshift;
+mod snowflake;
+mod sql_helpers;
+#[cfg(test)]
+mod test_fixtures;
+
+use introspection::AdbcIntrospection;
+
 const DEFAULT_POOL_SIZE: u32 = 4;
 
 const SUPPORTED_DRIVERS: &[&str] = &[
@@ -62,6 +73,32 @@ fn driver_to_engine_type(driver: &str) -> EngineType {
         "singlestore" => EngineType::SingleStore,
         _ => EngineType::Adbc,
     }
+}
+
+fn build_introspection(
+    driver: &str,
+    cluster_name: &ClusterName,
+    uri: &str,
+    db_kwargs: &[(String, String)],
+    pool: AdbcPool,
+) -> Option<Box<dyn AdbcIntrospection>> {
+    if driver == "databricks" {
+        return databricks::try_from_adbc_config(cluster_name, uri, db_kwargs)
+            .map(|i| Box::new(i) as Box<dyn AdbcIntrospection>);
+    }
+    if driver == "snowflake" {
+        return snowflake::try_from_adbc_config(cluster_name, uri, db_kwargs, pool)
+            .map(|i| Box::new(i) as Box<dyn AdbcIntrospection>);
+    }
+    if driver == "bigquery" {
+        return bigquery::try_from_adbc_config(cluster_name, uri, db_kwargs, pool)
+            .map(|i| Box::new(i) as Box<dyn AdbcIntrospection>);
+    }
+    if driver == "redshift" {
+        return redshift::try_from_adbc_config(cluster_name, uri, db_kwargs, pool)
+            .map(|i| Box::new(i) as Box<dyn AdbcIntrospection>);
+    }
+    None
 }
 
 /// First numeric cell of the first row (for `COUNT(*)`-style reconcile queries).
@@ -266,7 +303,7 @@ impl crate::EngineConfigParseable for AdbcConfig {
     }
 }
 
-type AdbcPool = r2d2::Pool<AdbcConnectionManager<ManagedDatabase>>;
+pub(crate) type AdbcPool = r2d2::Pool<AdbcConnectionManager<ManagedDatabase>>;
 
 /// ADBC adapter — wraps any ADBC-compatible shared library driver.
 ///
@@ -279,6 +316,9 @@ pub struct AdbcAdapter {
     pool: AdbcPool,
     engine_type: EngineType,
     translation_dialect: queryflux_core::query::SqlDialect,
+    /// Optional driver-specific introspection (Databricks REST, SaaS reconcile SQL).
+    /// When present, default `health_check` / `fetch_running_query_count` delegate here.
+    introspection: Option<Box<dyn AdbcIntrospection>>,
 }
 
 impl AdbcAdapter {
@@ -289,9 +329,12 @@ impl AdbcAdapter {
     ) -> Result<Self> {
         let engine_type = config.engine_type();
         let translation_dialect = config.flight_sql_translation_dialect();
+        let db_kwargs = config.db_kwargs;
+        let driver_name = config.driver;
+        let uri = config.uri;
 
         let mut driver = ManagedDriver::load_from_name(
-            &config.driver,
+            &driver_name,
             None,
             AdbcVersion::V110,
             LOAD_FLAG_DEFAULT,
@@ -300,12 +343,12 @@ impl AdbcAdapter {
         .map_err(|e| {
             QueryFluxError::Engine(format!(
                 "cluster '{}': failed to load ADBC driver '{}': {e}",
-                cluster_name.0, config.driver
+                cluster_name.0, driver_name
             ))
         })?;
 
         let mut opts: Vec<(OptionDatabase, adbc_core::options::OptionValue)> =
-            vec![(OptionDatabase::Uri, config.uri.into())];
+            vec![(OptionDatabase::Uri, uri.clone().into())];
 
         if let Some(username) = config.username {
             opts.push((OptionDatabase::Username, username.into()));
@@ -313,8 +356,8 @@ impl AdbcAdapter {
         if let Some(password) = config.password {
             opts.push((OptionDatabase::Password, password.into()));
         }
-        for (k, v) in config.db_kwargs {
-            opts.push((OptionDatabase::Other(k), v.into()));
+        for (k, v) in &db_kwargs {
+            opts.push((OptionDatabase::Other(k.clone()), v.clone().into()));
         }
 
         let database = driver.new_database_with_opts(opts).map_err(|e| {
@@ -323,8 +366,6 @@ impl AdbcAdapter {
                 cluster_name.0
             ))
         })?;
-        // driver dropped here — ManagedDatabase holds Arc ref to driver internals,
-        // so the shared library remains loaded.
 
         let manager = AdbcConnectionManager::new(database);
         let pool = r2d2::Pool::builder()
@@ -337,12 +378,16 @@ impl AdbcAdapter {
                 ))
             })?;
 
+        let introspection =
+            build_introspection(&driver_name, &cluster_name, &uri, &db_kwargs, pool.clone());
+
         Ok(Self {
             cluster_name,
             group_name,
             pool,
             engine_type,
             translation_dialect,
+            introspection,
         })
     }
 
@@ -470,7 +515,7 @@ fn params_to_record_batch(params: &queryflux_core::params::QueryParams) -> Resul
         .map_err(|e| QueryFluxError::Engine(format!("ADBC: failed to build param batch: {e}")))
 }
 
-fn collect_batches(
+pub(crate) fn collect_batches(
     reader: impl Iterator<Item = std::result::Result<RecordBatch, arrow::error::ArrowError>>,
 ) -> std::result::Result<Vec<RecordBatch>, QueryFluxError> {
     reader
@@ -618,11 +663,19 @@ impl SyncAdapter for AdbcAdapter {
                 .await
                 .ok()?
             }
-            _ => None,
+            _ => {
+                if let Some(ref intro) = self.introspection {
+                    return intro.fetch_running_query_count().await;
+                }
+                None
+            }
         }
     }
 
     async fn health_check(&self) -> bool {
+        if let Some(ref intro) = self.introspection {
+            return intro.health_check().await;
+        }
         let pool = self.pool.clone();
         tokio::task::spawn_blocking(move || {
             let mut conn = pool.get().ok()?;
@@ -635,6 +688,40 @@ impl SyncAdapter for AdbcAdapter {
         .ok()
         .flatten()
         .is_some()
+    }
+
+    async fn execute_custom_health_check(&self, sql: &str) -> bool {
+        let pool = self.pool.clone();
+        let sql = sql.to_string();
+        tokio::task::spawn_blocking(move || {
+            let mut conn = pool.get().ok()?;
+            let mut stmt = conn.new_statement().ok()?;
+            stmt.set_sql_query(&sql).ok()?;
+            stmt.execute().ok()?;
+            Some(())
+        })
+        .await
+        .ok()
+        .flatten()
+        .is_some()
+    }
+
+    async fn execute_custom_reconcile_query(&self, sql: &str) -> Option<u64> {
+        let pool = self.pool.clone();
+        let sql = sql.to_string();
+        tokio::task::spawn_blocking(move || {
+            let mut conn = pool.get().ok()?;
+            let mut stmt = conn.new_statement().ok()?;
+            stmt.set_sql_query(&sql).ok()?;
+            let reader = stmt.execute().ok()?;
+            let batches = collect_batches(reader).ok()?;
+            batches.iter().find_map(|batch| {
+                sql_helpers::cell_u64(batch, "running", 0)
+                    .or_else(|| batch_first_cell_as_u64(batch))
+            })
+        })
+        .await
+        .ok()?
     }
 
     async fn list_catalogs(&self) -> Result<Vec<String>> {
@@ -1179,5 +1266,39 @@ mod tests {
         ];
         let batch = params_to_record_batch(&params).expect("build");
         assert_eq!(batch.num_rows(), 1);
+    }
+
+    #[test]
+    fn batch_first_cell_as_u64_parses_numeric_types() {
+        use std::sync::Arc;
+
+        use arrow::array::Int64Array;
+        use arrow::datatypes::{DataType, Field, Schema};
+        use arrow::record_batch::RecordBatch;
+
+        use super::batch_first_cell_as_u64;
+        use crate::adbc::test_fixtures::count_batch;
+
+        assert_eq!(batch_first_cell_as_u64(&count_batch(9)), Some(9));
+
+        let schema = Arc::new(Schema::new(vec![Field::new("n", DataType::Int64, false)]));
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![4_i64]))]).unwrap();
+        assert_eq!(batch_first_cell_as_u64(&batch), Some(4));
+    }
+
+    #[test]
+    fn batch_first_cell_as_u64_empty_batch_returns_none() {
+        use std::sync::Arc;
+
+        use arrow::datatypes::Schema;
+        use arrow::record_batch::RecordBatch;
+
+        use super::batch_first_cell_as_u64;
+
+        assert_eq!(
+            batch_first_cell_as_u64(&RecordBatch::new_empty(Arc::new(Schema::empty()))),
+            None
+        );
     }
 }

@@ -22,7 +22,7 @@ QueryFlux exposes a `/metrics` endpoint (default port 9000) in standard Promethe
 | `queryflux_queries_total` | Counter | `engine_type`, `cluster_group`, `status`, `protocol` | Total queries by outcome and engine |
 | `queryflux_query_duration_seconds` | Histogram | `engine_type`, `cluster_group` | End-to-end query duration from proxy receipt to result delivery |
 | `queryflux_translated_queries_total` | Counter | `src_dialect`, `tgt_dialect` | Queries where SQL dialect translation ran |
-| `queryflux_running_queries` | Gauge | `cluster_group`, `cluster_name` | Currently executing queries per cluster |
+| `queryflux_running_queries` | Gauge | `cluster_group`, `cluster_name` | Running queries per cluster. In distributed mode, reflects reconcile-published engine ground truth from Postgres (`cluster_capacity_counters.running`), not per-replica lease counts. |
 | `queryflux_queued_queries` | Gauge | `cluster_group` | Queries waiting for a free cluster slot |
 | `queryflux_query_tags_total` | Counter | `tag_key`, `tag_value`, `cluster_group` | Per-tag counter — tracks which workloads (teams, cost centers, etc.) drive load per group. See [Query tags](./query-tags#prometheus). |
 | `queryflux_cache_hits_total` | Counter | `cluster_group` | Query result cache hits |
@@ -30,6 +30,8 @@ QueryFlux exposes a `/metrics` endpoint (default port 9000) in standard Promethe
 | `queryflux_cache_writes_total` | Counter | `cluster_group` | Query results written to cache |
 
 The metrics pipeline uses `MultiMetricsStore` to fan out to Prometheus (real-time) and optionally Postgres (historical). `BufferedMetricsStore` wraps the Postgres store to avoid blocking query execution on I/O.
+
+In **distributed mode** (Postgres persistence, multiple replicas), cluster utilization gauges are sampled every 5 seconds from `CapacityStore::active_count` so every replica exposes the same backend running counts on `/metrics`. Admission still uses capacity leases separately — see **[Cluster variants, health checks & reconciliation](./cluster-variants-and-health#distributed-mode-and-capacitystore)**.
 
 ### Prometheus config
 
@@ -100,7 +102,7 @@ or remap Grafana in `docker-compose.yml` (`ports: ["3001:3000"]`).
 | Page | What it shows |
 |------|---------------|
 | Dashboard | Live query rate, error rate, avg latency, translation rate; cluster health grid; recent queries |
-| Clusters | All cluster groups and member clusters — health, running/queued counts, enable/disable, max concurrency |
+| Clusters | All cluster groups and member clusters — health, running/queued counts, enable/disable, max concurrency. In distributed mode, **running** reflects reconcile-published backend ground truth. |
 | Queries | Searchable, filterable query history — SQL, status, duration, engine, routing trace |
 | Engines | Engine registry — supported engines, connection types, config fields |
 
@@ -126,7 +128,7 @@ The admin API is served on port 9000 alongside `/metrics`. An OpenAPI spec is av
 | `GET` | `/admin/group-stats?hours=N` | Per-cluster-group aggregated stats |
 | `GET` | `/admin/engines` | Distinct engine types in query log |
 | `GET` | `/admin/engine-registry` | Full engine descriptor catalog |
-| `GET/PUT/DELETE` | `/admin/config/clusters/{name}` | Cluster config CRUD (Postgres required) |
+| `GET/PUT/DELETE` | `/admin/config/clusters/{name}` | Cluster config CRUD (Postgres required). Request/response include `variants`, and optional `config.healthCheckQuery` / `config.reconcileQuery`. |
 | `GET` | `/admin/config/clusters` | List all persisted cluster configs |
 | `GET/PUT/DELETE` | `/admin/config/groups/{name}` | Cluster group config CRUD (Postgres required) |
 | `GET` | `/admin/config/groups` | List all persisted group configs |

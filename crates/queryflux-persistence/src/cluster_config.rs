@@ -33,6 +33,10 @@ pub struct ClusterConfigRecord {
     /// All engine-specific connection details (endpoint, auth, TLS, region, …).
     #[schema(value_type = Object)]
     pub config: serde_json::Value,
+    /// Sub-resource variants that expand this config into multiple runtime clusters.
+    #[serde(default = "default_variants")]
+    #[schema(value_type = Object)]
+    pub variants: serde_json::Value,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -50,6 +54,10 @@ pub struct UpsertClusterConfig {
     /// Engine-specific connection details. Schema depends on `engineKey`.
     #[schema(value_type = Object)]
     pub config: serde_json::Value,
+    /// Sub-resource variants. Each variant expands into an independent runtime cluster.
+    #[serde(default = "default_variants")]
+    #[schema(value_type = Object)]
+    pub variants: serde_json::Value,
 }
 
 /// Request body for PATCH rename (`/admin/config/clusters/{name}`, `/admin/config/groups/{name}`).
@@ -218,11 +226,19 @@ impl UpsertClusterConfig {
             config.insert("queryAuth".into(), serde_json::to_value(qa)?);
         }
 
+        let variants = if cfg.variants.is_empty() {
+            serde_json::Value::Array(Vec::new())
+        } else {
+            serde_json::to_value(&cfg.variants)
+                .unwrap_or_else(|_| serde_json::Value::Array(Vec::new()))
+        };
+
         Ok(Some(Self {
             engine_key: engine_key.to_owned(),
             enabled: cfg.enabled,
             max_running_queries: cfg.max_running_queries.map(|v| v as i64),
             config: serde_json::Value::Object(config),
+            variants,
         }))
     }
 }
@@ -310,6 +326,10 @@ impl ClusterGroupConfigRecord {
 
 fn default_true() -> bool {
     true
+}
+
+fn default_variants() -> serde_json::Value {
+    serde_json::Value::Array(Vec::new())
 }
 
 fn default_tags_value() -> serde_json::Value {

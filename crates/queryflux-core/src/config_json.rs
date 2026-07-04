@@ -146,6 +146,9 @@ pub fn cluster_config_from_persisted_json(
         tls: None,
         auth,
         query_auth,
+        variants: Vec::new(),
+        health_check_query: json_str(config, "healthCheckQuery"),
+        reconcile_query: json_str(config, "reconcileQuery"),
     }
 }
 

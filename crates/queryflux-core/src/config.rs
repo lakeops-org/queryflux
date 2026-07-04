@@ -896,6 +896,331 @@ pub struct ClusterConfig {
     /// Default when omitted: `serviceAccount` (use Type 1 for all queries).
     #[serde(default)]
     pub query_auth: Option<QueryAuthConfig>,
+    /// Sub-resource variants that expand this config into multiple runtime clusters.
+    /// Each variant produces an independent cluster named `{base}::{variant.name}`.
+    #[serde(default)]
+    pub variants: Vec<ClusterVariant>,
+    /// Custom SQL query for health checks. When set, replaces built-in introspection.
+    /// When absent, driver-specific defaults apply (e.g. Snowflake `SHOW WAREHOUSES`).
+    /// Supports `{{sub_resource}}` placeholder for variant clusters.
+    #[serde(default)]
+    pub health_check_query: Option<String>,
+    /// Custom SQL query for running-query reconciliation. Must return a single integer
+    /// (or a result set with a `running` column for Snowflake `SHOW WAREHOUSES`).
+    /// When absent, driver-specific defaults apply. Databricks uses REST (no SQL default).
+    /// Supports `{{sub_resource}}` placeholder for variant clusters.
+    #[serde(default)]
+    pub reconcile_query: Option<String>,
+}
+
+/// A variant that overrides specific fields of a base cluster config,
+/// expanding into an independent runtime cluster named `{base}::{name}`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClusterVariant {
+    pub name: String,
+    #[serde(default)]
+    pub overrides: serde_json::Value,
+    #[serde(default)]
+    pub max_running_queries: Option<u64>,
+}
+
+/// Result of expanding a single variant from a base cluster config.
+#[derive(Debug, Clone)]
+pub struct ExpandedCluster {
+    pub expanded_name: String,
+    pub merged_config: serde_json::Value,
+    pub max_running_queries: Option<u64>,
+    pub health_check_query: Option<String>,
+    pub reconcile_query: Option<String>,
+}
+
+/// Maps user-friendly variant override keys to ADBC driver-specific `dbKwargs` keys.
+pub fn variant_field_to_db_kwarg(driver: &str, key: &str) -> Option<&'static str> {
+    match (driver, key) {
+        ("snowflake", "warehouse") => Some("adbc.snowflake.sql.warehouse"),
+        ("snowflake", "role") => Some("adbc.snowflake.sql.role"),
+        ("snowflake", "database") => Some("adbc.snowflake.sql.db"),
+        ("snowflake", "schema") => Some("adbc.snowflake.sql.schema"),
+        ("databricks", "httpPath") => Some("http_path"),
+        ("bigquery", "project") => Some("project_id"),
+        _ => None,
+    }
+}
+
+/// Resolves the sub-resource name from variant overrides for `{{sub_resource}}` substitution.
+fn resolve_sub_resource(driver: &str, overrides: &serde_json::Value) -> Option<String> {
+    let primary_keys: &[&str] = match driver {
+        "snowflake" => &["warehouse"],
+        "databricks" => &["httpPath"],
+        "bigquery" => &["project"],
+        _ => &[],
+    };
+    for key in primary_keys {
+        if let Some(val) = overrides.get(key).and_then(|v| v.as_str()) {
+            return Some(val.to_string());
+        }
+    }
+    None
+}
+
+fn escape_sql_literal(s: &str) -> String {
+    s.replace('\'', "''")
+}
+
+fn json_db_kwarg(config: &serde_json::Value, key: &str) -> Option<String> {
+    config
+        .get("dbKwargs")
+        .and_then(|v| v.get(key))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+}
+
+/// Resolve the primary sub-resource (warehouse, project, httpPath) from a merged ADBC config.
+pub fn resolve_adbc_sub_resource(driver: &str, config: &serde_json::Value) -> Option<String> {
+    match driver {
+        "snowflake" => config
+            .get("warehouse")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .or_else(|| json_db_kwarg(config, "adbc.snowflake.sql.warehouse"))
+            .or_else(|| json_db_kwarg(config, "warehouse")),
+        "bigquery" => json_db_kwarg(config, "project_id").or_else(|| {
+            config
+                .get("project")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+        }),
+        "databricks" => json_db_kwarg(config, "http_path").or_else(|| {
+            config
+                .get("httpPath")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+        }),
+        _ => None,
+    }
+}
+
+fn build_bigquery_reconcile_sql(project_id: &str, region: Option<&str>) -> String {
+    if let Some(region) = region {
+        format!(
+            "SELECT COUNT(*) FROM `{region}`.INFORMATION_SCHEMA.JOBS_BY_PROJECT \
+             WHERE state = 'RUNNING' AND project_id = '{}'",
+            escape_sql_literal(project_id)
+        )
+    } else {
+        format!(
+            "SELECT COUNT(*) FROM `{project}`.INFORMATION_SCHEMA.JOBS_BY_PROJECT \
+             WHERE state = 'RUNNING'",
+            project = project_id
+        )
+    }
+}
+
+/// Built-in reconcile SQL when the operator does not set `reconcileQuery`.
+/// Returns `None` for engines that use non-SQL introspection (e.g. Databricks REST).
+pub fn default_reconcile_query(engine_key: &str, config: &serde_json::Value) -> Option<String> {
+    match engine_key {
+        "trino" => {
+            Some("SELECT count(*) - 1 FROM system.runtime.queries WHERE state = 'RUNNING'".into())
+        }
+        "starRocks" => Some(
+            "SELECT COUNT(*) FROM information_schema.processlist WHERE COMMAND = 'Query'".into(),
+        ),
+        "adbc" => {
+            let driver = config.get("driver")?.as_str()?;
+            match driver {
+                "snowflake" => {
+                    let wh = resolve_adbc_sub_resource(driver, config)?;
+                    Some(format!(
+                        "SHOW WAREHOUSES LIKE '{}'",
+                        escape_sql_literal(&wh)
+                    ))
+                }
+                "bigquery" => {
+                    let project = resolve_adbc_sub_resource(driver, config)?;
+                    let region = json_db_kwarg(config, "location")
+                        .or_else(|| json_db_kwarg(config, "region"));
+                    Some(build_bigquery_reconcile_sql(&project, region.as_deref()))
+                }
+                "redshift" => {
+                    Some("SELECT COUNT(*) FROM stv_recents WHERE status = 'Running'".into())
+                }
+                "trino" => Some(
+                    "SELECT count(*) - 1 FROM system.runtime.queries WHERE state = 'RUNNING'"
+                        .into(),
+                ),
+                "flightsql" => Some(
+                    "SELECT COUNT(*) FROM information_schema.processlist WHERE COMMAND = 'Query'"
+                        .into(),
+                ),
+                "clickhouse" => Some("SELECT count() FROM system.processes".into()),
+                // Databricks uses REST introspection — no SQL default.
+                "databricks" => None,
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Built-in health-check SQL when the operator does not set `healthCheckQuery`.
+pub fn default_health_check_query(engine_key: &str, config: &serde_json::Value) -> Option<String> {
+    if engine_key != "adbc" {
+        return None;
+    }
+    let driver = config.get("driver")?.as_str()?;
+    match driver {
+        "snowflake" => {
+            let wh = resolve_adbc_sub_resource(driver, config)?;
+            Some(format!(
+                "SHOW WAREHOUSES LIKE '{}'",
+                escape_sql_literal(&wh)
+            ))
+        }
+        _ => None,
+    }
+}
+
+/// Fill unset probe queries on a cluster config from engine/driver defaults.
+pub fn apply_default_probe_queries(
+    cfg: &mut ClusterConfig,
+    engine_key: &str,
+    config: &serde_json::Value,
+) {
+    if cfg
+        .health_check_query
+        .as_ref()
+        .map(|s| s.trim().is_empty())
+        .unwrap_or(true)
+    {
+        cfg.health_check_query = default_health_check_query(engine_key, config);
+    }
+    if cfg
+        .reconcile_query
+        .as_ref()
+        .map(|s| s.trim().is_empty())
+        .unwrap_or(true)
+    {
+        cfg.reconcile_query = default_reconcile_query(engine_key, config);
+    }
+}
+
+fn substitute_sub_resource(query: &str, sub_resource: Option<&str>) -> String {
+    match sub_resource {
+        Some(sr) => query.replace("{{sub_resource}}", sr),
+        None => query.to_string(),
+    }
+}
+
+fn effective_probe_query(
+    user: Option<&str>,
+    default: Option<String>,
+    sub_resource: Option<&str>,
+) -> Option<String> {
+    if let Some(q) = user.filter(|s| !s.trim().is_empty()) {
+        return Some(substitute_sub_resource(q, sub_resource));
+    }
+    default
+}
+
+/// Deep-merge `patch` into `base`. Object values are recursively merged;
+/// all other types in `patch` overwrite the corresponding key in `base`.
+fn deep_merge(base: &mut serde_json::Value, patch: &serde_json::Value) {
+    if let (Some(base_obj), Some(patch_obj)) = (base.as_object_mut(), patch.as_object()) {
+        for (k, v) in patch_obj {
+            if v.is_object() {
+                let entry = base_obj
+                    .entry(k.clone())
+                    .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+                deep_merge(entry, v);
+            } else {
+                base_obj.insert(k.clone(), v.clone());
+            }
+        }
+    } else {
+        *base = patch.clone();
+    }
+}
+
+/// Validates and expands cluster variants into independent runtime clusters.
+///
+/// For ADBC clusters, user-friendly override keys (e.g., `warehouse`) are
+/// additionally injected into `dbKwargs` using driver-specific mappings.
+pub fn expand_cluster_variants(
+    base_name: &str,
+    base_config: &serde_json::Value,
+    engine_key: &str,
+    variants: &[ClusterVariant],
+    health_check_query: Option<&str>,
+    reconcile_query: Option<&str>,
+) -> Result<Vec<ExpandedCluster>, String> {
+    let mut seen_names = std::collections::HashSet::new();
+    let mut result = Vec::with_capacity(variants.len());
+
+    let driver = base_config
+        .get("driver")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let is_adbc = engine_key == "adbc";
+
+    for variant in variants {
+        if variant.name.is_empty() {
+            return Err(format!(
+                "cluster '{base_name}': variant name cannot be empty"
+            ));
+        }
+        if variant.name.contains("::") {
+            return Err(format!(
+                "cluster '{base_name}': variant name '{}' must not contain '::'",
+                variant.name
+            ));
+        }
+        if !seen_names.insert(&variant.name) {
+            return Err(format!(
+                "cluster '{base_name}': duplicate variant name '{}'",
+                variant.name
+            ));
+        }
+
+        let expanded_name = format!("{base_name}::{}", variant.name);
+
+        let mut merged = base_config.clone();
+        if variant.overrides.is_object() {
+            deep_merge(&mut merged, &variant.overrides);
+
+            if is_adbc {
+                let db_kwargs = merged
+                    .as_object_mut()
+                    .unwrap()
+                    .entry("dbKwargs")
+                    .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+                if let Some(kwargs_obj) = db_kwargs.as_object_mut() {
+                    for (key, val) in variant.overrides.as_object().unwrap() {
+                        if let Some(db_key) = variant_field_to_db_kwarg(driver, key) {
+                            kwargs_obj.insert(db_key.to_string(), val.clone());
+                        }
+                    }
+                }
+            }
+        }
+
+        let sub_resource = resolve_sub_resource(driver, &variant.overrides);
+        let default_hcq = default_health_check_query(engine_key, &merged);
+        let default_rq = default_reconcile_query(engine_key, &merged);
+        let hcq = effective_probe_query(health_check_query, default_hcq, sub_resource.as_deref());
+        let rq = effective_probe_query(reconcile_query, default_rq, sub_resource.as_deref());
+
+        result.push(ExpandedCluster {
+            expanded_name,
+            merged_config: merged,
+            max_running_queries: variant.max_running_queries,
+            health_check_query: hcq,
+            reconcile_query: rq,
+        });
+    }
+
+    Ok(result)
 }
 
 /// Authentication credentials for a backend cluster (Type 1 — service account).
@@ -1632,5 +1957,350 @@ queryflux:
         let yaml = "queryflux:\n  distributed: false\n";
         let cfg: ProxyConfig = serde_yaml::from_str(yaml).unwrap();
         assert!(!cfg.queryflux.resolve_distributed(true).unwrap());
+    }
+
+    // -----------------------------------------------------------------------
+    // Cluster variant expansion
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn expand_variants_basic_snowflake() {
+        let base = serde_json::json!({
+            "driver": "snowflake",
+            "uri": "svc@myaccount/mydb",
+            "dbKwargs": {}
+        });
+        let variants = vec![
+            super::ClusterVariant {
+                name: "analytics".into(),
+                overrides: serde_json::json!({"warehouse": "ANALYTICS_WH"}),
+                max_running_queries: None,
+            },
+            super::ClusterVariant {
+                name: "etl".into(),
+                overrides: serde_json::json!({"warehouse": "ETL_WH"}),
+                max_running_queries: Some(5),
+            },
+        ];
+        let result = super::expand_cluster_variants("sf", &base, "adbc", &variants, None, None)
+            .expect("expansion should succeed");
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].expanded_name, "sf::analytics");
+        assert_eq!(result[1].expanded_name, "sf::etl");
+        assert_eq!(result[1].max_running_queries, Some(5));
+        // Verify dbKwargs injection.
+        let db_kwargs = result[0].merged_config["dbKwargs"].as_object().unwrap();
+        assert_eq!(
+            db_kwargs["adbc.snowflake.sql.warehouse"].as_str(),
+            Some("ANALYTICS_WH")
+        );
+    }
+
+    #[test]
+    fn expand_variants_databricks_http_path() {
+        let base = serde_json::json!({
+            "driver": "databricks",
+            "uri": "https://adb-123.net",
+            "dbKwargs": {"token": "abc"}
+        });
+        let variants = vec![super::ClusterVariant {
+            name: "wh1".into(),
+            overrides: serde_json::json!({"httpPath": "/sql/1.0/warehouses/xyz"}),
+            max_running_queries: None,
+        }];
+        let result =
+            super::expand_cluster_variants("db", &base, "adbc", &variants, None, None).unwrap();
+        assert_eq!(result[0].expanded_name, "db::wh1");
+        let kwargs = result[0].merged_config["dbKwargs"].as_object().unwrap();
+        assert_eq!(
+            kwargs["http_path"].as_str(),
+            Some("/sql/1.0/warehouses/xyz")
+        );
+    }
+
+    #[test]
+    fn expand_variants_deep_merge() {
+        let base = serde_json::json!({
+            "driver": "snowflake",
+            "dbKwargs": {"a": "1", "b": "2"},
+            "nested": {"x": 1, "y": 2}
+        });
+        let variants = vec![super::ClusterVariant {
+            name: "v1".into(),
+            overrides: serde_json::json!({
+                "dbKwargs": {"b": "replaced", "c": "new"},
+                "nested": {"y": 99, "z": 3}
+            }),
+            max_running_queries: None,
+        }];
+        let result =
+            super::expand_cluster_variants("base", &base, "adbc", &variants, None, None).unwrap();
+        let cfg = &result[0].merged_config;
+        let kwargs = cfg["dbKwargs"].as_object().unwrap();
+        assert_eq!(kwargs["a"].as_str(), Some("1")); // preserved
+        assert_eq!(kwargs["b"].as_str(), Some("replaced")); // overridden
+        assert_eq!(kwargs["c"].as_str(), Some("new")); // added
+        let nested = cfg["nested"].as_object().unwrap();
+        assert_eq!(nested["x"].as_i64(), Some(1)); // preserved
+        assert_eq!(nested["y"].as_i64(), Some(99)); // overridden
+        assert_eq!(nested["z"].as_i64(), Some(3)); // added
+    }
+
+    #[test]
+    fn expand_variants_rejects_empty_name() {
+        let base = serde_json::json!({"driver": "snowflake"});
+        let variants = vec![super::ClusterVariant {
+            name: "".into(),
+            overrides: serde_json::Value::Null,
+            max_running_queries: None,
+        }];
+        let err = super::expand_cluster_variants("c", &base, "adbc", &variants, None, None)
+            .expect_err("should fail");
+        assert!(err.contains("cannot be empty"));
+    }
+
+    #[test]
+    fn expand_variants_rejects_double_colon_in_name() {
+        let base = serde_json::json!({"driver": "snowflake"});
+        let variants = vec![super::ClusterVariant {
+            name: "a::b".into(),
+            overrides: serde_json::Value::Null,
+            max_running_queries: None,
+        }];
+        let err = super::expand_cluster_variants("c", &base, "adbc", &variants, None, None)
+            .expect_err("should fail");
+        assert!(err.contains("must not contain '::'"));
+    }
+
+    #[test]
+    fn expand_variants_rejects_duplicates() {
+        let base = serde_json::json!({"driver": "snowflake"});
+        let variants = vec![
+            super::ClusterVariant {
+                name: "dup".into(),
+                overrides: serde_json::Value::Null,
+                max_running_queries: None,
+            },
+            super::ClusterVariant {
+                name: "dup".into(),
+                overrides: serde_json::Value::Null,
+                max_running_queries: None,
+            },
+        ];
+        let err = super::expand_cluster_variants("c", &base, "adbc", &variants, None, None)
+            .expect_err("should fail");
+        assert!(err.contains("duplicate"));
+    }
+
+    #[test]
+    fn expand_variants_sub_resource_substitution() {
+        let base = serde_json::json!({
+            "driver": "snowflake",
+            "dbKwargs": {}
+        });
+        let variants = vec![super::ClusterVariant {
+            name: "wh1".into(),
+            overrides: serde_json::json!({"warehouse": "MY_WH"}),
+            max_running_queries: None,
+        }];
+        let hcq = "SHOW WAREHOUSES LIKE '{{sub_resource}}'";
+        let rq = "SELECT count FROM wh WHERE name = '{{sub_resource}}'";
+        let result =
+            super::expand_cluster_variants("c", &base, "adbc", &variants, Some(hcq), Some(rq))
+                .unwrap();
+        assert_eq!(
+            result[0].health_check_query.as_deref(),
+            Some("SHOW WAREHOUSES LIKE 'MY_WH'")
+        );
+        assert_eq!(
+            result[0].reconcile_query.as_deref(),
+            Some("SELECT count FROM wh WHERE name = 'MY_WH'")
+        );
+    }
+
+    #[test]
+    fn variant_field_to_db_kwarg_mappings() {
+        assert_eq!(
+            super::variant_field_to_db_kwarg("snowflake", "warehouse"),
+            Some("adbc.snowflake.sql.warehouse")
+        );
+        assert_eq!(
+            super::variant_field_to_db_kwarg("snowflake", "role"),
+            Some("adbc.snowflake.sql.role")
+        );
+        assert_eq!(
+            super::variant_field_to_db_kwarg("databricks", "httpPath"),
+            Some("http_path")
+        );
+        assert_eq!(
+            super::variant_field_to_db_kwarg("bigquery", "project"),
+            Some("project_id")
+        );
+        assert_eq!(super::variant_field_to_db_kwarg("unknown", "foo"), None);
+    }
+
+    #[test]
+    fn cluster_variant_serde_roundtrip() {
+        let v = super::ClusterVariant {
+            name: "analytics".into(),
+            overrides: serde_json::json!({"warehouse": "WH1"}),
+            max_running_queries: Some(10),
+        };
+        let json = serde_json::to_string(&v).unwrap();
+        let v2: super::ClusterVariant = serde_json::from_str(&json).unwrap();
+        assert_eq!(v2.name, "analytics");
+        assert_eq!(v2.max_running_queries, Some(10));
+        assert_eq!(v2.overrides["warehouse"].as_str(), Some("WH1"));
+    }
+
+    #[test]
+    fn non_adbc_engine_no_dbkwargs_injection() {
+        let base = serde_json::json!({"endpoint": "http://localhost:8080"});
+        let variants = vec![super::ClusterVariant {
+            name: "v1".into(),
+            overrides: serde_json::json!({"workgroup": "primary"}),
+            max_running_queries: None,
+        }];
+        let result =
+            super::expand_cluster_variants("athena", &base, "athena", &variants, None, None)
+                .unwrap();
+        // Generic overrides are merged but dbKwargs injection is NOT applied.
+        assert_eq!(
+            result[0].merged_config["workgroup"].as_str(),
+            Some("primary")
+        );
+        assert!(result[0].merged_config.get("dbKwargs").is_none());
+    }
+
+    #[test]
+    fn expand_variants_null_health_and_reconcile_queries() {
+        let base = serde_json::json!({"driver": "snowflake", "uri": "acct/db"});
+        let variants = vec![super::ClusterVariant {
+            name: "wh1".into(),
+            overrides: serde_json::json!({"warehouse": "WH1"}),
+            max_running_queries: None,
+        }];
+        let result =
+            super::expand_cluster_variants("sf", &base, "adbc", &variants, None, None).unwrap();
+        assert_eq!(
+            result[0].health_check_query.as_deref(),
+            Some("SHOW WAREHOUSES LIKE 'WH1'")
+        );
+        assert_eq!(
+            result[0].reconcile_query.as_deref(),
+            Some("SHOW WAREHOUSES LIKE 'WH1'")
+        );
+    }
+
+    #[test]
+    fn default_reconcile_query_snowflake_and_bigquery() {
+        let sf = serde_json::json!({
+            "driver": "snowflake",
+            "warehouse": "ANALYTICS_WH"
+        });
+        assert_eq!(
+            super::default_reconcile_query("adbc", &sf).as_deref(),
+            Some("SHOW WAREHOUSES LIKE 'ANALYTICS_WH'")
+        );
+
+        let bq = serde_json::json!({
+            "driver": "bigquery",
+            "project": "my-proj",
+            "dbKwargs": { "location": "region-us" }
+        });
+        let sql = super::default_reconcile_query("adbc", &bq).unwrap();
+        assert!(sql.contains("`region-us`.INFORMATION_SCHEMA.JOBS_BY_PROJECT"));
+        assert!(sql.contains("project_id = 'my-proj'"));
+    }
+
+    #[test]
+    fn default_reconcile_query_databricks_is_none() {
+        let cfg =
+            serde_json::json!({ "driver": "databricks", "httpPath": "/sql/1.0/warehouses/x" });
+        assert!(super::default_reconcile_query("adbc", &cfg).is_none());
+    }
+
+    #[test]
+    fn apply_default_probe_queries_fills_reconcile_only_when_unset() {
+        let mut cfg = super::ClusterConfig {
+            engine: Some(super::EngineConfig::Adbc),
+            enabled: true,
+            max_running_queries: None,
+            pool_size: None,
+            endpoint: None,
+            database_path: None,
+            region: None,
+            s3_output_location: None,
+            workgroup: None,
+            catalog: None,
+            tls: None,
+            auth: None,
+            query_auth: None,
+            variants: vec![],
+            health_check_query: Some("CUSTOM HC".into()),
+            reconcile_query: None,
+        };
+        let json = serde_json::json!({
+            "driver": "redshift"
+        });
+        super::apply_default_probe_queries(&mut cfg, "adbc", &json);
+        assert_eq!(cfg.health_check_query.as_deref(), Some("CUSTOM HC"));
+        assert_eq!(
+            cfg.reconcile_query.as_deref(),
+            Some("SELECT COUNT(*) FROM stv_recents WHERE status = 'Running'")
+        );
+    }
+
+    #[test]
+    fn expand_variants_bigquery_project_substitution() {
+        let base = serde_json::json!({"driver": "bigquery"});
+        let variants = vec![
+            super::ClusterVariant {
+                name: "p1".into(),
+                overrides: serde_json::json!({"project": "proj-a"}),
+                max_running_queries: None,
+            },
+            super::ClusterVariant {
+                name: "p2".into(),
+                overrides: serde_json::json!({"project": "proj-b"}),
+                max_running_queries: Some(3),
+            },
+        ];
+        let hcq = "SELECT 1 -- {{sub_resource}}";
+        let result =
+            super::expand_cluster_variants("bq", &base, "adbc", &variants, Some(hcq), None)
+                .unwrap();
+        assert_eq!(result.len(), 2);
+        assert_eq!(
+            result[0].health_check_query.as_deref(),
+            Some("SELECT 1 -- proj-a")
+        );
+        assert_eq!(
+            result[1].health_check_query.as_deref(),
+            Some("SELECT 1 -- proj-b")
+        );
+        assert_eq!(result[1].max_running_queries, Some(3));
+        assert_eq!(
+            result[0].merged_config["dbKwargs"]["project_id"].as_str(),
+            Some("proj-a")
+        );
+    }
+
+    #[test]
+    fn expand_variants_without_sub_resource_leaves_placeholder() {
+        let base = serde_json::json!({"driver": "redshift"});
+        let variants = vec![super::ClusterVariant {
+            name: "main".into(),
+            overrides: serde_json::json!({}),
+            max_running_queries: None,
+        }];
+        let hcq = "SELECT 1 WHERE x = '{{sub_resource}}'";
+        let result =
+            super::expand_cluster_variants("rs", &base, "adbc", &variants, Some(hcq), Some(hcq))
+                .unwrap();
+        assert_eq!(
+            result[0].health_check_query.as_deref(),
+            Some("SELECT 1 WHERE x = '{{sub_resource}}'")
+        );
     }
 }
