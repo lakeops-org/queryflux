@@ -175,8 +175,8 @@ async fn main() -> Result<()> {
             let mem = Arc::new(InMemoryPersistence::new());
             mem_store = Some(mem.clone());
             (
-                mem as Arc<dyn queryflux_persistence::Persistence>,
-                prometheus.clone() as Arc<dyn MetricsStore>,
+                mem.clone() as Arc<dyn queryflux_persistence::Persistence>,
+                in_memory_metrics(prometheus.clone(), mem),
             )
         }
     };
@@ -2794,6 +2794,20 @@ fn build_guard_chains_from_db_value(
     (global, groups)
 }
 
+/// Metrics chain for in-memory persistence: Prometheus plus the in-memory store
+/// itself. The in-memory store must be part of the chain — the admin API serves
+/// `/admin/queries` and `/admin/stats` from it, so recording only to Prometheus
+/// leaves query history and the Studio dashboard permanently empty.
+fn in_memory_metrics(
+    prometheus: Arc<PrometheusMetrics>,
+    mem: Arc<InMemoryPersistence>,
+) -> Arc<dyn MetricsStore> {
+    Arc::new(MultiMetricsStore::new(vec![
+        prometheus as Arc<dyn MetricsStore>,
+        mem as Arc<dyn MetricsStore>,
+    ]))
+}
+
 #[cfg(test)]
 mod tests {
     use super::parse_security_setting;
@@ -2849,5 +2863,86 @@ mod tests {
         let (auth, authz) = parse_security_setting(&json!({ "something": "else" }));
         assert!(auth.is_none());
         assert!(authz.is_none());
+    }
+
+    mod in_memory_metrics {
+        use std::sync::Arc;
+
+        use queryflux_core::query::{
+            ClusterGroupName, ClusterName, EngineType, FrontendProtocol, QueryStatus, SqlDialect,
+        };
+        use queryflux_metrics::{prometheus_store::PrometheusMetrics, QueryRecord};
+        use queryflux_persistence::{
+            in_memory::InMemoryPersistence, query_history::QueryFilters, QueryHistoryStore,
+        };
+
+        fn sample_record() -> QueryRecord {
+            QueryRecord {
+                proxy_query_id: "q-1".into(),
+                backend_query_id: None,
+                cluster_group: ClusterGroupName("duckdb-local".to_string()),
+                cluster_name: ClusterName("duckdb-1".to_string()),
+                cluster_group_config_id: None,
+                cluster_config_id: None,
+                engine_type: EngineType::DuckDb,
+                frontend_protocol: FrontendProtocol::TrinoHttp,
+                source_dialect: SqlDialect::Trino,
+                target_dialect: SqlDialect::DuckDb,
+                was_translated: false,
+                translated_sql: None,
+                user: None,
+                catalog: None,
+                database: None,
+                sql_preview: "SELECT 1".into(),
+                status: QueryStatus::Success,
+                routing_trace: None,
+                queue_duration_ms: 0,
+                execution_duration_ms: 1,
+                rows_returned: Some(1),
+                error_message: None,
+                created_at: chrono::Utc::now(),
+                engine_stats: None,
+                query_tags: Default::default(),
+                query_hash: None,
+                query_parameterized_hash: None,
+                translated_query_hash: None,
+                digest_text: None,
+                translated_digest_text: None,
+                agent_id: None,
+                conversation_id: None,
+                step_index: None,
+                tool_call_id: None,
+                query_intent: None,
+                guard_actions: Vec::new(),
+                was_guard_blocked: false,
+                cache_hit: false,
+            }
+        }
+
+        /// Regression test: with in-memory persistence, queries recorded through
+        /// the metrics chain must land in the same store the admin API reads
+        /// (`/admin/queries`, `/admin/stats`). Wiring Prometheus alone leaves the
+        /// dashboard and query history permanently empty.
+        #[tokio::test]
+        async fn records_query_history_in_backing_store() {
+            let prometheus = Arc::new(PrometheusMetrics::new().expect("prometheus init"));
+            let mem = Arc::new(InMemoryPersistence::new());
+            let metrics = super::super::in_memory_metrics(prometheus, mem.clone());
+
+            metrics
+                .record_query(sample_record())
+                .await
+                .expect("record_query");
+
+            // `limit: 0` is the `Default` value and returns nothing; the HTTP
+            // layer fills it via serde's `default_limit` (50) instead.
+            let filters = QueryFilters {
+                limit: 50,
+                ..Default::default()
+            };
+            let rows = mem.list_queries(&filters).await.expect("list_queries");
+            assert_eq!(rows.len(), 1, "query must be visible to the admin API");
+            assert_eq!(rows[0].sql_preview, "SELECT 1");
+        }
     }
 }
