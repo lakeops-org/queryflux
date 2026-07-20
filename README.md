@@ -170,6 +170,28 @@ curl -X POST http://localhost:8080/v1/statement \
   -d "SELECT 42"
 ```
 
+### CLI Quickstart (No Docker)
+
+You can run QueryFlux natively with an embedded DuckDB engine without any containers:
+
+```bash
+# 1. Clone the repository
+git clone https://github.com/lakeops-org/queryflux.git
+cd queryflux
+
+# 2. Install the binary globally
+cargo install --path crates/queryflux
+
+# 3. Automatically create a .venv and install Python dependencies (e.g., sqlglot)
+queryflux --install-deps
+
+# 4. Validate the config and environment
+queryflux --config examples/cli-quickstart/config.yaml --validate
+
+# 5. Start the proxy
+queryflux --config examples/cli-quickstart/config.yaml
+```
+
 ### Kubernetes
 
 QueryFlux includes a provider-neutral Helm chart:
@@ -243,6 +265,7 @@ See `config.example.yaml` for the full reference including TLS, auth, query queu
 queryflux/
 ├── crates/
 │   ├── queryflux/                  # Main binary
+│   ├── queryflux-cli/              # CLI logic and environment setup
 │   ├── queryflux-core/             # Shared types and traits
 │   ├── queryflux-config/           # Config loading
 │   ├── queryflux-frontend/         # Protocol frontends (Trino HTTP, PG/MySQL wire, Snowflake HTTP, …)

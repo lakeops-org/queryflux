@@ -11,3 +11,7 @@ rustflags = ["-L", "native=/opt/homebrew/lib"]
 
 [target.x86_64-apple-darwin]
 rustflags = ["-L", "native=/usr/local/lib"]
+
+[env]
+# Safely fall back to downloading libduckdb if not installed on the host system
+DUCKDB_DOWNLOAD_LIB = { value = "1", force = false }

@@ -2,7 +2,6 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use clap::Parser;
 use queryflux_auth::{
     AllowAllAuthorization, BackendIdentityResolver, LdapAuthProvider, NoneAuthProvider,
     OidcAuthProvider, OpenFgaAuthorizationClient, SimpleAuthorizationPolicy, StaticAuthProvider,
@@ -53,20 +52,13 @@ use tracing::info;
 
 mod registered_engines;
 
-#[derive(Parser)]
-#[command(name = "queryflux", about = "Multi-engine SQL query proxy")]
-struct Cli {
-    #[arg(short, long, default_value = "config.yaml")]
-    config: String,
-}
-
 #[tokio::main]
 async fn main() -> Result<()> {
-    let cli = Cli::parse();
+    let config_path = queryflux_cli::run_cli().await;
 
     // Load config before initializing the tracing subscriber so that
     // `otlpEndpoint` from the config file can feed the OTel layer.
-    let mut config = YamlFileConfigProvider::new(&cli.config)
+    let mut config = YamlFileConfigProvider::new(&config_path)
         .load()
         .await
         .context("Failed to load config")?;
@@ -116,7 +108,7 @@ async fn main() -> Result<()> {
         }
     }
 
-    info!("QueryFlux starting — loaded config from: {}", cli.config);
+    info!("QueryFlux starting — loaded config from: {}", config_path);
 
     let external_address = config
         .queryflux
