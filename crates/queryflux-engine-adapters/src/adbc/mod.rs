@@ -6,11 +6,12 @@ use adbc_driver_manager::{ManagedDatabase, ManagedDriver};
 use arrow::array::Array;
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
+use polyglot_sql::{expressions::Expression, DialectType};
 use queryflux_core::{
     catalog::TableSchema,
     config::ClusterConfig,
     error::{QueryFluxError, Result},
-    query::{ClusterGroupName, ClusterName, EngineType},
+    query::{ClusterGroupName, ClusterName, EngineType, SqlDialect},
     session::SessionContext,
     tags::QueryTags,
 };
@@ -479,10 +480,34 @@ fn collect_batches(
 }
 
 /// Classify SQL as a read-like query (returns a result set) vs DDL/DML (returns an
-/// update count). Strips leading whitespace and SQL comments (`--` / `/* … */`),
-/// then checks whether the first keyword is SELECT / WITH / SHOW / DESCRIBE /
-/// EXPLAIN / DESC.
-fn is_read_like_sql(sql: &str) -> bool {
+/// update count). Uses `polyglot_sql` with the adapter's effective dialect when
+/// parsing succeeds, and falls back to a leading-keyword heuristic when parsing
+/// fails for dialect-specific SQL.
+fn is_read_like_sql(sql: &str, dialect: &SqlDialect) -> bool {
+    match polyglot_sql::parse(sql, to_polyglot_dialect(dialect)) {
+        Ok(stmts) => !stmts.is_empty() && stmts.iter().all(is_read_stmt),
+        Err(_) => is_read_like_sql_fallback(sql),
+    }
+}
+
+fn is_read_stmt(expr: &Expression) -> bool {
+    matches!(
+        expr,
+        Expression::Select(_)
+            | Expression::Union(_)
+            | Expression::Intersect(_)
+            | Expression::Except(_)
+            | Expression::Subquery(_)
+            | Expression::Describe(_)
+            | Expression::Show(_)
+            | Expression::Command(_)
+    )
+}
+
+/// Fallback classifier for statements `polyglot_sql` cannot parse. Strips leading
+/// whitespace and SQL comments (`--` / `/* … */`), then checks whether the first
+/// keyword is SELECT / WITH / SHOW / DESCRIBE / EXPLAIN / DESC.
+fn is_read_like_sql_fallback(sql: &str) -> bool {
     let trimmed = strip_leading_sql_comments(sql).to_uppercase();
     trimmed.starts_with("SELECT")
         || trimmed.starts_with("WITH")
@@ -515,6 +540,26 @@ fn strip_leading_sql_comments(mut s: &str) -> &str {
     }
 }
 
+fn to_polyglot_dialect(dialect: &SqlDialect) -> DialectType {
+    match dialect {
+        SqlDialect::Trino => DialectType::Trino,
+        SqlDialect::Athena => DialectType::Athena,
+        SqlDialect::DuckDb => DialectType::DuckDB,
+        SqlDialect::StarRocks => DialectType::StarRocks,
+        SqlDialect::ClickHouse => DialectType::ClickHouse,
+        SqlDialect::MySql => DialectType::MySQL,
+        SqlDialect::Postgres => DialectType::PostgreSQL,
+        SqlDialect::Sqlite => DialectType::SQLite,
+        SqlDialect::Snowflake => DialectType::Snowflake,
+        SqlDialect::BigQuery => DialectType::BigQuery,
+        SqlDialect::Databricks => DialectType::Databricks,
+        SqlDialect::MsSql => DialectType::TSQL,
+        SqlDialect::Redshift => DialectType::Redshift,
+        SqlDialect::Exasol => DialectType::Exasol,
+        SqlDialect::Generic | SqlDialect::Sqlglot(_) => DialectType::Generic,
+    }
+}
+
 #[async_trait]
 impl SyncAdapter for AdbcAdapter {
     fn supports_native_params(&self) -> bool {
@@ -531,7 +576,7 @@ impl SyncAdapter for AdbcAdapter {
     ) -> Result<SyncExecution> {
         let pool = self.pool.clone();
         let sql = sql.to_string();
-        let is_query = is_read_like_sql(&sql);
+        let is_query = is_read_like_sql(&sql, &self.translation_dialect);
         let param_batch = if params.is_empty() {
             None
         } else {
@@ -1268,51 +1313,87 @@ mod tests {
 
     // ── is_read_like_sql ──────────────────────────────────────────────────────
 
-    use super::{is_read_like_sql, strip_leading_sql_comments};
+    use super::{is_read_like_sql, is_read_like_sql_fallback, strip_leading_sql_comments};
 
     #[test]
     fn select_is_read() {
-        assert!(is_read_like_sql("SELECT 1"));
-        assert!(is_read_like_sql("  select * from t"));
+        assert!(is_read_like_sql("SELECT 1", &SqlDialect::Generic));
+        assert!(is_read_like_sql("  select * from t", &SqlDialect::Generic));
     }
 
     #[test]
     fn with_cte_is_read() {
-        assert!(is_read_like_sql("WITH cte AS (SELECT 1) SELECT * FROM cte"));
+        assert!(is_read_like_sql(
+            "WITH cte AS (SELECT 1) SELECT * FROM cte",
+            &SqlDialect::Generic,
+        ));
     }
 
     #[test]
     fn show_describe_explain_are_read() {
-        assert!(is_read_like_sql("SHOW TABLES"));
-        assert!(is_read_like_sql("DESCRIBE my_table"));
-        assert!(is_read_like_sql("DESC my_table"));
-        assert!(is_read_like_sql("EXPLAIN SELECT 1"));
+        assert!(is_read_like_sql("SHOW TABLES", &SqlDialect::Generic));
+        assert!(is_read_like_sql("DESCRIBE my_table", &SqlDialect::Generic));
+        assert!(is_read_like_sql("DESC my_table", &SqlDialect::Generic));
+        assert!(is_read_like_sql("EXPLAIN SELECT 1", &SqlDialect::Generic));
     }
 
     #[test]
     fn create_insert_drop_are_not_read() {
-        assert!(!is_read_like_sql("CREATE TABLE t (id INT)"));
-        assert!(!is_read_like_sql("INSERT INTO t VALUES (1)"));
-        assert!(!is_read_like_sql("DROP TABLE t"));
-        assert!(!is_read_like_sql("DELETE FROM t WHERE id = 1"));
-        assert!(!is_read_like_sql("UPDATE t SET x = 1"));
-        assert!(!is_read_like_sql("ALTER TABLE t ADD COLUMN y INT"));
+        assert!(!is_read_like_sql(
+            "CREATE TABLE t (id INT)",
+            &SqlDialect::Generic
+        ));
+        assert!(!is_read_like_sql(
+            "INSERT INTO t VALUES (1)",
+            &SqlDialect::Generic
+        ));
+        assert!(!is_read_like_sql("DROP TABLE t", &SqlDialect::Generic));
+        assert!(!is_read_like_sql(
+            "DELETE FROM t WHERE id = 1",
+            &SqlDialect::Generic
+        ));
+        assert!(!is_read_like_sql(
+            "UPDATE t SET x = 1",
+            &SqlDialect::Generic
+        ));
+        assert!(!is_read_like_sql(
+            "ALTER TABLE t ADD COLUMN y INT",
+            &SqlDialect::Generic
+        ));
     }
 
     #[test]
-    fn block_comment_stripped_before_classification() {
-        assert!(is_read_like_sql("/* comment */ SELECT 1"));
-        assert!(is_read_like_sql("/* a */ /* b */ SELECT 1"));
-        assert!(!is_read_like_sql("/* comment */ INSERT INTO t VALUES (1)"));
+    fn fallback_block_comment_stripped_before_classification() {
+        assert!(is_read_like_sql_fallback("/* comment */ SELECT 1"));
+        assert!(is_read_like_sql_fallback("/* a */ /* b */ SELECT 1"));
+        assert!(!is_read_like_sql_fallback(
+            "/* comment */ INSERT INTO t VALUES (1)"
+        ));
     }
 
     #[test]
-    fn line_comment_stripped_before_classification() {
-        assert!(is_read_like_sql("-- comment\nSELECT 1"));
-        assert!(is_read_like_sql("-- a\n-- b\nSELECT 1"));
-        assert!(is_read_like_sql("-- comment\n/* block */ SELECT 1"));
-        assert!(is_read_like_sql("/* block */\n-- line\nSELECT 1"));
-        assert!(!is_read_like_sql("-- comment\nINSERT INTO t VALUES (1)"));
+    fn fallback_line_comment_stripped_before_classification() {
+        assert!(is_read_like_sql_fallback("-- comment\nSELECT 1"));
+        assert!(is_read_like_sql_fallback("-- a\n-- b\nSELECT 1"));
+        assert!(is_read_like_sql_fallback(
+            "-- comment\n/* block */ SELECT 1"
+        ));
+        assert!(is_read_like_sql_fallback("/* block */\n-- line\nSELECT 1"));
+        assert!(!is_read_like_sql_fallback(
+            "-- comment\nINSERT INTO t VALUES (1)"
+        ));
+    }
+
+    #[test]
+    fn ast_classification_handles_comments_without_fallback() {
+        assert!(is_read_like_sql(
+            "-- comment\n/* block */ SELECT 1",
+            &SqlDialect::Generic,
+        ));
+        assert!(!is_read_like_sql(
+            "-- comment\nINSERT INTO t VALUES (1)",
+            &SqlDialect::Generic,
+        ));
     }
 
     #[test]
