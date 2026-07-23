@@ -42,9 +42,16 @@ impl SqlParseCache {
 
     fn parsed(&self) -> &ParsedStatements {
         self.cache.get_or_init(|| {
-            polyglot_sql::parse(&self.sql, to_polyglot_dialect(&self.dialect))
-                .map(ParsedStatements::Ok)
-                .unwrap_or(ParsedStatements::Err)
+            // polyglot-sql can overflow the default Tokio (~2 MiB) stack; always
+            // parse on the dedicated large-stack pool (see polyglot_pool).
+            let sql = self.sql.clone();
+            let dialect = to_polyglot_dialect(&self.dialect);
+            crate::polyglot_pool::run(move || {
+                polyglot_sql::parse(&sql, dialect)
+                    .map(ParsedStatements::Ok)
+                    .unwrap_or(ParsedStatements::Err)
+            })
+            .unwrap_or(ParsedStatements::Err)
         })
     }
 
@@ -222,5 +229,28 @@ mod tests {
     fn execution_hints_default_is_unset() {
         let hints = ExecutionHints::default();
         assert_eq!(hints.is_read_like, None);
+    }
+
+    /// Regression for snowflake_wire_tests::sql_api_multi_row_query stack overflow:
+    /// classifying `unnest([...])` on a Tokio-sized (~2 MiB) stack must not abort —
+    /// parse runs on the dedicated large-stack polyglot pool.
+    #[test]
+    fn unnest_array_classifies_without_stack_overflow() {
+        let handle = std::thread::Builder::new()
+            .stack_size(2 * 1024 * 1024)
+            .name("classify-small-stack".into())
+            .spawn(|| {
+                let sql = "SELECT unnest([1, 2, 3]) AS n ORDER BY n";
+                let cache = SqlParseCache::new(sql, SqlDialect::DuckDb);
+                assert!(
+                    cache.is_read_like(),
+                    "unnest SELECT must classify as read-like"
+                );
+                assert!(cache.is_read_like());
+            })
+            .expect("spawn small-stack classify thread");
+        handle
+            .join()
+            .expect("unnest classify panicked or overflowed on small stack");
     }
 }

@@ -19,9 +19,12 @@ fn guard_statements<'a>(
         return cache.statements().map(std::borrow::Cow::Borrowed).ok_or(());
     }
 
-    polyglot_sql::parse(ctx.translated_sql, engine_dialect(ctx.engine_type))
+    let sql = ctx.translated_sql.to_string();
+    let dialect = engine_dialect(ctx.engine_type);
+    queryflux_core::polyglot_pool::run(move || polyglot_sql::parse(&sql, dialect))
+        .and_then(|r| r.ok())
         .map(std::borrow::Cow::Owned)
-        .map_err(|_| ())
+        .ok_or(())
 }
 
 /// The extension trait every guard implements.

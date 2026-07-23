@@ -76,7 +76,11 @@ pub fn interpolate_params(
 
     let pg_dialect = crate::sql_classify::to_polyglot_dialect(dialect);
 
-    let statements = parse(sql, pg_dialect).map_err(|e| anyhow::anyhow!("SQL parse error: {e}"))?;
+    // polyglot-sql can overflow the default Tokio stack — parse off-worker.
+    let sql_owned = sql.to_string();
+    let statements = crate::polyglot_pool::run(move || parse(&sql_owned, pg_dialect))
+        .ok_or_else(|| anyhow::anyhow!("SQL parse worker failed"))?
+        .map_err(|e| anyhow::anyhow!("SQL parse error: {e}"))?;
 
     // Cell<usize> gives us interior mutability so the Fn closure can advance the index.
     let param_idx = Cell::new(0usize);

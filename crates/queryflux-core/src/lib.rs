@@ -5,6 +5,7 @@ pub mod engine_registry;
 pub mod error;
 pub mod native_result;
 pub mod params;
+pub mod polyglot_pool;
 pub mod query;
 pub mod session;
 pub mod sql_classify;
