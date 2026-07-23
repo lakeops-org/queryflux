@@ -764,4 +764,32 @@ mod tests {
             "batch without RowDescription must not emit DataRow"
         );
     }
+
+    /// Regression for lakeops-org/queryflux#97 (Postgres wire).
+    /// DDL/DML with no result set must emit CommandComplete OK, not SELECT 0
+    /// after a zero-field RowDescription.
+    #[tokio::test]
+    async fn issue97_ddl_path_emits_ok_command_complete_without_row_description() {
+        let (tx, mut rx) = unbounded_channel::<Vec<u8>>();
+        let mut sink = PostgresResultSink::new(tx);
+
+        let stats = QueryStats {
+            affected_rows: Some(2),
+            ..Default::default()
+        };
+        sink.on_complete(&stats).await.unwrap();
+
+        let msg = rx.try_recv().expect("CommandComplete");
+        assert_eq!(msg[0], b'C');
+        let tag = String::from_utf8_lossy(&msg[5..]);
+        assert!(
+            tag.starts_with("OK 2"),
+            "expected OK with affected_rows, got: {tag}"
+        );
+        assert!(
+            !tag.starts_with("SELECT"),
+            "DDL/DML must not use SELECT tag"
+        );
+        assert!(rx.try_recv().is_err(), "only one CommandComplete expected");
+    }
 }

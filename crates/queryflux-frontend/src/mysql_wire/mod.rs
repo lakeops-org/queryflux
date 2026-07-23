@@ -1871,4 +1871,57 @@ mod tests {
             "empty native columns must not emit packets"
         );
     }
+
+    /// Regression for lakeops-org/queryflux#97.
+    ///
+    /// Before the fix, dispatch called `on_schema(Schema::empty())` for DDL/DML,
+    /// which encoded MySQL column-count `0` as payload byte `0x00` (same as OK).
+    /// Clients then mis-framed the response as ERROR 2008. The correct path is:
+    /// no schema packets at all, then a single OK packet on complete.
+    #[tokio::test]
+    async fn issue97_ddl_path_emits_single_ok_packet_not_zero_column_result_set() {
+        let (tx, mut rx) = unbounded_channel::<Vec<u8>>();
+        let mut sink = MysqlResultSink::new(tx, 1);
+
+        // Simulate dispatch for ADBC execute_update: empty stream → no on_schema.
+        let stats = QueryStats {
+            affected_rows: Some(1),
+            rows_returned: 0,
+            ..Default::default()
+        };
+        sink.on_complete(&stats).await.unwrap();
+
+        let pkt = rx.try_recv().expect("OK packet");
+        let payload = &pkt[4..];
+        assert_eq!(
+            payload[0], 0x00,
+            "must be OK marker, not a zero column-count result header"
+        );
+        assert_eq!(payload[1], 1, "affected_rows should be reported");
+        // EOF terminator for result sets is 0xfe — must not appear as a second packet.
+        assert!(
+            rx.try_recv().is_err(),
+            "DDL/DML must not emit trailing result-set EOF (ERROR 2008 root cause)"
+        );
+    }
+
+    /// Empty schema is treated as OK-mode (defense in depth) and must not emit
+    /// a column-count packet of 0, which MySQL clients confuse with OK.
+    #[tokio::test]
+    async fn issue97_empty_schema_does_not_emit_column_count_zero() {
+        let (tx, mut rx) = unbounded_channel::<Vec<u8>>();
+        let mut sink = MysqlResultSink::new(tx, 1);
+
+        sink.on_schema(&Schema::empty()).await.unwrap();
+        assert_eq!(sink.mode, ResponseMode::Ok);
+        assert!(
+            rx.try_recv().is_err(),
+            "empty schema must not encode column-count 0 (looks like OK marker 0x00)"
+        );
+
+        sink.on_complete(&QueryStats::default()).await.unwrap();
+        let pkt = rx.try_recv().expect("OK packet");
+        assert_eq!(pkt[4], 0x00);
+        assert!(rx.try_recv().is_err());
+    }
 }

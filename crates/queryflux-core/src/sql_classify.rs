@@ -168,16 +168,32 @@ mod tests {
     }
 
     #[test]
-    fn select_is_read() {
+    fn select_with_show_describe_explain_are_read() {
         assert!(is_read_like_sql("SELECT 1", &SqlDialect::Generic));
+        assert!(is_read_like_sql(
+            "WITH cte AS (SELECT 1) SELECT * FROM cte",
+            &SqlDialect::Generic
+        ));
+        assert!(is_read_like_sql("SHOW TABLES", &SqlDialect::Generic));
+        assert!(is_read_like_sql("DESCRIBE my_table", &SqlDialect::Generic));
+        assert!(is_read_like_sql("EXPLAIN SELECT 1", &SqlDialect::Generic));
     }
 
     #[test]
-    fn create_is_not_read() {
-        assert!(!is_read_like_sql(
+    fn ddl_dml_are_not_read() {
+        for sql in [
             "CREATE TABLE t (id INT)",
-            &SqlDialect::Generic
-        ));
+            "INSERT INTO t VALUES (1)",
+            "UPDATE t SET x = 1",
+            "DELETE FROM t WHERE id = 1",
+            "DROP TABLE t",
+            "ALTER TABLE t ADD COLUMN y INT",
+        ] {
+            assert!(
+                !is_read_like_sql(sql, &SqlDialect::Generic),
+                "expected non-read for: {sql}"
+            );
+        }
     }
 
     #[test]
@@ -186,5 +202,25 @@ mod tests {
             "-- comment\n/* block */ SELECT 1",
             &SqlDialect::Generic,
         ));
+        assert!(!is_read_like_sql(
+            "-- comment\nINSERT INTO t VALUES (1)",
+            &SqlDialect::Generic,
+        ));
+    }
+
+    #[test]
+    fn dialect_specific_parse_still_classifies_select() {
+        assert!(is_read_like_sql("SELECT 1", &SqlDialect::Trino));
+        assert!(is_read_like_sql("SELECT 1", &SqlDialect::Snowflake));
+        assert!(!is_read_like_sql(
+            "CREATE TABLE t (id INT)",
+            &SqlDialect::Trino
+        ));
+    }
+
+    #[test]
+    fn execution_hints_default_is_unset() {
+        let hints = ExecutionHints::default();
+        assert_eq!(hints.is_read_like, None);
     }
 }
