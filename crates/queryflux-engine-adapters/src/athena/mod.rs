@@ -441,6 +441,7 @@ impl AsyncAdapter for AthenaAdapter {
             return Ok(SyncExecution {
                 stream: Box::pin(stream::empty()),
                 stats: rx,
+                affected_rows: None,
             });
         }
 
@@ -463,6 +464,7 @@ impl AsyncAdapter for AthenaAdapter {
         Ok(SyncExecution {
             stream: Box::pin(stream::iter(std::iter::once(Ok(batch)))),
             stats: rx,
+            affected_rows: None,
         })
     }
 

@@ -47,6 +47,9 @@ pub struct SyncExecution {
     pub stream: ArrowStream,
     /// Engine-reported execution stats. Sent by the adapter once the stream ends.
     pub stats: tokio::sync::oneshot::Receiver<Option<queryflux_core::query::QueryEngineStats>>,
+    /// Number of rows affected by a DDL/DML statement (from `execute_update`).
+    /// `None` for queries that return a result set.
+    pub affected_rows: Option<u64>,
 }
 
 /// What wire format this adapter natively produces, determined by its connection type.

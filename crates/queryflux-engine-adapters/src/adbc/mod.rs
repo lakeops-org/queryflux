@@ -478,6 +478,35 @@ fn collect_batches(
         .map_err(|e| QueryFluxError::Engine(format!("ADBC: failed to read results: {e}")))
 }
 
+/// Classify SQL as a read-like query (returns a result set) vs DDL/DML (returns an
+/// update count). Mirrors the heuristic in `ReadOnlyGuard`'s fallback path: trim
+/// whitespace + strip leading block comments, then check the first keyword.
+fn is_read_like_sql(sql: &str) -> bool {
+    let trimmed = strip_leading_block_comments(sql.trim_start()).to_uppercase();
+    trimmed.starts_with("SELECT")
+        || trimmed.starts_with("WITH")
+        || trimmed.starts_with("SHOW")
+        || trimmed.starts_with("DESCRIBE")
+        || trimmed.starts_with("EXPLAIN")
+        || trimmed.starts_with("DESC ")
+        || trimmed.starts_with("DESC\t")
+}
+
+/// Strip leading `/* … */` block comments so the first SQL keyword is visible.
+fn strip_leading_block_comments(mut s: &str) -> &str {
+    loop {
+        s = s.trim_start();
+        if let Some(rest) = s.strip_prefix("/*") {
+            match rest.find("*/") {
+                Some(end) => s = &rest[end + 2..],
+                None => return s,
+            }
+        } else {
+            return s;
+        }
+    }
+}
+
 #[async_trait]
 impl SyncAdapter for AdbcAdapter {
     fn supports_native_params(&self) -> bool {
@@ -494,73 +523,131 @@ impl SyncAdapter for AdbcAdapter {
     ) -> Result<SyncExecution> {
         let pool = self.pool.clone();
         let sql = sql.to_string();
+        let is_query = is_read_like_sql(&sql);
         let param_batch = if params.is_empty() {
             None
         } else {
             Some(params_to_record_batch(params)?)
         };
 
-        let (batch_tx, batch_rx) = mpsc::channel::<Result<RecordBatch>>(32);
-        let (stats_tx, stats_rx) = oneshot::channel();
+        if is_query {
+            let (batch_tx, batch_rx) = mpsc::channel::<Result<RecordBatch>>(32);
+            let (stats_tx, stats_rx) = oneshot::channel();
 
-        tokio::task::spawn_blocking(move || {
-            let mut conn = match pool.get() {
-                Ok(c) => c,
-                Err(e) => {
+            tokio::task::spawn_blocking(move || {
+                let mut conn = match pool.get() {
+                    Ok(c) => c,
+                    Err(e) => {
+                        let _ = batch_tx.blocking_send(Err(QueryFluxError::Engine(format!(
+                            "ADBC: failed to get connection from pool: {e}"
+                        ))));
+                        return;
+                    }
+                };
+                let mut stmt = match conn.new_statement() {
+                    Ok(s) => s,
+                    Err(e) => {
+                        let _ = batch_tx.blocking_send(Err(QueryFluxError::Engine(format!(
+                            "ADBC: failed to create statement: {e}"
+                        ))));
+                        return;
+                    }
+                };
+                if let Err(e) = stmt.set_sql_query(&sql) {
                     let _ = batch_tx.blocking_send(Err(QueryFluxError::Engine(format!(
-                        "ADBC: failed to get connection from pool: {e}"
+                        "ADBC: failed to set SQL query: {e}"
                     ))));
                     return;
                 }
-            };
-            let mut stmt = match conn.new_statement() {
-                Ok(s) => s,
-                Err(e) => {
-                    let _ = batch_tx.blocking_send(Err(QueryFluxError::Engine(format!(
-                        "ADBC: failed to create statement: {e}"
-                    ))));
-                    return;
+                if let Some(batch) = param_batch {
+                    if let Err(e) = stmt.bind(batch) {
+                        let _ = batch_tx.blocking_send(Err(QueryFluxError::Engine(format!(
+                            "ADBC: failed to bind parameters: {e}"
+                        ))));
+                        return;
+                    }
                 }
-            };
-            if let Err(e) = stmt.set_sql_query(&sql) {
-                let _ = batch_tx.blocking_send(Err(QueryFluxError::Engine(format!(
-                    "ADBC: failed to set SQL query: {e}"
-                ))));
-                return;
-            }
-            if let Some(batch) = param_batch {
-                if let Err(e) = stmt.bind(batch) {
-                    let _ = batch_tx.blocking_send(Err(QueryFluxError::Engine(format!(
-                        "ADBC: failed to bind parameters: {e}"
-                    ))));
-                    return;
+                let reader = match stmt.execute() {
+                    Ok(r) => r,
+                    Err(e) => {
+                        let _ = batch_tx.blocking_send(Err(QueryFluxError::Engine(format!(
+                            "ADBC: query execution failed: {e}"
+                        ))));
+                        return;
+                    }
+                };
+                for batch in reader {
+                    let result = batch.map_err(|e| {
+                        QueryFluxError::Engine(format!("ADBC: failed to read results: {e}"))
+                    });
+                    if batch_tx.blocking_send(result).is_err() {
+                        return;
+                    }
                 }
-            }
-            let reader = match stmt.execute() {
-                Ok(r) => r,
-                Err(e) => {
-                    let _ = batch_tx.blocking_send(Err(QueryFluxError::Engine(format!(
-                        "ADBC: query execution failed: {e}"
-                    ))));
-                    return;
-                }
-            };
-            for batch in reader {
-                let result = batch.map_err(|e| {
-                    QueryFluxError::Engine(format!("ADBC: failed to read results: {e}"))
-                });
-                if batch_tx.blocking_send(result).is_err() {
-                    return; // consumer dropped, stop reading
-                }
-            }
-            // Send stats only after all batches have been produced.
-            let _ = stats_tx.send(None); // ADBC has no standard stats API
-        });
+                let _ = stats_tx.send(None);
+            });
 
-        Ok(SyncExecution {
-            stream: Box::pin(ReceiverStream::new(batch_rx)),
-            stats: stats_rx,
-        })
+            Ok(SyncExecution {
+                stream: Box::pin(ReceiverStream::new(batch_rx)),
+                stats: stats_rx,
+                affected_rows: None,
+            })
+        } else {
+            // DDL/DML path: use execute_update to get the affected row count
+            // without producing an Arrow stream.
+            let (affected_tx, affected_rx) = oneshot::channel::<Result<Option<u64>>>();
+            let (stats_tx, stats_rx) = oneshot::channel();
+
+            tokio::task::spawn_blocking(move || {
+                let result = (|| -> Result<Option<u64>> {
+                    let mut conn = pool.get().map_err(|e| {
+                        QueryFluxError::Engine(format!(
+                            "ADBC: failed to get connection from pool: {e}"
+                        ))
+                    })?;
+                    let mut stmt = conn.new_statement().map_err(|e| {
+                        QueryFluxError::Engine(format!(
+                            "ADBC: failed to create statement: {e}"
+                        ))
+                    })?;
+                    stmt.set_sql_query(&sql).map_err(|e| {
+                        QueryFluxError::Engine(format!(
+                            "ADBC: failed to set SQL query: {e}"
+                        ))
+                    })?;
+                    if let Some(batch) = param_batch {
+                        stmt.bind(batch).map_err(|e| {
+                            QueryFluxError::Engine(format!(
+                                "ADBC: failed to bind parameters: {e}"
+                            ))
+                        })?;
+                    }
+                    let rows = stmt.execute_update().map_err(|e| {
+                        QueryFluxError::Engine(format!(
+                            "ADBC: DDL/DML execution failed: {e}"
+                        ))
+                    })?;
+                    Ok(rows.and_then(|n| if n >= 0 { Some(n as u64) } else { None }))
+                })();
+                let _ = affected_tx.send(result);
+                let _ = stats_tx.send(None);
+            });
+
+            let affected = affected_rx
+                .await
+                .map_err(|_| {
+                    QueryFluxError::Engine(
+                        "ADBC: execute_update channel closed unexpectedly".to_string(),
+                    )
+                })??;
+
+            let empty: crate::ArrowStream = Box::pin(futures::stream::empty());
+            Ok(SyncExecution {
+                stream: empty,
+                stats: stats_rx,
+                affected_rows: Some(affected.unwrap_or(0)),
+            })
+        }
     }
 
     fn engine_type(&self) -> EngineType {
@@ -1179,5 +1266,50 @@ mod tests {
         ];
         let batch = params_to_record_batch(&params).expect("build");
         assert_eq!(batch.num_rows(), 1);
+    }
+
+    // ── is_read_like_sql ──────────────────────────────────────────────────────
+
+    use super::{is_read_like_sql, strip_leading_block_comments};
+
+    #[test]
+    fn select_is_read() {
+        assert!(is_read_like_sql("SELECT 1"));
+        assert!(is_read_like_sql("  select * from t"));
+    }
+
+    #[test]
+    fn with_cte_is_read() {
+        assert!(is_read_like_sql("WITH cte AS (SELECT 1) SELECT * FROM cte"));
+    }
+
+    #[test]
+    fn show_describe_explain_are_read() {
+        assert!(is_read_like_sql("SHOW TABLES"));
+        assert!(is_read_like_sql("DESCRIBE my_table"));
+        assert!(is_read_like_sql("DESC my_table"));
+        assert!(is_read_like_sql("EXPLAIN SELECT 1"));
+    }
+
+    #[test]
+    fn create_insert_drop_are_not_read() {
+        assert!(!is_read_like_sql("CREATE TABLE t (id INT)"));
+        assert!(!is_read_like_sql("INSERT INTO t VALUES (1)"));
+        assert!(!is_read_like_sql("DROP TABLE t"));
+        assert!(!is_read_like_sql("DELETE FROM t WHERE id = 1"));
+        assert!(!is_read_like_sql("UPDATE t SET x = 1"));
+        assert!(!is_read_like_sql("ALTER TABLE t ADD COLUMN y INT"));
+    }
+
+    #[test]
+    fn block_comment_stripped_before_classification() {
+        assert!(is_read_like_sql("/* comment */ SELECT 1"));
+        assert!(is_read_like_sql("/* a */ /* b */ SELECT 1"));
+        assert!(!is_read_like_sql("/* comment */ INSERT INTO t VALUES (1)"));
+    }
+
+    #[test]
+    fn strip_comments_returns_rest_on_unclosed() {
+        assert_eq!(strip_leading_block_comments("/* unclosed"), "/* unclosed");
     }
 }

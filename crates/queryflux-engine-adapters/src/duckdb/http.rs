@@ -250,7 +250,7 @@ impl SyncAdapter for DuckDbHttpAdapter {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let _ = tx.send(None);
         let stream = Box::pin(stream::iter(vec![Ok(batch)]));
-        Ok(SyncExecution { stream, stats: rx })
+        Ok(SyncExecution { stream, stats: rx, affected_rows: None })
     }
 
     async fn list_catalogs(&self) -> Result<Vec<String>> {

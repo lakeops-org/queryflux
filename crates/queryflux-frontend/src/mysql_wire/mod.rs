@@ -589,6 +589,19 @@ async fn write_synthetic_multi_column_row<W: AsyncWriteExt + Unpin>(
 
 // ── MysqlResultSink ───────────────────────────────────────────────────────────
 
+/// Tracks whether the MySQL response should be framed as a result set or an OK
+/// packet. DDL/DML produce no schema (or an empty one) and must emit `build_ok`;
+/// queries with columns must go through the column-def + rows + EOF path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResponseMode {
+    /// No schema or native chunk has been received yet.
+    None,
+    /// A non-empty schema was sent — framing as a result set.
+    ResultSet,
+    /// Schema was empty (DDL/DML) — on_complete will emit an OK packet.
+    Ok,
+}
+
 /// Streams Arrow RecordBatches as MySQL text-protocol result packets over a channel.
 ///
 /// Each `on_*` call encodes one or more MySQL packets (4-byte header + payload)
@@ -597,11 +610,16 @@ async fn write_synthetic_multi_column_row<W: AsyncWriteExt + Unpin>(
 struct MysqlResultSink {
     tx: UnboundedSender<Vec<u8>>,
     seq: u8,
+    mode: ResponseMode,
 }
 
 impl MysqlResultSink {
     fn new(tx: UnboundedSender<Vec<u8>>, start_seq: u8) -> Self {
-        Self { tx, seq: start_seq }
+        Self {
+            tx,
+            seq: start_seq,
+            mode: ResponseMode::None,
+        }
     }
 
     /// Prepend a 4-byte MySQL packet header and send to the channel.
@@ -622,6 +640,13 @@ impl MysqlResultSink {
 #[async_trait]
 impl ResultSink for MysqlResultSink {
     async fn on_schema(&mut self, schema: &Schema) -> Result<()> {
+        if schema.fields().is_empty() {
+            self.mode = ResponseMode::Ok;
+            return Ok(());
+        }
+
+        self.mode = ResponseMode::ResultSet;
+
         // Column count packet.
         let mut count_pkt = Vec::new();
         write_lenenc_int(&mut count_pkt, schema.fields().len() as u64);
@@ -651,8 +676,18 @@ impl ResultSink for MysqlResultSink {
         Ok(())
     }
 
-    async fn on_complete(&mut self, _stats: &QueryStats) -> Result<()> {
-        self.encode_and_send(build_eof());
+    async fn on_complete(&mut self, stats: &QueryStats) -> Result<()> {
+        match self.mode {
+            ResponseMode::ResultSet => {
+                self.encode_and_send(build_eof());
+            }
+            ResponseMode::Ok | ResponseMode::None => {
+                self.encode_and_send(build_ok(
+                    stats.affected_rows.unwrap_or(0),
+                    0,
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -664,6 +699,8 @@ impl ResultSink for MysqlResultSink {
     async fn on_native_chunk(&mut self, chunk: &NativeResultChunk) -> Result<()> {
         // On the first chunk, send column count + column definition packets + EOF.
         if let Some(columns) = &chunk.columns {
+            self.mode = ResponseMode::ResultSet;
+
             let mut count_pkt = Vec::new();
             write_lenenc_int(&mut count_pkt, columns.len() as u64);
             self.encode_and_send(count_pkt);
@@ -1677,5 +1714,93 @@ mod tests {
         ]);
         let ctx = s.resolved_agent_context().expect("should resolve");
         assert_eq!(ctx.agent_id, "second");
+    }
+
+    // ── MysqlResultSink ResponseMode ──────────────────────────────────────────
+
+    use super::ResponseMode;
+    use queryflux_core::query::QueryStats;
+    use tokio::sync::mpsc::unbounded_channel;
+
+    #[tokio::test]
+    async fn no_schema_complete_emits_ok_packet() {
+        let (tx, mut rx) = unbounded_channel::<Vec<u8>>();
+        let mut sink = MysqlResultSink::new(tx, 1);
+
+        let stats = QueryStats {
+            affected_rows: Some(3),
+            ..Default::default()
+        };
+        sink.on_complete(&stats).await.unwrap();
+        assert_eq!(sink.mode, ResponseMode::None);
+
+        let pkt = rx.try_recv().expect("should have one packet");
+        // pkt layout: [len_lo, len_mid, len_hi, seq, payload...]
+        assert_eq!(pkt[3], 1, "sequence number");
+        let payload = &pkt[4..];
+        assert_eq!(payload[0], 0x00, "OK marker");
+        // affected_rows = 3 as lenenc int
+        assert_eq!(payload[1], 3, "affected_rows lenenc");
+
+        assert!(rx.try_recv().is_err(), "no second packet (no trailing EOF)");
+    }
+
+    #[tokio::test]
+    async fn empty_schema_sets_ok_mode() {
+        let (tx, mut rx) = unbounded_channel::<Vec<u8>>();
+        let mut sink = MysqlResultSink::new(tx, 1);
+
+        sink.on_schema(&Schema::empty()).await.unwrap();
+        assert_eq!(sink.mode, ResponseMode::Ok);
+
+        // No packets emitted by on_schema for empty schema.
+        assert!(rx.try_recv().is_err(), "empty schema should emit no packets");
+
+        let stats = QueryStats {
+            affected_rows: Some(0),
+            ..Default::default()
+        };
+        sink.on_complete(&stats).await.unwrap();
+
+        let pkt = rx.try_recv().expect("should have OK packet");
+        assert_eq!(pkt[4], 0x00, "OK marker");
+        assert!(rx.try_recv().is_err(), "no trailing EOF");
+    }
+
+    #[tokio::test]
+    async fn non_empty_schema_sets_result_set_mode() {
+        use arrow::datatypes::{DataType, Field};
+        let (tx, mut rx) = unbounded_channel::<Vec<u8>>();
+        let mut sink = MysqlResultSink::new(tx, 1);
+
+        let schema = Schema::new(vec![Field::new("id", DataType::Int32, false)]);
+        sink.on_schema(&schema).await.unwrap();
+        assert_eq!(sink.mode, ResponseMode::ResultSet);
+
+        // Should have emitted: column-count (1 col), column-def, EOF
+        let _col_count = rx.try_recv().expect("column count");
+        let _col_def = rx.try_recv().expect("column def");
+        let eof_pkt = rx.try_recv().expect("EOF");
+        assert_eq!(eof_pkt[4], 0xfe, "EOF marker");
+
+        let stats = QueryStats::default();
+        sink.on_complete(&stats).await.unwrap();
+
+        let final_pkt = rx.try_recv().expect("final EOF");
+        assert_eq!(final_pkt[4], 0xfe, "result set ends with EOF");
+    }
+
+    #[tokio::test]
+    async fn ok_packet_with_zero_affected_rows_when_none() {
+        let (tx, mut rx) = unbounded_channel::<Vec<u8>>();
+        let mut sink = MysqlResultSink::new(tx, 1);
+
+        let stats = QueryStats::default(); // affected_rows = None
+        sink.on_complete(&stats).await.unwrap();
+
+        let pkt = rx.try_recv().expect("OK packet");
+        let payload = &pkt[4..];
+        assert_eq!(payload[0], 0x00, "OK marker");
+        assert_eq!(payload[1], 0, "affected_rows defaults to 0");
     }
 }

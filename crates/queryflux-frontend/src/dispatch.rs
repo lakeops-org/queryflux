@@ -1292,6 +1292,7 @@ async fn execute_stream(
 
     let mut stream = execution.stream;
     let mut stats_rx = execution.stats;
+    let affected_rows = execution.affected_rows;
 
     let mut schema_sent = false;
     let mut rows_returned: u64 = 0;
@@ -1346,22 +1347,14 @@ async fn execute_stream(
     // before or during stream production, so try_recv() is always sufficient here.
     let engine_stats = stats_rx.try_recv().ok().flatten();
 
-    if !schema_sent {
-        if let Err(e) = sink.on_schema(&Schema::empty()).await {
-            let outcome = SyncOutcome {
-                status: QueryStatus::Failed,
-                rows: Some(0),
-                error: Some("client disconnected during empty schema send".to_string()),
-                elapsed_ms,
-                engine_stats,
-            };
-            return (outcome, Err(e));
-        }
-    }
+    // Do NOT synthesize on_schema(Schema::empty()) for empty streams: DDL/DML
+    // statements produce no batches and sinks treat the absence of on_schema as a
+    // signal to emit an OK/CommandComplete instead of a result-set sequence.
 
     let stats = QueryStats {
         execution_duration_ms: elapsed_ms,
         rows_returned,
+        affected_rows,
         ..Default::default()
     };
 
@@ -1653,6 +1646,7 @@ pub async fn execute_to_sink(
                     bytes_returned: Some(_stats.size_bytes),
                     queue_duration_ms: 0,
                     execution_duration_ms: 0,
+                    affected_rows: None,
                 };
                 return sink.on_complete(&stats).await;
             }

@@ -359,6 +359,7 @@ impl SyncAdapter for StarRocksAdapter {
             return Ok(SyncExecution {
                 stream: Box::pin(stream::empty()),
                 stats: rx,
+                affected_rows: None,
             });
         }
 
@@ -393,6 +394,7 @@ impl SyncAdapter for StarRocksAdapter {
         Ok(SyncExecution {
             stream: Box::pin(stream::iter(std::iter::once(Ok(batch)))),
             stats: rx,
+            affected_rows: None,
         })
     }
 

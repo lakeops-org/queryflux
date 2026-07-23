@@ -355,6 +355,9 @@ pub struct QueryStats {
     pub execution_duration_ms: u64,
     pub rows_returned: u64,
     pub bytes_returned: Option<u64>,
+    /// Rows affected by DDL/DML (from ADBC `execute_update`). `None` for result-set queries.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub affected_rows: Option<u64>,
 }
 
 /// Engine-level execution statistics captured from the final query response.

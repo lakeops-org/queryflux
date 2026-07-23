@@ -537,6 +537,7 @@ impl AsyncAdapter for TrinoAdapter {
         Ok(SyncExecution {
             stream: Box::pin(ReceiverStream::new(batch_rx)),
             stats: stats_rx,
+            affected_rows: None,
         })
     }
 

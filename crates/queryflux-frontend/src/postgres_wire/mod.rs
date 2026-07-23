@@ -383,11 +383,16 @@ async fn handle_simple_query<W: AsyncWriteExt + Unpin>(
 struct PostgresResultSink {
     tx: UnboundedSender<Vec<u8>>,
     row_count: u64,
+    schema_sent: bool,
 }
 
 impl PostgresResultSink {
     fn new(tx: UnboundedSender<Vec<u8>>) -> Self {
-        Self { tx, row_count: 0 }
+        Self {
+            tx,
+            row_count: 0,
+            schema_sent: false,
+        }
     }
 
     fn send_msg(&self, msg_type: u8, body: Vec<u8>) {
@@ -403,6 +408,12 @@ impl PostgresResultSink {
 #[async_trait]
 impl ResultSink for PostgresResultSink {
     async fn on_schema(&mut self, schema: &Schema) -> Result<()> {
+        if schema.fields().is_empty() {
+            return Ok(());
+        }
+
+        self.schema_sent = true;
+
         // RowDescription: field count (i16) + field descriptors.
         let n = schema.fields().len() as i16;
         let mut body = n.to_be_bytes().to_vec();
@@ -440,9 +451,14 @@ impl ResultSink for PostgresResultSink {
         Ok(())
     }
 
-    async fn on_complete(&mut self, _stats: &QueryStats) -> Result<()> {
-        // CommandComplete: tag string (e.g. "SELECT 42").
-        let tag = format!("SELECT {}\0", self.row_count);
+    async fn on_complete(&mut self, stats: &QueryStats) -> Result<()> {
+        let tag = if self.schema_sent {
+            format!("SELECT {}\0", self.row_count)
+        } else if let Some(n) = stats.affected_rows {
+            format!("OK {n}\0")
+        } else {
+            "OK\0".to_string()
+        };
         self.send_msg(b'C', tag.into_bytes());
         Ok(())
     }
@@ -647,6 +663,82 @@ mod tests {
         assert_eq!(
             s.extra.get("custom_routing_hint").map(String::as_str),
             Some("region-us")
+        );
+    }
+
+    // ── PostgresResultSink: no-result vs result-set framing ───────────────────
+
+    use queryflux_core::query::QueryStats;
+    use tokio::sync::mpsc::unbounded_channel;
+
+    #[tokio::test]
+    async fn no_schema_complete_emits_ok_command_complete() {
+        let (tx, mut rx) = unbounded_channel::<Vec<u8>>();
+        let mut sink = PostgresResultSink::new(tx);
+
+        let stats = QueryStats {
+            affected_rows: Some(1),
+            ..Default::default()
+        };
+        sink.on_complete(&stats).await.unwrap();
+
+        let msg = rx.try_recv().expect("should have CommandComplete");
+        assert_eq!(msg[0], b'C', "CommandComplete message type");
+        let body = &msg[5..]; // skip type + i32 length
+        let tag = String::from_utf8_lossy(body);
+        assert!(
+            tag.starts_with("OK 1"),
+            "tag should be 'OK 1', got: {tag}"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_schema_no_affected_rows_emits_ok() {
+        let (tx, mut rx) = unbounded_channel::<Vec<u8>>();
+        let mut sink = PostgresResultSink::new(tx);
+
+        let stats = QueryStats::default();
+        sink.on_complete(&stats).await.unwrap();
+
+        let msg = rx.try_recv().expect("CommandComplete");
+        let body = &msg[5..];
+        let tag = String::from_utf8_lossy(body);
+        assert!(tag.starts_with("OK\0"), "tag should be 'OK', got: {tag}");
+    }
+
+    #[tokio::test]
+    async fn empty_schema_skips_row_description() {
+        let (tx, mut rx) = unbounded_channel::<Vec<u8>>();
+        let mut sink = PostgresResultSink::new(tx);
+
+        sink.on_schema(&Schema::empty()).await.unwrap();
+        assert!(
+            rx.try_recv().is_err(),
+            "empty schema should not emit RowDescription"
+        );
+    }
+
+    #[tokio::test]
+    async fn non_empty_schema_sends_row_description_and_select_tag() {
+        use arrow::datatypes::{DataType, Field};
+        let (tx, mut rx) = unbounded_channel::<Vec<u8>>();
+        let mut sink = PostgresResultSink::new(tx);
+
+        let schema = Schema::new(vec![Field::new("id", DataType::Int32, false)]);
+        sink.on_schema(&schema).await.unwrap();
+
+        let row_desc = rx.try_recv().expect("RowDescription");
+        assert_eq!(row_desc[0], b'T', "RowDescription message type");
+
+        let stats = QueryStats::default();
+        sink.on_complete(&stats).await.unwrap();
+
+        let cmd = rx.try_recv().expect("CommandComplete");
+        assert_eq!(cmd[0], b'C');
+        let tag = String::from_utf8_lossy(&cmd[5..]);
+        assert!(
+            tag.starts_with("SELECT 0"),
+            "result set should have SELECT tag, got: {tag}"
         );
     }
 }
