@@ -663,6 +663,11 @@ impl ResultSink for MysqlResultSink {
     }
 
     async fn on_batch(&mut self, batch: &RecordBatch) -> Result<()> {
+        // Zero-column / OK-mode responses must not emit row packets — clients
+        // would misread them as part of an OK framing sequence.
+        if self.mode != ResponseMode::ResultSet {
+            return Ok(());
+        }
         for row in 0..batch.num_rows() {
             let mut row_pkt = Vec::new();
             for col in batch.columns() {
@@ -682,10 +687,7 @@ impl ResultSink for MysqlResultSink {
                 self.encode_and_send(build_eof());
             }
             ResponseMode::Ok | ResponseMode::None => {
-                self.encode_and_send(build_ok(
-                    stats.affected_rows.unwrap_or(0),
-                    0,
-                ));
+                self.encode_and_send(build_ok(stats.affected_rows.unwrap_or(0), 0));
             }
         }
         Ok(())
@@ -699,6 +701,12 @@ impl ResultSink for MysqlResultSink {
     async fn on_native_chunk(&mut self, chunk: &NativeResultChunk) -> Result<()> {
         // On the first chunk, send column count + column definition packets + EOF.
         if let Some(columns) = &chunk.columns {
+            if columns.is_empty() {
+                // Zero-column native result → OK framing, same as Schema::empty().
+                self.mode = ResponseMode::Ok;
+                return Ok(());
+            }
+
             self.mode = ResponseMode::ResultSet;
 
             let mut count_pkt = Vec::new();
@@ -710,6 +718,11 @@ impl ResultSink for MysqlResultSink {
             }
 
             self.encode_and_send(build_eof());
+        }
+
+        // Only emit row packets when framing a result set.
+        if self.mode != ResponseMode::ResultSet {
+            return Ok(());
         }
 
         // Encode each row as a MySQL text-protocol row data packet.
@@ -1754,7 +1767,10 @@ mod tests {
         assert_eq!(sink.mode, ResponseMode::Ok);
 
         // No packets emitted by on_schema for empty schema.
-        assert!(rx.try_recv().is_err(), "empty schema should emit no packets");
+        assert!(
+            rx.try_recv().is_err(),
+            "empty schema should emit no packets"
+        );
 
         let stats = QueryStats {
             affected_rows: Some(0),
@@ -1802,5 +1818,57 @@ mod tests {
         let payload = &pkt[4..];
         assert_eq!(payload[0], 0x00, "OK marker");
         assert_eq!(payload[1], 0, "affected_rows defaults to 0");
+    }
+
+    #[tokio::test]
+    async fn empty_schema_batch_does_not_emit_rows() {
+        use arrow::array::Int32Array;
+        use arrow::datatypes::{DataType, Field};
+        use std::sync::Arc;
+
+        let (tx, mut rx) = unbounded_channel::<Vec<u8>>();
+        let mut sink = MysqlResultSink::new(tx, 1);
+
+        sink.on_schema(&Schema::empty()).await.unwrap();
+        assert_eq!(sink.mode, ResponseMode::Ok);
+
+        // A batch following an empty schema must be ignored.
+        let batch = RecordBatch::new_empty(Arc::new(Schema::empty()));
+        sink.on_batch(&batch).await.unwrap();
+        assert!(
+            rx.try_recv().is_err(),
+            "OK-mode on_batch must not emit packets"
+        );
+
+        // Also guard when somehow a non-empty batch arrives in Ok mode.
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(vec![1])) as _]).unwrap();
+        sink.on_batch(&batch).await.unwrap();
+        assert!(rx.try_recv().is_err(), "OK-mode on_batch must ignore rows");
+
+        let stats = QueryStats::default();
+        sink.on_complete(&stats).await.unwrap();
+        let pkt = rx.try_recv().expect("OK packet");
+        assert_eq!(pkt[4], 0x00);
+    }
+
+    #[tokio::test]
+    async fn empty_native_columns_sets_ok_mode() {
+        use queryflux_core::native_result::{NativeResultChunk, NativeRow};
+
+        let (tx, mut rx) = unbounded_channel::<Vec<u8>>();
+        let mut sink = MysqlResultSink::new(tx, 1);
+
+        let chunk = NativeResultChunk {
+            columns: Some(vec![]),
+            rows: vec![NativeRow(vec![])],
+        };
+        sink.on_native_chunk(&chunk).await.unwrap();
+        assert_eq!(sink.mode, ResponseMode::Ok);
+        assert!(
+            rx.try_recv().is_err(),
+            "empty native columns must not emit packets"
+        );
     }
 }

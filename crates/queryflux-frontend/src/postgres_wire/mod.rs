@@ -432,6 +432,11 @@ impl ResultSink for PostgresResultSink {
     }
 
     async fn on_batch(&mut self, batch: &RecordBatch) -> Result<()> {
+        // Do not emit DataRow packets without a prior RowDescription (e.g. after
+        // an empty schema / DDL path).
+        if !self.schema_sent {
+            return Ok(());
+        }
         for row in 0..batch.num_rows() {
             // DataRow: column count (i16) + per-column (length i32 + bytes, or -1 for NULL).
             let n = batch.num_columns() as i16;
@@ -686,10 +691,7 @@ mod tests {
         assert_eq!(msg[0], b'C', "CommandComplete message type");
         let body = &msg[5..]; // skip type + i32 length
         let tag = String::from_utf8_lossy(body);
-        assert!(
-            tag.starts_with("OK 1"),
-            "tag should be 'OK 1', got: {tag}"
-        );
+        assert!(tag.starts_with("OK 1"), "tag should be 'OK 1', got: {tag}");
     }
 
     #[tokio::test]
@@ -739,6 +741,27 @@ mod tests {
         assert!(
             tag.starts_with("SELECT 0"),
             "result set should have SELECT tag, got: {tag}"
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_schema_batch_does_not_emit_datarow() {
+        use arrow::array::Int32Array;
+        use arrow::datatypes::{DataType, Field};
+        use std::sync::Arc;
+
+        let (tx, mut rx) = unbounded_channel::<Vec<u8>>();
+        let mut sink = PostgresResultSink::new(tx);
+
+        sink.on_schema(&Schema::empty()).await.unwrap();
+
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(vec![1])) as _]).unwrap();
+        sink.on_batch(&batch).await.unwrap();
+        assert!(
+            rx.try_recv().is_err(),
+            "batch without RowDescription must not emit DataRow"
         );
     }
 }

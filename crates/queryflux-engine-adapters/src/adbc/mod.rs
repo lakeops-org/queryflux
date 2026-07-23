@@ -479,10 +479,11 @@ fn collect_batches(
 }
 
 /// Classify SQL as a read-like query (returns a result set) vs DDL/DML (returns an
-/// update count). Mirrors the heuristic in `ReadOnlyGuard`'s fallback path: trim
-/// whitespace + strip leading block comments, then check the first keyword.
+/// update count). Strips leading whitespace and SQL comments (`--` / `/* … */`),
+/// then checks whether the first keyword is SELECT / WITH / SHOW / DESCRIBE /
+/// EXPLAIN / DESC.
 fn is_read_like_sql(sql: &str) -> bool {
-    let trimmed = strip_leading_block_comments(sql.trim_start()).to_uppercase();
+    let trimmed = strip_leading_sql_comments(sql).to_uppercase();
     trimmed.starts_with("SELECT")
         || trimmed.starts_with("WITH")
         || trimmed.starts_with("SHOW")
@@ -492,11 +493,18 @@ fn is_read_like_sql(sql: &str) -> bool {
         || trimmed.starts_with("DESC\t")
 }
 
-/// Strip leading `/* … */` block comments so the first SQL keyword is visible.
-fn strip_leading_block_comments(mut s: &str) -> &str {
+/// Strip leading whitespace, `--` line comments, and `/* … */` block comments
+/// so the first SQL keyword is visible.
+fn strip_leading_sql_comments(mut s: &str) -> &str {
     loop {
         s = s.trim_start();
-        if let Some(rest) = s.strip_prefix("/*") {
+        if let Some(rest) = s.strip_prefix("--") {
+            // Line comment: skip through the end of the line.
+            s = match rest.find('\n') {
+                Some(end) => &rest[end + 1..],
+                None => "",
+            };
+        } else if let Some(rest) = s.strip_prefix("/*") {
             match rest.find("*/") {
                 Some(end) => s = &rest[end + 2..],
                 None => return s,
@@ -606,26 +614,18 @@ impl SyncAdapter for AdbcAdapter {
                         ))
                     })?;
                     let mut stmt = conn.new_statement().map_err(|e| {
-                        QueryFluxError::Engine(format!(
-                            "ADBC: failed to create statement: {e}"
-                        ))
+                        QueryFluxError::Engine(format!("ADBC: failed to create statement: {e}"))
                     })?;
                     stmt.set_sql_query(&sql).map_err(|e| {
-                        QueryFluxError::Engine(format!(
-                            "ADBC: failed to set SQL query: {e}"
-                        ))
+                        QueryFluxError::Engine(format!("ADBC: failed to set SQL query: {e}"))
                     })?;
                     if let Some(batch) = param_batch {
                         stmt.bind(batch).map_err(|e| {
-                            QueryFluxError::Engine(format!(
-                                "ADBC: failed to bind parameters: {e}"
-                            ))
+                            QueryFluxError::Engine(format!("ADBC: failed to bind parameters: {e}"))
                         })?;
                     }
                     let rows = stmt.execute_update().map_err(|e| {
-                        QueryFluxError::Engine(format!(
-                            "ADBC: DDL/DML execution failed: {e}"
-                        ))
+                        QueryFluxError::Engine(format!("ADBC: DDL/DML execution failed: {e}"))
                     })?;
                     Ok(rows.and_then(|n| if n >= 0 { Some(n as u64) } else { None }))
                 })();
@@ -633,13 +633,11 @@ impl SyncAdapter for AdbcAdapter {
                 let _ = stats_tx.send(None);
             });
 
-            let affected = affected_rx
-                .await
-                .map_err(|_| {
-                    QueryFluxError::Engine(
-                        "ADBC: execute_update channel closed unexpectedly".to_string(),
-                    )
-                })??;
+            let affected = affected_rx.await.map_err(|_| {
+                QueryFluxError::Engine(
+                    "ADBC: execute_update channel closed unexpectedly".to_string(),
+                )
+            })??;
 
             let empty: crate::ArrowStream = Box::pin(futures::stream::empty());
             Ok(SyncExecution {
@@ -1270,7 +1268,7 @@ mod tests {
 
     // ── is_read_like_sql ──────────────────────────────────────────────────────
 
-    use super::{is_read_like_sql, strip_leading_block_comments};
+    use super::{is_read_like_sql, strip_leading_sql_comments};
 
     #[test]
     fn select_is_read() {
@@ -1309,7 +1307,21 @@ mod tests {
     }
 
     #[test]
-    fn strip_comments_returns_rest_on_unclosed() {
-        assert_eq!(strip_leading_block_comments("/* unclosed"), "/* unclosed");
+    fn line_comment_stripped_before_classification() {
+        assert!(is_read_like_sql("-- comment\nSELECT 1"));
+        assert!(is_read_like_sql("-- a\n-- b\nSELECT 1"));
+        assert!(is_read_like_sql("-- comment\n/* block */ SELECT 1"));
+        assert!(is_read_like_sql("/* block */\n-- line\nSELECT 1"));
+        assert!(!is_read_like_sql("-- comment\nINSERT INTO t VALUES (1)"));
+    }
+
+    #[test]
+    fn strip_comments_returns_rest_on_unclosed_block() {
+        assert_eq!(strip_leading_sql_comments("/* unclosed"), "/* unclosed");
+    }
+
+    #[test]
+    fn strip_line_comment_without_newline_yields_empty() {
+        assert_eq!(strip_leading_sql_comments("-- only comment"), "");
     }
 }

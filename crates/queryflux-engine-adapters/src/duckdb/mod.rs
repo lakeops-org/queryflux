@@ -178,7 +178,11 @@ impl SyncAdapter for DuckDbAdapter {
         // via the query_arrow API — send None and establish the pattern for future use.
         let _ = tx.send(None);
         let stream = Box::pin(stream::iter(batches.into_iter().map(Ok)));
-        Ok(SyncExecution { stream, stats: rx, affected_rows: None })
+        Ok(SyncExecution {
+            stream,
+            stats: rx,
+            affected_rows: None,
+        })
     }
 
     // --- Catalog discovery ---
