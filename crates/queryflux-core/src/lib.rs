@@ -7,4 +7,5 @@ pub mod native_result;
 pub mod params;
 pub mod query;
 pub mod session;
+pub mod sql_classify;
 pub mod tags;

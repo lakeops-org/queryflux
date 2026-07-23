@@ -74,7 +74,7 @@ pub fn interpolate_params(
     use polyglot_sql::{generate, parse};
     use std::cell::Cell;
 
-    let pg_dialect = to_polyglot_dialect(dialect);
+    let pg_dialect = crate::sql_classify::to_polyglot_dialect(dialect);
 
     let statements = parse(sql, pg_dialect).map_err(|e| anyhow::anyhow!("SQL parse error: {e}"))?;
 
@@ -137,28 +137,6 @@ pub fn interpolate_params(
     }
 
     Ok(parts.join(";\n"))
-}
-
-/// Map a [`SqlDialect`] to the corresponding [`polyglot_sql::DialectType`].
-fn to_polyglot_dialect(d: &SqlDialect) -> polyglot_sql::DialectType {
-    use polyglot_sql::DialectType;
-    match d {
-        SqlDialect::Trino => DialectType::Trino,
-        SqlDialect::Athena => DialectType::Athena,
-        SqlDialect::DuckDb => DialectType::DuckDB,
-        SqlDialect::StarRocks => DialectType::StarRocks,
-        SqlDialect::ClickHouse => DialectType::ClickHouse,
-        SqlDialect::MySql => DialectType::MySQL,
-        SqlDialect::Postgres => DialectType::PostgreSQL,
-        SqlDialect::Sqlite => DialectType::SQLite,
-        SqlDialect::Snowflake => DialectType::Snowflake,
-        SqlDialect::BigQuery => DialectType::BigQuery,
-        SqlDialect::Databricks => DialectType::Databricks,
-        SqlDialect::MsSql => DialectType::TSQL,
-        SqlDialect::Redshift => DialectType::Redshift,
-        SqlDialect::Exasol => DialectType::Exasol,
-        SqlDialect::Generic | SqlDialect::Sqlglot(_) => DialectType::Generic,
-    }
 }
 
 // ---------------------------------------------------------------------------

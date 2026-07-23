@@ -315,6 +315,7 @@ impl SyncAdapter for StarRocksAdapter {
         _credentials: &queryflux_auth::QueryCredentials,
         tags: &QueryTags,
         params: &queryflux_core::params::QueryParams,
+        _hints: queryflux_core::sql_classify::ExecutionHints,
     ) -> Result<SyncExecution> {
         let mut conn = self.acquire_conn().await?;
 

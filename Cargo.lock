@@ -3935,7 +3935,6 @@ dependencies = [
  "duckdb",
  "futures",
  "mysql_async",
- "polyglot-sql 0.3.2",
  "queryflux-auth",
  "queryflux-core",
  "r2d2",

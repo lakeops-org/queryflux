@@ -243,6 +243,7 @@ impl SyncAdapter for DuckDbHttpAdapter {
         _credentials: &QueryCredentials,
         _tags: &QueryTags,
         _params: &queryflux_core::params::QueryParams,
+        _hints: queryflux_core::sql_classify::ExecutionHints,
     ) -> Result<SyncExecution> {
         debug!(cluster = %self.cluster_name, "Executing DuckDB HTTP query");
         let response = self.run_query(sql).await?;

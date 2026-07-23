@@ -106,6 +106,7 @@ mod tests {
                 user: None,
                 agent_context: None,
                 query_tags: &self.query_tags,
+                sql_parse: None,
             }
         }
     }

@@ -153,6 +153,7 @@ impl SyncAdapter for DuckDbAdapter {
         _credentials: &queryflux_auth::QueryCredentials,
         _tags: &QueryTags,
         params: &QueryParams,
+        _hints: queryflux_core::sql_classify::ExecutionHints,
     ) -> Result<SyncExecution> {
         debug!(cluster = %self.cluster_name, "Executing DuckDB query as Arrow");
         let conn = Arc::clone(&self.conn);

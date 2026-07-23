@@ -181,6 +181,7 @@ pub trait SyncAdapter: Send + Sync {
         credentials: &queryflux_auth::QueryCredentials,
         tags: &queryflux_core::tags::QueryTags,
         params: &queryflux_core::params::QueryParams,
+        hints: queryflux_core::sql_classify::ExecutionHints,
     ) -> Result<SyncExecution>;
     fn engine_type(&self) -> queryflux_core::query::EngineType;
     /// Target dialect for SQL translation (may differ from `engine_type().dialect()`, e.g. Flight SQL + arbitrary sqlglot backend).
@@ -271,6 +272,7 @@ pub trait AsyncAdapter: Send + Sync {
         _credentials: &queryflux_auth::QueryCredentials,
         _tags: &queryflux_core::tags::QueryTags,
         _params: &queryflux_core::params::QueryParams,
+        _hints: queryflux_core::sql_classify::ExecutionHints,
     ) -> Result<SyncExecution> {
         Err(queryflux_core::error::QueryFluxError::SyncEngineRequired(
             "this engine only supports the async (HTTP submit-poll) protocol".to_string(),

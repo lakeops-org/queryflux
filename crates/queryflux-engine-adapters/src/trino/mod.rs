@@ -423,6 +423,7 @@ impl AsyncAdapter for TrinoAdapter {
         credentials: &queryflux_auth::QueryCredentials,
         tags: &queryflux_core::tags::QueryTags,
         params: &queryflux_core::params::QueryParams,
+        _hints: queryflux_core::sql_classify::ExecutionHints,
     ) -> crate::Result<crate::SyncExecution> {
         use crate::SyncExecution;
         use queryflux_core::query::QueryPollResult;

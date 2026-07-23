@@ -70,7 +70,14 @@ async fn count_arrow_rows(adapter: &AdbcAdapter, sql: &str) -> usize {
     let creds = QueryCredentials::ServiceAccount;
     let tags = QueryTags::new();
     let mut exec = adapter
-        .execute_as_arrow(sql, &session, &creds, &tags, &vec![])
+        .execute_as_arrow(
+            sql,
+            &session,
+            &creds,
+            &tags,
+            &vec![],
+            queryflux_core::sql_classify::ExecutionHints::default(),
+        )
         .await
         .expect("execute_as_arrow");
     let mut total = 0usize;

@@ -393,6 +393,7 @@ impl AsyncAdapter for AthenaAdapter {
         _credentials: &queryflux_auth::QueryCredentials,
         _tags: &queryflux_core::tags::QueryTags,
         params: &queryflux_core::params::QueryParams,
+        _hints: queryflux_core::sql_classify::ExecutionHints,
     ) -> crate::Result<crate::SyncExecution> {
         use crate::SyncExecution;
         use futures::stream;

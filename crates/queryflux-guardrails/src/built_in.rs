@@ -3,28 +3,25 @@ use polyglot_sql::{
     expressions::{Expression, Literal},
     DialectType,
 };
-use queryflux_core::query::{EngineType, SqlDialect};
+use queryflux_core::query::EngineType;
+use queryflux_core::sql_classify::{is_read_like_fallback, is_read_stmt, to_polyglot_dialect};
 
 use crate::context::{GuardContext, GuardLayer, GuardResult};
 
 fn engine_dialect(engine: &EngineType) -> DialectType {
-    match engine.dialect() {
-        SqlDialect::Trino => DialectType::Trino,
-        SqlDialect::Athena => DialectType::Athena,
-        SqlDialect::DuckDb => DialectType::DuckDB,
-        SqlDialect::StarRocks => DialectType::StarRocks,
-        SqlDialect::ClickHouse => DialectType::ClickHouse,
-        SqlDialect::MySql => DialectType::MySQL,
-        SqlDialect::Postgres => DialectType::PostgreSQL,
-        SqlDialect::Sqlite => DialectType::SQLite,
-        SqlDialect::Snowflake => DialectType::Snowflake,
-        SqlDialect::BigQuery => DialectType::BigQuery,
-        SqlDialect::Databricks => DialectType::Databricks,
-        SqlDialect::MsSql => DialectType::TSQL,
-        SqlDialect::Redshift => DialectType::Redshift,
-        SqlDialect::Exasol => DialectType::Exasol,
-        SqlDialect::Generic | SqlDialect::Sqlglot(_) => DialectType::Generic,
+    to_polyglot_dialect(&engine.dialect())
+}
+
+fn guard_statements<'a>(
+    ctx: &'a GuardContext<'a>,
+) -> Result<std::borrow::Cow<'a, [Expression]>, ()> {
+    if let Some(cache) = ctx.sql_parse {
+        return cache.statements().map(std::borrow::Cow::Borrowed).ok_or(());
     }
+
+    polyglot_sql::parse(ctx.translated_sql, engine_dialect(ctx.engine_type))
+        .map(std::borrow::Cow::Owned)
+        .map_err(|_| ())
 }
 
 /// The extension trait every guard implements.
@@ -50,9 +47,9 @@ impl Guard for ReadOnlyGuard {
         GuardLayer::Plan
     }
     async fn check(&self, ctx: &GuardContext<'_>) -> GuardResult {
-        match polyglot_sql::parse(ctx.translated_sql, engine_dialect(ctx.engine_type)) {
+        match guard_statements(ctx) {
             Ok(stmts) => {
-                for stmt in &stmts {
+                for stmt in stmts.iter() {
                     if !is_read_stmt(stmt) {
                         return GuardResult::deny(
                             "write operations are not permitted",
@@ -63,14 +60,7 @@ impl Guard for ReadOnlyGuard {
                 GuardResult::allow()
             }
             Err(_) => {
-                // Fall back to prefix heuristic when the parser cannot handle the dialect.
-                let trimmed = ctx.translated_sql.trim_start().to_uppercase();
-                let is_read = trimmed.starts_with("SELECT")
-                    || trimmed.starts_with("WITH")
-                    || trimmed.starts_with("SHOW")
-                    || trimmed.starts_with("DESCRIBE")
-                    || trimmed.starts_with("EXPLAIN");
-                if is_read {
+                if is_read_like_fallback(ctx.translated_sql) {
                     GuardResult::allow()
                 } else {
                     GuardResult::deny("write operations are not permitted", "READ_ONLY_VIOLATION")
@@ -78,20 +68,6 @@ impl Guard for ReadOnlyGuard {
             }
         }
     }
-}
-
-fn is_read_stmt(expr: &Expression) -> bool {
-    matches!(
-        expr,
-        Expression::Select(_)
-            | Expression::Union(_)
-            | Expression::Intersect(_)
-            | Expression::Except(_)
-            | Expression::Subquery(_)
-            | Expression::Describe(_)
-            | Expression::Show(_)
-            | Expression::Command(_)
-    )
 }
 
 // ---------------------------------------------------------------------------
@@ -111,9 +87,9 @@ impl Guard for RowLimitGuard {
         GuardLayer::Plan
     }
     async fn check(&self, ctx: &GuardContext<'_>) -> GuardResult {
-        match polyglot_sql::parse(ctx.translated_sql, engine_dialect(ctx.engine_type)) {
+        match guard_statements(ctx) {
             Ok(stmts) => {
-                for stmt in &stmts {
+                for stmt in stmts.iter() {
                     if !is_read_stmt(stmt) {
                         continue;
                     }
@@ -206,9 +182,9 @@ impl Guard for RequirePredicateGuard {
         GuardLayer::Plan
     }
     async fn check(&self, ctx: &GuardContext<'_>) -> GuardResult {
-        match polyglot_sql::parse(ctx.translated_sql, engine_dialect(ctx.engine_type)) {
+        match guard_statements(ctx) {
             Ok(stmts) => {
-                for stmt in &stmts {
+                for stmt in stmts.iter() {
                     if select_lacks_where(stmt, &self.applies_to) {
                         return GuardResult::deny(
                             "query must include a WHERE predicate",
@@ -363,6 +339,7 @@ mod tests {
                 user: None,
                 agent_context: None,
                 query_tags: &self.query_tags,
+                sql_parse: None,
             }
         }
     }

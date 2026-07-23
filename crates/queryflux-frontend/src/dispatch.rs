@@ -309,6 +309,8 @@ pub async fn dispatch_query(
     // Global guards run first; per-group guards are appended after.
     let resolved_agent_ctx = session.resolved_agent_context();
     let mut all_guard_actions: Vec<queryflux_persistence::GuardAction> = Vec::new();
+    let sql_parse =
+        queryflux_core::sql_classify::SqlParseCache::new(sql.clone(), tgt_dialect.clone());
 
     let guard_ctx = GuardContext {
         sql: &original_sql,
@@ -318,6 +320,7 @@ pub async fn dispatch_query(
         user: session.user(),
         agent_context: resolved_agent_ctx.as_ref(),
         query_tags: &effective_tags,
+        sql_parse: Some(&sql_parse),
     };
 
     macro_rules! guard_deny {
@@ -926,14 +929,15 @@ impl DispatchAdapter {
         credentials: &QueryCredentials,
         tags: &queryflux_core::tags::QueryTags,
         params: &QueryParams,
+        hints: queryflux_core::sql_classify::ExecutionHints,
     ) -> Result<queryflux_engine_adapters::SyncExecution> {
         match self {
             Self::Sync(a) => {
-                a.execute_as_arrow(sql, session, credentials, tags, params)
+                a.execute_as_arrow(sql, session, credentials, tags, params, hints)
                     .await
             }
             Self::Async(a) => {
-                a.execute_as_arrow(sql, session, credentials, tags, params)
+                a.execute_as_arrow(sql, session, credentials, tags, params, hints)
                     .await
             }
         }
@@ -985,6 +989,8 @@ struct SyncQuerySetup {
     params: QueryParams,
     /// Guard actions collected by the guard chain (allow/warn). Merged into QueryOutcome.
     guard_actions: Vec<queryflux_persistence::GuardAction>,
+    /// Shared SQL parse cache — used by guardrails and execution hints.
+    sql_parse: queryflux_core::sql_classify::SqlParseCache,
 }
 
 /// The outcome of executing a sync query — everything record_query needs.
@@ -1217,7 +1223,7 @@ async fn setup_sync_query(
         cluster_config_id,
         engine_type,
         src_dialect,
-        tgt_dialect,
+        tgt_dialect: tgt_dialect.clone(),
         was_translated,
         translated_sql: if was_translated {
             Some(translated.clone())
@@ -1231,7 +1237,8 @@ async fn setup_sync_query(
 
     Ok(SyncQuerySetup {
         adapter,
-        translated,
+        translated: translated.clone(),
+        sql_parse: queryflux_core::sql_classify::SqlParseCache::new(translated, tgt_dialect),
         start,
         slot,
         ctx,
@@ -1263,6 +1270,9 @@ async fn execute_stream(
             &setup.credentials,
             &setup.ctx.query_tags,
             &setup.params,
+            queryflux_core::sql_classify::ExecutionHints {
+                is_read_like: Some(setup.sql_parse.is_read_like()),
+            },
         )
         .await
     {
@@ -1494,6 +1504,10 @@ async fn run_plan_guards(
 ) -> std::result::Result<Vec<queryflux_persistence::GuardAction>, String> {
     let engine_type = queryflux_core::query::EngineType::Cache;
     let resolved_agent_ctx = session.resolved_agent_context();
+    let sql_parse = queryflux_core::sql_classify::SqlParseCache::new(
+        sql.to_string(),
+        queryflux_core::query::SqlDialect::Generic,
+    );
     let guard_ctx = GuardContext {
         sql,
         translated_sql: sql,
@@ -1502,6 +1516,7 @@ async fn run_plan_guards(
         user: session.user(),
         agent_context: resolved_agent_ctx.as_ref(),
         query_tags: effective_tags,
+        sql_parse: Some(&sql_parse),
     };
 
     let mut all_actions = Vec::new();
@@ -1777,6 +1792,7 @@ async fn execute_to_sink_inner(
             user: ctx.session.user(),
             agent_context: ctx.agent_context.as_ref(),
             query_tags: &ctx.query_tags,
+            sql_parse: Some(&setup.sql_parse),
         };
 
         let mut all_actions: Vec<queryflux_persistence::GuardAction> = Vec::new();
