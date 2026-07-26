@@ -10,6 +10,9 @@ use queryflux_core::error::QueryFluxError;
 use queryflux_core::query::{ClusterGroupName, ClusterName};
 use queryflux_engine_adapters::adbc::AdbcFactory;
 use queryflux_engine_adapters::athena::{AthenaAdapter, AthenaConfig, AthenaFactory};
+use queryflux_engine_adapters::clickhouse::{
+    ClickHouseAdapter, ClickHouseConfig, ClickHouseFactory,
+};
 use queryflux_engine_adapters::duckdb::http::{
     DuckDbHttpAdapter, DuckDbHttpConfig, DuckDbHttpFactory,
 };
@@ -28,6 +31,7 @@ pub fn all_factories() -> Vec<Box<dyn EngineAdapterFactory>> {
         Box::new(DuckDbFactory),
         Box::new(DuckDbHttpFactory),
         Box::new(StarRocksFactory),
+        Box::new(ClickHouseFactory),
         Box::new(AthenaFactory),
         Box::new(AdbcFactory),
     ]
@@ -120,7 +124,12 @@ pub async fn build_adapter(
             ))
         }
         EngineConfig::ClickHouse => {
-            anyhow::bail!("Engine ClickHouse not yet implemented")
+            let config = ClickHouseConfig::from_cluster_config(cluster_cfg, cluster_name_str)
+                .map_err(map_qf_err)?;
+            AdapterKind::Sync(Arc::new(
+                ClickHouseAdapter::new(cluster_name, placeholder_group, config)
+                    .map_err(map_qf_err)?,
+            ))
         }
         EngineConfig::Adbc => {
             anyhow::bail!("ADBC clusters must be created via the admin API, not YAML config")
