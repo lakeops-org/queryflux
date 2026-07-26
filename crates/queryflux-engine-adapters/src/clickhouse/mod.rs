@@ -306,15 +306,21 @@ fn find_exception_frame(body: &[u8], tag: &str) -> Option<String> {
     // The frame closes with `\r\n<message_length> <TAG>\r\n__exception__\r\n`.
     let close_suffix = format!(" {tag}\r\n__exception__\r\n");
     let close_at = find_last(rest, close_suffix.as_bytes())?;
-    // Walk back over the message-length digits and the `\r\n` preceding them.
+    // Walk back over the message-length digits and the newline preceding them.
+    // Observed on 26.7 the separator is a bare `\n` (the docs say `\r\n`) —
+    // accept either.
     let mut msg_end = close_at;
     while msg_end > 0 && rest[msg_end - 1].is_ascii_digit() {
         msg_end -= 1;
     }
-    let msg_end = msg_end
-        .checked_sub(2)
-        .filter(|_| rest.get(msg_end.wrapping_sub(2)..msg_end) == Some(b"\r\n".as_slice()))?;
-    Some(String::from_utf8_lossy(&rest[..msg_end]).into_owned())
+    let sep_len = if msg_end >= 2 && &rest[msg_end - 2..msg_end] == b"\r\n" {
+        2
+    } else if msg_end >= 1 && rest[msg_end - 1] == b'\n' {
+        1
+    } else {
+        return None;
+    };
+    Some(String::from_utf8_lossy(&rest[..msg_end - sep_len]).into_owned())
 }
 
 fn find_last(haystack: &[u8], needle: &[u8]) -> Option<usize> {
@@ -650,7 +656,23 @@ mod tests {
 
     const TAG: &str = "yqftqimeegydpouu";
 
+    /// Byte-exact real-server framing (verified against ClickHouse 26.7):
+    /// bare `\n` between message and length line.
     fn framed(message: &str) -> Vec<u8> {
+        let mut body = b"some arrow bytes".to_vec();
+        body.extend_from_slice(
+            format!(
+                "\r\n__exception__\r\n{TAG}\r\n{message}\n{} {TAG}\r\n__exception__\r\n",
+                message.len()
+            )
+            .as_bytes(),
+        );
+        body
+    }
+
+    /// The framing the ClickHouse docs describe (`\r\n` separator) — accepted
+    /// too in case other versions emit it.
+    fn framed_crlf(message: &str) -> Vec<u8> {
         let mut body = b"some arrow bytes".to_vec();
         body.extend_from_slice(
             format!(
@@ -668,6 +690,15 @@ mod tests {
         assert_eq!(
             find_exception_frame(&body, TAG).as_deref(),
             Some("Code: 395. DB::Exception: Value passed to 'throwIf'.")
+        );
+    }
+
+    #[test]
+    fn exception_frame_with_crlf_separator_is_extracted() {
+        let body = framed_crlf("Code: 395. DB::Exception: boom.");
+        assert_eq!(
+            find_exception_frame(&body, TAG).as_deref(),
+            Some("Code: 395. DB::Exception: boom.")
         );
     }
 

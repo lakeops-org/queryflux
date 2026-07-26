@@ -99,6 +99,30 @@ async fn clickhouse_syntax_error_returns_error() {
     assert!(r.error.is_some(), "expected error for invalid SQL");
 }
 
+/// A query that fails AFTER ClickHouse sent HTTP 200 (mid-stream) must
+/// surface the server's exception text — proving `find_exception_frame`
+/// parses the real server's `__exception__` framing, not just fixtures.
+#[tokio::test]
+#[ignore = "requires ClickHouse — run with: make test-e2e"]
+async fn clickhouse_mid_stream_failure_surfaces_exception_message() {
+    require_group!(GROUP_CLICKHOUSE);
+    let r = client()
+        .execute_on(
+            "SELECT throwIf(number = 5000000) FROM system.numbers LIMIT 10000000 \
+             SETTINGS max_block_size = 65536",
+            GROUP_CLICKHOUSE,
+        )
+        .await
+        .expect("request succeeded");
+    let err = r
+        .error
+        .expect("expected mid-stream failure to surface as an error");
+    assert!(
+        err.contains("throwIf") || err.contains("DB::Exception"),
+        "expected the ClickHouse exception text from the __exception__ frame, got: {err}"
+    );
+}
+
 #[tokio::test]
 #[ignore = "requires ClickHouse — run with: make test-e2e"]
 async fn clickhouse_empty_result() {
