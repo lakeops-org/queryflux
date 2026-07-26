@@ -122,7 +122,7 @@ QueryExecution::Sync { result: QueryPollResult }
 | Trino | Async | Submit → poll `nextUri` until done |
 | DuckDB | Sync | Runs on `spawn_blocking`, result available immediately |
 | StarRocks | Sync | MySQL protocol, single round-trip |
-| ClickHouse | — | Planned |
+| ClickHouse | Sync | HTTP interface, `ArrowStream` response decoded to Arrow record batches |
 
 ### EngineAdapterTrait (`queryflux-engine-adapters`)
 
@@ -192,7 +192,7 @@ pub trait RouterTrait: Send + Sync {
 | DuckDB | **Done** | `Arrow` | Sync embedded — `spawn_blocking` + Arrow result set |
 | StarRocks | **Done** | `MysqlWire` | Sync — `mysql_async` pool; native path (zero Arrow) for MySQL wire clients |
 | Athena | **Done** | `Arrow` | Async AWS SDK — `StartQueryExecution` → poll → `GetQueryResults` |
-| ClickHouse | Planned | `MysqlWire` / `Arrow` / `ClickHouseHttp` | Depends on configured connection type |
+| ClickHouse | **Done** | `Arrow` | Sync — HTTP interface (`default_format=ArrowStream`), Arrow result set |
 
 ### Routers
 
@@ -375,4 +375,5 @@ curl -s -X POST http://localhost:8080/v1/statement \
 | P1 | Athena backend | **Done** |
 | P1 | Authentication / authorization (`queryflux-auth`) | **Done** |
 | P2 | Wire `SchemaContext` from catalog into dispatch | Planned |
-| P3 | ClickHouse HTTP backend + frontend | Planned |
+| P3 | ClickHouse backend (HTTP, Arrow) | **Done** |
+| P3 | ClickHouse HTTP frontend | Planned |

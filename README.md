@@ -75,7 +75,7 @@ routers:
 - DuckDB — embedded, in-process execution
 - StarRocks — MySQL wire protocol
 - Athena — AWS SDK, async polling
-- ClickHouse — planned
+- ClickHouse — HTTP interface, Arrow results
 
 **Routing**
 - Protocol-based (route by client connection type)
