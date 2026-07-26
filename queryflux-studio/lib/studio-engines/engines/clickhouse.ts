@@ -11,7 +11,7 @@ export const clickHouseStudioEngine: StudioEngineModule = {
     defaultPort: 8123,
     endpointExample: "http://clickhouse:8123",
     supportedAuth: ["basic"],
-    implemented: false,
+    implemented: true,
     configFields: [
       {
         key: "endpoint",
