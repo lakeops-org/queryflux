@@ -46,6 +46,14 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Cap on error-body text included in error messages.
 const MAX_ERROR_BODY: usize = 2000;
 
+/// Cap on error-response bodies read off the wire — exception text is small.
+const MAX_ERROR_RESPONSE_BYTES: usize = 64 * 1024;
+
+/// The exception frame is appended at the tail of the body (≤16 KiB per the
+/// ClickHouse docs) — bound the reverse scan so large successful results do
+/// not pay a full-buffer scan looking for a frame that isn't there.
+const EXCEPTION_SCAN_WINDOW: usize = 64 * 1024;
+
 /// Default cap on the buffered result body (`maxResultBufferBytes` config).
 /// ClickHouse has infinite virtual tables (`system.numbers`,
 /// `generateRandom()`, …) — without a cap, one unbounded SELECT would grow
@@ -267,9 +275,10 @@ impl ClickHouseAdapter {
 
     /// Run a control-plane query (catalog listing, process counts) and return
     /// the response body as non-empty TSV lines. Values are NOT unescaped —
-    /// callers that surface identifiers apply [`tsv_unescape`].
+    /// callers that surface identifiers apply [`tsv_unescape`]. Hardened like
+    /// the Arrow path: capped read, exception-frame scan, aborts propagate.
     async fn run_query_lines(&self, sql: &str) -> Result<Vec<String>> {
-        let resp = self
+        let mut resp = self
             .query_request(sql, "TSV")
             .timeout(CONTROL_TIMEOUT)
             .send()
@@ -277,16 +286,74 @@ impl ClickHouseAdapter {
             .map_err(|e| QueryFluxError::Engine(format!("ClickHouse request failed: {e}")))?;
         let status = resp.status();
         let exception_code = header_string(&resp, "x-clickhouse-exception-code");
-        let body = resp.text().await.unwrap_or_default();
+        let exception_tag = header_string(&resp, "x-clickhouse-exception-tag");
         if !status.is_success() {
+            let body = read_error_body(&mut resp).await;
             return Err(clickhouse_http_error(status, exception_code, &body));
         }
-        Ok(body
+        let (body, transfer_error) =
+            read_body_capped(&mut resp, self.max_result_buffer_bytes).await?;
+        if let Some(tag) = &exception_tag {
+            if let Some(msg) = find_exception_frame(&body, tag) {
+                return Err(QueryFluxError::Engine(format!(
+                    "ClickHouse query failed mid-stream: {}",
+                    msg.trim()
+                )));
+            }
+        }
+        if let Some(e) = transfer_error {
+            return Err(QueryFluxError::Engine(format!(
+                "ClickHouse response aborted mid-stream: {e}"
+            )));
+        }
+        Ok(String::from_utf8_lossy(&body)
             .lines()
             .filter(|l| !l.is_empty())
             .map(String::from)
             .collect())
     }
+}
+
+/// Read a response body up to `cap` bytes. A mid-stream transfer error is
+/// returned alongside the bytes received so far — ClickHouse aborts the
+/// chunked encoding on post-200 failures, and callers must scan those bytes
+/// for the exception frame before treating the abort as a transport error.
+async fn read_body_capped(
+    resp: &mut reqwest::Response,
+    cap: usize,
+) -> Result<(Vec<u8>, Option<reqwest::Error>)> {
+    let mut body: Vec<u8> = Vec::new();
+    loop {
+        match resp.chunk().await {
+            Ok(Some(chunk)) => {
+                if body.len() + chunk.len() > cap {
+                    return Err(QueryFluxError::Engine(format!(
+                        "ClickHouse result exceeded the {cap}-byte buffered-result cap; \
+                         add a LIMIT, narrow the query, or raise maxResultBufferBytes"
+                    )));
+                }
+                body.extend_from_slice(&chunk);
+            }
+            Ok(None) => return Ok((body, None)),
+            Err(e) => return Ok((body, Some(e))),
+        }
+    }
+}
+
+/// Read an error-response body, capped — exception text is small, and an
+/// unbounded read would bypass the buffered-result protection.
+async fn read_error_body(resp: &mut reqwest::Response) -> String {
+    let mut body: Vec<u8> = Vec::new();
+    while body.len() < MAX_ERROR_RESPONSE_BYTES {
+        match resp.chunk().await {
+            Ok(Some(chunk)) => {
+                let room = MAX_ERROR_RESPONSE_BYTES - body.len();
+                body.extend_from_slice(&chunk[..chunk.len().min(room)]);
+            }
+            _ => break,
+        }
+    }
+    String::from_utf8_lossy(&body).into_owned()
 }
 
 /// Decode ClickHouse TSV escape sequences (`\\`, `\t`, `\n`, `\r`, `\b`,
@@ -345,6 +412,8 @@ fn header_string(resp: &reqwest::Response, name: &str) -> Option<String> {
 /// frame is present. Older servers splice plain error text into the stream
 /// instead; those surface as an Arrow decode / transfer error.
 fn find_exception_frame(body: &[u8], tag: &str) -> Option<String> {
+    // The frame only ever lives at the tail — search a bounded window.
+    let body = &body[body.len().saturating_sub(EXCEPTION_SCAN_WINDOW)..];
     let open = format!("\r\n__exception__\r\n{tag}\r\n");
     let start = find_last(body, open.as_bytes())?;
     let rest = &body[start + open.len()..];
@@ -418,6 +487,14 @@ fn escape_ident(ident: &str) -> String {
     format!("`{}`", ident.replace('\\', "\\\\").replace('`', "``"))
 }
 
+/// True when an error carries ClickHouse's UNKNOWN_TABLE (60) or
+/// UNKNOWN_DATABASE (81) exception code — the codes `clickhouse_http_error`
+/// embeds in the message it formats.
+fn is_unknown_table_error(e: &QueryFluxError) -> bool {
+    let msg = e.to_string();
+    msg.contains("exception code 60)") || msg.contains("exception code 81)")
+}
+
 #[async_trait]
 impl crate::SyncAdapter for ClickHouseAdapter {
     async fn execute_as_arrow(
@@ -451,34 +528,15 @@ impl crate::SyncAdapter for ClickHouseAdapter {
         let exception_tag = header_string(&resp, "x-clickhouse-exception-tag");
 
         if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
+            let body = read_error_body(&mut resp).await;
             return Err(clickhouse_http_error(status, exception_code, &body));
         }
 
         // Buffer the body, tolerating a mid-stream abort: ClickHouse kills the
         // chunked encoding when a query fails after 200 was already sent, and
         // the exception frame is in the bytes received so far.
-        let mut body: Vec<u8> = Vec::new();
-        let mut transfer_error: Option<reqwest::Error> = None;
-        loop {
-            match resp.chunk().await {
-                Ok(Some(chunk)) => {
-                    if body.len() + chunk.len() > self.max_result_buffer_bytes {
-                        return Err(QueryFluxError::Engine(format!(
-                            "ClickHouse result exceeded the {}-byte buffered-result cap; \
-                             add a LIMIT, narrow the query, or raise maxResultBufferBytes",
-                            self.max_result_buffer_bytes
-                        )));
-                    }
-                    body.extend_from_slice(&chunk);
-                }
-                Ok(None) => break,
-                Err(e) => {
-                    transfer_error = Some(e);
-                    break;
-                }
-            }
-        }
+        let (body, transfer_error) =
+            read_body_capped(&mut resp, self.max_result_buffer_bytes).await?;
 
         // A post-200 failure appends a tag-framed exception block — check for
         // it before decoding so a failed query never yields partial batches.
@@ -567,7 +625,10 @@ impl crate::SyncAdapter for ClickHouseAdapter {
         );
         let lines = match self.run_query_lines(&sql).await {
             Ok(l) => l,
-            Err(_) => return Ok(None),
+            // Only a genuinely missing table/database maps to `None`;
+            // connectivity, auth, and timeout errors propagate.
+            Err(e) if is_unknown_table_error(&e) => return Ok(None),
+            Err(e) => return Err(e),
         };
         let columns = lines
             .iter()
@@ -786,6 +847,32 @@ mod tests {
     #[test]
     fn body_without_frame_returns_none() {
         assert_eq!(find_exception_frame(b"plain arrow bytes", TAG), None);
+    }
+
+    /// The tail-window bound must not lose a frame at the end of a large body.
+    #[test]
+    fn frame_is_found_behind_a_large_body() {
+        let mut body = vec![b'x'; EXCEPTION_SCAN_WINDOW * 4];
+        body.extend_from_slice(&framed("boom")[b"some arrow bytes".len()..]);
+        assert_eq!(find_exception_frame(&body, TAG).as_deref(), Some("boom"));
+    }
+
+    #[test]
+    fn unknown_table_codes_map_to_none_others_propagate() {
+        let unknown_table = QueryFluxError::Engine(
+            "ClickHouse query failed (HTTP 404 Not Found, exception code 60): Code: 60.".into(),
+        );
+        let unknown_db = QueryFluxError::Engine(
+            "ClickHouse query failed (HTTP 404 Not Found, exception code 81): Code: 81.".into(),
+        );
+        let timeout = QueryFluxError::Engine(
+            "ClickHouse query failed (HTTP 408 Request Timeout, exception code 159): ...".into(),
+        );
+        let transport = QueryFluxError::Engine("ClickHouse request failed: connect error".into());
+        assert!(is_unknown_table_error(&unknown_table));
+        assert!(is_unknown_table_error(&unknown_db));
+        assert!(!is_unknown_table_error(&timeout));
+        assert!(!is_unknown_table_error(&transport));
     }
 
     #[test]
