@@ -3,6 +3,7 @@
 /// Backends are optional and discovered via connectivity / env:
 ///   TRINO_URL         — default http://localhost:18081
 ///   STARROCKS_URL     — default mysql://root@localhost:9030 (matches docker-compose.test.yml)
+///   CLICKHOUSE_URL    — default http://localhost:18123 (ClickHouse HTTP interface)
 ///
 /// Lakekeeper / Iceberg (optional):
 ///   LAKEKEEPER_URL, MINIO_ENDPOINT — StarRocks external catalog DDL only.
@@ -29,6 +30,7 @@ use queryflux_core::{
     query::{ClusterGroupName, ClusterName, EngineType},
 };
 use queryflux_engine_adapters::{
+    clickhouse::{ClickHouseAdapter, ClickHouseConfig},
     duckdb::{DuckDbAdapter, DuckDbConfig},
     starrocks::StarRocksAdapter,
     trino::TrinoAdapter,
@@ -71,6 +73,7 @@ pub const GROUP_STARROCKS: &str = "starrocks";
 pub const GROUP_DUCKDB: &str = "duckdb";
 /// Set when Lakekeeper port is reachable (Iceberg tables seeded by e2e tests via Trino).
 pub const GROUP_LAKEKEEPER: &str = "lakekeeper";
+pub const GROUP_CLICKHOUSE: &str = "clickhouse";
 
 pub struct TestHarness {
     pub port: u16,
@@ -196,6 +199,42 @@ impl TestHarness {
 
         if let Some((cluster, sr)) = sr_adapter {
             adapters.insert(cluster.0.clone(), AdapterKind::Sync(sr));
+        }
+
+        // --- ClickHouse (HTTP interface, Arrow result path) ---
+        let ch_url = std::env::var("CLICKHOUSE_URL")
+            .unwrap_or_else(|_| "http://localhost:18123".to_string());
+        if is_clickhouse_ready(&ch_url).await {
+            let group = ClusterGroupName(GROUP_CLICKHOUSE.to_string());
+            let cluster = ClusterName("clickhouse-1".to_string());
+            let state = Arc::new(ClusterState::new(
+                cluster.clone(),
+                group.clone(),
+                None,
+                None,
+                EngineType::ClickHouse,
+                Some(ch_url.clone()),
+                8,
+                true,
+            ));
+            let adapter = Arc::new(
+                ClickHouseAdapter::new(
+                    cluster.clone(),
+                    group.clone(),
+                    ClickHouseConfig {
+                        endpoint: ch_url,
+                        auth: None,
+                        tls_skip_verify: false,
+                    },
+                )
+                .map_err(|e| anyhow!("ClickHouse adapter: {e}"))?,
+            );
+            group_states.insert(group.clone(), (vec![state], strategy_from_config(None)));
+            group_members.insert(GROUP_CLICKHOUSE.to_string(), vec![cluster.0.clone()]);
+            group_order.push(GROUP_CLICKHOUSE.to_string());
+            adapters.insert(cluster.0.clone(), AdapterKind::Sync(adapter));
+            available_groups.push(GROUP_CLICKHOUSE.to_string());
+            header_map.insert(GROUP_CLICKHOUSE.to_string(), group);
         }
 
         // --- DuckDB (always available — embedded, in-memory, no external dependency) ---
@@ -418,6 +457,15 @@ async fn is_starrocks_ready(url: &str) -> bool {
     };
     let host = parsed.host_str().unwrap_or("localhost");
     let port = parsed.port().unwrap_or(9030);
+    port_is_open(host, port).await
+}
+
+async fn is_clickhouse_ready(url: &str) -> bool {
+    let Ok(parsed) = reqwest::Url::parse(url) else {
+        return false;
+    };
+    let host = parsed.host_str().unwrap_or("localhost");
+    let port = parsed.port().unwrap_or(8123);
     port_is_open(host, port).await
 }
 
