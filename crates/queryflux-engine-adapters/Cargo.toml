@@ -25,6 +25,7 @@ aws-config = { version = "1", default-features = false, features = ["rustls"] }
 aws-credential-types = "1"
 aws-types = "1"
 url = "2"
+uuid = { version = "1", features = ["v4"] }
 adbc_core = "0.23"
 adbc_driver_manager = "0.23"
 r2d2 = "0.8"
