@@ -225,6 +225,8 @@ impl TestHarness {
                         endpoint: ch_url,
                         auth: None,
                         tls_skip_verify: false,
+                        max_result_buffer_bytes:
+                            queryflux_engine_adapters::clickhouse::DEFAULT_MAX_RESULT_BUFFER_BYTES,
                     },
                 )
                 .map_err(|e| anyhow!("ClickHouse adapter: {e}"))?,

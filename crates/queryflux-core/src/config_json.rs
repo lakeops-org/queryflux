@@ -144,6 +144,7 @@ pub fn cluster_config_from_persisted_json(
         workgroup: None,
         catalog: None,
         tls: None,
+        max_result_buffer_bytes: None,
         auth,
         query_auth,
     }

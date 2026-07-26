@@ -887,6 +887,11 @@ pub struct ClusterConfig {
     /// Default Athena catalog. Defaults to `"AwsDataCatalog"` when omitted.
     #[serde(default)]
     pub catalog: Option<String>,
+    /// Max bytes of a single query result QueryFlux buffers in memory
+    /// (`maxResultBufferBytes` in JSON/YAML). ClickHouse only; defaults to
+    /// 1 GiB when omitted. Other engines ignore this.
+    #[serde(default)]
+    pub max_result_buffer_bytes: Option<u64>,
     #[serde(default)]
     pub tls: Option<TlsConfig>,
     /// Type 1 credentials — service account used for health checks and (by default) query execution.

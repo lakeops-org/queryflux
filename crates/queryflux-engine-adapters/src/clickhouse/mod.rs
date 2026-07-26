@@ -46,16 +46,38 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Cap on error-body text included in error messages.
 const MAX_ERROR_BODY: usize = 2000;
 
-/// Cap on the buffered result body. ClickHouse has infinite virtual tables
-/// (`system.numbers`, `generateRandom()`, …) — without a cap, one unbounded
-/// SELECT would grow the buffer until the process is OOM-killed.
-const MAX_RESULT_BODY_BYTES: usize = 1 << 30; // 1 GiB
+/// Default cap on the buffered result body (`maxResultBufferBytes` config).
+/// ClickHouse has infinite virtual tables (`system.numbers`,
+/// `generateRandom()`, …) — without a cap, one unbounded SELECT would grow
+/// the buffer until the process is OOM-killed.
+pub const DEFAULT_MAX_RESULT_BUFFER_BYTES: usize = 1 << 30; // 1 GiB
 
 /// Parsed and validated configuration for a ClickHouse cluster.
 pub struct ClickHouseConfig {
     pub endpoint: String,
     pub auth: Option<ClusterAuth>,
     pub tls_skip_verify: bool,
+    /// Per-query buffered-result cap in bytes.
+    pub max_result_buffer_bytes: usize,
+}
+
+/// Parse the optional `maxResultBufferBytes` JSON field (positive integer).
+fn parse_max_result_buffer_from_json(
+    json: &serde_json::Value,
+    cluster_name: &str,
+) -> Result<usize> {
+    match json.get("maxResultBufferBytes") {
+        None => Ok(DEFAULT_MAX_RESULT_BUFFER_BYTES),
+        Some(v) => v
+            .as_u64()
+            .filter(|&n| n >= 1)
+            .and_then(|n| usize::try_from(n).ok())
+            .ok_or_else(|| {
+                QueryFluxError::Engine(format!(
+                    "cluster '{cluster_name}': maxResultBufferBytes must be a positive integer"
+                ))
+            }),
+    }
 }
 
 impl ClickHouseConfig {
@@ -87,6 +109,7 @@ impl crate::EngineConfigParseable for ClickHouseConfig {
             endpoint,
             auth,
             tls_skip_verify: json_tls_insecure_skip_verify(json),
+            max_result_buffer_bytes: parse_max_result_buffer_from_json(json, cluster_name)?,
         })
     }
 
@@ -95,10 +118,20 @@ impl crate::EngineConfigParseable for ClickHouseConfig {
             QueryFluxError::Engine(format!("cluster '{cluster_name}': missing endpoint"))
         })?;
         Self::reject_non_basic_auth(&cfg.auth, cluster_name)?;
+        let max_result_buffer_bytes = match cfg.max_result_buffer_bytes {
+            None => DEFAULT_MAX_RESULT_BUFFER_BYTES,
+            Some(0) => {
+                return Err(QueryFluxError::Engine(format!(
+                    "cluster '{cluster_name}': maxResultBufferBytes must be a positive integer"
+                )))
+            }
+            Some(n) => usize::try_from(n).unwrap_or(usize::MAX),
+        };
         Ok(Self {
             endpoint,
             auth: cfg.auth.clone(),
             tls_skip_verify: cfg.tls.as_ref().is_some_and(|t| t.insecure_skip_verify),
+            max_result_buffer_bytes,
         })
     }
 }
@@ -113,6 +146,8 @@ pub struct ClickHouseAdapter {
     endpoint: String,
     /// Basic-auth credentials (username, password) when configured.
     basic_auth: Option<(String, String)>,
+    /// Per-query buffered-result cap in bytes (`maxResultBufferBytes`).
+    max_result_buffer_bytes: usize,
     client: reqwest::Client,
 }
 
@@ -141,6 +176,7 @@ impl ClickHouseAdapter {
             group_name,
             endpoint: config.endpoint.trim_end_matches('/').to_string(),
             basic_auth,
+            max_result_buffer_bytes: config.max_result_buffer_bytes,
             client,
         })
     }
@@ -188,6 +224,15 @@ impl ClickHouseAdapter {
                     field_type: FieldType::Secret,
                     required: false,
                     example: None,
+                },
+                ConfigField {
+                    key: "maxResultBufferBytes",
+                    label: "Max result buffer (bytes)",
+                    description: "Per-query cap on the result bytes QueryFlux buffers in memory. \
+                                  Defaults to 1 GiB when omitted.",
+                    field_type: FieldType::Number,
+                    required: false,
+                    example: Some("1073741824"),
                 },
                 ConfigField {
                     key: "tls.insecureSkipVerify",
@@ -418,10 +463,11 @@ impl crate::SyncAdapter for ClickHouseAdapter {
         loop {
             match resp.chunk().await {
                 Ok(Some(chunk)) => {
-                    if body.len() + chunk.len() > MAX_RESULT_BODY_BYTES {
+                    if body.len() + chunk.len() > self.max_result_buffer_bytes {
                         return Err(QueryFluxError::Engine(format!(
-                            "ClickHouse result exceeded the {MAX_RESULT_BODY_BYTES}-byte \
-                             buffered-result cap; add a LIMIT or narrow the query"
+                            "ClickHouse result exceeded the {}-byte buffered-result cap; \
+                             add a LIMIT, narrow the query, or raise maxResultBufferBytes",
+                            self.max_result_buffer_bytes
                         )));
                     }
                     body.extend_from_slice(&chunk);
@@ -603,6 +649,31 @@ mod tests {
     }
 
     #[test]
+    fn result_buffer_cap_defaults_and_overrides() {
+        // Omitted → 1 GiB default.
+        let cfg =
+            ClickHouseConfig::from_json(&json!({"endpoint": "http://ch:8123"}), "ch-1").unwrap();
+        assert_eq!(cfg.max_result_buffer_bytes, DEFAULT_MAX_RESULT_BUFFER_BYTES);
+        // Explicit value wins.
+        let cfg = ClickHouseConfig::from_json(
+            &json!({"endpoint": "http://ch:8123", "maxResultBufferBytes": 65536}),
+            "ch-1",
+        )
+        .unwrap();
+        assert_eq!(cfg.max_result_buffer_bytes, 65536);
+        // Zero and non-integers are rejected.
+        for bad in [json!(0), json!("big"), json!(-1)] {
+            let err = ClickHouseConfig::from_json(
+                &json!({"endpoint": "http://ch:8123", "maxResultBufferBytes": bad}),
+                "ch-1",
+            )
+            .map(|_| ())
+            .unwrap_err();
+            assert!(err.to_string().contains("maxResultBufferBytes"));
+        }
+    }
+
+    #[test]
     fn from_json_rejects_bearer_auth() {
         let err = ClickHouseConfig::from_json(
             &json!({
@@ -631,6 +702,7 @@ mod tests {
             workgroup: None,
             catalog: None,
             tls: None,
+            max_result_buffer_bytes: None,
             auth: None,
             query_auth: None,
         };
