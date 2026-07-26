@@ -46,8 +46,12 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Cap on error-body text included in error messages.
 const MAX_ERROR_BODY: usize = 2000;
 
+/// Cap on the buffered result body. ClickHouse has infinite virtual tables
+/// (`system.numbers`, `generateRandom()`, …) — without a cap, one unbounded
+/// SELECT would grow the buffer until the process is OOM-killed.
+const MAX_RESULT_BODY_BYTES: usize = 1 << 30; // 1 GiB
+
 /// Parsed and validated configuration for a ClickHouse cluster.
-#[derive(Debug)]
 pub struct ClickHouseConfig {
     pub endpoint: String,
     pub auth: Option<ClusterAuth>,
@@ -99,6 +103,10 @@ impl crate::EngineConfigParseable for ClickHouseConfig {
     }
 }
 
+/// ClickHouse adapter — executes SQL over the HTTP interface (default port
+/// 8123) and decodes `ArrowStream` responses; sync/eager like the other sync
+/// adapters. See the module docs for exception-frame handling and catalog
+/// mapping.
 pub struct ClickHouseAdapter {
     pub cluster_name: ClusterName,
     pub group_name: ClusterGroupName,
@@ -184,8 +192,7 @@ impl ClickHouseAdapter {
                 ConfigField {
                     key: "tls.insecureSkipVerify",
                     label: "Skip TLS verification",
-                    description:
-                        "Accept invalid/self-signed TLS certificates (https endpoints only).",
+                    description: "Disable TLS certificate verification. Use only in development.",
                     field_type: FieldType::Boolean,
                     required: false,
                     example: Some("false"),
@@ -214,19 +221,15 @@ impl ClickHouseAdapter {
     }
 
     /// Run a control-plane query (catalog listing, process counts) and return
-    /// the response body as trimmed non-empty TSV lines.
+    /// the response body as non-empty TSV lines. Values are NOT unescaped —
+    /// callers that surface identifiers apply [`tsv_unescape`].
     async fn run_query_lines(&self, sql: &str) -> Result<Vec<String>> {
         let resp = self
             .query_request(sql, "TSV")
             .timeout(CONTROL_TIMEOUT)
             .send()
             .await
-            .map_err(|e| {
-                QueryFluxError::Engine(format!(
-                    "cluster '{}': ClickHouse request failed: {e}",
-                    self.cluster_name.0
-                ))
-            })?;
+            .map_err(|e| QueryFluxError::Engine(format!("ClickHouse request failed: {e}")))?;
         let status = resp.status();
         let exception_code = header_string(&resp, "x-clickhouse-exception-code");
         let body = resp.text().await.unwrap_or_default();
@@ -235,11 +238,34 @@ impl ClickHouseAdapter {
         }
         Ok(body
             .lines()
-            .map(str::trim_end)
             .filter(|l| !l.is_empty())
             .map(String::from)
             .collect())
     }
+}
+
+/// Decode ClickHouse TSV escape sequences (`\\`, `\t`, `\n`, `\r`, `\b`,
+/// `\f`, `\0`, `\'`). Unknown escapes pass the escaped character through.
+fn tsv_unescape(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    let mut chars = value.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('t') => out.push('\t'),
+            Some('n') => out.push('\n'),
+            Some('r') => out.push('\r'),
+            Some('b') => out.push('\u{8}'),
+            Some('f') => out.push('\u{c}'),
+            Some('0') => out.push('\0'),
+            Some(other) => out.push(other),
+            None => out.push('\\'),
+        }
+    }
+    out
 }
 
 /// Format a non-200 ClickHouse response as an engine error.
@@ -318,7 +344,7 @@ fn decode_arrow_stream(body: &[u8]) -> Result<Vec<RecordBatch>> {
 /// Line shape: `name\ttype\tdefault_type\tdefault_expression\t…`.
 fn parse_describe_line(line: &str) -> Option<ColumnDef> {
     let mut fields = line.split('\t');
-    let name = fields.next()?.to_string();
+    let name = tsv_unescape(fields.next()?);
     let raw_type = fields.next().unwrap_or("String");
     let (data_type, nullable) = strip_nullable(raw_type);
     Some(ColumnDef {
@@ -335,9 +361,10 @@ fn strip_nullable(raw: &str) -> (&str, bool) {
         .map_or((raw, false), |inner| (inner, true))
 }
 
-/// Backtick-escape a ClickHouse identifier.
+/// Backtick-escape a ClickHouse identifier. Backslashes are escaped too —
+/// ClickHouse interprets backslash escapes inside back-quoted identifiers.
 fn escape_ident(ident: &str) -> String {
-    format!("`{}`", ident.replace('`', "``"))
+    format!("`{}`", ident.replace('\\', "\\\\").replace('`', "``"))
 }
 
 #[async_trait]
@@ -364,12 +391,10 @@ impl crate::SyncAdapter for ClickHouseAdapter {
             req = req.query(&[("log_comment", tag_json.as_str())]);
         }
 
-        let mut resp = req.send().await.map_err(|e| {
-            QueryFluxError::Engine(format!(
-                "cluster '{}': ClickHouse request failed: {e}",
-                self.cluster_name.0
-            ))
-        })?;
+        let mut resp = req
+            .send()
+            .await
+            .map_err(|e| QueryFluxError::Engine(format!("ClickHouse request failed: {e}")))?;
         let status = resp.status();
         let exception_code = header_string(&resp, "x-clickhouse-exception-code");
         let exception_tag = header_string(&resp, "x-clickhouse-exception-tag");
@@ -386,7 +411,15 @@ impl crate::SyncAdapter for ClickHouseAdapter {
         let mut transfer_error: Option<reqwest::Error> = None;
         loop {
             match resp.chunk().await {
-                Ok(Some(chunk)) => body.extend_from_slice(&chunk),
+                Ok(Some(chunk)) => {
+                    if body.len() + chunk.len() > MAX_RESULT_BODY_BYTES {
+                        return Err(QueryFluxError::Engine(format!(
+                            "ClickHouse result exceeded the {MAX_RESULT_BODY_BYTES}-byte \
+                             buffered-result cap; add a LIMIT or narrow the query"
+                        )));
+                    }
+                    body.extend_from_slice(&chunk);
+                }
                 Ok(None) => break,
                 Err(e) => {
                     transfer_error = Some(e);
@@ -459,12 +492,14 @@ impl crate::SyncAdapter for ClickHouseAdapter {
     }
 
     async fn list_databases(&self, _catalog: &str) -> Result<Vec<String>> {
-        self.run_query_lines("SHOW DATABASES").await
+        let lines = self.run_query_lines("SHOW DATABASES").await?;
+        Ok(lines.iter().map(|l| tsv_unescape(l)).collect())
     }
 
     async fn list_tables(&self, _catalog: &str, database: &str) -> Result<Vec<String>> {
         let sql = format!("SHOW TABLES FROM {}", escape_ident(database));
-        self.run_query_lines(&sql).await
+        let lines = self.run_query_lines(&sql).await?;
+        Ok(lines.iter().map(|l| tsv_unescape(l)).collect())
     }
 
     async fn describe_table(
@@ -555,7 +590,9 @@ mod tests {
 
     #[test]
     fn from_json_missing_endpoint_errors() {
-        let err = ClickHouseConfig::from_json(&json!({}), "ch-1").unwrap_err();
+        let err = ClickHouseConfig::from_json(&json!({}), "ch-1")
+            .map(|_| ())
+            .unwrap_err();
         assert!(err.to_string().contains("missing endpoint"));
     }
 
@@ -569,6 +606,7 @@ mod tests {
             }),
             "ch-1",
         )
+        .map(|_| ())
         .unwrap_err();
         assert!(err.to_string().contains("only supports basic auth"));
     }
@@ -596,7 +634,9 @@ mod tests {
         cfg.auth = Some(ClusterAuth::Bearer {
             token: "tok".to_string(),
         });
-        let err = ClickHouseConfig::from_cluster_config(&cfg, "ch-1").unwrap_err();
+        let err = ClickHouseConfig::from_cluster_config(&cfg, "ch-1")
+            .map(|_| ())
+            .unwrap_err();
         assert!(err.to_string().contains("only supports basic auth"));
 
         cfg.auth = Some(ClusterAuth::Basic {
@@ -728,5 +768,29 @@ mod tests {
     fn idents_are_backtick_escaped() {
         assert_eq!(escape_ident("db"), "`db`");
         assert_eq!(escape_ident("we`ird"), "`we``ird`");
+        assert_eq!(escape_ident(r"back\slash"), r"`back\\slash`");
+    }
+
+    #[test]
+    fn tsv_escapes_are_decoded() {
+        assert_eq!(tsv_unescape(r"plain"), "plain");
+        assert_eq!(tsv_unescape(r"tab\there"), "tab\there");
+        assert_eq!(tsv_unescape(r"line\nbreak"), "line\nbreak");
+        assert_eq!(tsv_unescape(r"back\\slash"), r"back\slash");
+        assert_eq!(tsv_unescape(r"quote\'s"), "quote's");
+        // Unknown escape passes the escaped character through; trailing
+        // backslash is preserved.
+        assert_eq!(tsv_unescape(r"odd\z"), "oddz");
+        assert_eq!(tsv_unescape("trailing\\"), "trailing\\");
+    }
+
+    /// A TSV-escaped identifier from SHOW DATABASES round-trips through
+    /// decode + re-escape into a form ClickHouse parses back to the original.
+    #[test]
+    fn tsv_identifier_roundtrip() {
+        let listed = r"back\\slash"; // SHOW DATABASES output for `back\slash`
+        let decoded = tsv_unescape(listed);
+        assert_eq!(decoded, r"back\slash");
+        assert_eq!(escape_ident(&decoded), r"`back\\slash`");
     }
 }
