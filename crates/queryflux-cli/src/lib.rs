@@ -40,20 +40,27 @@ fn setup_env() {
                 }
             }
 
-            // Set PYTHONPATH by finding .venv/lib/python*/site-packages
+            // Set PYTHONPATH by finding .venv/lib/python*/site-packages or .venv/Lib/site-packages
             if std::env::var("PYTHONPATH").is_err() {
-                let lib_dir = venv_dir.join("lib");
-                if lib_dir.exists() {
-                    if let Ok(entries) = std::fs::read_dir(lib_dir) {
-                        for entry in entries.flatten() {
-                            let path = entry.path();
-                            if path.is_dir() {
-                                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                                    if name.starts_with("python") {
-                                        let site_packages = path.join("site-packages");
-                                        if site_packages.exists() {
-                                            if let Some(site_str) = site_packages.to_str() {
-                                                std::env::set_var("PYTHONPATH", site_str);
+                let mut site_pkg_path = None;
+
+                // Windows style: .venv/Lib/site-packages
+                let win_site = venv_dir.join("Lib").join("site-packages");
+                if win_site.exists() {
+                    site_pkg_path = Some(win_site);
+                } else {
+                    // POSIX style: .venv/lib/python*/site-packages
+                    let lib_dir = venv_dir.join("lib");
+                    if lib_dir.exists() {
+                        if let Ok(entries) = std::fs::read_dir(lib_dir) {
+                            for entry in entries.flatten() {
+                                let path = entry.path();
+                                if path.is_dir() {
+                                    if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                                        if name.starts_with("python") {
+                                            let site_packages = path.join("site-packages");
+                                            if site_packages.exists() {
+                                                site_pkg_path = Some(site_packages);
                                                 break;
                                             }
                                         }
@@ -63,25 +70,49 @@ fn setup_env() {
                         }
                     }
                 }
+
+                if let Some(path) = site_pkg_path {
+                    if let Some(site_str) = path.to_str() {
+                        std::env::set_var("PYTHONPATH", site_str);
+                    }
+                }
             }
         }
     }
 }
 
 /// Create a local Python virtual environment and install dependencies
-fn handle_install_deps() {
+fn handle_install_deps() -> std::io::Result<()> {
     println!("Creating Python virtual environment in .venv...");
-    let venv_status = std::process::Command::new("python3")
-        .args(["-m", "venv", ".venv"])
-        .status();
+
+    // Find python executable to use for venv creation
+    let py_cmds = if let Ok(pyo3_py) = std::env::var("PYO3_PYTHON") {
+        vec![pyo3_py]
+    } else {
+        vec!["python3".to_string(), "python".to_string()]
+    };
+
+    let mut venv_status = None;
+    for cmd in py_cmds {
+        if let Ok(status) = std::process::Command::new(&cmd)
+            .args(["-m", "venv", ".venv"])
+            .status()
+        {
+            venv_status = Some(status);
+            if status.success() {
+                break;
+            }
+        }
+    }
 
     match venv_status {
-        Ok(status) if status.success() => {
+        Some(status) if status.success() => {
             println!("✓ Virtual environment created successfully.");
         }
         _ => {
-            eprintln!("✗ Failed to create virtual environment. Ensure python3 and python3-venv are installed on the host.");
-            std::process::exit(1);
+            return Err(std::io::Error::other(
+                "Failed to create virtual environment. Ensure python3/python and python3-venv are installed.",
+            ));
         }
     }
 
@@ -106,18 +137,14 @@ fn handle_install_deps() {
         pip_cmd.arg("sqlglot");
     }
 
-    let pip_status = pip_cmd.status();
-
-    match pip_status {
-        Ok(status) if status.success() => {
-            println!("✓ Dependencies installed successfully.");
-            println!("\n✓ Dependency installation successful! You can now run QueryFlux.");
-            std::process::exit(0);
-        }
-        _ => {
-            eprintln!("✗ Failed to install dependencies. Make sure you have internet access.");
-            std::process::exit(1);
-        }
+    let pip_status = pip_cmd.status()?;
+    if pip_status.success() {
+        println!("✓ Dependencies installed successfully.");
+        Ok(())
+    } else {
+        Err(std::io::Error::other(
+            "Failed to install dependencies. Make sure you have internet access.",
+        ))
     }
 }
 
@@ -290,7 +317,22 @@ async fn handle_validation(config_path: &str) {
 
                 if confirmed {
                     println!();
-                    handle_install_deps();
+                    if let Err(err) = handle_install_deps() {
+                        eprintln!("✗ {}", err);
+                        std::process::exit(1);
+                    }
+
+                    // Re-setup env variables and re-check sqlglot
+                    setup_env();
+                    if let Err(e2) = queryflux_translation::TranslationService::new_sqlglot(vec![])
+                    {
+                        eprintln!(
+                            "✗ SQL translation check failed even after installation: {}",
+                            e2
+                        );
+                        std::process::exit(1);
+                    }
+                    println!("✓ Python interpreter and 'sqlglot' library successfully configured after auto-installation.");
                 } else {
                     eprintln!("\nTo run QueryFlux with SQL translation, please ensure that:");
                     eprintln!("  1. Python 3.10+ is installed on the host.");
@@ -315,7 +357,12 @@ pub async fn run_cli() -> String {
     setup_env();
 
     if cli.install_deps {
-        handle_install_deps();
+        if let Err(e) = handle_install_deps() {
+            eprintln!("✗ {}", e);
+            std::process::exit(1);
+        }
+        println!("\n✓ Dependency installation successful! You can now run QueryFlux.");
+        std::process::exit(0);
     }
 
     if cli.validate {

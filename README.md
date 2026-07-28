@@ -179,7 +179,7 @@ You can run QueryFlux natively with an embedded DuckDB engine without any contai
 git clone https://github.com/lakeops-org/queryflux.git
 cd queryflux
 
-# 2. Install the binary globally
+# 2. Install the binary globally (if linking fails, use `export DUCKDB_DOWNLOAD_LIB=1` before running this)
 cargo install --path crates/queryflux
 
 # 3. Automatically create a .venv and install Python dependencies (e.g., sqlglot)

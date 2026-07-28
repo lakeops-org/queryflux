@@ -3776,7 +3776,6 @@ version = "0.2.0"
 dependencies = [
  "anyhow",
  "chrono",
- "clap",
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",

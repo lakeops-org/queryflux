@@ -16,7 +16,8 @@ members = [
     "crates/queryflux-config",
     "crates/queryflux-metrics",
     "crates/queryflux-fingerprint",
-    "crates/queryflux-guardrails", "crates/queryflux-cli",
+    "crates/queryflux-guardrails",
+    "crates/queryflux-cli",
 ]
 
 [workspace.package]
