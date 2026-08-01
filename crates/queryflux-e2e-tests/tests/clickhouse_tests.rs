@@ -147,6 +147,12 @@ async fn exec_ok(c: &TrinoClient, sql: &str) -> queryflux_e2e_tests::trino_clien
 
 /// DDL and INSERT return an empty ArrowStream body; a full create → insert →
 /// select → drop cycle proves those paths and data round-tripping.
+///
+/// NOTE: the harness runs `TranslationService::disabled()`, so this SQL is
+/// native ClickHouse dialect (`UInt32`, `ENGINE = Memory`) sent as-is — the
+/// Trino→ClickHouse sqlglot translation path is NOT exercised here. Real
+/// clients go through translation, whose DDL coverage is a known limitation
+/// (see the PR #105 description).
 #[tokio::test]
 #[ignore = "requires ClickHouse — run with: make test-e2e"]
 async fn clickhouse_ddl_insert_select_roundtrip() {
