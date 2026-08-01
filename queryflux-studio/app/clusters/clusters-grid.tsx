@@ -919,6 +919,7 @@ const PERSISTED_CONFIG_ROW_ORDER: Array<{ key: string; label: string }> = [
     label: "Cluster SQL dialect (Flight SQL)",
   },
   { key: "poolSize", label: "Pool size" },
+  { key: "maxResultBufferBytes", label: "Max result buffer (bytes)" },
   { key: "region", label: "AWS region" },
   { key: "s3OutputLocation", label: "S3 output location" },
   { key: "workgroup", label: "Workgroup" },
