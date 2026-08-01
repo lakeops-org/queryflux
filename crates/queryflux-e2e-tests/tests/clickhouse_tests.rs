@@ -102,13 +102,21 @@ async fn clickhouse_syntax_error_returns_error() {
 /// A query that fails AFTER ClickHouse sent HTTP 200 (mid-stream) must
 /// surface the server's exception text — proving `find_exception_frame`
 /// parses the real server's `__exception__` framing, not just fixtures.
+///
+/// The throw fires in the second output block (100_000 > one 65_536-row
+/// block), after the server has flushed the first block and committed to
+/// HTTP 200 — verified against 26.3.17.56 (the CI image) and 26.8. The
+/// `mid-stream` assertion keeps the row count honest: if the failure ever
+/// arrives before streaming starts it degrades to a plain HTTP error and
+/// this test fails, instead of silently passing without exercising the
+/// framing parser.
 #[tokio::test]
 #[ignore = "requires ClickHouse — run with: make test-e2e"]
 async fn clickhouse_mid_stream_failure_surfaces_exception_message() {
     require_group!(GROUP_CLICKHOUSE);
     let r = client()
         .execute_on(
-            "SELECT throwIf(number = 5000000) FROM system.numbers LIMIT 10000000 \
+            "SELECT throwIf(number = 100000) FROM system.numbers LIMIT 200000 \
              SETTINGS max_block_size = 65536",
             GROUP_CLICKHOUSE,
         )
@@ -117,6 +125,10 @@ async fn clickhouse_mid_stream_failure_surfaces_exception_message() {
     let err = r
         .error
         .expect("expected mid-stream failure to surface as an error");
+    assert!(
+        err.contains("mid-stream"),
+        "expected the exception-frame path (adapter says 'failed mid-stream'), got: {err}"
+    );
     assert!(
         err.contains("throwIf") || err.contains("DB::Exception"),
         "expected the ClickHouse exception text from the __exception__ frame, got: {err}"
