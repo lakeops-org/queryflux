@@ -257,7 +257,9 @@ impl ClickHouseAdapter {
     /// Build a query request: SQL as the POST body, everything else as URL params.
     ///
     /// `query_id` is always set (one UUID per request) so queries are traceable
-    /// in `system.query_log` and killable via `KILL QUERY WHERE query_id = …`.
+    /// in `system.query_log`. Cancellation is NOT wired up: the sync adapter
+    /// path has no cancel hook, so a client disconnect does not `KILL QUERY`
+    /// on the ClickHouse side (tracked in #111).
     fn query_request(&self, sql: &str, format: &str) -> reqwest::RequestBuilder {
         let mut req = self
             .client
