@@ -410,18 +410,33 @@ fn header_string(resp: &reqwest::Response, name: &str) -> Option<String> {
 /// Since 25.11, a query that fails after HTTP 200 was sent appends
 /// `\r\n__exception__\r\n<TAG>\r\n<message>\r\n<len> <TAG>\r\n__exception__\r\n`
 /// to the body, where `<TAG>` is a random per-response tag pre-announced in the
-/// `X-ClickHouse-Exception-Tag` header. Returns the error message when the
-/// frame is present. Older servers splice plain error text into the stream
-/// instead; those surface as an Arrow decode / transfer error.
+/// `X-ClickHouse-Exception-Tag` header. Both `\r\n` and bare `\n` are
+/// accepted around every part of the frame (real 26.x servers already mix
+/// them: CRLF markers, LF message-length separator). Returns the error
+/// message when the frame is present. Older servers splice plain error text
+/// into the stream instead; those surface as an Arrow decode / transfer
+/// error.
 fn find_exception_frame(body: &[u8], tag: &str) -> Option<String> {
     // The frame only ever lives at the tail — search a bounded window.
     let body = &body[body.len().saturating_sub(EXCEPTION_SCAN_WINDOW)..];
-    let open = format!("\r\n__exception__\r\n{tag}\r\n");
-    let start = find_last(body, open.as_bytes())?;
-    let rest = &body[start + open.len()..];
-    // The frame closes with `\r\n<message_length> <TAG>\r\n__exception__\r\n`.
-    let close_suffix = format!(" {tag}\r\n__exception__\r\n");
-    let close_at = find_last(rest, close_suffix.as_bytes())?;
+    // Real servers put `\r\n` around the markers (verified on 26.3–26.8), yet
+    // the message-length separator is already a bare `\n` where the docs say
+    // `\r\n` — so accept both separators around the markers too, lest an
+    // LF-only server version slip a failed query past the scan.
+    let open_crlf = format!("\r\n__exception__\r\n{tag}\r\n");
+    let open_lf = format!("\n__exception__\n{tag}\n");
+    let (start, open_len) = [open_crlf, open_lf]
+        .iter()
+        .filter_map(|o| find_last(body, o.as_bytes()).map(|at| (at, o.len())))
+        .max_by_key(|&(at, _)| at)?;
+    let rest = &body[start + open_len..];
+    // The frame closes with `<sep><message_length> <TAG><sep>__exception__<sep>`.
+    let close_crlf = format!(" {tag}\r\n__exception__\r\n");
+    let close_lf = format!(" {tag}\n__exception__\n");
+    let close_at = [close_crlf, close_lf]
+        .iter()
+        .filter_map(|c| find_last(rest, c.as_bytes()))
+        .max()?;
     // Walk back over the message-length digits and the newline preceding them.
     // Observed on 26.7 the separator is a bare `\n` (the docs say `\r\n`) —
     // accept either.
@@ -835,6 +850,36 @@ mod tests {
             find_exception_frame(&body, TAG).as_deref(),
             Some("Code: 395. DB::Exception: boom.")
         );
+    }
+
+    /// Hypothetical LF-only framing (no server observed emitting it, but the
+    /// real servers already deviate from the docs on the length separator, so
+    /// the markers are parsed separator-agnostically too).
+    fn framed_lf(message: &str) -> Vec<u8> {
+        let mut body = b"some arrow bytes".to_vec();
+        body.extend_from_slice(
+            format!(
+                "\n__exception__\n{TAG}\n{message}\n{} {TAG}\n__exception__\n",
+                message.len()
+            )
+            .as_bytes(),
+        );
+        body
+    }
+
+    #[test]
+    fn exception_frame_with_lf_only_markers_is_extracted() {
+        let body = framed_lf("Code: 395. DB::Exception: boom.");
+        assert_eq!(
+            find_exception_frame(&body, TAG).as_deref(),
+            Some("Code: 395. DB::Exception: boom.")
+        );
+    }
+
+    #[test]
+    fn lf_only_frame_with_wrong_tag_returns_none() {
+        let body = framed_lf("boom");
+        assert_eq!(find_exception_frame(&body, "aaaaaaaaaaaaaaaa"), None);
     }
 
     #[test]
