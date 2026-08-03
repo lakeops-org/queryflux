@@ -35,6 +35,7 @@ export const MANAGED_CONFIG_JSON_KEYS = new Set([
   "role",
   "schema",
   "poolSize",
+  "maxResultBufferBytes",
 ]);
 
 function jsonScalarToString(v: unknown): string {
@@ -134,6 +135,7 @@ export function persistedClusterConfigToFlat(
     config.tlsInsecureSkipVerify === true ? "true" : "false";
 
   flat.poolSize = jsonScalarToString(config.poolSize);
+  flat.maxResultBufferBytes = jsonScalarToString(config.maxResultBufferBytes);
 
   if (descriptor) {
     for (const f of descriptor.configFields) {
@@ -178,6 +180,8 @@ export function flatToPersistedConfig(flat: Record<string, string>): Record<stri
   if (flat.schema?.trim()) cfg.schema = flat.schema.trim();
   const poolN = parsePositiveIntString(flat.poolSize);
   if (poolN !== undefined) cfg.poolSize = poolN;
+  const bufN = parsePositiveIntString(flat.maxResultBufferBytes);
+  if (bufN !== undefined) cfg.maxResultBufferBytes = bufN;
   return cfg;
 }
 
@@ -265,6 +269,15 @@ export function mergeClusterConfigFromFlat(
     } else delete out.poolSize;
   }
 
+  if (flat.maxResultBufferBytes !== undefined) {
+    const t = flat.maxResultBufferBytes.trim();
+    if (t) {
+      const n = parsePositiveIntString(flat.maxResultBufferBytes);
+      if (n !== undefined) out.maxResultBufferBytes = n;
+      else delete out.maxResultBufferBytes;
+    } else delete out.maxResultBufferBytes;
+  }
+
   return out;
 }
 
@@ -312,6 +325,8 @@ export function buildValidateShape(flat: Record<string, string>): Record<string,
   if (flat.schema) o.schema = flat.schema;
   const poolN = parsePositiveIntString(flat.poolSize);
   if (poolN !== undefined) o.poolSize = poolN;
+  const bufN = parsePositiveIntString(flat.maxResultBufferBytes);
+  if (bufN !== undefined) o.maxResultBufferBytes = bufN;
   const auth: Record<string, string> = {};
   if (flat["auth.type"]) auth.type = flat["auth.type"];
   if (flat["auth.username"]) auth.username = flat["auth.username"];

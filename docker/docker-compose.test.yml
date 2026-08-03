@@ -1,6 +1,6 @@
 # Lean compose file for E2E tests.
 #
-# Engines: Trino, StarRocks.
+# Engines: Trino, StarRocks, ClickHouse.
 # Iceberg stack: Postgres (Lakekeeper backend), MinIO, Lakekeeper.
 #
 # Usage:
@@ -55,6 +55,30 @@ services:
       timeout: 25s
       retries: 60
       start_period: 180s
+    networks:
+      - test_net
+
+  clickhouse:
+    # 26.3 is an LTS release (x.3 / x.8 are LTS; no `lts` tag exists on Docker Hub).
+    image: clickhouse/clickhouse-server:26.3.17.56
+    # Default user with empty password reachable from the network — tests only.
+    # Without this the image restricts the default user to localhost.
+    environment:
+      - CLICKHOUSE_SKIP_USER_SETUP=1
+    ports:
+      # Loopback-only: the test server has an empty-password default user.
+      - "127.0.0.1:18123:8123" # HTTP interface (adapter endpoint + /ping probe)
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    # /ping returns 200 once the server accepts queries; the image ships wget, not curl.
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://127.0.0.1:8123/ping"]
+      interval: 10s
+      timeout: 25s
+      retries: 30
+      start_period: 60s
     networks:
       - test_net
 

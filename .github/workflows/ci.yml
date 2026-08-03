@@ -219,15 +219,16 @@ jobs:
           echo "${HOME}/.local/bin" >> "${GITHUB_PATH}"
 
       # Same stack as `make test-e2e`, but split so "Engine logs" / `compose down` still run if `cargo test` fails.
-      - name: Start e2e Docker stack (Trino + StarRocks + sentinel)
+      - name: Start e2e Docker stack (Trino + StarRocks + ClickHouse + sentinel)
         run: |
-          docker compose -f docker/docker-compose.test.yml --project-directory . up -d --wait --wait-timeout 300 trino starrocks sentinel
+          docker compose -f docker/docker-compose.test.yml --project-directory . up -d --wait --wait-timeout 300 trino starrocks clickhouse sentinel
 
       - name: E2E tests (queryflux-e2e-tests)
         env:
           TRINO_URL: http://localhost:18081
           TRINO_ADBC_URI: http://localhost:18081
           STARROCKS_URL: mysql://root@localhost:9030
+          CLICKHOUSE_URL: http://localhost:18123
           LAKEKEEPER_URL: http://localhost:18181
           MINIO_ENDPOINT: localhost:19000
         run: |
@@ -238,6 +239,7 @@ jobs:
         run: |
           docker compose -f docker/docker-compose.test.yml --project-directory . logs --no-color --tail=200 trino || true
           docker compose -f docker/docker-compose.test.yml --project-directory . logs --no-color --tail=200 starrocks || true
+          docker compose -f docker/docker-compose.test.yml --project-directory . logs --no-color --tail=200 clickhouse || true
 
       - name: Stop e2e Docker stack
         if: always()

@@ -103,7 +103,7 @@ You normally **do not** edit `queryflux-persistence` for engine-specific JSON ke
 
 ### Unimplemented placeholder
 
-Until the adapter exists, **`EngineConfig::ClickHouse`** (or similar) may **`bail!`** inside **`build_adapter`**. Replace that with a real arm when you implement the adapter.
+Until the adapter exists, your `EngineConfig` variant may **`bail!("Engine <name> not yet implemented")`** inside **`build_adapter`** (ClickHouse used this pattern before its adapter landed). Replace that with a real arm when you implement the adapter.
 
 ---
 

@@ -1,5 +1,6 @@
 pub mod adbc;
 pub mod athena;
+pub mod clickhouse;
 pub mod duckdb;
 pub mod mysql_native;
 pub mod starrocks;
