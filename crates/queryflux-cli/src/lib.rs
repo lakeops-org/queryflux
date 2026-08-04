@@ -149,6 +149,10 @@ fn handle_install_deps() -> std::io::Result<()> {
 }
 
 fn config_requires_translation(config: &ProxyConfig) -> bool {
+    if !config.translation.python_scripts.is_empty() {
+        return true;
+    }
+
     let mut target_groups = vec![config.routing_fallback.clone()];
 
     for router in &config.routers {
@@ -294,7 +298,9 @@ async fn handle_validation(config_path: &str) {
     let requires_translation = config_requires_translation(&config);
 
     println!("Validating Python & sqlglot environment...");
-    match queryflux_translation::TranslationService::new_sqlglot(vec![]) {
+    match queryflux_translation::TranslationService::new_sqlglot(
+        config.translation.python_scripts.clone(),
+    ) {
         Ok(_) => {
             println!("✓ Python interpreter and 'sqlglot' library are available and correctly configured.");
         }
@@ -324,8 +330,9 @@ async fn handle_validation(config_path: &str) {
 
                     // Re-setup env variables and re-check sqlglot
                     setup_env();
-                    if let Err(e2) = queryflux_translation::TranslationService::new_sqlglot(vec![])
-                    {
+                    if let Err(e2) = queryflux_translation::TranslationService::new_sqlglot(
+                        config.translation.python_scripts.clone(),
+                    ) {
                         eprintln!(
                             "✗ SQL translation check failed even after installation: {}",
                             e2
