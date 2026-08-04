@@ -117,14 +117,19 @@ fn handle_install_deps() -> std::io::Result<()> {
     }
 
     let cwd = std::env::current_dir().unwrap_or_default();
-    let pip_path = if cfg!(windows) {
-        cwd.join(".venv/Scripts/pip.exe")
+    let venv_python = if cfg!(windows) {
+        cwd.join(".venv/Scripts/python.exe")
     } else {
-        cwd.join(".venv/bin/pip")
+        let py3 = cwd.join(".venv/bin/python3");
+        if py3.exists() {
+            py3
+        } else {
+            cwd.join(".venv/bin/python")
+        }
     };
 
-    let mut pip_cmd = std::process::Command::new(&pip_path);
-    pip_cmd.arg("install");
+    let mut pip_cmd = std::process::Command::new(&venv_python);
+    pip_cmd.args(["-m", "pip", "install"]);
 
     let req_path = cwd.join("requirements.txt");
     if req_path.exists() {
@@ -281,7 +286,7 @@ fn config_requires_translation(config: &ProxyConfig) -> bool {
     false
 }
 
-async fn handle_validation(config_path: &str) {
+async fn handle_validation(config_path: &str) -> anyhow::Result<()> {
     println!("Validating configuration file: {}", config_path);
     let config_res = YamlFileConfigProvider::new(config_path).load().await;
     let config = match config_res {
@@ -290,8 +295,10 @@ async fn handle_validation(config_path: &str) {
             c
         }
         Err(e) => {
-            eprintln!("✗ Failed to load or parse configuration file: {:?}", e);
-            std::process::exit(1);
+            return Err(anyhow::anyhow!(
+                "Failed to load or parse configuration file: {:?}",
+                e
+            ));
         }
     };
 
@@ -324,8 +331,7 @@ async fn handle_validation(config_path: &str) {
                 if confirmed {
                     println!();
                     if let Err(err) = handle_install_deps() {
-                        eprintln!("✗ {}", err);
-                        std::process::exit(1);
+                        return Err(anyhow::anyhow!(err));
                     }
 
                     // Re-setup env variables and re-check sqlglot
@@ -333,19 +339,16 @@ async fn handle_validation(config_path: &str) {
                     if let Err(e2) = queryflux_translation::TranslationService::new_sqlglot(
                         config.translation.python_scripts.clone(),
                     ) {
-                        eprintln!(
-                            "✗ SQL translation check failed even after installation: {}",
+                        return Err(anyhow::anyhow!(
+                            "SQL translation check failed even after installation: {}",
                             e2
-                        );
-                        std::process::exit(1);
+                        ));
                     }
                     println!("✓ Python interpreter and 'sqlglot' library successfully configured after auto-installation.");
                 } else {
-                    eprintln!("\nTo run QueryFlux with SQL translation, please ensure that:");
-                    eprintln!("  1. Python 3.10+ is installed on the host.");
-                    eprintln!("  2. 'sqlglot' package is installed in your Python environment (run: pip install sqlglot).");
-                    eprintln!("  3. If using a virtual environment (venv), activate it or run 'queryflux --install-deps'.");
-                    std::process::exit(1);
+                    return Err(anyhow::anyhow!(
+                        "To run QueryFlux with SQL translation, please ensure that:\n  1. Python 3.10+ is installed on the host.\n  2. 'sqlglot' package is installed in your Python environment (run: pip install sqlglot).\n  3. If using a virtual environment (venv), activate it or run 'queryflux --install-deps'."
+                    ));
                 }
             } else {
                 println!("✓ Python/sqlglot is not available ({}), but translation is not required for this configuration.", e);
@@ -354,27 +357,25 @@ async fn handle_validation(config_path: &str) {
     }
 
     println!("\n✓ Validation successful! Configuration and runtime dependencies are correctly configured.");
-    std::process::exit(0);
+    Ok(())
 }
 
-/// The main entry point for the CLI. Returns the config path.
-pub async fn run_cli() -> String {
+/// The main entry point for the CLI. Returns the config path if execution should continue.
+pub async fn run_cli() -> anyhow::Result<Option<String>> {
     let cli = Cli::parse();
 
     setup_env();
 
     if cli.install_deps {
-        if let Err(e) = handle_install_deps() {
-            eprintln!("✗ {}", e);
-            std::process::exit(1);
-        }
+        handle_install_deps()?;
         println!("\n✓ Dependency installation successful! You can now run QueryFlux.");
-        std::process::exit(0);
+        return Ok(None);
     }
 
     if cli.validate {
-        handle_validation(&cli.config).await;
+        handle_validation(&cli.config).await?;
+        return Ok(None);
     }
 
-    cli.config
+    Ok(Some(cli.config))
 }

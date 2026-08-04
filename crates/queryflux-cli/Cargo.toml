@@ -9,3 +9,4 @@ queryflux-core = { workspace = true }
 queryflux-config = { workspace = true }
 queryflux-translation = { workspace = true }
 clap = { version = "4", features = ["derive"] }
+anyhow = { workspace = true }

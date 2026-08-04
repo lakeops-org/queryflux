@@ -3857,6 +3857,7 @@ dependencies = [
 name = "queryflux-cli"
 version = "0.2.0"
 dependencies = [
+ "anyhow",
  "clap",
  "queryflux-config",
  "queryflux-core",

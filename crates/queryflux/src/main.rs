@@ -54,7 +54,10 @@ mod registered_engines;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let config_path = queryflux_cli::run_cli().await;
+    let config_path = match queryflux_cli::run_cli().await? {
+        Some(path) => path,
+        None => return Ok(()),
+    };
 
     // Load config before initializing the tracing subscriber so that
     // `otlpEndpoint` from the config file can feed the OTel layer.
