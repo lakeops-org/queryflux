@@ -39,7 +39,7 @@ use queryflux_core::{
     tags::{parse_query_tags, QueryTags},
 };
 
-use crate::abort::AbortOnDrop;
+use crate::abort::{wait_client_gone, AbortOnDrop};
 use crate::dispatch::{execute_to_sink, ResultSink};
 use crate::state::AppState;
 use crate::{FrontendListenerTrait, ShutdownRx};
@@ -160,7 +160,7 @@ async fn handle_connection(
     connection_id: u32,
 ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
     stream.set_nodelay(true)?;
-    let (mut reader, mut writer) = tokio::io::split(stream);
+    let (mut reader, mut writer) = stream.into_split();
 
     // Send server handshake.
     write_packet(&mut writer, 0, &build_handshake(connection_id)).await?;
@@ -275,18 +275,14 @@ async fn handle_connection(
 
 // ── Query execution ───────────────────────────────────────────────────────────
 
-async fn handle_com_query<R, W>(
-    reader: &mut R,
-    writer: &mut W,
+async fn handle_com_query(
+    reader: &mut tokio::net::tcp::OwnedReadHalf,
+    writer: &mut tokio::net::tcp::OwnedWriteHalf,
     state: &Arc<AppState>,
     session: &mut SessionContext,
     sql: &str,
     start_seq: u8,
-) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>>
-where
-    R: AsyncReadExt + Unpin,
-    W: AsyncWriteExt + Unpin,
-{
+) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Unwrap MySQL conditional comments: /*!40101 SET ... */ → SET ...
     let logical = strip_mysql_conditional_comment(sql);
     let sql_lower = logical.trim().to_lowercase();
@@ -437,12 +433,6 @@ where
     }
 
     Ok(())
-}
-
-/// Resolves when the client TCP stream is readable (typically EOF / next command).
-async fn wait_client_gone<R: AsyncReadExt + Unpin>(reader: &mut R) {
-    let mut buf = [0u8; 1];
-    let _ = reader.read(&mut buf).await;
 }
 
 // ── Synthetic result helpers ──────────────────────────────────────────────────

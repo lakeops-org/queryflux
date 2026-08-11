@@ -81,8 +81,9 @@ pub struct DuckDbAdapter {
     /// Interrupt handle — `interrupt()` is safe from another thread while a
     /// query holds the connection mutex.
     interrupt: Arc<duckdb::InterruptHandle>,
-    /// Backend id of the query currently running on `conn`, if any.
-    inflight: Mutex<Option<BackendQueryId>>,
+    /// Backend id of the query that currently owns `conn`, if any.
+    /// Written only while holding the connection mutex.
+    inflight: Arc<Mutex<Option<BackendQueryId>>>,
 }
 
 impl DuckDbAdapter {
@@ -104,7 +105,7 @@ impl DuckDbAdapter {
             group_name,
             conn: Arc::new(Mutex::new(conn)),
             interrupt,
-            inflight: Mutex::new(None),
+            inflight: Arc::new(Mutex::new(None)),
         })
     }
 }
@@ -180,39 +181,40 @@ impl SyncAdapter for DuckDbAdapter {
         debug!(cluster = %self.cluster_name, "Executing DuckDB query as Arrow");
         let query_id = BackendQueryId(uuid::Uuid::new_v4().to_string());
         id_slot.publish(query_id.0.clone());
-        {
-            let mut inflight = self.inflight.lock().unwrap_or_else(|e| e.into_inner());
-            *inflight = Some(query_id.clone());
-        }
 
         let conn = Arc::clone(&self.conn);
+        let inflight = Arc::clone(&self.inflight);
+        let id_for_task = query_id.clone();
         let sql = sql.to_string();
         let duckdb_params: Vec<duckdb::types::Value> =
             params.iter().map(query_param_to_duckdb).collect();
 
         let batches = tokio::task::spawn_blocking(move || {
             let guard = conn.lock().unwrap_or_else(|e| e.into_inner());
-            let mut stmt = guard
-                .prepare(&sql)
-                .map_err(|e| QueryFluxError::Engine(format!("DuckDB prepare failed: {e}")))?;
-            let arrow = stmt
-                .query_arrow(duckdb::params_from_iter(duckdb_params))
-                .map_err(|e| QueryFluxError::Engine(format!("DuckDB query failed: {e}")))?;
-            Ok::<_, QueryFluxError>(arrow.collect::<Vec<_>>())
+            // Claim ownership only once this task holds the connection, so
+            // `interrupt()` targets the statement actually running on `conn`.
+            *inflight.lock().unwrap_or_else(|e| e.into_inner()) = Some(id_for_task.clone());
+            let result = (|| {
+                let mut stmt = guard
+                    .prepare(&sql)
+                    .map_err(|e| QueryFluxError::Engine(format!("DuckDB prepare failed: {e}")))?;
+                let arrow = stmt
+                    .query_arrow(duckdb::params_from_iter(duckdb_params))
+                    .map_err(|e| QueryFluxError::Engine(format!("DuckDB query failed: {e}")))?;
+                Ok::<_, QueryFluxError>(arrow.collect::<Vec<_>>())
+            })();
+            {
+                let mut slot = inflight.lock().unwrap_or_else(|e| e.into_inner());
+                if slot.as_ref() == Some(&id_for_task) {
+                    *slot = None;
+                }
+            }
+            result
         })
         .await
-        .map_err(|e| QueryFluxError::Engine(format!("spawn_blocking failed: {e}")));
+        .map_err(|e| QueryFluxError::Engine(format!("spawn_blocking failed: {e}")))?;
 
-        // Clear only after the blocking work returns. If this future is dropped
-        // mid-query, `inflight` stays set so `cancel_query` can still interrupt.
-        {
-            let mut inflight = self.inflight.lock().unwrap_or_else(|e| e.into_inner());
-            if inflight.as_ref() == Some(&query_id) {
-                *inflight = None;
-            }
-        }
-
-        let batches = batches??;
+        let batches = batches?;
 
         let (tx, rx) = tokio::sync::oneshot::channel();
         // DuckDB does not expose structured engine stats (CPU time, bytes scanned, etc.)
@@ -619,6 +621,92 @@ mod tests {
         assert!(
             result.is_err(),
             "interrupted range() query should fail, got Ok(SyncExecution)"
+        );
+    }
+
+    #[tokio::test]
+    async fn interrupt_targets_the_running_query() {
+        use queryflux_auth::QueryCredentials;
+        use queryflux_core::query::{ClusterGroupName, ClusterName};
+
+        let adapter = std::sync::Arc::new(
+            DuckDbAdapter::new(
+                ClusterName("duck".into()),
+                ClusterGroupName("g".into()),
+                DuckDbConfig {
+                    database_path: None,
+                    motherduck_token: None,
+                },
+            )
+            .expect("open in-memory duckdb"),
+        );
+
+        let session = SessionContext::default();
+        let creds = QueryCredentials::ServiceAccount;
+        let tags = QueryTags::new();
+        let params: QueryParams = vec![];
+
+        let slot_a = BackendQueryIdSlot::new();
+        let slot_b = BackendQueryIdSlot::new();
+
+        let exec_a = {
+            let adapter = Arc::clone(&adapter);
+            let session = session.clone();
+            let creds = creds.clone();
+            let tags = tags.clone();
+            let params = params.clone();
+            let slot_a = slot_a.clone();
+            async move {
+                adapter
+                    .execute_as_arrow(
+                        "SELECT count(*) FROM range(1000000000)",
+                        &session,
+                        &creds,
+                        &tags,
+                        &params,
+                        &slot_a,
+                    )
+                    .await
+            }
+        };
+        let exec_b = {
+            let adapter = Arc::clone(&adapter);
+            let session = session.clone();
+            let creds = creds.clone();
+            let tags = tags.clone();
+            let params = params.clone();
+            let slot_b = slot_b.clone();
+            async move {
+                // Let A acquire the connection first.
+                tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+                adapter
+                    .execute_as_arrow("SELECT 1", &session, &creds, &tags, &params, &slot_b)
+                    .await
+            }
+        };
+        let cancel_a = {
+            let adapter = Arc::clone(&adapter);
+            async move {
+                for _ in 0..200 {
+                    if slot_a.get().is_some() {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                let id = slot_a.get().expect("backend id published");
+                adapter.cancel_query(&id).await.expect("cancel");
+            }
+        };
+
+        let (result_a, result_b, _) = tokio::join!(exec_a, exec_b, cancel_a);
+        assert!(
+            result_a.is_err(),
+            "canceled first query should fail, got Ok(SyncExecution)"
+        );
+        assert!(
+            result_b.is_ok(),
+            "second query should complete after the first is interrupted"
         );
     }
 }

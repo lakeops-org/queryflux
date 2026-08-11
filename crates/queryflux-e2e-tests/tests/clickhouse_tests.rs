@@ -321,7 +321,6 @@ async fn routing_same_sql_trino_and_clickhouse() {
 #[ignore = "requires ClickHouse — run with: make test-e2e"]
 async fn clickhouse_client_disconnect_kills_backend_query() {
     require_group!(GROUP_CLICKHOUSE);
-    harness().clear_records();
     let marker = format!(
         "qf-cancel-{}",
         std::time::SystemTime::now()

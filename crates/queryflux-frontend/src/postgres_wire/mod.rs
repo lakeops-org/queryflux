@@ -31,7 +31,7 @@ use queryflux_core::{
     tags::parse_query_tags,
 };
 
-use crate::abort::AbortOnDrop;
+use crate::abort::{wait_client_gone, AbortOnDrop};
 use crate::dispatch::{execute_to_sink, ResultSink};
 use crate::state::AppState;
 use crate::{FrontendListenerTrait, ShutdownRx};
@@ -127,7 +127,7 @@ async fn handle_connection(
     connection_id: u32,
 ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
     stream.set_nodelay(true)?;
-    let (mut reader, mut writer) = tokio::io::split(stream);
+    let (mut reader, mut writer) = stream.into_split();
 
     // ── Startup phase ────────────────────────────────────────────────────────
 
@@ -285,17 +285,13 @@ async fn handle_connection(
 
 // ── Query execution ───────────────────────────────────────────────────────────
 
-async fn handle_simple_query<R, W>(
-    reader: &mut R,
-    writer: &mut W,
+async fn handle_simple_query(
+    reader: &mut tokio::net::tcp::OwnedReadHalf,
+    writer: &mut tokio::net::tcp::OwnedWriteHalf,
     state: &Arc<AppState>,
     session: &SessionContext,
     sql: &str,
-) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>>
-where
-    R: AsyncReadExt + Unpin,
-    W: AsyncWriteExt + Unpin,
-{
+) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if sql.is_empty() {
         // Empty query: EmptyQueryResponse + ReadyForQuery.
         write_msg(writer, b'I', &[]).await?;
@@ -392,12 +388,6 @@ where
     // ReadyForQuery after each command.
     write_msg(writer, b'Z', b"I").await?;
     Ok(())
-}
-
-/// Resolves when the client TCP stream is readable (typically EOF / next message).
-async fn wait_client_gone<R: AsyncReadExt + Unpin>(reader: &mut R) {
-    let mut buf = [0u8; 1];
-    let _ = reader.read(&mut buf).await;
 }
 
 // ── PostgresResultSink ────────────────────────────────────────────────────────

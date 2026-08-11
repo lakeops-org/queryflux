@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use arrow::datatypes::Schema;
 use arrow::record_batch::RecordBatch;
@@ -991,15 +991,29 @@ impl Drop for SyncCancelGuard {
     }
 }
 
+/// Outer deadline for detached `cancel_query` tasks. Matches adapter control-plane
+/// timeouts (ClickHouse / StarRocks pool checkout) so a hung backend cannot leak tasks.
+const SYNC_CANCEL_TIMEOUT: Duration = Duration::from_secs(10);
+
 fn spawn_sync_cancel(adapter: DispatchAdapter, id_slot: BackendQueryIdSlot) {
     let Some(id) = id_slot.get() else {
         return;
     };
     tokio::spawn(async move {
-        if let Err(e) = adapter.cancel_query(&id).await {
-            warn!(backend = %id, "Best-effort sync cancel on client disconnect: {e}");
-        } else {
-            debug!(backend = %id, "Issued backend cancel after client disconnect");
+        match tokio::time::timeout(SYNC_CANCEL_TIMEOUT, adapter.cancel_query(&id)).await {
+            Err(_) => {
+                warn!(
+                    backend = %id,
+                    timeout_secs = SYNC_CANCEL_TIMEOUT.as_secs(),
+                    "Sync cancel timed out"
+                );
+            }
+            Ok(Err(e)) => {
+                warn!(backend = %id, "Best-effort sync cancel on client disconnect: {e}");
+            }
+            Ok(Ok(())) => {
+                debug!(backend = %id, "Issued backend cancel after client disconnect");
+            }
         }
     });
 }
@@ -1105,13 +1119,12 @@ struct SyncOutcome {
     /// Engine-reported execution stats received via `SyncExecution.stats` after stream exhaustion.
     /// `None` for engines that do not expose structured stats (DuckDB, StarRocks today).
     engine_stats: Option<QueryEngineStats>,
-    backend_query_id: Option<String>,
 }
 
 impl From<SyncOutcome> for QueryOutcome {
     fn from(o: SyncOutcome) -> QueryOutcome {
         QueryOutcome {
-            backend_query_id: o.backend_query_id,
+            backend_query_id: None,
             status: o.status,
             execution_ms: o.elapsed_ms,
             rows: o.rows,
@@ -1397,7 +1410,6 @@ async fn execute_stream(
                 error: Some(msg.clone()),
                 elapsed_ms: elapsed(),
                 engine_stats: None,
-                backend_query_id: None,
             };
             return (outcome, sink.on_error(&msg).await);
         }
@@ -1419,7 +1431,6 @@ async fn execute_stream(
                     error: Some(msg.clone()),
                     elapsed_ms: elapsed(),
                     engine_stats: None,
-                    backend_query_id: None,
                 };
                 return (outcome, sink.on_error(&msg).await);
             }
@@ -1432,7 +1443,6 @@ async fn execute_stream(
                             error: Some("client disconnected during schema send".to_string()),
                             elapsed_ms: elapsed(),
                             engine_stats: None,
-                            backend_query_id: None,
                         };
                         return (outcome, Err(e));
                     }
@@ -1448,7 +1458,6 @@ async fn execute_stream(
                         error: Some(msg),
                         elapsed_ms: elapsed(),
                         engine_stats: None,
-                        backend_query_id: None,
                     };
                     return (outcome, Err(e));
                 }
@@ -1470,7 +1479,6 @@ async fn execute_stream(
                 error: Some("client disconnected during empty schema send".to_string()),
                 elapsed_ms,
                 engine_stats,
-                backend_query_id: None,
             };
             return (outcome, Err(e));
         }
@@ -1488,7 +1496,6 @@ async fn execute_stream(
         error: None,
         elapsed_ms,
         engine_stats,
-        backend_query_id: None,
     };
 
     (outcome, sink.on_complete(&stats).await)
@@ -1521,7 +1528,6 @@ async fn execute_native_to_sink(
                 error: Some(msg.to_string()),
                 elapsed_ms: elapsed(),
                 engine_stats: None,
-                backend_query_id: None,
             };
             return (outcome, sink.on_error(msg).await);
         }
@@ -1553,7 +1559,6 @@ async fn execute_native_to_sink(
                 error: Some(msg.clone()),
                 elapsed_ms: elapsed(),
                 engine_stats: None,
-                backend_query_id: None,
             };
             return (outcome, sink.on_error(&msg).await);
         }
@@ -1573,7 +1578,6 @@ async fn execute_native_to_sink(
                     error: Some(msg.clone()),
                     elapsed_ms: elapsed(),
                     engine_stats: None,
-                    backend_query_id: None,
                 };
                 return (outcome, sink.on_error(&msg).await);
             }
@@ -1587,7 +1591,6 @@ async fn execute_native_to_sink(
                         error: Some(msg.clone()),
                         elapsed_ms: elapsed(),
                         engine_stats: None,
-                        backend_query_id: None,
                     };
                     return (outcome, Err(e));
                 }
@@ -1610,7 +1613,6 @@ async fn execute_native_to_sink(
         error: None,
         elapsed_ms,
         engine_stats,
-        backend_query_id: None,
     };
 
     (outcome, sink.on_complete(&stats).await)
@@ -1970,12 +1972,14 @@ async fn execute_to_sink_inner(
     } else {
         execute_stream(&setup, sink, &id_slot).await
     };
-    outcome.backend_query_id = id_slot.get().map(|id| id.0);
-
     if sink_result.is_err() {
         // Client gone mid-stream (or during schema send): stop the engine query.
         cancel.fire();
-        outcome.status = QueryStatus::Cancelled;
+        // Only reclassify when the engine itself did not already fail — otherwise
+        // an engine error delivered to a departed client is logged as a cancel.
+        if outcome.status == QueryStatus::Success {
+            outcome.status = QueryStatus::Cancelled;
+        }
         if outcome.error.is_none() {
             outcome.error = Some("client disconnected".to_string());
         }
@@ -1987,6 +1991,7 @@ async fn execute_to_sink_inner(
     // slot.release() is idempotent and sets released=true so Drop is a no-op.
     setup.slot.release().await;
     let mut final_outcome: QueryOutcome = outcome.into();
+    final_outcome.backend_query_id = id_slot.get().map(|id| id.0);
     // Prepend guard actions (allow/warn) collected before execution.
     if !setup.guard_actions.is_empty() {
         setup.guard_actions.extend(final_outcome.guard_actions);

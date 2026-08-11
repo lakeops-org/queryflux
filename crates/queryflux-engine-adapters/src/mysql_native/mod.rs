@@ -10,6 +10,9 @@
 //! column metadata directly from the mysql_async driver and encodes values from their
 //! native `mysql_async::Value` representation, preserving full precision.
 
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex};
+
 use bytes::Bytes;
 use futures::stream;
 use mysql_async::{consts::ColumnType, prelude::Queryable, Pool, Row, Value};
@@ -27,6 +30,73 @@ use crate::{BackendQueryIdSlot, NativeExecution};
 /// Number of rows per `NativeResultChunk`. Balances channel overhead vs. memory.
 const BATCH_SIZE: usize = 1_000;
 
+/// Pooled MySQL connection ids that currently own an in-flight query.
+///
+/// `KILL QUERY <connection_id>` is only safe while this set contains the id.
+/// Completing an execute (success or engine error) removes the id before the
+/// connection returns to the pool. Dropping the execute future leaves the id
+/// registered so a later cancel can still kill the server-side query.
+#[derive(Clone, Default)]
+pub struct InflightConnIds {
+    inner: Arc<Mutex<HashSet<u32>>>,
+}
+
+/// Claim released by [`InflightConnGuard::finish`] when the query completes.
+pub struct InflightConnGuard {
+    ids: InflightConnIds,
+    id: u32,
+    finished: bool,
+}
+
+impl InflightConnIds {
+    pub fn claim(&self, id: u32) -> InflightConnGuard {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(id);
+        InflightConnGuard {
+            ids: self.clone(),
+            id,
+            finished: false,
+        }
+    }
+
+    pub fn contains_published(&self, backend_id: &str) -> bool {
+        backend_id.trim().parse::<u32>().ok().is_some_and(|id| {
+            self.inner
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains(&id)
+        })
+    }
+
+    pub fn release_published(&self, backend_id: &str) {
+        if let Ok(id) = backend_id.trim().parse::<u32>() {
+            self.inner
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&id);
+        }
+    }
+
+    fn release(&self, id: u32) {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&id);
+    }
+}
+
+impl InflightConnGuard {
+    /// Query finished; the connection may return to the pool.
+    pub fn finish(&mut self) {
+        if !self.finished {
+            self.ids.release(self.id);
+            self.finished = true;
+        }
+    }
+}
+
 /// Execute `sql` against `pool` and return a stream of `NativeResultChunk`s.
 ///
 /// The connection is acquired, session is set up (USE database, @query_tag), the query
@@ -38,6 +108,7 @@ const BATCH_SIZE: usize = 1_000;
 /// behaviour as the current Arrow path. The in-memory constraint is removed in a follow-up
 /// by switching to `query_iter` + a spawned task, which requires working around
 /// `mysql_async::QueryResult`'s borrow-based lifetime constraints.
+#[allow(clippy::too_many_arguments)]
 pub async fn execute(
     pool: &Pool,
     sql: &str,
@@ -46,13 +117,28 @@ pub async fn execute(
     tags: &QueryTags,
     params: &QueryParams,
     id_slot: &BackendQueryIdSlot,
+    inflight: &InflightConnIds,
 ) -> Result<NativeExecution> {
     let mut conn = pool
         .get_conn()
         .await
         .map_err(|e| QueryFluxError::Engine(format!("mysql_native: connection failed: {e}")))?;
-    id_slot.publish(conn.id().to_string());
+    let conn_id = conn.id();
+    id_slot.publish(conn_id.to_string());
+    let mut claim = inflight.claim(conn_id);
 
+    let result = execute_on_conn(&mut conn, sql, session, tags, params).await;
+    claim.finish();
+    result
+}
+
+async fn execute_on_conn(
+    conn: &mut mysql_async::Conn,
+    sql: &str,
+    session: &SessionContext,
+    tags: &QueryTags,
+    params: &QueryParams,
+) -> Result<NativeExecution> {
     if let Some(db) = session.database() {
         let use_sql = format!("USE `{}`", db.replace('`', "``"));
         conn.query_drop(&use_sql)

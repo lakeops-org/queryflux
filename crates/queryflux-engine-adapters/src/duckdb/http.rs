@@ -243,13 +243,16 @@ impl SyncAdapter for DuckDbHttpAdapter {
         _credentials: &QueryCredentials,
         _tags: &QueryTags,
         _params: &queryflux_core::params::QueryParams,
-        id_slot: &BackendQueryIdSlot,
+        _id_slot: &BackendQueryIdSlot,
     ) -> Result<SyncExecution> {
-        debug!(cluster = %self.cluster_name, "Executing DuckDB HTTP query");
-        // Community httpserver has no cancel API. Publish a synthetic id so
-        // dispatch can still trace the attempt; `cancel_query` is a no-op.
+        // Community httpserver has no cancel API — leave the slot unset so
+        // dispatch does not record a fake backend id or spawn a no-op cancel.
         // Dropping this future aborts the HTTP request (best-effort).
-        id_slot.publish(uuid::Uuid::new_v4().to_string());
+        debug!(
+            cluster = %self.cluster_name,
+            attempt_id = %uuid::Uuid::new_v4(),
+            "Executing DuckDB HTTP query"
+        );
         let response = self.run_query(sql).await?;
         let batch = response_to_record_batch(response)?;
         let (tx, rx) = tokio::sync::oneshot::channel();

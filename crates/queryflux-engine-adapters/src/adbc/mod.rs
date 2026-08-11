@@ -491,13 +491,18 @@ impl SyncAdapter for AdbcAdapter {
         _credentials: &queryflux_auth::QueryCredentials,
         _tags: &QueryTags,
         params: &queryflux_core::params::QueryParams,
-        id_slot: &BackendQueryIdSlot,
+        _id_slot: &BackendQueryIdSlot,
     ) -> Result<SyncExecution> {
         // ADBC `Statement::cancel` requires the live statement (`&mut self`)
         // on the blocking thread; there is no cross-thread cancel handle.
-        // Publish a synthetic id for tracing. `cancel_query` stays the default
-        // no-op. Dropping the result stream stops *reading* batches.
-        id_slot.publish(uuid::Uuid::new_v4().to_string());
+        // Leave the slot unset so dispatch does not record a fake backend id.
+        // `cancel_query` stays the default no-op. Dropping the result stream
+        // stops *reading* batches.
+        tracing::debug!(
+            cluster = %self.cluster_name,
+            attempt_id = %uuid::Uuid::new_v4(),
+            "Executing ADBC query"
+        );
         let pool = self.pool.clone();
         let sql = sql.to_string();
         let param_batch = if params.is_empty() {

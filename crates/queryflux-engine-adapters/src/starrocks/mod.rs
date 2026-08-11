@@ -134,6 +134,9 @@ pub struct StarRocksAdapter {
     pool: Pool,
     /// Dedicated 1×1 pool for `health_check` so probes do not compete with query traffic.
     control_pool: Pool,
+    /// Connection ids that currently own an in-flight query. `cancel_query`
+    /// skips `KILL QUERY` once the id is released (connection back in the pool).
+    inflight: crate::mysql_native::InflightConnIds,
 }
 
 impl StarRocksAdapter {
@@ -187,6 +190,7 @@ impl StarRocksAdapter {
             group_name,
             pool,
             control_pool,
+            inflight: crate::mysql_native::InflightConnIds::default(),
         })
     }
 
@@ -240,129 +244,15 @@ impl StarRocksAdapter {
             })
             .collect())
     }
-}
 
-#[async_trait]
-impl SyncAdapter for StarRocksAdapter {
-    async fn health_check(&self) -> bool {
-        use mysql_async::prelude::Queryable;
-        match self.acquire_control_conn().await {
-            Ok(mut conn) => match conn.ping().await {
-                Ok(_) => true,
-                Err(e) => {
-                    tracing::warn!(
-                        cluster = %self.cluster_name,
-                        error = %e,
-                        "StarRocks health check ping failed"
-                    );
-                    false
-                }
-            },
-            Err(e) => {
-                tracing::warn!(
-                    cluster = %self.cluster_name,
-                    error = %e,
-                    "StarRocks health check: pool checkout failed"
-                );
-                false
-            }
-        }
-    }
-
-    async fn fetch_running_query_count(&self) -> Option<u64> {
-        // Query the FE's processlist for all actively executing queries — not just the ones
-        // routed through QueryFlux. This gives a true picture of StarRocks load and prevents
-        // the reconciler from overcorrecting when the engine is busy with external traffic.
-        let rows = self
-            .run_query(
-                "SELECT COUNT(*) FROM information_schema.processlist WHERE COMMAND = 'Query'",
-            )
-            .await
-            .ok()?;
-        rows.into_iter()
-            .next()
-            .and_then(|mut row| row.take::<u64, usize>(0))
-    }
-
-    fn engine_type(&self) -> EngineType {
-        EngineType::StarRocks
-    }
-
-    fn connection_format(&self) -> crate::ConnectionFormat {
-        crate::ConnectionFormat::MysqlWire
-    }
-
-    fn supports_native_params(&self) -> bool {
-        true
-    }
-
-    async fn execute_native(
+    async fn execute_as_arrow_on_conn(
         &self,
-        _protocol: &queryflux_core::query::FrontendProtocol,
+        conn: &mut Conn,
         sql: &str,
         session: &SessionContext,
-        credentials: &queryflux_auth::QueryCredentials,
         tags: &QueryTags,
         params: &queryflux_core::params::QueryParams,
-        id_slot: &BackendQueryIdSlot,
-    ) -> crate::Result<crate::NativeExecution> {
-        crate::mysql_native::execute(&self.pool, sql, session, credentials, tags, params, id_slot)
-            .await
-    }
-
-    async fn cancel_query(&self, backend_id: &BackendQueryId) -> Result<()> {
-        let Some(sql) = kill_query_sql(&backend_id.0) else {
-            tracing::debug!(
-                cluster = %self.cluster_name,
-                query_id = %backend_id,
-                "StarRocks cancel skipped: connection id is not a safe integer"
-            );
-            return Ok(());
-        };
-        let mut conn = match self.acquire_control_conn().await {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::debug!(
-                    cluster = %self.cluster_name,
-                    query_id = %backend_id,
-                    error = %e,
-                    "StarRocks KILL QUERY: control pool checkout failed (ignored)"
-                );
-                return Ok(());
-            }
-        };
-        match conn.query_drop(&sql).await {
-            Ok(()) => {
-                tracing::debug!(
-                    cluster = %self.cluster_name,
-                    query_id = %backend_id,
-                    "StarRocks KILL QUERY issued"
-                );
-            }
-            Err(e) => {
-                tracing::debug!(
-                    cluster = %self.cluster_name,
-                    query_id = %backend_id,
-                    error = %e,
-                    "StarRocks KILL QUERY failed (ignored)"
-                );
-            }
-        }
-        Ok(())
-    }
-
-    async fn execute_as_arrow(
-        &self,
-        sql: &str,
-        session: &SessionContext,
-        _credentials: &queryflux_auth::QueryCredentials,
-        tags: &QueryTags,
-        params: &queryflux_core::params::QueryParams,
-        id_slot: &BackendQueryIdSlot,
     ) -> Result<SyncExecution> {
-        let mut conn = self.acquire_conn().await?;
-        id_slot.publish(conn.id().to_string());
-
         if let Some(db) = session.database() {
             let use_sql = format!("USE `{}`", db.replace('`', "``"));
             conn.query_drop(&use_sql)
@@ -439,6 +329,154 @@ impl SyncAdapter for StarRocksAdapter {
             stream: Box::pin(stream::iter(std::iter::once(Ok(batch)))),
             stats: rx,
         })
+    }
+}
+
+#[async_trait]
+impl SyncAdapter for StarRocksAdapter {
+    async fn health_check(&self) -> bool {
+        use mysql_async::prelude::Queryable;
+        match self.acquire_control_conn().await {
+            Ok(mut conn) => match conn.ping().await {
+                Ok(_) => true,
+                Err(e) => {
+                    tracing::warn!(
+                        cluster = %self.cluster_name,
+                        error = %e,
+                        "StarRocks health check ping failed"
+                    );
+                    false
+                }
+            },
+            Err(e) => {
+                tracing::warn!(
+                    cluster = %self.cluster_name,
+                    error = %e,
+                    "StarRocks health check: pool checkout failed"
+                );
+                false
+            }
+        }
+    }
+
+    async fn fetch_running_query_count(&self) -> Option<u64> {
+        // Query the FE's processlist for all actively executing queries — not just the ones
+        // routed through QueryFlux. This gives a true picture of StarRocks load and prevents
+        // the reconciler from overcorrecting when the engine is busy with external traffic.
+        let rows = self
+            .run_query(
+                "SELECT COUNT(*) FROM information_schema.processlist WHERE COMMAND = 'Query'",
+            )
+            .await
+            .ok()?;
+        rows.into_iter()
+            .next()
+            .and_then(|mut row| row.take::<u64, usize>(0))
+    }
+
+    fn engine_type(&self) -> EngineType {
+        EngineType::StarRocks
+    }
+
+    fn connection_format(&self) -> crate::ConnectionFormat {
+        crate::ConnectionFormat::MysqlWire
+    }
+
+    fn supports_native_params(&self) -> bool {
+        true
+    }
+
+    async fn execute_native(
+        &self,
+        _protocol: &queryflux_core::query::FrontendProtocol,
+        sql: &str,
+        session: &SessionContext,
+        credentials: &queryflux_auth::QueryCredentials,
+        tags: &QueryTags,
+        params: &queryflux_core::params::QueryParams,
+        id_slot: &BackendQueryIdSlot,
+    ) -> crate::Result<crate::NativeExecution> {
+        crate::mysql_native::execute(
+            &self.pool,
+            sql,
+            session,
+            credentials,
+            tags,
+            params,
+            id_slot,
+            &self.inflight,
+        )
+        .await
+    }
+
+    async fn cancel_query(&self, backend_id: &BackendQueryId) -> Result<()> {
+        let Some(sql) = kill_query_sql(&backend_id.0) else {
+            tracing::debug!(
+                cluster = %self.cluster_name,
+                query_id = %backend_id,
+                "StarRocks cancel skipped: connection id is not a safe integer"
+            );
+            return Ok(());
+        };
+        if !self.inflight.contains_published(&backend_id.0) {
+            tracing::debug!(
+                cluster = %self.cluster_name,
+                query_id = %backend_id,
+                "StarRocks cancel skipped: connection no longer owns an in-flight query"
+            );
+            return Ok(());
+        }
+        let mut conn = match self.acquire_control_conn().await {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::debug!(
+                    cluster = %self.cluster_name,
+                    query_id = %backend_id,
+                    error = %e,
+                    "StarRocks KILL QUERY: control pool checkout failed (ignored)"
+                );
+                return Ok(());
+            }
+        };
+        match conn.query_drop(&sql).await {
+            Ok(()) => {
+                tracing::debug!(
+                    cluster = %self.cluster_name,
+                    query_id = %backend_id,
+                    "StarRocks KILL QUERY issued"
+                );
+            }
+            Err(e) => {
+                tracing::debug!(
+                    cluster = %self.cluster_name,
+                    query_id = %backend_id,
+                    error = %e,
+                    "StarRocks KILL QUERY failed (ignored)"
+                );
+            }
+        }
+        self.inflight.release_published(&backend_id.0);
+        Ok(())
+    }
+
+    async fn execute_as_arrow(
+        &self,
+        sql: &str,
+        session: &SessionContext,
+        _credentials: &queryflux_auth::QueryCredentials,
+        tags: &QueryTags,
+        params: &queryflux_core::params::QueryParams,
+        id_slot: &BackendQueryIdSlot,
+    ) -> Result<SyncExecution> {
+        let mut conn = self.acquire_conn().await?;
+        let conn_id = conn.id();
+        id_slot.publish(conn_id.to_string());
+        let mut claim = self.inflight.claim(conn_id);
+        let result = self
+            .execute_as_arrow_on_conn(&mut conn, sql, session, tags, params)
+            .await;
+        claim.finish();
+        result
     }
 
     // --- Catalog discovery ---

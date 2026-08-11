@@ -54,13 +54,12 @@ impl BackendQueryIdSlot {
     /// Record the engine-side id. Safe to call from the execute task; dispatch
     /// reads it from a `Drop` guard on another task.
     pub fn publish(&self, id: impl Into<String>) {
-        if let Ok(mut guard) = self.inner.lock() {
-            *guard = Some(BackendQueryId(id.into()));
-        }
+        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        *guard = Some(BackendQueryId(id.into()));
     }
 
     pub fn get(&self) -> Option<BackendQueryId> {
-        self.inner.lock().ok().and_then(|guard| guard.clone())
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 }
 
