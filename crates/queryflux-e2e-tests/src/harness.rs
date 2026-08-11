@@ -400,6 +400,10 @@ impl TestHarness {
         self.records.lock().expect("lock records").clear();
     }
 
+    pub fn snapshot_records(&self) -> Vec<QueryRecord> {
+        self.records.lock().expect("lock records").clone()
+    }
+
     pub async fn wait_for_record<F>(&self, predicate: F) -> Option<QueryRecord>
     where
         F: Fn(&QueryRecord) -> bool,

@@ -316,7 +316,7 @@ async fn routing_same_sql_trino_and_clickhouse() {
     assert_eq!(trino.rows[0][0], ch.rows[0][0]);
 }
 
-/// Client disconnect must `KILL QUERY` the in-flight ClickHouse query (#111).
+/// Client disconnect must `KILL QUERY` an in-flight ClickHouse query (#111).
 #[tokio::test]
 #[ignore = "requires ClickHouse — run with: make test-e2e"]
 async fn clickhouse_client_disconnect_kills_backend_query() {
@@ -330,7 +330,9 @@ async fn clickhouse_client_disconnect_kills_backend_query() {
             .as_nanos()
     );
     let url = format!("{}/v1/statement", harness().base_url());
-    let sql = format!("SELECT sleep(30) /* {marker} */");
+    // `sleep(N)` is capped at 3s (`function_sleep_max_microseconds_per_block`).
+    // An unbounded `system.numbers` count stays in-flight until KILL QUERY.
+    let sql = format!("SELECT count() FROM system.numbers /* {marker} */");
 
     let http = reqwest::Client::new();
     let inflight = tokio::spawn({
@@ -367,7 +369,7 @@ async fn clickhouse_client_disconnect_kills_backend_query() {
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
-    assert!(started, "sleep query never appeared in system.processes");
+    assert!(started, "long query never appeared in system.processes");
 
     inflight.abort();
     let _ = inflight.await;
@@ -392,7 +394,7 @@ async fn clickhouse_client_disconnect_kills_backend_query() {
     }
     assert!(
         gone,
-        "sleep query still running after client disconnect — KILL QUERY did not land"
+        "long query still running after client disconnect — KILL QUERY did not land"
     );
 
     let record = harness()
@@ -402,8 +404,19 @@ async fn clickhouse_client_disconnect_kills_backend_query() {
                 && r.status == QueryStatus::Cancelled
         })
         .await;
-    assert!(
-        record.is_some(),
-        "expected QueryRecord with status=Cancelled for the disconnected sleep query"
-    );
+    if record.is_none() {
+        let dump: Vec<String> = harness()
+            .snapshot_records()
+            .into_iter()
+            .map(|r| {
+                format!(
+                    "status={:?} group={} preview={:?} err={:?}",
+                    r.status, r.cluster_group.0, r.sql_preview, r.error_message
+                )
+            })
+            .collect();
+        panic!(
+            "expected QueryRecord with status=Cancelled for the disconnected query; records: {dump:?}"
+        );
+    }
 }
