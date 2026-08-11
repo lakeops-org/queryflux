@@ -320,6 +320,8 @@ export function SecurityEditor({ initialSecurity }: Props) {
           credentials: null, // never pre-fill secrets
         }
       : null,
+    operator_roles: initialSecurity?.operator_roles ?? [],
+    operator_groups: initialSecurity?.operator_groups ?? [],
   });
 
   const [securityForm, setSecurityForm] = useState<UpsertSecurityConfig>(initSecurityForm);
@@ -842,6 +844,49 @@ export function SecurityEditor({ initialSecurity }: Props) {
               </div>
             </div>
           )}
+
+          <div className="rounded-lg border border-slate-200 bg-slate-50 p-4 space-y-3">
+            <div>
+              <p className="text-xs font-semibold text-slate-600 uppercase tracking-widest">
+                Query operators
+              </p>
+              <p className="text-xs text-slate-500 mt-1">
+                IdP roles or groups that may cancel any in-flight or queued query.
+                Operators cannot poll another user&apos;s results. The Admin API
+                can always cancel.
+              </p>
+            </div>
+            <div className="grid grid-cols-2 gap-3">
+              <TextInput
+                label="Operator roles (comma-separated)"
+                value={(securityForm.operator_roles ?? []).join(", ")}
+                onChange={(v) =>
+                  setSecurityForm((f) => ({
+                    ...f,
+                    operator_roles: v
+                      .split(",")
+                      .map((s) => s.trim())
+                      .filter(Boolean),
+                  }))
+                }
+                placeholder="queryflux-operator"
+              />
+              <TextInput
+                label="Operator groups (comma-separated)"
+                value={(securityForm.operator_groups ?? []).join(", ")}
+                onChange={(v) =>
+                  setSecurityForm((f) => ({
+                    ...f,
+                    operator_groups: v
+                      .split(",")
+                      .map((s) => s.trim())
+                      .filter(Boolean),
+                  }))
+                }
+                placeholder="platform-ops"
+              />
+            </div>
+          </div>
 
           <SaveBar
             saving={securitySaving}

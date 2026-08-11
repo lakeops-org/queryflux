@@ -354,6 +354,10 @@ export interface SecurityConfigDto {
   openfga: OpenFgaConfigDto | null;
   /** Per-cluster-group allow-lists (used when authorization_provider = "none"). */
   group_authorization: Record<string, GroupAuthzDto>;
+  /** IdP roles that may cancel any query. */
+  operator_roles?: string[];
+  /** IdP groups that may cancel any query. */
+  operator_groups?: string[];
 }
 
 export interface RoutingConfigDto {
@@ -449,6 +453,8 @@ export interface UpsertSecurityConfig {
   } | null;
   static_users?: Record<string, { password: string; groups?: string[]; roles?: string[] }> | null;
   authorization_provider: string;
+  operator_roles?: string[];
+  operator_groups?: string[];
   openfga?: {
     url: string;
     store_id: string;

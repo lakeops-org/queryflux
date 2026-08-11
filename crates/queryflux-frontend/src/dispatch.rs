@@ -181,6 +181,7 @@ pub async fn dispatch_query(
             already_queued,
             sequence,
             max_queued_queries,
+            auth_ctx,
         )
         .await?;
         return Ok(DispatchOutcome::Queued {
@@ -204,6 +205,7 @@ pub async fn dispatch_query(
                         already_queued,
                         sequence,
                         max_queued_queries,
+                        auth_ctx,
                     )
                     .await?;
                     return Ok(DispatchOutcome::Queued {
@@ -224,6 +226,7 @@ pub async fn dispatch_query(
                 already_queued,
                 sequence,
                 max_queued_queries,
+                auth_ctx,
             )
             .await?;
             return Ok(DispatchOutcome::Queued {
@@ -463,6 +466,7 @@ pub async fn dispatch_query(
                 agent_context: resolved_agent_ctx,
                 submitted_guard_actions,
                 was_guard_blocked: false,
+                submitted_by: auth_ctx.user.clone(),
             };
 
             match execution {
@@ -756,6 +760,7 @@ async fn persist_queued_query(
     _already_stored: bool,
     sequence: u64,
     max_queued_queries: Option<u64>,
+    auth_ctx: &AuthContext,
 ) -> Result<String> {
     // Enforce queue depth limit before admitting to the queue.
     if let Some(limit) = max_queued_queries {
@@ -781,12 +786,13 @@ async fn persist_queued_query(
     let queued = QueuedQuery {
         id: query_id.clone(),
         sql,
-        session,
+        session: session.without_auth_headers(),
         frontend_protocol: protocol,
         cluster_group: group,
         creation_time: now,
         last_accessed: now,
         sequence,
+        submitted_by: auth_ctx.user.clone(),
     };
     state.persistence.upsert_queued(queued).await?;
     let next_seq = sequence + 1;

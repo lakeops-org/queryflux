@@ -281,6 +281,11 @@ pub struct ExecutingQuery {
     /// True when a guard blocked this query at submit time.
     #[serde(default)]
     pub was_guard_blocked: bool,
+    /// Authenticated user who submitted the query. Used to reject poll/cancel
+    /// from a different subject (IDOR). Empty on rows written before this field
+    /// existed — those are treated as legacy and not ownership-checked.
+    #[serde(default)]
+    pub submitted_by: String,
 }
 
 // --- Query execution result model ---
@@ -297,6 +302,10 @@ pub struct QueuedQuery {
     pub last_accessed: DateTime<Utc>,
     /// How many times the client has polled. Used for exponential backoff.
     pub sequence: u64,
+    /// Authenticated user who enqueued the query. Dequeue/poll must match.
+    /// Empty on legacy rows — not ownership-checked.
+    #[serde(default)]
+    pub submitted_by: String,
 }
 
 /// Returned by `AsyncAdapter::submit_query`.
@@ -388,4 +397,41 @@ pub enum QueryStatus {
     Success,
     Failed,
     Cancelled,
+}
+
+#[cfg(test)]
+mod submitted_by_serde_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn executing_query_missing_submitted_by_defaults_empty() {
+        let v = json!({
+            "id": "p1",
+            "sql": "SELECT 1",
+            "cluster_group": "g",
+            "cluster_name": "c",
+            "backend_query_id": "b1",
+            "creation_time": "2026-01-01T00:00:00Z",
+            "last_accessed": "2026-01-01T00:00:00Z"
+        });
+        let q: ExecutingQuery = serde_json::from_value(v).expect("legacy executing row");
+        assert!(q.submitted_by.is_empty());
+    }
+
+    #[test]
+    fn queued_query_missing_submitted_by_defaults_empty() {
+        let mut v = json!({
+            "id": "p1",
+            "sql": "SELECT 1",
+            "frontend_protocol": "trinoHttp",
+            "cluster_group": "g",
+            "creation_time": "2026-01-01T00:00:00Z",
+            "last_accessed": "2026-01-01T00:00:00Z",
+            "sequence": 0
+        });
+        v["session"] = serde_json::to_value(SessionContext::default()).unwrap();
+        let q: QueuedQuery = serde_json::from_value(v).expect("legacy queued row");
+        assert!(q.submitted_by.is_empty());
+    }
 }

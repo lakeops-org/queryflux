@@ -330,7 +330,8 @@ impl TestHarness {
             group_default_tags: HashMap::new(),
             group_cache_settings: HashMap::new(),
             auth_provider: Arc::new(NoneAuthProvider::new(false)) as Arc<dyn AuthProvider>,
-            authorization: Arc::new(AllowAllAuthorization) as Arc<dyn AuthorizationChecker>,
+            authorization: Arc::new(AllowAllAuthorization::default())
+                as Arc<dyn AuthorizationChecker>,
         };
         let records = Arc::new(Mutex::new(Vec::<QueryRecord>::new()));
         let state = Arc::new(AppState {
@@ -568,7 +569,8 @@ impl WireTestHarness {
             group_default_tags: HashMap::new(),
             group_cache_settings: HashMap::new(),
             auth_provider: Arc::new(NoneAuthProvider::new(false)) as Arc<dyn AuthProvider>,
-            authorization: Arc::new(AllowAllAuthorization) as Arc<dyn AuthorizationChecker>,
+            authorization: Arc::new(AllowAllAuthorization::default())
+                as Arc<dyn AuthorizationChecker>,
         };
 
         let state = Arc::new(AppState {
@@ -701,7 +703,8 @@ impl WireTestHarness {
             group_default_tags: HashMap::new(),
             group_cache_settings: HashMap::new(),
             auth_provider: Arc::new(NoneAuthProvider::new(false)) as Arc<dyn AuthProvider>,
-            authorization: Arc::new(AllowAllAuthorization) as Arc<dyn AuthorizationChecker>,
+            authorization: Arc::new(AllowAllAuthorization::default())
+                as Arc<dyn AuthorizationChecker>,
         };
 
         let state = Arc::new(AppState {

@@ -36,6 +36,35 @@ pub struct AuthContext {
     pub raw_token: Option<String>,
 }
 
+/// Reject poll/cancel/dequeue when the caller is not the query owner.
+///
+/// - Empty `submitted_by` (legacy in-flight rows) is allowed so a rolling
+///   deploy does not brick queries persisted before this field existed.
+/// - Two anonymous identities cannot be distinguished and are allowed
+///   (network-trust / `auth.provider: none` with no username).
+/// - Otherwise the authenticated user must equal `submitted_by`.
+pub fn require_query_owner(
+    auth: &AuthContext,
+    submitted_by: &str,
+) -> queryflux_core::error::Result<()> {
+    if submitted_by.is_empty() {
+        return Ok(());
+    }
+    if is_anonymous(&auth.user) && is_anonymous(submitted_by) {
+        return Ok(());
+    }
+    if auth.user != submitted_by {
+        return Err(queryflux_core::error::QueryFluxError::Unauthorized(
+            "query belongs to a different user".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn is_anonymous(user: &str) -> bool {
+    user.is_empty() || user == "anonymous"
+}
+
 /// Resolved wire credentials for a specific backend query execution.
 ///
 /// Produced by `BackendIdentityResolver` from `(AuthContext, queryAuth config)`.
@@ -69,4 +98,53 @@ pub enum QueryCredentials {
     /// The adapter sets `Authorization: Bearer <token>` on the outgoing request.
     /// Used by `tokenExchange` mode (Phase 6 — Snowflake, Databricks).
     Bearer { token: String },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ctx(user: &str) -> AuthContext {
+        AuthContext {
+            user: user.to_string(),
+            groups: vec![],
+            roles: vec![],
+            raw_token: None,
+        }
+    }
+
+    #[test]
+    fn owner_matches() {
+        assert!(require_query_owner(&ctx("alice"), "alice").is_ok());
+    }
+
+    #[test]
+    fn different_user_denied() {
+        let err = require_query_owner(&ctx("bob"), "alice").unwrap_err();
+        assert!(matches!(
+            err,
+            queryflux_core::error::QueryFluxError::Unauthorized(_)
+        ));
+    }
+
+    #[test]
+    fn anonymous_cannot_access_named_owner() {
+        assert!(require_query_owner(&ctx("anonymous"), "alice").is_err());
+    }
+
+    #[test]
+    fn named_user_cannot_access_anonymous_query() {
+        assert!(require_query_owner(&ctx("alice"), "anonymous").is_err());
+    }
+
+    #[test]
+    fn both_anonymous_allowed() {
+        assert!(require_query_owner(&ctx("anonymous"), "anonymous").is_ok());
+    }
+
+    #[test]
+    fn legacy_empty_owner_allowed() {
+        assert!(require_query_owner(&ctx("alice"), "").is_ok());
+        assert!(require_query_owner(&ctx("anonymous"), "").is_ok());
+    }
 }

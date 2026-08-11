@@ -9,7 +9,7 @@ use axum::{
 };
 use bytes::Bytes;
 use chrono::Utc;
-use queryflux_auth::Credentials;
+use queryflux_auth::{Credentials, QueryAction, QueryAuthz};
 use queryflux_core::{
     error::QueryFluxError,
     query::{BackendQueryId, FrontendProtocol, ProxyQueryId, QueryPollResult, QueryStatus},
@@ -73,6 +73,31 @@ impl Drop for QueueClaimHeartbeat {
             let _ = tx.send(());
         }
     }
+}
+
+async fn allow_query_action_or_forbid(
+    state: &AppState,
+    auth_ctx: &queryflux_auth::AuthContext,
+    action: QueryAction,
+    submitted_by: &str,
+    group: &str,
+) -> Option<Response<Body>> {
+    let authz = state.live.read().await.authorization.clone();
+    let query = QueryAuthz {
+        submitted_by: submitted_by.to_string(),
+        group: group.to_string(),
+    };
+    if authz.check_query(auth_ctx, action, &query).await {
+        return None;
+    }
+    warn!(
+        action = ?action,
+        user = %auth_ctx.user,
+        owner = %submitted_by,
+        group,
+        "Query action denied"
+    );
+    Some(StatusCode::FORBIDDEN.into_response())
 }
 
 fn trino_error_response(query_id: &str, message: &str) -> Response<Body> {
@@ -685,6 +710,29 @@ pub async fn get_queued_statement(
 
     let query_id = ProxyQueryId(id);
 
+    // Load first so we can reject a non-owner *before* taking a distributed
+    // claim (otherwise an attacker could pin the row for the claim TTL).
+    let queued = match state.persistence.get_queued(&query_id).await {
+        Ok(Some(q)) => q,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(e) => {
+            warn!("Persistence error: {e}");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+
+    if let Some(resp) = allow_query_action_or_forbid(
+        &state,
+        &auth_ctx,
+        QueryAction::Dequeue,
+        &queued.submitted_by,
+        &queued.cluster_group.0,
+    )
+    .await
+    {
+        return resp;
+    }
+
     // In distributed mode, try to claim ownership of this queued query so only
     // one replica dispatches it. If another replica already claimed it, return
     // a "still queued" response and let the client poll again.
@@ -769,15 +817,6 @@ pub async fn get_queued_statement(
         }
     }
     let _claim_heartbeat = claim_heartbeat;
-
-    let queued = match state.persistence.get_queued(&query_id).await {
-        Ok(Some(q)) => q,
-        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
-        Err(e) => {
-            warn!("Persistence error: {e}");
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-        }
-    };
 
     if let Err(e) = state
         .persistence
@@ -942,13 +981,16 @@ pub async fn get_executing_statement(
         }
     };
 
-    // TODO: verify query ownership once submitter_user is stored in ExecutingQuery
-    if auth_ctx.user != "anonymous" {
-        tracing::debug!(
-            id = %executing.id,
-            poll_user = %auth_ctx.user,
-            "Authenticated poll request — ownership check deferred until submitter is persisted"
-        );
+    if let Some(resp) = allow_query_action_or_forbid(
+        &state,
+        &auth_ctx,
+        QueryAction::Poll,
+        &executing.submitted_by,
+        &executing.cluster_group.0,
+    )
+    .await
+    {
+        return resp;
     }
 
     let adapter = match state.adapter(&executing.cluster_name.0).await {
@@ -1256,13 +1298,16 @@ pub async fn delete_executing_statement(
         }
     };
 
-    // TODO: verify query ownership once submitter_user is stored in ExecutingQuery
-    if auth_ctx.user != "anonymous" {
-        tracing::debug!(
-            id = %executing.id,
-            cancel_user = %auth_ctx.user,
-            "Authenticated cancel request — ownership check deferred until submitter is persisted"
-        );
+    if let Some(resp) = allow_query_action_or_forbid(
+        &state,
+        &auth_ctx,
+        QueryAction::Cancel,
+        &executing.submitted_by,
+        &executing.cluster_group.0,
+    )
+    .await
+    {
+        return resp;
     }
 
     let Some(adapter) = state.adapter(&executing.cluster_name.0).await else {

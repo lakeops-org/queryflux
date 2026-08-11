@@ -17,7 +17,7 @@ use queryflux_core::{
     },
     engine_registry::EngineRegistry,
     error::{QueryFluxError, Result},
-    query::{ClusterGroupName, ClusterName},
+    query::{BackendQueryId, ClusterGroupName, ClusterName, ProxyQueryId},
 };
 use queryflux_metrics::prometheus_store::PrometheusMetrics;
 use queryflux_persistence::{
@@ -42,7 +42,10 @@ use utoipa::{OpenApi, ToSchema};
 use std::future::Future;
 use std::pin::Pin;
 
-use crate::{state::LiveConfig, FrontendListenerTrait, ShutdownRx};
+use crate::{
+    state::{AppState, LiveConfig},
+    FrontendListenerTrait, ShutdownRx,
+};
 
 /// Callback type for testing a cluster config without persisting it.
 /// Receives `(engine_key, config_json)` → returns `Ok(true)` if healthy, `Ok(false)` if
@@ -87,6 +90,8 @@ pub struct ClusterStateDto {
         update_cluster_handler,
         engine_registry_handler,
         list_queries_handler,
+        list_running_queries_handler,
+        cancel_query_handler,
         get_stats_handler,
         list_engines_handler,
         get_engine_stats_handler,
@@ -127,6 +132,7 @@ pub struct ClusterStateDto {
         ClusterStateDto,
         ClusterUpdateRequest,
         QuerySummary,
+        RunningQueryDto,
         DashboardStats,
         EngineStatRow,
         GroupStatRow,
@@ -170,6 +176,12 @@ pub struct SecurityConfigDto {
     pub openfga: Option<OpenFgaConfigDto>,
     /// Per-cluster-group simple allow-lists (used when authorization_provider = "none").
     pub group_authorization: HashMap<String, GroupAuthzDto>,
+    /// IdP roles that may cancel any query.
+    #[serde(default)]
+    pub operator_roles: Vec<String>,
+    /// IdP groups that may cancel any query.
+    #[serde(default)]
+    pub operator_groups: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -225,6 +237,8 @@ impl Default for SecurityConfigDto {
             authorization_provider: "none".to_string(),
             openfga: None,
             group_authorization: HashMap::new(),
+            operator_roles: Vec::new(),
+            operator_groups: Vec::new(),
         }
     }
 }
@@ -442,6 +456,8 @@ impl SecurityConfigDto {
             authorization_provider,
             openfga,
             group_authorization,
+            operator_roles: auth.operator_roles.clone(),
+            operator_groups: auth.operator_groups.clone(),
         }
     }
 }
@@ -483,6 +499,10 @@ pub struct UpsertSecurityConfig {
     pub static_users: Option<serde_json::Value>,
     pub authorization_provider: String,
     pub openfga: Option<serde_json::Value>,
+    #[serde(default)]
+    pub operator_roles: Option<Vec<String>>,
+    #[serde(default)]
+    pub operator_groups: Option<Vec<String>>,
 }
 
 /// Request body for PUT /admin/config/routing
@@ -523,6 +543,8 @@ struct AdminState {
     test_cluster_fn: TestClusterFn,
     /// Query result cache for invalidation endpoints.
     result_cache: Arc<dyn queryflux_cache::QueryResultCache>,
+    /// Shared proxy state — in-flight queries, adapters, slot release.
+    app: Arc<AppState>,
 }
 
 // ---------------------------------------------------------------------------
@@ -543,6 +565,7 @@ pub struct AdminFrontend {
     test_cluster_fn: TestClusterFn,
     cors_allowed_origins: Vec<String>,
     result_cache: Arc<dyn queryflux_cache::QueryResultCache>,
+    app: Arc<AppState>,
 }
 
 impl AdminFrontend {
@@ -561,6 +584,7 @@ impl AdminFrontend {
         test_cluster_fn: TestClusterFn,
         cors_allowed_origins: Vec<String>,
         result_cache: Arc<dyn queryflux_cache::QueryResultCache>,
+        app: Arc<AppState>,
     ) -> Self {
         Self {
             prometheus,
@@ -576,6 +600,7 @@ impl AdminFrontend {
             test_cluster_fn,
             cors_allowed_origins,
             result_cache,
+            app,
         }
     }
 
@@ -592,6 +617,7 @@ impl AdminFrontend {
             admin_creds: self.admin_creds.clone(),
             test_cluster_fn: self.test_cluster_fn.clone(),
             result_cache: self.result_cache.clone(),
+            app: self.app.clone(),
         });
 
         let spec_json =
@@ -621,6 +647,8 @@ impl AdminFrontend {
         let protected = Router::new()
             .route("/admin/clusters", get(clusters_handler))
             .route("/admin/queries", get(list_queries_handler))
+            .route("/admin/queries/running", get(list_running_queries_handler))
+            .route("/admin/queries/{id}", delete(cancel_query_handler))
             .route("/admin/agents", get(list_agents_handler))
             .route("/admin/conversations", get(list_conversations_handler))
             .route("/admin/conversations/{id}", get(get_conversation_handler))
@@ -1002,6 +1030,173 @@ async fn list_queries_handler(
         Ok(rows) => Json::<Vec<QuerySummary>>(rows).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct RunningQueryDto {
+    pub id: String,
+    pub backend_query_id: Option<String>,
+    pub submitted_by: String,
+    pub group: String,
+    pub cluster: Option<String>,
+    pub sql_preview: String,
+    /// `executing` or `queued`
+    pub state: String,
+}
+
+fn sql_preview(sql: &str) -> String {
+    let t = sql.split_whitespace().collect::<Vec<_>>().join(" ");
+    if t.chars().count() > 160 {
+        format!("{}…", t.chars().take(160).collect::<String>())
+    } else {
+        t
+    }
+}
+
+/// In-flight executing + queued queries (not history).
+#[utoipa::path(
+    get,
+    path = "/admin/queries/running",
+    tag = "admin",
+    responses(
+        (status = 200, description = "In-flight queries", body = Vec<RunningQueryDto>),
+        (status = 500, description = "Internal error", body = str),
+    )
+)]
+async fn list_running_queries_handler(State(state): State<Arc<AdminState>>) -> impl IntoResponse {
+    let mut out = Vec::new();
+    match state.app.persistence.list_all().await {
+        Ok(rows) => {
+            for q in rows {
+                out.push(RunningQueryDto {
+                    id: q.id.0,
+                    backend_query_id: Some(q.backend_query_id.0),
+                    submitted_by: q.submitted_by,
+                    group: q.cluster_group.0,
+                    cluster: Some(q.cluster_name.0),
+                    sql_preview: sql_preview(&q.sql),
+                    state: "executing".to_string(),
+                });
+            }
+        }
+        Err(e) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+        }
+    }
+    match state.app.persistence.list_queued().await {
+        Ok(rows) => {
+            for q in rows {
+                out.push(RunningQueryDto {
+                    id: q.id.0,
+                    backend_query_id: None,
+                    submitted_by: q.submitted_by,
+                    group: q.cluster_group.0,
+                    cluster: None,
+                    sql_preview: sql_preview(&q.sql),
+                    state: "queued".to_string(),
+                });
+            }
+        }
+        Err(e) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+        }
+    }
+    Json(out).into_response()
+}
+
+/// Cancel any in-flight or queued query. Admin Basic auth is the privilege.
+#[utoipa::path(
+    delete,
+    path = "/admin/queries/{id}",
+    tag = "admin",
+    params(("id" = String, Path, description = "Proxy query id or backend query id")),
+    responses(
+        (status = 204, description = "Cancelled"),
+        (status = 404, description = "Query not found", body = str),
+        (status = 500, description = "Internal error", body = str),
+    )
+)]
+async fn cancel_query_handler(
+    State(state): State<Arc<AdminState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let persistence = &state.app.persistence;
+
+    if let Ok(Some(executing)) = persistence.get(&BackendQueryId(id.clone())).await {
+        return cancel_executing(&state, executing).await;
+    }
+    if let Ok(all) = persistence.list_all().await {
+        if let Some(executing) = all.into_iter().find(|q| q.id.0 == id) {
+            return cancel_executing(&state, executing).await;
+        }
+    }
+
+    let qid = ProxyQueryId(id.clone());
+    match persistence.get_queued(&qid).await {
+        Ok(Some(queued)) => {
+            if let Some(qc) = &state.app.queue_coordinator {
+                let _ = qc.release_claim(&queued.id.0).await;
+            }
+            if let Err(e) = persistence.delete_queued(&qid).await {
+                return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+            }
+            info!(id = %qid, owner = %queued.submitted_by, "Admin cancelled queued query");
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Ok(None) => (StatusCode::NOT_FOUND, "query not found").into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+async fn cancel_executing(
+    state: &AdminState,
+    executing: queryflux_core::query::ExecutingQuery,
+) -> Response {
+    if let Some(adapter) = state.app.adapter(&executing.cluster_name.0).await {
+        if let Some(async_adapter) = adapter.as_async() {
+            if let Err(e) = async_adapter
+                .cancel_query(&executing.backend_query_id)
+                .await
+            {
+                warn!(
+                    id = %executing.id,
+                    backend = %executing.backend_query_id,
+                    "Admin adapter cancel failed: {e}"
+                );
+            }
+        }
+    }
+    if let Some(base) = executing.poll_base_url.as_deref() {
+        let url = format!(
+            "{}/v1/statement/executing/{}/0",
+            base.trim_end_matches('/'),
+            executing.backend_query_id.0
+        );
+        let _ = state.app.http_client.delete(&url).send().await;
+    }
+    state
+        .app
+        .release_query_slot(
+            &executing.cluster_group,
+            &executing.cluster_name,
+            &executing.id.0,
+        )
+        .await;
+    if let Err(e) = state
+        .app
+        .persistence
+        .delete(&executing.backend_query_id)
+        .await
+    {
+        return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+    }
+    info!(
+        id = %executing.id,
+        backend = %executing.backend_query_id,
+        owner = %executing.submitted_by,
+        "Admin cancelled executing query"
+    );
+    StatusCode::NO_CONTENT.into_response()
 }
 
 /// Distinct agents that have run queries, with aggregate stats.
