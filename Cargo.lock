@@ -3797,12 +3797,12 @@ version = "0.2.0"
 dependencies = [
  "anyhow",
  "chrono",
- "clap",
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",
  "queryflux-auth",
  "queryflux-cache",
+ "queryflux-cli",
  "queryflux-cluster-manager",
  "queryflux-config",
  "queryflux-core",
@@ -3872,6 +3872,17 @@ dependencies = [
  "tokio",
  "tracing",
  "xxhash-rust",
+]
+
+[[package]]
+name = "queryflux-cli"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "queryflux-config",
+ "queryflux-core",
+ "queryflux-translation",
 ]
 
 [[package]]

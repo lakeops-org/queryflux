@@ -17,6 +17,7 @@ members = [
     "crates/queryflux-metrics",
     "crates/queryflux-fingerprint",
     "crates/queryflux-guardrails",
+    "crates/queryflux-cli",
 ]
 
 [workspace.package]
@@ -83,6 +84,7 @@ queryflux-metrics = { path = "crates/queryflux-metrics" }
 queryflux-fingerprint = { path = "crates/queryflux-fingerprint" }
 queryflux-guardrails = { path = "crates/queryflux-guardrails" }
 queryflux-cache = { path = "crates/queryflux-cache" }
+queryflux-cli = { path = "crates/queryflux-cli" }
 
 # OpenDAL — storage abstraction for cache backend
 opendal = { version = "0.53", features = ["services-fs", "services-s3", "services-gcs"] }
