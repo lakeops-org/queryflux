@@ -27,8 +27,10 @@ Config key: `trinoHttp`. Protocol identifier: `FrontendProtocol::TrinoHttp`. Def
 | `GET` | `/v1/statement/qf/queued/{id}/{seq}` | Poll a queued query (proxy-side backoff) |
 | `GET` | `/v1/statement/qf/executing/{id}` | Poll an executing query |
 | `GET` | `/v1/statement/{*path}` | Forward Trino-style poll paths |
-| `DELETE` | `/v1/statement/qf/executing/{id}` | Cancel a running query |
-| `DELETE` | `/v1/statement/{*path}` | Cancel via forwarded Trino path |
+| `DELETE` | `/v1/statement/qf/executing/{id}` | Cancel a running **async** query (persisted `ExecutingQuery`) |
+| `DELETE` | `/v1/statement/{*path}` | Cancel via forwarded Trino path (async only) |
+
+Sync engines (ClickHouse, StarRocks, DuckDB, …) do not persist an executing record. Cancel for those is driven by **client disconnect**: the HTTP handler future is dropped and dispatch issues the engine kill (`KILL QUERY`, interrupt, …).
 
 ## Authentication
 

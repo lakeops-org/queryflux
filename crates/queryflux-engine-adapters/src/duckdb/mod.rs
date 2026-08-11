@@ -10,13 +10,13 @@ use queryflux_core::{
     config::{ClusterAuth, ClusterConfig},
     error::{QueryFluxError, Result},
     params::{QueryParam, QueryParams},
-    query::{ClusterGroupName, ClusterName, EngineType},
+    query::{BackendQueryId, ClusterGroupName, ClusterName, EngineType},
     session::SessionContext,
     tags::QueryTags,
 };
 use tracing::debug;
 
-use crate::{AdapterKind, SyncAdapter, SyncExecution};
+use crate::{AdapterKind, BackendQueryIdSlot, SyncAdapter, SyncExecution};
 use queryflux_core::engine_registry::{
     AuthType, ConfigField, ConnectionType, EngineDescriptor, FieldType,
 };
@@ -78,6 +78,11 @@ pub struct DuckDbAdapter {
     /// Thread-safe DuckDB connection. Wrapped in Arc<Mutex> so it can be shared
     /// across `spawn_blocking` calls without moving out of `&self`.
     conn: Arc<Mutex<Connection>>,
+    /// Interrupt handle — `interrupt()` is safe from another thread while a
+    /// query holds the connection mutex.
+    interrupt: Arc<duckdb::InterruptHandle>,
+    /// Backend id of the query currently running on `conn`, if any.
+    inflight: Mutex<Option<BackendQueryId>>,
 }
 
 impl DuckDbAdapter {
@@ -93,10 +98,13 @@ impl DuckDbAdapter {
         }
         .map_err(|e| QueryFluxError::Engine(format!("DuckDB open failed: {e}")))?;
 
+        let interrupt = conn.interrupt_handle();
         Ok(Self {
             cluster_name,
             group_name,
             conn: Arc::new(Mutex::new(conn)),
+            interrupt,
+            inflight: Mutex::new(None),
         })
     }
 }
@@ -146,6 +154,20 @@ impl SyncAdapter for DuckDbAdapter {
         true
     }
 
+    async fn cancel_query(&self, backend_id: &BackendQueryId) -> Result<()> {
+        let matches = self
+            .inflight
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            == Some(backend_id);
+        if matches {
+            self.interrupt.interrupt();
+            debug!(cluster = %self.cluster_name, query_id = %backend_id, "DuckDB interrupt issued");
+        }
+        Ok(())
+    }
+
     async fn execute_as_arrow(
         &self,
         sql: &str,
@@ -153,8 +175,16 @@ impl SyncAdapter for DuckDbAdapter {
         _credentials: &queryflux_auth::QueryCredentials,
         _tags: &QueryTags,
         params: &QueryParams,
+        id_slot: &BackendQueryIdSlot,
     ) -> Result<SyncExecution> {
         debug!(cluster = %self.cluster_name, "Executing DuckDB query as Arrow");
+        let query_id = BackendQueryId(uuid::Uuid::new_v4().to_string());
+        id_slot.publish(query_id.0.clone());
+        {
+            let mut inflight = self.inflight.lock().unwrap_or_else(|e| e.into_inner());
+            *inflight = Some(query_id.clone());
+        }
+
         let conn = Arc::clone(&self.conn);
         let sql = sql.to_string();
         let duckdb_params: Vec<duckdb::types::Value> =
@@ -171,7 +201,18 @@ impl SyncAdapter for DuckDbAdapter {
             Ok::<_, QueryFluxError>(arrow.collect::<Vec<_>>())
         })
         .await
-        .map_err(|e| QueryFluxError::Engine(format!("spawn_blocking failed: {e}")))??;
+        .map_err(|e| QueryFluxError::Engine(format!("spawn_blocking failed: {e}")));
+
+        // Clear only after the blocking work returns. If this future is dropped
+        // mid-query, `inflight` stays set so `cancel_query` can still interrupt.
+        {
+            let mut inflight = self.inflight.lock().unwrap_or_else(|e| e.into_inner());
+            if inflight.as_ref() == Some(&query_id) {
+                *inflight = None;
+            }
+        }
+
+        let batches = batches??;
 
         let (tx, rx) = tokio::sync::oneshot::channel();
         // DuckDB does not expose structured engine stats (CPU time, bytes scanned, etc.)
@@ -529,5 +570,55 @@ mod tests {
     #[test]
     fn null_maps_to_null() {
         assert_eq!(query_param_to_duckdb(&QueryParam::Null), Value::Null);
+    }
+
+    #[tokio::test]
+    async fn interrupt_stops_a_long_query() {
+        use queryflux_auth::QueryCredentials;
+        use queryflux_core::query::{ClusterGroupName, ClusterName};
+
+        let adapter = DuckDbAdapter::new(
+            ClusterName("duck".into()),
+            ClusterGroupName("g".into()),
+            DuckDbConfig {
+                database_path: None,
+                motherduck_token: None,
+            },
+        )
+        .expect("open in-memory duckdb");
+
+        let slot = BackendQueryIdSlot::new();
+        let session = SessionContext::default();
+        let creds = QueryCredentials::ServiceAccount;
+        let tags = QueryTags::new();
+        let params: QueryParams = vec![];
+
+        let exec = adapter.execute_as_arrow(
+            "SELECT count(*) FROM range(1000000000)",
+            &session,
+            &creds,
+            &tags,
+            &params,
+            &slot,
+        );
+        let cancel = async {
+            // Wait until the adapter has published an id and the blocking
+            // query has had a chance to start, then interrupt.
+            for _ in 0..200 {
+                if slot.get().is_some() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            let id = slot.get().expect("backend id published");
+            adapter.cancel_query(&id).await.expect("cancel");
+        };
+
+        let (result, _) = tokio::join!(exec, cancel);
+        assert!(
+            result.is_err(),
+            "interrupted range() query should fail, got Ok(SyncExecution)"
+        );
     }
 }

@@ -95,6 +95,7 @@ pub struct AppState {
 /// Stable per-query metadata that does not change across the query's lifecycle.
 /// Built once (after cluster selection and SQL translation) and passed to every
 /// `record_query` call within the same dispatch function.
+#[derive(Clone)]
 pub struct QueryContext {
     pub query_id: ProxyQueryId,
     pub sql: String,

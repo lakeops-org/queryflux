@@ -17,12 +17,12 @@ use queryflux_core::{
     catalog::TableSchema,
     config::{ClusterAuth, ClusterConfig},
     error::{QueryFluxError, Result},
-    query::{ClusterGroupName, ClusterName, EngineType},
+    query::{BackendQueryId, ClusterGroupName, ClusterName, EngineType},
     session::SessionContext,
     tags::{tags_to_json, QueryTags},
 };
 
-use crate::{AdapterKind, SyncAdapter, SyncExecution};
+use crate::{AdapterKind, BackendQueryIdSlot, SyncAdapter, SyncExecution};
 use queryflux_core::engine_registry::{
     AuthType, ConfigField, ConnectionType, EngineDescriptor, FieldType,
 };
@@ -304,8 +304,51 @@ impl SyncAdapter for StarRocksAdapter {
         credentials: &queryflux_auth::QueryCredentials,
         tags: &QueryTags,
         params: &queryflux_core::params::QueryParams,
+        id_slot: &BackendQueryIdSlot,
     ) -> crate::Result<crate::NativeExecution> {
-        crate::mysql_native::execute(&self.pool, sql, session, credentials, tags, params).await
+        crate::mysql_native::execute(&self.pool, sql, session, credentials, tags, params, id_slot)
+            .await
+    }
+
+    async fn cancel_query(&self, backend_id: &BackendQueryId) -> Result<()> {
+        let Some(sql) = kill_query_sql(&backend_id.0) else {
+            tracing::debug!(
+                cluster = %self.cluster_name,
+                query_id = %backend_id,
+                "StarRocks cancel skipped: connection id is not a safe integer"
+            );
+            return Ok(());
+        };
+        let mut conn = match self.acquire_control_conn().await {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::debug!(
+                    cluster = %self.cluster_name,
+                    query_id = %backend_id,
+                    error = %e,
+                    "StarRocks KILL QUERY: control pool checkout failed (ignored)"
+                );
+                return Ok(());
+            }
+        };
+        match conn.query_drop(&sql).await {
+            Ok(()) => {
+                tracing::debug!(
+                    cluster = %self.cluster_name,
+                    query_id = %backend_id,
+                    "StarRocks KILL QUERY issued"
+                );
+            }
+            Err(e) => {
+                tracing::debug!(
+                    cluster = %self.cluster_name,
+                    query_id = %backend_id,
+                    error = %e,
+                    "StarRocks KILL QUERY failed (ignored)"
+                );
+            }
+        }
+        Ok(())
     }
 
     async fn execute_as_arrow(
@@ -315,8 +358,10 @@ impl SyncAdapter for StarRocksAdapter {
         _credentials: &queryflux_auth::QueryCredentials,
         tags: &QueryTags,
         params: &queryflux_core::params::QueryParams,
+        id_slot: &BackendQueryIdSlot,
     ) -> Result<SyncExecution> {
         let mut conn = self.acquire_conn().await?;
+        id_slot.publish(conn.id().to_string());
 
         if let Some(db) = session.database() {
             let use_sql = format!("USE `{}`", db.replace('`', "``"));
@@ -474,6 +519,15 @@ impl SyncAdapter for StarRocksAdapter {
             columns,
         }))
     }
+}
+
+/// `KILL QUERY <connection_id>` — `connection_id` must be a decimal integer.
+fn kill_query_sql(id: &str) -> Option<String> {
+    let trimmed = id.trim();
+    if trimmed.is_empty() || trimmed.len() > 20 || !trimmed.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    Some(format!("KILL QUERY {trimmed}"))
 }
 
 // ---------------------------------------------------------------------------
@@ -863,5 +917,19 @@ mod tests {
     #[test]
     fn null_maps_to_null() {
         assert_eq!(query_param_to_mysql_value(&QueryParam::Null), Value::NULL);
+    }
+
+    #[test]
+    fn kill_query_sql_accepts_decimal_ids() {
+        assert_eq!(kill_query_sql("42").as_deref(), Some("KILL QUERY 42"));
+        assert_eq!(kill_query_sql(" 7 ").as_deref(), Some("KILL QUERY 7"));
+    }
+
+    #[test]
+    fn kill_query_sql_rejects_non_integers() {
+        assert!(kill_query_sql("").is_none());
+        assert!(kill_query_sql("12; DROP").is_none());
+        assert!(kill_query_sql("-1").is_none());
+        assert!(kill_query_sql("1e2").is_none());
     }
 }

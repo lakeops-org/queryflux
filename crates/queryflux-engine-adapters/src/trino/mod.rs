@@ -25,7 +25,7 @@ use queryflux_core::{
 use reqwest::{Client, StatusCode};
 use tracing::debug;
 
-use crate::{AdapterKind, AsyncAdapter};
+use crate::{AdapterKind, AsyncAdapter, BackendQueryIdSlot};
 use api::TrinoResponse;
 
 use queryflux_core::engine_registry::{
@@ -410,9 +410,38 @@ impl AsyncAdapter for TrinoAdapter {
         })
     }
 
-    async fn cancel_query(&self, _backend_id: &BackendQueryId) -> Result<()> {
-        // Trino cancel: DELETE the nextUri. We'd need to look it up from persistence.
-        // For now this is handled by the frontend which has the stored next_uri.
+    async fn cancel_query(&self, backend_id: &BackendQueryId) -> Result<()> {
+        // `DELETE /v1/query/{id}` cancels a running query without needing nextUri.
+        let url = self.trino_url(&format!("/v1/query/{}", backend_id.0));
+        match self
+            .apply_cluster_auth(self.http_client.delete(&url))
+            .send()
+            .await
+        {
+            Ok(resp) if resp.status().is_success() => {
+                debug!(
+                    cluster = %self.cluster_name,
+                    query_id = %backend_id,
+                    "Trino query cancelled (DELETE /v1/query)"
+                );
+            }
+            Ok(resp) => {
+                debug!(
+                    cluster = %self.cluster_name,
+                    status = %resp.status(),
+                    query_id = %backend_id,
+                    "Trino cancel DELETE non-success (ignored)"
+                );
+            }
+            Err(e) => {
+                debug!(
+                    cluster = %self.cluster_name,
+                    query_id = %backend_id,
+                    error = %e,
+                    "Trino cancel DELETE failed (ignored)"
+                );
+            }
+        }
         Ok(())
     }
 
@@ -423,6 +452,7 @@ impl AsyncAdapter for TrinoAdapter {
         credentials: &queryflux_auth::QueryCredentials,
         tags: &queryflux_core::tags::QueryTags,
         params: &queryflux_core::params::QueryParams,
+        id_slot: &BackendQueryIdSlot,
     ) -> crate::Result<crate::SyncExecution> {
         use crate::SyncExecution;
         use queryflux_core::query::QueryPollResult;
@@ -445,6 +475,7 @@ impl AsyncAdapter for TrinoAdapter {
                     ..
                 } => (backend_query_id, None, initial_response, engine_stats),
             };
+        id_slot.publish(backend_query_id.0.clone());
 
         let (batch_tx, batch_rx) = tokio::sync::mpsc::channel::<crate::Result<RecordBatch>>(32);
         let (stats_tx, stats_rx) = tokio::sync::oneshot::channel();

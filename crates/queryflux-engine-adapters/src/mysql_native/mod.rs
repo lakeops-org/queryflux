@@ -22,7 +22,7 @@ use queryflux_core::{
     tags::{tags_to_json, QueryTags},
 };
 
-use crate::NativeExecution;
+use crate::{BackendQueryIdSlot, NativeExecution};
 
 /// Number of rows per `NativeResultChunk`. Balances channel overhead vs. memory.
 const BATCH_SIZE: usize = 1_000;
@@ -45,11 +45,13 @@ pub async fn execute(
     _credentials: &QueryCredentials,
     tags: &QueryTags,
     params: &QueryParams,
+    id_slot: &BackendQueryIdSlot,
 ) -> Result<NativeExecution> {
     let mut conn = pool
         .get_conn()
         .await
         .map_err(|e| QueryFluxError::Engine(format!("mysql_native: connection failed: {e}")))?;
+    id_slot.publish(conn.id().to_string());
 
     if let Some(db) = session.database() {
         let use_sql = format!("USE `{}`", db.replace('`', "``"));

@@ -32,11 +32,11 @@ use queryflux_core::engine_registry::{
     AuthType, ConfigField, ConnectionType, EngineDescriptor, FieldType,
 };
 use queryflux_core::error::{QueryFluxError, Result};
-use queryflux_core::query::{ClusterGroupName, ClusterName, EngineType};
+use queryflux_core::query::{BackendQueryId, ClusterGroupName, ClusterName, EngineType};
 use queryflux_core::session::SessionContext;
 use queryflux_core::tags::QueryTags;
 
-use crate::{AdapterKind, SyncExecution};
+use crate::{AdapterKind, BackendQueryIdSlot, SyncExecution};
 
 /// Timeout for control-plane requests (health checks, catalog listing).
 /// Query execution has no overall timeout — analytics queries can be long.
@@ -256,18 +256,22 @@ impl ClickHouseAdapter {
 
     /// Build a query request: SQL as the POST body, everything else as URL params.
     ///
-    /// `query_id` is always set (one UUID per request) so queries are traceable
-    /// in `system.query_log`. Cancellation is NOT wired up: the sync adapter
-    /// path has no cancel hook, so a client disconnect does not `KILL QUERY`
-    /// on the ClickHouse side (tracked in #111).
+    /// `query_id` is always set so queries are traceable in `system.query_log`
+    /// and so [`SyncAdapter::cancel_query`] can issue `KILL QUERY WHERE query_id = …`.
     fn query_request(&self, sql: &str, format: &str) -> reqwest::RequestBuilder {
+        self.query_request_with_id(sql, format, &uuid::Uuid::new_v4().to_string())
+    }
+
+    fn query_request_with_id(
+        &self,
+        sql: &str,
+        format: &str,
+        query_id: &str,
+    ) -> reqwest::RequestBuilder {
         let mut req = self
             .client
             .post(format!("{}/", self.endpoint))
-            .query(&[
-                ("default_format", format),
-                ("query_id", &uuid::Uuid::new_v4().to_string()),
-            ])
+            .query(&[("default_format", format), ("query_id", query_id)])
             .body(sql.to_string());
         if let Some((user, pass)) = &self.basic_auth {
             req = req.basic_auth(user, Some(pass));
@@ -504,6 +508,21 @@ fn escape_ident(ident: &str) -> String {
     format!("`{}`", ident.replace('\\', "\\\\").replace('`', "``"))
 }
 
+/// True when `id` is safe to interpolate into `KILL QUERY WHERE query_id = '…'`.
+/// QueryFlux mints UUIDs; this also rejects anything a confused caller might pass.
+fn is_safe_query_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 128
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+/// `KILL QUERY WHERE query_id = '<id>'`, or `None` if `id` is not safe.
+fn kill_query_sql(id: &str) -> Option<String> {
+    is_safe_query_id(id).then(|| format!("KILL QUERY WHERE query_id = '{id}'"))
+}
+
 /// True when an error carries ClickHouse's UNKNOWN_TABLE (60) or
 /// UNKNOWN_DATABASE (81) exception code — the codes `clickhouse_http_error`
 /// embeds in the message it formats.
@@ -523,8 +542,11 @@ impl crate::SyncAdapter for ClickHouseAdapter {
         // Dispatch interpolates params into the SQL before calling — this
         // adapter reports `supports_native_params() == false` (the default).
         _params: &queryflux_core::params::QueryParams,
+        id_slot: &BackendQueryIdSlot,
     ) -> Result<SyncExecution> {
-        let mut req = self.query_request(sql, "ArrowStream");
+        let query_id = uuid::Uuid::new_v4().to_string();
+        id_slot.publish(query_id.clone());
+        let mut req = self.query_request_with_id(sql, "ArrowStream", &query_id);
         if let Some(db) = session.database() {
             req = req.query(&[("database", db)]);
         }
@@ -585,6 +607,36 @@ impl crate::SyncAdapter for ClickHouseAdapter {
 
     fn engine_type(&self) -> EngineType {
         EngineType::ClickHouse
+    }
+
+    async fn cancel_query(&self, backend_id: &BackendQueryId) -> Result<()> {
+        let Some(sql) = kill_query_sql(&backend_id.0) else {
+            tracing::debug!(
+                cluster = %self.cluster_name,
+                query_id = %backend_id,
+                "ClickHouse cancel skipped: query_id is not a safe identifier"
+            );
+            return Ok(());
+        };
+        match self.run_query_lines(&sql).await {
+            Ok(_) => {
+                tracing::debug!(
+                    cluster = %self.cluster_name,
+                    query_id = %backend_id,
+                    "ClickHouse KILL QUERY issued"
+                );
+            }
+            Err(e) => {
+                // Best-effort: the query may already have finished.
+                tracing::debug!(
+                    cluster = %self.cluster_name,
+                    query_id = %backend_id,
+                    error = %e,
+                    "ClickHouse KILL QUERY failed (ignored)"
+                );
+            }
+        }
+        Ok(())
     }
 
     async fn health_check(&self) -> bool {
@@ -1029,5 +1081,21 @@ mod tests {
         let decoded = tsv_unescape(listed);
         assert_eq!(decoded, r"back\slash");
         assert_eq!(escape_ident(&decoded), r"`back\\slash`");
+    }
+
+    #[test]
+    fn kill_query_sql_accepts_uuids() {
+        let id = "550e8400-e29b-41d4-a716-446655440000";
+        assert_eq!(
+            kill_query_sql(id).as_deref(),
+            Some("KILL QUERY WHERE query_id = '550e8400-e29b-41d4-a716-446655440000'")
+        );
+    }
+
+    #[test]
+    fn kill_query_sql_rejects_quotes_and_empty() {
+        assert!(kill_query_sql("").is_none());
+        assert!(kill_query_sql("abc'; DROP TABLE t; --").is_none());
+        assert!(kill_query_sql("has space").is_none());
     }
 }

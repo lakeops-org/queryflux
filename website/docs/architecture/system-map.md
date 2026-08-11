@@ -124,23 +124,19 @@ QueryExecution::Sync { result: QueryPollResult }
 | StarRocks | Sync | MySQL protocol, single round-trip |
 | ClickHouse | Sync | HTTP interface, `ArrowStream` response decoded to Arrow record batches |
 
-### EngineAdapterTrait (`queryflux-engine-adapters`)
+### Engine adapters (`queryflux-engine-adapters`)
+
+There is no single `EngineAdapterTrait`. Engines implement **`SyncAdapter`** (DuckDB, StarRocks, ClickHouse, ADBC) or **`AsyncAdapter`** (Trino, Athena).
 
 ```rust
-pub trait EngineAdapterTrait: Send + Sync {
-    async fn submit_query(&self, sql: &str, session: &SessionContext) -> Result<QueryExecution>;
-    async fn poll_query(&self, backend_id: &BackendQueryId, next_uri: Option<&str>) -> Result<QueryPollResult>;
-    async fn cancel_query(&self, backend_id: &BackendQueryId) -> Result<()>;
-    async fn health_check(&self) -> bool;
-    fn engine_type(&self) -> EngineType;
+// SyncAdapter — execute_as_arrow / optional execute_native
+async fn cancel_query(&self, backend_id: &BackendQueryId) -> Result<()>; // default no-op
 
-    // Catalog discovery — feeds schema context for translation
-    async fn list_catalogs(&self) -> Result<Vec<String>>;
-    async fn list_databases(&self, catalog: &str) -> Result<Vec<String>>;
-    async fn list_tables(&self, catalog: &str, db: &str) -> Result<Vec<String>>;
-    async fn describe_table(&self, catalog: &str, db: &str, table: &str) -> Result<Option<TableSchema>>;
-}
+// AsyncAdapter — submit_query + poll_query
+async fn cancel_query(&self, backend_id: &BackendQueryId) -> Result<()>; // required
 ```
+
+On the sync path, dispatch holds a `SyncCancelGuard`. Adapters publish a `BackendQueryId` into a shared slot as soon as the engine id is known (before the blocking wait). If the client disconnects, the guard calls `cancel_query` (ClickHouse `KILL QUERY WHERE query_id = …`, StarRocks `KILL QUERY <connection_id>`, DuckDB `interrupt()`, Athena `StopQueryExecution`, Trino `DELETE /v1/query/{id}`). DuckDB HTTP and ADBC have no cross-thread kill API — cancel is a documented no-op; dropping the HTTP request is best-effort.
 
 ### RouterTrait (`queryflux-routing`)
 

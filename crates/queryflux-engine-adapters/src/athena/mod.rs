@@ -22,7 +22,7 @@ use queryflux_core::{
 };
 use tracing::warn;
 
-use crate::{AdapterKind, AsyncAdapter};
+use crate::{AdapterKind, AsyncAdapter, BackendQueryIdSlot};
 
 /// Parsed and validated configuration for an Athena cluster.
 pub struct AthenaConfig {
@@ -393,6 +393,7 @@ impl AsyncAdapter for AthenaAdapter {
         _credentials: &queryflux_auth::QueryCredentials,
         _tags: &queryflux_core::tags::QueryTags,
         params: &queryflux_core::params::QueryParams,
+        id_slot: &BackendQueryIdSlot,
     ) -> crate::Result<crate::SyncExecution> {
         use crate::SyncExecution;
         use futures::stream;
@@ -429,6 +430,7 @@ impl AsyncAdapter for AthenaAdapter {
             .query_execution_id()
             .ok_or_else(|| QueryFluxError::Engine("Athena returned no execution ID".to_string()))?
             .to_string();
+        id_slot.publish(execution_id.clone());
 
         self.wait_for_completion(&execution_id).await?;
 

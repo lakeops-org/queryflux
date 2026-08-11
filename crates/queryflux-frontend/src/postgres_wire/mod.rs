@@ -31,6 +31,7 @@ use queryflux_core::{
     tags::parse_query_tags,
 };
 
+use crate::abort::AbortOnDrop;
 use crate::dispatch::{execute_to_sink, ResultSink};
 use crate::state::AppState;
 use crate::{FrontendListenerTrait, ShutdownRx};
@@ -243,7 +244,7 @@ async fn handle_connection(
                     .trim()
                     .to_string();
                 debug!(conn_id = connection_id, sql = %sql, "Postgres wire: query");
-                handle_simple_query(&mut writer, &state, &session, &sql).await?;
+                handle_simple_query(&mut reader, &mut writer, &state, &session, &sql).await?;
             }
 
             b'P' => {
@@ -284,12 +285,17 @@ async fn handle_connection(
 
 // ── Query execution ───────────────────────────────────────────────────────────
 
-async fn handle_simple_query<W: AsyncWriteExt + Unpin>(
+async fn handle_simple_query<R, W>(
+    reader: &mut R,
     writer: &mut W,
     state: &Arc<AppState>,
     session: &SessionContext,
     sql: &str,
-) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>>
+where
+    R: AsyncReadExt + Unpin,
+    W: AsyncWriteExt + Unpin,
+{
     if sql.is_empty() {
         // Empty query: EmptyQueryResponse + ReadyForQuery.
         write_msg(writer, b'I', &[]).await?;
@@ -344,7 +350,7 @@ async fn handle_simple_query<W: AsyncWriteExt + Unpin>(
     let session2 = session.clone();
     let sql2 = sql.to_string();
 
-    let exec_task = tokio::spawn(async move {
+    let exec_task = AbortOnDrop::new(tokio::spawn(async move {
         execute_to_sink(
             &state2,
             sql2,
@@ -357,21 +363,41 @@ async fn handle_simple_query<W: AsyncWriteExt + Unpin>(
         )
         .await
         // sink drops here, closing tx
-    });
+    }));
 
-    // Forward encoded Postgres messages to the client as they arrive.
-    while let Some(msg) = rx.recv().await {
-        writer.write_all(&msg).await?;
-        writer.flush().await?;
+    // Forward encoded Postgres messages. Abort the engine query if the client
+    // closes (or sends another message) while we are still waiting for results.
+    loop {
+        tokio::select! {
+            msg = rx.recv() => {
+                match msg {
+                    Some(msg) => {
+                        writer.write_all(&msg).await?;
+                        writer.flush().await?;
+                    }
+                    None => break,
+                }
+            }
+            _ = wait_client_gone(reader) => {
+                debug!("Postgres wire: client disconnected during query — aborting");
+                return Ok(());
+            }
+        }
     }
 
-    if let Err(e) = exec_task.await {
+    if let Err(e) = exec_task.join().await {
         warn!("Postgres query task panicked: {e}");
     }
 
     // ReadyForQuery after each command.
     write_msg(writer, b'Z', b"I").await?;
     Ok(())
+}
+
+/// Resolves when the client TCP stream is readable (typically EOF / next message).
+async fn wait_client_gone<R: AsyncReadExt + Unpin>(reader: &mut R) {
+    let mut buf = [0u8; 1];
+    let _ = reader.read(&mut buf).await;
 }
 
 // ── PostgresResultSink ────────────────────────────────────────────────────────

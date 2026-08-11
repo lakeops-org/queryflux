@@ -4,6 +4,7 @@
 /// or: cargo test -p queryflux-e2e-tests --test clickhouse_tests -- --include-ignored
 use std::sync::OnceLock;
 
+use queryflux_core::query::QueryStatus;
 use queryflux_e2e_tests::{
     harness::{TestHarness, GROUP_CLICKHOUSE, GROUP_TRINO},
     trino_client::TrinoClient,
@@ -313,4 +314,96 @@ async fn routing_same_sql_trino_and_clickhouse() {
     assert_eq!(trino.rows.len(), 1);
     assert_eq!(ch.rows.len(), 1);
     assert_eq!(trino.rows[0][0], ch.rows[0][0]);
+}
+
+/// Client disconnect must `KILL QUERY` the in-flight ClickHouse query (#111).
+#[tokio::test]
+#[ignore = "requires ClickHouse — run with: make test-e2e"]
+async fn clickhouse_client_disconnect_kills_backend_query() {
+    require_group!(GROUP_CLICKHOUSE);
+    harness().clear_records();
+    let marker = format!(
+        "qf-cancel-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time")
+            .as_nanos()
+    );
+    let url = format!("{}/v1/statement", harness().base_url());
+    let sql = format!("SELECT sleep(30) /* {marker} */");
+
+    let http = reqwest::Client::new();
+    let inflight = tokio::spawn({
+        let http = http.clone();
+        let url = url.clone();
+        let sql = sql.clone();
+        async move {
+            let _ = http
+                .post(url)
+                .header("X-Trino-User", "test")
+                .header("X-Qf-Group", GROUP_CLICKHOUSE)
+                .body(sql)
+                .send()
+                .await;
+        }
+    });
+
+    // Wait until ClickHouse is actually running the sleep query.
+    let mut started = false;
+    for _ in 0..50 {
+        let r = client()
+            .execute_on(
+                &format!(
+                    "SELECT count() FROM system.processes \
+                     WHERE query LIKE '%/* {marker} */%' AND query NOT LIKE '%system.processes%'"
+                ),
+                GROUP_CLICKHOUSE,
+            )
+            .await
+            .expect("processlist");
+        if r.error.is_none() && r.rows.first().and_then(|row| row.first()) == Some(&json!(1)) {
+            started = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(started, "sleep query never appeared in system.processes");
+
+    inflight.abort();
+    let _ = inflight.await;
+
+    let mut gone = false;
+    for _ in 0..50 {
+        let r = client()
+            .execute_on(
+                &format!(
+                    "SELECT count() FROM system.processes \
+                     WHERE query LIKE '%/* {marker} */%' AND query NOT LIKE '%system.processes%'"
+                ),
+                GROUP_CLICKHOUSE,
+            )
+            .await
+            .expect("processlist");
+        if r.error.is_none() && r.rows.first().and_then(|row| row.first()) == Some(&json!(0)) {
+            gone = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(
+        gone,
+        "sleep query still running after client disconnect — KILL QUERY did not land"
+    );
+
+    let record = harness()
+        .wait_for_record(|r| {
+            r.cluster_group.0 == GROUP_CLICKHOUSE
+                && r.sql_preview.contains(&marker)
+                && r.status == QueryStatus::Cancelled
+        })
+        .await;
+    assert!(
+        record.is_some(),
+        "expected QueryRecord with status=Cancelled for the disconnected sleep query"
+    );
 }
