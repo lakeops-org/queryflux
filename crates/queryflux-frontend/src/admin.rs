@@ -162,6 +162,10 @@ pub struct SecurityConfigDto {
     pub ldap: Option<LdapConfigDto>,
     /// Number of users defined when provider = "static". Passwords are never exposed.
     pub static_user_count: Option<usize>,
+    /// Usernames + groups/roles so Studio can re-save without wiping the user list.
+    /// Passwords are never included.
+    #[serde(default)]
+    pub static_user_summaries: Vec<StaticUserSummaryDto>,
     pub authorization_provider: String,
     pub openfga: Option<OpenFgaConfigDto>,
     /// Per-cluster-group simple allow-lists (used when authorization_provider = "none").
@@ -202,6 +206,13 @@ pub struct GroupAuthzDto {
     pub allow_users: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct StaticUserSummaryDto {
+    pub username: String,
+    pub groups: Vec<String>,
+    pub roles: Vec<String>,
+}
+
 impl Default for SecurityConfigDto {
     fn default() -> Self {
         Self {
@@ -210,6 +221,7 @@ impl Default for SecurityConfigDto {
             oidc: None,
             ldap: None,
             static_user_count: None,
+            static_user_summaries: Vec::new(),
             authorization_provider: "none".to_string(),
             openfga: None,
             group_authorization: HashMap::new(),
@@ -366,7 +378,25 @@ impl SecurityConfigDto {
             group_name_attribute: l.group_name_attribute.clone(),
         });
 
-        let static_user_count = auth.static_users.as_ref().map(|s| s.users.len());
+        let static_user_summaries: Vec<StaticUserSummaryDto> = auth
+            .static_users
+            .as_ref()
+            .map(|s| {
+                s.users
+                    .iter()
+                    .map(|(username, entry)| StaticUserSummaryDto {
+                        username: username.clone(),
+                        groups: entry.groups.clone(),
+                        roles: entry.roles.clone(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let static_user_count = if static_user_summaries.is_empty() {
+            None
+        } else {
+            Some(static_user_summaries.len())
+        };
 
         let authorization_provider = match authz.provider {
             AuthorizationProviderConfig::None => "none",
@@ -408,6 +438,7 @@ impl SecurityConfigDto {
             oidc,
             ldap,
             static_user_count,
+            static_user_summaries,
             authorization_provider,
             openfga,
             group_authorization,
@@ -1816,10 +1847,37 @@ async fn delete_user_script_handler(
 async fn get_security_config_handler(State(state): State<Arc<AdminState>>) -> impl IntoResponse {
     if let Some(store) = &state.admin_store {
         if let Ok(Some(v)) = store.get_proxy_setting("security_config").await {
-            return Json(v).into_response();
+            if !queryflux_core::security_setting::is_blank_security_setting(&v) {
+                return Json(security_dto_from_stored(&v, &state.security_config)).into_response();
+            }
         }
     }
     Json(state.security_config.as_ref()).into_response()
+}
+
+/// Sanitized view of a stored security blob. Never returns raw passwords.
+fn security_dto_from_stored(
+    v: &serde_json::Value,
+    fallback: &SecurityConfigDto,
+) -> SecurityConfigDto {
+    let (auth, authz) = queryflux_core::security_setting::parse_security_setting(v);
+    let mut dto = fallback.clone();
+    if let Some(auth) = auth.as_ref() {
+        let tmp =
+            SecurityConfigDto::from_config(auth, &AuthorizationConfig::default(), &HashMap::new());
+        dto.auth_provider = tmp.auth_provider;
+        dto.auth_required = tmp.auth_required;
+        dto.oidc = tmp.oidc;
+        dto.ldap = tmp.ldap;
+        dto.static_user_count = tmp.static_user_count;
+        dto.static_user_summaries = tmp.static_user_summaries;
+    }
+    if let Some(authz) = authz.as_ref() {
+        let tmp = SecurityConfigDto::from_config(&AuthConfig::default(), authz, &HashMap::new());
+        dto.authorization_provider = tmp.authorization_provider;
+        dto.openfga = tmp.openfga;
+    }
+    dto
 }
 
 fn group_id_maps(
@@ -1898,7 +1956,58 @@ async fn put_security_config_handler(
         )
             .into_response();
     };
-    let value = serde_json::to_value(&body).unwrap_or(serde_json::Value::Null);
+    let incoming = serde_json::to_value(&body).unwrap_or(serde_json::Value::Null);
+    let existing = store
+        .get_proxy_setting("security_config")
+        .await
+        .ok()
+        .flatten();
+    let value =
+        queryflux_core::security_setting::merge_security_setting(existing.as_ref(), incoming);
+
+    let (auth, _) = queryflux_core::security_setting::parse_security_setting(&value);
+    match auth {
+        None if body.auth_provider != "none" => {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "could not parse auth.provider = {} (check static users / OIDC / LDAP fields)",
+                    body.auth_provider
+                ),
+            )
+                .into_response();
+        }
+        Some(cfg)
+            if matches!(cfg.provider, AuthProviderConfig::Static)
+                && cfg
+                    .static_users
+                    .as_ref()
+                    .map(|s| s.users.is_empty())
+                    .unwrap_or(true) =>
+        {
+            return (
+                StatusCode::BAD_REQUEST,
+                "auth.provider = static requires at least one user",
+            )
+                .into_response();
+        }
+        Some(cfg) if matches!(cfg.provider, AuthProviderConfig::Oidc) && cfg.oidc.is_none() => {
+            return (
+                StatusCode::BAD_REQUEST,
+                "auth.provider = oidc requires oidc issuer and jwks_uri",
+            )
+                .into_response();
+        }
+        Some(cfg) if matches!(cfg.provider, AuthProviderConfig::Ldap) && cfg.ldap.is_none() => {
+            return (
+                StatusCode::BAD_REQUEST,
+                "auth.provider = ldap requires ldap url and user_search_base",
+            )
+                .into_response();
+        }
+        _ => {}
+    }
+
     match store.set_proxy_setting("security_config", value).await {
         Ok(()) => {
             notify_live_config_reload(&state);

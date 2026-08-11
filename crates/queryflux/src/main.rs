@@ -300,13 +300,17 @@ async fn main() -> Result<()> {
             .collect();
 
         // Apply persisted security overrides (`security_settings` / `security_config` key).
+        // The migration seeds `{}`; that is not an override — keep YAML.
         if let Ok(Some(v)) = pg.get_proxy_setting("security_config").await {
-            let (auth_cfg, authz_cfg) = parse_security_setting(&v);
-            if let Some(auth_cfg) = auth_cfg {
-                config.auth = auth_cfg;
-            }
-            if let Some(authz_cfg) = authz_cfg {
-                config.authorization = authz_cfg;
+            if !queryflux_core::security_setting::is_blank_security_setting(&v) {
+                let (auth_cfg, authz_cfg) =
+                    queryflux_core::security_setting::parse_security_setting(&v);
+                if let Some(auth_cfg) = auth_cfg {
+                    config.auth = auth_cfg;
+                }
+                if let Some(authz_cfg) = authz_cfg {
+                    config.authorization = authz_cfg;
+                }
             }
         }
         let mut routing_from_db = false;
@@ -2360,8 +2364,10 @@ async fn reload_live_config(
     // any parse/build failure keep the carried-over providers — a reload must
     // never fall back to permissive defaults.
     match pg.get_proxy_setting("security_config").await {
+        Ok(Some(v)) if queryflux_core::security_setting::is_blank_security_setting(&v) => {}
         Ok(Some(v)) => {
-            let (auth_cfg, authz_cfg) = parse_security_setting(&v);
+            let (auth_cfg, authz_cfg) =
+                queryflux_core::security_setting::parse_security_setting(&v);
             match auth_cfg.map(|cfg| build_auth_provider(&cfg)) {
                 Some(Ok(provider)) => live.auth_provider = provider,
                 Some(Err(e)) => {
@@ -2388,51 +2394,6 @@ async fn reload_live_config(
     }
 
     Ok(live)
-}
-
-/// Parse the persisted `security_config` proxy setting into typed configs.
-///
-/// `PUT /admin/config/security` stores the flat `UpsertSecurityConfig` shape
-/// (`auth_provider`, `auth_required`, `authorization_provider`, ...); earlier
-/// builds wrapped typed configs under `authConfig` / `authorizationConfig`.
-/// Accept both so existing rows keep working. Returns `None` for a section
-/// that is absent or fails to parse.
-fn parse_security_setting(
-    v: &serde_json::Value,
-) -> (
-    Option<queryflux_core::config::AuthConfig>,
-    Option<queryflux_core::config::AuthorizationConfig>,
-) {
-    use serde_json::{json, Value};
-
-    let auth = if let Some(wrapped) = v.get("authConfig") {
-        serde_json::from_value(wrapped.clone()).ok()
-    } else if v.get("auth_provider").is_some() {
-        serde_json::from_value(json!({
-            "provider": v.get("auth_provider").cloned().unwrap_or(Value::Null),
-            "required": v.get("auth_required").cloned().unwrap_or(Value::Bool(false)),
-            "oidc": v.get("oidc").cloned().unwrap_or(Value::Null),
-            "ldap": v.get("ldap").cloned().unwrap_or(Value::Null),
-            "staticUsers": v.get("static_users").cloned().unwrap_or(Value::Null),
-        }))
-        .ok()
-    } else {
-        None
-    };
-
-    let authz = if let Some(wrapped) = v.get("authorizationConfig") {
-        serde_json::from_value(wrapped.clone()).ok()
-    } else if v.get("authorization_provider").is_some() {
-        serde_json::from_value(json!({
-            "provider": v.get("authorization_provider").cloned().unwrap_or(Value::Null),
-            "openfga": v.get("openfga").cloned().unwrap_or(Value::Null),
-        }))
-        .ok()
-    } else {
-        None
-    };
-
-    (auth, authz)
 }
 
 fn build_auth_provider(
@@ -2805,61 +2766,6 @@ fn in_memory_metrics(
 
 #[cfg(test)]
 mod tests {
-    use super::parse_security_setting;
-    use queryflux_core::config::{AuthProviderConfig, AuthorizationProviderConfig};
-    use serde_json::json;
-
-    /// The shape `PUT /admin/config/security` actually persists
-    /// (flat `UpsertSecurityConfig` fields).
-    #[test]
-    fn parse_security_setting_flat_admin_shape() {
-        let v = json!({
-            "auth_provider": "static",
-            "auth_required": true,
-            "oidc": null,
-            "ldap": null,
-            "static_users": { "users": { "alice": { "password": "pw" } } },
-            "authorization_provider": "none",
-            "openfga": null,
-        });
-        let (auth, authz) = parse_security_setting(&v);
-        let auth = auth.expect("auth section should parse");
-        assert!(matches!(auth.provider, AuthProviderConfig::Static));
-        assert!(auth.required);
-        assert!(auth.static_users.is_some());
-        let authz = authz.expect("authz section should parse");
-        assert!(matches!(authz.provider, AuthorizationProviderConfig::None));
-    }
-
-    /// Legacy wrapped shape from earlier builds.
-    #[test]
-    fn parse_security_setting_wrapped_legacy_shape() {
-        let v = json!({
-            "authConfig": { "provider": "none", "required": true },
-            "authorizationConfig": { "provider": "openfga", "openfga": {
-                "url": "http://fga:8080", "storeId": "s1", "model": null
-            }},
-        });
-        let (auth, authz) = parse_security_setting(&v);
-        let auth = auth.expect("wrapped auth should parse");
-        assert!(matches!(auth.provider, AuthProviderConfig::None));
-        assert!(auth.required);
-        let authz = authz.expect("wrapped authz should parse");
-        assert!(matches!(
-            authz.provider,
-            AuthorizationProviderConfig::OpenFga
-        ));
-    }
-
-    /// Unrecognizable value: both sections None so the caller preserves
-    /// the previous providers instead of weakening to permissive defaults.
-    #[test]
-    fn parse_security_setting_unrecognized_yields_none() {
-        let (auth, authz) = parse_security_setting(&json!({ "something": "else" }));
-        assert!(auth.is_none());
-        assert!(authz.is_none());
-    }
-
     mod in_memory_metrics {
         use std::sync::Arc;
 
