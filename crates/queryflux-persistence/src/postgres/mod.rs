@@ -1000,7 +1000,17 @@ impl ProxySettingsStore for PostgresStore {
                     serde_json::json!({ "global": global, "groups": groups }),
                 ))
             }
-            _ => Ok(None),
+            other => {
+                let row: Option<(serde_json::Value,)> =
+                    sqlx::query_as(r#"SELECT value FROM proxy_settings WHERE key = $1"#)
+                        .bind(other)
+                        .fetch_optional(&self.pool)
+                        .await
+                        .map_err(|e| {
+                            QueryFluxError::Persistence(format!("get_proxy_setting: {e}"))
+                        })?;
+                Ok(row.map(|(v,)| v))
+            }
         }
     }
 
@@ -1072,7 +1082,17 @@ impl ProxySettingsStore for PostgresStore {
                     QueryFluxError::Persistence(format!("guardrails tx commit: {e}"))
                 })?;
             }
-            _ => {}
+            other => {
+                sqlx::query(
+                    r#"INSERT INTO proxy_settings (key, value) VALUES ($1, $2)
+                       ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()"#,
+                )
+                .bind(other)
+                .bind(&value)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| QueryFluxError::Persistence(format!("set_proxy_setting: {e}")))?;
+            }
         }
         Ok(())
     }
@@ -1093,7 +1113,15 @@ impl ProxySettingsStore for PostgresStore {
                     .await
                     .map_err(|e| QueryFluxError::Persistence(format!("delete guardrails: {e}")))?;
             }
-            _ => {}
+            other => {
+                sqlx::query(r#"DELETE FROM proxy_settings WHERE key = $1"#)
+                    .bind(other)
+                    .execute(&self.pool)
+                    .await
+                    .map_err(|e| {
+                        QueryFluxError::Persistence(format!("delete_proxy_setting: {e}"))
+                    })?;
+            }
         }
         Ok(())
     }

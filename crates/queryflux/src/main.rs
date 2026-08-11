@@ -894,7 +894,7 @@ async fn main() -> Result<()> {
     let admin_store: Option<Arc<dyn AdminStore>> = backend
         .clone()
         .map(|b| b as Arc<dyn AdminStore>)
-        .or_else(|| mem_store.map(|m| m as Arc<dyn AdminStore>));
+        .or_else(|| mem_store.clone().map(|m| m as Arc<dyn AdminStore>));
     let security_config = Arc::new(AdminSecurityConfigDto::from_config(
         &config.auth,
         &config.authorization,
@@ -913,13 +913,19 @@ async fn main() -> Result<()> {
     );
 
     // Build admin credentials — env vars take precedence over YAML.
-    let admin_username =
-        std::env::var("QUERYFLUX_ADMIN_USER").unwrap_or_else(|_| config.admin_api.username.clone());
+    // Bootstrap lives on `queryflux.adminApi`, not the unused top-level `adminApi`.
+    let admin_username = std::env::var("QUERYFLUX_ADMIN_USER")
+        .unwrap_or_else(|_| config.queryflux.admin_api.username.clone());
     let admin_password = std::env::var("QUERYFLUX_ADMIN_PASSWORD")
-        .unwrap_or_else(|_| config.admin_api.password.clone());
+        .unwrap_or_else(|_| config.queryflux.admin_api.password.clone());
     let settings_store = backend
         .clone()
-        .map(|b| b as Arc<dyn queryflux_persistence::ProxySettingsStore>);
+        .map(|b| b as Arc<dyn queryflux_persistence::ProxySettingsStore>)
+        .or_else(|| {
+            mem_store
+                .clone()
+                .map(|m| m as Arc<dyn queryflux_persistence::ProxySettingsStore>)
+        });
     let admin_creds = Arc::new(queryflux_auth::AdminCredentialsManager::new(
         admin_username,
         admin_password,

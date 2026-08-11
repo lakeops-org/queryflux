@@ -823,13 +823,13 @@ async fn change_password_handler(
     {
         Ok(()) => (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response(),
         Err(e) => {
-            let msg = e.to_string();
-            let status = if msg.contains("incorrect") {
-                StatusCode::UNAUTHORIZED
-            } else {
-                StatusCode::BAD_REQUEST
-            };
-            (status, Json(serde_json::json!({"error": msg}))).into_response()
+            // Always 400 — 401 would clear the Studio session even when Basic
+            // auth is still valid and only the "current password" field is wrong.
+            (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": e.to_string()})),
+            )
+                .into_response()
         }
     }
 }

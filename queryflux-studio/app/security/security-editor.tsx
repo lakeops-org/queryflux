@@ -2,7 +2,7 @@
 
 import React, { useEffect, useState } from "react";
 import Link from "next/link";
-import { getAuthStatus, putSecurityConfig } from "@/lib/api";
+import { changePassword, getAuthStatus, putSecurityConfig } from "@/lib/api";
 import type { SecurityConfigDto, UpsertSecurityConfig, GroupAuthzDto } from "@/lib/api-types";
 import { Field, SectionHeader, TextInput, SaveBar } from "@/components/studio-settings";
 import {
@@ -176,6 +176,84 @@ function StaticUsersEditor({
 
 
 // ---------------------------------------------------------------------------
+// Admin API password
+// ---------------------------------------------------------------------------
+
+function AdminPasswordSection({
+  dbOverride,
+  onChanged,
+}: {
+  dbOverride: boolean | null;
+  onChanged: () => void;
+}) {
+  const [currentPassword, setCurrentPassword] = useState("");
+  const [newPassword, setNewPassword] = useState("");
+  const [confirmPassword, setConfirmPassword] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [msg, setMsg] = useState<{ text: string; ok: boolean } | null>(null);
+
+  const save = async () => {
+    setSaving(true);
+    setMsg(null);
+    try {
+      if (newPassword.length < 8) {
+        throw new Error("New password must be at least 8 characters.");
+      }
+      if (newPassword !== confirmPassword) {
+        throw new Error("New password and confirmation do not match.");
+      }
+      await changePassword(currentPassword, newPassword);
+      setCurrentPassword("");
+      setNewPassword("");
+      setConfirmPassword("");
+      onChanged();
+      setMsg({ text: "Password updated. Use it on the next Studio sign-in.", ok: true });
+    } catch (e) {
+      setMsg({ text: String(e), ok: false });
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <section className="bg-white rounded-xl border border-slate-200 shadow-xs overflow-hidden">
+      <SectionHeader icon={<Key size={15} />} title="Admin API Password" />
+      <div className="p-6 space-y-4">
+        <p className="text-xs text-slate-600">
+          {dbOverride === true
+            ? "A password hash is stored in the database and is used instead of YAML/env bootstrap credentials."
+            : dbOverride === false
+              ? "Bootstrap credentials from YAML or QUERYFLUX_ADMIN_* are in use. Changing the password here persists it to the database."
+              : "Status unavailable."}
+        </p>
+        <div className="grid grid-cols-3 gap-3">
+          <TextInput
+            label="Current password"
+            type="password"
+            value={currentPassword}
+            onChange={setCurrentPassword}
+          />
+          <TextInput
+            label="New password"
+            type="password"
+            value={newPassword}
+            onChange={setNewPassword}
+            placeholder="at least 8 characters"
+          />
+          <TextInput
+            label="Confirm new password"
+            type="password"
+            value={confirmPassword}
+            onChange={setConfirmPassword}
+          />
+        </div>
+        <SaveBar saving={saving} message={msg} onSave={save} label="Change admin password" />
+      </div>
+    </section>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Main editor component
 // ---------------------------------------------------------------------------
 
@@ -267,18 +345,7 @@ export function SecurityEditor({ initialSecurity }: Props) {
       </div>
 
       {/* ── Admin API Password ───────────────────────────────────────────── */}
-      <section className="bg-white rounded-xl border border-slate-200 shadow-xs overflow-hidden">
-        <SectionHeader icon={<Key size={15} />} title="Admin API Password" />
-        <div className="p-6">
-          <p className="text-xs text-slate-600">
-            {dbOverride === true
-              ? "A password is stored in the database for the admin API (not managed from Studio)."
-              : dbOverride === false
-                ? "Bootstrap credentials from YAML or environment may be in use. Configure the admin password on the server."
-                : "Status unavailable."}
-          </p>
-        </div>
-      </section>
+      <AdminPasswordSection dbOverride={dbOverride} onChanged={() => setDbOverride(true)} />
 
       {/* ── Authentication ───────────────────────────────────────────────── */}
       <section className="bg-white rounded-xl border border-slate-200 shadow-xs overflow-hidden">
