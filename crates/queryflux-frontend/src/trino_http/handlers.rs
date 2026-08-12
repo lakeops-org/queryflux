@@ -100,6 +100,26 @@ async fn allow_query_action_or_forbid(
     Some(StatusCode::FORBIDDEN.into_response())
 }
 
+/// Restore backend auth stripped from persisted queued sessions.
+///
+/// Called only after the dequeue caller is verified as the query owner.
+fn session_for_queued_dispatch(
+    mut session: SessionContext,
+    headers: &HeaderMap,
+    auth_ctx: &queryflux_auth::AuthContext,
+) -> SessionContext {
+    if let Some(v) = headers.get("authorization").and_then(|h| h.to_str().ok()) {
+        session
+            .extra
+            .insert("authorization".to_string(), v.to_string());
+    } else if let Some(token) = &auth_ctx.raw_token {
+        session
+            .extra
+            .insert("authorization".to_string(), format!("Bearer {token}"));
+    }
+    session
+}
+
 fn trino_error_response(query_id: &str, message: &str) -> Response<Body> {
     let resp = queryflux_engine_adapters::trino::api::TrinoResponse {
         id: query_id.to_string(),
@@ -829,7 +849,7 @@ pub async fn get_queued_statement(
     queued_backoff_delay(seq).await;
 
     let sql = queued.sql.clone();
-    let session = queued.session.clone();
+    let session = session_for_queued_dispatch(queued.session.clone(), &headers, &auth_ctx);
     let protocol = queued.frontend_protocol.clone();
     let group = queued.cluster_group.clone();
 

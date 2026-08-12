@@ -1047,7 +1047,7 @@ pub struct RunningQueryDto {
 fn sql_preview(sql: &str) -> String {
     let t = sql.split_whitespace().collect::<Vec<_>>().join(" ");
     if t.chars().count() > 160 {
-        format!("{}…", t.chars().take(160).collect::<String>())
+        format!("{}…", t.chars().take(159).collect::<String>())
     } else {
         t
     }
@@ -1122,12 +1122,21 @@ async fn cancel_query_handler(
 ) -> impl IntoResponse {
     let persistence = &state.app.persistence;
 
-    if let Ok(Some(executing)) = persistence.get(&BackendQueryId(id.clone())).await {
-        return cancel_executing(&state, executing).await;
+    match persistence.get(&BackendQueryId(id.clone())).await {
+        Ok(Some(executing)) => return cancel_executing(&state, executing).await,
+        Ok(None) => {}
+        Err(e) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+        }
     }
-    if let Ok(all) = persistence.list_all().await {
-        if let Some(executing) = all.into_iter().find(|q| q.id.0 == id) {
-            return cancel_executing(&state, executing).await;
+    match persistence.list_all().await {
+        Ok(all) => {
+            if let Some(executing) = all.into_iter().find(|q| q.id.0 == id) {
+                return cancel_executing(&state, executing).await;
+            }
+        }
+        Err(e) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
         }
     }
 
@@ -1152,16 +1161,20 @@ async fn cancel_executing(
     state: &AdminState,
     executing: queryflux_core::query::ExecutingQuery,
 ) -> Response {
+    let mut cancelled = false;
     if let Some(adapter) = state.app.adapter(&executing.cluster_name.0).await {
         if let Some(async_adapter) = adapter.as_async() {
-            if let Err(e) = async_adapter
+            if async_adapter
                 .cancel_query(&executing.backend_query_id)
                 .await
+                .is_ok()
             {
+                cancelled = true;
+            } else {
                 warn!(
                     id = %executing.id,
                     backend = %executing.backend_query_id,
-                    "Admin adapter cancel failed: {e}"
+                    "Admin adapter cancel failed"
                 );
             }
         }
@@ -1172,7 +1185,22 @@ async fn cancel_executing(
             base.trim_end_matches('/'),
             executing.backend_query_id.0
         );
-        let _ = state.app.http_client.delete(&url).send().await;
+        match state.app.http_client.delete(&url).send().await {
+            Ok(resp) if resp.status().is_success() => cancelled = true,
+            Ok(resp) => warn!(
+                id = %executing.id,
+                status = %resp.status(),
+                "Admin HTTP cancel returned non-success"
+            ),
+            Err(e) => warn!(id = %executing.id, "Admin HTTP cancel failed: {e}"),
+        }
+    }
+    if !cancelled {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "failed to cancel query on backend",
+        )
+            .into_response();
     }
     state
         .app

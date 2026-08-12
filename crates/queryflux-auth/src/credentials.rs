@@ -1,4 +1,7 @@
+use queryflux_core::error::{QueryFluxError, Result};
 use serde::{Deserialize, Serialize};
+
+use crate::authorization::is_query_owner;
 
 /// Raw credential material extracted from the frontend protocol before any verification.
 ///
@@ -43,26 +46,14 @@ pub struct AuthContext {
 /// - Two anonymous identities cannot be distinguished and are allowed
 ///   (network-trust / `auth.provider: none` with no username).
 /// - Otherwise the authenticated user must equal `submitted_by`.
-pub fn require_query_owner(
-    auth: &AuthContext,
-    submitted_by: &str,
-) -> queryflux_core::error::Result<()> {
-    if submitted_by.is_empty() {
-        return Ok(());
-    }
-    if is_anonymous(&auth.user) && is_anonymous(submitted_by) {
-        return Ok(());
-    }
-    if auth.user != submitted_by {
-        return Err(queryflux_core::error::QueryFluxError::Unauthorized(
+pub fn require_query_owner(auth: &AuthContext, submitted_by: &str) -> Result<()> {
+    if is_query_owner(auth, submitted_by) {
+        Ok(())
+    } else {
+        Err(QueryFluxError::Unauthorized(
             "query belongs to a different user".to_string(),
-        ));
+        ))
     }
-    Ok(())
-}
-
-fn is_anonymous(user: &str) -> bool {
-    user.is_empty() || user == "anonymous"
 }
 
 /// Resolved wire credentials for a specific backend query execution.

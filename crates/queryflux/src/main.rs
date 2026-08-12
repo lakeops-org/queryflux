@@ -2380,11 +2380,7 @@ async fn reload_live_config(
         Ok(Some(v)) => {
             let (auth_cfg, authz_cfg) =
                 queryflux_core::security_setting::parse_security_setting(&v);
-            let operators = auth_cfg
-                .as_ref()
-                .map(operators_from_auth)
-                .unwrap_or_default();
-            match auth_cfg.map(|cfg| build_auth_provider(&cfg)) {
+            match auth_cfg.as_ref().map(|cfg| build_auth_provider(cfg)) {
                 Some(Ok(provider)) => live.auth_provider = provider,
                 Some(Err(e)) => {
                     tracing::warn!("Reload: failed to rebuild auth provider; keeping previous: {e}")
@@ -2393,14 +2389,28 @@ async fn reload_live_config(
                     "Reload: security_config has no recognizable auth section; keeping previous"
                 ),
             }
-            match authz_cfg.map(|cfg| build_authorization(&cfg, &cluster_groups, operators)) {
-                Some(Ok(checker)) => live.authorization = checker,
-                Some(Err(e)) => {
-                    tracing::warn!("Reload: failed to rebuild authorization; keeping previous: {e}")
+            match auth_cfg {
+                Some(auth) => {
+                    let operators = operators_from_auth(&auth);
+                    match authz_cfg.map(|cfg| build_authorization(&cfg, &cluster_groups, operators))
+                    {
+                        Some(Ok(checker)) => live.authorization = checker,
+                        Some(Err(e)) => {
+                            tracing::warn!(
+                                "Reload: failed to rebuild authorization; keeping previous: {e}"
+                            )
+                        }
+                        None => tracing::warn!(
+                            "Reload: security_config has no recognizable authorization section; keeping previous"
+                        ),
+                    }
                 }
-                None => tracing::warn!(
-                    "Reload: security_config has no recognizable authorization section; keeping previous"
-                ),
+                None if authz_cfg.is_some() => {
+                    tracing::warn!(
+                        "Reload: security_config has authorization but no auth section; keeping previous authorization (operator policy unchanged)"
+                    );
+                }
+                None => {}
             }
         }
         Ok(None) => {}

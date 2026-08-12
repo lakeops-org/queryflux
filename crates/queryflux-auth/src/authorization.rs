@@ -57,6 +57,10 @@ fn is_anonymous(user: &str) -> bool {
 /// cannot be distinguished and are allowed.
 pub fn is_query_owner(auth: &AuthContext, submitted_by: &str) -> bool {
     if submitted_by.is_empty() {
+        warn!(
+            user = %auth.user,
+            "Query has no recorded owner — allowing action (legacy compatibility)"
+        );
         return true;
     }
     if is_anonymous(&auth.user) && is_anonymous(submitted_by) {
@@ -91,8 +95,6 @@ pub trait AuthorizationChecker: Send + Sync {
     async fn check(&self, auth_ctx: &AuthContext, group: &str) -> bool;
 
     /// Returns `true` if `auth_ctx` may perform `action` on `query`.
-    ///
-    /// Default: owner for all actions; operators may cancel.
     async fn check_query(
         &self,
         auth_ctx: &AuthContext,

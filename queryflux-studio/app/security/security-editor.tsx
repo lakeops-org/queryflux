@@ -324,6 +324,13 @@ export function SecurityEditor({ initialSecurity }: Props) {
     operator_groups: initialSecurity?.operator_groups ?? [],
   });
 
+  const [operatorRolesText, setOperatorRolesText] = useState(
+    () => (initialSecurity?.operator_roles ?? []).join(", "),
+  );
+  const [operatorGroupsText, setOperatorGroupsText] = useState(
+    () => (initialSecurity?.operator_groups ?? []).join(", "),
+  );
+
   const [securityForm, setSecurityForm] = useState<UpsertSecurityConfig>(initSecurityForm);
   const [securitySaving, setSecuritySaving] = useState(false);
   const [securityMsg, setSecurityMsg] = useState<{ text: string; ok: boolean } | null>(null);
@@ -353,7 +360,17 @@ export function SecurityEditor({ initialSecurity }: Props) {
     setSecuritySaving(true);
     setSecurityMsg(null);
     try {
-      await putSecurityConfig(securityForm);
+      await putSecurityConfig({
+        ...securityForm,
+        operator_roles: operatorRolesText
+          .split(",")
+          .map((s) => s.trim())
+          .filter(Boolean),
+        operator_groups: operatorGroupsText
+          .split(",")
+          .map((s) => s.trim())
+          .filter(Boolean),
+      });
       setSecurityMsg({ text: "Saved. The proxy reloads config automatically.", ok: true });
     } catch (e) {
       setSecurityMsg({ text: String(e), ok: false });
@@ -859,30 +876,14 @@ export function SecurityEditor({ initialSecurity }: Props) {
             <div className="grid grid-cols-2 gap-3">
               <TextInput
                 label="Operator roles (comma-separated)"
-                value={(securityForm.operator_roles ?? []).join(", ")}
-                onChange={(v) =>
-                  setSecurityForm((f) => ({
-                    ...f,
-                    operator_roles: v
-                      .split(",")
-                      .map((s) => s.trim())
-                      .filter(Boolean),
-                  }))
-                }
+                value={operatorRolesText}
+                onChange={setOperatorRolesText}
                 placeholder="queryflux-operator"
               />
               <TextInput
                 label="Operator groups (comma-separated)"
-                value={(securityForm.operator_groups ?? []).join(", ")}
-                onChange={(v) =>
-                  setSecurityForm((f) => ({
-                    ...f,
-                    operator_groups: v
-                      .split(",")
-                      .map((s) => s.trim())
-                      .filter(Boolean),
-                  }))
-                }
+                value={operatorGroupsText}
+                onChange={setOperatorGroupsText}
                 placeholder="platform-ops"
               />
             </div>
