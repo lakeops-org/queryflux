@@ -328,6 +328,7 @@ impl TestHarness {
             group_order,
             group_translation_scripts: HashMap::new(),
             group_default_tags: HashMap::new(),
+            group_max_queued_queries: HashMap::new(),
             group_cache_settings: HashMap::new(),
             auth_provider: Arc::new(NoneAuthProvider::new(false)) as Arc<dyn AuthProvider>,
             authorization: Arc::new(AllowAllAuthorization::default())
@@ -567,6 +568,7 @@ impl WireTestHarness {
             group_order: vec![GROUP_DUCKDB.to_string()],
             group_translation_scripts: HashMap::new(),
             group_default_tags: HashMap::new(),
+            group_max_queued_queries: HashMap::new(),
             group_cache_settings: HashMap::new(),
             auth_provider: Arc::new(NoneAuthProvider::new(false)) as Arc<dyn AuthProvider>,
             authorization: Arc::new(AllowAllAuthorization::default())
@@ -701,6 +703,7 @@ impl WireTestHarness {
             group_order: vec![GROUP_STARROCKS.to_string()],
             group_translation_scripts: HashMap::new(),
             group_default_tags: HashMap::new(),
+            group_max_queued_queries: HashMap::new(),
             group_cache_settings: HashMap::new(),
             auth_provider: Arc::new(NoneAuthProvider::new(false)) as Arc<dyn AuthProvider>,
             authorization: Arc::new(AllowAllAuthorization::default())

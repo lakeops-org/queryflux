@@ -132,9 +132,6 @@ pub async fn dispatch_query(
         guard_chain,
         group_guard_chain,
         cluster_cfg,
-        // TODO: plumb max_queued_queries through LiveConfig. Add a field like
-        // `group_max_queued_queries: HashMap<String, Option<u64>>` to LiveConfig,
-        // populated from ClusterGroupConfig.max_queued_queries during reload.
         max_queued_queries,
     ) = {
         let live = state.live.read().await;
@@ -154,7 +151,10 @@ pub async fn dispatch_query(
             // cluster_cfg resolved after cluster selection below; captured here
             // so credential resolution uses the same config generation.
             live.cluster_configs.clone(),
-            None::<u64>,
+            live.group_max_queued_queries
+                .get(&group.0)
+                .copied()
+                .flatten(),
         )
     };
 
@@ -757,27 +757,31 @@ async fn persist_queued_query(
     session: SessionContext,
     protocol: FrontendProtocol,
     group: ClusterGroupName,
-    _already_stored: bool,
+    already_stored: bool,
     sequence: u64,
     max_queued_queries: Option<u64>,
     auth_ctx: &AuthContext,
 ) -> Result<String> {
     // Enforce queue depth limit before admitting to the queue.
-    if let Some(limit) = max_queued_queries {
-        if limit > 0 {
-            let active_after = Utc::now() - chrono::Duration::seconds(QUEUE_ACTIVE_WINDOW_SECS);
-            let count = state
-                .persistence
-                .count_active_queued_before(&group.0, None, active_after)
-                .await
-                .unwrap_or(0);
-            if count >= limit {
-                return Err(QueryFluxError::Other(anyhow::anyhow!(
-                    "Queue full for group '{}': {}/{} queued queries",
-                    group.0,
-                    count,
-                    limit
-                )));
+    // Skip when re-persisting an already-queued query so a waiter cannot
+    // self-reject by counting itself against the limit.
+    if !already_stored {
+        if let Some(limit) = max_queued_queries {
+            if limit > 0 {
+                let active_after = Utc::now() - chrono::Duration::seconds(QUEUE_ACTIVE_WINDOW_SECS);
+                let count = state
+                    .persistence
+                    .count_active_queued_before(&group.0, None, active_after)
+                    .await
+                    .unwrap_or(0);
+                if count >= limit {
+                    state.metrics.on_queue_full(&group.0);
+                    return Err(QueryFluxError::QueueFull {
+                        group: group.0.clone(),
+                        count,
+                        limit,
+                    });
+                }
             }
         }
     }
@@ -2006,4 +2010,197 @@ async fn execute_to_sink_inner(
     state.record_query(&setup.ctx, final_outcome);
 
     sink_result
+}
+
+#[cfg(test)]
+mod queue_limit_tests {
+    use super::persist_queued_query;
+    use crate::state::test_fixtures::app_state;
+    use queryflux_auth::AuthContext;
+    use queryflux_core::error::QueryFluxError;
+    use queryflux_core::query::{ClusterGroupName, FrontendProtocol, ProxyQueryId};
+    use queryflux_core::session::SessionContext;
+    use std::collections::HashMap;
+
+    #[tokio::test]
+    async fn persist_queued_rejects_when_at_limit() {
+        let state = app_state(false);
+        let auth = AuthContext {
+            user: "alice".into(),
+            groups: vec![],
+            roles: vec![],
+            raw_token: None,
+        };
+        let group = ClusterGroupName("default".into());
+
+        persist_queued_query(
+            &state,
+            ProxyQueryId::new(),
+            "SELECT 1".into(),
+            SessionContext::default(),
+            FrontendProtocol::TrinoHttp,
+            group.clone(),
+            false,
+            0,
+            Some(1),
+            &auth,
+        )
+        .await
+        .expect("first enqueue");
+
+        let err = persist_queued_query(
+            &state,
+            ProxyQueryId::new(),
+            "SELECT 2".into(),
+            SessionContext::default(),
+            FrontendProtocol::TrinoHttp,
+            group.clone(),
+            false,
+            0,
+            Some(1),
+            &auth,
+        )
+        .await
+        .expect_err("second enqueue must fail");
+        match err {
+            QueryFluxError::QueueFull {
+                group: g,
+                count,
+                limit,
+            } => {
+                assert_eq!(g, "default");
+                assert_eq!(count, 1);
+                assert_eq!(limit, 1);
+            }
+            other => panic!("expected QueueFull, got {other}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn already_stored_skips_limit_check() {
+        let state = app_state(false);
+        let auth = AuthContext {
+            user: "alice".into(),
+            groups: vec![],
+            roles: vec![],
+            raw_token: None,
+        };
+        let group = ClusterGroupName("default".into());
+        let id = ProxyQueryId::new();
+
+        persist_queued_query(
+            &state,
+            id.clone(),
+            "SELECT 1".into(),
+            SessionContext::default(),
+            FrontendProtocol::TrinoHttp,
+            group.clone(),
+            false,
+            0,
+            Some(1),
+            &auth,
+        )
+        .await
+        .expect("first enqueue");
+
+        persist_queued_query(
+            &state,
+            id,
+            "SELECT 1".into(),
+            SessionContext::default(),
+            FrontendProtocol::TrinoHttp,
+            group,
+            true,
+            1,
+            Some(1),
+            &auth,
+        )
+        .await
+        .expect("already_stored must bypass limit");
+    }
+
+    #[tokio::test]
+    async fn dispatch_reads_limit_from_live_config() {
+        use super::dispatch_query;
+        use queryflux_cluster_manager::cluster_state::ClusterState;
+        use queryflux_cluster_manager::simple::SimpleClusterGroupManager;
+        use queryflux_core::query::{ClusterName, EngineType};
+        use std::sync::Arc;
+
+        let state = app_state(false);
+        {
+            let mut live = state.live.write().await;
+            live.group_max_queued_queries
+                .insert("default".into(), Some(1));
+            let group = ClusterGroupName("default".into());
+            let cluster = ClusterName("trino".into());
+            let cluster_state = Arc::new(ClusterState::new(
+                cluster.clone(),
+                group.clone(),
+                None,
+                None,
+                EngineType::Trino,
+                Some("http://trino.test:8080".into()),
+                0,
+                true,
+            ));
+            let mut groups = HashMap::new();
+            groups.insert(
+                group.clone(),
+                (
+                    vec![cluster_state],
+                    Arc::new(queryflux_cluster_manager::strategy::RoundRobinStrategy::new())
+                        as Arc<dyn queryflux_cluster_manager::strategy::ClusterSelectionStrategy>,
+                ),
+            );
+            live.cluster_manager = Arc::new(SimpleClusterGroupManager::new(groups));
+        }
+
+        let auth = AuthContext {
+            user: "alice".into(),
+            groups: vec![],
+            roles: vec![],
+            raw_token: None,
+        };
+        let group = ClusterGroupName("default".into());
+
+        dispatch_query(
+            &state,
+            ProxyQueryId::new(),
+            "SELECT 1".into(),
+            vec![],
+            SessionContext::default(),
+            FrontendProtocol::TrinoHttp,
+            group.clone(),
+            false,
+            None,
+            0,
+            &auth,
+        )
+        .await
+        .expect("first should queue");
+
+        let err = match dispatch_query(
+            &state,
+            ProxyQueryId::new(),
+            "SELECT 2".into(),
+            vec![],
+            SessionContext::default(),
+            FrontendProtocol::TrinoHttp,
+            group,
+            false,
+            None,
+            0,
+            &auth,
+        )
+        .await
+        {
+            Ok(_) => panic!("second should hit QueueFull"),
+            Err(e) => e,
+        };
+        assert!(
+            matches!(err, QueryFluxError::QueueFull { limit: 1, .. }),
+            "got {err}"
+        );
+    }
 }

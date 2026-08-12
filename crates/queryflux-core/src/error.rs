@@ -40,6 +40,14 @@ pub enum QueryFluxError {
     #[error("Cluster {0} requires Arrow execution path")]
     SyncEngineRequired(String),
 
+    /// The cluster group's `maxQueuedQueries` limit has been reached.
+    #[error("Queue full for group '{group}': {count}/{limit} queued queries")]
+    QueueFull {
+        group: String,
+        count: u64,
+        limit: u64,
+    },
+
     #[error(transparent)]
     Other(#[from] anyhow::Error),
 }
@@ -82,5 +90,23 @@ impl QueryFluxError {
             // misses, config errors, not-found, etc.
             _ => false,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::QueryFluxError;
+
+    #[test]
+    fn queue_full_display_includes_counts() {
+        let err = QueryFluxError::QueueFull {
+            group: "analytics".into(),
+            count: 5,
+            limit: 5,
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("analytics"), "{msg}");
+        assert!(msg.contains("5/5"), "{msg}");
+        assert!(!err.is_transient());
     }
 }

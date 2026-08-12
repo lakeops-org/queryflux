@@ -157,7 +157,8 @@ fn client_safe_message(e: &QueryFluxError) -> &'static str {
         Engine(_) => "Backend engine error",
         Routing(_) | NoClusterGroupAvailable(_) => "Query routing failed",
         Config(_) => "Configuration error",
-        Auth(_) | Unauthorized(_) | QueryNotFound(_) | ClusterNotFound(_) => "",
+        // Empty → caller forwards Display (includes group/count/limit for QueueFull).
+        Auth(_) | Unauthorized(_) | QueryNotFound(_) | ClusterNotFound(_) | QueueFull { .. } => "",
         _ => "Internal error",
     }
 }
@@ -1540,6 +1541,7 @@ mod cancel_executing_statement_tests {
             group_order: vec![group_name.0.clone()],
             group_translation_scripts: HashMap::new(),
             group_default_tags: HashMap::new(),
+            group_max_queued_queries: HashMap::new(),
             group_cache_settings: HashMap::new(),
             auth_provider: Arc::new(NoneAuthProvider::new(false)) as Arc<dyn AuthProvider>,
             authorization: Arc::new(AllowAllAuthorization::default())
