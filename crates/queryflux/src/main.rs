@@ -1288,7 +1288,7 @@ async fn main() -> Result<()> {
     }
 
     // Background task: enforce query_history_retention_days — runs hourly and deletes
-    // query_records rows older than the configured retention window.
+    // query_records, query_digest_stats, and cluster_snapshots older than the window.
     // Only active when Postgres is configured and retention_days is set.
     if let (Some(backend), Some(retention_days)) = (
         backend.clone(),
@@ -1303,7 +1303,7 @@ async fn main() -> Result<()> {
                 match backend.purge_old_query_records(cutoff).await {
                     Ok(0) => {}
                     Ok(n) => {
-                        tracing::info!("Purged {n} query records older than {retention_days} days")
+                        tracing::info!("Purged {n} history rows older than {retention_days} days")
                     }
                     Err(e) => tracing::warn!("Query history purge failed: {e}"),
                 }

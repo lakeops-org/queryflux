@@ -508,8 +508,9 @@ pub struct QueryFluxConfig {
     /// when the admin API notifies after Studio or other writes.
     #[serde(default)]
     pub config_reload_interval_secs: Option<u64>,
-    /// Number of days to retain query history records. When set, a background task
-    /// runs hourly and deletes `query_records` rows older than this many days.
+    /// Number of days to retain query history. When set, a background task runs
+    /// hourly and deletes `query_records` (`created_at`), `query_digest_stats`
+    /// (`last_seen`), and `cluster_snapshots` (`recorded_at`) older than this many days.
     /// Only takes effect when Postgres persistence is configured.
     /// Omit or set to `null` to keep history indefinitely.
     #[serde(default)]
