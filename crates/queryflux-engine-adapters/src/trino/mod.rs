@@ -32,6 +32,12 @@ use queryflux_core::engine_registry::{
     AuthType, ConfigField, ConnectionType, EngineDescriptor, FieldType,
 };
 
+/// TCP connect deadline for every Trino HTTP call.
+const TRINO_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// POST submit, DELETE cancel, and health checks. Must not apply to poll GETs:
+/// Trino long-polls a running query and a 30s client timeout kills it.
+const TRINO_CONTROL_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Parsed and validated configuration for a Trino cluster.
 pub struct TrinoConfig {
     pub endpoint: String,
@@ -109,7 +115,7 @@ impl TrinoAdapter {
         config: TrinoConfig,
     ) -> Self {
         let http_client = Client::builder()
-            .timeout(Duration::from_secs(30))
+            .connect_timeout(TRINO_CONNECT_TIMEOUT)
             .danger_accept_invalid_certs(config.tls_skip_verify)
             .build()
             .expect("Failed to build HTTP client");
@@ -136,6 +142,10 @@ impl TrinoAdapter {
             | Some(ClusterAuth::RoleArn { .. }) => builder,
             None => builder,
         }
+    }
+
+    fn with_control_timeout(&self, builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        builder.timeout(TRINO_CONTROL_TIMEOUT)
     }
 
     fn trino_url(&self, path: &str) -> String {
@@ -218,7 +228,7 @@ impl TrinoAdapter {
             return;
         };
         match self
-            .apply_cluster_auth(self.http_client.delete(uri))
+            .with_control_timeout(self.apply_cluster_auth(self.http_client.delete(uri)))
             .send()
             .await
         {
@@ -279,6 +289,7 @@ impl AsyncAdapter for TrinoAdapter {
         let mut req = self.http_client.post(&url).body(sql.to_string());
         req = self.apply_cluster_auth(req);
         req = self.apply_session_headers(req, session, tags);
+        req = self.with_control_timeout(req);
 
         let resp = req
             .send()
@@ -357,6 +368,9 @@ impl AsyncAdapter for TrinoAdapter {
 
         debug!(uri = %uri, "Polling Trino");
 
+        // No request timeout: Trino holds this GET until the query produces a
+        // page or its long-poll window elapses. A 30s client timeout would
+        // abort a healthy running query.
         let resp = self
             .apply_cluster_auth(self.http_client.get(uri))
             .send()
@@ -414,7 +428,7 @@ impl AsyncAdapter for TrinoAdapter {
         // `DELETE /v1/query/{id}` cancels a running query without needing nextUri.
         let url = self.trino_url(&format!("/v1/query/{}", backend_id.0));
         match self
-            .apply_cluster_auth(self.http_client.delete(&url))
+            .with_control_timeout(self.apply_cluster_auth(self.http_client.delete(&url)))
             .send()
             .await
         {
@@ -573,7 +587,7 @@ impl AsyncAdapter for TrinoAdapter {
 
     async fn health_check(&self) -> bool {
         let url = self.trino_url("/v1/info");
-        self.apply_cluster_auth(self.http_client.get(&url))
+        self.with_control_timeout(self.apply_cluster_auth(self.http_client.get(&url)))
             .send()
             .await
             .map(|r| r.status().is_success())
@@ -1122,5 +1136,75 @@ impl crate::EngineAdapterFactory for TrinoFactory {
             group,
             config,
         ))))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{TrinoAdapter, TrinoConfig, TRINO_CONNECT_TIMEOUT, TRINO_CONTROL_TIMEOUT};
+    use crate::AsyncAdapter;
+    use queryflux_core::query::{BackendQueryId, ClusterGroupName, ClusterName, QueryPollResult};
+    use std::time::{Duration, Instant};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    #[test]
+    fn control_timeout_is_shorter_than_a_trino_long_poll_window() {
+        assert_eq!(TRINO_CONNECT_TIMEOUT, Duration::from_secs(10));
+        assert_eq!(TRINO_CONTROL_TIMEOUT, Duration::from_secs(30));
+        // Poll GETs use the client with no overall timeout (connect only).
+        // Control operations keep the 30s cap so submit/cancel/health cannot hang.
+        let typical_trino_long_poll = Duration::from_secs(50);
+        assert!(
+            TRINO_CONTROL_TIMEOUT < typical_trino_long_poll,
+            "poll GETs must not use the control timeout"
+        );
+    }
+
+    #[tokio::test]
+    async fn poll_get_waits_for_slow_backend_without_request_timeout() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            let mut buf = [0u8; 2048];
+            let n = stream.read(&mut buf).await.expect("read");
+            let req = String::from_utf8_lossy(&buf[..n]);
+            assert!(
+                req.starts_with("GET "),
+                "poll_query should issue a GET, got: {}",
+                req.lines().next().unwrap_or("")
+            );
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            let body = r#"{"id":"q1","infoUri":"http://trino.test/ui","stats":{"state":"FINISHED"},"warnings":[]}"#;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(resp.as_bytes()).await.expect("write");
+        });
+
+        let adapter = TrinoAdapter::new(
+            ClusterName("trino".into()),
+            ClusterGroupName("default".into()),
+            TrinoConfig {
+                endpoint: format!("http://{addr}"),
+                tls_skip_verify: false,
+                auth: None,
+            },
+        );
+        let poll_uri = format!("http://{addr}/v1/statement/executing/q1/1");
+        let started = Instant::now();
+        let result = adapter
+            .poll_query(&BackendQueryId("q1".into()), Some(&poll_uri))
+            .await
+            .expect("poll should succeed");
+        assert!(
+            started.elapsed() >= Duration::from_secs(2),
+            "poll should wait for the backend long poll"
+        );
+        assert!(matches!(result, QueryPollResult::Raw { .. }));
     }
 }
