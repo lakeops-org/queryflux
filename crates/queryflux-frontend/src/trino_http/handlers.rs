@@ -25,6 +25,55 @@ use tracing::{error, info, warn};
 use super::result_sink::TrinoHttpResultSink;
 use crate::dispatch::{dispatch_query, execute_to_sink, rewrite_trino_uri, DispatchOutcome};
 use crate::state::{AppState, QueryContext, QueryOutcome};
+use queryflux_persistence::QueueCoordinator;
+
+/// Stale-claim cutoff. Heartbeats must run more often than this while dispatch
+/// is in progress so a slow submit cannot look like a crashed replica.
+const QUEUE_CLAIM_TIMEOUT_SECS: i64 = 60;
+const QUEUE_CLAIM_HEARTBEAT_SECS: u64 = 15;
+
+/// Refreshes `claimed_at` until dropped so another replica cannot take over.
+struct QueueClaimHeartbeat {
+    stop: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+impl QueueClaimHeartbeat {
+    fn start(qc: Arc<dyn QueueCoordinator>, query_id: String, instance_id: String) -> Self {
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let mut interval =
+                tokio::time::interval(Duration::from_secs(QUEUE_CLAIM_HEARTBEAT_SECS));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            interval.tick().await;
+            loop {
+                tokio::select! {
+                    _ = &mut rx => break,
+                    _ = interval.tick() => {
+                        match qc.refresh_claim(&query_id, &instance_id).await {
+                            Ok(true) => {}
+                            Ok(false) => {
+                                warn!(id = %query_id, "Queue claim lost during dispatch");
+                                break;
+                            }
+                            Err(e) => {
+                                warn!(id = %query_id, "Queue claim refresh failed: {e}");
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        Self { stop: Some(tx) }
+    }
+}
+
+impl Drop for QueueClaimHeartbeat {
+    fn drop(&mut self) {
+        if let Some(tx) = self.stop.take() {
+            let _ = tx.send(());
+        }
+    }
+}
 
 fn trino_error_response(query_id: &str, message: &str) -> Response<Body> {
     let resp = queryflux_engine_adapters::trino::api::TrinoResponse {
@@ -640,15 +689,22 @@ pub async fn get_queued_statement(
     //
     // Claims are held only for the duration of one dispatch attempt. A claim
     // older than the timeout means the claiming replica crashed mid-dispatch,
-    // so it is treated as abandoned and taken over.
-    const QUEUE_CLAIM_TIMEOUT_SECS: i64 = 60;
+    // so it is treated as abandoned and taken over. Heartbeat while dispatch
+    // runs so a slow submit cannot look like a crash.
+    let mut claim_heartbeat = None;
     if let Some(qc) = &state.queue_coordinator {
         let stale_before = chrono::Utc::now() - chrono::Duration::seconds(QUEUE_CLAIM_TIMEOUT_SECS);
         match qc
             .try_claim(&query_id.0, &state.instance_id, stale_before)
             .await
         {
-            Ok(Some(_)) => {} // claimed successfully, proceed with dispatch
+            Ok(Some(_)) => {
+                claim_heartbeat = Some(QueueClaimHeartbeat::start(
+                    qc.clone(),
+                    query_id.0.clone(),
+                    state.instance_id.clone(),
+                ));
+            }
             Ok(None) => {
                 // `None` means either claimed by another replica or the row no
                 // longer exists (finished/cleaned up). Distinguish them: a
@@ -710,6 +766,7 @@ pub async fn get_queued_statement(
             }
         }
     }
+    let _claim_heartbeat = claim_heartbeat;
 
     let queued = match state.persistence.get_queued(&query_id).await {
         Ok(Some(q)) => q,

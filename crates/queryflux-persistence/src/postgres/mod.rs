@@ -1932,6 +1932,23 @@ impl QueueCoordinator for PostgresStore {
         Ok(())
     }
 
+    async fn refresh_claim(&self, query_id: &str, instance_id: &str) -> Result<bool> {
+        let row: Option<(String,)> = sqlx::query_as(
+            r#"
+            UPDATE queued_queries
+            SET claimed_at = now()
+            WHERE id = $1 AND claimed_by = $2
+            RETURNING id
+            "#,
+        )
+        .bind(query_id)
+        .bind(instance_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| QueryFluxError::Persistence(format!("refresh_claim: {e}")))?;
+        Ok(row.is_some())
+    }
+
     async fn list_unclaimed(&self, stale_before: DateTime<Utc>) -> Result<Vec<QueuedQuery>> {
         let rows: Vec<(serde_json::Value,)> = sqlx::query_as(
             r#"
@@ -2532,6 +2549,25 @@ mod tests {
             "second claim by different instance should fail"
         );
 
+        store.delete_queued(&ProxyQueryId(qid)).await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn pg_queue_refresh_claim_only_for_owner() {
+        let store = test_store().await;
+        let qid = unique_id("hb");
+        store.upsert_queued(make_queued(&qid)).await.unwrap();
+        assert!(store
+            .try_claim(&qid, "inst-A", no_stale())
+            .await
+            .unwrap()
+            .is_some());
+        assert!(store.refresh_claim(&qid, "inst-A").await.unwrap());
+        assert!(
+            !store.refresh_claim(&qid, "inst-B").await.unwrap(),
+            "other instance must not refresh the claim"
+        );
         store.delete_queued(&ProxyQueryId(qid)).await.unwrap();
     }
 
