@@ -144,6 +144,16 @@ impl TrinoAdapter {
         }
     }
 
+    /// Trino only sends HTTP Authorization for basic/bearer cluster auth.
+    /// Other variants (AccessKey, KeyPair, RoleArn) do not set that header, so
+    /// a client Authorization value must still be forwarded.
+    fn cluster_sets_http_authorization(&self) -> bool {
+        matches!(
+            self.auth.as_ref(),
+            Some(ClusterAuth::Basic { .. } | ClusterAuth::Bearer { .. })
+        )
+    }
+
     fn with_control_timeout(&self, builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
         builder.timeout(TRINO_CONTROL_TIMEOUT)
     }
@@ -172,6 +182,12 @@ impl TrinoAdapter {
             // X-Trino-Client-Tags and X-Trino-Session are rebuilt below so that
             // effective_tags always win. All other X-Trino-* headers pass through.
             if k_lower == "x-trino-client-tags" || k_lower == "x-trino-session" {
+                continue;
+            }
+            // Security: never let a client `Authorization` header override HTTP
+            // cluster auth (basic/bearer). Other ClusterAuth variants do not set
+            // that header, so client passthrough must remain.
+            if k_lower == "authorization" && self.cluster_sets_http_authorization() {
                 continue;
             }
             if k_lower.starts_with("x-trino-") || k_lower == "authorization" {
@@ -1159,10 +1175,89 @@ mod tests {
     };
     use crate::AsyncAdapter;
     use queryflux_core::query::{BackendQueryId, ClusterGroupName, ClusterName, QueryPollResult};
-    use reqwest::StatusCode;
+    use queryflux_core::session::SessionContext;
+    use queryflux_core::tags::QueryTags;
+    use reqwest::{Client, StatusCode};
     use std::time::{Duration, Instant};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+
+    #[test]
+    fn client_authorization_does_not_override_cluster_auth() {
+        let cluster_auth = Some(queryflux_core::config::ClusterAuth::Bearer {
+            token: "cluster-token".to_string(),
+        });
+        let adapter = TrinoAdapter {
+            cluster_name: ClusterName("c1".to_string()),
+            group_name: ClusterGroupName("g1".to_string()),
+            endpoint: "http://trino:8080".to_string(),
+            http_client: Client::new(),
+            auth: cluster_auth,
+        };
+
+        let mut session = SessionContext::default();
+        session.extra.insert(
+            "authorization".to_string(),
+            "Bearer client-token".to_string(),
+        );
+
+        let builder =
+            adapter.apply_cluster_auth(adapter.http_client.get("http://trino:8080/v1/statement"));
+        let builder = adapter.apply_session_headers(builder, &session, &QueryTags::new());
+        let req = builder.build().expect("request should build");
+
+        let auth = req
+            .headers()
+            .get("authorization")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+
+        assert!(
+            auth.contains("cluster-token"),
+            "expected cluster auth token, got: {auth}"
+        );
+        assert!(
+            !auth.contains("client-token"),
+            "client token must not be forwarded: {auth}"
+        );
+    }
+
+    #[test]
+    fn client_authorization_passthrough_when_cluster_auth_is_not_http() {
+        let adapter = TrinoAdapter {
+            cluster_name: ClusterName("c1".to_string()),
+            group_name: ClusterGroupName("g1".to_string()),
+            endpoint: "http://trino:8080".to_string(),
+            http_client: Client::new(),
+            auth: Some(queryflux_core::config::ClusterAuth::AccessKey {
+                access_key_id: "AKIA".to_string(),
+                secret_access_key: "secret".to_string(),
+                session_token: None,
+            }),
+        };
+
+        let mut session = SessionContext::default();
+        session.extra.insert(
+            "authorization".to_string(),
+            "Bearer client-token".to_string(),
+        );
+
+        let builder =
+            adapter.apply_cluster_auth(adapter.http_client.get("http://trino:8080/v1/statement"));
+        let builder = adapter.apply_session_headers(builder, &session, &QueryTags::new());
+        let req = builder.build().expect("request should build");
+
+        let auth = req
+            .headers()
+            .get("authorization")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+
+        assert!(
+            auth.contains("client-token"),
+            "client Authorization must pass through when cluster auth is not HTTP: {auth}"
+        );
+    }
 
     #[test]
     fn quote_ident_escapes_double_quotes() {
