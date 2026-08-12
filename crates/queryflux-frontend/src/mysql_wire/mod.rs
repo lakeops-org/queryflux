@@ -42,7 +42,7 @@ use queryflux_core::{
 use crate::abort::{wait_client_gone, AbortOnDrop};
 use crate::dispatch::{execute_to_sink, ResultSink};
 use crate::state::AppState;
-use crate::{FrontendListenerTrait, ShutdownRx};
+use crate::{FrontendListenerTrait, ShutdownRx, MAX_FRONTEND_MESSAGE_BYTES};
 
 // ── MySQL command bytes ───────────────────────────────────────────────────────
 
@@ -841,6 +841,12 @@ async fn read_packet<R: AsyncReadExt + Unpin>(
     reader.read_exact(&mut header).await?;
     let len = u32::from_le_bytes([header[0], header[1], header[2], 0]) as usize;
     let seq = header[3];
+    if len > MAX_FRONTEND_MESSAGE_BYTES {
+        return Err(format!(
+            "MySQL packet length {len} exceeds max allowed {MAX_FRONTEND_MESSAGE_BYTES} bytes"
+        )
+        .into());
+    }
     let mut payload = vec![0u8; len];
     if len > 0 {
         reader.read_exact(&mut payload).await?;
@@ -1743,5 +1749,20 @@ mod tests {
             buf[4], 0xff,
             "expected MySQL ERR packet when auth is required"
         );
+    }
+
+    #[tokio::test]
+    async fn read_packet_rejects_oversized_length() {
+        // 24-bit length = MAX_FRONTEND_MESSAGE_BYTES + 1, seq 0.
+        let over = (MAX_FRONTEND_MESSAGE_BYTES + 1) as u32;
+        let header = [
+            (over & 0xff) as u8,
+            ((over >> 8) & 0xff) as u8,
+            ((over >> 16) & 0xff) as u8,
+            0,
+        ];
+        let mut cursor = std::io::Cursor::new(header.to_vec());
+        let err = read_packet(&mut cursor).await.expect_err("must reject");
+        assert!(err.to_string().contains("exceeds max allowed"), "got {err}");
     }
 }
