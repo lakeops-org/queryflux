@@ -33,7 +33,7 @@ The SQL API v2 routes are served on the same port as the wire protocol — there
 
 ### Session affinity
 
-The Snowflake HTTP wire protocol is **stateful**: a session token issued at login must be presented on every subsequent request. If you run multiple QueryFlux instances behind a load balancer, all requests from the same client must go to the same instance. Set `sessionAffinityAcknowledged: true` to confirm your load balancer provides this guarantee; otherwise QueryFlux will warn at startup.
+The Snowflake HTTP wire protocol is **stateful**: a session token issued at login must be presented on every subsequent request. If you run multiple QueryFlux instances behind a load balancer, all requests from the same client must go to the same instance. Set `sessionAffinityAcknowledged: true` to confirm your load balancer provides this guarantee; otherwise QueryFlux will warn at startup. See [Multi-replica operations](../../operations/multi-replica.md) for the full HA checklist.
 
 ## Endpoints
 

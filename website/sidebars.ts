@@ -18,6 +18,12 @@ const sidebars: SidebarsConfig = {
     },
     {
       type: 'category',
+      label: 'Operations',
+      collapsed: false,
+      items: ['operations/multi-replica'],
+    },
+    {
+      type: 'category',
       label: 'Reference',
       collapsed: false,
       items: ['configuration'],
