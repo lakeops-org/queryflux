@@ -40,6 +40,8 @@ pub struct PrometheusMetrics {
     capacity_degraded_total: CounterVec,
     /// queryflux_auth_failures_total{protocol}
     auth_failures_total: CounterVec,
+    /// queryflux_config_reload_failures_total{stage}
+    config_reload_failures_total: CounterVec,
     /// queryflux_queue_rejections_total{cluster_group}
     queue_rejections_total: CounterVec,
     /// queryflux_queue_duration_seconds{cluster_group}
@@ -136,6 +138,14 @@ impl PrometheusMetrics {
             &["protocol"],
         )?;
 
+        let config_reload_failures_total = CounterVec::new(
+            Opts::new(
+                "queryflux_config_reload_failures_total",
+                "Config / auth / guard hot-reload soft-failures that kept last-good config",
+            ),
+            &["stage"],
+        )?;
+
         let queue_rejections_total = CounterVec::new(
             Opts::new(
                 "queryflux_queue_rejections_total",
@@ -180,6 +190,7 @@ impl PrometheusMetrics {
         registry.register(Box::new(coordination_failures_total.clone()))?;
         registry.register(Box::new(capacity_degraded_total.clone()))?;
         registry.register(Box::new(auth_failures_total.clone()))?;
+        registry.register(Box::new(config_reload_failures_total.clone()))?;
         registry.register(Box::new(queue_rejections_total.clone()))?;
         registry.register(Box::new(queue_duration_seconds.clone()))?;
         registry.register(Box::new(cache_hits_total.clone()))?;
@@ -197,6 +208,7 @@ impl PrometheusMetrics {
             coordination_failures_total,
             capacity_degraded_total,
             auth_failures_total,
+            config_reload_failures_total,
             queue_rejections_total,
             queue_duration_seconds,
             cache_hits_total,
@@ -256,6 +268,12 @@ impl MetricsStore for PrometheusMetrics {
     fn on_auth_failure(&self, protocol: &str) {
         self.auth_failures_total
             .with_label_values(&[protocol])
+            .inc();
+    }
+
+    fn on_config_reload_failure(&self, stage: &str) {
+        self.config_reload_failures_total
+            .with_label_values(&[stage])
             .inc();
     }
 
@@ -336,5 +354,31 @@ impl MetricsStore for PrometheusMetrics {
             .set(snapshot.queued_queries as f64);
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use queryflux_persistence::MetricsStore;
+
+    #[test]
+    fn config_reload_failure_increments_counter() {
+        let metrics = PrometheusMetrics::new().expect("prometheus init");
+        metrics.on_config_reload_failure("auth_rebuild");
+        metrics.on_config_reload_failure("auth_rebuild");
+        let text = metrics.gather_text();
+        assert!(
+            text.contains("queryflux_config_reload_failures_total"),
+            "missing metric in scrape:\n{text}"
+        );
+        assert!(
+            text.contains("stage=\"auth_rebuild\""),
+            "missing stage label in scrape:\n{text}"
+        );
+        assert!(
+            text.contains('2') || text.contains("2\n"),
+            "expected counter value 2 in scrape:\n{text}"
+        );
     }
 }

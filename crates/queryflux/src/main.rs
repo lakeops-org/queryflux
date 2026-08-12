@@ -1310,6 +1310,7 @@ async fn main() -> Result<()> {
         let cache = adapter_reload_cache.clone();
         let notify = config_reload_notify.clone();
         let admin_for_reload = admin_store_for_reload;
+        let metrics = app_state.metrics.clone();
         let periodic_secs = config.queryflux.periodic_config_reload_interval_secs();
 
         // Subscribe to distributed config revision changes (push where the
@@ -1335,6 +1336,7 @@ async fn main() -> Result<()> {
                 backend: &Arc<dyn BackendStore>,
                 cache: &tokio::sync::Mutex<AdapterReloadCache>,
                 live: &Arc<tokio::sync::RwLock<LiveConfig>>,
+                metrics: &Arc<dyn MetricsStore>,
             ) {
                 let mut cache_guard = cache.lock().await;
                 // Snapshot the pieces a reload must never silently weaken; the
@@ -1348,18 +1350,22 @@ async fn main() -> Result<()> {
                         group_guard_chains: l.group_guard_chains.clone(),
                     }
                 };
-                match reload_live_config(backend, &mut cache_guard, &prev).await {
+                match reload_live_config(backend, &mut cache_guard, &prev, metrics).await {
                     Ok(new_live) => {
                         *live.write().await = new_live;
                         tracing::info!("Live config reloaded from backend");
                     }
-                    Err(e) => tracing::warn!("Config reload failed: {e}"),
+                    Err(e) => {
+                        metrics.on_config_reload_failure("reload");
+                        tracing::warn!("Config reload failed: {e}");
+                    }
                 }
             }
 
             async fn reload_guard_chain_from_admin(
                 admin: &Option<Arc<dyn AdminStore>>,
                 live: &Arc<tokio::sync::RwLock<LiveConfig>>,
+                metrics: &Arc<dyn MetricsStore>,
             ) {
                 if let Some(store) = admin {
                     let guard_script_bodies =
@@ -1377,7 +1383,10 @@ async fn main() -> Result<()> {
                             w.guard_chain = None;
                             w.group_guard_chains = HashMap::new();
                         }
-                        Err(e) => tracing::warn!("Guard chain reload failed: {e}"),
+                        Err(e) => {
+                            metrics.on_config_reload_failure("guard_reload");
+                            tracing::warn!("Guard chain reload failed: {e}");
+                        }
                     }
                 }
             }
@@ -1387,16 +1396,17 @@ async fn main() -> Result<()> {
                 cache: &tokio::sync::Mutex<AdapterReloadCache>,
                 live: &Arc<tokio::sync::RwLock<LiveConfig>>,
                 admin: &Option<Arc<dyn AdminStore>>,
+                metrics: &Arc<dyn MetricsStore>,
             ) {
                 if let Some(backend) = backend {
-                    do_reload(backend, cache, live).await;
+                    do_reload(backend, cache, live, metrics).await;
                 } else {
                     // YAML-mode reload contract: without a Postgres backend, routing rules,
                     // cluster configs, and adapters are fixed at startup from the YAML file
                     // and cannot change at runtime. Only guard chains (stored in the admin
                     // store) can be hot-reloaded via the admin API. Routing or cluster
                     // changes in YAML require a process restart.
-                    reload_guard_chain_from_admin(admin, live).await;
+                    reload_guard_chain_from_admin(admin, live, metrics).await;
                 }
             }
 
@@ -1447,7 +1457,7 @@ async fn main() -> Result<()> {
                         }
                     }
                     coalesce_revisions(&mut revision_rx).await;
-                    do_reload_or_guard(&backend, &cache, &live, &admin_for_reload).await;
+                    do_reload_or_guard(&backend, &cache, &live, &admin_for_reload, &metrics).await;
                 },
                 Some(interval_secs) => {
                     let mut interval =
@@ -1464,7 +1474,8 @@ async fn main() -> Result<()> {
                             }
                         }
                         coalesce_revisions(&mut revision_rx).await;
-                        do_reload_or_guard(&backend, &cache, &live, &admin_for_reload).await;
+                        do_reload_or_guard(&backend, &cache, &live, &admin_for_reload, &metrics)
+                            .await;
                     }
                 }
             }
@@ -2286,6 +2297,7 @@ async fn reload_live_config(
     pg: &Arc<dyn BackendStore>,
     cache: &mut AdapterReloadCache,
     prev: &PreservedLive,
+    metrics: &Arc<dyn MetricsStore>,
 ) -> Result<LiveConfig> {
     let cluster_records = pg
         .list_cluster_configs()
@@ -2374,6 +2386,7 @@ async fn reload_live_config(
         }
         Ok(None) => {}
         Err(e) => {
+            metrics.on_config_reload_failure("guard_reload");
             tracing::warn!("Reload: guardrails_config read failed; keeping previous chains: {e}")
         }
     }
@@ -2389,11 +2402,15 @@ async fn reload_live_config(
             match auth_cfg.as_ref().map(|cfg| build_auth_provider(cfg)) {
                 Some(Ok(provider)) => live.auth_provider = provider,
                 Some(Err(e)) => {
+                    metrics.on_config_reload_failure("auth_rebuild");
                     tracing::warn!("Reload: failed to rebuild auth provider; keeping previous: {e}")
                 }
-                None => tracing::warn!(
-                    "Reload: security_config has no recognizable auth section; keeping previous"
-                ),
+                None => {
+                    metrics.on_config_reload_failure("auth_rebuild");
+                    tracing::warn!(
+                        "Reload: security_config has no recognizable auth section; keeping previous"
+                    );
+                }
             }
             match auth_cfg {
                 Some(auth) => {
@@ -2402,16 +2419,21 @@ async fn reload_live_config(
                     {
                         Some(Ok(checker)) => live.authorization = checker,
                         Some(Err(e)) => {
+                            metrics.on_config_reload_failure("authz_rebuild");
                             tracing::warn!(
                                 "Reload: failed to rebuild authorization; keeping previous: {e}"
                             )
                         }
-                        None => tracing::warn!(
+                        None => {
+                            metrics.on_config_reload_failure("authz_rebuild");
+                            tracing::warn!(
                             "Reload: security_config has no recognizable authorization section; keeping previous"
-                        ),
+                        );
+                        }
                     }
                 }
                 None if authz_cfg.is_some() => {
+                    metrics.on_config_reload_failure("authz_rebuild");
                     tracing::warn!(
                         "Reload: security_config has authorization but no auth section; keeping previous authorization (operator policy unchanged)"
                     );
@@ -2421,6 +2443,7 @@ async fn reload_live_config(
         }
         Ok(None) => {}
         Err(e) => {
+            metrics.on_config_reload_failure("auth_rebuild");
             tracing::warn!("Reload: security_config read failed; keeping previous auth: {e}")
         }
     }
