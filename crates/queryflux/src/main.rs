@@ -614,7 +614,11 @@ async fn main() -> Result<()> {
     let router_chain = RouterChain::new(routers, fallback);
 
     let auth_provider = build_auth_provider(&config.auth)?;
-    let authorization = build_authorization(&config.authorization, &config.cluster_groups)?;
+    let authorization = build_authorization(
+        &config.authorization,
+        &config.cluster_groups,
+        operators_from_auth(&config.auth),
+    )?;
 
     // --- Production safety warnings ---
     if matches!(
@@ -972,6 +976,7 @@ async fn main() -> Result<()> {
         test_cluster_fn,
         cors_origins,
         app_state.result_cache.clone(),
+        app_state.clone(),
     );
 
     // --- Start Trino HTTP frontend ---
@@ -2252,7 +2257,7 @@ async fn build_live_config(
         group_default_tags,
         group_cache_settings,
         auth_provider: Arc::new(NoneAuthProvider::new(false)),
-        authorization: Arc::new(AllowAllAuthorization),
+        authorization: Arc::new(AllowAllAuthorization::default()),
     })
 }
 
@@ -2375,7 +2380,7 @@ async fn reload_live_config(
         Ok(Some(v)) => {
             let (auth_cfg, authz_cfg) =
                 queryflux_core::security_setting::parse_security_setting(&v);
-            match auth_cfg.map(|cfg| build_auth_provider(&cfg)) {
+            match auth_cfg.as_ref().map(|cfg| build_auth_provider(cfg)) {
                 Some(Ok(provider)) => live.auth_provider = provider,
                 Some(Err(e)) => {
                     tracing::warn!("Reload: failed to rebuild auth provider; keeping previous: {e}")
@@ -2384,14 +2389,28 @@ async fn reload_live_config(
                     "Reload: security_config has no recognizable auth section; keeping previous"
                 ),
             }
-            match authz_cfg.map(|cfg| build_authorization(&cfg, &cluster_groups)) {
-                Some(Ok(checker)) => live.authorization = checker,
-                Some(Err(e)) => {
-                    tracing::warn!("Reload: failed to rebuild authorization; keeping previous: {e}")
+            match auth_cfg {
+                Some(auth) => {
+                    let operators = operators_from_auth(&auth);
+                    match authz_cfg.map(|cfg| build_authorization(&cfg, &cluster_groups, operators))
+                    {
+                        Some(Ok(checker)) => live.authorization = checker,
+                        Some(Err(e)) => {
+                            tracing::warn!(
+                                "Reload: failed to rebuild authorization; keeping previous: {e}"
+                            )
+                        }
+                        None => tracing::warn!(
+                            "Reload: security_config has no recognizable authorization section; keeping previous"
+                        ),
+                    }
                 }
-                None => tracing::warn!(
-                    "Reload: security_config has no recognizable authorization section; keeping previous"
-                ),
+                None if authz_cfg.is_some() => {
+                    tracing::warn!(
+                        "Reload: security_config has authorization but no auth section; keeping previous authorization (operator policy unchanged)"
+                    );
+                }
+                None => {}
             }
         }
         Ok(None) => {}
@@ -2442,11 +2461,28 @@ fn build_auth_provider(
     })
 }
 
+fn operators_from_auth(
+    auth: &queryflux_core::config::AuthConfig,
+) -> queryflux_auth::OperatorPolicy {
+    queryflux_auth::OperatorPolicy::from_lists(
+        auth.operator_roles.clone(),
+        auth.operator_groups.clone(),
+    )
+}
+
 fn build_authorization(
     authz: &queryflux_core::config::AuthorizationConfig,
     cluster_groups: &HashMap<String, queryflux_core::config::ClusterGroupConfig>,
+    operators: queryflux_auth::OperatorPolicy,
 ) -> Result<Arc<dyn queryflux_auth::AuthorizationChecker>> {
     use queryflux_core::config::AuthorizationProviderConfig;
+    if !operators.roles.is_empty() || !operators.groups.is_empty() {
+        info!(
+            operator_roles = ?operators.roles,
+            operator_groups = ?operators.groups,
+            "Query operators configured (may cancel any query)"
+        );
+    }
     Ok(match &authz.provider {
         AuthorizationProviderConfig::None => {
             let policies = cluster_groups
@@ -2459,10 +2495,10 @@ fn build_authorization(
             });
             if has_any_policy {
                 info!("Authorization: simple allow-list policy");
-                Arc::new(SimpleAuthorizationPolicy::new(policies))
+                Arc::new(SimpleAuthorizationPolicy::new(policies).with_operators(operators))
             } else {
                 info!("Authorization: allow-all (no allow-lists configured)");
-                Arc::new(AllowAllAuthorization)
+                Arc::new(AllowAllAuthorization::with_operators(operators))
             }
         }
         AuthorizationProviderConfig::OpenFga => {
@@ -2470,7 +2506,7 @@ fn build_authorization(
                 "authorization.provider = openfga requires authorization.openfga to be configured",
             )?;
             info!(url = %openfga_cfg.url, store_id = %openfga_cfg.store_id, "Authorization: OpenFGA");
-            Arc::new(OpenFgaAuthorizationClient::new(openfga_cfg))
+            Arc::new(OpenFgaAuthorizationClient::new(openfga_cfg).with_operators(operators))
         }
     })
 }

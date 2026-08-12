@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import { changePassword, getAuthStatus, putSecurityConfig } from "@/lib/api";
 import type { SecurityConfigDto, UpsertSecurityConfig, GroupAuthzDto } from "@/lib/api-types";
@@ -320,7 +320,40 @@ export function SecurityEditor({ initialSecurity }: Props) {
           credentials: null, // never pre-fill secrets
         }
       : null,
+    operator_roles: initialSecurity?.operator_roles ?? [],
+    operator_groups: initialSecurity?.operator_groups ?? [],
   });
+
+  const [operatorRolesText, setOperatorRolesText] = useState(
+    () => (initialSecurity?.operator_roles ?? []).join(", "),
+  );
+  const [operatorGroupsText, setOperatorGroupsText] = useState(
+    () => (initialSecurity?.operator_groups ?? []).join(", "),
+  );
+
+  const lastSyncedRolesText = useRef(operatorRolesText);
+  const lastSyncedGroupsText = useRef(operatorGroupsText);
+  const rolesFromProps = (initialSecurity?.operator_roles ?? []).join(", ");
+  const groupsFromProps = (initialSecurity?.operator_groups ?? []).join(", ");
+
+  useEffect(() => {
+    setOperatorRolesText((current) => {
+      if (current === lastSyncedRolesText.current) {
+        lastSyncedRolesText.current = rolesFromProps;
+        return rolesFromProps;
+      }
+      lastSyncedRolesText.current = rolesFromProps;
+      return current;
+    });
+    setOperatorGroupsText((current) => {
+      if (current === lastSyncedGroupsText.current) {
+        lastSyncedGroupsText.current = groupsFromProps;
+        return groupsFromProps;
+      }
+      lastSyncedGroupsText.current = groupsFromProps;
+      return current;
+    });
+  }, [rolesFromProps, groupsFromProps]);
 
   const [securityForm, setSecurityForm] = useState<UpsertSecurityConfig>(initSecurityForm);
   const [securitySaving, setSecuritySaving] = useState(false);
@@ -351,7 +384,17 @@ export function SecurityEditor({ initialSecurity }: Props) {
     setSecuritySaving(true);
     setSecurityMsg(null);
     try {
-      await putSecurityConfig(securityForm);
+      await putSecurityConfig({
+        ...securityForm,
+        operator_roles: operatorRolesText
+          .split(",")
+          .map((s) => s.trim())
+          .filter(Boolean),
+        operator_groups: operatorGroupsText
+          .split(",")
+          .map((s) => s.trim())
+          .filter(Boolean),
+      });
       setSecurityMsg({ text: "Saved. The proxy reloads config automatically.", ok: true });
     } catch (e) {
       setSecurityMsg({ text: String(e), ok: false });
@@ -842,6 +885,33 @@ export function SecurityEditor({ initialSecurity }: Props) {
               </div>
             </div>
           )}
+
+          <div className="rounded-lg border border-slate-200 bg-slate-50 p-4 space-y-3">
+            <div>
+              <p className="text-xs font-semibold text-slate-600 uppercase tracking-widest">
+                Query operators
+              </p>
+              <p className="text-xs text-slate-500 mt-1">
+                IdP roles or groups that may cancel any in-flight or queued query.
+                Operators cannot poll another user&apos;s results. The Admin API
+                can always cancel.
+              </p>
+            </div>
+            <div className="grid grid-cols-2 gap-3">
+              <TextInput
+                label="Operator roles (comma-separated)"
+                value={operatorRolesText}
+                onChange={setOperatorRolesText}
+                placeholder="queryflux-operator"
+              />
+              <TextInput
+                label="Operator groups (comma-separated)"
+                value={operatorGroupsText}
+                onChange={setOperatorGroupsText}
+                placeholder="platform-ops"
+              />
+            </div>
+          </div>
 
           <SaveBar
             saving={securitySaving}

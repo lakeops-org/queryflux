@@ -354,6 +354,9 @@ struct AuthContext {
 auth:
   provider: none | static | oidc | ldap
   required: true   # with NoneProvider: network-trust only, not cryptographic assurance
+  # IdP roles/groups that may cancel any query (not poll another user's results).
+  operatorRoles: [queryflux-operator]
+  operatorGroups: [platform-ops]
   oidc:
     issuer: https://...
     jwksUri: https://...

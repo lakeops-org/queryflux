@@ -1250,7 +1250,22 @@ mod tests {
             creation_time: chrono::Utc::now(),
             last_accessed: chrono::Utc::now(),
             sequence: 0,
+            submitted_by: String::new(),
         }
+    }
+
+    #[tokio::test]
+    async fn queued_submitted_by_survives_upsert() {
+        let store = InMemoryPersistence::new();
+        let mut q = make_queued("q-owner");
+        q.submitted_by = "alice".to_string();
+        store.upsert_queued(q).await.unwrap();
+        let got = store
+            .get_queued(&ProxyQueryId("q-owner".into()))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(got.submitted_by, "alice");
     }
 
     #[tokio::test]

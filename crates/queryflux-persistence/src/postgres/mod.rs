@@ -2124,6 +2124,7 @@ mod tests {
             creation_time: chrono::Utc::now(),
             last_accessed: chrono::Utc::now(),
             sequence: 0,
+            submitted_by: String::new(),
         }
     }
 
@@ -2377,6 +2378,7 @@ mod tests {
             creation_time,
             last_accessed,
             sequence: 0,
+            submitted_by: String::new(),
         }
     }
 

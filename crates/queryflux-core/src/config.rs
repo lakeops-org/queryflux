@@ -308,6 +308,12 @@ pub struct AuthConfig {
     pub ldap: Option<LdapConfig>,
     #[serde(default)]
     pub static_users: Option<StaticUsersConfig>,
+    /// IdP roles that may cancel any in-flight or queued query (not poll).
+    #[serde(default)]
+    pub operator_roles: Vec<String>,
+    /// IdP groups that may cancel any in-flight or queued query (not poll).
+    #[serde(default)]
+    pub operator_groups: Vec<String>,
 }
 
 impl Default for AuthConfig {
@@ -318,6 +324,8 @@ impl Default for AuthConfig {
             oidc: None,
             ldap: None,
             static_users: None,
+            operator_roles: Vec::new(),
+            operator_groups: Vec::new(),
         }
     }
 }
