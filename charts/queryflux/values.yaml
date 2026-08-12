@@ -216,6 +216,9 @@ pdb:
   maxUnavailable: 1
 
 networkPolicy:
+  # Keep false unless you supply non-empty ingress/egress for every declared
+  # policyType. Empty rules + enabled = deny-all; the chart fails install then.
+  # See examples/networkpolicy-values.yaml.
   enabled: false
   policyTypes:
     - Ingress

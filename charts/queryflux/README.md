@@ -88,7 +88,7 @@ existingSecret:
 - `ingress.enabled`: expose the Trino HTTP frontend through an ingress controller.
 - `autoscaling.enabled`: create an HPA.
 - `pdb.enabled`: create a PodDisruptionBudget.
-- `networkPolicy.enabled`: create a NetworkPolicy. The default policy body is empty so operators can define provider-specific ingress and egress rules.
+- `networkPolicy.enabled`: create a NetworkPolicy. Defaults to `false`. Enabling with empty `ingress`/`egress` while `policyTypes` lists Ingress/Egress **denies all traffic**; the chart **fails install** in that case. Copy and tighten rules from `examples/networkpolicy-values.yaml` or `examples/production-values.yaml`.
 - `serviceMonitor.enabled`: create a Prometheus Operator ServiceMonitor for `/metrics` on the admin port.
 - `startupProbe`: HTTP check on `/readyz` (admin port) so liveness does not kill slow startups.
 - `terminationGracePeriodSeconds`: default `45`. Keep this ≥ `queryflux.shutdownDrainTimeoutSecs` (default `30`) plus a buffer so Kubernetes does not SIGKILL mid-drain.
@@ -99,6 +99,7 @@ The chart also supports `env`, `envFrom`, `extraVolumes`, `extraVolumeMounts`, `
 
 - `examples/external-config-values.yaml`: use a pre-created ConfigMap and Secret, and run the server-only image.
 - `examples/production-values.yaml`: shows ingress, TLS, HPA, PDB, ServiceMonitor, NetworkPolicy, resource requests, and topology spread settings.
+- `examples/networkpolicy-values.yaml`: starter NetworkPolicy allowing clients, DNS, Postgres, and engines (tighten selectors before production).
 
 ## Validation
 
