@@ -397,10 +397,20 @@ impl QueryHistoryStore for InMemoryPersistence {
     }
 
     async fn purge_old_query_records(&self, older_than: DateTime<Utc>) -> Result<u64> {
-        let mut records = self.query_records.write().unwrap();
-        let before = records.len();
-        records.retain(|r| r.created_at >= older_than);
-        Ok((before - records.len()) as u64)
+        let mut deleted = 0u64;
+        {
+            let mut records = self.query_records.write().unwrap();
+            let before = records.len();
+            records.retain(|r| r.created_at >= older_than);
+            deleted += (before - records.len()) as u64;
+        }
+        {
+            let mut snaps = self._snapshots.write().unwrap();
+            let before = snaps.len();
+            snaps.retain(|s| s.recorded_at >= older_than);
+            deleted += (before - snaps.len()) as u64;
+        }
+        Ok(deleted)
     }
 }
 
@@ -1390,5 +1400,33 @@ mod tests {
         let store = InMemoryPersistence::new();
         let unclaimed = store.list_unclaimed(chrono::Utc::now()).await.unwrap();
         assert!(unclaimed.is_empty());
+    }
+
+    #[tokio::test]
+    async fn purge_old_query_records_drops_old_snapshots() {
+        use queryflux_core::query::{ClusterGroupName, ClusterName, EngineType};
+
+        let store = InMemoryPersistence::new();
+        let cutoff = Utc::now() - chrono::Duration::days(1);
+        let old = ClusterSnapshot {
+            cluster_name: ClusterName("c1".into()),
+            group_name: ClusterGroupName("g1".into()),
+            engine_type: EngineType::Trino,
+            running_queries: 0,
+            queued_queries: 0,
+            max_running_queries: 10,
+            recorded_at: cutoff - chrono::Duration::hours(1),
+        };
+        let fresh = ClusterSnapshot {
+            recorded_at: Utc::now(),
+            ..old.clone()
+        };
+        store.record_cluster_snapshot(old).await.unwrap();
+        store.record_cluster_snapshot(fresh).await.unwrap();
+
+        let n = store.purge_old_query_records(cutoff).await.unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(store._snapshots.read().unwrap().len(), 1);
+        assert!(store._snapshots.read().unwrap()[0].recorded_at >= cutoff);
     }
 }

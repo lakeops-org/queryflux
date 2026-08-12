@@ -435,12 +435,33 @@ impl QueryHistoryStore for PostgresStore {
         &self,
         older_than: chrono::DateTime<chrono::Utc>,
     ) -> Result<u64> {
-        let r = sqlx::query("DELETE FROM query_records WHERE created_at < $1")
+        let mut tx = self.pool.begin().await.map_err(|e| {
+            QueryFluxError::Persistence(format!("purge_old_query_records begin: {e}"))
+        })?;
+
+        let records = sqlx::query("DELETE FROM query_records WHERE created_at < $1")
             .bind(older_than)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await
-            .map_err(|e| QueryFluxError::Persistence(format!("purge_old_query_records: {e}")))?;
-        Ok(r.rows_affected())
+            .map_err(|e| QueryFluxError::Persistence(format!("purge query_records: {e}")))?;
+
+        let digests = sqlx::query("DELETE FROM query_digest_stats WHERE last_seen < $1")
+            .bind(older_than)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| QueryFluxError::Persistence(format!("purge query_digest_stats: {e}")))?;
+
+        let snapshots = sqlx::query("DELETE FROM cluster_snapshots WHERE recorded_at < $1")
+            .bind(older_than)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| QueryFluxError::Persistence(format!("purge cluster_snapshots: {e}")))?;
+
+        tx.commit().await.map_err(|e| {
+            QueryFluxError::Persistence(format!("purge_old_query_records commit: {e}"))
+        })?;
+
+        Ok(records.rows_affected() + digests.rows_affected() + snapshots.rows_affected())
     }
 }
 

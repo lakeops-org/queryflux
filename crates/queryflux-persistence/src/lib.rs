@@ -129,8 +129,9 @@ pub trait QueryHistoryStore: Send + Sync {
     /// All query records belonging to a conversation, ordered by step_index.
     async fn get_conversation(&self, conversation_id: &str) -> Result<Vec<QuerySummary>>;
 
-    /// Delete all query records created before `older_than` (history retention).
-    /// Returns the number of records deleted.
+    /// Delete history older than `older_than`: `query_records` (`created_at`),
+    /// `query_digest_stats` (`last_seen`), and `cluster_snapshots` (`recorded_at`).
+    /// Returns the total number of rows deleted across those tables.
     async fn purge_old_query_records(&self, older_than: DateTime<Utc>) -> Result<u64>;
 }
 
