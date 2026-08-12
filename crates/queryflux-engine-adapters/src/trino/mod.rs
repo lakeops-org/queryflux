@@ -1141,8 +1141,12 @@ impl crate::EngineAdapterFactory for TrinoFactory {
 
 #[cfg(test)]
 mod tests {
-    use super::{TRINO_CONNECT_TIMEOUT, TRINO_CONTROL_TIMEOUT};
-    use std::time::Duration;
+    use super::{TrinoAdapter, TrinoConfig, TRINO_CONNECT_TIMEOUT, TRINO_CONTROL_TIMEOUT};
+    use crate::AsyncAdapter;
+    use queryflux_core::query::{BackendQueryId, ClusterGroupName, ClusterName, QueryPollResult};
+    use std::time::{Duration, Instant};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
 
     #[test]
     fn control_timeout_is_shorter_than_a_trino_long_poll_window() {
@@ -1150,5 +1154,57 @@ mod tests {
         assert_eq!(TRINO_CONTROL_TIMEOUT, Duration::from_secs(30));
         // Poll GETs use the client with no overall timeout (connect only).
         // Control operations keep the 30s cap so submit/cancel/health cannot hang.
+        let typical_trino_long_poll = Duration::from_secs(50);
+        assert!(
+            TRINO_CONTROL_TIMEOUT < typical_trino_long_poll,
+            "poll GETs must not use the control timeout"
+        );
+    }
+
+    #[tokio::test]
+    async fn poll_get_waits_for_slow_backend_without_request_timeout() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            let mut buf = [0u8; 2048];
+            let n = stream.read(&mut buf).await.expect("read");
+            let req = String::from_utf8_lossy(&buf[..n]);
+            assert!(
+                req.starts_with("GET "),
+                "poll_query should issue a GET, got: {}",
+                req.lines().next().unwrap_or("")
+            );
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            let body = r#"{"id":"q1","infoUri":"http://trino.test/ui","stats":{"state":"FINISHED"},"warnings":[]}"#;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(resp.as_bytes()).await.expect("write");
+        });
+
+        let adapter = TrinoAdapter::new(
+            ClusterName("trino".into()),
+            ClusterGroupName("default".into()),
+            TrinoConfig {
+                endpoint: format!("http://{addr}"),
+                tls_skip_verify: false,
+                auth: None,
+            },
+        );
+        let poll_uri = format!("http://{addr}/v1/statement/executing/q1/1");
+        let started = Instant::now();
+        let result = adapter
+            .poll_query(&BackendQueryId("q1".into()), Some(&poll_uri))
+            .await
+            .expect("poll should succeed");
+        assert!(
+            started.elapsed() >= Duration::from_secs(2),
+            "poll should wait for the backend long poll"
+        );
+        assert!(matches!(result, QueryPollResult::Raw { .. }));
     }
 }
