@@ -53,6 +53,10 @@ pub async fn login_request(
     {
         Ok(ctx) => ctx,
         Err(e) => {
+            state
+                .app
+                .metrics
+                .on_auth_failure(&format!("{:?}", FrontendProtocol::SnowflakeHttp));
             warn!(user = %login_name, "Snowflake wire login failed: {e}");
             return (
                 StatusCode::UNAUTHORIZED,

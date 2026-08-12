@@ -197,10 +197,15 @@ impl FlightSqlService for QueryFluxFlightSql {
             ..Default::default()
         };
         let auth_provider = self.state.live.read().await.auth_provider.clone();
-        let auth_ctx = auth_provider
-            .authenticate(&creds)
-            .await
-            .map_err(|e| Status::unauthenticated(e.to_string()))?;
+        let auth_ctx = match auth_provider.authenticate(&creds).await {
+            Ok(ctx) => ctx,
+            Err(e) => {
+                self.state
+                    .metrics
+                    .on_auth_failure(&format!("{:?}", FrontendProtocol::FlightSql));
+                return Err(Status::unauthenticated(e.to_string()));
+            }
+        };
 
         let routing_result = {
             let live = self.state.live.read().await;
