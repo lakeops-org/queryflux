@@ -17,7 +17,7 @@ By contributing, you agree that your contributions will be licensed under the sa
 2. **PR title:** use Conventional Commits (`feat:`, `fix:`, `docs:`, `chore:`, `ui:`, optional `(scope)` and `!`); CI checks [.github/pr-title-checker-config.json](.github/pr-title-checker-config.json). This repo **squash-merges**, and [Release Please](https://github.com/googleapis/release-please) uses that squash commit (the PR title) for [CHANGELOG.md](CHANGELOG.md) and GitHub Release notes. Use `feat:`, `fix:`, or `ui:` for user-facing changes so they appear; `docs:`, `chore:`, and `test:` are omitted.
 3. **Match existing style.** Rust: same patterns as surrounding code, `rustfmt`-compatible formatting, and no new Clippy warnings (see checks below).
 4. **Test your change.**
-   - Run `make check` (Clippy with `-D warnings` + unit tests; no Docker required).
+   - Run `make clippy` (same flags as CI: `-D warnings`, exclude `queryflux-bench`) and `make test`. Do not open or update a Rust PR until Clippy exits 0.
    - If you touch integration behavior (routing, Trino HTTP, adapters), run `make test-e2e` when you can (Docker required).
 5. **Update docs when behavior changes.** Config keys, router types, or public HTTP/admin behavior should be reflected in `README.md`, `docs/`, or `config.example.yaml` as appropriate.
 
