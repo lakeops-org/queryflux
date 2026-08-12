@@ -157,8 +157,13 @@ fn client_safe_message(e: &QueryFluxError) -> &'static str {
         Engine(_) => "Backend engine error",
         Routing(_) | NoClusterGroupAvailable(_) => "Query routing failed",
         Config(_) => "Configuration error",
-        // Empty → caller forwards Display (includes group/count/limit for QueueFull).
-        Auth(_) | Unauthorized(_) | QueryNotFound(_) | ClusterNotFound(_) | QueueFull { .. } => "",
+        // Empty → caller forwards Display (QueueFull / CapacityWaitTimeout detail).
+        Auth(_)
+        | Unauthorized(_)
+        | QueryNotFound(_)
+        | ClusterNotFound(_)
+        | QueueFull { .. }
+        | CapacityWaitTimeout { .. } => "",
         _ => "Internal error",
     }
 }
@@ -741,6 +746,30 @@ pub async fn get_queued_statement(
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     };
+
+    // Fail on wall-clock wait from enqueue (`creation_time`), not `last_accessed`
+    // (polls refresh last_accessed and would otherwise wait forever).
+    let wait_timeout_secs = {
+        let live = state.live.read().await;
+        live.group_capacity_wait_timeout_secs
+            .get(&queued.cluster_group.0)
+            .copied()
+            .unwrap_or(queryflux_core::config::DEFAULT_CAPACITY_WAIT_TIMEOUT_SECS)
+    };
+    let waited_secs = (Utc::now() - queued.creation_time).num_seconds().max(0) as u64;
+    if waited_secs >= wait_timeout_secs {
+        if let Err(e) = state.persistence.delete_queued(&query_id).await {
+            warn!(id = %query_id, "Failed to delete queued query after capacity wait timeout: {e}");
+        }
+        if let Some(qc) = &state.queue_coordinator {
+            let _ = qc.release_claim(&query_id.0).await;
+        }
+        let err = QueryFluxError::CapacityWaitTimeout {
+            group: queued.cluster_group.0.clone(),
+            timeout_secs: wait_timeout_secs,
+        };
+        return trino_error_response(&query_id.0, &err.to_string()).into_response();
+    }
 
     if let Some(resp) = allow_query_action_or_forbid(
         &state,
@@ -1542,6 +1571,7 @@ mod cancel_executing_statement_tests {
             group_translation_scripts: HashMap::new(),
             group_default_tags: HashMap::new(),
             group_max_queued_queries: HashMap::new(),
+            group_capacity_wait_timeout_secs: HashMap::new(),
             group_cache_settings: HashMap::new(),
             auth_provider: Arc::new(NoneAuthProvider::new(false)) as Arc<dyn AuthProvider>,
             authorization: Arc::new(AllowAllAuthorization::default())

@@ -811,6 +811,9 @@ impl Default for AdminApiConfig {
 
 // --- Cluster groups ---
 
+/// Default proxy-side wait for cluster capacity (`capacityWaitTimeoutSecs`).
+pub const DEFAULT_CAPACITY_WAIT_TIMEOUT_SECS: u64 = 300;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ClusterGroupConfig {
@@ -825,6 +828,10 @@ pub struct ClusterGroupConfig {
     pub max_running_queries: u64,
     #[serde(default)]
     pub max_queued_queries: Option<u64>,
+    /// Max seconds a query may wait for capacity (sync spin or async queue).
+    /// Defaults to [`DEFAULT_CAPACITY_WAIT_TIMEOUT_SECS`] when omitted.
+    #[serde(default)]
+    pub capacity_wait_timeout_secs: Option<u64>,
     /// Simple authorization policy (used when `authorization.provider: none`).
     /// If both lists are empty/absent, all authenticated users are allowed.
     #[serde(default)]
@@ -837,6 +844,16 @@ pub struct ClusterGroupConfig {
     /// Query result cache configuration for this group. Omit to disable caching.
     #[serde(default)]
     pub cache: Option<GroupCacheConfig>,
+}
+
+impl ClusterGroupConfig {
+    /// Resolved capacity wait timeout; omitted / zero → [`DEFAULT_CAPACITY_WAIT_TIMEOUT_SECS`].
+    pub fn capacity_wait_timeout_secs_or_default(&self) -> u64 {
+        match self.capacity_wait_timeout_secs {
+            Some(n) if n > 0 => n,
+            _ => DEFAULT_CAPACITY_WAIT_TIMEOUT_SECS,
+        }
+    }
 }
 
 /// Simple allow-list authorization for a cluster group.
