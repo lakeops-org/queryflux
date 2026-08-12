@@ -992,17 +992,19 @@ async fn main() -> Result<()> {
         app_state.clone(),
     );
 
-    // --- Start Trino HTTP frontend ---
-    let trino_port = config.queryflux.frontends.trino_http.port;
-    let frontend = TrinoHttpFrontend::new(
-        app_state.clone(),
-        trino_port,
-        config.queryflux.frontends.trino_http.max_connections,
-    );
+    // --- Start Trino HTTP frontend (honors frontends.trinoHttp.enabled) ---
+    let trino_cfg = config.queryflux.frontends.trino_http.clone();
+    let trino_port = trino_cfg.port;
 
-    info!(
-        "QueryFlux ready — Trino HTTP on :{trino_port}, admin/metrics on :{admin_port}, external address: {external_address}"
-    );
+    if trino_cfg.enabled {
+        info!(
+            "QueryFlux ready — Trino HTTP on :{trino_port}, admin/metrics on :{admin_port}, external address: {external_address}"
+        );
+    } else {
+        info!(
+            "QueryFlux ready — Trino HTTP disabled, admin/metrics on :{admin_port}, external address: {external_address}"
+        );
+    }
 
     if distributed {
         if config
@@ -1587,9 +1589,18 @@ async fn main() -> Result<()> {
     // finish in-flight requests), wire-based frontends break their accept loop, and
     // tonic (Flight SQL) uses `serve_with_shutdown`.
     let mut trino_handle = tokio::spawn({
-        let fe = frontend;
+        let state = app_state.clone();
         let rx = shutdown_rx.clone();
-        async move { fe.listen(rx).await }
+        let cfg = trino_cfg;
+        async move {
+            if cfg.enabled {
+                TrinoHttpFrontend::new(state, cfg.port, cfg.max_connections)
+                    .listen(rx)
+                    .await
+            } else {
+                std::future::pending::<queryflux_core::error::Result<()>>().await
+            }
+        }
     });
     let mut admin_handle = tokio::spawn({
         let rx = shutdown_rx.clone();
