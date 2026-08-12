@@ -1702,4 +1702,43 @@ mod tests {
         let ctx = s.resolved_agent_context().expect("should resolve");
         assert_eq!(ctx.agent_id, "second");
     }
+
+    #[tokio::test]
+    async fn set_fast_path_rejects_unauthenticated_when_required() {
+        use tokio::io::AsyncReadExt;
+        use tokio::net::{TcpListener, TcpStream};
+
+        use crate::state::test_fixtures;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let state = test_fixtures::app_state(true);
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let (mut reader, mut writer) = stream.into_split();
+            let mut session = SessionContext::default();
+            super::handle_com_query(
+                &mut reader,
+                &mut writer,
+                &state,
+                &mut session,
+                "SET query_tags='team:eng'",
+                0,
+            )
+            .await
+            .expect("handle_com_query");
+        });
+
+        let mut stream = TcpStream::connect(addr).await.expect("connect");
+        let mut buf = [0u8; 512];
+        let n = stream.read(&mut buf).await.expect("read");
+        server.await.expect("server");
+
+        assert!(n >= 5, "expected MySQL packet, got {n} bytes");
+        assert_eq!(
+            buf[4], 0xff,
+            "expected MySQL ERR packet when auth is required"
+        );
+    }
 }

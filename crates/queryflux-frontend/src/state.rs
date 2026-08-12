@@ -271,3 +271,80 @@ impl AppState {
         });
     }
 }
+
+#[cfg(test)]
+pub mod test_fixtures {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use queryflux_auth::{
+        AllowAllAuthorization, AuthProvider, AuthorizationChecker, BackendIdentityResolver,
+        NoneAuthProvider,
+    };
+    use queryflux_cluster_manager::{
+        cluster_state::ClusterState, simple::SimpleClusterGroupManager,
+    };
+    use queryflux_core::query::{ClusterGroupName, ClusterName, EngineType};
+    use queryflux_metrics::NoopMetricsStore;
+    use queryflux_persistence::in_memory::InMemoryPersistence;
+    use queryflux_routing::chain::RouterChain;
+    use queryflux_translation::TranslationService;
+    use tokio::sync::RwLock;
+
+    use super::{AppState, LiveConfig};
+
+    pub fn app_state(auth_required: bool) -> Arc<AppState> {
+        let group_name = ClusterGroupName("default".into());
+        let cluster_name = ClusterName("trino".into());
+        let cluster_state = Arc::new(ClusterState::new(
+            cluster_name.clone(),
+            group_name.clone(),
+            None,
+            None,
+            EngineType::Trino,
+            Some("http://trino.test:8080".into()),
+            10,
+            true,
+        ));
+        let mut group_members = HashMap::new();
+        group_members.insert(group_name.0.clone(), vec![cluster_name.0.clone()]);
+        let mut groups = HashMap::new();
+        groups.insert(
+            group_name.clone(),
+            (
+                vec![cluster_state],
+                Arc::new(queryflux_cluster_manager::strategy::RoundRobinStrategy::new())
+                    as Arc<dyn queryflux_cluster_manager::strategy::ClusterSelectionStrategy>,
+            ),
+        );
+        let live = LiveConfig {
+            router_chain: RouterChain::new(vec![], group_name.clone()),
+            guard_chain: None,
+            group_guard_chains: HashMap::new(),
+            cluster_manager: Arc::new(SimpleClusterGroupManager::new(groups)),
+            adapters: HashMap::new(),
+            health_check_targets: vec![],
+            cluster_configs: HashMap::new(),
+            group_members,
+            group_order: vec![group_name.0.clone()],
+            group_translation_scripts: HashMap::new(),
+            group_default_tags: HashMap::new(),
+            group_cache_settings: HashMap::new(),
+            auth_provider: Arc::new(NoneAuthProvider::new(auth_required)) as Arc<dyn AuthProvider>,
+            authorization: Arc::new(AllowAllAuthorization) as Arc<dyn AuthorizationChecker>,
+        };
+        Arc::new(AppState {
+            external_address: "http://127.0.0.1:8080".into(),
+            live: Arc::new(RwLock::new(live)),
+            persistence: Arc::new(InMemoryPersistence::new()),
+            translation: Arc::new(TranslationService::disabled()),
+            metrics: Arc::new(NoopMetricsStore),
+            identity_resolver: Arc::new(BackendIdentityResolver::new()),
+            capacity_store: None,
+            queue_coordinator: None,
+            instance_id: "test".into(),
+            http_client: reqwest::Client::new(),
+            result_cache: Arc::new(queryflux_cache::noop::NoopResultCache),
+        })
+    }
+}

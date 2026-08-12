@@ -1589,6 +1589,47 @@ mod cancel_executing_statement_tests {
 }
 
 #[cfg(test)]
+mod auth_fast_path_tests {
+    use axum::extract::State;
+    use axum::http::{HeaderMap, HeaderValue, StatusCode};
+    use axum::response::IntoResponse;
+    use bytes::Bytes;
+
+    use super::post_statement;
+    use crate::state::test_fixtures;
+
+    #[tokio::test]
+    async fn set_session_fast_path_rejects_unauthenticated_when_required() {
+        let state = test_fixtures::app_state(true);
+        let resp = post_statement(
+            State(state),
+            HeaderMap::new(),
+            Bytes::from("SET SESSION query_tags = 'team=eng'"),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn set_session_fast_path_allows_authenticated_user() {
+        let state = test_fixtures::app_state(true);
+        let mut headers = HeaderMap::new();
+        headers.insert("X-Trino-User", HeaderValue::from_static("alice"));
+        let resp = post_statement(
+            State(state),
+            headers,
+            Bytes::from("SET SESSION query_tags = 'team=eng'"),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+}
+
+#[cfg(test)]
 mod trino_session_property_encoding_tests {
     use super::*;
     use std::collections::HashMap;
