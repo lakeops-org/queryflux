@@ -731,6 +731,11 @@ async fn main() -> Result<()> {
         .filter(|(_, g)| g.max_queued_queries.is_some())
         .map(|(name, g)| (name.clone(), g.max_queued_queries))
         .collect();
+    let group_capacity_wait_timeout_secs: HashMap<String, u64> = config
+        .cluster_groups
+        .iter()
+        .map(|(name, g)| (name.clone(), g.capacity_wait_timeout_secs_or_default()))
+        .collect();
     let group_cache_settings: HashMap<String, queryflux_core::config::GroupCacheConfig> = config
         .cluster_groups
         .iter()
@@ -754,6 +759,7 @@ async fn main() -> Result<()> {
         group_translation_scripts,
         group_default_tags,
         group_max_queued_queries,
+        group_capacity_wait_timeout_secs,
         group_cache_settings,
         auth_provider,
         authorization,
@@ -2241,6 +2247,11 @@ async fn build_live_config(
         .map(|(name, g)| (name.clone(), g.max_queued_queries))
         .collect();
 
+    let group_capacity_wait_timeout_secs: HashMap<String, u64> = cluster_groups
+        .iter()
+        .map(|(name, g)| (name.clone(), g.capacity_wait_timeout_secs_or_default()))
+        .collect();
+
     let group_cache_settings: HashMap<String, queryflux_core::config::GroupCacheConfig> =
         cluster_groups
             .iter()
@@ -2286,6 +2297,7 @@ async fn build_live_config(
         group_translation_scripts,
         group_default_tags,
         group_max_queued_queries,
+        group_capacity_wait_timeout_secs,
         group_cache_settings,
         auth_provider: Arc::new(NoneAuthProvider::new(false)),
         authorization: Arc::new(AllowAllAuthorization::default()),

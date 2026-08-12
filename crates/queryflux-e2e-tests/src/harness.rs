@@ -329,6 +329,7 @@ impl TestHarness {
             group_translation_scripts: HashMap::new(),
             group_default_tags: HashMap::new(),
             group_max_queued_queries: HashMap::new(),
+            group_capacity_wait_timeout_secs: HashMap::new(),
             group_cache_settings: HashMap::new(),
             auth_provider: Arc::new(NoneAuthProvider::new(false)) as Arc<dyn AuthProvider>,
             authorization: Arc::new(AllowAllAuthorization::default())
@@ -569,6 +570,7 @@ impl WireTestHarness {
             group_translation_scripts: HashMap::new(),
             group_default_tags: HashMap::new(),
             group_max_queued_queries: HashMap::new(),
+            group_capacity_wait_timeout_secs: HashMap::new(),
             group_cache_settings: HashMap::new(),
             auth_provider: Arc::new(NoneAuthProvider::new(false)) as Arc<dyn AuthProvider>,
             authorization: Arc::new(AllowAllAuthorization::default())
@@ -704,6 +706,7 @@ impl WireTestHarness {
             group_translation_scripts: HashMap::new(),
             group_default_tags: HashMap::new(),
             group_max_queued_queries: HashMap::new(),
+            group_capacity_wait_timeout_secs: HashMap::new(),
             group_cache_settings: HashMap::new(),
             auth_provider: Arc::new(NoneAuthProvider::new(false)) as Arc<dyn AuthProvider>,
             authorization: Arc::new(AllowAllAuthorization::default())

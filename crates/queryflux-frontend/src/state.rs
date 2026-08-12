@@ -58,6 +58,8 @@ pub struct LiveConfig {
     /// `None` / missing entry means unlimited. `Some(0)` is treated as unlimited
     /// (same as the enforce check requiring `limit > 0`).
     pub group_max_queued_queries: HashMap<String, Option<u64>>,
+    /// group_name → resolved capacity wait timeout in seconds (default 300).
+    pub group_capacity_wait_timeout_secs: HashMap<String, u64>,
     /// group_name → cache settings for groups that have caching enabled.
     pub group_cache_settings: HashMap<String, queryflux_core::config::GroupCacheConfig>,
     /// Verifies client identity — hot-reloaded when security config changes via admin API.
@@ -334,6 +336,7 @@ pub mod test_fixtures {
             group_translation_scripts: HashMap::new(),
             group_default_tags: HashMap::new(),
             group_max_queued_queries: HashMap::new(),
+            group_capacity_wait_timeout_secs: HashMap::new(),
             group_cache_settings: HashMap::new(),
             auth_provider: Arc::new(NoneAuthProvider::new(auth_required)) as Arc<dyn AuthProvider>,
             authorization: Arc::new(AllowAllAuthorization::default())

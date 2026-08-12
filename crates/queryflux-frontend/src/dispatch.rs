@@ -1169,8 +1169,13 @@ async fn setup_sync_query(
 ) -> Result<SyncQuerySetup> {
     let query_id = ProxyQueryId::new();
 
-    let (cluster_manager, group_fixups, group_default_tags, cluster_configs) = {
+    let (cluster_manager, group_fixups, group_default_tags, cluster_configs, wait_timeout_secs) = {
         let live = state.live.read().await;
+        let wait_timeout_secs = live
+            .group_capacity_wait_timeout_secs
+            .get(&group.0)
+            .copied()
+            .unwrap_or(queryflux_core::config::DEFAULT_CAPACITY_WAIT_TIMEOUT_SECS);
         (
             live.cluster_manager.clone(),
             live.group_translation_scripts
@@ -1182,6 +1187,7 @@ async fn setup_sync_query(
                 .cloned()
                 .unwrap_or_default(),
             live.cluster_configs.clone(),
+            wait_timeout_secs,
         )
     };
     let effective_tags: QueryTags = merge_tags(&group_default_tags, &session.tags().clone());
@@ -1189,9 +1195,17 @@ async fn setup_sync_query(
     // Queue loop: spin until a cluster slot is available (both local and global).
     // `wait_start` is this query's place in line for the fairness gate: queued
     // queries enqueued before it (and still polling) get freed slots first.
+    // Bound by `capacityWaitTimeoutSecs` so clients cannot wait forever.
     let wait_start = Utc::now();
+    let deadline = wait_start + chrono::Duration::seconds(wait_timeout_secs as i64);
     let mut seq: u64 = 0;
     let (cluster_name, adapter) = loop {
+        if Utc::now() >= deadline {
+            return Err(QueryFluxError::CapacityWaitTimeout {
+                group: group.0.clone(),
+                timeout_secs: wait_timeout_secs,
+            });
+        }
         if should_yield_to_older_queued(state, &cluster_manager, &group, Some(wait_start)).await {
             queued_backoff_delay(seq).await;
             seq += 1;
@@ -2202,5 +2216,90 @@ mod queue_limit_tests {
             matches!(err, QueryFluxError::QueueFull { limit: 1, .. }),
             "got {err}"
         );
+    }
+}
+
+#[cfg(test)]
+mod capacity_wait_tests {
+    use super::setup_sync_query;
+    use crate::state::test_fixtures::app_state;
+    use queryflux_auth::AuthContext;
+    use queryflux_cluster_manager::cluster_state::ClusterState;
+    use queryflux_cluster_manager::simple::SimpleClusterGroupManager;
+    use queryflux_core::error::QueryFluxError;
+    use queryflux_core::query::{ClusterGroupName, ClusterName, EngineType, FrontendProtocol};
+    use queryflux_core::session::SessionContext;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    #[tokio::test]
+    async fn sync_setup_times_out_when_no_capacity() {
+        let state = app_state(false);
+        {
+            let mut live = state.live.write().await;
+            live.group_capacity_wait_timeout_secs
+                .insert("default".into(), 1);
+            let group = ClusterGroupName("default".into());
+            let cluster = ClusterName("trino".into());
+            // max_running_queries = 0 → acquire_cluster always returns None.
+            let cluster_state = Arc::new(ClusterState::new(
+                cluster.clone(),
+                group.clone(),
+                None,
+                None,
+                EngineType::Trino,
+                Some("http://trino.test:8080".into()),
+                0,
+                true,
+            ));
+            let mut groups = HashMap::new();
+            groups.insert(
+                group.clone(),
+                (
+                    vec![cluster_state],
+                    Arc::new(queryflux_cluster_manager::strategy::RoundRobinStrategy::new())
+                        as Arc<dyn queryflux_cluster_manager::strategy::ClusterSelectionStrategy>,
+                ),
+            );
+            live.cluster_manager = Arc::new(SimpleClusterGroupManager::new(groups));
+        }
+
+        let auth = AuthContext {
+            user: "alice".into(),
+            groups: vec![],
+            roles: vec![],
+            raw_token: None,
+        };
+        let started = Instant::now();
+        let result = setup_sync_query(
+            &state,
+            "SELECT 1".into(),
+            vec![],
+            SessionContext::default(),
+            FrontendProtocol::TrinoHttp,
+            ClusterGroupName("default".into()),
+            &auth,
+        )
+        .await;
+        assert!(
+            started.elapsed().as_secs() < 10,
+            "timeout should fire near 1s, got {:?}",
+            started.elapsed()
+        );
+        let err = match result {
+            Ok(_) => panic!("must time out waiting for capacity"),
+            Err(e) => e,
+        };
+        match err {
+            QueryFluxError::CapacityWaitTimeout {
+                group,
+                timeout_secs,
+            } => {
+                assert_eq!(group, "default");
+                assert_eq!(timeout_secs, 1);
+            }
+            other => panic!("expected CapacityWaitTimeout, got {other}"),
+        }
     }
 }

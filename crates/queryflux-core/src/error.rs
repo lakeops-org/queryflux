@@ -48,6 +48,12 @@ pub enum QueryFluxError {
         limit: u64,
     },
 
+    /// No cluster capacity within `capacityWaitTimeoutSecs`.
+    #[error(
+        "Capacity wait timed out for group '{group}' after {timeout_secs}s — no slot available"
+    )]
+    CapacityWaitTimeout { group: String, timeout_secs: u64 },
+
     #[error(transparent)]
     Other(#[from] anyhow::Error),
 }
@@ -107,6 +113,18 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("analytics"), "{msg}");
         assert!(msg.contains("5/5"), "{msg}");
+        assert!(!err.is_transient());
+    }
+
+    #[test]
+    fn capacity_wait_timeout_display() {
+        let err = QueryFluxError::CapacityWaitTimeout {
+            group: "analytics".into(),
+            timeout_secs: 300,
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("analytics"), "{msg}");
+        assert!(msg.contains("300"), "{msg}");
         assert!(!err.is_transient());
     }
 }
