@@ -233,6 +233,16 @@ impl AuthProvider for OidcAuthProvider {
             }
         };
 
+        // Audience validation is security-critical for production deployments.
+        // If the operator marked auth as required but did not configure `audience`,
+        // fail closed instead of skipping audience checks.
+        if self.required && self.config.audience.is_none() {
+            return Err(QueryFluxError::Auth(
+                "OIDC audience validation required: configure auth.oidc.audience when auth.required=true"
+                    .into(),
+            ));
+        }
+
         // Decode the header to get kid + algorithm.
         let header = decode_header(token)
             .map_err(|e| QueryFluxError::Auth(format!("invalid JWT header: {e}")))?;
@@ -321,4 +331,37 @@ fn resolve_dot_path<'a>(value: &'a Value, path: &str) -> Option<&'a Value> {
         current = current.get(segment)?;
     }
     Some(current)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use queryflux_core::config::OidcConfig;
+
+    #[tokio::test]
+    async fn oidc_audience_required_fails_fast_when_missing() {
+        let provider = OidcAuthProvider::new(
+            OidcConfig {
+                issuer: "https://idp".to_string(),
+                jwks_uri: "https://idp/jwks".to_string(),
+                audience: None,
+                groups_claim: "groups".to_string(),
+                roles_claim: None,
+            },
+            true,
+        );
+
+        let creds = Credentials {
+            username: None,
+            password: None,
+            bearer_token: Some("not-a-real-jwt".to_string()),
+        };
+
+        let err = provider.authenticate(&creds).await.unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("OIDC audience validation required"),
+            "unexpected error: {err}"
+        );
+    }
 }
