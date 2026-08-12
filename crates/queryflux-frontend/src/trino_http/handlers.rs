@@ -1282,6 +1282,19 @@ pub async fn delete_executing_statement(
 }
 
 #[cfg(test)]
+mod queue_claim_heartbeat_tests {
+    use super::{QUEUE_CLAIM_HEARTBEAT_SECS, QUEUE_CLAIM_TIMEOUT_SECS};
+
+    #[test]
+    fn heartbeat_interval_is_well_below_stale_claim_timeout() {
+        assert!(
+            QUEUE_CLAIM_HEARTBEAT_SECS * 2 <= QUEUE_CLAIM_TIMEOUT_SECS as u64,
+            "heartbeat must run at least twice within the stale-claim window"
+        );
+    }
+}
+
+#[cfg(test)]
 mod trino_session_property_encoding_tests {
     use super::*;
     use std::collections::HashMap;
