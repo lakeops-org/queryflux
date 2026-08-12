@@ -206,7 +206,12 @@ export function SecurityEditor({ initialSecurity }: Props) {
           group_name_attribute: initialSecurity.ldap.group_name_attribute,
         }
       : null,
-    static_users: null, // passwords never pre-filled
+    static_users: Object.fromEntries(
+      (initialSecurity?.static_user_summaries ?? []).map((u) => [
+        u.username,
+        { password: "", groups: u.groups ?? [], roles: u.roles ?? [] },
+      ]),
+    ),
     authorization_provider: initialSecurity?.authorization_provider ?? "none",
     openfga: initialSecurity?.openfga
       ? {

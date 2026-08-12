@@ -343,6 +343,12 @@ export interface SecurityConfigDto {
   ldap: LdapConfigDto | null;
   /** Count of users when provider = "static". Passwords are never exposed. */
   static_user_count: number | null;
+  /** Usernames + groups/roles so a re-save does not wipe users. No passwords. */
+  static_user_summaries?: Array<{
+    username: string;
+    groups: string[];
+    roles: string[];
+  }>;
   /** "none" | "openfga" */
   authorization_provider: string;
   openfga: OpenFgaConfigDto | null;
