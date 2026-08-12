@@ -122,7 +122,7 @@ fn json_positive_usize(v: &serde_json::Value) -> Option<usize> {
 /// - StarRocks: `poolSize` → [`ClusterConfig::pool_size`] for YAML-compat / `from_cluster_config` builds
 ///
 /// Other engine-specific fields (`databasePath`, `region`, `s3OutputLocation`, `workgroup`, `catalog`,
-/// `tls`) are **not** extracted here — each adapter reads those directly from JSON via its own
+/// `maxWaitSecs`, `tls`) are **not** extracted here — each adapter reads those directly from JSON via its own
 /// [`EngineConfigParseable::from_json`] implementation.
 pub fn cluster_config_from_persisted_json(
     engine: EngineConfig,
@@ -143,6 +143,7 @@ pub fn cluster_config_from_persisted_json(
         s3_output_location: None,
         workgroup: None,
         catalog: None,
+        max_wait_secs: None,
         tls: None,
         max_result_buffer_bytes: None,
         auth,

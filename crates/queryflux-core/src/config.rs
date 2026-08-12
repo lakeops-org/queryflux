@@ -895,6 +895,11 @@ pub struct ClusterConfig {
     /// Default Athena catalog. Defaults to `"AwsDataCatalog"` when omitted.
     #[serde(default)]
     pub catalog: Option<String>,
+    /// Max seconds QueryFlux will poll Athena for query completion
+    /// (`maxWaitSecs` in JSON/YAML). Defaults to 600 (10 minutes) when omitted.
+    /// On timeout the proxy calls `StopQueryExecution`.
+    #[serde(default)]
+    pub max_wait_secs: Option<u64>,
     /// Max bytes of a single query result QueryFlux buffers in memory
     /// (`maxResultBufferBytes` in JSON/YAML). ClickHouse only; defaults to
     /// 1 GiB when omitted. Other engines ignore this.

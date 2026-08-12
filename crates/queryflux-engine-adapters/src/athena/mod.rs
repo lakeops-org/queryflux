@@ -28,7 +28,38 @@ pub struct AthenaConfig {
     pub s3_output_location: String,
     pub workgroup: Option<String>,
     pub catalog: Option<String>,
+    /// Max seconds to poll for query completion before `StopQueryExecution`.
+    pub max_wait_secs: u64,
     pub auth: Option<ClusterAuth>,
+}
+
+/// Default proxy-side wait for Athena completion (`maxWaitSecs`).
+pub const DEFAULT_ATHENA_MAX_WAIT_SECS: u64 = 600;
+const ATHENA_POLL_INTERVAL: Duration = Duration::from_millis(500);
+/// Bound for best-effort `StopQueryExecution` after the main wait deadline expires.
+const ATHENA_STOP_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Parse optional `maxWaitSecs` (positive integer seconds). Defaults to
+/// [`DEFAULT_ATHENA_MAX_WAIT_SECS`].
+fn parse_max_wait_secs_from_json(json: &serde_json::Value, cluster_name: &str) -> Result<u64> {
+    match json.get("maxWaitSecs") {
+        None => Ok(DEFAULT_ATHENA_MAX_WAIT_SECS),
+        Some(v) => v.as_u64().filter(|&n| n >= 1).ok_or_else(|| {
+            QueryFluxError::Engine(format!(
+                "cluster '{cluster_name}': maxWaitSecs must be a positive integer"
+            ))
+        }),
+    }
+}
+
+fn resolve_max_wait_secs(raw: Option<u64>, cluster_name: &str) -> Result<u64> {
+    match raw {
+        None => Ok(DEFAULT_ATHENA_MAX_WAIT_SECS),
+        Some(n) if n >= 1 => Ok(n),
+        Some(_) => Err(QueryFluxError::Engine(format!(
+            "cluster '{cluster_name}': maxWaitSecs must be a positive integer"
+        ))),
+    }
 }
 
 impl crate::EngineConfigParseable for AthenaConfig {
@@ -65,6 +96,7 @@ impl crate::EngineConfigParseable for AthenaConfig {
             s3_output_location,
             workgroup: json_str(json, "workgroup"),
             catalog: json_str(json, "catalog"),
+            max_wait_secs: parse_max_wait_secs_from_json(json, cluster_name)?,
             auth,
         })
     }
@@ -96,6 +128,7 @@ impl crate::EngineConfigParseable for AthenaConfig {
             s3_output_location,
             workgroup: cfg.workgroup.clone(),
             catalog: cfg.catalog.clone(),
+            max_wait_secs: resolve_max_wait_secs(cfg.max_wait_secs, cluster_name)?,
             auth,
         })
     }
@@ -121,12 +154,6 @@ use queryflux_core::engine_registry::{
     AuthType, ConfigField, ConnectionType, EngineDescriptor, FieldType,
 };
 
-/// Upper bound for Athena `GetQueryExecution` polling in the proxy.
-/// Workgroup query timeouts still apply server-side; this prevents an unbounded
-/// local loop if the execution never reaches a terminal state.
-const ATHENA_MAX_WAIT: Duration = Duration::from_secs(12 * 60 * 60);
-const ATHENA_POLL_INTERVAL: Duration = Duration::from_millis(500);
-
 /// Amazon Athena adapter.
 ///
 /// Submits queries via `StartQueryExecution`, polls `GetQueryExecution` until complete,
@@ -147,6 +174,8 @@ pub struct AthenaAdapter {
     workgroup: String,
     /// Default Glue catalog. Defaults to `AwsDataCatalog`.
     catalog: String,
+    /// Proxy-side max wait for completion (`maxWaitSecs`).
+    max_wait: Duration,
 }
 
 impl AthenaAdapter {
@@ -233,40 +262,72 @@ impl AthenaAdapter {
             catalog: config
                 .catalog
                 .unwrap_or_else(|| "AwsDataCatalog".to_string()),
+            max_wait: Duration::from_secs(config.max_wait_secs),
         })
+    }
+
+    async fn stop_query_best_effort(&self, execution_id: &str) {
+        let stop = self
+            .client
+            .stop_query_execution()
+            .query_execution_id(execution_id)
+            .send();
+        match tokio::time::timeout(ATHENA_STOP_TIMEOUT, stop).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => {
+                warn!(
+                    execution_id = %execution_id,
+                    error = %aws_err(&e),
+                    "Athena StopQueryExecution failed (ignored)"
+                );
+            }
+            Err(_) => {
+                warn!(
+                    execution_id = %execution_id,
+                    "Athena StopQueryExecution timed out (ignored)"
+                );
+            }
+        }
     }
 
     /// Poll until the given query execution reaches a terminal state.
     /// Returns `Ok(())` on success, `Err` on failure, cancellation, or timeout.
     ///
-    /// Athena workgroups may enforce their own runtime limits; this bound also
-    /// stops the proxy from looping forever if status stays non-terminal, and
-    /// issues `StopQueryExecution` on timeout.
+    /// Athena workgroups may enforce their own runtime limits; `maxWaitSecs`
+    /// also stops the proxy from looping forever if status stays non-terminal,
+    /// and issues `StopQueryExecution` on timeout.
     async fn wait_for_completion(&self, execution_id: &str) -> Result<()> {
-        let deadline = tokio::time::Instant::now() + ATHENA_MAX_WAIT;
+        let deadline = tokio::time::Instant::now() + self.max_wait;
         loop {
             if tokio::time::Instant::now() >= deadline {
-                let _ = self
-                    .client
-                    .stop_query_execution()
-                    .query_execution_id(execution_id)
-                    .send()
-                    .await;
+                self.stop_query_best_effort(execution_id).await;
                 return Err(QueryFluxError::Engine(format!(
                     "Athena query {execution_id} exceeded max wait of {}s",
-                    ATHENA_MAX_WAIT.as_secs()
+                    self.max_wait.as_secs()
                 )));
             }
 
-            let resp = self
+            let get = self
                 .client
                 .get_query_execution()
                 .query_execution_id(execution_id)
-                .send()
-                .await
-                .map_err(|e| {
-                    QueryFluxError::Engine(format!("Athena GetQueryExecution: {}", aws_err(&e)))
-                })?;
+                .send();
+            let resp = match tokio::time::timeout_at(deadline, get).await {
+                Ok(Ok(resp)) => resp,
+                Ok(Err(e)) => {
+                    return Err(QueryFluxError::Engine(format!(
+                        "Athena GetQueryExecution: {}",
+                        aws_err(&e)
+                    )));
+                }
+                Err(_) => {
+                    self.stop_query_best_effort(execution_id).await;
+                    return Err(QueryFluxError::Engine(format!(
+                        "Athena query {execution_id} exceeded max wait of {}s",
+                        self.max_wait.as_secs()
+                    )));
+                }
+            };
 
             let state = resp
                 .query_execution()
@@ -794,6 +855,14 @@ impl AthenaAdapter {
                     example: Some("AwsDataCatalog"),
                 },
                 ConfigField {
+                    key: "maxWaitSecs",
+                    label: "Max wait (seconds)",
+                    description: "Max seconds QueryFlux polls Athena before cancelling the query. Defaults to 600 (10 minutes).",
+                    field_type: FieldType::Number,
+                    required: false,
+                    example: Some("600"),
+                },
+                ConfigField {
                     key: "auth.type",
                     label: "Auth type",
                     description: "Use 'accessKey' for static credentials. Omit to use the default AWS credential chain.",
@@ -924,9 +993,50 @@ mod tests {
     }
 
     #[test]
-    fn wait_for_completion_bound_is_finite() {
-        assert_eq!(ATHENA_MAX_WAIT, Duration::from_secs(12 * 60 * 60));
+    fn wait_for_completion_bound_defaults_to_ten_minutes() {
+        assert_eq!(DEFAULT_ATHENA_MAX_WAIT_SECS, 600);
         assert_eq!(ATHENA_POLL_INTERVAL, Duration::from_millis(500));
-        assert!(ATHENA_POLL_INTERVAL < ATHENA_MAX_WAIT);
+        assert!(ATHENA_POLL_INTERVAL < Duration::from_secs(DEFAULT_ATHENA_MAX_WAIT_SECS));
+    }
+
+    #[test]
+    fn max_wait_secs_parses_from_json() {
+        use crate::EngineConfigParseable;
+        use serde_json::json;
+
+        let cfg = AthenaConfig::from_json(
+            &json!({
+                "region": "us-east-1",
+                "s3OutputLocation": "s3://bucket/results/"
+            }),
+            "athena-1",
+        )
+        .expect("defaults");
+        assert_eq!(cfg.max_wait_secs, DEFAULT_ATHENA_MAX_WAIT_SECS);
+
+        let cfg = AthenaConfig::from_json(
+            &json!({
+                "region": "us-east-1",
+                "s3OutputLocation": "s3://bucket/results/",
+                "maxWaitSecs": 120
+            }),
+            "athena-1",
+        )
+        .expect("override");
+        assert_eq!(cfg.max_wait_secs, 120);
+
+        for bad in [json!(0), json!(-1), json!("600"), json!(null)] {
+            let err = AthenaConfig::from_json(
+                &json!({
+                    "region": "us-east-1",
+                    "s3OutputLocation": "s3://bucket/results/",
+                    "maxWaitSecs": bad
+                }),
+                "athena-1",
+            )
+            .map(|_| ())
+            .unwrap_err();
+            assert!(err.to_string().contains("maxWaitSecs"));
+        }
     }
 }
