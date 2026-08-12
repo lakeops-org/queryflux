@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use arrow::datatypes::Schema;
 use arrow::record_batch::RecordBatch;
@@ -20,7 +20,9 @@ use queryflux_core::{
     },
     session::SessionContext,
 };
-use queryflux_engine_adapters::{AdapterKind, AsyncAdapter, ConnectionFormat, SyncAdapter};
+use queryflux_engine_adapters::{
+    AdapterKind, AsyncAdapter, BackendQueryIdSlot, ConnectionFormat, SyncAdapter,
+};
 use queryflux_guardrails::{GuardChain, GuardContext, GuardLayer};
 use queryflux_metrics::MetricsStore;
 use queryflux_translation::SchemaContext;
@@ -905,6 +907,118 @@ impl Drop for ClusterSlotGuard {
 }
 
 // ---------------------------------------------------------------------------
+// SyncCancelGuard — kill the engine query if the client drops mid-flight
+// ---------------------------------------------------------------------------
+
+/// Issues `adapter.cancel_query` when dropped without [`SyncCancelGuard::disarm`].
+///
+/// Adapters publish the engine-side id into `id_slot` before the blocking wait.
+/// On HTTP handler cancellation the future is dropped, this guard fires, and
+/// the backend query is stopped (ClickHouse `KILL QUERY`, StarRocks `KILL QUERY`,
+/// DuckDB interrupt, Athena `StopQueryExecution`, Trino `DELETE /v1/query`).
+struct SyncCancelGuard {
+    adapter: DispatchAdapter,
+    id_slot: BackendQueryIdSlot,
+    state: Option<Arc<AppState>>,
+    ctx: Option<QueryContext>,
+    start: Instant,
+    disarmed: bool,
+}
+
+impl SyncCancelGuard {
+    fn new(
+        adapter: DispatchAdapter,
+        id_slot: BackendQueryIdSlot,
+        state: Arc<AppState>,
+        ctx: QueryContext,
+        start: Instant,
+    ) -> Self {
+        Self {
+            adapter,
+            id_slot,
+            state: Some(state),
+            ctx: Some(ctx),
+            start,
+            disarmed: false,
+        }
+    }
+
+    /// Do not cancel — the query finished (success or engine error).
+    fn disarm(&mut self) {
+        self.disarmed = true;
+        self.state = None;
+        self.ctx = None;
+    }
+
+    /// Spawn a best-effort cancel now. Idempotent with [`Drop`].
+    fn fire(&mut self) {
+        if self.disarmed {
+            return;
+        }
+        self.disarmed = true;
+        self.state = None;
+        self.ctx = None;
+        spawn_sync_cancel(self.adapter.clone(), self.id_slot.clone());
+    }
+}
+
+impl Drop for SyncCancelGuard {
+    fn drop(&mut self) {
+        if self.disarmed {
+            return;
+        }
+        self.disarmed = true;
+        spawn_sync_cancel(self.adapter.clone(), self.id_slot.clone());
+        if let (Some(state), Some(ctx)) = (self.state.take(), self.ctx.take()) {
+            let backend_query_id = self.id_slot.get().map(|id| id.0);
+            state.record_query(
+                &ctx,
+                QueryOutcome {
+                    backend_query_id,
+                    status: QueryStatus::Cancelled,
+                    execution_ms: self.start.elapsed().as_millis() as u64,
+                    rows: None,
+                    error: Some("client disconnected".to_string()),
+                    routing_trace: None,
+                    engine_stats: None,
+                    guard_actions: vec![],
+                    was_guard_blocked: false,
+                    queue_duration_ms: 0,
+                    cache_hit: false,
+                },
+            );
+        }
+    }
+}
+
+/// Outer deadline for detached `cancel_query` tasks. Matches adapter control-plane
+/// timeouts (ClickHouse / StarRocks pool checkout) so a hung backend cannot leak tasks.
+const SYNC_CANCEL_TIMEOUT: Duration = Duration::from_secs(10);
+
+fn spawn_sync_cancel(adapter: DispatchAdapter, id_slot: BackendQueryIdSlot) {
+    let Some(id) = id_slot.get() else {
+        return;
+    };
+    tokio::spawn(async move {
+        match tokio::time::timeout(SYNC_CANCEL_TIMEOUT, adapter.cancel_query(&id)).await {
+            Err(_) => {
+                warn!(
+                    backend = %id,
+                    timeout_secs = SYNC_CANCEL_TIMEOUT.as_secs(),
+                    "Sync cancel timed out"
+                );
+            }
+            Ok(Err(e)) => {
+                warn!(backend = %id, "Best-effort sync cancel on client disconnect: {e}");
+            }
+            Ok(Ok(())) => {
+                debug!(backend = %id, "Issued backend cancel after client disconnect");
+            }
+        }
+    });
+}
+
+// ---------------------------------------------------------------------------
 // Sync execution path — shared by MySQL wire, Postgres wire, Flight SQL
 // ---------------------------------------------------------------------------
 
@@ -913,6 +1027,7 @@ impl Drop for ClusterSlotGuard {
 /// Async engines (Trino) implement `execute_as_arrow` internally by driving their own
 /// submit+poll loop — allowing MySQL/Postgres clients to query them without needing a
 /// separate execution path in dispatch.
+#[derive(Clone)]
 enum DispatchAdapter {
     Sync(Arc<dyn SyncAdapter>),
     Async(Arc<dyn AsyncAdapter>),
@@ -926,16 +1041,24 @@ impl DispatchAdapter {
         credentials: &QueryCredentials,
         tags: &queryflux_core::tags::QueryTags,
         params: &QueryParams,
+        id_slot: &BackendQueryIdSlot,
     ) -> Result<queryflux_engine_adapters::SyncExecution> {
         match self {
             Self::Sync(a) => {
-                a.execute_as_arrow(sql, session, credentials, tags, params)
+                a.execute_as_arrow(sql, session, credentials, tags, params, id_slot)
                     .await
             }
             Self::Async(a) => {
-                a.execute_as_arrow(sql, session, credentials, tags, params)
+                a.execute_as_arrow(sql, session, credentials, tags, params, id_slot)
                     .await
             }
+        }
+    }
+
+    async fn cancel_query(&self, backend_id: &queryflux_core::query::BackendQueryId) -> Result<()> {
+        match self {
+            Self::Sync(a) => a.cancel_query(backend_id).await,
+            Self::Async(a) => a.cancel_query(backend_id).await,
         }
     }
 
@@ -1252,6 +1375,7 @@ async fn setup_sync_query(
 async fn execute_stream(
     setup: &SyncQuerySetup,
     sink: &mut impl ResultSink,
+    id_slot: &BackendQueryIdSlot,
 ) -> (SyncOutcome, Result<()>) {
     let elapsed = || setup.start.elapsed().as_millis() as u64;
 
@@ -1263,6 +1387,7 @@ async fn execute_stream(
             &setup.credentials,
             &setup.ctx.query_tags,
             &setup.params,
+            id_slot,
         )
         .await
     {
@@ -1384,6 +1509,7 @@ async fn execute_native_to_sink(
     setup: &SyncQuerySetup,
     protocol: &FrontendProtocol,
     sink: &mut impl ResultSink,
+    id_slot: &BackendQueryIdSlot,
 ) -> (SyncOutcome, Result<()>) {
     let elapsed = || setup.start.elapsed().as_millis() as u64;
 
@@ -1415,6 +1541,7 @@ async fn execute_native_to_sink(
             &setup.credentials,
             &setup.ctx.query_tags,
             &setup.params,
+            id_slot,
         )
         .await
     {
@@ -1828,20 +1955,43 @@ async fn execute_to_sink_inner(
     // Native path: skip Arrow when backend connection format matches frontend protocol.
     // All other guarantees (slot release, record_query) are upheld by this function's
     // outer structure — only the inner execution subroutine is swapped.
-    let (outcome, sink_result) = if setup
+    let id_slot = BackendQueryIdSlot::new();
+    let mut cancel = SyncCancelGuard::new(
+        setup.adapter.clone(),
+        id_slot.clone(),
+        state.clone(),
+        setup.ctx.clone(),
+        setup.start,
+    );
+    let (mut outcome, sink_result) = if setup
         .adapter
         .connection_format()
         .matches_frontend(&protocol)
     {
-        execute_native_to_sink(&setup, &protocol, sink).await
+        execute_native_to_sink(&setup, &protocol, sink, &id_slot).await
     } else {
-        execute_stream(&setup, sink).await
+        execute_stream(&setup, sink, &id_slot).await
     };
+    if sink_result.is_err() {
+        // Client gone mid-stream (or during schema send): stop the engine query.
+        cancel.fire();
+        // Only reclassify when the engine itself did not already fail — otherwise
+        // an engine error delivered to a departed client is logged as a cancel.
+        if outcome.status == QueryStatus::Success {
+            outcome.status = QueryStatus::Cancelled;
+        }
+        if outcome.error.is_none() {
+            outcome.error = Some("client disconnected".to_string());
+        }
+    }
+    // Successful completion and engine errors: the query is already finished.
+    cancel.disarm();
 
     // Guaranteed single exit: release slot, then record.
     // slot.release() is idempotent and sets released=true so Drop is a no-op.
     setup.slot.release().await;
     let mut final_outcome: QueryOutcome = outcome.into();
+    final_outcome.backend_query_id = id_slot.get().map(|id| id.0);
     // Prepend guard actions (allow/warn) collected before execution.
     if !setup.guard_actions.is_empty() {
         setup.guard_actions.extend(final_outcome.guard_actions);

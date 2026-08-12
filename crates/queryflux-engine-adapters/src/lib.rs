@@ -17,7 +17,7 @@ use queryflux_core::{
     engine_registry::EngineDescriptor,
     error::Result,
     native_result::NativeResultChunk,
-    query::{ClusterGroupName, ClusterName, FrontendProtocol},
+    query::{BackendQueryId, ClusterGroupName, ClusterName, FrontendProtocol},
 };
 
 /// Implemented by each engine's typed config struct.
@@ -34,6 +34,34 @@ pub trait EngineConfigParseable: Sized {
 
 /// A stream of Arrow RecordBatches — the universal output type for all adapters.
 pub type ArrowStream = Pin<Box<dyn Stream<Item = Result<RecordBatch>> + Send>>;
+
+/// Slot an adapter fills with the engine-side query id as soon as it is known
+/// — typically *before* the blocking wait — so dispatch can `cancel_query` if
+/// the client disconnects mid-flight.
+///
+/// Cheap to clone (shared mutex). Publish is last-write-wins; `get` returns
+/// the most recently published id, or `None` if the adapter never assigned one.
+#[derive(Clone, Default)]
+pub struct BackendQueryIdSlot {
+    inner: std::sync::Arc<std::sync::Mutex<Option<BackendQueryId>>>,
+}
+
+impl BackendQueryIdSlot {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record the engine-side id. Safe to call from the execute task; dispatch
+    /// reads it from a `Drop` guard on another task.
+    pub fn publish(&self, id: impl Into<String>) {
+        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        *guard = Some(BackendQueryId(id.into()));
+    }
+
+    pub fn get(&self) -> Option<BackendQueryId> {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+}
 
 /// Returned by `SyncAdapter::execute_as_arrow`.
 ///
@@ -162,6 +190,32 @@ mod connection_format_tests {
     }
 }
 
+#[cfg(test)]
+mod backend_query_id_slot_tests {
+    use super::BackendQueryIdSlot;
+
+    #[test]
+    fn empty_slot_returns_none() {
+        assert!(BackendQueryIdSlot::new().get().is_none());
+    }
+
+    #[test]
+    fn publish_is_visible_on_clones() {
+        let slot = BackendQueryIdSlot::new();
+        let clone = slot.clone();
+        slot.publish("ch-query-1");
+        assert_eq!(clone.get().unwrap().0, "ch-query-1");
+    }
+
+    #[test]
+    fn last_publish_wins() {
+        let slot = BackendQueryIdSlot::new();
+        slot.publish("first");
+        slot.publish("second");
+        assert_eq!(slot.get().unwrap().0, "second");
+    }
+}
+
 /// Returned by `SyncAdapter::execute_native` — a stream of protocol-agnostic row chunks.
 pub struct NativeExecution {
     pub stream: Pin<Box<dyn Stream<Item = Result<NativeResultChunk>> + Send>>,
@@ -169,9 +223,10 @@ pub struct NativeExecution {
 }
 
 /// Sync engines: execute to completion, stream Arrow results.
-/// Used by DuckDB (embedded + HTTP) and StarRocks.
+/// Used by DuckDB (embedded + HTTP), StarRocks, ClickHouse, and ADBC.
 #[async_trait]
 pub trait SyncAdapter: Send + Sync {
+    #[allow(clippy::too_many_arguments)]
     async fn execute_as_arrow(
         &self,
         sql: &str,
@@ -179,6 +234,7 @@ pub trait SyncAdapter: Send + Sync {
         credentials: &queryflux_auth::QueryCredentials,
         tags: &queryflux_core::tags::QueryTags,
         params: &queryflux_core::params::QueryParams,
+        id_slot: &BackendQueryIdSlot,
     ) -> Result<SyncExecution>;
     fn engine_type(&self) -> queryflux_core::query::EngineType;
     /// Target dialect for SQL translation (may differ from `engine_type().dialect()`, e.g. Flight SQL + arbitrary sqlglot backend).
@@ -204,6 +260,7 @@ pub trait SyncAdapter: Send + Sync {
 
     /// Only called by dispatch when `connection_format().matches_frontend(protocol)` is true.
     /// Default returns `Err` — adapters that override `connection_format` must also override this.
+    #[allow(clippy::too_many_arguments)]
     async fn execute_native(
         &self,
         _protocol: &FrontendProtocol,
@@ -212,10 +269,21 @@ pub trait SyncAdapter: Send + Sync {
         _credentials: &queryflux_auth::QueryCredentials,
         _tags: &queryflux_core::tags::QueryTags,
         _params: &queryflux_core::params::QueryParams,
+        _id_slot: &BackendQueryIdSlot,
     ) -> Result<NativeExecution> {
         Err(queryflux_core::error::QueryFluxError::Engine(
             "execute_native not implemented for this adapter".to_string(),
         ))
+    }
+
+    /// Best-effort: stop an in-flight engine query identified by `backend_id`.
+    ///
+    /// Dispatch calls this when the client disconnects or the request is
+    /// cancelled. The default is a no-op — override when the engine has a kill
+    /// API (ClickHouse `KILL QUERY`, StarRocks `KILL QUERY`, DuckDB interrupt).
+    /// "Query already finished" must be treated as success.
+    async fn cancel_query(&self, _backend_id: &BackendQueryId) -> Result<()> {
+        Ok(())
     }
 
     async fn health_check(&self) -> bool;
@@ -262,6 +330,7 @@ pub trait AsyncAdapter: Send + Sync {
     ///
     /// Enables MySQL/Postgres wire protocol clients to query async engines.
     /// Returns `Err(SyncEngineRequired)` by default — engines that support this path override it.
+    #[allow(clippy::too_many_arguments)]
     async fn execute_as_arrow(
         &self,
         _sql: &str,
@@ -269,6 +338,7 @@ pub trait AsyncAdapter: Send + Sync {
         _credentials: &queryflux_auth::QueryCredentials,
         _tags: &queryflux_core::tags::QueryTags,
         _params: &queryflux_core::params::QueryParams,
+        _id_slot: &BackendQueryIdSlot,
     ) -> Result<SyncExecution> {
         Err(queryflux_core::error::QueryFluxError::SyncEngineRequired(
             "this engine only supports the async (HTTP submit-poll) protocol".to_string(),
@@ -350,6 +420,13 @@ impl AdapterKind {
         match self {
             Self::Async(a) => Some(a.clone()),
             Self::Sync(_) => None,
+        }
+    }
+
+    pub async fn cancel_query(&self, backend_id: &BackendQueryId) -> Result<()> {
+        match self {
+            Self::Sync(a) => a.cancel_query(backend_id).await,
+            Self::Async(a) => a.cancel_query(backend_id).await,
         }
     }
 }

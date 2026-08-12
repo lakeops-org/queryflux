@@ -18,7 +18,7 @@ use r2d2_adbc::AdbcConnectionManager;
 use tokio::sync::{mpsc, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
 
-use crate::{AdapterKind, EngineAdapterFactory, SyncAdapter, SyncExecution};
+use crate::{AdapterKind, BackendQueryIdSlot, EngineAdapterFactory, SyncAdapter, SyncExecution};
 use queryflux_core::engine_registry::{
     AuthType, ConfigField, ConnectionType, EngineDescriptor, FieldType,
 };
@@ -491,7 +491,18 @@ impl SyncAdapter for AdbcAdapter {
         _credentials: &queryflux_auth::QueryCredentials,
         _tags: &QueryTags,
         params: &queryflux_core::params::QueryParams,
+        _id_slot: &BackendQueryIdSlot,
     ) -> Result<SyncExecution> {
+        // ADBC `Statement::cancel` requires the live statement (`&mut self`)
+        // on the blocking thread; there is no cross-thread cancel handle.
+        // Leave the slot unset so dispatch does not record a fake backend id.
+        // `cancel_query` stays the default no-op. Dropping the result stream
+        // stops *reading* batches.
+        tracing::debug!(
+            cluster = %self.cluster_name,
+            attempt_id = %uuid::Uuid::new_v4(),
+            "Executing ADBC query"
+        );
         let pool = self.pool.clone();
         let sql = sql.to_string();
         let param_batch = if params.is_empty() {

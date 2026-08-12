@@ -39,6 +39,7 @@ use queryflux_core::{
     tags::{parse_query_tags, QueryTags},
 };
 
+use crate::abort::{wait_client_gone, AbortOnDrop};
 use crate::dispatch::{execute_to_sink, ResultSink};
 use crate::state::AppState;
 use crate::{FrontendListenerTrait, ShutdownRx};
@@ -159,7 +160,7 @@ async fn handle_connection(
     connection_id: u32,
 ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
     stream.set_nodelay(true)?;
-    let (mut reader, mut writer) = tokio::io::split(stream);
+    let (mut reader, mut writer) = stream.into_split();
 
     // Send server handshake.
     write_packet(&mut writer, 0, &build_handshake(connection_id)).await?;
@@ -238,8 +239,15 @@ async fn handle_connection(
                     .trim_end_matches('\0')
                     .to_string();
                 debug!(conn_id = connection_id, sql = %sql, "MySQL wire: query");
-                handle_com_query(&mut writer, &state, &mut session, &sql, seq.wrapping_add(1))
-                    .await?;
+                handle_com_query(
+                    &mut reader,
+                    &mut writer,
+                    &state,
+                    &mut session,
+                    &sql,
+                    seq.wrapping_add(1),
+                )
+                .await?;
             }
 
             COM_FIELD_LIST => {
@@ -267,8 +275,9 @@ async fn handle_connection(
 
 // ── Query execution ───────────────────────────────────────────────────────────
 
-async fn handle_com_query<W: AsyncWriteExt + Unpin>(
-    writer: &mut W,
+async fn handle_com_query(
+    reader: &mut tokio::net::tcp::OwnedReadHalf,
+    writer: &mut tokio::net::tcp::OwnedWriteHalf,
     state: &Arc<AppState>,
     session: &mut SessionContext,
     sql: &str,
@@ -383,7 +392,7 @@ async fn handle_com_query<W: AsyncWriteExt + Unpin>(
     let session2 = session.clone();
     let sql2 = sql.to_string();
 
-    let exec_task = tokio::spawn(async move {
+    let exec_task = AbortOnDrop::new(tokio::spawn(async move {
         execute_to_sink(
             &state2,
             sql2,
@@ -396,16 +405,30 @@ async fn handle_com_query<W: AsyncWriteExt + Unpin>(
         )
         .await
         // `sink` drops here — closes tx — rx.recv() will return None after last packet
-    });
+    }));
 
-    // Forward encoded MySQL packets to the client as they arrive.
-    while let Some(pkt) = rx.recv().await {
-        writer.write_all(&pkt).await?;
-        writer.flush().await?;
+    // Forward encoded MySQL packets. Abort the engine query if the client
+    // closes (or sends another command) while we are still waiting for results.
+    loop {
+        tokio::select! {
+            pkt = rx.recv() => {
+                match pkt {
+                    Some(pkt) => {
+                        writer.write_all(&pkt).await?;
+                        writer.flush().await?;
+                    }
+                    None => break,
+                }
+            }
+            _ = wait_client_gone(reader) => {
+                debug!("MySQL wire: client disconnected during query — aborting");
+                return Ok(());
+            }
+        }
     }
 
     // Log any panic in the execution task; result errors go through on_error → ERR packet.
-    if let Err(e) = exec_task.await {
+    if let Err(e) = exec_task.join().await {
         warn!("MySQL query task panicked: {e}");
     }
 

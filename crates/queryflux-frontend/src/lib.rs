@@ -1,3 +1,4 @@
+pub mod abort;
 pub mod admin;
 pub mod dispatch;
 pub mod flight_sql;
