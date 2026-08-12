@@ -369,6 +369,15 @@ pub trait QueueCoordinator: Send + Sync {
     /// or the claiming instance is shutting down).
     async fn release_claim(&self, query_id: &str) -> Result<()>;
 
+    /// Refresh `claimed_at` if `instance_id` still owns the claim.
+    ///
+    /// Dispatch can take longer than the stale-claim cutoff. Callers must
+    /// heartbeat while they hold the claim so another replica does not
+    /// take over and double-dispatch.
+    ///
+    /// Returns `true` if this instance still owns the claim.
+    async fn refresh_claim(&self, query_id: &str, instance_id: &str) -> Result<bool>;
+
     /// List queued queries that are not currently claimed by any instance.
     /// Claims older than `stale_before` count as unclaimed.
     async fn list_unclaimed(&self, stale_before: DateTime<Utc>) -> Result<Vec<QueuedQuery>>;

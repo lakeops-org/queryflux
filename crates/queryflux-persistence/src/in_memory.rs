@@ -866,6 +866,10 @@ impl QueueCoordinator for InMemoryPersistence {
         Ok(())
     }
 
+    async fn refresh_claim(&self, query_id: &str, _instance_id: &str) -> Result<bool> {
+        Ok(self.queued.contains_key(query_id))
+    }
+
     async fn list_unclaimed(&self, _stale_before: DateTime<Utc>) -> Result<Vec<QueuedQuery>> {
         // Single instance — all queued queries are effectively unclaimed.
         Ok(self.queued.iter().map(|e| e.value().clone()).collect())
@@ -1270,6 +1274,18 @@ mod tests {
             .await
             .unwrap();
         assert!(claimed.is_none());
+    }
+
+    #[tokio::test]
+    async fn queue_refresh_claim_true_while_queued() {
+        let store = InMemoryPersistence::new();
+        store.upsert_queued(make_queued("q-hb")).await.unwrap();
+        assert!(store.refresh_claim("q-hb", "inst-1").await.unwrap());
+        store
+            .delete_queued(&ProxyQueryId("q-hb".into()))
+            .await
+            .unwrap();
+        assert!(!store.refresh_claim("q-hb", "inst-1").await.unwrap());
     }
 
     #[tokio::test]
