@@ -179,11 +179,32 @@ function StaticUsersEditor({
 // Admin API password
 // ---------------------------------------------------------------------------
 
+function adminPasswordStatusMessage(
+  dbOverride: boolean | null,
+  durableStore: boolean | null,
+): string {
+  if (dbOverride === null || durableStore === null) {
+    return "Status unavailable.";
+  }
+  if (dbOverride && durableStore) {
+    return "A password hash is stored in the database and is used instead of YAML/env bootstrap credentials.";
+  }
+  if (dbOverride && !durableStore) {
+    return "A password override is active in memory only and will be lost on restart. Configure Postgres persistence for durable storage.";
+  }
+  if (!dbOverride && durableStore) {
+    return "Bootstrap credentials from YAML or QUERYFLUX_ADMIN_* are in use. Changing the password here persists it to the database.";
+  }
+  return "Bootstrap credentials from YAML or QUERYFLUX_ADMIN_* are in use. Without Postgres persistence, password changes cannot be stored durably.";
+}
+
 function AdminPasswordSection({
   dbOverride,
+  durableStore,
   onChanged,
 }: {
   dbOverride: boolean | null;
+  durableStore: boolean | null;
   onChanged: () => void;
 }) {
   const [currentPassword, setCurrentPassword] = useState("");
@@ -207,7 +228,12 @@ function AdminPasswordSection({
       setNewPassword("");
       setConfirmPassword("");
       onChanged();
-      setMsg({ text: "Password updated. Use it on the next Studio sign-in.", ok: true });
+      setMsg({
+        text: durableStore
+          ? "Password updated. Use it on the next Studio sign-in."
+          : "Password updated for this session. It will be lost on restart unless Postgres persistence is configured.",
+        ok: true,
+      });
     } catch (e) {
       setMsg({ text: String(e), ok: false });
     } finally {
@@ -220,11 +246,7 @@ function AdminPasswordSection({
       <SectionHeader icon={<Key size={15} />} title="Admin API Password" />
       <div className="p-6 space-y-4">
         <p className="text-xs text-slate-600">
-          {dbOverride === true
-            ? "A password hash is stored in the database and is used instead of YAML/env bootstrap credentials."
-            : dbOverride === false
-              ? "Bootstrap credentials from YAML or QUERYFLUX_ADMIN_* are in use. Changing the password here persists it to the database."
-              : "Status unavailable."}
+          {adminPasswordStatusMessage(dbOverride, durableStore)}
         </p>
         <div className="grid grid-cols-3 gap-3">
           <TextInput
@@ -302,11 +324,22 @@ export function SecurityEditor({ initialSecurity }: Props) {
   // ── Admin password status (read-only; password changes are not available in Studio) ──
 
   const [dbOverride, setDbOverride] = useState<boolean | null>(null);
+  const [durableStore, setDurableStore] = useState<boolean | null>(null);
+
+  const refreshAuthStatus = () => {
+    getAuthStatus()
+      .then((s) => {
+        setDbOverride(s.db_override);
+        setDurableStore(s.durable_store);
+      })
+      .catch(() => {
+        setDbOverride(null);
+        setDurableStore(null);
+      });
+  };
 
   useEffect(() => {
-    getAuthStatus()
-      .then((s) => setDbOverride(s.db_override))
-      .catch(() => setDbOverride(null));
+    refreshAuthStatus();
   }, []);
 
   const saveSecurityConfig = async () => {
@@ -345,7 +378,11 @@ export function SecurityEditor({ initialSecurity }: Props) {
       </div>
 
       {/* ── Admin API Password ───────────────────────────────────────────── */}
-      <AdminPasswordSection dbOverride={dbOverride} onChanged={() => setDbOverride(true)} />
+      <AdminPasswordSection
+        dbOverride={dbOverride}
+        durableStore={durableStore}
+        onChanged={refreshAuthStatus}
+      />
 
       {/* ── Authentication ───────────────────────────────────────────────── */}
       <section className="bg-white rounded-xl border border-slate-200 shadow-xs overflow-hidden">

@@ -38,6 +38,8 @@ pub struct AdminCredentialsManager {
     bootstrap_username: String,
     bootstrap_password: String,
     store: Option<Arc<dyn ProxySettingsStore>>,
+    /// `true` when settings are backed by Postgres (survive restart).
+    durable_store: bool,
 }
 
 impl AdminCredentialsManager {
@@ -45,12 +47,19 @@ impl AdminCredentialsManager {
         bootstrap_username: String,
         bootstrap_password: String,
         store: Option<Arc<dyn ProxySettingsStore>>,
+        durable_store: bool,
     ) -> Self {
         Self {
             bootstrap_username,
             bootstrap_password,
             store,
+            durable_store,
         }
+    }
+
+    /// `true` when the active settings store is Postgres-backed.
+    pub fn settings_are_durable(&self) -> bool {
+        self.durable_store
     }
 
     /// Returns `true` when the DB contains an overriding credential record.
@@ -160,13 +169,13 @@ mod tests {
     use super::*;
     use queryflux_persistence::in_memory::InMemoryPersistence;
 
-    fn mgr(store: Option<Arc<dyn ProxySettingsStore>>) -> AdminCredentialsManager {
-        AdminCredentialsManager::new("admin".into(), "admin".into(), store)
+    fn mgr(store: Option<Arc<dyn ProxySettingsStore>>, durable: bool) -> AdminCredentialsManager {
+        AdminCredentialsManager::new("admin".into(), "admin".into(), store, durable)
     }
 
     #[tokio::test]
     async fn bootstrap_accepts_default_until_override() {
-        let m = mgr(Some(Arc::new(InMemoryPersistence::new())));
+        let m = mgr(Some(Arc::new(InMemoryPersistence::new())), false);
         assert!(m.verify("admin", "admin").await);
         assert!(!m.has_db_override().await);
     }
@@ -174,20 +183,20 @@ mod tests {
     #[tokio::test]
     async fn change_password_persists_and_rejects_bootstrap() {
         let store = Arc::new(InMemoryPersistence::new());
-        let m = mgr(Some(store.clone()));
+        let m = mgr(Some(store.clone()), false);
         m.change_password("admin", "new-secret").await.unwrap();
         assert!(m.has_db_override().await);
         assert!(m.verify("admin", "new-secret").await);
         assert!(!m.verify("admin", "admin").await);
 
-        let again = mgr(Some(store));
+        let again = mgr(Some(store), false);
         assert!(again.has_db_override().await);
         assert!(again.verify("admin", "new-secret").await);
     }
 
     #[tokio::test]
     async fn change_password_without_store_fails() {
-        let m = mgr(None);
+        let m = mgr(None, false);
         let err = m.change_password("admin", "new-secret").await.unwrap_err();
         assert!(err.to_string().contains("no settings store"));
         assert!(m.verify("admin", "admin").await);
@@ -195,7 +204,7 @@ mod tests {
 
     #[tokio::test]
     async fn wrong_current_password_rejected() {
-        let m = mgr(Some(Arc::new(InMemoryPersistence::new())));
+        let m = mgr(Some(Arc::new(InMemoryPersistence::new())), false);
         assert!(m.change_password("nope", "new-secret").await.is_err());
         assert!(m.verify("admin", "admin").await);
     }

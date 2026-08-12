@@ -930,6 +930,7 @@ async fn main() -> Result<()> {
         admin_username,
         admin_password,
         settings_store,
+        backend.is_some(),
     ));
 
     let test_cluster_fn: TestClusterFn = Arc::new(|engine_key, config_json| {
