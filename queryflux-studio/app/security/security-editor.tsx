@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import { changePassword, getAuthStatus, putSecurityConfig } from "@/lib/api";
 import type { SecurityConfigDto, UpsertSecurityConfig, GroupAuthzDto } from "@/lib/api-types";
@@ -330,6 +330,30 @@ export function SecurityEditor({ initialSecurity }: Props) {
   const [operatorGroupsText, setOperatorGroupsText] = useState(
     () => (initialSecurity?.operator_groups ?? []).join(", "),
   );
+
+  const lastSyncedRolesText = useRef(operatorRolesText);
+  const lastSyncedGroupsText = useRef(operatorGroupsText);
+  const rolesFromProps = (initialSecurity?.operator_roles ?? []).join(", ");
+  const groupsFromProps = (initialSecurity?.operator_groups ?? []).join(", ");
+
+  useEffect(() => {
+    setOperatorRolesText((current) => {
+      if (current === lastSyncedRolesText.current) {
+        lastSyncedRolesText.current = rolesFromProps;
+        return rolesFromProps;
+      }
+      lastSyncedRolesText.current = rolesFromProps;
+      return current;
+    });
+    setOperatorGroupsText((current) => {
+      if (current === lastSyncedGroupsText.current) {
+        lastSyncedGroupsText.current = groupsFromProps;
+        return groupsFromProps;
+      }
+      lastSyncedGroupsText.current = groupsFromProps;
+      return current;
+    });
+  }, [rolesFromProps, groupsFromProps]);
 
   const [securityForm, setSecurityForm] = useState<UpsertSecurityConfig>(initSecurityForm);
   const [securitySaving, setSecuritySaving] = useState(false);

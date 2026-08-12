@@ -863,6 +863,21 @@ pub async fn get_queued_statement(
         }
     };
 
+    // Admin cancel deletes the queued row. Abort if it disappeared after claim
+    // so dequeue cannot dispatch a query that already returned 204.
+    match state.persistence.get_queued(&query_id).await {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            release_claim(&state, &query_id.0).await;
+            return StatusCode::NOT_FOUND.into_response();
+        }
+        Err(e) => {
+            warn!("Persistence error re-checking queued query before dispatch: {e}");
+            release_claim(&state, &query_id.0).await;
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    }
+
     let use_cache_path = {
         let live = state.live.read().await;
         let caching_requested = live.group_cache_settings.contains_key(&group.0)

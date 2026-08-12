@@ -17,7 +17,7 @@ use queryflux_core::{
     },
     engine_registry::EngineRegistry,
     error::{QueryFluxError, Result},
-    query::{BackendQueryId, ClusterGroupName, ClusterName, ProxyQueryId},
+    query::{BackendQueryId, ClusterGroupName, ClusterName, ExecutingQuery, ProxyQueryId},
 };
 use queryflux_metrics::prometheus_store::PrometheusMetrics;
 use queryflux_persistence::{
@@ -1097,6 +1097,20 @@ async fn delete_queued_if_exists(
     }
 }
 
+async fn find_executing_query(
+    persistence: &dyn queryflux_persistence::Persistence,
+    id: &str,
+) -> queryflux_core::error::Result<Option<ExecutingQuery>> {
+    if let Some(q) = persistence.get(&BackendQueryId(id.to_string())).await? {
+        return Ok(Some(q));
+    }
+    Ok(persistence
+        .list_all()
+        .await?
+        .into_iter()
+        .find(|q| q.id.0 == id))
+}
+
 /// In-flight executing + queued queries (not history).
 #[utoipa::path(
     get,
@@ -1132,19 +1146,9 @@ async fn cancel_query_handler(
 ) -> impl IntoResponse {
     let persistence = &state.app.persistence;
 
-    match persistence.get(&BackendQueryId(id.clone())).await {
+    match find_executing_query(persistence.as_ref(), &id).await {
         Ok(Some(executing)) => return cancel_executing(&state, executing).await,
         Ok(None) => {}
-        Err(e) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
-        }
-    }
-    match persistence.list_all().await {
-        Ok(all) => {
-            if let Some(executing) = all.into_iter().find(|q| q.id.0 == id) {
-                return cancel_executing(&state, executing).await;
-            }
-        }
         Err(e) => {
             return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
         }
@@ -1153,13 +1157,29 @@ async fn cancel_query_handler(
     let qid = ProxyQueryId(id.clone());
     match delete_queued_if_exists(persistence.as_ref(), &id).await {
         Ok(true) => {
+            // A worker may have claimed and started executing between the first
+            // lookup and this delete. Cancel that path too.
+            match find_executing_query(persistence.as_ref(), &id).await {
+                Ok(Some(executing)) => return cancel_executing(&state, executing).await,
+                Ok(None) => {}
+                Err(e) => {
+                    return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+                }
+            }
             if let Some(qc) = &state.app.queue_coordinator {
                 let _ = qc.release_claim(&qid.0).await;
             }
             info!(id = %qid, "Admin cancelled queued query");
             StatusCode::NO_CONTENT.into_response()
         }
-        Ok(false) => (StatusCode::NOT_FOUND, "query not found").into_response(),
+        Ok(false) => {
+            // Claimed and moved to executing after the first lookup.
+            match find_executing_query(persistence.as_ref(), &id).await {
+                Ok(Some(executing)) => cancel_executing(&state, executing).await,
+                Ok(None) => (StatusCode::NOT_FOUND, "query not found").into_response(),
+                Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+            }
+        }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }

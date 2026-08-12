@@ -47,6 +47,8 @@ pub fn parse_security_setting(v: &Value) -> (Option<AuthConfig>, Option<Authoriz
             "oidc": camelize_value(v.get("oidc").unwrap_or(&Value::Null)),
             "ldap": camelize_value(v.get("ldap").unwrap_or(&Value::Null)),
             "staticUsers": normalize_static_users(v.get("static_users").or_else(|| v.get("staticUsers")).unwrap_or(&Value::Null)),
+            "operatorRoles": json_string_array(v, "operator_roles", "operatorRoles"),
+            "operatorGroups": json_string_array(v, "operator_groups", "operatorGroups"),
         }))
         .ok()
     } else {
@@ -226,6 +228,13 @@ fn merge_openfga_secrets(incoming: &mut Value, prev: &Value) {
     }
 }
 
+fn json_string_array(v: &Value, snake: &str, camel: &str) -> Value {
+    match v.get(snake).or_else(|| v.get(camel)) {
+        Some(x) if x.is_array() => x.clone(),
+        _ => json!([]),
+    }
+}
+
 fn snake_to_camel(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut up = false;
@@ -362,5 +371,49 @@ mod tests {
         let (auth, authz) = parse_security_setting(&json!({ "something": "else" }));
         assert!(auth.is_none());
         assert!(authz.is_none());
+    }
+
+    #[test]
+    fn operator_lists_parse() {
+        let v = json!({
+            "auth_provider": "none",
+            "auth_required": true,
+            "authorization_provider": "none",
+            "operator_roles": ["queryflux-operator"],
+            "operator_groups": ["platform-ops"],
+        });
+        let (auth, _) = parse_security_setting(&v);
+        let auth = auth.expect("auth section should parse");
+        assert_eq!(auth.operator_roles, vec!["queryflux-operator"]);
+        assert_eq!(auth.operator_groups, vec!["platform-ops"]);
+    }
+
+    #[test]
+    fn null_operator_lists_default_empty() {
+        let v = json!({
+            "auth_provider": "none",
+            "auth_required": false,
+            "authorization_provider": "none",
+            "operator_roles": null,
+            "operator_groups": null,
+        });
+        let (auth, _) = parse_security_setting(&v);
+        let auth = auth.expect("null operator lists must not fail parse");
+        assert!(auth.operator_roles.is_empty());
+        assert!(auth.operator_groups.is_empty());
+    }
+
+    #[test]
+    fn operator_lists_parse_camel_case_typed_input() {
+        let v = json!({
+            "provider": "none",
+            "required": true,
+            "operatorRoles": ["queryflux-operator"],
+            "operatorGroups": ["platform-ops"],
+        });
+        let (auth, _) = parse_security_setting(&v);
+        let auth = auth.expect("camelCase operator lists should parse");
+        assert_eq!(auth.operator_roles, vec!["queryflux-operator"]);
+        assert_eq!(auth.operator_groups, vec!["platform-ops"]);
     }
 }
