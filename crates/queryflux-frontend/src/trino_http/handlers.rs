@@ -504,6 +504,9 @@ pub async fn post_statement(
     let auth_ctx = match auth_provider.authenticate(&creds).await {
         Ok(ctx) => ctx,
         Err(e) => {
+            state
+                .metrics
+                .on_auth_failure(&format!("{:?}", FrontendProtocol::TrinoHttp));
             warn!("Authentication failed: {e}");
             return StatusCode::UNAUTHORIZED.into_response();
         }
@@ -729,6 +732,9 @@ pub async fn get_queued_statement(
     let auth_ctx = match auth_provider.authenticate(&creds).await {
         Ok(ctx) => ctx,
         Err(e) => {
+            state
+                .metrics
+                .on_auth_failure(&format!("{:?}", FrontendProtocol::TrinoHttp));
             warn!("Queued poll auth failed: {e}");
             return StatusCode::UNAUTHORIZED.into_response();
         }
@@ -1017,6 +1023,9 @@ pub async fn get_executing_statement(
     let auth_ctx = match auth_provider.authenticate(&creds).await {
         Ok(ctx) => ctx,
         Err(e) => {
+            state
+                .metrics
+                .on_auth_failure(&format!("{:?}", FrontendProtocol::TrinoHttp));
             warn!("Poll auth failed: {e}");
             return StatusCode::UNAUTHORIZED.into_response();
         }
@@ -1338,6 +1347,9 @@ pub async fn delete_executing_statement(
     let auth_ctx = match auth_provider.authenticate(&creds).await {
         Ok(ctx) => ctx,
         Err(e) => {
+            state
+                .metrics
+                .on_auth_failure(&format!("{:?}", FrontendProtocol::TrinoHttp));
             warn!("Cancel auth failed: {e}");
             return StatusCode::UNAUTHORIZED.into_response();
         }

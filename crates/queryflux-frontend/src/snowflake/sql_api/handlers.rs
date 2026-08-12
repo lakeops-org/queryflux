@@ -321,5 +321,10 @@ async fn authenticate(
             bearer_token: bearer,
         })
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| {
+            state
+                .metrics
+                .on_auth_failure(&format!("{:?}", FrontendProtocol::SnowflakeSqlApi));
+            e.to_string()
+        })
 }

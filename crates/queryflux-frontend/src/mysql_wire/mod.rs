@@ -298,6 +298,9 @@ async fn handle_com_query(
     let auth_ctx = match auth_provider.authenticate(&creds).await {
         Ok(ctx) => ctx,
         Err(e) => {
+            state
+                .metrics
+                .on_auth_failure(&format!("{:?}", FrontendProtocol::MySqlWire));
             write_packet(writer, start_seq, &build_err(1045, &e.to_string())).await?;
             return Ok(());
         }

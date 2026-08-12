@@ -311,6 +311,9 @@ async fn handle_simple_query(
     let auth_ctx = match auth_provider.authenticate(&creds).await {
         Ok(ctx) => ctx,
         Err(e) => {
+            state
+                .metrics
+                .on_auth_failure(&format!("{:?}", FrontendProtocol::PostgresWire));
             write_error_response(writer, "28000", &e.to_string()).await?;
             write_msg(writer, b'Z', b"I").await?;
             return Ok(());
