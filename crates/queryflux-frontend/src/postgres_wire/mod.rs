@@ -301,13 +301,6 @@ async fn handle_simple_query(
 
     let sql_lower = sql.trim().to_lowercase();
 
-    // Fast-path: SET statements.
-    if sql_lower.starts_with("set ") || sql_lower.starts_with("set\t") {
-        write_msg(writer, b'C', b"SET\0").await?;
-        write_msg(writer, b'Z', b"I").await?;
-        return Ok(());
-    }
-
     let protocol = FrontendProtocol::PostgresWire;
 
     let creds = Credentials {
@@ -323,6 +316,14 @@ async fn handle_simple_query(
             return Ok(());
         }
     };
+
+    // Auth-complete fast path: `SET` statements are handled locally by the proxy,
+    // but must still go through authentication when `auth.required=true`.
+    if sql_lower.starts_with("set ") || sql_lower.starts_with("set\t") {
+        write_msg(writer, b'C', b"SET\0").await?;
+        write_msg(writer, b'Z', b"I").await?;
+        return Ok(());
+    }
 
     let routing_result = {
         let live = state.live.read().await;

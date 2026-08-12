@@ -444,11 +444,6 @@ pub async fn post_statement(
     // Intercept SET SESSION query_tags/query_tag before routing to backend.
     // Trino doesn't know these properties; QueryFlux handles them locally and
     // returns X-Trino-Set-Session so the CLI carries the value in subsequent requests.
-    if let Some((prop_key, prop_val)) = try_parse_set_session_tags(&sql) {
-        let query_id = ProxyQueryId::new();
-        return set_session_response(&query_id.0, &prop_key, &prop_val).into_response();
-    }
-
     let session = extract_session(&headers);
     let protocol = FrontendProtocol::TrinoHttp;
 
@@ -462,6 +457,13 @@ pub async fn post_statement(
             return StatusCode::UNAUTHORIZED.into_response();
         }
     };
+
+    // Auth-complete fast path: `SET SESSION query_tag(s)` is handled locally by QueryFlux,
+    // but must still require authentication when `auth.required=true`.
+    if let Some((prop_key, prop_val)) = try_parse_set_session_tags(&sql) {
+        let query_id = ProxyQueryId::new();
+        return set_session_response(&query_id.0, &prop_key, &prop_val).into_response();
+    }
 
     // 2. Route — first matching router wins.
     // `route_with_trace` is CPU-bound (regex match, header lookup); holding the read lock

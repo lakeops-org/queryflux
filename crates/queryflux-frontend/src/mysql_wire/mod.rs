@@ -287,6 +287,22 @@ async fn handle_com_query(
     let logical = strip_mysql_conditional_comment(sql);
     let sql_lower = logical.trim().to_lowercase();
 
+    // Auth-complete early gate: all statement/metadata fast paths must still
+    // be subject to authentication when `auth.required=true`.
+    let protocol = FrontendProtocol::MySqlWire;
+    let creds = Credentials {
+        username: session.user().map(|s| s.to_string()),
+        ..Default::default()
+    };
+    let auth_provider = state.live.read().await.auth_provider.clone();
+    let auth_ctx = match auth_provider.authenticate(&creds).await {
+        Ok(ctx) => ctx,
+        Err(e) => {
+            write_packet(writer, start_seq, &build_err(1045, &e.to_string())).await?;
+            return Ok(());
+        }
+    };
+
     // Fast-path: SET query_tags / SET SESSION query_tags — update session tags and ACK.
     if let Some(new_tags) = try_parse_set_query_tags(logical) {
         session.tags = new_tags;
@@ -354,21 +370,6 @@ async fn handle_com_query(
     if let Some(col_vals) = try_parse_mysql_metadata_select(&sql_lower, session) {
         return write_synthetic_multi_column_row(writer, &col_vals, start_seq).await;
     }
-
-    let protocol = FrontendProtocol::MySqlWire;
-
-    let creds = Credentials {
-        username: session.user().map(|s| s.to_string()),
-        ..Default::default()
-    };
-    let auth_provider = state.live.read().await.auth_provider.clone();
-    let auth_ctx = match auth_provider.authenticate(&creds).await {
-        Ok(ctx) => ctx,
-        Err(e) => {
-            write_packet(writer, start_seq, &build_err(1045, &e.to_string())).await?;
-            return Ok(());
-        }
-    };
 
     let routing_result = {
         let live = state.live.read().await;
