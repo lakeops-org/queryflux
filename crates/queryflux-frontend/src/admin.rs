@@ -2385,8 +2385,39 @@ async fn invalidate_group_cache_handler(
 
 #[cfg(test)]
 mod tests {
-    use super::GuardrailsConfigDto;
+    use super::{GuardrailsConfigDto, SecurityConfigDto};
+    use queryflux_core::config::{
+        AuthConfig, AuthProviderConfig, AuthorizationConfig, StaticUserEntry, StaticUsersConfig,
+    };
     use serde_json::json;
+    use std::collections::HashMap;
+
+    #[test]
+    fn security_config_dto_omits_static_user_passwords() {
+        let mut users = HashMap::new();
+        users.insert(
+            "alice".into(),
+            StaticUserEntry {
+                password: "s3cret".into(),
+                groups: vec!["analytics".into()],
+                roles: vec!["reader".into()],
+            },
+        );
+        let auth = AuthConfig {
+            provider: AuthProviderConfig::Static,
+            required: true,
+            static_users: Some(StaticUsersConfig { users }),
+            ..AuthConfig::default()
+        };
+        let dto =
+            SecurityConfigDto::from_config(&auth, &AuthorizationConfig::default(), &HashMap::new());
+        let serialized = serde_json::to_value(&dto).unwrap().to_string();
+        assert!(!serialized.contains("s3cret"));
+        assert!(!serialized.contains("\"password\""));
+        assert_eq!(dto.static_user_summaries.len(), 1);
+        assert_eq!(dto.static_user_summaries[0].username, "alice");
+        assert_eq!(dto.static_user_summaries[0].groups, vec!["analytics"]);
+    }
 
     #[test]
     fn guardrails_dto_allows_supported_built_in_guards() {
