@@ -331,7 +331,8 @@ pub mod test_fixtures {
             group_default_tags: HashMap::new(),
             group_cache_settings: HashMap::new(),
             auth_provider: Arc::new(NoneAuthProvider::new(auth_required)) as Arc<dyn AuthProvider>,
-            authorization: Arc::new(AllowAllAuthorization) as Arc<dyn AuthorizationChecker>,
+            authorization: Arc::new(AllowAllAuthorization::default())
+                as Arc<dyn AuthorizationChecker>,
         };
         Arc::new(AppState {
             external_address: "http://127.0.0.1:8080".into(),

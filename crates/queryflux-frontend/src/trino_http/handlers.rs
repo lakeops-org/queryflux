@@ -1542,7 +1542,8 @@ mod cancel_executing_statement_tests {
             group_default_tags: HashMap::new(),
             group_cache_settings: HashMap::new(),
             auth_provider: Arc::new(NoneAuthProvider::new(false)) as Arc<dyn AuthProvider>,
-            authorization: Arc::new(AllowAllAuthorization) as Arc<dyn AuthorizationChecker>,
+            authorization: Arc::new(AllowAllAuthorization::default())
+                as Arc<dyn AuthorizationChecker>,
         };
         Arc::new(AppState {
             external_address: "http://127.0.0.1:8080".into(),
@@ -1577,6 +1578,7 @@ mod cancel_executing_statement_tests {
             agent_context: None,
             submitted_guard_actions: vec![],
             was_guard_blocked: false,
+            submitted_by: "anonymous".into(),
         };
         state
             .persistence
