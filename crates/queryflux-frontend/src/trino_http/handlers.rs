@@ -1309,6 +1309,284 @@ mod queue_claim_heartbeat_tests {
 }
 
 #[cfg(test)]
+mod cancel_executing_statement_tests {
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    use async_trait::async_trait;
+    use axum::extract::{Path, State};
+    use axum::http::{HeaderMap, StatusCode};
+    use axum::response::IntoResponse;
+    use chrono::Utc;
+    use queryflux_auth::{
+        AllowAllAuthorization, AuthProvider, AuthorizationChecker, BackendIdentityResolver,
+        NoneAuthProvider,
+    };
+    use queryflux_cluster_manager::{
+        cluster_state::ClusterState, simple::SimpleClusterGroupManager,
+    };
+    use queryflux_core::{
+        error::{QueryFluxError, Result},
+        query::{
+            BackendQueryId, ClusterGroupName, ClusterName, EngineType, ExecutingQuery,
+            ProxyQueryId, QueryExecution, QueryPollResult, SqlDialect,
+        },
+    };
+    use queryflux_engine_adapters::{AdapterKind, AsyncAdapter};
+    use queryflux_metrics::NoopMetricsStore;
+    use queryflux_persistence::in_memory::InMemoryPersistence;
+    use queryflux_routing::chain::RouterChain;
+    use queryflux_translation::TranslationService;
+    use tokio::sync::RwLock;
+
+    use super::delete_executing_statement;
+    use crate::state::{AppState, LiveConfig};
+
+    struct CancelStubAdapter {
+        calls: Arc<AtomicUsize>,
+        fail: bool,
+    }
+
+    #[async_trait]
+    impl AsyncAdapter for CancelStubAdapter {
+        async fn submit_query(
+            &self,
+            _sql: &str,
+            _session: &queryflux_core::session::SessionContext,
+            _credentials: &queryflux_auth::QueryCredentials,
+            _tags: &queryflux_core::tags::QueryTags,
+            _params: &queryflux_core::params::QueryParams,
+        ) -> Result<QueryExecution> {
+            Err(QueryFluxError::Engine("not used in cancel tests".into()))
+        }
+
+        async fn poll_query(
+            &self,
+            _backend_id: &BackendQueryId,
+            _poll_token: Option<&str>,
+        ) -> Result<QueryPollResult> {
+            Err(QueryFluxError::Engine("not used in cancel tests".into()))
+        }
+
+        async fn cancel_query(&self, _backend_id: &BackendQueryId) -> Result<()> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if self.fail {
+                Err(QueryFluxError::Engine("cancel rejected".into()))
+            } else {
+                Ok(())
+            }
+        }
+
+        fn engine_type(&self) -> EngineType {
+            EngineType::Trino
+        }
+
+        fn translation_target_dialect(&self) -> SqlDialect {
+            SqlDialect::Trino
+        }
+
+        async fn health_check(&self) -> bool {
+            true
+        }
+
+        async fn list_catalogs(&self) -> Result<Vec<String>> {
+            Ok(vec![])
+        }
+
+        async fn list_databases(&self, _catalog: &str) -> Result<Vec<String>> {
+            Ok(vec![])
+        }
+
+        async fn list_tables(&self, _catalog: &str, _database: &str) -> Result<Vec<String>> {
+            Ok(vec![])
+        }
+
+        async fn describe_table(
+            &self,
+            _catalog: &str,
+            _database: &str,
+            _table: &str,
+        ) -> Result<Option<queryflux_core::catalog::TableSchema>> {
+            Ok(None)
+        }
+    }
+
+    fn test_cluster_names() -> (ClusterGroupName, ClusterName) {
+        (
+            ClusterGroupName("default".into()),
+            ClusterName("trino".into()),
+        )
+    }
+
+    async fn test_state(adapter: Option<AdapterKind>) -> Arc<AppState> {
+        let (group_name, cluster_name) = test_cluster_names();
+        let cluster_state = Arc::new(ClusterState::new(
+            cluster_name.clone(),
+            group_name.clone(),
+            None,
+            None,
+            EngineType::Trino,
+            Some("http://trino.test:8080".into()),
+            10,
+            true,
+        ));
+        let mut adapters = HashMap::new();
+        if let Some(adapter) = adapter {
+            adapters.insert(cluster_name.0.clone(), adapter);
+        }
+        let mut group_members = HashMap::new();
+        group_members.insert(group_name.0.clone(), vec![cluster_name.0.clone()]);
+        let mut groups = HashMap::new();
+        groups.insert(
+            group_name.clone(),
+            (
+                vec![cluster_state],
+                Arc::new(queryflux_cluster_manager::strategy::RoundRobinStrategy::new())
+                    as Arc<dyn queryflux_cluster_manager::strategy::ClusterSelectionStrategy>,
+            ),
+        );
+        let live = LiveConfig {
+            router_chain: RouterChain::new(vec![], group_name.clone()),
+            guard_chain: None,
+            group_guard_chains: HashMap::new(),
+            cluster_manager: Arc::new(SimpleClusterGroupManager::new(groups)),
+            adapters,
+            health_check_targets: vec![],
+            cluster_configs: HashMap::new(),
+            group_members,
+            group_order: vec![group_name.0.clone()],
+            group_translation_scripts: HashMap::new(),
+            group_default_tags: HashMap::new(),
+            group_cache_settings: HashMap::new(),
+            auth_provider: Arc::new(NoneAuthProvider::new(false)) as Arc<dyn AuthProvider>,
+            authorization: Arc::new(AllowAllAuthorization) as Arc<dyn AuthorizationChecker>,
+        };
+        Arc::new(AppState {
+            external_address: "http://127.0.0.1:8080".into(),
+            live: Arc::new(RwLock::new(live)),
+            persistence: Arc::new(InMemoryPersistence::new()),
+            translation: Arc::new(TranslationService::disabled()),
+            metrics: Arc::new(NoopMetricsStore),
+            identity_resolver: Arc::new(BackendIdentityResolver::new()),
+            capacity_store: None,
+            queue_coordinator: None,
+            instance_id: "test".into(),
+            http_client: reqwest::Client::new(),
+            result_cache: Arc::new(queryflux_cache::noop::NoopResultCache),
+        })
+    }
+
+    async fn seed_executing(state: &AppState, backend_id: &str) {
+        let (group_name, cluster_name) = test_cluster_names();
+        let executing = ExecutingQuery {
+            id: ProxyQueryId("proxy-1".into()),
+            sql: "SELECT 1".into(),
+            translated_sql: None,
+            cluster_group: group_name,
+            cluster_name,
+            cluster_group_config_id: None,
+            cluster_config_id: None,
+            backend_query_id: BackendQueryId(backend_id.into()),
+            poll_base_url: None,
+            creation_time: Utc::now(),
+            last_accessed: Utc::now(),
+            query_tags: HashMap::new(),
+            agent_context: None,
+            submitted_guard_actions: vec![],
+            was_guard_blocked: false,
+        };
+        state
+            .persistence
+            .upsert(executing)
+            .await
+            .expect("seed executing query");
+    }
+
+    #[tokio::test]
+    async fn cancel_removes_executing_record_after_adapter_succeeds() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let adapter = AdapterKind::Async(Arc::new(CancelStubAdapter {
+            calls: calls.clone(),
+            fail: false,
+        }));
+        let state = test_state(Some(adapter)).await;
+        seed_executing(&state, "trino-q-ok").await;
+
+        let resp = delete_executing_statement(
+            State(state.clone()),
+            Path("executing/trino-q-ok".into()),
+            HeaderMap::new(),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(
+            state
+                .persistence
+                .get(&BackendQueryId("trino-q-ok".into()))
+                .await
+                .expect("get")
+                .is_none(),
+            "executing record must be deleted only after backend cancel succeeds"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_keeps_executing_record_when_adapter_fails() {
+        let adapter = AdapterKind::Async(Arc::new(CancelStubAdapter {
+            calls: Arc::new(AtomicUsize::new(0)),
+            fail: true,
+        }));
+        let state = test_state(Some(adapter)).await;
+        seed_executing(&state, "trino-q-fail").await;
+
+        let resp = delete_executing_statement(
+            State(state.clone()),
+            Path("executing/trino-q-fail".into()),
+            HeaderMap::new(),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        assert!(
+            state
+                .persistence
+                .get(&BackendQueryId("trino-q-fail".into()))
+                .await
+                .expect("get")
+                .is_some(),
+            "slot must not be released when backend cancel fails"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_refuses_when_cluster_adapter_missing() {
+        let state = test_state(None).await;
+        seed_executing(&state, "trino-q-no-adapter").await;
+
+        let resp = delete_executing_statement(
+            State(state.clone()),
+            Path("executing/trino-q-no-adapter".into()),
+            HeaderMap::new(),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        assert!(state
+            .persistence
+            .get(&BackendQueryId("trino-q-no-adapter".into()))
+            .await
+            .expect("get")
+            .is_some());
+    }
+}
+
+#[cfg(test)]
 mod trino_session_property_encoding_tests {
     use super::*;
     use std::collections::HashMap;
