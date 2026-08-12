@@ -427,36 +427,27 @@ impl AsyncAdapter for TrinoAdapter {
     async fn cancel_query(&self, backend_id: &BackendQueryId) -> Result<()> {
         // `DELETE /v1/query/{id}` cancels a running query without needing nextUri.
         let url = self.trino_url(&format!("/v1/query/{}", backend_id.0));
-        match self
+        let resp = self
             .with_control_timeout(self.apply_cluster_auth(self.http_client.delete(&url)))
             .send()
             .await
-        {
-            Ok(resp) if resp.status().is_success() => {
-                debug!(
-                    cluster = %self.cluster_name,
-                    query_id = %backend_id,
-                    "Trino query cancelled (DELETE /v1/query)"
-                );
-            }
-            Ok(resp) => {
-                debug!(
-                    cluster = %self.cluster_name,
-                    status = %resp.status(),
-                    query_id = %backend_id,
-                    "Trino cancel DELETE non-success (ignored)"
-                );
-            }
-            Err(e) => {
-                debug!(
-                    cluster = %self.cluster_name,
-                    query_id = %backend_id,
-                    error = %e,
-                    "Trino cancel DELETE failed (ignored)"
-                );
-            }
+            .map_err(|e| QueryFluxError::Engine(format!("Trino cancel failed: {e}")))?;
+
+        let status = resp.status();
+        if trino_cancel_succeeded(status) {
+            debug!(
+                cluster = %self.cluster_name,
+                query_id = %backend_id,
+                status = %status,
+                "Trino query cancelled (DELETE /v1/query)"
+            );
+            return Ok(());
         }
-        Ok(())
+
+        let body = resp.text().await.unwrap_or_default();
+        Err(QueryFluxError::Engine(format!(
+            "Trino cancel returned {status}: {body}"
+        )))
     }
 
     async fn execute_as_arrow(
@@ -1139,11 +1130,19 @@ impl crate::EngineAdapterFactory for TrinoFactory {
     }
 }
 
+fn trino_cancel_succeeded(status: StatusCode) -> bool {
+    status.is_success() || status == StatusCode::NOT_FOUND
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{TrinoAdapter, TrinoConfig, TRINO_CONNECT_TIMEOUT, TRINO_CONTROL_TIMEOUT};
+    use super::{
+        trino_cancel_succeeded, TrinoAdapter, TrinoConfig, TRINO_CONNECT_TIMEOUT,
+        TRINO_CONTROL_TIMEOUT,
+    };
     use crate::AsyncAdapter;
     use queryflux_core::query::{BackendQueryId, ClusterGroupName, ClusterName, QueryPollResult};
+    use reqwest::StatusCode;
     use std::time::{Duration, Instant};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
@@ -1159,6 +1158,15 @@ mod tests {
             TRINO_CONTROL_TIMEOUT < typical_trino_long_poll,
             "poll GETs must not use the control timeout"
         );
+    }
+
+    #[test]
+    fn cancel_treats_success_and_not_found_as_done() {
+        assert!(trino_cancel_succeeded(StatusCode::OK));
+        assert!(trino_cancel_succeeded(StatusCode::NO_CONTENT));
+        assert!(trino_cancel_succeeded(StatusCode::NOT_FOUND));
+        assert!(!trino_cancel_succeeded(StatusCode::UNAUTHORIZED));
+        assert!(!trino_cancel_succeeded(StatusCode::INTERNAL_SERVER_ERROR));
     }
 
     #[tokio::test]

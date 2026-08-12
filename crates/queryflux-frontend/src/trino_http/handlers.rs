@@ -1245,37 +1245,51 @@ pub async fn delete_executing_statement(
     };
     let backend_id = BackendQueryId(trino_id);
 
-    if let Ok(Some(executing)) = state.persistence.get(&backend_id).await {
-        // TODO: verify query ownership once submitter_user is stored in ExecutingQuery
-        if auth_ctx.user != "anonymous" {
-            tracing::debug!(
-                id = %executing.id,
-                cancel_user = %auth_ctx.user,
-                "Authenticated cancel request — ownership check deferred until submitter is persisted"
-            );
+    let executing = match state.persistence.get(&backend_id).await {
+        Ok(Some(q)) => q,
+        Ok(None) => return StatusCode::NO_CONTENT.into_response(),
+        Err(e) => {
+            warn!("Persistence error on cancel: {e}");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
+    };
 
-        let trino_url = format!(
-            "{}/v1/statement/{}",
-            executing
-                .poll_base_url
-                .as_deref()
-                .unwrap_or_default()
-                .trim_end_matches('/'),
-            trino_path
+    // TODO: verify query ownership once submitter_user is stored in ExecutingQuery
+    if auth_ctx.user != "anonymous" {
+        tracing::debug!(
+            id = %executing.id,
+            cancel_user = %auth_ctx.user,
+            "Authenticated cancel request — ownership check deferred until submitter is persisted"
         );
-        let _ = state.http_client.delete(&trino_url).send().await;
+    }
 
-        state
-            .release_query_slot(
-                &executing.cluster_group,
-                &executing.cluster_name,
-                &executing.id.0,
-            )
-            .await;
-        if let Err(e) = state.persistence.delete(&backend_id).await {
-            warn!(id = %executing.id, "Failed to delete executing record on cancel: {e}");
-        }
+    let Some(adapter) = state.adapter(&executing.cluster_name.0).await else {
+        warn!(
+            id = %executing.id,
+            cluster = %executing.cluster_name,
+            "No adapter for cluster; refusing to release slot without backend cancel"
+        );
+        return (StatusCode::BAD_GATEWAY, "failed to cancel query on backend").into_response();
+    };
+
+    if let Err(e) = adapter.cancel_query(&executing.backend_query_id).await {
+        warn!(
+            id = %executing.id,
+            backend = %executing.backend_query_id,
+            "Cancel with cluster credentials failed: {e}"
+        );
+        return (StatusCode::BAD_GATEWAY, "failed to cancel query on backend").into_response();
+    }
+
+    state
+        .release_query_slot(
+            &executing.cluster_group,
+            &executing.cluster_name,
+            &executing.id.0,
+        )
+        .await;
+    if let Err(e) = state.persistence.delete(&backend_id).await {
+        warn!(id = %executing.id, "Failed to delete executing record on cancel: {e}");
     }
 
     StatusCode::NO_CONTENT.into_response()
