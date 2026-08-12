@@ -606,13 +606,17 @@ impl AsyncAdapter for TrinoAdapter {
     }
 
     async fn list_databases(&self, catalog: &str) -> Result<Vec<String>> {
-        self.run_show_query(&format!("SHOW SCHEMAS IN {catalog}"))
+        self.run_show_query(&format!("SHOW SCHEMAS IN {}", Self::quote_ident(catalog)))
             .await
     }
 
     async fn list_tables(&self, catalog: &str, database: &str) -> Result<Vec<String>> {
-        self.run_show_query(&format!("SHOW TABLES IN {catalog}.{database}"))
-            .await
+        self.run_show_query(&format!(
+            "SHOW TABLES IN {}.{}",
+            Self::quote_ident(catalog),
+            Self::quote_ident(database)
+        ))
+        .await
     }
 
     async fn describe_table(
@@ -621,7 +625,12 @@ impl AsyncAdapter for TrinoAdapter {
         database: &str,
         table: &str,
     ) -> Result<Option<TableSchema>> {
-        let sql = format!("DESCRIBE {catalog}.{database}.{table}");
+        let sql = format!(
+            "DESCRIBE {}.{}.{}",
+            Self::quote_ident(catalog),
+            Self::quote_ident(database),
+            Self::quote_ident(table)
+        );
         let session = SessionContext {
             user: Some("queryflux-catalog-discovery".to_string()),
             extra: HashMap::from([(
@@ -668,6 +677,14 @@ impl AsyncAdapter for TrinoAdapter {
 }
 
 impl TrinoAdapter {
+    /// Quote a Trino identifier (catalog/schema/table/column) safely.
+    ///
+    /// Trino uses double-quotes for identifiers; internal `"` must be escaped
+    /// by doubling (`"` → `""`).
+    fn quote_ident(ident: &str) -> String {
+        format!("\"{}\"", ident.replace('\"', "\"\""))
+    }
+
     /// Submit a single-cell numeric discovery query and read the result via submit + poll.
     async fn run_discovery_scalar_u64(&self, sql: &str) -> Option<u64> {
         let session = SessionContext {
@@ -1102,6 +1119,20 @@ impl TrinoAdapter {
 }
 
 pub struct TrinoFactory;
+
+#[cfg(test)]
+mod tests {
+    use super::TrinoAdapter;
+
+    #[test]
+    fn quote_ident_escapes_double_quotes() {
+        assert_eq!(TrinoAdapter::quote_ident("simple"), "\"simple\"");
+        assert_eq!(
+            TrinoAdapter::quote_ident("with\"quote"),
+            "\"with\"\"quote\""
+        );
+    }
+}
 
 #[async_trait]
 impl crate::EngineAdapterFactory for TrinoFactory {
