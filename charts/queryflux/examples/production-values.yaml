@@ -83,6 +83,8 @@ serviceMonitor:
     release: prometheus
 
 networkPolicy:
+  # Non-empty rules required when enabled (empty + Ingress/Egress = deny-all).
+  # Tighten namespaceSelector matchLabels for ingress, Postgres, and engines.
   enabled: true
   ingress:
     - from:
