@@ -301,13 +301,6 @@ async fn handle_simple_query(
 
     let sql_lower = sql.trim().to_lowercase();
 
-    // Fast-path: SET statements.
-    if sql_lower.starts_with("set ") || sql_lower.starts_with("set\t") {
-        write_msg(writer, b'C', b"SET\0").await?;
-        write_msg(writer, b'Z', b"I").await?;
-        return Ok(());
-    }
-
     let protocol = FrontendProtocol::PostgresWire;
 
     let creds = Credentials {
@@ -323,6 +316,14 @@ async fn handle_simple_query(
             return Ok(());
         }
     };
+
+    // Auth-complete fast path: `SET` statements are handled locally by the proxy,
+    // but must still go through authentication when `auth.required=true`.
+    if sql_lower.starts_with("set ") || sql_lower.starts_with("set\t") {
+        write_msg(writer, b'C', b"SET\0").await?;
+        write_msg(writer, b'Z', b"I").await?;
+        return Ok(());
+    }
 
     let routing_result = {
         let live = state.live.read().await;
@@ -663,6 +664,43 @@ mod tests {
         assert_eq!(
             s.extra.get("custom_routing_hint").map(String::as_str),
             Some("region-us")
+        );
+    }
+
+    #[tokio::test]
+    async fn set_fast_path_rejects_unauthenticated_when_required() {
+        use tokio::io::AsyncReadExt;
+        use tokio::net::{TcpListener, TcpStream};
+
+        use crate::state::test_fixtures;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let state = test_fixtures::app_state(true);
+        let session = SessionContext::default();
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let (mut reader, mut writer) = stream.into_split();
+            super::handle_simple_query(
+                &mut reader,
+                &mut writer,
+                &state,
+                &session,
+                "SET search_path = public",
+            )
+            .await
+            .expect("handle_simple_query");
+        });
+
+        let mut stream = TcpStream::connect(addr).await.expect("connect");
+        let mut msg_type = [0u8; 1];
+        stream.read_exact(&mut msg_type).await.expect("read type");
+        server.await.expect("server");
+
+        assert_eq!(
+            msg_type[0], b'E',
+            "expected Postgres ErrorResponse when auth is required"
         );
     }
 }

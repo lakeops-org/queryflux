@@ -444,11 +444,6 @@ pub async fn post_statement(
     // Intercept SET SESSION query_tags/query_tag before routing to backend.
     // Trino doesn't know these properties; QueryFlux handles them locally and
     // returns X-Trino-Set-Session so the CLI carries the value in subsequent requests.
-    if let Some((prop_key, prop_val)) = try_parse_set_session_tags(&sql) {
-        let query_id = ProxyQueryId::new();
-        return set_session_response(&query_id.0, &prop_key, &prop_val).into_response();
-    }
-
     let session = extract_session(&headers);
     let protocol = FrontendProtocol::TrinoHttp;
 
@@ -462,6 +457,13 @@ pub async fn post_statement(
             return StatusCode::UNAUTHORIZED.into_response();
         }
     };
+
+    // Auth-complete fast path: `SET SESSION query_tag(s)` is handled locally by QueryFlux,
+    // but must still require authentication when `auth.required=true`.
+    if let Some((prop_key, prop_val)) = try_parse_set_session_tags(&sql) {
+        let query_id = ProxyQueryId::new();
+        return set_session_response(&query_id.0, &prop_key, &prop_val).into_response();
+    }
 
     // 2. Route — first matching router wins.
     // `route_with_trace` is CPU-bound (regex match, header lookup); holding the read lock
@@ -1583,6 +1585,47 @@ mod cancel_executing_statement_tests {
             .await
             .expect("get")
             .is_some());
+    }
+}
+
+#[cfg(test)]
+mod auth_fast_path_tests {
+    use axum::extract::State;
+    use axum::http::{HeaderMap, HeaderValue, StatusCode};
+    use axum::response::IntoResponse;
+    use bytes::Bytes;
+
+    use super::post_statement;
+    use crate::state::test_fixtures;
+
+    #[tokio::test]
+    async fn set_session_fast_path_rejects_unauthenticated_when_required() {
+        let state = test_fixtures::app_state(true);
+        let resp = post_statement(
+            State(state),
+            HeaderMap::new(),
+            Bytes::from("SET SESSION query_tags = 'team=eng'"),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn set_session_fast_path_allows_authenticated_user() {
+        let state = test_fixtures::app_state(true);
+        let mut headers = HeaderMap::new();
+        headers.insert("X-Trino-User", HeaderValue::from_static("alice"));
+        let resp = post_statement(
+            State(state),
+            headers,
+            Bytes::from("SET SESSION query_tags = 'team=eng'"),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 }
 
