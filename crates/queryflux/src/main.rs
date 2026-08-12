@@ -166,7 +166,13 @@ async fn main() -> Result<()> {
                 metrics as Arc<dyn MetricsStore>,
             )
         }
-        _ => {
+        queryflux_core::config::PersistenceConfig::Redis { url } => {
+            anyhow::bail!(
+                "persistence.type = redis is not implemented (configured url: {url}). \
+                 Use type: postgres or type: inMemory."
+            );
+        }
+        queryflux_core::config::PersistenceConfig::InMemory => {
             let mem = Arc::new(InMemoryPersistence::new());
             mem_store = Some(mem.clone());
             (
@@ -177,8 +183,8 @@ async fn main() -> Result<()> {
     };
 
     // The durable backend behind the proxy, type-erased so that everything south
-    // of this point is wired against traits. A future backend (e.g. Redis) only
-    // needs to implement `BackendStore` and be constructed in the match above.
+    // of this point is wired against traits. Redis is intentionally rejected above
+    // until a real `BackendStore` implementation exists (no silent in-memory fallback).
     // `None` in in-memory mode, which intentionally has no durable config source.
     let backend: Option<Arc<dyn BackendStore>> = pg_store.clone().map(|pg| pg as _);
     // Multi-replica coordination is optional: only backends that also implement
