@@ -1120,20 +1120,6 @@ impl TrinoAdapter {
 
 pub struct TrinoFactory;
 
-#[cfg(test)]
-mod tests {
-    use super::TrinoAdapter;
-
-    #[test]
-    fn quote_ident_escapes_double_quotes() {
-        assert_eq!(TrinoAdapter::quote_ident("simple"), "\"simple\"");
-        assert_eq!(
-            TrinoAdapter::quote_ident("with\"quote"),
-            "\"with\"\"quote\""
-        );
-    }
-}
-
 #[async_trait]
 impl crate::EngineAdapterFactory for TrinoFactory {
     fn engine_key(&self) -> &'static str {
@@ -1177,6 +1163,15 @@ mod tests {
     use std::time::{Duration, Instant};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+
+    #[test]
+    fn quote_ident_escapes_double_quotes() {
+        assert_eq!(TrinoAdapter::quote_ident("simple"), "\"simple\"");
+        assert_eq!(
+            TrinoAdapter::quote_ident("with\"quote"),
+            "\"with\"\"quote\""
+        );
+    }
 
     #[test]
     fn control_timeout_is_shorter_than_a_trino_long_poll_window() {
