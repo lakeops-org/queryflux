@@ -431,7 +431,10 @@ export async function testClusterConfig(
 // Auth management
 // ---------------------------------------------------------------------------
 
-export async function getAuthStatus(): Promise<{ db_override: boolean }> {
+export async function getAuthStatus(): Promise<{
+  db_override: boolean;
+  durable_store: boolean;
+}> {
   return apiFetch("/admin/auth/status");
 }
 

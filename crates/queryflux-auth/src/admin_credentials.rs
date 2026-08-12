@@ -10,8 +10,9 @@
 //!    Used until the operator changes the password via the web UI.
 //!
 //! # Persistence note
-//! Password changes require a `ProxySettingsStore` (Postgres). When running with
-//! in-memory persistence the change succeeds within the session but is lost on restart.
+//! Password changes require a `ProxySettingsStore`. With Postgres the bcrypt hash
+//! is written to `proxy_settings` under `"admin_credentials"` and survives restart.
+//! In-memory persistence keeps the override only for the process lifetime.
 
 use std::sync::Arc;
 
@@ -37,6 +38,8 @@ pub struct AdminCredentialsManager {
     bootstrap_username: String,
     bootstrap_password: String,
     store: Option<Arc<dyn ProxySettingsStore>>,
+    /// `true` when settings are backed by Postgres (survive restart).
+    durable_store: bool,
 }
 
 impl AdminCredentialsManager {
@@ -44,12 +47,19 @@ impl AdminCredentialsManager {
         bootstrap_username: String,
         bootstrap_password: String,
         store: Option<Arc<dyn ProxySettingsStore>>,
+        durable_store: bool,
     ) -> Self {
         Self {
             bootstrap_username,
             bootstrap_password,
             store,
+            durable_store,
         }
+    }
+
+    /// `true` when the active settings store is Postgres-backed.
+    pub fn settings_are_durable(&self) -> bool {
+        self.durable_store
     }
 
     /// Returns `true` when the DB contains an overriding credential record.
@@ -128,21 +138,17 @@ impl AdminCredentialsManager {
         let value = serde_json::to_value(&stored)
             .map_err(|e| QueryFluxError::Auth(format!("serialize credentials: {e}")))?;
 
-        match &self.store {
-            Some(store) => {
-                store.set_proxy_setting(SETTINGS_KEY, value).await?;
-                info!(username, "Admin password changed and stored in DB");
-            }
-            None => {
-                // No persistent store — store in the in-memory fallback path by
-                // writing directly to the settings map via the None branch.
-                // Since there is no store, the change cannot be persisted; warn loudly.
-                warn!(
-                    "No persistent store configured — admin password change will be lost on restart. \
-                     Configure Postgres persistence to make password changes permanent."
-                );
-            }
-        }
+        let Some(store) = &self.store else {
+            warn!(
+                "No settings store configured — admin password change refused. \
+                 Configure Postgres persistence to make password changes permanent."
+            );
+            return Err(QueryFluxError::Auth(
+                "admin password cannot be persisted: no settings store configured".to_string(),
+            ));
+        };
+        store.set_proxy_setting(SETTINGS_KEY, value).await?;
+        info!(username, "Admin password changed and stored in DB");
 
         Ok(())
     }
@@ -155,5 +161,76 @@ impl AdminCredentialsManager {
         let store = self.store.as_ref()?;
         let value = store.get_proxy_setting(SETTINGS_KEY).await.ok()??;
         serde_json::from_value(value).ok()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use queryflux_persistence::in_memory::InMemoryPersistence;
+
+    fn mgr(store: Option<Arc<dyn ProxySettingsStore>>, durable: bool) -> AdminCredentialsManager {
+        AdminCredentialsManager::new("admin".into(), "admin".into(), store, durable)
+    }
+
+    #[tokio::test]
+    async fn bootstrap_accepts_default_until_override() {
+        let m = mgr(Some(Arc::new(InMemoryPersistence::new())), false);
+        assert!(m.verify("admin", "admin").await);
+        assert!(!m.has_db_override().await);
+    }
+
+    #[tokio::test]
+    async fn change_password_persists_and_rejects_bootstrap() {
+        let store = Arc::new(InMemoryPersistence::new());
+        let m = mgr(Some(store.clone()), false);
+        m.change_password("admin", "new-secret").await.unwrap();
+        assert!(m.has_db_override().await);
+        assert!(m.verify("admin", "new-secret").await);
+        assert!(!m.verify("admin", "admin").await);
+
+        let again = mgr(Some(store), false);
+        assert!(again.has_db_override().await);
+        assert!(again.verify("admin", "new-secret").await);
+    }
+
+    #[tokio::test]
+    async fn change_password_without_store_fails() {
+        let m = mgr(None, false);
+        let err = m.change_password("admin", "new-secret").await.unwrap_err();
+        assert!(err.to_string().contains("no settings store"));
+        assert!(m.verify("admin", "admin").await);
+    }
+
+    #[tokio::test]
+    async fn wrong_current_password_rejected() {
+        let m = mgr(Some(Arc::new(InMemoryPersistence::new())), false);
+        assert!(m.change_password("nope", "new-secret").await.is_err());
+        assert!(m.verify("admin", "admin").await);
+    }
+
+    #[test]
+    fn settings_are_durable_reflects_constructor() {
+        let store = Arc::new(InMemoryPersistence::new());
+        assert!(mgr(Some(store.clone()), true).settings_are_durable());
+        assert!(!mgr(Some(store), false).settings_are_durable());
+        assert!(!mgr(None, false).settings_are_durable());
+    }
+
+    #[tokio::test]
+    async fn change_password_stores_bcrypt_hash_under_admin_credentials_key() {
+        let store = Arc::new(InMemoryPersistence::new());
+        let m = mgr(Some(store.clone()), false);
+        m.change_password("admin", "new-secret").await.unwrap();
+
+        let raw = store
+            .get_proxy_setting(SETTINGS_KEY)
+            .await
+            .unwrap()
+            .expect("admin_credentials row");
+        assert_eq!(raw["username"], "admin");
+        let hash = raw["password_hash"].as_str().expect("bcrypt hash");
+        assert!(hash.starts_with("$2"), "expected bcrypt hash, got {hash}");
+        assert!(bcrypt::verify("new-secret", hash).unwrap());
     }
 }

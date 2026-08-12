@@ -16,7 +16,7 @@ use queryflux_core::{
         ClusterGroupConfig, FrontendConfig, FrontendsConfig, OpenFgaCredentials, RouterConfig,
     },
     engine_registry::EngineRegistry,
-    error::Result,
+    error::{QueryFluxError, Result},
     query::{ClusterGroupName, ClusterName},
 };
 use queryflux_metrics::prometheus_store::PrometheusMetrics;
@@ -830,11 +830,17 @@ struct AuthStatusResponse {
     /// `true` once the operator has changed the password via the web UI.
     /// `false` means bootstrap (YAML/env) credentials are still in use.
     db_override: bool,
+    /// `true` when settings are backed by Postgres (survive restart).
+    durable_store: bool,
 }
 
 async fn auth_status_handler(State(state): State<Arc<AdminState>>) -> impl IntoResponse {
     let db_override = state.admin_creds.has_db_override().await;
-    Json(AuthStatusResponse { db_override })
+    let durable_store = state.admin_creds.settings_are_durable();
+    Json(AuthStatusResponse {
+        db_override,
+        durable_store,
+    })
 }
 
 #[derive(Deserialize)]
@@ -853,14 +859,26 @@ async fn change_password_handler(
         .await
     {
         Ok(()) => (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response(),
+        Err(QueryFluxError::Auth(msg)) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": msg})),
+        )
+            .into_response(),
+        Err(QueryFluxError::Persistence(e)) => {
+            tracing::error!(error = %e, "failed to persist admin password change");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "failed to persist password change"})),
+            )
+                .into_response()
+        }
         Err(e) => {
-            let msg = e.to_string();
-            let status = if msg.contains("incorrect") {
-                StatusCode::UNAUTHORIZED
-            } else {
-                StatusCode::BAD_REQUEST
-            };
-            (status, Json(serde_json::json!({"error": msg}))).into_response()
+            tracing::error!(error = %e, "unexpected error changing admin password");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "failed to change password"})),
+            )
+                .into_response()
         }
     }
 }
