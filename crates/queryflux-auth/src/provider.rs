@@ -306,6 +306,33 @@ impl AuthProvider for OidcAuthProvider {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/// Extract a `Vec<String>` from a JWT claim by dot-notation path.
+/// E.g. `"realm_access.roles"` → `claims["realm_access"]["roles"]`.
+fn extract_string_array(claims: &Value, claim_path: &str) -> Vec<String> {
+    let value = resolve_dot_path(claims, claim_path);
+    match value {
+        Some(Value::Array(arr)) => arr
+            .iter()
+            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+            .collect(),
+        Some(Value::String(s)) => vec![s.clone()],
+        _ => vec![],
+    }
+}
+
+/// Walk a dot-separated path through nested JSON objects.
+fn resolve_dot_path<'a>(value: &'a Value, path: &str) -> Option<&'a Value> {
+    let mut current = value;
+    for segment in path.split('.') {
+        current = current.get(segment)?;
+    }
+    Some(current)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -337,31 +364,4 @@ mod tests {
             "unexpected error: {err}"
         );
     }
-}
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-/// Extract a `Vec<String>` from a JWT claim by dot-notation path.
-/// E.g. `"realm_access.roles"` → `claims["realm_access"]["roles"]`.
-fn extract_string_array(claims: &Value, claim_path: &str) -> Vec<String> {
-    let value = resolve_dot_path(claims, claim_path);
-    match value {
-        Some(Value::Array(arr)) => arr
-            .iter()
-            .filter_map(|v| v.as_str().map(|s| s.to_string()))
-            .collect(),
-        Some(Value::String(s)) => vec![s.clone()],
-        _ => vec![],
-    }
-}
-
-/// Walk a dot-separated path through nested JSON objects.
-fn resolve_dot_path<'a>(value: &'a Value, path: &str) -> Option<&'a Value> {
-    let mut current = value;
-    for segment in path.split('.') {
-        current = current.get(segment)?;
-    }
-    Some(current)
 }
