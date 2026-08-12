@@ -34,7 +34,7 @@ use queryflux_core::{
 use crate::abort::{wait_client_gone, AbortOnDrop};
 use crate::dispatch::{execute_to_sink, ResultSink};
 use crate::state::AppState;
-use crate::{FrontendListenerTrait, ShutdownRx};
+use crate::{FrontendListenerTrait, ShutdownRx, MAX_FRONTEND_MESSAGE_BYTES};
 
 // ── Postgres type OIDs (text-format only in V1) ───────────────────────────────
 
@@ -132,7 +132,7 @@ async fn handle_connection(
     // ── Startup phase ────────────────────────────────────────────────────────
 
     // Read the startup message: 4-byte length + 4-byte protocol version + params.
-    let startup_len = read_i32(&mut reader).await? as usize;
+    let startup_len = checked_frontend_len(read_i32(&mut reader).await?)?;
     if startup_len < 8 {
         return Ok(());
     }
@@ -151,7 +151,7 @@ async fn handle_connection(
         writer.write_all(b"N").await?; // 'N' = no SSL
         writer.flush().await?;
         // Re-read the real startup message.
-        let real_len = read_i32(&mut reader).await? as usize;
+        let real_len = checked_frontend_len(read_i32(&mut reader).await?)?;
         if real_len < 8 {
             return Ok(());
         }
@@ -224,7 +224,7 @@ async fn handle_connection(
             Err(_) => break,
         };
 
-        let msg_len = read_i32(&mut reader).await? as usize;
+        let msg_len = checked_frontend_len(read_i32(&mut reader).await?)?;
         if msg_len < 4 {
             break;
         }
@@ -564,6 +564,23 @@ async fn read_i32<R: AsyncReadExt + Unpin>(
     Ok(i32::from_be_bytes(buf))
 }
 
+/// Validate a Postgres length-prefixed message size before allocating.
+fn checked_frontend_len(
+    len: i32,
+) -> std::result::Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+    if len <= 0 {
+        return Err(format!("invalid Postgres message length {len}").into());
+    }
+    let len = len as usize;
+    if len > MAX_FRONTEND_MESSAGE_BYTES {
+        return Err(format!(
+            "Postgres message length {len} exceeds max allowed {MAX_FRONTEND_MESSAGE_BYTES} bytes"
+        )
+        .into());
+    }
+    Ok(len)
+}
+
 // ── Startup message parsing ───────────────────────────────────────────────────
 
 /// Parse Postgres startup params: NUL-separated key=value pairs, terminated by NUL.
@@ -705,5 +722,13 @@ mod tests {
             msg_type[0], b'E',
             "expected Postgres ErrorResponse when auth is required"
         );
+    }
+
+    #[test]
+    fn checked_frontend_len_rejects_negative_and_oversized() {
+        assert!(checked_frontend_len(0).is_err());
+        assert!(checked_frontend_len(-1).is_err());
+        assert!(checked_frontend_len((MAX_FRONTEND_MESSAGE_BYTES + 1) as i32).is_err());
+        assert_eq!(checked_frontend_len(8).unwrap(), 8);
     }
 }
