@@ -59,7 +59,7 @@ build:
 ## Run clippy lints (no external services needed).
 lint: clippy
 clippy:
-	$(CARGO) clippy --all-targets --all-features -- -D warnings
+	$(CARGO) clippy --workspace --all-targets --all-features --exclude queryflux-bench -- -D warnings
 
 ## Validate the Helm chart structure and run helm lint/template.
 helm-check:
