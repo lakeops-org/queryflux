@@ -664,29 +664,18 @@ impl AsyncAdapter for TrinoAdapter {
                 &vec![],
             )
             .await?;
-        let initial_response = match execution {
-            QueryExecution::Running {
-                initial_response, ..
-            } => initial_response,
-            QueryExecution::Completed {
-                status,
-                error,
-                initial_response,
-                ..
-            } => {
-                if status != QueryStatus::Success {
-                    return Err(QueryFluxError::Catalog(
-                        error.unwrap_or_else(|| "Trino DESCRIBE query failed".to_string()),
-                    ));
-                }
-                initial_response
-            }
-        };
-        if let Some(body) = initial_response {
+        let (backend_query_id, poll_token, initial_response) =
+            self.unpack_helper_execution(execution, "Trino DESCRIBE query failed")?;
+        let pages = self
+            .drain_helper_pages(&backend_query_id, poll_token, initial_response)
+            .await?;
+        for body in pages {
             let resp: TrinoResponse = serde_json::from_slice(&body)
                 .map_err(|e| QueryFluxError::Catalog(format!("DESCRIBE parse failed: {e}")))?;
-            let columns = parse_describe_result(&resp, catalog, database, table);
-            return Ok(Some(columns));
+            // DESCRIBE returns one page with columns; keep scanning if Trino splits pages.
+            if resp.data.as_ref().and_then(|d| d.as_array()).is_some() {
+                return Ok(Some(parse_describe_result(&resp, catalog, database, table)));
+            }
         }
         Ok(None)
     }
@@ -699,6 +688,127 @@ impl TrinoAdapter {
     /// by doubling (`"` → `""`).
     fn quote_ident(ident: &str) -> String {
         format!("\"{}\"", ident.replace('\"', "\"\""))
+    }
+
+    /// Unpack submit result for catalog/reconcile helpers. Failed `Completed`
+    /// queries become catalog errors; `Running` keeps the poll token so callers
+    /// can drain or cancel.
+    fn unpack_helper_execution(
+        &self,
+        execution: QueryExecution,
+        failed_msg: &str,
+    ) -> Result<(BackendQueryId, Option<String>, Option<bytes::Bytes>)> {
+        match execution {
+            QueryExecution::Running {
+                backend_query_id,
+                poll_token,
+                initial_response,
+            } => Ok((backend_query_id, poll_token, initial_response)),
+            QueryExecution::Completed {
+                backend_query_id,
+                status,
+                error,
+                initial_response,
+                ..
+            } => {
+                if status != QueryStatus::Success {
+                    return Err(QueryFluxError::Catalog(
+                        error.unwrap_or_else(|| failed_msg.to_string()),
+                    ));
+                }
+                Ok((backend_query_id, None, initial_response))
+            }
+        }
+    }
+
+    /// Best-effort cancel when a helper still has a `nextUri` (query not finished).
+    async fn cancel_helper_if_running(
+        &self,
+        backend_query_id: &BackendQueryId,
+        poll_token: Option<&str>,
+    ) {
+        if poll_token.is_none() {
+            return;
+        }
+        if let Err(e) = self.cancel_query(backend_query_id).await {
+            debug!(
+                cluster = %self.cluster_name,
+                query_id = %backend_query_id,
+                error = %e,
+                "Trino helper cancel failed (ignored)"
+            );
+        }
+    }
+
+    /// Poll one helper page, preserving Trino's raw `nextUri`.
+    ///
+    /// Unlike [`AsyncAdapter::poll_query`], this does **not** clear `nextUri` when
+    /// `stats.state` is `FINISHED`. The HTTP proxy clears it so Trino clients stop
+    /// polling; helpers must follow every page until `nextUri` is absent so they
+    /// do not drop a trailing page (or skip cancel when a page still has a URI).
+    async fn poll_helper_page(
+        &self,
+        uri: &str,
+    ) -> Result<(bytes::Bytes, Option<String>, Option<String>)> {
+        let resp = self
+            .apply_cluster_auth(self.http_client.get(uri))
+            .send()
+            .await
+            .map_err(|e| QueryFluxError::Engine(format!("Trino helper poll GET failed: {e}")))?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(QueryFluxError::Engine(format!(
+                "Trino helper poll returned {status}: {body}"
+            )));
+        }
+
+        let body_bytes = resp.bytes().await.map_err(|e| {
+            QueryFluxError::Engine(format!("Failed to read Trino helper poll body: {e}"))
+        })?;
+
+        let trino_resp: TrinoResponse = serde_json::from_slice(&body_bytes).map_err(|e| {
+            QueryFluxError::Engine(format!("Failed to parse Trino helper poll response: {e}"))
+        })?;
+
+        if let Some(err) = &trino_resp.error {
+            return Ok((body_bytes, None, Some(err.message.clone())));
+        }
+
+        Ok((body_bytes, trino_resp.next_uri.clone(), None))
+    }
+
+    /// Poll until the helper query finishes. Cancels on poll failure so executions
+    /// do not leak when catalog/reconcile helpers abandon early.
+    async fn drain_helper_pages(
+        &self,
+        backend_query_id: &BackendQueryId,
+        mut poll_token: Option<String>,
+        initial_response: Option<bytes::Bytes>,
+    ) -> Result<Vec<bytes::Bytes>> {
+        let mut pages = Vec::new();
+        if let Some(body) = initial_response {
+            pages.push(body);
+        }
+        while let Some(uri) = poll_token {
+            match self.poll_helper_page(uri.as_str()).await {
+                Ok((body, _next, Some(message))) => {
+                    pages.push(body);
+                    let _ = self.cancel_query(backend_query_id).await;
+                    return Err(QueryFluxError::Catalog(message));
+                }
+                Ok((body, next, None)) => {
+                    pages.push(body);
+                    poll_token = next;
+                }
+                Err(e) => {
+                    let _ = self.cancel_query(backend_query_id).await;
+                    return Err(e);
+                }
+            }
+        }
+        Ok(pages)
     }
 
     /// Submit a single-cell numeric discovery query and read the result via submit + poll.
@@ -733,31 +843,41 @@ impl TrinoAdapter {
                 ..
             } => (backend_query_id, None, initial_response),
         };
-        let mut body = initial_response?;
+        let Some(mut body) = initial_response else {
+            self.cancel_helper_if_running(&backend_query_id, poll_token.as_deref())
+                .await;
+            return None;
+        };
 
         if let Some(n) = trino_json_first_cell_u64_from_body(&body) {
+            // Cancel using the raw nextUri from submit (not poll_query's FINISHED clearing).
+            self.cancel_helper_if_running(&backend_query_id, poll_token.as_deref())
+                .await;
             return Some(n);
         }
 
         while let Some(ref uri) = poll_token {
-            let result = self
-                .poll_query(&backend_query_id, Some(uri.as_str()))
-                .await
-                .ok()?;
-            match result {
-                QueryPollResult::Raw {
-                    body: b,
-                    poll_token: n,
-                    ..
-                } => {
-                    if let Some(v) = trino_json_first_cell_u64_from_body(&b) {
-                        return Some(v);
-                    }
-                    n.as_ref()?;
-                    body = b;
-                    poll_token = n;
+            let (b, next, err) = match self.poll_helper_page(uri.as_str()).await {
+                Ok(r) => r,
+                Err(_) => {
+                    let _ = self.cancel_query(&backend_query_id).await;
+                    return None;
                 }
-                QueryPollResult::Failed { .. } | QueryPollResult::Pending { .. } => return None,
+            };
+            if err.is_some() {
+                let _ = self.cancel_query(&backend_query_id).await;
+                return None;
+            }
+            if let Some(v) = trino_json_first_cell_u64_from_body(&b) {
+                self.cancel_helper_if_running(&backend_query_id, next.as_deref())
+                    .await;
+                return Some(v);
+            }
+            body = b;
+            let finished = next.is_none();
+            poll_token = next;
+            if finished {
+                break;
             }
         }
 
@@ -782,37 +902,25 @@ impl TrinoAdapter {
                 &vec![],
             )
             .await?;
-        let initial_response = match execution {
-            QueryExecution::Running {
-                initial_response, ..
-            } => initial_response,
-            QueryExecution::Completed {
-                status,
-                error,
-                initial_response,
-                ..
-            } => {
-                if status != QueryStatus::Success {
-                    return Err(QueryFluxError::Catalog(
-                        error.unwrap_or_else(|| format!("Trino SHOW query failed: {sql}")),
-                    ));
-                }
-                initial_response
-            }
-        };
-        if let Some(body) = initial_response {
+        let (backend_query_id, poll_token, initial_response) =
+            self.unpack_helper_execution(execution, &format!("Trino SHOW query failed: {sql}"))?;
+        let pages = self
+            .drain_helper_pages(&backend_query_id, poll_token, initial_response)
+            .await?;
+        let mut names = Vec::new();
+        for body in pages {
             let resp: TrinoResponse = serde_json::from_slice(&body)
                 .map_err(|e| QueryFluxError::Catalog(format!("SHOW query parse failed: {e}")))?;
             if let Some(data) = resp.data {
                 if let Some(rows) = data.as_array() {
-                    return Ok(rows
-                        .iter()
-                        .filter_map(|row| row.as_array()?.first()?.as_str().map(String::from))
-                        .collect());
+                    names.extend(
+                        rows.iter()
+                            .filter_map(|row| row.as_array()?.first()?.as_str().map(String::from)),
+                    );
                 }
             }
         }
-        Ok(vec![])
+        Ok(names)
     }
 }
 
@@ -1288,6 +1396,185 @@ mod tests {
         assert!(trino_cancel_succeeded(StatusCode::NOT_FOUND));
         assert!(!trino_cancel_succeeded(StatusCode::UNAUTHORIZED));
         assert!(!trino_cancel_succeeded(StatusCode::INTERNAL_SERVER_ERROR));
+    }
+
+    #[tokio::test]
+    async fn helper_show_drains_pages_until_finished() {
+        // Sequence: POST submit (RUNNING + nextUri) → GET poll (FINISHED with data).
+        // Without drain/cancel, the Running query would leak.
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let endpoint = format!("http://{addr}");
+
+        tokio::spawn(async move {
+            for round in 0..2 {
+                let (mut stream, _) = listener.accept().await.expect("accept");
+                let mut buf = [0u8; 4096];
+                let n = stream.read(&mut buf).await.expect("read");
+                let req = String::from_utf8_lossy(&buf[..n]);
+                let body = if round == 0 {
+                    assert!(req.starts_with("POST "), "expected submit POST");
+                    format!(
+                        r#"{{"id":"helper1","infoUri":"http://trino.test/ui","nextUri":"http://{addr}/v1/statement/executing/helper1/1","stats":{{"state":"RUNNING"}},"warnings":[]}}"#
+                    )
+                } else {
+                    assert!(req.starts_with("GET "), "expected poll GET");
+                    r#"{"id":"helper1","infoUri":"http://trino.test/ui","columns":[{"name":"Schema","type":"varchar","typeSignature":{"rawType":"varchar","arguments":[]}}],"data":[["s1"],["s2"]],"stats":{"state":"FINISHED"},"warnings":[]}"#
+                        .to_string()
+                };
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                stream.write_all(resp.as_bytes()).await.expect("write");
+            }
+        });
+
+        let adapter = TrinoAdapter::new(
+            ClusterName("trino".into()),
+            ClusterGroupName("default".into()),
+            TrinoConfig {
+                endpoint,
+                tls_skip_verify: false,
+                auth: None,
+            },
+        );
+        let names = adapter
+            .run_show_query("SHOW SCHEMAS FROM \"tpch\"")
+            .await
+            .expect("SHOW should succeed");
+        assert_eq!(names, vec!["s1".to_string(), "s2".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn helper_show_follows_next_uri_even_when_state_is_finished() {
+        // poll_query clears nextUri on FINISHED for HTTP clients; helpers must still
+        // follow the raw nextUri so a trailing page is not dropped.
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let endpoint = format!("http://{addr}");
+
+        tokio::spawn(async move {
+            for round in 0..3 {
+                let (mut stream, _) = listener.accept().await.expect("accept");
+                let mut buf = [0u8; 4096];
+                let n = stream.read(&mut buf).await.expect("read");
+                let req = String::from_utf8_lossy(&buf[..n]);
+                let body = match round {
+                    0 => {
+                        assert!(req.starts_with("POST "));
+                        format!(
+                            r#"{{"id":"helper2","infoUri":"http://trino.test/ui","nextUri":"http://{addr}/v1/statement/executing/helper2/1","data":[["s1"]],"stats":{{"state":"RUNNING"}},"warnings":[]}}"#
+                        )
+                    }
+                    1 => {
+                        assert!(req.starts_with("GET "));
+                        // FINISHED *with* nextUri — poll_query would clear this.
+                        format!(
+                            r#"{{"id":"helper2","infoUri":"http://trino.test/ui","nextUri":"http://{addr}/v1/statement/executing/helper2/2","data":[["s2"]],"stats":{{"state":"FINISHED"}},"warnings":[]}}"#
+                        )
+                    }
+                    _ => {
+                        assert!(req.starts_with("GET "));
+                        r#"{"id":"helper2","infoUri":"http://trino.test/ui","data":[["s3"]],"stats":{"state":"FINISHED"},"warnings":[]}"#
+                            .to_string()
+                    }
+                };
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                stream.write_all(resp.as_bytes()).await.expect("write");
+            }
+        });
+
+        let adapter = TrinoAdapter::new(
+            ClusterName("trino".into()),
+            ClusterGroupName("default".into()),
+            TrinoConfig {
+                endpoint,
+                tls_skip_verify: false,
+                auth: None,
+            },
+        );
+        let names = adapter
+            .run_show_query("SHOW SCHEMAS FROM \"tpch\"")
+            .await
+            .expect("SHOW should succeed");
+        assert_eq!(
+            names,
+            vec!["s1".to_string(), "s2".to_string(), "s3".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn discovery_scalar_cancels_when_value_found_with_next_uri() {
+        // Submit returns the scalar + nextUri (still Running). Helper must DELETE cancel.
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let endpoint = format!("http://{addr}");
+        let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
+
+        tokio::spawn(async move {
+            // 1) POST submit
+            {
+                let (mut stream, _) = listener.accept().await.expect("accept");
+                let mut buf = [0u8; 4096];
+                let n = stream.read(&mut buf).await.expect("read");
+                let req = String::from_utf8_lossy(&buf[..n]);
+                assert!(req.starts_with("POST "));
+                let body = format!(
+                    r#"{{"id":"disc1","infoUri":"http://trino.test/ui","nextUri":"http://{addr}/v1/statement/executing/disc1/1","data":[[42]],"stats":{{"state":"RUNNING"}},"warnings":[]}}"#
+                );
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                stream.write_all(resp.as_bytes()).await.expect("write");
+            }
+            // 2) DELETE cancel via /v1/query/{id}
+            {
+                let (mut stream, _) = listener.accept().await.expect("accept");
+                let mut buf = [0u8; 4096];
+                let n = stream.read(&mut buf).await.expect("read");
+                let req = String::from_utf8_lossy(&buf[..n]);
+                assert!(
+                    req.starts_with("DELETE "),
+                    "expected cancel DELETE, got: {}",
+                    req.lines().next().unwrap_or("")
+                );
+                assert!(
+                    req.contains("/v1/query/disc1"),
+                    "cancel must target /v1/query/{{id}}"
+                );
+                let resp =
+                    "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                stream.write_all(resp.as_bytes()).await.expect("write");
+                let _ = cancel_tx.send(());
+            }
+        });
+
+        let adapter = TrinoAdapter::new(
+            ClusterName("trino".into()),
+            ClusterGroupName("default".into()),
+            TrinoConfig {
+                endpoint,
+                tls_skip_verify: false,
+                auth: None,
+            },
+        );
+        let n = adapter
+            .run_discovery_scalar_u64("SELECT 42")
+            .await
+            .expect("scalar");
+        assert_eq!(n, 42);
+        tokio::time::timeout(Duration::from_secs(2), cancel_rx)
+            .await
+            .expect("cancel should be issued")
+            .expect("cancel channel");
     }
 
     #[tokio::test]
