@@ -297,8 +297,8 @@ mod tests {
             ],
         )
         .without_auth_headers();
-        assert!(s.extra.get("authorization").is_none());
-        assert!(s.extra.get("proxy-authorization").is_none());
+        assert!(!s.extra.contains_key("authorization"));
+        assert!(!s.extra.contains_key("proxy-authorization"));
         assert_eq!(
             s.extra.get("x-trino-catalog").map(String::as_str),
             Some("hive")
