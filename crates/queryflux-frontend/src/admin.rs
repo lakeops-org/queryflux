@@ -1053,6 +1053,50 @@ fn sql_preview(sql: &str) -> String {
     }
 }
 
+/// Build the admin "running queries" response from persistence.
+async fn collect_running_queries(
+    persistence: &dyn queryflux_persistence::Persistence,
+) -> queryflux_core::error::Result<Vec<RunningQueryDto>> {
+    let mut out = Vec::new();
+    for q in persistence.list_all().await? {
+        out.push(RunningQueryDto {
+            id: q.id.0,
+            backend_query_id: Some(q.backend_query_id.0),
+            submitted_by: q.submitted_by,
+            group: q.cluster_group.0,
+            cluster: Some(q.cluster_name.0),
+            sql_preview: sql_preview(&q.sql),
+            state: "executing".to_string(),
+        });
+    }
+    for q in persistence.list_queued().await? {
+        out.push(RunningQueryDto {
+            id: q.id.0,
+            backend_query_id: None,
+            submitted_by: q.submitted_by,
+            group: q.cluster_group.0,
+            cluster: None,
+            sql_preview: sql_preview(&q.sql),
+            state: "queued".to_string(),
+        });
+    }
+    Ok(out)
+}
+
+/// Admin cancel path for a queued query (claim release handled by caller).
+async fn delete_queued_if_exists(
+    persistence: &dyn queryflux_persistence::Persistence,
+    id: &str,
+) -> queryflux_core::error::Result<bool> {
+    let qid = ProxyQueryId(id.to_string());
+    if persistence.get_queued(&qid).await?.is_some() {
+        persistence.delete_queued(&qid).await?;
+        Ok(true)
+    } else {
+        Ok(false)
+    }
+}
+
 /// In-flight executing + queued queries (not history).
 #[utoipa::path(
     get,
@@ -1064,44 +1108,10 @@ fn sql_preview(sql: &str) -> String {
     )
 )]
 async fn list_running_queries_handler(State(state): State<Arc<AdminState>>) -> impl IntoResponse {
-    let mut out = Vec::new();
-    match state.app.persistence.list_all().await {
-        Ok(rows) => {
-            for q in rows {
-                out.push(RunningQueryDto {
-                    id: q.id.0,
-                    backend_query_id: Some(q.backend_query_id.0),
-                    submitted_by: q.submitted_by,
-                    group: q.cluster_group.0,
-                    cluster: Some(q.cluster_name.0),
-                    sql_preview: sql_preview(&q.sql),
-                    state: "executing".to_string(),
-                });
-            }
-        }
-        Err(e) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
-        }
+    match collect_running_queries(state.app.persistence.as_ref()).await {
+        Ok(out) => Json(out).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
-    match state.app.persistence.list_queued().await {
-        Ok(rows) => {
-            for q in rows {
-                out.push(RunningQueryDto {
-                    id: q.id.0,
-                    backend_query_id: None,
-                    submitted_by: q.submitted_by,
-                    group: q.cluster_group.0,
-                    cluster: None,
-                    sql_preview: sql_preview(&q.sql),
-                    state: "queued".to_string(),
-                });
-            }
-        }
-        Err(e) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
-        }
-    }
-    Json(out).into_response()
 }
 
 /// Cancel any in-flight or queued query. Admin Basic auth is the privilege.
@@ -1141,18 +1151,15 @@ async fn cancel_query_handler(
     }
 
     let qid = ProxyQueryId(id.clone());
-    match persistence.get_queued(&qid).await {
-        Ok(Some(queued)) => {
+    match delete_queued_if_exists(persistence.as_ref(), &id).await {
+        Ok(true) => {
             if let Some(qc) = &state.app.queue_coordinator {
-                let _ = qc.release_claim(&queued.id.0).await;
+                let _ = qc.release_claim(&qid.0).await;
             }
-            if let Err(e) = persistence.delete_queued(&qid).await {
-                return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
-            }
-            info!(id = %qid, owner = %queued.submitted_by, "Admin cancelled queued query");
+            info!(id = %qid, "Admin cancelled queued query");
             StatusCode::NO_CONTENT.into_response()
         }
-        Ok(None) => (StatusCode::NOT_FOUND, "query not found").into_response(),
+        Ok(false) => (StatusCode::NOT_FOUND, "query not found").into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
@@ -2626,12 +2633,23 @@ async fn invalidate_group_cache_handler(
 
 #[cfg(test)]
 mod tests {
-    use super::{GuardrailsConfigDto, SecurityConfigDto};
+    use super::{
+        collect_running_queries, delete_queued_if_exists, sql_preview, GuardrailsConfigDto,
+        SecurityConfigDto,
+    };
+    use chrono::Utc;
     use queryflux_core::config::{
         AuthConfig, AuthProviderConfig, AuthorizationConfig, StaticUserEntry, StaticUsersConfig,
     };
+    use queryflux_core::query::{
+        BackendQueryId, ClusterGroupName, ClusterName, ExecutingQuery, FrontendProtocol,
+        ProxyQueryId, QueuedQuery,
+    };
+    use queryflux_core::session::SessionContext;
+    use queryflux_persistence::{in_memory::InMemoryPersistence, Persistence};
     use serde_json::json;
     use std::collections::HashMap;
+    use std::sync::Arc;
 
     #[test]
     fn security_config_dto_omits_static_user_passwords() {
@@ -2658,6 +2676,102 @@ mod tests {
         assert_eq!(dto.static_user_summaries.len(), 1);
         assert_eq!(dto.static_user_summaries[0].username, "alice");
         assert_eq!(dto.static_user_summaries[0].groups, vec!["analytics"]);
+    }
+
+    #[test]
+    fn sql_preview_truncates_to_160_chars() {
+        let long = "word ".repeat(50);
+        let preview = sql_preview(&long);
+        assert!(preview.chars().count() <= 160);
+        assert!(preview.ends_with('…'));
+    }
+
+    #[test]
+    fn sql_preview_collapses_whitespace() {
+        assert_eq!(sql_preview("SELECT   1\nFROM  t"), "SELECT 1 FROM t");
+    }
+
+    #[tokio::test]
+    async fn collect_running_queries_includes_executing_and_queued() {
+        let store = Arc::new(InMemoryPersistence::new());
+        let now = Utc::now();
+        store
+            .upsert(ExecutingQuery {
+                id: ProxyQueryId("exec-1".into()),
+                sql: "SELECT 1".into(),
+                translated_sql: None,
+                cluster_group: ClusterGroupName("analytics".into()),
+                cluster_name: ClusterName("trino".into()),
+                cluster_group_config_id: None,
+                cluster_config_id: None,
+                backend_query_id: BackendQueryId("backend-1".into()),
+                poll_base_url: None,
+                creation_time: now,
+                last_accessed: now,
+                query_tags: Default::default(),
+                agent_context: None,
+                submitted_guard_actions: vec![],
+                was_guard_blocked: false,
+                submitted_by: "alice".into(),
+            })
+            .await
+            .unwrap();
+        store
+            .upsert_queued(QueuedQuery {
+                id: ProxyQueryId("queued-1".into()),
+                sql: "SELECT 2".into(),
+                session: SessionContext::default(),
+                frontend_protocol: FrontendProtocol::TrinoHttp,
+                cluster_group: ClusterGroupName("analytics".into()),
+                creation_time: now,
+                last_accessed: now,
+                sequence: 0,
+                submitted_by: "bob".into(),
+            })
+            .await
+            .unwrap();
+
+        let rows = collect_running_queries(store.as_ref()).await.unwrap();
+        assert_eq!(rows.len(), 2);
+        let exec = rows.iter().find(|r| r.id == "exec-1").unwrap();
+        assert_eq!(exec.state, "executing");
+        assert_eq!(exec.submitted_by, "alice");
+        assert_eq!(exec.backend_query_id.as_deref(), Some("backend-1"));
+        let queued = rows.iter().find(|r| r.id == "queued-1").unwrap();
+        assert_eq!(queued.state, "queued");
+        assert_eq!(queued.submitted_by, "bob");
+        assert!(queued.backend_query_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn delete_queued_if_exists_removes_row() {
+        let store = Arc::new(InMemoryPersistence::new());
+        store
+            .upsert_queued(QueuedQuery {
+                id: ProxyQueryId("q-cancel".into()),
+                sql: "SELECT 1".into(),
+                session: SessionContext::default(),
+                frontend_protocol: FrontendProtocol::TrinoHttp,
+                cluster_group: ClusterGroupName("g".into()),
+                creation_time: Utc::now(),
+                last_accessed: Utc::now(),
+                sequence: 0,
+                submitted_by: "alice".into(),
+            })
+            .await
+            .unwrap();
+
+        assert!(delete_queued_if_exists(store.as_ref(), "q-cancel")
+            .await
+            .unwrap());
+        assert!(store
+            .get_queued(&ProxyQueryId("q-cancel".into()))
+            .await
+            .unwrap()
+            .is_none());
+        assert!(!delete_queued_if_exists(store.as_ref(), "missing")
+            .await
+            .unwrap());
     }
 
     #[test]
