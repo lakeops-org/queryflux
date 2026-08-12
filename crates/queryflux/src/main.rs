@@ -1174,19 +1174,25 @@ async fn main() -> Result<()> {
                             "Evicting zombie executing query — not polled for >5 min"
                         );
 
-                        // Best-effort cancel on the backend engine so the query
-                        // doesn't keep consuming cluster resources.
-                        if let Some(base_url) = &q.poll_base_url {
-                            let cancel_url =
-                                format!("{base_url}/v1/statement/executing/{}", q.backend_query_id);
-                            let client = state.http_client.clone();
+                        // Best-effort cancel on the backend with cluster credentials
+                        // (same path as client/admin cancel). The previous unauthenticated
+                        // DELETE on `/v1/statement/executing/...` did not stop secured Trino.
+                        let backend_id = q.backend_query_id.clone();
+                        let cluster = q.cluster_name.0.clone();
+                        if let Some(adapter) = state.adapter(&cluster).await {
                             tokio::spawn(async move {
-                                if let Err(e) = client.delete(&cancel_url).send().await {
+                                if let Err(e) = adapter.cancel_query(&backend_id).await {
                                     tracing::debug!(
                                         "Zombie cancel request failed (best-effort): {e}"
                                     );
                                 }
                             });
+                        } else {
+                            tracing::debug!(
+                                cluster = %cluster,
+                                id = %q.backend_query_id,
+                                "No adapter available for zombie cancel"
+                            );
                         }
 
                         state

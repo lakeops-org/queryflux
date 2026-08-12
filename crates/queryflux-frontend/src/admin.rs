@@ -1190,37 +1190,22 @@ async fn cancel_executing(
 ) -> Response {
     let mut cancelled = false;
     if let Some(adapter) = state.app.adapter(&executing.cluster_name.0).await {
-        if let Some(async_adapter) = adapter.as_async() {
-            if async_adapter
-                .cancel_query(&executing.backend_query_id)
-                .await
-                .is_ok()
-            {
-                cancelled = true;
-            } else {
+        match adapter.cancel_query(&executing.backend_query_id).await {
+            Ok(()) => cancelled = true,
+            Err(e) => {
                 warn!(
                     id = %executing.id,
                     backend = %executing.backend_query_id,
-                    "Admin adapter cancel failed"
+                    "Admin adapter cancel failed: {e}"
                 );
             }
         }
-    }
-    if let Some(base) = executing.poll_base_url.as_deref() {
-        let url = format!(
-            "{}/v1/statement/executing/{}/0",
-            base.trim_end_matches('/'),
-            executing.backend_query_id.0
+    } else {
+        warn!(
+            id = %executing.id,
+            cluster = %executing.cluster_name,
+            "Admin cancel: no adapter for cluster"
         );
-        match state.app.http_client.delete(&url).send().await {
-            Ok(resp) if resp.status().is_success() => cancelled = true,
-            Ok(resp) => warn!(
-                id = %executing.id,
-                status = %resp.status(),
-                "Admin HTTP cancel returned non-success"
-            ),
-            Err(e) => warn!(id = %executing.id, "Admin HTTP cancel failed: {e}"),
-        }
     }
     if !cancelled {
         return (
