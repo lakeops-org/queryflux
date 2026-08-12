@@ -1,8 +1,6 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use aws_sdk_sts;
-
 use arrow::array::{
     ArrayRef, BooleanBuilder, Float32Builder, Float64Builder, Int64Builder, StringBuilder,
 };
@@ -123,6 +121,12 @@ use queryflux_core::engine_registry::{
     AuthType, ConfigField, ConnectionType, EngineDescriptor, FieldType,
 };
 
+/// Upper bound for Athena `GetQueryExecution` polling in the proxy.
+/// Workgroup query timeouts still apply server-side; this prevents an unbounded
+/// local loop if the execution never reaches a terminal state.
+const ATHENA_MAX_WAIT: Duration = Duration::from_secs(12 * 60 * 60);
+const ATHENA_POLL_INTERVAL: Duration = Duration::from_millis(500);
+
 /// Amazon Athena adapter.
 ///
 /// Submits queries via `StartQueryExecution`, polls `GetQueryExecution` until complete,
@@ -132,7 +136,8 @@ use queryflux_core::engine_registry::{
 ///
 /// Auth: set `auth.type: accessKey` for static credentials. When omitted the default
 /// AWS credential chain is used (env vars `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`,
-/// ECS task role, EC2 instance profile, etc.).
+/// ECS task role, EC2 instance profile, etc.). RoleArn auth uses a refreshing
+/// `AssumeRoleProvider` so temporary STS credentials renew before expiry.
 pub struct AthenaAdapter {
     pub cluster_name: ClusterName,
     pub group_name: ClusterGroupName,
@@ -181,37 +186,23 @@ impl AthenaAdapter {
                 role_arn,
                 external_id,
             }) => {
-                // First load the base config from the default credential chain,
-                // then use STS AssumeRole to obtain temporary credentials.
+                // Refreshing AssumeRole provider: temporary STS credentials expire
+                // (default 1h). A one-shot AssumeRole left the Athena client with
+                // static creds that never refreshed.
                 let base_config = aws_config::defaults(BehaviorVersion::latest())
                     .region(aws_region.clone())
                     .load()
                     .await;
-                let sts_client = aws_sdk_sts::Client::new(&base_config);
-                let mut assume = sts_client
-                    .assume_role()
-                    .role_arn(&role_arn)
-                    .role_session_name("queryflux-session");
+                let mut role_builder = aws_config::sts::AssumeRoleProvider::builder(&role_arn)
+                    .session_name("queryflux-session")
+                    .configure(&base_config);
                 if let Some(eid) = external_id {
-                    assume = assume.external_id(eid);
+                    role_builder = role_builder.external_id(eid);
                 }
-                let resp = assume
-                    .send()
-                    .await
-                    .map_err(|e| QueryFluxError::Engine(format!("STS AssumeRole failed: {e}")))?;
-                let creds_resp = resp.credentials().ok_or_else(|| {
-                    QueryFluxError::Engine("STS returned no credentials".to_string())
-                })?;
-                let creds = Credentials::new(
-                    creds_resp.access_key_id(),
-                    creds_resp.secret_access_key(),
-                    Some(creds_resp.session_token().to_string()),
-                    None,
-                    "queryflux-role-arn",
-                );
+                let provider = role_builder.build().await;
                 aws_config::defaults(BehaviorVersion::latest())
                     .region(aws_region.clone())
-                    .credentials_provider(creds)
+                    .credentials_provider(provider)
                     .load()
                     .await
             }
@@ -246,9 +237,27 @@ impl AthenaAdapter {
     }
 
     /// Poll until the given query execution reaches a terminal state.
-    /// Returns `Ok(())` on success, `Err` on failure or cancellation.
+    /// Returns `Ok(())` on success, `Err` on failure, cancellation, or timeout.
+    ///
+    /// Athena workgroups may enforce their own runtime limits; this bound also
+    /// stops the proxy from looping forever if status stays non-terminal, and
+    /// issues `StopQueryExecution` on timeout.
     async fn wait_for_completion(&self, execution_id: &str) -> Result<()> {
+        let deadline = tokio::time::Instant::now() + ATHENA_MAX_WAIT;
         loop {
+            if tokio::time::Instant::now() >= deadline {
+                let _ = self
+                    .client
+                    .stop_query_execution()
+                    .query_execution_id(execution_id)
+                    .send()
+                    .await;
+                return Err(QueryFluxError::Engine(format!(
+                    "Athena query {execution_id} exceeded max wait of {}s",
+                    ATHENA_MAX_WAIT.as_secs()
+                )));
+            }
+
             let resp = self
                 .client
                 .get_query_execution()
@@ -284,7 +293,14 @@ impl AthenaAdapter {
                         "Athena query was cancelled".to_string(),
                     ));
                 }
-                _ => tokio::time::sleep(Duration::from_millis(500)).await,
+                _ => {
+                    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                    let sleep_for = ATHENA_POLL_INTERVAL.min(remaining);
+                    if sleep_for.is_zero() {
+                        continue;
+                    }
+                    tokio::time::sleep(sleep_for).await;
+                }
             }
         }
     }
@@ -905,5 +921,12 @@ mod tests {
     #[test]
     fn null_emits_null_string() {
         assert_eq!(query_param_to_athena_string(&QueryParam::Null), "NULL");
+    }
+
+    #[test]
+    fn wait_for_completion_bound_is_finite() {
+        assert_eq!(ATHENA_MAX_WAIT, Duration::from_secs(12 * 60 * 60));
+        assert_eq!(ATHENA_POLL_INTERVAL, Duration::from_millis(500));
+        assert!(ATHENA_POLL_INTERVAL < ATHENA_MAX_WAIT);
     }
 }

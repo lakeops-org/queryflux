@@ -3961,7 +3961,6 @@ dependencies = [
  "aws-config",
  "aws-credential-types",
  "aws-sdk-athena",
- "aws-sdk-sts",
  "aws-types",
  "bytes",
  "duckdb",
