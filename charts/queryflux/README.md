@@ -88,6 +88,8 @@ existingSecret:
 - `pdb.enabled`: create a PodDisruptionBudget.
 - `networkPolicy.enabled`: create a NetworkPolicy. The default policy body is empty so operators can define provider-specific ingress and egress rules.
 - `serviceMonitor.enabled`: create a Prometheus Operator ServiceMonitor for `/metrics` on the admin port.
+- `startupProbe`: HTTP check on `/readyz` (admin port) so liveness does not kill slow startups.
+- `terminationGracePeriodSeconds`: default `45`. Keep this ≥ `queryflux.shutdownDrainTimeoutSecs` (default `30`) plus a buffer so Kubernetes does not SIGKILL mid-drain.
 
 The chart also supports `env`, `envFrom`, `extraVolumes`, `extraVolumeMounts`, `extraContainers`, `nodeSelector`, `tolerations`, `affinity`, and `topologySpreadConstraints` for platform-specific integration.
 

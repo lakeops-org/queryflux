@@ -117,6 +117,9 @@ resources:
   limits:
     memory: 2Gi
 
+# Keep ≥ queryflux.shutdownDrainTimeoutSecs (default 30) + buffer.
+terminationGracePeriodSeconds: 45
+
 topologySpreadConstraints:
   - maxSkew: 1
     topologyKey: kubernetes.io/hostname
