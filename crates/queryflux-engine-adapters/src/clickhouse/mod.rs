@@ -832,6 +832,7 @@ mod tests {
             workgroup: None,
             catalog: None,
             tls: None,
+            max_wait_secs: None,
             max_result_buffer_bytes: None,
             auth: None,
             query_auth: None,

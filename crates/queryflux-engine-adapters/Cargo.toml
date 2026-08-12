@@ -20,8 +20,7 @@ arrow = { workspace = true }
 futures = { workspace = true }
 tokio-stream = { workspace = true }
 aws-sdk-athena = "1.104.0"
-aws-sdk-sts = "1"
-aws-config = { version = "1", default-features = false, features = ["rustls"] }
+aws-config = { version = "1", default-features = false, features = ["rustls", "rt-tokio"] }
 aws-credential-types = "1"
 aws-types = "1"
 url = "2"
