@@ -757,9 +757,9 @@ pub enum PersistenceConfig {
     #[default]
     #[serde(rename = "inMemory")]
     InMemory,
-    Redis {
-        url: String,
-    },
+    /// Reserved for a future Redis backend. QueryFlux rejects this at startup
+    /// (no silent fallback to in-memory).
+    Redis { url: String },
     Postgres {
         #[serde(flatten)]
         conn: PostgresPersistenceConfig,
