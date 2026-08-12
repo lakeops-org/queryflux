@@ -725,6 +725,12 @@ async fn main() -> Result<()> {
         .filter(|(_, g)| !g.default_tags.is_empty())
         .map(|(name, g)| (name.clone(), g.default_tags.clone()))
         .collect();
+    let group_max_queued_queries: HashMap<String, Option<u64>> = config
+        .cluster_groups
+        .iter()
+        .filter(|(_, g)| g.max_queued_queries.is_some())
+        .map(|(name, g)| (name.clone(), g.max_queued_queries))
+        .collect();
     let group_cache_settings: HashMap<String, queryflux_core::config::GroupCacheConfig> = config
         .cluster_groups
         .iter()
@@ -747,6 +753,7 @@ async fn main() -> Result<()> {
         group_order,
         group_translation_scripts,
         group_default_tags,
+        group_max_queued_queries,
         group_cache_settings,
         auth_provider,
         authorization,
@@ -2217,6 +2224,12 @@ async fn build_live_config(
         .map(|(name, g)| (name.clone(), g.default_tags.clone()))
         .collect();
 
+    let group_max_queued_queries: HashMap<String, Option<u64>> = cluster_groups
+        .iter()
+        .filter(|(_, g)| g.max_queued_queries.is_some())
+        .map(|(name, g)| (name.clone(), g.max_queued_queries))
+        .collect();
+
     let group_cache_settings: HashMap<String, queryflux_core::config::GroupCacheConfig> =
         cluster_groups
             .iter()
@@ -2261,6 +2274,7 @@ async fn build_live_config(
         group_order,
         group_translation_scripts,
         group_default_tags,
+        group_max_queued_queries,
         group_cache_settings,
         auth_provider: Arc::new(NoneAuthProvider::new(false)),
         authorization: Arc::new(AllowAllAuthorization::default()),

@@ -54,6 +54,10 @@ pub struct LiveConfig {
     /// group_name → default tags configured on the group.
     /// Merged with session tags at dispatch time; session tags win on key conflicts.
     pub group_default_tags: HashMap<String, QueryTags>,
+    /// group_name → optional `maxQueuedQueries` from ClusterGroupConfig.
+    /// `None` / missing entry means unlimited. `Some(0)` is treated as unlimited
+    /// (same as the enforce check requiring `limit > 0`).
+    pub group_max_queued_queries: HashMap<String, Option<u64>>,
     /// group_name → cache settings for groups that have caching enabled.
     pub group_cache_settings: HashMap<String, queryflux_core::config::GroupCacheConfig>,
     /// Verifies client identity — hot-reloaded when security config changes via admin API.
@@ -329,6 +333,7 @@ pub mod test_fixtures {
             group_order: vec![group_name.0.clone()],
             group_translation_scripts: HashMap::new(),
             group_default_tags: HashMap::new(),
+            group_max_queued_queries: HashMap::new(),
             group_cache_settings: HashMap::new(),
             auth_provider: Arc::new(NoneAuthProvider::new(auth_required)) as Arc<dyn AuthProvider>,
             authorization: Arc::new(AllowAllAuthorization::default())
