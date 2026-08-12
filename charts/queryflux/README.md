@@ -64,6 +64,8 @@ The default config uses `persistence.type: inMemory`, which is per-pod. Running 
 
 With Postgres persistence, QueryFlux runs in distributed mode: config changes propagate to all replicas, `maxRunningQueries` is enforced cluster-wide rather than per-pod, and each queued query is dispatched by exactly one replica. Each pod derives a unique instance ID automatically; set the `QUERYFLUX_INSTANCE_ID` env var only if you need to override it.
 
+Operator runbook (capacity leases, queue claims, affinity, crash recovery): [Multi-replica operations](https://queryflux.dev/docs/operations/multi-replica).
+
 ### Snowflake HTTP requires session affinity
 
 Snowflake HTTP sessions are held in pod-local memory. With more than one replica, every request of a Snowflake session must reach the same pod — configure sticky sessions (session affinity) on the load balancer or ingress in front of the Snowflake port. The other frontends (Trino HTTP, MySQL/PostgreSQL wire, Flight SQL) keep their state in Postgres or on the connection itself and do not need affinity.
