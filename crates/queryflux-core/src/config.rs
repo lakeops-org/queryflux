@@ -75,6 +75,14 @@ pub struct ProxyConfig {
     pub guardrails: Option<GuardrailsConfig>,
 }
 
+impl ProxyConfig {
+    /// Fail-closed checks run before auth providers are constructed at startup.
+    pub fn validate_startup_security(&self) -> std::result::Result<(), String> {
+        self.auth.validate_for_required()?;
+        self.authorization.validate()
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Guardrails configuration
 // ---------------------------------------------------------------------------
@@ -1875,6 +1883,19 @@ queryflux:
         };
         let err = auth.validate_for_required().unwrap_err();
         assert!(err.contains("userSearchFilter"), "{err}");
+    }
+
+    #[test]
+    fn startup_rejects_required_auth_none_provider() {
+        let yaml = r#"
+queryflux: {}
+auth:
+  required: true
+  provider: none
+"#;
+        let cfg: ProxyConfig = serde_yaml::from_str(yaml).unwrap();
+        let err = cfg.validate_startup_security().unwrap_err();
+        assert!(err.contains("auth.required"), "{err}");
     }
 
     #[test]
