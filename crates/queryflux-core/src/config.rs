@@ -75,6 +75,14 @@ pub struct ProxyConfig {
     pub guardrails: Option<GuardrailsConfig>,
 }
 
+impl ProxyConfig {
+    /// Fail-closed checks run before auth providers are constructed at startup.
+    pub fn validate_startup_security(&self) -> std::result::Result<(), String> {
+        self.auth.validate_for_required()?;
+        self.authorization.validate()
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Guardrails configuration
 // ---------------------------------------------------------------------------
@@ -330,6 +338,90 @@ impl Default for AuthConfig {
     }
 }
 
+impl AuthConfig {
+    /// Fail closed when `required` is true but the selected provider is incomplete.
+    ///
+    /// When `required` is false (dev/trusted networks), incomplete provider blocks
+    /// are not rejected here — `build_auth_provider` may still fail later.
+    pub fn validate_for_required(&self) -> std::result::Result<(), String> {
+        if !self.required {
+            return Ok(());
+        }
+        match self.provider {
+            AuthProviderConfig::None => Err("auth.required is true but auth.provider is 'none' — \
+                 set provider to oidc, ldap, or static"
+                .into()),
+            AuthProviderConfig::Static => {
+                let Some(users) = &self.static_users else {
+                    return Err("auth.required is true and auth.provider is 'static' but \
+                         auth.staticUsers is missing"
+                        .into());
+                };
+                if users.users.is_empty() {
+                    return Err("auth.required is true and auth.provider is 'static' but \
+                         auth.staticUsers.users is empty"
+                        .into());
+                }
+                Ok(())
+            }
+            AuthProviderConfig::Oidc => {
+                let Some(oidc) = &self.oidc else {
+                    return Err("auth.required is true and auth.provider is 'oidc' but \
+                         auth.oidc is missing"
+                        .into());
+                };
+                if oidc.issuer.trim().is_empty() {
+                    return Err(
+                        "auth.oidc.issuer must not be empty when auth.required is true".into(),
+                    );
+                }
+                if oidc.jwks_uri.trim().is_empty() {
+                    return Err(
+                        "auth.oidc.jwksUri must not be empty when auth.required is true".into(),
+                    );
+                }
+                match &oidc.audience {
+                    Some(aud) if !aud.trim().is_empty() => Ok(()),
+                    _ => Err("auth.oidc.audience is required when auth.required is true \
+                         (fail closed — no JWT accepted without an audience)"
+                        .into()),
+                }
+            }
+            AuthProviderConfig::Ldap => {
+                let Some(ldap) = &self.ldap else {
+                    return Err("auth.required is true and auth.provider is 'ldap' but \
+                         auth.ldap is missing"
+                        .into());
+                };
+                if ldap.url.trim().is_empty() {
+                    return Err("auth.ldap.url must not be empty when auth.required is true".into());
+                }
+                let user_dn_template = ldap
+                    .user_dn_template
+                    .as_deref()
+                    .filter(|template| !template.trim().is_empty());
+                if let Some(template) = user_dn_template {
+                    if !template.contains("{}") {
+                        return Err("auth.ldap.userDnTemplate must contain '{}' when \
+                             auth.required is true"
+                            .into());
+                    }
+                } else if ldap.user_search_base.trim().is_empty() {
+                    return Err("auth.ldap must set userDnTemplate or userSearchBase when \
+                         auth.required is true"
+                        .into());
+                }
+                if user_dn_template.is_none() && ldap.user_search_filter.trim().is_empty() {
+                    return Err("auth.ldap.userSearchFilter must not be empty when \
+                         auth.required is true"
+                        .into());
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub enum AuthProviderConfig {
@@ -443,6 +535,30 @@ impl Default for AuthorizationConfig {
         Self {
             provider: AuthorizationProviderConfig::None,
             openfga: None,
+        }
+    }
+}
+
+impl AuthorizationConfig {
+    /// Refuse OpenFGA when the provider is selected but URL/store are incomplete.
+    pub fn validate(&self) -> std::result::Result<(), String> {
+        match self.provider {
+            AuthorizationProviderConfig::None => Ok(()),
+            AuthorizationProviderConfig::OpenFga => {
+                let Some(fga) = &self.openfga else {
+                    return Err(
+                        "authorization.provider is 'openfga' but authorization.openfga is missing"
+                            .into(),
+                    );
+                };
+                if fga.url.trim().is_empty() {
+                    return Err("authorization.openfga.url must not be empty".into());
+                }
+                if fga.store_id.trim().is_empty() {
+                    return Err("authorization.openfga.storeId must not be empty".into());
+                }
+                Ok(())
+            }
         }
     }
 }
@@ -1277,8 +1393,9 @@ fn default_cache_ttl() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        GuardKindConfig, GuardSpecConfig, PersistenceConfig, PostgresPersistenceConfig,
-        ProxyConfig, RouterConfig,
+        AuthConfig, AuthProviderConfig, AuthorizationConfig, AuthorizationProviderConfig,
+        GuardKindConfig, GuardSpecConfig, LdapConfig, OidcConfig, OpenFgaConfig, PersistenceConfig,
+        PostgresPersistenceConfig, ProxyConfig, RouterConfig,
     };
 
     #[test]
@@ -1668,5 +1785,129 @@ queryflux:
         let yaml = "queryflux:\n  distributed: false\n";
         let cfg: ProxyConfig = serde_yaml::from_str(yaml).unwrap();
         assert!(!cfg.queryflux.resolve_distributed(true).unwrap());
+    }
+
+    #[test]
+    fn auth_required_none_provider_fails_validation() {
+        let auth = AuthConfig {
+            required: true,
+            provider: AuthProviderConfig::None,
+            ..Default::default()
+        };
+        assert!(auth.validate_for_required().is_err());
+    }
+
+    #[test]
+    fn auth_required_oidc_needs_audience() {
+        let auth = AuthConfig {
+            required: true,
+            provider: AuthProviderConfig::Oidc,
+            oidc: Some(OidcConfig {
+                issuer: "https://idp.example".into(),
+                jwks_uri: "https://idp.example/jwks".into(),
+                audience: None,
+                groups_claim: "groups".into(),
+                roles_claim: None,
+            }),
+            ..Default::default()
+        };
+        let err = auth.validate_for_required().unwrap_err();
+        assert!(err.contains("audience"), "{err}");
+    }
+
+    #[test]
+    fn auth_required_oidc_ok_with_audience() {
+        let auth = AuthConfig {
+            required: true,
+            provider: AuthProviderConfig::Oidc,
+            oidc: Some(OidcConfig {
+                issuer: "https://idp.example".into(),
+                jwks_uri: "https://idp.example/jwks".into(),
+                audience: Some("queryflux".into()),
+                groups_claim: "groups".into(),
+                roles_claim: None,
+            }),
+            ..Default::default()
+        };
+        assert!(auth.validate_for_required().is_ok());
+    }
+
+    #[test]
+    fn auth_not_required_skips_provider_checks() {
+        let auth = AuthConfig {
+            required: false,
+            provider: AuthProviderConfig::Oidc,
+            oidc: None,
+            ..Default::default()
+        };
+        assert!(auth.validate_for_required().is_ok());
+    }
+
+    #[test]
+    fn auth_required_ldap_user_dn_template_needs_placeholder() {
+        let auth = AuthConfig {
+            required: true,
+            provider: AuthProviderConfig::Ldap,
+            ldap: Some(LdapConfig {
+                url: "ldap://ldap.internal:389".into(),
+                bind_dn: String::new(),
+                bind_password: None,
+                user_search_base: String::new(),
+                user_search_filter: "(uid={})".into(),
+                user_dn_template: Some("cn=admin,ou=users,dc=example,dc=com".into()),
+                group_search_base: None,
+                group_name_attribute: "cn".into(),
+            }),
+            ..Default::default()
+        };
+        let err = auth.validate_for_required().unwrap_err();
+        assert!(err.contains("userDnTemplate"), "{err}");
+    }
+
+    #[test]
+    fn auth_required_ldap_search_mode_needs_filter() {
+        let auth = AuthConfig {
+            required: true,
+            provider: AuthProviderConfig::Ldap,
+            ldap: Some(LdapConfig {
+                url: "ldap://ldap.internal:389".into(),
+                bind_dn: String::new(),
+                bind_password: None,
+                user_search_base: "ou=users,dc=example,dc=com".into(),
+                user_search_filter: String::new(),
+                user_dn_template: None,
+                group_search_base: None,
+                group_name_attribute: "cn".into(),
+            }),
+            ..Default::default()
+        };
+        let err = auth.validate_for_required().unwrap_err();
+        assert!(err.contains("userSearchFilter"), "{err}");
+    }
+
+    #[test]
+    fn startup_rejects_required_auth_none_provider() {
+        let yaml = r#"
+queryflux: {}
+auth:
+  required: true
+  provider: none
+"#;
+        let cfg: ProxyConfig = serde_yaml::from_str(yaml).unwrap();
+        let err = cfg.validate_startup_security().unwrap_err();
+        assert!(err.contains("auth.required"), "{err}");
+    }
+
+    #[test]
+    fn openfga_provider_requires_url_and_store() {
+        let authz = AuthorizationConfig {
+            provider: AuthorizationProviderConfig::OpenFga,
+            openfga: Some(OpenFgaConfig {
+                url: "".into(),
+                store_id: "store".into(),
+                credentials: None,
+            }),
+        };
+        assert!(authz.validate().is_err());
     }
 }

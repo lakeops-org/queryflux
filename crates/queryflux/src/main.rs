@@ -635,6 +635,10 @@ async fn main() -> Result<()> {
 
     let router_chain = RouterChain::new(routers, fallback);
 
+    config
+        .validate_startup_security()
+        .map_err(|e| anyhow::anyhow!("Startup security validation failed: {e}"))?;
+
     let auth_provider = build_auth_provider(&config.auth)?;
     let authorization = build_authorization(
         &config.authorization,
