@@ -795,9 +795,11 @@ pub struct PostgresPersistenceConfig {
     pub password: Option<String>,
     #[serde(default)]
     pub database: Option<String>,
-    /// Legacy total connection budget (`poolSize` in YAML). When the per-workload
-    /// pool sizes below are omitted, this value is split 60% query / 20% coordination /
-    /// 20% admin (minimum 1 each). Ignored when all three workload pools are set.
+    /// Legacy total connection budget (`poolSize` in YAML), **inclusive of** the
+    /// dedicated `PgListener` connection. When the per-workload pool sizes below
+    /// are omitted, one slot is reserved for LISTEN and the remainder is split
+    /// 60% query / 20% coordination / 20% admin (minimum 1 each). Must be at least
+    /// 4. Ignored when any workload-specific pool size is set.
     #[serde(default)]
     pub pool_size: Option<u32>,
     /// Hot-path pool for executing/queued query state (`queryPoolSize`).
@@ -875,29 +877,51 @@ impl PostgresPersistenceConfig {
         Ok(url.to_string())
     }
 
+    /// Dedicated `PgListener` connections held outside the three sqlx pools.
+    pub const LISTENER_CONNECTIONS: u32 = 1;
+    /// Minimum legacy `poolSize`: 3 isolated pools (1 each) + 1 LISTEN connection.
+    pub const MIN_LEGACY_POOL_SIZE: u32 = 4;
+
     /// Resolve isolated pool sizes for query, coordination, and admin workloads.
-    pub fn resolve_pool_sizes(&self) -> (u32, u32, u32) {
+    ///
+    /// Legacy `poolSize` is inclusive of [`Self::LISTENER_CONNECTIONS`]. Workload-specific
+    /// sizes (`queryPoolSize` / …) are pool-only; the listener is extra in that mode.
+    pub fn resolve_pool_sizes(&self) -> Result<(u32, u32, u32), String> {
         const DEFAULT_TOTAL: u32 = 10;
 
         if self.query_pool_size.is_some()
             || self.coordination_pool_size.is_some()
             || self.admin_pool_size.is_some()
         {
-            return (
+            return Ok((
                 self.query_pool_size.unwrap_or(6).max(1),
                 self.coordination_pool_size.unwrap_or(2).max(1),
                 self.admin_pool_size.unwrap_or(2).max(1),
-            );
+            ));
         }
 
-        let total = self.pool_size.unwrap_or(DEFAULT_TOTAL).max(3);
-        let coordination = (total * 20 / 100).max(1);
-        let admin = (total * 20 / 100).max(1);
-        let query = total
+        let total = self.pool_size.unwrap_or(DEFAULT_TOTAL);
+        if total < Self::MIN_LEGACY_POOL_SIZE {
+            return Err(format!(
+                "postgres persistence: poolSize must be at least {} \
+                 (3 isolated pools + {} LISTEN connection); got {total}",
+                Self::MIN_LEGACY_POOL_SIZE,
+                Self::LISTENER_CONNECTIONS
+            ));
+        }
+
+        let pool_budget = total - Self::LISTENER_CONNECTIONS;
+        let coordination = (pool_budget * 20 / 100).max(1);
+        let admin = (pool_budget * 20 / 100).max(1);
+        let query = pool_budget
             .saturating_sub(coordination)
             .saturating_sub(admin)
             .max(1);
-        (query, coordination, admin)
+        debug_assert!(
+            query + coordination + admin + Self::LISTENER_CONNECTIONS <= total,
+            "legacy poolSize split must not exceed configured budget"
+        );
+        Ok((query, coordination, admin))
     }
 }
 
@@ -1663,13 +1687,57 @@ guardrails:
         assert!(err.contains("script"));
     }
 
+    fn assert_legacy_budget_inclusive_of_listener(cfg: &PostgresPersistenceConfig) {
+        let total = cfg.pool_size.unwrap_or(10);
+        let (query, coordination, admin) = cfg.resolve_pool_sizes().unwrap();
+        assert!(
+            query + coordination + admin + PostgresPersistenceConfig::LISTENER_CONNECTIONS <= total,
+            "pools ({query}+{coordination}+{admin}) + listener must not exceed poolSize {total}"
+        );
+    }
+
     #[test]
     fn postgres_pool_sizes_split_legacy_total() {
         let c = PostgresPersistenceConfig {
             pool_size: Some(20),
             ..Default::default()
         };
-        assert_eq!(c.resolve_pool_sizes(), (12, 4, 4));
+        assert_eq!(c.resolve_pool_sizes().unwrap(), (13, 3, 3));
+        assert_legacy_budget_inclusive_of_listener(&c);
+    }
+
+    #[test]
+    fn postgres_pool_sizes_default_total_includes_listener() {
+        let c = PostgresPersistenceConfig::default();
+        assert_eq!(c.resolve_pool_sizes().unwrap(), (7, 1, 1));
+        let with_ten = PostgresPersistenceConfig {
+            pool_size: Some(10),
+            ..Default::default()
+        };
+        assert_eq!(with_ten.resolve_pool_sizes().unwrap(), (7, 1, 1));
+        assert_legacy_budget_inclusive_of_listener(&with_ten);
+    }
+
+    #[test]
+    fn postgres_pool_sizes_minimum_legacy_total() {
+        let c = PostgresPersistenceConfig {
+            pool_size: Some(4),
+            ..Default::default()
+        };
+        assert_eq!(c.resolve_pool_sizes().unwrap(), (1, 1, 1));
+        assert_legacy_budget_inclusive_of_listener(&c);
+    }
+
+    #[test]
+    fn postgres_pool_sizes_rejects_legacy_total_below_four() {
+        for n in [0, 1, 2, 3] {
+            let c = PostgresPersistenceConfig {
+                pool_size: Some(n),
+                ..Default::default()
+            };
+            let err = c.resolve_pool_sizes().unwrap_err();
+            assert!(err.contains("at least 4"), "poolSize {n}: {err}");
+        }
     }
 
     #[test]
@@ -1681,7 +1749,7 @@ guardrails:
             pool_size: Some(99),
             ..Default::default()
         };
-        assert_eq!(c.resolve_pool_sizes(), (12, 3, 5));
+        assert_eq!(c.resolve_pool_sizes().unwrap(), (12, 3, 5));
     }
 
     #[test]

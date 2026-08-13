@@ -106,7 +106,9 @@ impl PostgresStore {
         database_url: &str,
         conn: &queryflux_core::config::PostgresPersistenceConfig,
     ) -> Result<Self> {
-        let (query_max, coordination_max, admin_max) = conn.resolve_pool_sizes();
+        let (query_max, coordination_max, admin_max) = conn
+            .resolve_pool_sizes()
+            .map_err(QueryFluxError::Persistence)?;
         let query_pool = build_pg_pool(
             database_url,
             query_max,
@@ -2321,7 +2323,7 @@ mod tests {
             admin_pool_size: Some(5),
             ..Default::default()
         };
-        assert_eq!(cfg.resolve_pool_sizes(), (12, 3, 5));
+        assert_eq!(cfg.resolve_pool_sizes().unwrap(), (12, 3, 5));
     }
 
     async fn test_store() -> PostgresStore {
