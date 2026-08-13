@@ -795,12 +795,20 @@ pub struct PostgresPersistenceConfig {
     pub password: Option<String>,
     #[serde(default)]
     pub database: Option<String>,
-    /// Max connections in the sqlx pool (`poolSize` in YAML). Omit for the
-    /// sqlx default (10). The pool serves the dispatch hot path (capacity
-    /// acquire/release per query) plus persistence, admin, LISTEN/NOTIFY,
-    /// and sweeps — raise this before adding replicas under high QPS.
+    /// Legacy total connection budget (`poolSize` in YAML). When the per-workload
+    /// pool sizes below are omitted, this value is split 60% query / 20% coordination /
+    /// 20% admin (minimum 1 each). Ignored when all three workload pools are set.
     #[serde(default)]
     pub pool_size: Option<u32>,
+    /// Hot-path pool for executing/queued query state (`queryPoolSize`).
+    #[serde(default)]
+    pub query_pool_size: Option<u32>,
+    /// Pool for distributed capacity, queue claims, and sweep locks (`coordinationPoolSize`).
+    #[serde(default)]
+    pub coordination_pool_size: Option<u32>,
+    /// Pool for admin API, metrics, cache metadata, and config reload reads (`adminPoolSize`).
+    #[serde(default)]
+    pub admin_pool_size: Option<u32>,
     /// Max seconds to wait for a connection from the pool before returning an error.
     /// Defaults to 30 seconds.
     #[serde(default)]
@@ -865,6 +873,31 @@ impl PostgresPersistenceConfig {
         url.set_path(&format!("/{}", database.trim_start_matches('/')));
 
         Ok(url.to_string())
+    }
+
+    /// Resolve isolated pool sizes for query, coordination, and admin workloads.
+    pub fn resolve_pool_sizes(&self) -> (u32, u32, u32) {
+        const DEFAULT_TOTAL: u32 = 10;
+
+        if self.query_pool_size.is_some()
+            || self.coordination_pool_size.is_some()
+            || self.admin_pool_size.is_some()
+        {
+            return (
+                self.query_pool_size.unwrap_or(6).max(1),
+                self.coordination_pool_size.unwrap_or(2).max(1),
+                self.admin_pool_size.unwrap_or(2).max(1),
+            );
+        }
+
+        let total = self.pool_size.unwrap_or(DEFAULT_TOTAL).max(3);
+        let coordination = (total * 20 / 100).max(1);
+        let admin = (total * 20 / 100).max(1);
+        let query = total
+            .saturating_sub(coordination)
+            .saturating_sub(admin)
+            .max(1);
+        (query, coordination, admin)
     }
 }
 
@@ -1628,6 +1661,27 @@ guardrails:
             .validate()
             .expect_err("missing external fields should fail");
         assert!(err.contains("script"));
+    }
+
+    #[test]
+    fn postgres_pool_sizes_split_legacy_total() {
+        let c = PostgresPersistenceConfig {
+            pool_size: Some(20),
+            ..Default::default()
+        };
+        assert_eq!(c.resolve_pool_sizes(), (12, 4, 4));
+    }
+
+    #[test]
+    fn postgres_pool_sizes_explicit_workloads() {
+        let c = PostgresPersistenceConfig {
+            query_pool_size: Some(12),
+            coordination_pool_size: Some(3),
+            admin_pool_size: Some(5),
+            pool_size: Some(99),
+            ..Default::default()
+        };
+        assert_eq!(c.resolve_pool_sizes(), (12, 3, 5));
     }
 
     #[test]
