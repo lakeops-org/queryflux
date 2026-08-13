@@ -37,9 +37,13 @@ use queryflux_engine_adapters::{
     AdapterKind,
 };
 use queryflux_frontend::{
+    flight_sql::FlightSqlFrontend,
+    mysql_wire::MysqlWireFrontend,
+    postgres_wire::PostgresWireFrontend,
     snowflake::SnowflakeFrontend,
     state::LiveConfig,
     trino_http::{state::AppState, TrinoHttpFrontend},
+    FrontendListenerTrait, ShutdownRx,
 };
 use queryflux_metrics::{ClusterSnapshot, MetricsStore, QueryRecord};
 use queryflux_persistence::in_memory::InMemoryPersistence;
@@ -785,4 +789,150 @@ impl MetricsStore for NullMetrics {
     async fn record_cluster_snapshot(&self, _s: ClusterSnapshot) -> QfResult<()> {
         Ok(())
     }
+}
+
+// ---------------------------------------------------------------------------
+// ProtocolWireHarness — MySQL wire, Postgres wire, and Flight SQL on DuckDB.
+// ---------------------------------------------------------------------------
+
+pub struct ProtocolWireHarness {
+    pub mysql_port: u16,
+    pub postgres_port: u16,
+    pub flight_port: u16,
+    _shutdown_tx: tokio::sync::watch::Sender<bool>,
+}
+
+impl ProtocolWireHarness {
+    pub async fn new() -> Result<Self> {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter("error")
+            .try_init();
+
+        let group = ClusterGroupName(GROUP_DUCKDB.to_string());
+        let cluster = ClusterName("duckdb-wire-proto-1".to_string());
+        let cs = Arc::new(ClusterState::new(
+            cluster.clone(),
+            group.clone(),
+            None,
+            None,
+            EngineType::DuckDb,
+            None,
+            4,
+            true,
+        ));
+        let adapter = Arc::new(
+            DuckDbAdapter::new(
+                cluster.clone(),
+                group.clone(),
+                DuckDbConfig {
+                    database_path: None,
+                    motherduck_token: None,
+                    pool_size: 2,
+                    max_result_buffer_bytes: DEFAULT_MAX_RESULT_BUFFER_BYTES,
+                },
+            )
+            .map_err(|e| anyhow!("DuckDB adapter: {e}"))?,
+        );
+
+        let mut group_states: HashMap<ClusterGroupName, _> = HashMap::new();
+        group_states.insert(group.clone(), (vec![cs], strategy_from_config(None)));
+        let mut adapters: HashMap<String, AdapterKind> = HashMap::new();
+        adapters.insert(cluster.0.clone(), AdapterKind::Sync(adapter));
+
+        let duckdb_group = group.clone();
+        let router = Box::new(ProtocolBasedRouter {
+            trino_http: None,
+            postgres_wire: Some(duckdb_group.clone()),
+            mysql_wire: Some(duckdb_group.clone()),
+            clickhouse_http: None,
+            flight_sql: Some(duckdb_group.clone()),
+            snowflake_http: None,
+            snowflake_sql_api: None,
+        });
+
+        let cluster_manager = Arc::new(SimpleClusterGroupManager::new(group_states));
+        let translation = Arc::new(TranslationService::disabled());
+        let router_chain = RouterChain::new(vec![router], group.clone());
+
+        let live_config = LiveConfig {
+            router_chain,
+            guard_chain: None,
+            group_guard_chains: HashMap::new(),
+            cluster_manager,
+            adapters,
+            health_check_targets: vec![],
+            cluster_configs: HashMap::new(),
+            group_members: HashMap::from([(GROUP_DUCKDB.to_string(), vec![cluster.0.clone()])]),
+            group_order: vec![GROUP_DUCKDB.to_string()],
+            group_translation_scripts: HashMap::new(),
+            group_default_tags: HashMap::new(),
+            group_max_queued_queries: HashMap::new(),
+            group_capacity_wait_timeout_secs: HashMap::new(),
+            group_cache_settings: HashMap::new(),
+            auth_provider: Arc::new(NoneAuthProvider::new(false)) as Arc<dyn AuthProvider>,
+            authorization: Arc::new(AllowAllAuthorization::default())
+                as Arc<dyn AuthorizationChecker>,
+        };
+
+        let state = Arc::new(AppState {
+            external_address: "http://127.0.0.1:0".to_string(),
+            live: Arc::new(tokio::sync::RwLock::new(live_config)),
+            persistence: Arc::new(InMemoryPersistence::new()),
+            translation,
+            metrics: Arc::new(NullMetrics),
+            identity_resolver: Arc::new(BackendIdentityResolver::new()),
+            capacity_store: None,
+            queue_coordinator: None,
+            instance_id: "wire-proto-harness".to_string(),
+            http_client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(30))
+                .build()
+                .expect("build http client"),
+            result_cache: Arc::new(queryflux_cache::noop::NoopResultCache),
+        });
+
+        let mysql_port = bind_ephemeral_port().await?;
+        let postgres_port = bind_ephemeral_port().await?;
+        let flight_port = bind_ephemeral_port().await?;
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+        spawn_wire_frontend(
+            MysqlWireFrontend::new(state.clone(), mysql_port, None),
+            shutdown_rx.clone(),
+        );
+        spawn_wire_frontend(
+            PostgresWireFrontend::new(state.clone(), postgres_port, None),
+            shutdown_rx.clone(),
+        );
+        spawn_wire_frontend(
+            FlightSqlFrontend::new(state, flight_port, None),
+            shutdown_rx,
+        );
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        Ok(Self {
+            mysql_port,
+            postgres_port,
+            flight_port,
+            _shutdown_tx: shutdown_tx,
+        })
+    }
+}
+
+async fn bind_ephemeral_port() -> Result<u16> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let port = listener.local_addr()?.port();
+    drop(listener);
+    Ok(port)
+}
+
+fn spawn_wire_frontend<F>(frontend: F, shutdown: ShutdownRx)
+where
+    F: FrontendListenerTrait + Send + Sync + 'static,
+{
+    tokio::spawn(async move {
+        let _ = frontend.listen(shutdown).await;
+    });
 }
