@@ -31,7 +31,7 @@ use queryflux_core::{
 };
 use queryflux_engine_adapters::{
     clickhouse::{ClickHouseAdapter, ClickHouseConfig},
-    duckdb::{DuckDbAdapter, DuckDbConfig},
+    duckdb::{DuckDbAdapter, DuckDbConfig, DEFAULT_MAX_RESULT_BUFFER_BYTES},
     starrocks::StarRocksAdapter,
     trino::TrinoAdapter,
     AdapterKind,
@@ -260,6 +260,8 @@ impl TestHarness {
                     DuckDbConfig {
                         database_path: None,
                         motherduck_token: None,
+                        pool_size: 1,
+                        max_result_buffer_bytes: DEFAULT_MAX_RESULT_BUFFER_BYTES,
                     },
                 )
                 .map_err(|e| anyhow!("DuckDB adapter: {e}"))?,
@@ -528,6 +530,8 @@ impl WireTestHarness {
                 DuckDbConfig {
                     database_path: None,
                     motherduck_token: None,
+                    pool_size: 1,
+                    max_result_buffer_bytes: DEFAULT_MAX_RESULT_BUFFER_BYTES,
                 },
             )
             .map_err(|e| anyhow!("DuckDB adapter: {e}"))?,
