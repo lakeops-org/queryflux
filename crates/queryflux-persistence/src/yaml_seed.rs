@@ -252,4 +252,34 @@ mod tests {
         let row = store.get_group_config("default").await.unwrap().unwrap();
         assert_eq!(row.max_running_queries, 20);
     }
+
+    #[tokio::test]
+    async fn insert_group_config_if_missing_skips_stale_yaml_when_group_exists() {
+        let store = InMemoryPersistence::new();
+        store
+            .upsert_cluster_config("trino", &studio_trino_upsert(4))
+            .await
+            .unwrap();
+        store
+            .upsert_group_config("default", &studio_group_upsert(20))
+            .await
+            .unwrap();
+
+        let stale_yaml = UpsertClusterGroupConfig {
+            enabled: true,
+            members: vec!["removed-cluster".into()],
+            max_running_queries: 10,
+            max_queued_queries: None,
+            strategy: None,
+            allow_groups: vec![],
+            allow_users: vec![],
+            translation_script_ids: vec![],
+            default_tags: serde_json::json!({}),
+            cache: None,
+        };
+        assert!(!store
+            .insert_group_config_if_missing("default", &stale_yaml)
+            .await
+            .unwrap());
+    }
 }

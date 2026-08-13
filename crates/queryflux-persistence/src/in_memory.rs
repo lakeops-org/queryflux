@@ -573,30 +573,30 @@ impl ClusterConfigStore for InMemoryPersistence {
         name: &str,
         cfg: &UpsertClusterGroupConfig,
     ) -> Result<bool> {
-        for m in &cfg.members {
-            if !self.cluster_configs.contains_key(m) {
-                return Err(queryflux_core::error::QueryFluxError::Persistence(format!(
-                    "Unknown cluster '{m}' in group members (clusters must exist first)"
-                )));
-            }
-        }
-        for sid in &cfg.translation_script_ids {
-            let ok = self
-                .user_scripts
-                .get(sid)
-                .map(|r| r.kind == KIND_TRANSLATION_FIXUP)
-                .unwrap_or(false);
-            if !ok {
-                return Err(queryflux_core::error::QueryFluxError::Persistence(format!(
-                    "Unknown or invalid translation script id {sid}"
-                )));
-            }
-        }
-
         let now = Utc::now();
         match self.group_configs.entry(name.to_string()) {
             dashmap::mapref::entry::Entry::Occupied(_) => Ok(false),
             dashmap::mapref::entry::Entry::Vacant(v) => {
+                for m in &cfg.members {
+                    if !self.cluster_configs.contains_key(m) {
+                        return Err(queryflux_core::error::QueryFluxError::Persistence(format!(
+                            "Unknown cluster '{m}' in group members (clusters must exist first)"
+                        )));
+                    }
+                }
+                for sid in &cfg.translation_script_ids {
+                    let ok = self
+                        .user_scripts
+                        .get(sid)
+                        .map(|r| r.kind == KIND_TRANSLATION_FIXUP)
+                        .unwrap_or(false);
+                    if !ok {
+                        return Err(queryflux_core::error::QueryFluxError::Persistence(format!(
+                            "Unknown or invalid translation script id {sid}"
+                        )));
+                    }
+                }
+
                 let id = self.next_group_id.fetch_add(1, Ordering::Relaxed);
                 v.insert(ClusterGroupConfigRecord {
                     id,
