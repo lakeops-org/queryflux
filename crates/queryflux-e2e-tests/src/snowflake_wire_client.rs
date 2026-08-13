@@ -166,6 +166,50 @@ impl SnowflakeWireClient {
         })
     }
 
+    /// DELETE /queries/v1/:query_id — cancel an in-flight query.
+    pub async fn cancel(&self, query_id: &str) -> Result<u16> {
+        let token = self.token()?;
+        let resp = self
+            .client
+            .delete(format!("{}/queries/v1/{query_id}", self.base_url))
+            .header("Authorization", format!("Snowflake Token=\"{token}\""))
+            .send()
+            .await?;
+        Ok(resp.status().as_u16())
+    }
+
+    /// GET /queries/v1/query-monitoring-request — list in-flight query ids.
+    pub async fn monitoring_query_ids(&self) -> Result<Vec<String>> {
+        let token = self.token()?;
+        let resp = self
+            .client
+            .get(format!(
+                "{}/queries/v1/query-monitoring-request",
+                self.base_url
+            ))
+            .header("Authorization", format!("Snowflake Token=\"{token}\""))
+            .send()
+            .await?
+            .json::<Value>()
+            .await?;
+
+        if resp["success"].as_bool() != Some(true) {
+            bail!(
+                "monitoring failed: {}",
+                resp["message"].as_str().unwrap_or("unknown")
+            );
+        }
+
+        Ok(resp["data"]["queries"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|q| q["id"].as_str().map(|s| s.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
+
     /// POST /queries/v1/query-request — returns the raw HTTP status code.
     /// Used in auth-failure tests where we expect a 401.
     pub async fn query_raw_status(&self, sql: &str) -> Result<u16> {

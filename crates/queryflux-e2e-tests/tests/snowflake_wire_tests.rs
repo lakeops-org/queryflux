@@ -396,6 +396,56 @@ async fn wire_and_sql_api_return_consistent_results() {
 }
 
 // ---------------------------------------------------------------------------
+// Cancel in-flight query (wire v1)
+// ---------------------------------------------------------------------------
+
+/// Heavy DuckDB query — long enough to cancel while still running.
+const LONG_RUNNING_SQL: &str = "SELECT sum(x * x) FROM generate_series(1, 500000000) AS t(x)";
+
+#[tokio::test]
+async fn cancel_in_flight_query() {
+    let h = harness().await;
+    let mut client = SnowflakeWireClient::new(&h.base_url());
+    client.login("testuser", "").await.expect("login");
+
+    let base_url = h.base_url();
+    let token = client.session_token.clone().expect("session token");
+    let http = reqwest::Client::new();
+
+    let query_task = tokio::spawn(async move {
+        http.post(format!("{base_url}/queries/v1/query-request"))
+            .header("Authorization", format!("Snowflake Token=\"{token}\""))
+            .header("Content-Type", "application/json")
+            .json(&json!({"sqlText": LONG_RUNNING_SQL}))
+            .send()
+            .await
+            .expect("query request")
+            .json::<serde_json::Value>()
+            .await
+            .expect("query json")
+    });
+
+    let query_id = loop {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let ids = client.monitoring_query_ids().await.expect("monitoring");
+        if let Some(id) = ids.into_iter().next() {
+            break id;
+        }
+    };
+
+    let cancel_status = client.cancel(&query_id).await.expect("cancel");
+    assert_eq!(cancel_status, 200, "cancel should return 200");
+
+    let resp = query_task.await.expect("query task join");
+    assert!(
+        resp["success"].as_bool() == Some(false),
+        "cancelled query should report success=false: {resp}"
+    );
+
+    client.logout().await.ok();
+}
+
+// ---------------------------------------------------------------------------
 // StarRocks backend scenarios
 //
 // These tests create a WireTestHarness backed by a real StarRocks instance and

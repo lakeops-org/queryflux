@@ -21,11 +21,12 @@ use serde_json::{json, Value};
 use tracing::warn;
 use uuid::Uuid;
 
-use crate::dispatch::{execute_to_sink, ResultSink};
+use crate::dispatch::ResultSink;
 use crate::snowflake::http::format::schema_to_rowtype;
 use crate::snowflake::http::handlers::bindings::bindings_to_params;
 use crate::snowflake::http::handlers::common::parse_snowflake_json_body;
-use crate::state::AppState;
+use crate::snowflake::http::SnowflakeWireState;
+use crate::snowflake::in_flight::{CancelOutcome, SnowflakeExecParams, SpawnExecuteResult};
 
 // ---------------------------------------------------------------------------
 // ResultSink that accumulates Arrow batches into SQL API v2 jsonv2 format
@@ -181,7 +182,7 @@ fn sql_api_error(status: StatusCode, code: &str, message: &str) -> Response {
 
 /// POST /api/v2/statements  — submit SQL, execute synchronously, return jsonv2
 pub async fn submit_statement(
-    State(state): State<Arc<AppState>>,
+    State(state): State<SnowflakeWireState>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
@@ -204,7 +205,7 @@ pub async fn submit_statement(
     let params = bindings_to_params(body_json.get("bindings"));
 
     // Stateless auth: Bearer token in Authorization header.
-    let auth_ctx = match authenticate(&state, &headers).await {
+    let auth_ctx = match authenticate(&state.app, &headers).await {
         Ok(ctx) => ctx,
         Err(e) => return sql_api_error(StatusCode::UNAUTHORIZED, "390002", &e.to_string()),
     };
@@ -227,7 +228,7 @@ pub async fn submit_statement(
         agent_context: None,
     };
     let group = {
-        let live = state.live.read().await;
+        let live = state.app.live.read().await;
         live.router_chain
             .route(
                 &sql,
@@ -243,30 +244,52 @@ pub async fn submit_statement(
     };
 
     let handle = Uuid::new_v4().to_string();
-    let mut sink = SqlApiSink::new();
 
-    if let Err(e) = execute_to_sink(
-        &state,
+    let exec = SnowflakeExecParams {
         sql,
         params,
         session_ctx,
-        FrontendProtocol::SnowflakeSqlApi,
+        protocol: FrontendProtocol::SnowflakeSqlApi,
         group,
-        &mut sink,
-        &auth_ctx,
+        auth_ctx: auth_ctx.clone(),
+    };
+
+    match crate::snowflake::in_flight::spawn_execute(
+        &state.app,
+        &state.in_flight,
+        handle.clone(),
+        auth_ctx.user.clone(),
+        exec,
+        SqlApiSink::new,
     )
     .await
     {
-        warn!(handle = %handle, "SQL API execute_to_sink error: {e}");
-        sink.error = Some(e.to_string());
+        SpawnExecuteResult::Completed(Ok(()), sink) => sink.into_response(&handle),
+        SpawnExecuteResult::Completed(Err(e), mut sink) => {
+            warn!(handle = %handle, "SQL API execute_to_sink error: {e}");
+            sink.error = Some(e.to_string());
+            sink.into_response(&handle)
+        }
+        SpawnExecuteResult::Cancelled => (
+            StatusCode::OK,
+            axum::Json(json!({
+                "code": "000630",
+                "message": "Statement aborted.",
+                "sqlState": "57014",
+                "statementHandle": handle
+            })),
+        )
+            .into_response(),
+        SpawnExecuteResult::JoinFailed(e) => {
+            warn!(handle = %handle, "SQL API query task failed: {e}");
+            sql_api_error(StatusCode::INTERNAL_SERVER_ERROR, "390000", &e)
+        }
     }
-
-    sink.into_response(&handle)
 }
 
 /// GET /api/v2/statements/:handle  — stub (sync execution, nothing to poll)
 pub async fn get_statement(
-    State(_state): State<Arc<AppState>>,
+    State(_state): State<SnowflakeWireState>,
     _headers: HeaderMap,
     axum::extract::Path(handle): axum::extract::Path<String>,
     _raw_query: axum::extract::RawQuery,
@@ -283,20 +306,32 @@ pub async fn get_statement(
         .into_response()
 }
 
-/// DELETE /api/v2/statements/:handle  — stub (sync execution, nothing to cancel)
+/// DELETE /api/v2/statements/:handle  — abort an in-flight statement
 pub async fn cancel_statement(
-    State(_state): State<Arc<AppState>>,
-    _headers: HeaderMap,
+    State(state): State<SnowflakeWireState>,
+    headers: HeaderMap,
     axum::extract::Path(handle): axum::extract::Path<String>,
 ) -> Response {
-    (
-        StatusCode::OK,
-        axum::Json(json!({
-            "statementHandle": handle,
-            "message": "Statement aborted.",
-        })),
-    )
-        .into_response()
+    let auth_ctx = match authenticate(&state.app, &headers).await {
+        Ok(ctx) => ctx,
+        Err(e) => return sql_api_error(StatusCode::UNAUTHORIZED, "390002", &e.to_string()),
+    };
+
+    match state.in_flight.cancel(&handle, &auth_ctx) {
+        CancelOutcome::Aborted | CancelOutcome::NotFound => (
+            StatusCode::OK,
+            axum::Json(json!({
+                "statementHandle": handle,
+                "message": "Statement aborted.",
+            })),
+        )
+            .into_response(),
+        CancelOutcome::Forbidden => sql_api_error(
+            StatusCode::FORBIDDEN,
+            "390403",
+            "Statement belongs to a different user.",
+        ),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -304,7 +339,7 @@ pub async fn cancel_statement(
 // ---------------------------------------------------------------------------
 
 async fn authenticate(
-    state: &Arc<AppState>,
+    state: &std::sync::Arc<crate::state::AppState>,
     headers: &HeaderMap,
 ) -> std::result::Result<queryflux_auth::AuthContext, String> {
     let bearer = headers
