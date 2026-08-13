@@ -1,10 +1,10 @@
 pub mod http;
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use duckdb::Connection;
-use futures::stream;
 use queryflux_core::{
     catalog::TableSchema,
     config::{ClusterAuth, ClusterConfig},
@@ -14,6 +14,8 @@ use queryflux_core::{
     session::SessionContext,
     tags::QueryTags,
 };
+use tokio::sync::Semaphore;
+use tokio_stream::wrappers::ReceiverStream;
 use tracing::debug;
 
 use crate::{AdapterKind, BackendQueryIdSlot, SyncAdapter, SyncExecution};
@@ -21,10 +23,76 @@ use queryflux_core::engine_registry::{
     AuthType, ConfigField, ConnectionType, EngineDescriptor, FieldType,
 };
 
+/// Default per-query buffered-result cap (1 GiB), matching ClickHouse.
+pub const DEFAULT_MAX_RESULT_BUFFER_BYTES: usize = 1 << 30;
+const DEFAULT_DUCKDB_POOL_SIZE: usize = 1;
+
 /// Parsed and validated configuration for a DuckDB cluster.
 pub struct DuckDbConfig {
     pub database_path: Option<String>,
     pub motherduck_token: Option<String>,
+    pub pool_size: usize,
+    pub max_result_buffer_bytes: usize,
+}
+
+fn parse_pool_size(raw: Option<usize>, cluster_name: &str) -> Result<usize> {
+    match raw {
+        None => Ok(DEFAULT_DUCKDB_POOL_SIZE),
+        Some(0) => Err(QueryFluxError::Engine(format!(
+            "cluster '{cluster_name}': poolSize must be a positive integer"
+        ))),
+        Some(n) => Ok(n),
+    }
+}
+
+pub fn parse_max_result_buffer_bytes(raw: Option<u64>, cluster_name: &str) -> Result<usize> {
+    match raw {
+        None => Ok(DEFAULT_MAX_RESULT_BUFFER_BYTES),
+        Some(0) => Err(QueryFluxError::Engine(format!(
+            "cluster '{cluster_name}': maxResultBufferBytes must be a positive integer"
+        ))),
+        Some(n) => usize::try_from(n).map_err(|_| {
+            QueryFluxError::Engine(format!(
+                "cluster '{cluster_name}': maxResultBufferBytes is too large for this platform"
+            ))
+        }),
+    }
+}
+
+pub fn parse_max_result_buffer_from_json(
+    json: &serde_json::Value,
+    cluster_name: &str,
+) -> Result<usize> {
+    match json.get("maxResultBufferBytes") {
+        None => Ok(DEFAULT_MAX_RESULT_BUFFER_BYTES),
+        Some(v) => v
+            .as_u64()
+            .filter(|&n| n >= 1)
+            .and_then(|n| usize::try_from(n).ok())
+            .ok_or_else(|| {
+                QueryFluxError::Engine(format!(
+                    "cluster '{cluster_name}': maxResultBufferBytes must be a positive integer"
+                ))
+            }),
+    }
+}
+
+fn parse_pool_size_from_json(json: &serde_json::Value, cluster_name: &str) -> Result<usize> {
+    match json.get("poolSize") {
+        None => Ok(DEFAULT_DUCKDB_POOL_SIZE),
+        Some(v) => {
+            let n = v.as_u64().filter(|&n| n >= 1).ok_or_else(|| {
+                QueryFluxError::Engine(format!(
+                    "cluster '{cluster_name}': poolSize must be a positive integer"
+                ))
+            })?;
+            usize::try_from(n).map_err(|_| {
+                QueryFluxError::Engine(format!(
+                    "cluster '{cluster_name}': poolSize is too large for this platform"
+                ))
+            })
+        }
+    }
 }
 
 impl crate::EngineConfigParseable for DuckDbConfig {
@@ -48,6 +116,8 @@ impl crate::EngineConfigParseable for DuckDbConfig {
         Ok(Self {
             database_path,
             motherduck_token,
+            pool_size: parse_pool_size_from_json(json, cluster_name)?,
+            max_result_buffer_bytes: parse_max_result_buffer_from_json(json, cluster_name)?,
         })
     }
 
@@ -64,26 +134,44 @@ impl crate::EngineConfigParseable for DuckDbConfig {
         Ok(Self {
             database_path: cfg.database_path.clone(),
             motherduck_token,
+            pool_size: parse_pool_size(cfg.pool_size, cluster_name)?,
+            max_result_buffer_bytes: parse_max_result_buffer_bytes(
+                cfg.max_result_buffer_bytes,
+                cluster_name,
+            )?,
         })
     }
 }
 
+struct ConnectionSlot {
+    conn: Arc<Mutex<Connection>>,
+    interrupt: Arc<duckdb::InterruptHandle>,
+    inflight: Arc<Mutex<Option<BackendQueryId>>>,
+}
+
 /// DuckDB embedded engine adapter.
 ///
-/// DuckDB is Arrow-native and runs in-process. All query execution goes through
-/// `execute_as_arrow` — `submit_query` is not used for this adapter.
+/// DuckDB is Arrow-native and runs in-process. Queries stream batches over an
+/// mpsc channel; a small connection pool allows limited concurrent queries.
 pub struct DuckDbAdapter {
     pub cluster_name: ClusterName,
     pub group_name: ClusterGroupName,
-    /// Thread-safe DuckDB connection. Wrapped in Arc<Mutex> so it can be shared
-    /// across `spawn_blocking` calls without moving out of `&self`.
-    conn: Arc<Mutex<Connection>>,
-    /// Interrupt handle — `interrupt()` is safe from another thread while a
-    /// query holds the connection mutex.
-    interrupt: Arc<duckdb::InterruptHandle>,
-    /// Backend id of the query that currently owns `conn`, if any.
-    /// Written only while holding the connection mutex.
-    inflight: Arc<Mutex<Option<BackendQueryId>>>,
+    slots: Arc<Vec<ConnectionSlot>>,
+    checkout: Arc<Semaphore>,
+    next_slot: AtomicUsize,
+    max_result_buffer_bytes: usize,
+}
+
+fn open_duckdb_connection(config: &DuckDbConfig) -> Result<Connection> {
+    let resolved_path = build_connection_string(
+        config.database_path.clone(),
+        config.motherduck_token.clone(),
+    );
+    match resolved_path.as_deref() {
+        Some(path) => Connection::open(path),
+        None => Connection::open_in_memory(),
+    }
+    .map_err(|e| QueryFluxError::Engine(format!("DuckDB open failed: {e}")))
 }
 
 impl DuckDbAdapter {
@@ -92,21 +180,35 @@ impl DuckDbAdapter {
         group_name: ClusterGroupName,
         config: DuckDbConfig,
     ) -> Result<Self> {
-        let resolved_path = build_connection_string(config.database_path, config.motherduck_token);
-        let conn = match resolved_path.as_deref() {
-            Some(path) => Connection::open(path),
-            None => Connection::open_in_memory(),
+        let mut slots = Vec::with_capacity(config.pool_size);
+        for _ in 0..config.pool_size {
+            let conn = open_duckdb_connection(&config)?;
+            let interrupt = conn.interrupt_handle();
+            slots.push(ConnectionSlot {
+                conn: Arc::new(Mutex::new(conn)),
+                interrupt,
+                inflight: Arc::new(Mutex::new(None)),
+            });
         }
-        .map_err(|e| QueryFluxError::Engine(format!("DuckDB open failed: {e}")))?;
-
-        let interrupt = conn.interrupt_handle();
+        let permits = u32::try_from(config.pool_size).unwrap_or(u32::MAX);
         Ok(Self {
             cluster_name,
             group_name,
-            conn: Arc::new(Mutex::new(conn)),
-            interrupt,
-            inflight: Arc::new(Mutex::new(None)),
+            slots: Arc::new(slots),
+            checkout: Arc::new(Semaphore::new(permits as usize)),
+            next_slot: AtomicUsize::new(0),
+            max_result_buffer_bytes: config.max_result_buffer_bytes,
         })
+    }
+
+    fn pick_slot(&self) -> ConnectionSlot {
+        let idx = self.next_slot.fetch_add(1, Ordering::Relaxed) % self.slots.len();
+        let slot = &self.slots[idx];
+        ConnectionSlot {
+            conn: Arc::clone(&slot.conn),
+            interrupt: Arc::clone(&slot.interrupt),
+            inflight: Arc::clone(&slot.inflight),
+        }
     }
 }
 
@@ -138,7 +240,7 @@ fn build_connection_string(
 #[async_trait]
 impl SyncAdapter for DuckDbAdapter {
     async fn health_check(&self) -> bool {
-        let conn = Arc::clone(&self.conn);
+        let conn = Arc::clone(&self.slots[0].conn);
         tokio::task::spawn_blocking(move || {
             let guard = conn.lock().unwrap_or_else(|e| e.into_inner());
             guard.execute_batch("SELECT 1").is_ok()
@@ -156,15 +258,18 @@ impl SyncAdapter for DuckDbAdapter {
     }
 
     async fn cancel_query(&self, backend_id: &BackendQueryId) -> Result<()> {
-        let matches = self
-            .inflight
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .as_ref()
-            == Some(backend_id);
-        if matches {
-            self.interrupt.interrupt();
-            debug!(cluster = %self.cluster_name, query_id = %backend_id, "DuckDB interrupt issued");
+        for slot in self.slots.iter() {
+            let matches = slot
+                .inflight
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_ref()
+                == Some(backend_id);
+            if matches {
+                slot.interrupt.interrupt();
+                debug!(cluster = %self.cluster_name, query_id = %backend_id, "DuckDB interrupt issued");
+                break;
+            }
         }
         Ok(())
     }
@@ -182,26 +287,46 @@ impl SyncAdapter for DuckDbAdapter {
         let query_id = BackendQueryId(uuid::Uuid::new_v4().to_string());
         id_slot.publish(query_id.0.clone());
 
-        let conn = Arc::clone(&self.conn);
-        let inflight = Arc::clone(&self.inflight);
-        let id_for_task = query_id.clone();
+        let _permit = self
+            .checkout
+            .acquire()
+            .await
+            .map_err(|_| QueryFluxError::Engine("DuckDB connection pool closed".into()))?;
+        let slot = self.pick_slot();
+        let (batch_tx, batch_rx) = tokio::sync::mpsc::channel(32);
+        let (stats_tx, stats_rx) = tokio::sync::oneshot::channel();
         let sql = sql.to_string();
         let duckdb_params: Vec<duckdb::types::Value> =
             params.iter().map(query_param_to_duckdb).collect();
+        let id_for_task = query_id.clone();
+        let max_bytes = self.max_result_buffer_bytes;
 
-        let batches = tokio::task::spawn_blocking(move || {
+        tokio::task::spawn_blocking(move || {
+            let conn = slot.conn;
+            let inflight = slot.inflight;
             let guard = conn.lock().unwrap_or_else(|e| e.into_inner());
-            // Claim ownership only once this task holds the connection, so
-            // `interrupt()` targets the statement actually running on `conn`.
             *inflight.lock().unwrap_or_else(|e| e.into_inner()) = Some(id_for_task.clone());
-            let result = (|| {
+            let stream_result = (|| {
                 let mut stmt = guard
                     .prepare(&sql)
                     .map_err(|e| QueryFluxError::Engine(format!("DuckDB prepare failed: {e}")))?;
                 let arrow = stmt
                     .query_arrow(duckdb::params_from_iter(duckdb_params))
                     .map_err(|e| QueryFluxError::Engine(format!("DuckDB query failed: {e}")))?;
-                Ok::<_, QueryFluxError>(arrow.collect::<Vec<_>>())
+                let mut buffered_bytes = 0usize;
+                for batch in arrow {
+                    buffered_bytes = buffered_bytes.saturating_add(batch.get_array_memory_size());
+                    if buffered_bytes > max_bytes {
+                        return Err(QueryFluxError::Engine(format!(
+                            "DuckDB result exceeded the {max_bytes}-byte buffered-result cap; \
+                             add a LIMIT, narrow the query, or raise maxResultBufferBytes"
+                        )));
+                    }
+                    if batch_tx.blocking_send(Ok(batch)).is_err() {
+                        return Ok(());
+                    }
+                }
+                Ok(())
             })();
             {
                 let mut slot = inflight.lock().unwrap_or_else(|e| e.into_inner());
@@ -209,19 +334,16 @@ impl SyncAdapter for DuckDbAdapter {
                     *slot = None;
                 }
             }
-            result
+            if let Err(e) = stream_result {
+                let _ = batch_tx.blocking_send(Err(e));
+            }
+            let _ = stats_tx.send(None);
+        });
+
+        Ok(SyncExecution {
+            stream: Box::pin(ReceiverStream::new(batch_rx)),
+            stats: stats_rx,
         })
-        .await
-        .map_err(|e| QueryFluxError::Engine(format!("spawn_blocking failed: {e}")))?;
-
-        let batches = batches?;
-
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        // DuckDB does not expose structured engine stats (CPU time, bytes scanned, etc.)
-        // via the query_arrow API — send None and establish the pattern for future use.
-        let _ = tx.send(None);
-        let stream = Box::pin(stream::iter(batches.into_iter().map(Ok)));
-        Ok(SyncExecution { stream, stats: rx })
     }
 
     // --- Catalog discovery ---
@@ -263,7 +385,7 @@ impl SyncAdapter for DuckDbAdapter {
              WHERE table_schema = '{database}' AND table_name = '{table}' \
              ORDER BY ordinal_position"
         );
-        let conn = Arc::clone(&self.conn);
+        let conn = Arc::clone(&self.slots[0].conn);
         let rows: Vec<(String, String, bool)> = tokio::task::spawn_blocking(move || {
             let guard = conn.lock().unwrap_or_else(|e| e.into_inner());
             let mut stmt = guard
@@ -334,7 +456,7 @@ impl DuckDbAdapter {
     /// Used by the test harness to prepare the Iceberg catalog extension before
     /// queries run. Runs on a blocking thread since DuckDB is synchronous.
     pub async fn setup_batch(&self, sql: &str) -> Result<()> {
-        let conn = Arc::clone(&self.conn);
+        let conn = Arc::clone(&self.slots[0].conn);
         let sql = sql.to_string();
         tokio::task::spawn_blocking(move || {
             let guard = conn.lock().unwrap_or_else(|e| e.into_inner());
@@ -349,7 +471,7 @@ impl DuckDbAdapter {
     /// Run a query and collect the first column of each row as strings.
     /// Used internally for catalog discovery queries.
     async fn run_show_query(&self, sql: &str) -> Result<Vec<String>> {
-        let conn = Arc::clone(&self.conn);
+        let conn = Arc::clone(&self.slots[0].conn);
         let sql = sql.to_string();
         tokio::task::spawn_blocking(move || {
             let guard = conn.lock().unwrap_or_else(|e| e.into_inner());
@@ -425,6 +547,22 @@ impl DuckDbAdapter {
                     field_type: FieldType::Secret,
                     required: false,
                     example: None,
+                },
+                ConfigField {
+                    key: "poolSize",
+                    label: "Connection pool size",
+                    description: "Number of embedded DuckDB connections for concurrent queries. Defaults to 1.",
+                    field_type: FieldType::Number,
+                    required: false,
+                    example: Some("1"),
+                },
+                ConfigField {
+                    key: "maxResultBufferBytes",
+                    label: "Max result buffer (bytes)",
+                    description: "Per-query cap on buffered Arrow result bytes. Defaults to 1 GiB.",
+                    field_type: FieldType::Number,
+                    required: false,
+                    example: Some("1073741824"),
                 },
             ],
         }
@@ -576,6 +714,7 @@ mod tests {
 
     #[tokio::test]
     async fn interrupt_stops_a_long_query() {
+        use futures::StreamExt;
         use queryflux_auth::QueryCredentials;
         use queryflux_core::query::{ClusterGroupName, ClusterName};
 
@@ -585,6 +724,8 @@ mod tests {
             DuckDbConfig {
                 database_path: None,
                 motherduck_token: None,
+                pool_size: 1,
+                max_result_buffer_bytes: DEFAULT_MAX_RESULT_BUFFER_BYTES,
             },
         )
         .expect("open in-memory duckdb");
@@ -595,7 +736,7 @@ mod tests {
         let tags = QueryTags::new();
         let params: QueryParams = vec![];
 
-        let exec = adapter.execute_as_arrow(
+        let exec_fut = adapter.execute_as_arrow(
             "SELECT count(*) FROM range(1000000000)",
             &session,
             &creds,
@@ -604,8 +745,6 @@ mod tests {
             &slot,
         );
         let cancel = async {
-            // Wait until the adapter has published an id and the blocking
-            // query has had a chance to start, then interrupt.
             for _ in 0..200 {
                 if slot.get().is_some() {
                     break;
@@ -617,15 +756,21 @@ mod tests {
             adapter.cancel_query(&id).await.expect("cancel");
         };
 
-        let (result, _) = tokio::join!(exec, cancel);
-        assert!(
-            result.is_err(),
-            "interrupted range() query should fail, got Ok(SyncExecution)"
-        );
+        let (exec_result, _) = tokio::join!(exec_fut, cancel);
+        let mut exec = exec_result.expect("execute returns stream handle");
+        let mut failed = false;
+        while let Some(item) = exec.stream.next().await {
+            if item.is_err() {
+                failed = true;
+                break;
+            }
+        }
+        assert!(failed, "interrupted range() query stream should error");
     }
 
     #[tokio::test]
     async fn interrupt_targets_the_running_query() {
+        use futures::StreamExt;
         use queryflux_auth::QueryCredentials;
         use queryflux_core::query::{ClusterGroupName, ClusterName};
 
@@ -636,6 +781,8 @@ mod tests {
                 DuckDbConfig {
                     database_path: None,
                     motherduck_token: None,
+                    pool_size: 1,
+                    max_result_buffer_bytes: DEFAULT_MAX_RESULT_BUFFER_BYTES,
                 },
             )
             .expect("open in-memory duckdb"),
@@ -700,13 +847,115 @@ mod tests {
         };
 
         let (result_a, result_b, _) = tokio::join!(exec_a, exec_b, cancel_a);
+        let mut exec_a = result_a.expect("first query stream handle");
+        let mut a_failed = false;
+        while let Some(item) = exec_a.stream.next().await {
+            if item.is_err() {
+                a_failed = true;
+                break;
+            }
+        }
+        assert!(a_failed, "canceled first query stream should error");
+
+        let mut exec_b = result_b.expect("second query stream handle");
+        while let Some(item) = exec_b.stream.next().await {
+            item.expect("second query batch");
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_as_arrow_streams_multiple_batches() {
+        use futures::StreamExt;
+        use queryflux_auth::QueryCredentials;
+        use queryflux_core::query::{ClusterGroupName, ClusterName};
+
+        let adapter = DuckDbAdapter::new(
+            ClusterName("duck".into()),
+            ClusterGroupName("g".into()),
+            DuckDbConfig {
+                database_path: None,
+                motherduck_token: None,
+                pool_size: 1,
+                max_result_buffer_bytes: DEFAULT_MAX_RESULT_BUFFER_BYTES,
+            },
+        )
+        .expect("open in-memory duckdb");
+
+        let params: QueryParams = vec![];
+
+        let exec = adapter
+            .execute_as_arrow(
+                "SELECT * FROM range(2500)",
+                &SessionContext::default(),
+                &QueryCredentials::ServiceAccount,
+                &QueryTags::new(),
+                &params,
+                &BackendQueryIdSlot::new(),
+            )
+            .await
+            .expect("execute");
+
+        let mut stream = exec.stream;
+        let mut batches = 0usize;
+        let mut rows = 0usize;
+        while let Some(batch) = stream.next().await {
+            let batch = batch.expect("batch ok");
+            batches += 1;
+            rows += batch.num_rows();
+        }
         assert!(
-            result_a.is_err(),
-            "canceled first query should fail, got Ok(SyncExecution)"
+            batches >= 2,
+            "expected multiple Arrow batches, got {batches}"
         );
-        assert!(
-            result_b.is_ok(),
-            "second query should complete after the first is interrupted"
-        );
+        assert_eq!(rows, 2500);
+    }
+
+    #[tokio::test]
+    async fn execute_as_arrow_enforces_result_buffer_cap() {
+        use futures::StreamExt;
+        use queryflux_auth::QueryCredentials;
+        use queryflux_core::query::{ClusterGroupName, ClusterName};
+
+        let adapter = DuckDbAdapter::new(
+            ClusterName("duck".into()),
+            ClusterGroupName("g".into()),
+            DuckDbConfig {
+                database_path: None,
+                motherduck_token: None,
+                pool_size: 1,
+                max_result_buffer_bytes: 4096,
+            },
+        )
+        .expect("open in-memory duckdb");
+
+        let params: QueryParams = vec![];
+
+        let exec = adapter
+            .execute_as_arrow(
+                "SELECT * FROM range(100000)",
+                &SessionContext::default(),
+                &QueryCredentials::ServiceAccount,
+                &QueryTags::new(),
+                &params,
+                &BackendQueryIdSlot::new(),
+            )
+            .await
+            .expect("execute");
+
+        let mut stream = exec.stream;
+        let mut saw_error = false;
+        while let Some(item) = stream.next().await {
+            if item.is_err() {
+                saw_error = true;
+                assert!(
+                    item.unwrap_err()
+                        .to_string()
+                        .contains("buffered-result cap"),
+                    "expected cap error"
+                );
+                break;
+            }
+        }
+        assert!(saw_error, "expected buffered-result cap error");
     }
 }
