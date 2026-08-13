@@ -388,12 +388,23 @@ impl AuthConfig {
                 if ldap.url.trim().is_empty() {
                     return Err("auth.ldap.url must not be empty when auth.required is true".into());
                 }
-                let has_template = ldap
+                let user_dn_template = ldap
                     .user_dn_template
-                    .as_ref()
-                    .is_some_and(|t| !t.trim().is_empty());
-                if !has_template && ldap.user_search_base.trim().is_empty() {
+                    .as_deref()
+                    .filter(|template| !template.trim().is_empty());
+                if let Some(template) = user_dn_template {
+                    if !template.contains("{}") {
+                        return Err("auth.ldap.userDnTemplate must contain '{}' when \
+                             auth.required is true"
+                            .into());
+                    }
+                } else if ldap.user_search_base.trim().is_empty() {
                     return Err("auth.ldap must set userDnTemplate or userSearchBase when \
+                         auth.required is true"
+                        .into());
+                }
+                if user_dn_template.is_none() && ldap.user_search_filter.trim().is_empty() {
+                    return Err("auth.ldap.userSearchFilter must not be empty when \
                          auth.required is true"
                         .into());
                 }
@@ -1375,7 +1386,7 @@ fn default_cache_ttl() -> u64 {
 mod tests {
     use super::{
         AuthConfig, AuthProviderConfig, AuthorizationConfig, AuthorizationProviderConfig,
-        GuardKindConfig, GuardSpecConfig, OidcConfig, OpenFgaConfig, PersistenceConfig,
+        GuardKindConfig, GuardSpecConfig, LdapConfig, OidcConfig, OpenFgaConfig, PersistenceConfig,
         PostgresPersistenceConfig, ProxyConfig, RouterConfig,
     };
 
@@ -1822,6 +1833,48 @@ queryflux:
             ..Default::default()
         };
         assert!(auth.validate_for_required().is_ok());
+    }
+
+    #[test]
+    fn auth_required_ldap_user_dn_template_needs_placeholder() {
+        let auth = AuthConfig {
+            required: true,
+            provider: AuthProviderConfig::Ldap,
+            ldap: Some(LdapConfig {
+                url: "ldap://ldap.internal:389".into(),
+                bind_dn: String::new(),
+                bind_password: None,
+                user_search_base: String::new(),
+                user_search_filter: "(uid={})".into(),
+                user_dn_template: Some("cn=admin,ou=users,dc=example,dc=com".into()),
+                group_search_base: None,
+                group_name_attribute: "cn".into(),
+            }),
+            ..Default::default()
+        };
+        let err = auth.validate_for_required().unwrap_err();
+        assert!(err.contains("userDnTemplate"), "{err}");
+    }
+
+    #[test]
+    fn auth_required_ldap_search_mode_needs_filter() {
+        let auth = AuthConfig {
+            required: true,
+            provider: AuthProviderConfig::Ldap,
+            ldap: Some(LdapConfig {
+                url: "ldap://ldap.internal:389".into(),
+                bind_dn: String::new(),
+                bind_password: None,
+                user_search_base: "ou=users,dc=example,dc=com".into(),
+                user_search_filter: String::new(),
+                user_dn_template: None,
+                group_search_base: None,
+                group_name_attribute: "cn".into(),
+            }),
+            ..Default::default()
+        };
+        let err = auth.validate_for_required().unwrap_err();
+        assert!(err.contains("userSearchFilter"), "{err}");
     }
 
     #[test]
