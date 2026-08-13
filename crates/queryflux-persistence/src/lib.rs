@@ -350,6 +350,7 @@ pub trait CapacityStore: Send + Sync {
     /// Release all capacity leases held by `instance_id`. Called during graceful
     /// shutdown so the departing replica's slots are immediately available to
     /// other replicas instead of waiting for the stale-lease expiry sweep.
+    /// Returns the number of leases released.
     async fn release_all_for_instance(&self, instance_id: &str) -> Result<u64>;
 }
 

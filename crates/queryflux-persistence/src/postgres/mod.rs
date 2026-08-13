@@ -2070,7 +2070,9 @@ impl CapacityStore for PostgresStore {
     }
 
     async fn release_all_for_instance(&self, instance_id: &str) -> Result<u64> {
-        let result = sqlx::query(
+        // Return the number of leases deleted (not counter rows updated). Multiple
+        // leases on one cluster still update a single counter row.
+        let deleted: i64 = sqlx::query_scalar(
             r#"
             WITH del AS (
                 DELETE FROM cluster_capacity_leases
@@ -2078,21 +2080,24 @@ impl CapacityStore for PostgresStore {
                 RETURNING cluster_name
             ),
             counts AS (
-                SELECT cluster_name, COUNT(*) AS cnt
+                SELECT cluster_name, COUNT(*)::bigint AS cnt
                 FROM del
                 GROUP BY cluster_name
+            ),
+            _upd AS (
+                UPDATE cluster_capacity_counters c
+                SET running = GREATEST(c.running - counts.cnt, 0)
+                FROM counts
+                WHERE c.cluster_name = counts.cluster_name
             )
-            UPDATE cluster_capacity_counters c
-            SET running = GREATEST(c.running - counts.cnt, 0)
-            FROM counts
-            WHERE c.cluster_name = counts.cluster_name
+            SELECT COALESCE((SELECT COUNT(*) FROM del), 0)
             "#,
         )
         .bind(instance_id)
-        .execute(&self.coordination_pool)
+        .fetch_one(&self.coordination_pool)
         .await
         .map_err(|e| QueryFluxError::Persistence(format!("release_all_for_instance: {e}")))?;
-        Ok(result.rows_affected())
+        Ok(deleted.max(0) as u64)
     }
 }
 
@@ -2585,6 +2590,138 @@ mod tests {
         assert!(count >= 1, "heartbeated lease must survive expiry");
 
         store.release("test-cluster-hb", &qid).await.unwrap();
+    }
+
+    /// Two logical replicas (distinct `instance_id`s) must not exceed the fleet
+    /// `maxRunningQueries` limit — the epic distributed-admission guarantee.
+    #[tokio::test]
+    #[ignore]
+    async fn pg_capacity_two_replicas_cannot_exceed_max_running() {
+        let _guard = CAPACITY_TEST_LOCK.lock().await;
+        let store = test_store().await;
+        let cluster = unique_id("fleet");
+        const LIMIT: u64 = 2;
+        let q1 = format!("{cluster}-a1");
+        let q2 = format!("{cluster}-b1");
+        let q3 = format!("{cluster}-a2");
+        let q4 = format!("{cluster}-b2");
+
+        assert!(
+            store
+                .try_acquire(&cluster, LIMIT, "replica-a", &q1)
+                .await
+                .unwrap(),
+            "replica-a should acquire first slot"
+        );
+        assert!(
+            store
+                .try_acquire(&cluster, LIMIT, "replica-b", &q2)
+                .await
+                .unwrap(),
+            "replica-b should acquire second slot"
+        );
+        assert!(
+            !store
+                .try_acquire(&cluster, LIMIT, "replica-a", &q3)
+                .await
+                .unwrap(),
+            "replica-a must be denied once fleet is at limit"
+        );
+        assert!(
+            !store
+                .try_acquire(&cluster, LIMIT, "replica-b", &q4)
+                .await
+                .unwrap(),
+            "replica-b must be denied once fleet is at limit"
+        );
+        assert_eq!(store.active_count(&cluster).await.unwrap(), LIMIT);
+
+        store.release(&cluster, &q1).await.unwrap();
+        store.release(&cluster, &q2).await.unwrap();
+        assert_eq!(store.active_count(&cluster).await.unwrap(), 0);
+    }
+
+    /// Crash path: holder never calls `release`. After `expire_stale`, a survivor
+    /// replica can acquire the slot again.
+    #[tokio::test]
+    #[ignore]
+    async fn pg_capacity_crash_without_release_recovered_by_expire_stale() {
+        let _guard = CAPACITY_TEST_LOCK.lock().await;
+        let store = test_store().await;
+        let cluster = unique_id("crash");
+        const LIMIT: u64 = 1;
+        let held = format!("{cluster}-held");
+        let next = format!("{cluster}-next");
+
+        assert!(store
+            .try_acquire(&cluster, LIMIT, "crashed-inst", &held)
+            .await
+            .unwrap());
+        assert!(
+            !store
+                .try_acquire(&cluster, LIMIT, "survivor", &next)
+                .await
+                .unwrap(),
+            "survivor must wait while crashed lease still counts"
+        );
+
+        // Treat every lease as stale (same approach as expire_stale_cleans_old_leases).
+        let far_future = chrono::Utc::now() + chrono::Duration::hours(1);
+        let expired = store.expire_stale(far_future).await.unwrap();
+        assert!(
+            expired >= 1,
+            "expire_stale must reclaim the crashed instance lease"
+        );
+        assert_eq!(store.active_count(&cluster).await.unwrap(), 0);
+
+        assert!(
+            store
+                .try_acquire(&cluster, LIMIT, "survivor", &next)
+                .await
+                .unwrap(),
+            "survivor must acquire after lease expiry reclaim"
+        );
+        assert_eq!(store.active_count(&cluster).await.unwrap(), 1);
+
+        store.release(&cluster, &next).await.unwrap();
+    }
+
+    /// Graceful shutdown path: `release_all_for_instance` frees every lease owned
+    /// by the departing replica so other replicas can admit.
+    #[tokio::test]
+    #[ignore]
+    async fn pg_capacity_release_all_for_instance_frees_slots() {
+        let _guard = CAPACITY_TEST_LOCK.lock().await;
+        let store = test_store().await;
+        let cluster = unique_id("drain");
+        const LIMIT: u64 = 2;
+        let departing = unique_id("departing");
+        let q1 = format!("{cluster}-d1");
+        let q2 = format!("{cluster}-d2");
+        let q3 = format!("{cluster}-s1");
+
+        assert!(store
+            .try_acquire(&cluster, LIMIT, &departing, &q1)
+            .await
+            .unwrap());
+        assert!(store
+            .try_acquire(&cluster, LIMIT, &departing, &q2)
+            .await
+            .unwrap());
+        assert!(!store
+            .try_acquire(&cluster, LIMIT, "survivor", &q3)
+            .await
+            .unwrap());
+
+        let freed = store.release_all_for_instance(&departing).await.unwrap();
+        assert_eq!(freed, 2);
+        assert_eq!(store.active_count(&cluster).await.unwrap(), 0);
+
+        assert!(store
+            .try_acquire(&cluster, LIMIT, "survivor", &q3)
+            .await
+            .unwrap());
+        store.release(&cluster, &q3).await.unwrap();
     }
 
     // -- Admission fairness ---------------------------------------------------
