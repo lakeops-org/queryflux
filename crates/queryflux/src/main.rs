@@ -152,14 +152,9 @@ async fn main() -> Result<()> {
                 .connection_url()
                 .map_err(|m| anyhow::anyhow!("Invalid postgres persistence config: {m}"))?;
             let pg = Arc::new(
-                PostgresStore::connect_with_pool_opts(
-                    &url,
-                    conn.pool_size,
-                    conn.acquire_timeout_secs,
-                    conn.statement_timeout_secs,
-                )
-                .await
-                .context("Failed to connect to Postgres")?,
+                PostgresStore::connect_from_config(&url, conn)
+                    .await
+                    .context("Failed to connect to Postgres")?,
             );
             pg.migrate().await.context("Migration failed")?;
             let buffered = Arc::new(BufferedMetricsStore::new(
