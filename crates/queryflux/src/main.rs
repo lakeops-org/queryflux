@@ -53,6 +53,17 @@ use tracing::info;
 
 mod registered_engines;
 
+/// Returns `true` when the interval fired (continue work), `false` on shutdown.
+async fn tick_or_shutdown(
+    interval: &mut tokio::time::Interval,
+    shutdown: &mut tokio::sync::watch::Receiver<bool>,
+) -> bool {
+    tokio::select! {
+        _ = shutdown.wait_for(|v| *v) => false,
+        _ = interval.tick() => true,
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let config_path = match queryflux_cli::run_cli().await? {
@@ -1061,10 +1072,13 @@ async fn main() -> Result<()> {
         let prometheus = prometheus.clone();
         let backend = backend.clone();
         let distributed_backend = distributed_backend.clone();
+        let mut shutdown_rx = shutdown_rx.clone();
         async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
             loop {
-                interval.tick().await;
+                if !tick_or_shutdown(&mut interval, &mut shutdown_rx).await {
+                    break;
+                }
                 let cluster_manager = state.live.read().await.cluster_manager.clone();
                 let Ok(snapshots) = cluster_manager.all_cluster_states().await else {
                     continue;
@@ -1128,10 +1142,13 @@ async fn main() -> Result<()> {
     // is 300s — five missed beats). Leases of crashed replicas stop heartbeating and expire.
     if let Some(cap) = app_state.capacity_store.clone() {
         let state = app_state.clone();
+        let mut shutdown_rx = shutdown_rx.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
             loop {
-                interval.tick().await;
+                if !tick_or_shutdown(&mut interval, &mut shutdown_rx).await {
+                    break;
+                }
                 if let Err(e) = cap.heartbeat(&state.instance_id).await {
                     state.metrics.on_coordination_failure("capacity_heartbeat");
                     tracing::warn!("Capacity lease heartbeat failed: {e}");
@@ -1149,11 +1166,14 @@ async fn main() -> Result<()> {
     tokio::spawn({
         let state = app_state.clone();
         let distributed_backend = distributed_backend.clone();
+        let mut shutdown_rx = shutdown_rx.clone();
         async move {
             const CLIENT_TIMEOUT_SECS: i64 = 300; // matches Trino's query.client.timeout default
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(120));
             loop {
-                interval.tick().await;
+                if !tick_or_shutdown(&mut interval, &mut shutdown_rx).await {
+                    break;
+                }
 
                 // Single-owner sweep: the eviction and lease expiry below are global
                 // (idempotent, but redundant on every replica), so only the replica
@@ -1253,11 +1273,14 @@ async fn main() -> Result<()> {
     // deletes queued entries not accessed for > 5 minutes.
     tokio::spawn({
         let state = app_state.clone();
+        let mut shutdown_rx = shutdown_rx.clone();
         async move {
             const CLIENT_TIMEOUT_SECS: i64 = 300;
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(120));
             loop {
-                interval.tick().await;
+                if !tick_or_shutdown(&mut interval, &mut shutdown_rx).await {
+                    break;
+                }
                 let cutoff = chrono::Utc::now() - chrono::Duration::seconds(CLIENT_TIMEOUT_SECS);
                 match state
                     .persistence
@@ -1282,12 +1305,17 @@ async fn main() -> Result<()> {
             .map(|c| c.cleanup_interval_secs)
             .unwrap_or(300);
         if interval_secs > 0 {
+            let mut shutdown_rx = shutdown_rx.clone();
             tokio::spawn(async move {
                 let mut interval =
                     tokio::time::interval(std::time::Duration::from_secs(interval_secs));
-                interval.tick().await;
+                if !tick_or_shutdown(&mut interval, &mut shutdown_rx).await {
+                    return;
+                }
                 loop {
-                    interval.tick().await;
+                    if !tick_or_shutdown(&mut interval, &mut shutdown_rx).await {
+                        break;
+                    }
                     match cache.cleanup_expired().await {
                         Ok(0) => {}
                         Ok(n) => {
@@ -1307,11 +1335,16 @@ async fn main() -> Result<()> {
         backend.clone(),
         config.queryflux.query_history_retention_days,
     ) {
+        let mut shutdown_rx = shutdown_rx.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600));
-            interval.tick().await; // skip the first immediate tick at startup
+            if !tick_or_shutdown(&mut interval, &mut shutdown_rx).await {
+                return;
+            }
             loop {
-                interval.tick().await;
+                if !tick_or_shutdown(&mut interval, &mut shutdown_rx).await {
+                    break;
+                }
                 let cutoff = chrono::Utc::now() - chrono::Duration::days(retention_days as i64);
                 match backend.purge_old_query_records(cutoff).await {
                     Ok(0) => {}
@@ -1338,6 +1371,7 @@ async fn main() -> Result<()> {
         let admin_for_reload = admin_store_for_reload;
         let metrics = app_state.metrics.clone();
         let periodic_secs = config.queryflux.periodic_config_reload_interval_secs();
+        let mut shutdown_rx = shutdown_rx.clone();
 
         // Subscribe to distributed config revision changes (push where the
         // backend supports it, e.g. Postgres LISTEN/NOTIFY).
@@ -1475,6 +1509,7 @@ async fn main() -> Result<()> {
             match periodic_secs {
                 None => loop {
                     tokio::select! {
+                        _ = shutdown_rx.wait_for(|v| *v) => break,
                         _ = notify.notified() => {
                             tracing::debug!("Config reload triggered by local admin write");
                         }
@@ -1491,6 +1526,7 @@ async fn main() -> Result<()> {
                     interval.tick().await; // skip the first immediate tick — startup already loaded
                     loop {
                         tokio::select! {
+                            _ = shutdown_rx.wait_for(|v| *v) => break,
                             _ = interval.tick() => {}
                             _ = notify.notified() => {
                                 tracing::debug!("Config reload triggered by local admin write");
@@ -1511,10 +1547,13 @@ async fn main() -> Result<()> {
     // Background task: health-check each cluster every 30s via its adapter.
     tokio::spawn({
         let state = app_state.clone();
+        let mut shutdown_rx = shutdown_rx.clone();
         async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
             loop {
-                interval.tick().await;
+                if !tick_or_shutdown(&mut interval, &mut shutdown_rx).await {
+                    break;
+                }
                 let targets = {
                     let live = state.live.read().await;
                     live.health_check_targets.clone()
@@ -1546,10 +1585,13 @@ async fn main() -> Result<()> {
     // In distributed mode, local counters are a cache; CapacityStore is authoritative.
     tokio::spawn({
         let state = app_state.clone();
+        let mut shutdown_rx = shutdown_rx.clone();
         async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
             loop {
-                interval.tick().await;
+                if !tick_or_shutdown(&mut interval, &mut shutdown_rx).await {
+                    break;
+                }
                 let targets = {
                     let live = state.live.read().await;
                     live.health_check_targets.clone()
