@@ -366,47 +366,63 @@ impl AthenaAdapter {
         }
     }
 
-    /// Fetch all pages of `GetQueryResults` and return (column_names, column_types, data_rows).
-    /// The first row returned by Athena is always the header row — we skip it.
-    async fn fetch_all_results(
-        &self,
-        execution_id: &str,
-    ) -> Result<(Vec<String>, Vec<String>, Vec<Vec<Option<String>>>)> {
+    /// Stream `GetQueryResults` pages as Arrow RecordBatches (one batch per API page).
+    async fn stream_results(
+        client: aws_sdk_athena::Client,
+        execution_id: String,
+        batch_tx: tokio::sync::mpsc::Sender<Result<RecordBatch>>,
+        stats_tx: tokio::sync::oneshot::Sender<Option<queryflux_core::query::QueryEngineStats>>,
+    ) {
         let mut col_names: Vec<String> = Vec::new();
         let mut col_types: Vec<String> = Vec::new();
-        let mut all_rows: Vec<Vec<Option<String>>> = Vec::new();
+        let mut schema: Option<Arc<ArrowSchema>> = None;
         let mut next_token: Option<String> = None;
         let mut first_page = true;
+        let mut sent_any = false;
 
         loop {
-            let mut req = self
-                .client
-                .get_query_results()
-                .query_execution_id(execution_id);
-            if let Some(t) = next_token {
-                req = req.next_token(t);
+            let mut req = client.get_query_results().query_execution_id(&execution_id);
+            if let Some(ref t) = next_token {
+                req = req.next_token(t.clone());
             }
-            let resp = req.send().await.map_err(|e| {
-                QueryFluxError::Engine(format!("Athena GetQueryResults: {}", aws_err(&e)))
-            })?;
+            let resp = match req.send().await {
+                Ok(r) => r,
+                Err(e) => {
+                    let _ = batch_tx
+                        .send(Err(QueryFluxError::Engine(format!(
+                            "Athena GetQueryResults: {}",
+                            aws_err(&e)
+                        ))))
+                        .await;
+                    let _ = stats_tx.send(None);
+                    return;
+                }
+            };
 
-            let result_set = resp.result_set();
-
-            // Extract column metadata from the first page only.
             if first_page {
-                if let Some(meta) = result_set.and_then(|rs| rs.result_set_metadata()) {
+                if let Some(meta) = resp.result_set().and_then(|rs| rs.result_set_metadata()) {
                     for col in meta.column_info() {
                         col_names.push(col.name().to_string());
                         col_types.push(col.r#type().to_string());
                     }
                 }
                 first_page = false;
+                if col_names.is_empty() {
+                    let _ = stats_tx.send(None);
+                    return;
+                }
+                let fields: Vec<Field> = col_names
+                    .iter()
+                    .zip(col_types.iter())
+                    .map(|(name, ty)| Field::new(name, athena_type_to_arrow(ty), true))
+                    .collect();
+                schema = Some(Arc::new(ArrowSchema::new(fields)));
             }
 
-            if let Some(rs) = result_set {
+            let mut page_rows: Vec<Vec<Option<String>>> = Vec::new();
+            if let Some(rs) = resp.result_set() {
                 for (row_idx, row) in rs.rows().iter().enumerate() {
-                    // Athena always puts the header as the first row of the first page.
-                    if row_idx == 0 && all_rows.is_empty() {
+                    if !sent_any && row_idx == 0 {
                         continue;
                     }
                     let cells: Vec<Option<String>> = row
@@ -414,7 +430,26 @@ impl AthenaAdapter {
                         .iter()
                         .map(|d| d.var_char_value().map(|s| s.to_string()))
                         .collect();
-                    all_rows.push(cells);
+                    page_rows.push(cells);
+                }
+            }
+
+            if let Some(ref schema) = schema {
+                if !page_rows.is_empty() {
+                    match rows_to_record_batch(schema, &page_rows) {
+                        Ok(batch) => {
+                            sent_any = true;
+                            if batch_tx.send(Ok(batch)).await.is_err() {
+                                let _ = stats_tx.send(None);
+                                return;
+                            }
+                        }
+                        Err(e) => {
+                            let _ = batch_tx.send(Err(e)).await;
+                            let _ = stats_tx.send(None);
+                            return;
+                        }
+                    }
                 }
             }
 
@@ -424,7 +459,14 @@ impl AthenaAdapter {
             }
         }
 
-        Ok((col_names, col_types, all_rows))
+        if !sent_any {
+            if let Some(schema) = schema {
+                let batch = RecordBatch::new_empty(schema);
+                let _ = batch_tx.send(Ok(batch)).await;
+            }
+        }
+
+        let _ = stats_tx.send(None);
     }
 }
 
@@ -473,7 +515,7 @@ impl AsyncAdapter for AthenaAdapter {
         id_slot: &BackendQueryIdSlot,
     ) -> crate::Result<crate::SyncExecution> {
         use crate::SyncExecution;
-        use futures::stream;
+        use tokio_stream::wrappers::ReceiverStream;
 
         let ctx = aws_sdk_athena::types::QueryExecutionContext::builder()
             .catalog(&self.catalog)
@@ -511,37 +553,16 @@ impl AsyncAdapter for AthenaAdapter {
 
         self.wait_for_completion(&execution_id).await?;
 
-        let (col_names, col_types, rows) = self.fetch_all_results(&execution_id).await?;
+        let (batch_tx, batch_rx) = tokio::sync::mpsc::channel::<Result<RecordBatch>>(8);
+        let (stats_tx, stats_rx) = tokio::sync::oneshot::channel();
+        let client = self.client.clone();
+        tokio::spawn(async move {
+            AthenaAdapter::stream_results(client, execution_id, batch_tx, stats_tx).await;
+        });
 
-        let (tx, rx) = tokio::sync::oneshot::channel();
-
-        if col_names.is_empty() {
-            let _ = tx.send(None);
-            return Ok(SyncExecution {
-                stream: Box::pin(stream::empty()),
-                stats: rx,
-            });
-        }
-
-        let fields: Vec<Field> = col_names
-            .iter()
-            .zip(col_types.iter())
-            .map(|(name, ty)| Field::new(name, athena_type_to_arrow(ty), true))
-            .collect();
-        let schema = Arc::new(ArrowSchema::new(fields));
-
-        let mut columns: Vec<ArrayRef> = Vec::with_capacity(schema.fields().len());
-        for (col_idx, field) in schema.fields().iter().enumerate() {
-            columns.push(build_column(field.data_type(), &rows, col_idx)?);
-        }
-
-        let batch = RecordBatch::try_new(schema, columns)
-            .map_err(|e| QueryFluxError::Engine(format!("Athena RecordBatch failed: {e}")))?;
-
-        let _ = tx.send(None);
         Ok(SyncExecution {
-            stream: Box::pin(stream::iter(std::iter::once(Ok(batch)))),
-            stats: rx,
+            stream: Box::pin(ReceiverStream::new(batch_rx)),
+            stats: stats_rx,
         })
     }
 
@@ -736,6 +757,18 @@ fn athena_type_to_arrow(athena_type: &str) -> DataType {
         // is returned as a UTF-8 string — callers can parse further if needed.
         _ => DataType::Utf8,
     }
+}
+
+fn rows_to_record_batch(
+    schema: &Arc<ArrowSchema>,
+    rows: &[Vec<Option<String>>],
+) -> Result<RecordBatch> {
+    let mut columns: Vec<ArrayRef> = Vec::with_capacity(schema.fields().len());
+    for (col_idx, field) in schema.fields().iter().enumerate() {
+        columns.push(build_column(field.data_type(), rows, col_idx)?);
+    }
+    RecordBatch::try_new(Arc::clone(schema), columns)
+        .map_err(|e| QueryFluxError::Engine(format!("Athena RecordBatch failed: {e}")))
 }
 
 fn build_column(dt: &DataType, rows: &[Vec<Option<String>>], col_idx: usize) -> Result<ArrayRef> {
@@ -1038,5 +1071,38 @@ mod tests {
             .unwrap_err();
             assert!(err.to_string().contains("maxWaitSecs"));
         }
+    }
+
+    #[test]
+    fn rows_to_record_batch_builds_typed_columns() {
+        use arrow::array::{Array, AsArray};
+        use arrow::datatypes::{DataType, Field, Int64Type, Schema as ArrowSchema};
+
+        let fields = vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("name", DataType::Utf8, true),
+        ];
+        let schema = Arc::new(ArrowSchema::new(fields));
+        let rows = vec![
+            vec![Some("1".into()), Some("alice".into())],
+            vec![Some("2".into()), None],
+        ];
+        let batch = rows_to_record_batch(&schema, &rows).expect("batch");
+        assert_eq!(batch.num_rows(), 2);
+        let ids = batch.column(0).as_primitive::<Int64Type>();
+        assert_eq!(ids.value(0), 1);
+        assert_eq!(ids.value(1), 2);
+        let names = batch.column(1).as_string::<i32>();
+        assert_eq!(names.value(0), "alice");
+        assert!(names.is_null(1));
+    }
+
+    #[test]
+    fn rows_to_record_batch_empty_yields_zero_rows() {
+        let fields = vec![Field::new("x", DataType::Utf8, true)];
+        let schema = Arc::new(ArrowSchema::new(fields));
+        let batch = rows_to_record_batch(&schema, &[]).expect("batch");
+        assert_eq!(batch.num_rows(), 0);
+        assert_eq!(batch.num_columns(), 1);
     }
 }
