@@ -171,9 +171,7 @@ async fn stream_on_conn(
     let mysql_params = if params.is_empty() {
         mysql_async::Params::Empty
     } else {
-        mysql_async::Params::Positional(
-            params.iter().map(query_param_to_mysql_value).collect(),
-        )
+        mysql_async::Params::Positional(params.iter().map(query_param_to_mysql_value).collect())
     };
     let mut query_result = conn
         .exec_iter(sql, mysql_params)
