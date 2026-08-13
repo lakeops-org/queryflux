@@ -173,30 +173,32 @@ async fn build_pg_pool(
 }
 
 /// The Postgres sweep lock is a session-scoped advisory lock held on a
-/// dedicated pooled connection inside the returned guard, so if the owning
-/// process crashes mid-sweep, Postgres releases the lock when the connection
-/// drops and another replica takes over on its next tick.
+/// dedicated direct connection (outside the coordination pool), so sweeps
+/// never pin pool slots and concurrent try-lock attempts can each open a
+/// connection to call `pg_try_advisory_lock`.
 #[async_trait]
 impl SweepCoordinator for PostgresStore {
     async fn try_sweep_lock(&self, name: &str) -> Result<Option<Box<dyn SweepGuard>>> {
-        let mut conn =
-            self.coordination_pool.acquire().await.map_err(|e| {
-                QueryFluxError::Persistence(format!("sweep lock acquire conn: {e}"))
-            })?;
+        use sqlx::Connection;
+        let mut conn = sqlx::PgConnection::connect(&self.database_url)
+            .await
+            .map_err(|e| QueryFluxError::Persistence(format!("sweep lock connect: {e}")))?;
 
         let got: bool =
             sqlx::query_scalar("SELECT pg_try_advisory_lock(hashtext('sweep:' || $1)::bigint)")
                 .bind(name)
-                .fetch_one(&mut *conn)
+                .fetch_one(&mut conn)
                 .await
                 .map_err(|e| QueryFluxError::Persistence(format!("sweep lock try: {e}")))?;
 
-        Ok(got.then(|| {
-            Box::new(SweepLock {
+        if got {
+            Ok(Some(Box::new(SweepLock {
                 conn: Some(conn),
                 name: name.to_string(),
-            }) as Box<dyn SweepGuard>
-        }))
+            }) as Box<dyn SweepGuard>))
+        } else {
+            Ok(None)
+        }
     }
 }
 
@@ -209,25 +211,24 @@ impl BackendCapabilities for PostgresStore {
 /// Guard for a single-owner background sweep (see [`PostgresStore::try_sweep_lock`]).
 ///
 /// Releases the advisory lock on [`Self::release`] or on drop. Session advisory
-/// locks are per-connection, so the unlock must run on the same connection the
-/// lock was taken on; if unlocking fails, the connection is closed rather than
-/// returned to the pool, so the lock can never leak onto a recycled connection.
+/// locks are per-connection; if unlocking fails, the connection is closed so the
+/// lock can never leak onto a recycled connection.
 pub struct SweepLock {
-    conn: Option<sqlx::pool::PoolConnection<sqlx::Postgres>>,
+    conn: Option<sqlx::PgConnection>,
     name: String,
 }
 
 impl SweepLock {
-    async fn unlock(mut conn: sqlx::pool::PoolConnection<sqlx::Postgres>, name: &str) {
+    async fn unlock(mut conn: sqlx::PgConnection, name: &str) {
         let res = sqlx::query("SELECT pg_advisory_unlock(hashtext('sweep:' || $1)::bigint)")
             .bind(name)
-            .execute(&mut *conn)
+            .execute(&mut conn)
             .await;
         if let Err(e) = res {
             tracing::warn!("Failed to release sweep lock '{name}': {e}; closing connection");
-            use sqlx::Connection;
-            let _ = conn.detach().close().await;
         }
+        use sqlx::Connection;
+        let _ = conn.close().await;
     }
 
     /// Release the lock now (deterministic, preferred at the end of a sweep).
@@ -248,10 +249,7 @@ impl SweepGuard for SweepLock {
 impl Drop for SweepLock {
     fn drop(&mut self) {
         // Fallback for early exits (`continue`, `?`): spawn the unlock so the
-        // connection never returns to the pool still holding the session lock.
-        // `tokio::spawn` panics outside a runtime (e.g. process teardown), so
-        // check first; without a runtime, dropping the connection closes it,
-        // which releases the session-scoped lock server-side.
+        // connection is closed rather than dropped while still holding the lock.
         if let Some(conn) = self.conn.take() {
             if let Ok(handle) = tokio::runtime::Handle::try_current() {
                 let name = std::mem::take(&mut self.name);
