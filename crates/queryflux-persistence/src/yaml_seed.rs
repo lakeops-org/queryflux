@@ -65,8 +65,9 @@ pub async fn seed_groups_from_yaml_if_missing(
 
 #[cfg(test)]
 mod tests {
-    use queryflux_core::config::ClusterConfig;
+    use queryflux_core::config::{ClusterConfig, ClusterGroupConfig};
 
+    use crate::cluster_config::UpsertClusterGroupConfig;
     use crate::in_memory::InMemoryPersistence;
     use crate::ClusterConfigStore;
 
@@ -90,6 +91,29 @@ mod tests {
                 "endpoint": "http://studio-trino:8080",
                 "poolSize": pool_size,
             }),
+        }
+    }
+
+    fn yaml_group(max_running: u64, members: &[&str]) -> ClusterGroupConfig {
+        serde_json::from_value(serde_json::json!({
+            "members": members,
+            "maxRunningQueries": max_running,
+        }))
+        .unwrap()
+    }
+
+    fn studio_group_upsert(max_running: i64) -> UpsertClusterGroupConfig {
+        UpsertClusterGroupConfig {
+            enabled: true,
+            members: vec!["trino".into()],
+            max_running_queries: max_running,
+            max_queued_queries: None,
+            strategy: None,
+            allow_groups: vec![],
+            allow_users: vec![],
+            translation_script_ids: vec![],
+            default_tags: serde_json::json!({}),
+            cache: None,
         }
     }
 
@@ -155,5 +179,77 @@ mod tests {
 
         let row = store.get_cluster_config("trino").await.unwrap().unwrap();
         assert_eq!(row.config.get("poolSize"), Some(&serde_json::json!(8)));
+    }
+
+    #[tokio::test]
+    async fn seeds_missing_group_on_empty_store() {
+        let store = InMemoryPersistence::new();
+        store
+            .upsert_cluster_config("trino", &studio_trino_upsert(4))
+            .await
+            .unwrap();
+
+        let mut yaml = HashMap::new();
+        yaml.insert("default".into(), yaml_group(10, &["trino"]));
+
+        let report = seed_groups_from_yaml_if_missing(&store, &yaml)
+            .await
+            .unwrap();
+        assert_eq!(report.seeded, 1);
+        assert_eq!(report.existing_before, 0);
+
+        let rows = store.list_group_configs().await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].max_running_queries, 10);
+    }
+
+    #[tokio::test]
+    async fn yaml_seed_skips_existing_group_names() {
+        let store = InMemoryPersistence::new();
+        store
+            .upsert_cluster_config("trino", &studio_trino_upsert(4))
+            .await
+            .unwrap();
+        store
+            .upsert_group_config("default", &studio_group_upsert(20))
+            .await
+            .unwrap();
+
+        let mut yaml = HashMap::new();
+        yaml.insert("default".into(), yaml_group(10, &["trino"]));
+        yaml.insert("analytics".into(), yaml_group(5, &["trino"]));
+
+        let report = seed_groups_from_yaml_if_missing(&store, &yaml)
+            .await
+            .unwrap();
+        assert_eq!(report.seeded, 1);
+        assert_eq!(report.existing_before, 1);
+
+        let rows = store.list_group_configs().await.unwrap();
+        assert_eq!(rows.len(), 2);
+        let default = rows.iter().find(|r| r.name == "default").unwrap();
+        assert_eq!(default.max_running_queries, 20);
+    }
+
+    #[tokio::test]
+    async fn insert_group_config_if_missing_does_not_overwrite() {
+        let store = InMemoryPersistence::new();
+        store
+            .upsert_cluster_config("trino", &studio_trino_upsert(4))
+            .await
+            .unwrap();
+        store
+            .upsert_group_config("default", &studio_group_upsert(20))
+            .await
+            .unwrap();
+
+        let yaml_upsert = UpsertClusterGroupConfig::from_core(&yaml_group(10, &["trino"]));
+        assert!(!store
+            .insert_group_config_if_missing("default", &yaml_upsert)
+            .await
+            .unwrap());
+
+        let row = store.get_group_config("default").await.unwrap().unwrap();
+        assert_eq!(row.max_running_queries, 20);
     }
 }

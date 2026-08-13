@@ -464,11 +464,24 @@ impl ClusterConfigStore for InMemoryPersistence {
         name: &str,
         cfg: &UpsertClusterConfig,
     ) -> Result<bool> {
-        if self.cluster_configs.contains_key(name) {
-            return Ok(false);
+        let now = Utc::now();
+        match self.cluster_configs.entry(name.to_string()) {
+            dashmap::mapref::entry::Entry::Occupied(_) => Ok(false),
+            dashmap::mapref::entry::Entry::Vacant(v) => {
+                let id = self.next_cluster_id.fetch_add(1, Ordering::Relaxed);
+                v.insert(ClusterConfigRecord {
+                    id,
+                    name: name.to_string(),
+                    engine_key: cfg.engine_key.clone(),
+                    enabled: cfg.enabled,
+                    max_running_queries: cfg.max_running_queries,
+                    config: cfg.config.clone(),
+                    created_at: now,
+                    updated_at: now,
+                });
+                Ok(true)
+            }
         }
-        self.upsert_cluster_config(name, cfg).await?;
-        Ok(true)
     }
 
     async fn delete_cluster_config(&self, name: &str) -> Result<bool> {
@@ -560,11 +573,50 @@ impl ClusterConfigStore for InMemoryPersistence {
         name: &str,
         cfg: &UpsertClusterGroupConfig,
     ) -> Result<bool> {
-        if self.group_configs.contains_key(name) {
-            return Ok(false);
+        for m in &cfg.members {
+            if !self.cluster_configs.contains_key(m) {
+                return Err(queryflux_core::error::QueryFluxError::Persistence(format!(
+                    "Unknown cluster '{m}' in group members (clusters must exist first)"
+                )));
+            }
         }
-        self.upsert_group_config(name, cfg).await?;
-        Ok(true)
+        for sid in &cfg.translation_script_ids {
+            let ok = self
+                .user_scripts
+                .get(sid)
+                .map(|r| r.kind == KIND_TRANSLATION_FIXUP)
+                .unwrap_or(false);
+            if !ok {
+                return Err(queryflux_core::error::QueryFluxError::Persistence(format!(
+                    "Unknown or invalid translation script id {sid}"
+                )));
+            }
+        }
+
+        let now = Utc::now();
+        match self.group_configs.entry(name.to_string()) {
+            dashmap::mapref::entry::Entry::Occupied(_) => Ok(false),
+            dashmap::mapref::entry::Entry::Vacant(v) => {
+                let id = self.next_group_id.fetch_add(1, Ordering::Relaxed);
+                v.insert(ClusterGroupConfigRecord {
+                    id,
+                    name: name.to_string(),
+                    enabled: cfg.enabled,
+                    members: cfg.members.clone(),
+                    max_running_queries: cfg.max_running_queries,
+                    max_queued_queries: cfg.max_queued_queries,
+                    strategy: cfg.strategy.clone(),
+                    allow_groups: cfg.allow_groups.clone(),
+                    allow_users: cfg.allow_users.clone(),
+                    translation_script_ids: cfg.translation_script_ids.clone(),
+                    default_tags: cfg.default_tags.clone(),
+                    cache: cfg.cache.clone(),
+                    created_at: now,
+                    updated_at: now,
+                });
+                Ok(true)
+            }
+        }
     }
 
     async fn delete_group_config(&self, name: &str) -> Result<bool> {

@@ -784,6 +784,23 @@ impl ClusterConfigStore for PostgresStore {
             QueryFluxError::Persistence(format!("insert_group_config_if_missing begin: {e}"))
         })?;
 
+        let existing: Option<(i64,)> =
+            sqlx::query_as("SELECT id FROM cluster_group_configs WHERE name = $1")
+                .bind(name)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|e| {
+                    QueryFluxError::Persistence(format!(
+                        "insert_group_config_if_missing lookup: {e}"
+                    ))
+                })?;
+        if existing.is_some() {
+            tx.commit().await.map_err(|e| {
+                QueryFluxError::Persistence(format!("insert_group_config_if_missing commit: {e}"))
+            })?;
+            return Ok(false);
+        }
+
         let mut member_ids: Vec<i64> = Vec::with_capacity(cfg.members.len());
         for m in &cfg.members {
             let row: Option<(i64,)> =
