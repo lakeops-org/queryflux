@@ -512,6 +512,30 @@ impl ClusterConfigStore for PostgresStore {
         .map_err(|e| QueryFluxError::Persistence(format!("upsert_cluster_config: {e}")))
     }
 
+    async fn insert_cluster_config_if_missing(
+        &self,
+        name: &str,
+        cfg: &UpsertClusterConfig,
+    ) -> Result<bool> {
+        let inserted = sqlx::query_as::<_, ClusterConfigRecord>(
+            r#"INSERT INTO cluster_configs (name, engine_key, enabled, max_running_queries, config)
+               VALUES ($1, $2, $3, $4, $5)
+               ON CONFLICT (name) DO NOTHING
+               RETURNING *"#,
+        )
+        .bind(name)
+        .bind(&cfg.engine_key)
+        .bind(cfg.enabled)
+        .bind(cfg.max_running_queries)
+        .bind(&cfg.config)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| {
+            QueryFluxError::Persistence(format!("insert_cluster_config_if_missing: {e}"))
+        })?;
+        Ok(inserted.is_some())
+    }
+
     async fn delete_cluster_config(&self, name: &str) -> Result<bool> {
         let mut tx = self.pool.begin().await.map_err(|e| {
             QueryFluxError::Persistence(format!("delete_cluster_config begin: {e}"))
@@ -749,6 +773,88 @@ impl ClusterConfigStore for PostgresStore {
             .await
             .map_err(|e| QueryFluxError::Persistence(format!("upsert_group_config commit: {e}")))?;
         Ok(record)
+    }
+
+    async fn insert_group_config_if_missing(
+        &self,
+        name: &str,
+        cfg: &UpsertClusterGroupConfig,
+    ) -> Result<bool> {
+        let mut tx = self.pool.begin().await.map_err(|e| {
+            QueryFluxError::Persistence(format!("insert_group_config_if_missing begin: {e}"))
+        })?;
+
+        let mut member_ids: Vec<i64> = Vec::with_capacity(cfg.members.len());
+        for m in &cfg.members {
+            let row: Option<(i64,)> =
+                sqlx::query_as("SELECT id FROM cluster_configs WHERE name = $1")
+                    .bind(m)
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .map_err(|e| {
+                        QueryFluxError::Persistence(format!(
+                            "insert_group_config_if_missing member lookup: {e}"
+                        ))
+                    })?;
+            let Some((cid,)) = row else {
+                return Err(QueryFluxError::Persistence(format!(
+                    "Unknown cluster '{m}' in group members (clusters must exist first)"
+                )));
+            };
+            member_ids.push(cid);
+        }
+
+        for sid in &cfg.translation_script_ids {
+            let row: Option<(String,)> =
+                sqlx::query_as("SELECT kind FROM user_scripts WHERE id = $1")
+                    .bind(sid)
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .map_err(|e| {
+                        QueryFluxError::Persistence(format!(
+                            "insert_group_config_if_missing script lookup: {e}"
+                        ))
+                    })?;
+            let Some((kind,)) = row else {
+                return Err(QueryFluxError::Persistence(format!(
+                    "Unknown translation script id {sid}"
+                )));
+            };
+            if kind != KIND_TRANSLATION_FIXUP {
+                return Err(QueryFluxError::Persistence(format!(
+                    "Script id {sid} has kind '{kind}', expected '{KIND_TRANSLATION_FIXUP}' for group translation"
+                )));
+            }
+        }
+
+        let inserted: Option<(i64,)> = sqlx::query_as(
+            r#"INSERT INTO cluster_group_configs
+                   (name, enabled, members, max_running_queries, max_queued_queries, strategy, allow_groups, allow_users, translation_script_ids, default_tags, cache)
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+               ON CONFLICT (name) DO NOTHING
+               RETURNING id"#,
+        )
+        .bind(name)
+        .bind(cfg.enabled)
+        .bind(&member_ids)
+        .bind(cfg.max_running_queries)
+        .bind(cfg.max_queued_queries)
+        .bind(&cfg.strategy)
+        .bind(&cfg.allow_groups)
+        .bind(&cfg.allow_users)
+        .bind(&cfg.translation_script_ids)
+        .bind(&cfg.default_tags)
+        .bind(&cfg.cache)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| {
+            QueryFluxError::Persistence(format!("insert_group_config_if_missing: {e}"))
+        })?;
+
+        tx.commit().await.map_err(|e| {
+            QueryFluxError::Persistence(format!("insert_group_config_if_missing commit: {e}"))
+        })?;
+        Ok(inserted.is_some())
     }
 
     async fn delete_group_config(&self, name: &str) -> Result<bool> {

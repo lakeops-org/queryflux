@@ -459,6 +459,18 @@ impl ClusterConfigStore for InMemoryPersistence {
         Ok(record)
     }
 
+    async fn insert_cluster_config_if_missing(
+        &self,
+        name: &str,
+        cfg: &UpsertClusterConfig,
+    ) -> Result<bool> {
+        if self.cluster_configs.contains_key(name) {
+            return Ok(false);
+        }
+        self.upsert_cluster_config(name, cfg).await?;
+        Ok(true)
+    }
+
     async fn delete_cluster_config(&self, name: &str) -> Result<bool> {
         if self.cluster_configs.remove(name).is_none() {
             return Ok(false);
@@ -541,6 +553,18 @@ impl ClusterConfigStore for InMemoryPersistence {
         };
         self.group_configs.insert(name.to_string(), record.clone());
         Ok(record)
+    }
+
+    async fn insert_group_config_if_missing(
+        &self,
+        name: &str,
+        cfg: &UpsertClusterGroupConfig,
+    ) -> Result<bool> {
+        if self.group_configs.contains_key(name) {
+            return Ok(false);
+        }
+        self.upsert_group_config(name, cfg).await?;
+        Ok(true)
     }
 
     async fn delete_group_config(&self, name: &str) -> Result<bool> {

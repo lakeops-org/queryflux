@@ -1,6 +1,6 @@
 //! Seed Postgres cluster/group rows from YAML only when the name is missing.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use queryflux_core::{
     config::{ClusterConfig, ClusterGroupConfig},
@@ -20,18 +20,14 @@ pub async fn seed_clusters_from_yaml_if_missing(
     pg: &dyn ClusterConfigStore,
     clusters: &HashMap<String, ClusterConfig>,
 ) -> Result<YamlSeedReport> {
-    let existing = pg.list_cluster_configs().await?;
-    let existing_before = existing.len();
-    let existing_names: HashSet<&str> = existing.iter().map(|r| r.name.as_str()).collect();
+    let existing_before = pg.list_cluster_configs().await?.len();
     let mut seeded = 0usize;
     for (name, cfg) in clusters {
-        if existing_names.contains(name.as_str()) {
-            continue;
-        }
         match UpsertClusterConfig::from_core(cfg) {
             Ok(Some(upsert)) => {
-                pg.upsert_cluster_config(name, &upsert).await?;
-                seeded += 1;
+                if pg.insert_cluster_config_if_missing(name, &upsert).await? {
+                    seeded += 1;
+                }
             }
             Ok(None) => {}
             Err(e) => {
@@ -51,17 +47,15 @@ pub async fn seed_groups_from_yaml_if_missing(
     pg: &dyn ClusterConfigStore,
     groups: &HashMap<String, ClusterGroupConfig>,
 ) -> Result<YamlSeedReport> {
-    let existing = pg.list_group_configs().await?;
-    let existing_before = existing.len();
-    let existing_names: HashSet<&str> = existing.iter().map(|r| r.name.as_str()).collect();
+    let existing_before = pg.list_group_configs().await?.len();
     let mut seeded = 0usize;
     for (name, cfg) in groups {
-        if existing_names.contains(name.as_str()) {
-            continue;
+        if pg
+            .insert_group_config_if_missing(name, &UpsertClusterGroupConfig::from_core(cfg))
+            .await?
+        {
+            seeded += 1;
         }
-        pg.upsert_group_config(name, &UpsertClusterGroupConfig::from_core(cfg))
-            .await?;
-        seeded += 1;
     }
     Ok(YamlSeedReport {
         seeded,
@@ -141,5 +135,25 @@ mod tests {
         assert_eq!(rows.len(), 2);
         let trino = rows.iter().find(|r| r.name == "trino").unwrap();
         assert_eq!(trino.config.get("poolSize"), Some(&serde_json::json!(8)));
+    }
+
+    #[tokio::test]
+    async fn insert_cluster_config_if_missing_does_not_overwrite() {
+        let store = InMemoryPersistence::new();
+        store
+            .upsert_cluster_config("trino", &studio_trino_upsert(8))
+            .await
+            .unwrap();
+
+        let yaml_upsert = UpsertClusterConfig::from_core(&trino_cluster("http://yaml:8080", 4))
+            .unwrap()
+            .unwrap();
+        assert!(!store
+            .insert_cluster_config_if_missing("trino", &yaml_upsert)
+            .await
+            .unwrap());
+
+        let row = store.get_cluster_config("trino").await.unwrap().unwrap();
+        assert_eq!(row.config.get("poolSize"), Some(&serde_json::json!(8)));
     }
 }
