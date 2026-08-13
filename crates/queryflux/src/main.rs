@@ -44,6 +44,7 @@ use queryflux_routing::{
     implementations::{
         compound::CompoundRouter, header::HeaderRouter, protocol_based::ProtocolBasedRouter,
         python_script::PythonScriptRouter, query_regex::QueryRegexRouter, tags::TagsRouter,
+        user_group::UserGroupRouter,
     },
     RouterTrait,
 };
@@ -578,6 +579,13 @@ async fn main() -> Result<()> {
                     .collect();
                 routers.push(Box::new(HeaderRouter::new(header_name.clone(), mapping)));
             }
+            RouterConfig::UserGroup { user_to_group } => {
+                let mapping = user_to_group
+                    .iter()
+                    .map(|(k, v)| (k.clone(), ClusterGroupName(v.clone())))
+                    .collect();
+                routers.push(Box::new(UserGroupRouter::new(mapping)));
+            }
             RouterConfig::QueryRegex { rules } => {
                 let pairs = rules
                     .iter()
@@ -610,9 +618,6 @@ async fn main() -> Result<()> {
                     conditions.clone(),
                     target_group.clone(),
                 )));
-            }
-            _ => {
-                tracing::warn!("Router type not yet implemented, skipping");
             }
         }
     }
@@ -2199,6 +2204,15 @@ async fn build_live_config(
                     ),
                 ));
             }
+            RouterConfig::UserGroup { user_to_group } => {
+                let mapping = user_to_group
+                    .iter()
+                    .map(|(k, v)| (k.clone(), ClusterGroupName(v.clone())))
+                    .collect();
+                routers.push(Box::new(
+                    queryflux_routing::implementations::user_group::UserGroupRouter::new(mapping),
+                ));
+            }
             RouterConfig::QueryRegex { rules } => {
                 let pairs = rules
                     .iter()
@@ -2244,9 +2258,6 @@ async fn build_live_config(
                         target_group.clone(),
                     ),
                 ));
-            }
-            _ => {
-                tracing::warn!("Reload: router type not yet implemented, skipping");
             }
         }
     }
