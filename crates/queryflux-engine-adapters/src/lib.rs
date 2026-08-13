@@ -108,7 +108,6 @@ impl ConnectionFormat {
                     ConnectionFormat::PostgresWire,
                     FrontendProtocol::PostgresWire
                 )
-                | (ConnectionFormat::Arrow, FrontendProtocol::FlightSql)
                 | (ConnectionFormat::TrinoHttp, FrontendProtocol::TrinoHttp)
                 | (
                     ConnectionFormat::ClickHouseHttp,
@@ -136,8 +135,8 @@ mod connection_format_tests {
     }
 
     #[test]
-    fn arrow_matches_flight_sql() {
-        assert!(ConnectionFormat::Arrow.matches_frontend(&FrontendProtocol::FlightSql));
+    fn arrow_does_not_match_flight_sql() {
+        assert!(!ConnectionFormat::Arrow.matches_frontend(&FrontendProtocol::FlightSql));
     }
 
     #[test]
