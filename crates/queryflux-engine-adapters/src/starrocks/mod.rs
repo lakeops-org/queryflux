@@ -8,7 +8,6 @@ use arrow::array::{
 use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
-use futures::stream;
 use mysql_async::{
     consts::ColumnType, prelude::Queryable, Conn, Opts, OptsBuilder, Pool, PoolConstraints,
     PoolOpts, Row, Value,
@@ -21,6 +20,7 @@ use queryflux_core::{
     session::SessionContext,
     tags::{tags_to_json, QueryTags},
 };
+use tokio_stream::wrappers::ReceiverStream;
 
 use crate::{AdapterKind, BackendQueryIdSlot, SyncAdapter, SyncExecution};
 use queryflux_core::engine_registry::{
@@ -245,14 +245,16 @@ impl StarRocksAdapter {
             .collect())
     }
 
-    async fn execute_as_arrow_on_conn(
-        &self,
+    async fn stream_arrow_on_conn(
         conn: &mut Conn,
         sql: &str,
         session: &SessionContext,
         tags: &QueryTags,
         params: &queryflux_core::params::QueryParams,
-    ) -> Result<SyncExecution> {
+        batch_tx: &tokio::sync::mpsc::Sender<Result<RecordBatch>>,
+    ) -> Result<()> {
+        const BATCH_SIZE: usize = 1_000;
+
         if let Some(db) = session.database() {
             let use_sql = format!("USE `{}`", db.replace('`', "``"));
             conn.query_drop(&use_sql)
@@ -260,11 +262,8 @@ impl StarRocksAdapter {
                 .map_err(|e| QueryFluxError::Engine(format!("StarRocks USE failed: {e}")))?;
         }
 
-        // Set query tag as a session variable so StarRocks surfaces it in audit logs.
         if !tags.is_empty() {
             let tag_json = tags_to_json(tags).to_string();
-            // Use the driver's Value escaping so all MySQL string-literal special
-            // characters (\0, \n, \r, \\, ', ") are handled correctly.
             let escaped = Value::from(tag_json).as_sql(false);
             let set_sql = format!("SET @query_tag = {escaped}");
             conn.query_drop(&set_sql).await.map_err(|e| {
@@ -272,33 +271,19 @@ impl StarRocksAdapter {
             })?;
         }
 
-        let mut rows: Vec<Row> = if params.is_empty() {
-            conn.query::<Row, _>(sql)
-                .await
-                .map_err(|e| QueryFluxError::Engine(format!("StarRocks query failed: {e}")))?
+        let mysql_params = if params.is_empty() {
+            mysql_async::Params::Empty
         } else {
-            let mysql_params = mysql_async::Params::Positional(
+            mysql_async::Params::Positional(
                 params.iter().map(query_param_to_mysql_value).collect(),
-            );
-            conn.exec::<Row, _, _>(sql, mysql_params)
-                .await
-                .map_err(|e| QueryFluxError::Engine(format!("StarRocks exec failed: {e}")))?
+            )
         };
+        let mut query_result = conn
+            .exec_iter(sql, mysql_params)
+            .await
+            .map_err(|e| QueryFluxError::Engine(format!("StarRocks exec failed: {e}")))?;
 
-        let (tx, rx) = tokio::sync::oneshot::channel();
-
-        if rows.is_empty() {
-            // StarRocks does not expose structured execution stats (CPU, bytes, etc.)
-            // via the MySQL protocol — send None and establish the pattern for future use.
-            let _ = tx.send(None);
-            return Ok(SyncExecution {
-                stream: Box::pin(stream::empty()),
-                stats: rx,
-            });
-        }
-
-        // Build Arrow schema from first row's column metadata.
-        let fields: Vec<Field> = rows[0]
+        let fields: Vec<Field> = query_result
             .columns_ref()
             .iter()
             .map(|c| {
@@ -309,26 +294,46 @@ impl StarRocksAdapter {
                 )
             })
             .collect();
-        let schema = Arc::new(ArrowSchema::new(fields));
 
-        // Build columns from rows.
-        let num_cols = schema.fields().len();
-        let mut columns: Vec<ArrayRef> = Vec::with_capacity(num_cols);
-
-        for col_idx in 0..num_cols {
-            let dt = schema.field(col_idx).data_type();
-            let col = starrocks_build_column(dt, &mut rows, col_idx)?;
-            columns.push(col);
+        if fields.is_empty() {
+            return Ok(());
         }
 
-        let batch = RecordBatch::try_new(schema, columns)
-            .map_err(|e| QueryFluxError::Engine(format!("StarRocks RecordBatch failed: {e}")))?;
+        let schema = Arc::new(ArrowSchema::new(fields));
+        let num_cols = schema.fields().len();
+        let mut batch_rows: Vec<Row> = Vec::with_capacity(BATCH_SIZE);
+        let mut sent_any = false;
 
-        let _ = tx.send(None);
-        Ok(SyncExecution {
-            stream: Box::pin(stream::iter(std::iter::once(Ok(batch)))),
-            stats: rx,
-        })
+        while let Some(row) = query_result
+            .next()
+            .await
+            .map_err(|e| QueryFluxError::Engine(format!("StarRocks read row failed: {e}")))?
+        {
+            batch_rows.push(row);
+            if batch_rows.len() >= BATCH_SIZE {
+                let batch = starrocks_rows_to_batch(&schema, &mut batch_rows, num_cols)?;
+                batch_rows.clear();
+                sent_any = true;
+                if batch_tx.send(Ok(batch)).await.is_err() {
+                    query_result.drop_result().await.ok();
+                    return Ok(());
+                }
+            }
+        }
+
+        if !batch_rows.is_empty() {
+            let batch = starrocks_rows_to_batch(&schema, &mut batch_rows, num_cols)?;
+            let _ = batch_tx.send(Ok(batch)).await;
+        } else if !sent_any {
+            let batch = RecordBatch::new_empty(Arc::clone(&schema));
+            let _ = batch_tx.send(Ok(batch)).await;
+        }
+
+        query_result
+            .drop_result()
+            .await
+            .map_err(|e| QueryFluxError::Engine(format!("StarRocks drop_result failed: {e}")))?;
+        Ok(())
     }
 }
 
@@ -471,12 +476,33 @@ impl SyncAdapter for StarRocksAdapter {
         let mut conn = self.acquire_conn().await?;
         let conn_id = conn.id();
         id_slot.publish(conn_id.to_string());
-        let mut claim = self.inflight.claim(conn_id);
-        let result = self
-            .execute_as_arrow_on_conn(&mut conn, sql, session, tags, params)
-            .await;
-        claim.finish();
-        result
+
+        let (batch_tx, batch_rx) = tokio::sync::mpsc::channel::<Result<RecordBatch>>(32);
+        let (stats_tx, stats_rx) = tokio::sync::oneshot::channel();
+        let inflight = self.inflight.clone();
+        let sql = sql.to_string();
+        let session = session.clone();
+        let tags = tags.clone();
+        let params = params.to_vec();
+
+        tokio::spawn(async move {
+            let mut claim = inflight.claim(conn_id);
+            if let Err(e) = StarRocksAdapter::stream_arrow_on_conn(
+                &mut conn, &sql, &session, &tags, &params, &batch_tx,
+            )
+            .await
+            {
+                let _ = batch_tx.send(Err(e)).await;
+            }
+            claim.finish();
+            drop(conn);
+            let _ = stats_tx.send(None);
+        });
+
+        Ok(SyncExecution {
+            stream: Box::pin(ReceiverStream::new(batch_rx)),
+            stats: stats_rx,
+        })
     }
 
     // --- Catalog discovery ---
@@ -613,6 +639,20 @@ fn mysql_column_type_to_arrow(ct: ColumnType) -> DataType {
         ColumnType::MYSQL_TYPE_BIT => DataType::Boolean,
         _ => DataType::Utf8,
     }
+}
+
+fn starrocks_rows_to_batch(
+    schema: &Arc<ArrowSchema>,
+    rows: &mut [Row],
+    num_cols: usize,
+) -> Result<RecordBatch> {
+    let mut columns: Vec<ArrayRef> = Vec::with_capacity(num_cols);
+    for col_idx in 0..num_cols {
+        let dt = schema.field(col_idx).data_type();
+        columns.push(starrocks_build_column(dt, rows, col_idx)?);
+    }
+    RecordBatch::try_new(Arc::clone(schema), columns)
+        .map_err(|e| QueryFluxError::Engine(format!("StarRocks RecordBatch failed: {e}")))
 }
 
 fn starrocks_build_column(dt: &DataType, rows: &mut [Row], col_idx: usize) -> Result<ArrayRef> {

@@ -14,7 +14,6 @@ use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
-use futures::stream;
 use mysql_async::{consts::ColumnType, prelude::Queryable, Pool, Row, Value};
 use queryflux_auth::QueryCredentials;
 use queryflux_core::{
@@ -24,6 +23,7 @@ use queryflux_core::{
     session::SessionContext,
     tags::{tags_to_json, QueryTags},
 };
+use tokio_stream::wrappers::ReceiverStream;
 
 use crate::{BackendQueryIdSlot, NativeExecution};
 
@@ -100,14 +100,8 @@ impl InflightConnGuard {
 /// Execute `sql` against `pool` and return a stream of `NativeResultChunk`s.
 ///
 /// The connection is acquired, session is set up (USE database, @query_tag), the query
-/// is executed, and rows are batched into `NativeResultChunk`s of up to `BATCH_SIZE` rows.
-/// The first chunk carries column metadata; subsequent chunks carry rows only.
-///
-/// # Streaming note
-/// This implementation collects all rows into memory before yielding chunks — the same
-/// behaviour as the current Arrow path. The in-memory constraint is removed in a follow-up
-/// by switching to `query_iter` + a spawned task, which requires working around
-/// `mysql_async::QueryResult`'s borrow-based lifetime constraints.
+/// is executed via `query_iter`/`exec_iter`, and rows are batched into chunks of up to
+/// `BATCH_SIZE` without materializing the full result set in memory first.
 #[allow(clippy::too_many_arguments)]
 pub async fn execute(
     pool: &Pool,
@@ -125,20 +119,39 @@ pub async fn execute(
         .map_err(|e| QueryFluxError::Engine(format!("mysql_native: connection failed: {e}")))?;
     let conn_id = conn.id();
     id_slot.publish(conn_id.to_string());
-    let mut claim = inflight.claim(conn_id);
 
-    let result = execute_on_conn(&mut conn, sql, session, tags, params).await;
-    claim.finish();
-    result
+    let (chunk_tx, chunk_rx) = tokio::sync::mpsc::channel::<Result<NativeResultChunk>>(32);
+    let (stats_tx, stats_rx) = tokio::sync::oneshot::channel();
+    let inflight = inflight.clone();
+    let sql = sql.to_string();
+    let session = session.clone();
+    let tags = tags.clone();
+    let params = params.to_vec();
+
+    tokio::spawn(async move {
+        let mut claim = inflight.claim(conn_id);
+        if let Err(e) = stream_on_conn(&mut conn, &sql, &session, &tags, &params, &chunk_tx).await {
+            let _ = chunk_tx.send(Err(e)).await;
+        }
+        claim.finish();
+        drop(conn);
+        let _ = stats_tx.send(None);
+    });
+
+    Ok(NativeExecution {
+        stream: Box::pin(ReceiverStream::new(chunk_rx)),
+        stats: stats_rx,
+    })
 }
 
-async fn execute_on_conn(
+async fn stream_on_conn(
     conn: &mut mysql_async::Conn,
     sql: &str,
     session: &SessionContext,
     tags: &QueryTags,
     params: &QueryParams,
-) -> Result<NativeExecution> {
+    chunk_tx: &tokio::sync::mpsc::Sender<Result<NativeResultChunk>>,
+) -> Result<()> {
     if let Some(db) = session.database() {
         let use_sql = format!("USE `{}`", db.replace('`', "``"));
         conn.query_drop(&use_sql)
@@ -155,31 +168,19 @@ async fn execute_on_conn(
         })?;
     }
 
-    let rows: Vec<Row> = if params.is_empty() {
-        conn.query::<Row, _>(sql)
-            .await
-            .map_err(|e| QueryFluxError::Engine(format!("mysql_native: query failed: {e}")))?
+    let mysql_params = if params.is_empty() {
+        mysql_async::Params::Empty
     } else {
-        let mysql_params = mysql_async::Params::Positional(
+        mysql_async::Params::Positional(
             params.iter().map(query_param_to_mysql_value).collect(),
-        );
-        conn.exec::<Row, _, _>(sql, mysql_params)
-            .await
-            .map_err(|e| QueryFluxError::Engine(format!("mysql_native: exec failed: {e}")))?
+        )
     };
+    let mut query_result = conn
+        .exec_iter(sql, mysql_params)
+        .await
+        .map_err(|e| QueryFluxError::Engine(format!("mysql_native: exec failed: {e}")))?;
 
-    let (stats_tx, stats_rx) = tokio::sync::oneshot::channel();
-
-    if rows.is_empty() {
-        let _ = stats_tx.send(None);
-        return Ok(NativeExecution {
-            stream: Box::pin(stream::empty()),
-            stats: stats_rx,
-        });
-    }
-
-    // Build column metadata from the first row's column descriptors.
-    let columns: Vec<NativeColumn> = rows[0]
+    let columns: Vec<NativeColumn> = query_result
         .columns_ref()
         .iter()
         .map(|c| NativeColumn {
@@ -188,32 +189,50 @@ async fn execute_on_conn(
             nullable: true,
         })
         .collect();
+    let num_cols = columns.len();
 
-    let num_cols = rows[0].len();
+    let mut batch: Vec<NativeRow> = Vec::with_capacity(BATCH_SIZE);
+    let mut first_chunk = true;
 
-    // Convert all rows to NativeRows first, then batch them.
-    let native_rows: Vec<NativeRow> = rows
-        .into_iter()
-        .map(|row| row_to_native(row, num_cols))
-        .collect();
+    while let Some(row) = query_result
+        .next()
+        .await
+        .map_err(|e| QueryFluxError::Engine(format!("mysql_native: read row failed: {e}")))?
+    {
+        batch.push(row_to_native(row, num_cols));
+        if batch.len() >= BATCH_SIZE {
+            let chunk = NativeResultChunk {
+                columns: if first_chunk {
+                    Some(columns.clone())
+                } else {
+                    None
+                },
+                rows: std::mem::take(&mut batch),
+            };
+            first_chunk = false;
+            if chunk_tx.send(Ok(chunk)).await.is_err() {
+                query_result.drop_result().await.ok();
+                return Ok(());
+            }
+        }
+    }
 
-    // Produce NativeResultChunks: columns present only on the first chunk.
-    let chunks: Vec<Result<NativeResultChunk>> = native_rows
-        .chunks(BATCH_SIZE)
-        .enumerate()
-        .map(|(i, batch)| {
-            Ok(NativeResultChunk {
-                columns: if i == 0 { Some(columns.clone()) } else { None },
-                rows: batch.to_vec(),
-            })
-        })
-        .collect();
+    if !batch.is_empty() || first_chunk {
+        let chunk = NativeResultChunk {
+            columns: if first_chunk { Some(columns) } else { None },
+            rows: batch,
+        };
+        if chunk_tx.send(Ok(chunk)).await.is_err() {
+            query_result.drop_result().await.ok();
+            return Ok(());
+        }
+    }
 
-    let _ = stats_tx.send(None);
-    Ok(NativeExecution {
-        stream: Box::pin(stream::iter(chunks)),
-        stats: stats_rx,
-    })
+    query_result
+        .drop_result()
+        .await
+        .map_err(|e| QueryFluxError::Engine(format!("mysql_native: drop_result failed: {e}")))?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -416,6 +435,16 @@ mod tests {
     #[test]
     fn null_maps_to_null() {
         assert_eq!(query_param_to_mysql_value(&QueryParam::Null), Value::NULL);
+    }
+
+    #[test]
+    fn batch_rows_splits_into_chunks() {
+        let rows: Vec<u32> = (0..2500).collect();
+        let batches: Vec<_> = rows.chunks(BATCH_SIZE).collect();
+        assert_eq!(batches.len(), 3);
+        assert_eq!(batches[0].len(), BATCH_SIZE);
+        assert_eq!(batches[1].len(), BATCH_SIZE);
+        assert_eq!(batches[2].len(), 500);
     }
 
     // ── value_to_bytes ────────────────────────────────────────────────────────
