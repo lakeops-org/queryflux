@@ -253,8 +253,6 @@ impl StarRocksAdapter {
         params: &queryflux_core::params::QueryParams,
         batch_tx: &tokio::sync::mpsc::Sender<Result<RecordBatch>>,
     ) -> Result<()> {
-        const BATCH_SIZE: usize = 1_000;
-
         if let Some(db) = session.database() {
             let use_sql = format!("USE `{}`", db.replace('`', "``"));
             conn.query_drop(&use_sql)
@@ -271,15 +269,30 @@ impl StarRocksAdapter {
             })?;
         }
 
-        let mysql_params = if params.is_empty() {
-            mysql_async::Params::Empty
+        if params.is_empty() {
+            // Text protocol — required for SHOW/DDL that StarRocks rejects via prepared statements.
+            let query_result = conn
+                .query_iter(sql)
+                .await
+                .map_err(|e| QueryFluxError::Engine(format!("StarRocks query failed: {e}")))?;
+            Self::stream_arrow_from_query_result(query_result, batch_tx).await
         } else {
-            mysql_async::Params::Positional(params.iter().map(query_param_to_mysql_value).collect())
-        };
-        let mut query_result = conn
-            .exec_iter(sql, mysql_params)
-            .await
-            .map_err(|e| QueryFluxError::Engine(format!("StarRocks exec failed: {e}")))?;
+            let mysql_params = mysql_async::Params::Positional(
+                params.iter().map(query_param_to_mysql_value).collect(),
+            );
+            let query_result = conn
+                .exec_iter(sql, mysql_params)
+                .await
+                .map_err(|e| QueryFluxError::Engine(format!("StarRocks exec failed: {e}")))?;
+            Self::stream_arrow_from_query_result(query_result, batch_tx).await
+        }
+    }
+
+    async fn stream_arrow_from_query_result<P: mysql_async::prelude::Protocol>(
+        mut query_result: mysql_async::QueryResult<'_, '_, P>,
+        batch_tx: &tokio::sync::mpsc::Sender<Result<RecordBatch>>,
+    ) -> Result<()> {
+        const BATCH_SIZE: usize = 1_000;
 
         let fields: Vec<Field> = query_result
             .columns_ref()

@@ -168,16 +168,29 @@ async fn stream_on_conn(
         })?;
     }
 
-    let mysql_params = if params.is_empty() {
-        mysql_async::Params::Empty
+    if params.is_empty() {
+        // Text protocol — required for SHOW/DDL that StarRocks rejects via prepared statements.
+        let query_result = conn
+            .query_iter(sql)
+            .await
+            .map_err(|e| QueryFluxError::Engine(format!("mysql_native: query failed: {e}")))?;
+        stream_mysql_query_result(query_result, chunk_tx).await
     } else {
-        mysql_async::Params::Positional(params.iter().map(query_param_to_mysql_value).collect())
-    };
-    let mut query_result = conn
-        .exec_iter(sql, mysql_params)
-        .await
-        .map_err(|e| QueryFluxError::Engine(format!("mysql_native: exec failed: {e}")))?;
+        let mysql_params = mysql_async::Params::Positional(
+            params.iter().map(query_param_to_mysql_value).collect(),
+        );
+        let query_result = conn
+            .exec_iter(sql, mysql_params)
+            .await
+            .map_err(|e| QueryFluxError::Engine(format!("mysql_native: exec failed: {e}")))?;
+        stream_mysql_query_result(query_result, chunk_tx).await
+    }
+}
 
+async fn stream_mysql_query_result<P: mysql_async::prelude::Protocol>(
+    mut query_result: mysql_async::QueryResult<'_, '_, P>,
+    chunk_tx: &tokio::sync::mpsc::Sender<Result<NativeResultChunk>>,
+) -> Result<()> {
     let columns: Vec<NativeColumn> = query_result
         .columns_ref()
         .iter()
