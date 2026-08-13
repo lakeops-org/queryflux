@@ -12,6 +12,7 @@ use axum::routing::{delete, get, post};
 use axum::Router;
 
 use crate::snowflake::http::session_store::SnowflakeSessionStore;
+use crate::snowflake::in_flight::SnowflakeInFlightRegistry;
 use crate::state::AppState;
 
 pub mod format;
@@ -31,6 +32,7 @@ pub mod session_store;
 pub struct SnowflakeWireState {
     pub app: Arc<AppState>,
     pub sessions: Arc<SnowflakeSessionStore>,
+    pub in_flight: Arc<SnowflakeInFlightRegistry>,
 }
 
 /// Allow Axum handlers that only need `Arc<AppState>` to extract it from
