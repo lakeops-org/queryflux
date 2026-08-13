@@ -23,6 +23,7 @@ required_files=(
   "README.md"
   "examples/external-config-values.yaml"
   "examples/production-values.yaml"
+  "examples/production-config.yaml"
   "examples/networkpolicy-values.yaml"
   "values.yaml"
   "values.schema.json"
@@ -76,7 +77,7 @@ $output"
 run_helm "helm lint" helm lint "$CHART_DIR"
 run_helm "helm template" helm template queryflux "$CHART_DIR"
 
-for values_file in "$CHART_DIR"/examples/*.yaml; do
+for values_file in "$CHART_DIR"/examples/*-values.yaml; do
   run_helm "helm lint --values $values_file" helm lint "$CHART_DIR" --values "$values_file"
   run_helm "helm template --values $values_file" helm template queryflux "$CHART_DIR" --values "$values_file"
 done

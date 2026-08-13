@@ -38,7 +38,7 @@ Do **not** set `replicaCount > 1` (or enable HPA) if any of the following hold:
 - [ ] If Snowflake HTTP is enabled: sticky sessions on that port, and set `frontends.snowflakeHttp.sessionAffinityAcknowledged: true` so the requirement is recorded in config
 - [ ] Prometheus scrape of admin `/metrics` (ServiceMonitor or equivalent)
 
-Starter values: [`charts/queryflux/examples/production-values.yaml`](https://github.com/lakeops-org/queryflux/blob/main/charts/queryflux/examples/production-values.yaml).
+Starter values: [`charts/queryflux/examples/production-values.yaml`](https://github.com/lakeops-org/queryflux/blob/main/charts/queryflux/examples/production-values.yaml) (pairs with [`production-config.yaml`](https://github.com/lakeops-org/queryflux/blob/main/charts/queryflux/examples/production-config.yaml) for the config Secret).
 
 ## Instance identity
 
