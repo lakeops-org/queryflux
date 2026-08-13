@@ -768,9 +768,8 @@ pub async fn get_queued_statement(
             group: queued.cluster_group.0.clone(),
             timeout_secs: wait_timeout_secs,
         };
-        state.record_queued_terminal(&queued, QueryStatus::Failed, &err.to_string());
-        if let Err(e) = state.persistence.delete_queued(&query_id).await {
-            warn!(id = %query_id, "Failed to delete queued query after capacity wait timeout: {e}");
+        if let Ok(Some(taken)) = state.persistence.take_queued(&query_id).await {
+            state.record_queued_terminal(&taken, QueryStatus::Failed, &err.to_string());
         }
         if let Some(qc) = &state.queue_coordinator {
             let _ = qc.release_claim(&query_id.0).await;

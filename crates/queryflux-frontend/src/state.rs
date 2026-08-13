@@ -154,6 +154,20 @@ impl AppState {
         self.live.read().await.cluster_configs.get(cluster).cloned()
     }
 
+    /// Resolve engine metadata from a live adapter or stored cluster config.
+    pub async fn engine_type_for_cluster(&self, cluster: &str) -> (EngineType, SqlDialect) {
+        if let Some(adapter) = self.adapter(cluster).await {
+            return (adapter.engine_type(), adapter.translation_target_dialect());
+        }
+        if let Some(cfg) = self.cluster_config_cloned(cluster).await {
+            if let Some(engine) = &cfg.engine {
+                let engine_type = EngineType::from(engine);
+                return (engine_type.clone(), engine_type.dialect());
+            }
+        }
+        (EngineType::Undispatched, SqlDialect::Generic)
+    }
+
     /// Returns true if any cluster in the group supports async execution (e.g. Trino).
     pub async fn group_supports_async(&self, group: &str) -> bool {
         let live = self.live.read().await;
@@ -351,13 +365,12 @@ impl AppState {
         let queue_duration_ms = (Utc::now() - queued.creation_time)
             .num_milliseconds()
             .max(0) as u64;
-        let session = {
-            let mut s = queued.session.clone();
-            if s.user.is_none() && !queued.submitted_by.is_empty() {
-                s.user = Some(queued.submitted_by.clone());
-            }
-            s
-        };
+        let mut session = queued.session.clone();
+        if session.user.is_none() && !queued.submitted_by.is_empty() {
+            session.user = Some(queued.submitted_by.clone());
+        }
+        let query_tags = session.tags().clone();
+        let agent_context = session.resolved_agent_context();
         let dialect = queued.frontend_protocol.default_dialect();
         let ctx = QueryContext {
             query_id: queued.id.clone(),
@@ -368,14 +381,14 @@ impl AppState {
             cluster: ClusterName("(not-dispatched)".into()),
             cluster_group_config_id: None,
             cluster_config_id: None,
-            engine_type: EngineType::Trino,
+            engine_type: EngineType::Undispatched,
             src_dialect: dialect.clone(),
-            tgt_dialect: dialect,
+            tgt_dialect: SqlDialect::Generic,
             was_translated: false,
             translated_sql: None,
-            query_tags: QueryTags::default(),
+            query_tags,
             query_params: vec![],
-            agent_context: None,
+            agent_context,
         };
         self.record_query(
             &ctx,

@@ -1225,14 +1225,20 @@ async fn main() -> Result<()> {
                         // DELETE on `/v1/statement/executing/...` did not stop secured Trino.
                         let backend_id = q.backend_query_id.clone();
                         let cluster = q.cluster_name.0.clone();
+                        let (engine_type, tgt_dialect) =
+                            if let Some(adapter) = state.adapter(&cluster).await {
+                                (adapter.engine_type(), adapter.translation_target_dialect())
+                            } else {
+                                state.engine_type_for_cluster(&cluster).await
+                            };
+                        state.record_executing_cancelled(
+                            &q,
+                            queryflux_core::query::FrontendProtocol::TrinoHttp,
+                            engine_type,
+                            tgt_dialect,
+                            "zombie_evicted: not polled for >5 min",
+                        );
                         if let Some(adapter) = state.adapter(&cluster).await {
-                            state.record_executing_cancelled(
-                                &q,
-                                queryflux_core::query::FrontendProtocol::TrinoHttp,
-                                adapter.engine_type(),
-                                adapter.translation_target_dialect(),
-                                "zombie_evicted: not polled for >5 min",
-                            );
                             tokio::spawn(async move {
                                 if let Err(e) = adapter.cancel_query(&backend_id).await {
                                     tracing::debug!(
@@ -1241,13 +1247,6 @@ async fn main() -> Result<()> {
                                 }
                             });
                         } else {
-                            state.record_executing_cancelled(
-                                &q,
-                                queryflux_core::query::FrontendProtocol::TrinoHttp,
-                                queryflux_core::query::EngineType::Trino,
-                                queryflux_core::query::SqlDialect::Trino,
-                                "zombie_evicted: not polled for >5 min",
-                            );
                             tracing::debug!(
                                 cluster = %cluster,
                                 id = %q.backend_query_id,
@@ -1289,12 +1288,12 @@ async fn main() -> Result<()> {
                 let mut cleaned = 0u64;
                 for q in queued {
                     if q.last_accessed < cutoff {
-                        state.record_queued_terminal(
-                            &q,
-                            queryflux_core::query::QueryStatus::Failed,
-                            "stale_queued_evicted: client disconnected before dispatch",
-                        );
-                        if state.persistence.delete_queued(&q.id).await.is_ok() {
+                        if let Ok(Some(taken)) = state.persistence.take_queued(&q.id).await {
+                            state.record_queued_terminal(
+                                &taken,
+                                queryflux_core::query::QueryStatus::Failed,
+                                "stale_queued_evicted: client disconnected before dispatch",
+                            );
                             cleaned += 1;
                         }
                     }

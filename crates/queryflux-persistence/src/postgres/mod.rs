@@ -1421,6 +1421,23 @@ impl Persistence for PostgresStore {
         Ok(())
     }
 
+    async fn take_queued(&self, id: &ProxyQueryId) -> Result<Option<QueuedQuery>> {
+        let row: Option<(serde_json::Value,)> =
+            sqlx::query_as("DELETE FROM queued_queries WHERE id = $1 RETURNING data")
+                .bind(&id.0)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| QueryFluxError::Persistence(format!("take_queued: {e}")))?;
+        match row {
+            None => Ok(None),
+            Some((data,)) => {
+                let q = serde_json::from_value(data)
+                    .map_err(|e| QueryFluxError::Persistence(format!("Deserialize error: {e}")))?;
+                Ok(Some(q))
+            }
+        }
+    }
+
     async fn list_queued(&self) -> Result<Vec<QueuedQuery>> {
         let rows: Vec<(serde_json::Value,)> =
             sqlx::query_as("SELECT data FROM queued_queries ORDER BY created_at")
@@ -1533,7 +1550,8 @@ impl MetricsStore for PostgresStore {
                  guard_actions, was_guard_blocked, cache_hit)
                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,
                        $21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,
-                       $36,$37,$38,$39,$40,$41,$42,$43)"#,
+                       $36,$37,$38,$39,$40,$41,$42,$43)
+               ON CONFLICT (proxy_query_id) DO NOTHING"#,
         )
         .bind(&r.proxy_query_id)
         .bind(&r.backend_query_id)

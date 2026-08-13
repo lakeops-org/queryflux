@@ -184,6 +184,9 @@ impl Persistence for InMemoryPersistence {
         self.queued.remove(&id.0);
         Ok(())
     }
+    async fn take_queued(&self, id: &ProxyQueryId) -> Result<Option<QueuedQuery>> {
+        Ok(self.queued.remove(&id.0).map(|(_, q)| q))
+    }
     async fn list_queued(&self) -> Result<Vec<QueuedQuery>> {
         Ok(self.queued.iter().map(|e| e.value().clone()).collect())
     }
@@ -242,6 +245,12 @@ impl MetricsStore for InMemoryPersistence {
     async fn record_query(&self, record: QueryRecord) -> Result<()> {
         let summary = self.record_to_summary(record);
         let mut records = self.query_records.write().unwrap();
+        if records
+            .iter()
+            .any(|r| r.proxy_query_id == summary.proxy_query_id)
+        {
+            return Ok(());
+        }
         if records.len() >= QUERY_RECORDS_MAX {
             // Evict the oldest quarter to amortize the cost of repeated trimming.
             let drain_count = QUERY_RECORDS_MAX / 4;

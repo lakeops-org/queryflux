@@ -1088,14 +1088,7 @@ async fn delete_queued_if_exists(
     persistence: &dyn queryflux_persistence::Persistence,
     id: &str,
 ) -> queryflux_core::error::Result<Option<queryflux_core::query::QueuedQuery>> {
-    let qid = ProxyQueryId(id.to_string());
-    match persistence.get_queued(&qid).await? {
-        Some(q) => {
-            persistence.delete_queued(&qid).await?;
-            Ok(Some(q))
-        }
-        None => Ok(None),
-    }
+    persistence.take_queued(&ProxyQueryId(id.to_string())).await
 }
 
 async fn find_executing_query(
