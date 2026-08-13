@@ -410,6 +410,121 @@ impl AppState {
 }
 
 #[cfg(test)]
+mod record_terminal_tests {
+    use std::sync::Arc;
+
+    use queryflux_core::{
+        query::{
+            ClusterGroupName, EngineType, FrontendProtocol, ProxyQueryId, QueryStatus, QueuedQuery,
+        },
+        session::SessionContext,
+        tags::QueryTags,
+    };
+    use queryflux_persistence::{
+        in_memory::InMemoryPersistence, query_history::QueryFilters, QueryHistoryStore,
+    };
+
+    use super::test_fixtures;
+
+    fn queued_with_tags() -> QueuedQuery {
+        let mut session = SessionContext {
+            tags: [("team".to_string(), Some("eng".to_string()))].into(),
+            ..Default::default()
+        };
+        session.extra.insert("agent_id".into(), "agent-1".into());
+        session
+            .extra
+            .insert("conversation_id".into(), "conv-1".into());
+        QueuedQuery {
+            id: ProxyQueryId("q-queued-terminal".into()),
+            sql: "SELECT 1".into(),
+            session,
+            frontend_protocol: FrontendProtocol::TrinoHttp,
+            cluster_group: ClusterGroupName("default".into()),
+            creation_time: chrono::Utc::now(),
+            last_accessed: chrono::Utc::now(),
+            sequence: 0,
+            submitted_by: "alice".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn record_queued_terminal_preserves_tags_and_agent_context() {
+        let mem = Arc::new(InMemoryPersistence::new());
+        let state = test_fixtures::app_state_with_metrics(mem.clone(), false);
+
+        state.record_queued_terminal(
+            &queued_with_tags(),
+            QueryStatus::Failed,
+            "capacity wait timeout",
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let rows = mem
+            .list_queries(&QueryFilters {
+                limit: 50,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].engine_type, "Undispatched");
+        assert_eq!(rows[0].username.as_deref(), Some("alice"));
+        assert_eq!(rows[0].agent_id.as_deref(), Some("agent-1"));
+        assert_eq!(rows[0].conversation_id.as_deref(), Some("conv-1"));
+        let tags = rows[0].query_tags.as_ref().expect("tags");
+        assert_eq!(tags.get("team"), Some(&serde_json::json!("eng")));
+    }
+
+    #[tokio::test]
+    async fn record_executing_cancelled_writes_cancelled_history_row() {
+        use chrono::Utc;
+        use queryflux_core::query::{BackendQueryId, ClusterName, ExecutingQuery, SqlDialect};
+
+        let mem = Arc::new(InMemoryPersistence::new());
+        let state = test_fixtures::app_state_with_metrics(mem.clone(), false);
+
+        let executing = ExecutingQuery {
+            id: ProxyQueryId("q-exec-cancel".into()),
+            sql: "SELECT 1".into(),
+            translated_sql: None,
+            cluster_group: ClusterGroupName("default".into()),
+            cluster_name: ClusterName("trino".into()),
+            cluster_group_config_id: None,
+            cluster_config_id: None,
+            backend_query_id: BackendQueryId("backend-1".into()),
+            poll_base_url: None,
+            creation_time: Utc::now(),
+            last_accessed: Utc::now(),
+            query_tags: QueryTags::default(),
+            agent_context: None,
+            submitted_guard_actions: vec![],
+            was_guard_blocked: false,
+            submitted_by: "bob".into(),
+        };
+        state.record_executing_cancelled(
+            &executing,
+            FrontendProtocol::TrinoHttp,
+            EngineType::Trino,
+            SqlDialect::Trino,
+            "client cancelled",
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let rows = mem
+            .list_queries(&QueryFilters {
+                limit: 50,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].status.contains("Cancelled"));
+        assert_eq!(rows[0].error_message.as_deref(), Some("client cancelled"));
+    }
+}
+
+#[cfg(test)]
 pub mod test_fixtures {
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -422,7 +537,7 @@ pub mod test_fixtures {
         cluster_state::ClusterState, simple::SimpleClusterGroupManager,
     };
     use queryflux_core::query::{ClusterGroupName, ClusterName, EngineType};
-    use queryflux_metrics::NoopMetricsStore;
+    use queryflux_metrics::{MetricsStore, NoopMetricsStore};
     use queryflux_persistence::in_memory::InMemoryPersistence;
     use queryflux_routing::chain::RouterChain;
     use queryflux_translation::TranslationService;
@@ -431,6 +546,13 @@ pub mod test_fixtures {
     use super::{AppState, LiveConfig};
 
     pub fn app_state(auth_required: bool) -> Arc<AppState> {
+        app_state_with_metrics(Arc::new(NoopMetricsStore), auth_required)
+    }
+
+    pub fn app_state_with_metrics(
+        metrics: Arc<dyn MetricsStore>,
+        auth_required: bool,
+    ) -> Arc<AppState> {
         let group_name = ClusterGroupName("default".into());
         let cluster_name = ClusterName("trino".into());
         let cluster_state = Arc::new(ClusterState::new(
@@ -478,7 +600,7 @@ pub mod test_fixtures {
             live: Arc::new(RwLock::new(live)),
             persistence: Arc::new(InMemoryPersistence::new()),
             translation: Arc::new(TranslationService::disabled()),
-            metrics: Arc::new(NoopMetricsStore),
+            metrics,
             identity_resolver: Arc::new(BackendIdentityResolver::new()),
             capacity_store: None,
             queue_coordinator: None,

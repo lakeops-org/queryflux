@@ -1438,4 +1438,88 @@ mod tests {
         assert_eq!(store._snapshots.read().unwrap().len(), 1);
         assert!(store._snapshots.read().unwrap()[0].recorded_at >= cutoff);
     }
+
+    #[tokio::test]
+    async fn take_queued_returns_row_once() {
+        use queryflux_core::query::ProxyQueryId;
+
+        let store = InMemoryPersistence::new();
+        store.upsert_queued(make_queued("q-take")).await.unwrap();
+        assert!(store
+            .take_queued(&ProxyQueryId("q-take".into()))
+            .await
+            .unwrap()
+            .is_some());
+        assert!(store
+            .take_queued(&ProxyQueryId("q-take".into()))
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn record_query_keeps_first_terminal_row_per_proxy_id() {
+        use crate::query_history::QueryFilters;
+        use crate::{MetricsStore, QueryHistoryStore, QueryRecord};
+        use queryflux_core::query::{
+            ClusterGroupName, ClusterName, EngineType, FrontendProtocol, QueryStatus, SqlDialect,
+        };
+
+        let store = InMemoryPersistence::new();
+        let mut first = QueryRecord {
+            proxy_query_id: "proxy-dedup".into(),
+            backend_query_id: None,
+            cluster_group: ClusterGroupName("g".into()),
+            cluster_name: ClusterName("c".into()),
+            cluster_group_config_id: None,
+            cluster_config_id: None,
+            engine_type: EngineType::Undispatched,
+            frontend_protocol: FrontendProtocol::TrinoHttp,
+            source_dialect: SqlDialect::Trino,
+            target_dialect: SqlDialect::Generic,
+            was_translated: false,
+            translated_sql: None,
+            user: None,
+            catalog: None,
+            database: None,
+            sql_preview: "SELECT 1".into(),
+            status: QueryStatus::Failed,
+            routing_trace: None,
+            queue_duration_ms: 100,
+            execution_duration_ms: 0,
+            rows_returned: None,
+            error_message: Some("capacity wait timeout".into()),
+            created_at: Utc::now(),
+            engine_stats: None,
+            query_tags: Default::default(),
+            query_hash: None,
+            query_parameterized_hash: None,
+            translated_query_hash: None,
+            digest_text: None,
+            translated_digest_text: None,
+            agent_id: None,
+            conversation_id: None,
+            step_index: None,
+            tool_call_id: None,
+            query_intent: None,
+            guard_actions: vec![],
+            was_guard_blocked: false,
+            cache_hit: false,
+        };
+        store.record_query(first.clone()).await.unwrap();
+        first.status = QueryStatus::Cancelled;
+        first.error_message = Some("client cancelled".into());
+        store.record_query(first).await.unwrap();
+
+        let rows = store
+            .list_queries(&QueryFilters {
+                limit: 50,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].proxy_query_id, "proxy-dedup");
+        assert!(rows[0].status.contains("Failed"));
+    }
 }

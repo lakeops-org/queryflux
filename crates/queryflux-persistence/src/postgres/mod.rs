@@ -1536,7 +1536,7 @@ impl MetricsStore for PostgresStore {
         let query_tags_json = tags_to_json(&r.query_tags);
         let guard_actions_json =
             serde_json::to_value(&r.guard_actions).unwrap_or(serde_json::Value::Array(vec![]));
-        sqlx::query(
+        let insert_result = sqlx::query(
             r#"INSERT INTO query_records
                 (proxy_query_id, backend_query_id, cluster_group, cluster_name, engine_type,
                  frontend_protocol, source_dialect, target_dialect, was_translated, username,
@@ -1599,6 +1599,9 @@ impl MetricsStore for PostgresStore {
         .execute(&self.pool)
         .await
         .map_err(|e| QueryFluxError::Persistence(format!("Insert query_records: {e}")))?;
+        if insert_result.rows_affected() == 0 {
+            return Ok(());
+        }
 
         // Upsert into query_digest_stats.
         if let Some(phash) = r.query_parameterized_hash {
