@@ -1273,6 +1273,7 @@ async fn main() -> Result<()> {
     // deletes queued entries not accessed for > 5 minutes.
     tokio::spawn({
         let state = app_state.clone();
+        let distributed_backend = distributed_backend.clone();
         let mut shutdown_rx = shutdown_rx.clone();
         async move {
             const CLIENT_TIMEOUT_SECS: i64 = 300;
@@ -1281,8 +1282,25 @@ async fn main() -> Result<()> {
                 if !tick_or_shutdown(&mut interval, &mut shutdown_rx).await {
                     break;
                 }
+
+                let sweep_lock = match &distributed_backend {
+                    Some(backend) => match backend.try_sweep_lock("stale-queued-eviction").await {
+                        Ok(Some(lock)) => Some(lock),
+                        Ok(None) => continue,
+                        Err(e) => {
+                            state.metrics.on_coordination_failure("sweep_lock");
+                            tracing::warn!("Stale queued sweep lock failed, sweeping anyway: {e}");
+                            None
+                        }
+                    },
+                    None => None,
+                };
+
                 let cutoff = chrono::Utc::now() - chrono::Duration::seconds(CLIENT_TIMEOUT_SECS);
                 let Ok(queued) = state.persistence.list_queued().await else {
+                    if let Some(lock) = sweep_lock {
+                        lock.release().await;
+                    }
                     continue;
                 };
                 let mut cleaned = 0u64;
@@ -1300,6 +1318,10 @@ async fn main() -> Result<()> {
                 }
                 if cleaned > 0 {
                     tracing::info!("Cleaned up {cleaned} stale queued queries");
+                }
+
+                if let Some(lock) = sweep_lock {
+                    lock.release().await;
                 }
             }
         }
