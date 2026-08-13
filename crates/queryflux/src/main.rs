@@ -34,7 +34,6 @@ use queryflux_metrics::{
     buffered_store::BufferedMetricsStore, prometheus_store::PrometheusMetrics, MetricsStore,
     MultiMetricsStore,
 };
-use queryflux_persistence::cluster_config::{UpsertClusterConfig, UpsertClusterGroupConfig};
 use queryflux_persistence::{
     in_memory::InMemoryPersistence, postgres::PostgresStore, AdminStore, BackendStore,
     DistributedBackendStore, KIND_GUARD,
@@ -218,63 +217,39 @@ async fn main() -> Result<()> {
     // from YAML. Omit those maps (or leave them empty) for Studio-only setups.
     if let Some(pg) = &backend {
         if !config.clusters.is_empty() {
-            let existing = pg
-                .list_cluster_configs()
-                .await
-                .context("List cluster configs before YAML seed")?;
-            let existing_names: std::collections::HashSet<&str> =
-                existing.iter().map(|r| r.name.as_str()).collect();
-            let mut seeded = 0usize;
-            for (name, cfg) in &config.clusters {
-                if existing_names.contains(name.as_str()) {
-                    continue;
-                }
-                match UpsertClusterConfig::from_core(cfg) {
-                    Ok(Some(upsert)) => {
-                        pg.upsert_cluster_config(name, &upsert)
-                            .await
-                            .with_context(|| format!("Seed cluster '{name}' from YAML"))?;
-                        seeded += 1;
-                    }
-                    Ok(None) => {}
-                    Err(e) => {
-                        return Err(anyhow::Error::from(e).context(format!(
-                            "cluster '{name}': serializing queryAuth for Postgres seed"
-                        )));
-                    }
-                }
-            }
-            if seeded > 0 {
-                info!("Seeded {seeded} cluster definition(s) from YAML into Postgres");
-            } else if !existing_names.is_empty() {
+            let report = queryflux_persistence::yaml_seed::seed_clusters_from_yaml_if_missing(
+                pg.as_ref(),
+                &config.clusters,
+            )
+            .await
+            .context("Seed clusters from YAML")?;
+            if report.seeded > 0 {
                 info!(
-                    existing = existing_names.len(),
+                    "Seeded {} cluster definition(s) from YAML into Postgres",
+                    report.seeded
+                );
+            } else if report.existing_before > 0 {
+                info!(
+                    existing = report.existing_before,
                     "Skipping YAML cluster upsert — Postgres already has these cluster names"
                 );
             }
         }
         if !config.cluster_groups.is_empty() {
-            let existing = pg
-                .list_group_configs()
-                .await
-                .context("List group configs before YAML seed")?;
-            let existing_names: std::collections::HashSet<&str> =
-                existing.iter().map(|r| r.name.as_str()).collect();
-            let mut seeded = 0usize;
-            for (name, cfg) in &config.cluster_groups {
-                if existing_names.contains(name.as_str()) {
-                    continue;
-                }
-                pg.upsert_group_config(name, &UpsertClusterGroupConfig::from_core(cfg))
-                    .await
-                    .with_context(|| format!("Seed group '{name}' from YAML"))?;
-                seeded += 1;
-            }
-            if seeded > 0 {
-                info!("Seeded {seeded} cluster group definition(s) from YAML into Postgres");
-            } else if !existing_names.is_empty() {
+            let report = queryflux_persistence::yaml_seed::seed_groups_from_yaml_if_missing(
+                pg.as_ref(),
+                &config.cluster_groups,
+            )
+            .await
+            .context("Seed cluster groups from YAML")?;
+            if report.seeded > 0 {
                 info!(
-                    existing = existing_names.len(),
+                    "Seeded {} cluster group definition(s) from YAML into Postgres",
+                    report.seeded
+                );
+            } else if report.existing_before > 0 {
+                info!(
+                    existing = report.existing_before,
                     "Skipping YAML group upsert — Postgres already has these group names"
                 );
             }

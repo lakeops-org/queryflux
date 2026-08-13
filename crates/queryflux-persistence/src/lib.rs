@@ -7,6 +7,7 @@ pub mod query_history;
 pub mod routing_json;
 pub mod routing_slices;
 pub mod script_library;
+pub mod yaml_seed;
 
 use std::collections::HashMap;
 
