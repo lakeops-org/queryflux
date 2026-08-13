@@ -635,6 +635,15 @@ async fn main() -> Result<()> {
 
     let router_chain = RouterChain::new(routers, fallback);
 
+    config
+        .auth
+        .validate_for_required()
+        .map_err(|e| anyhow::anyhow!("Auth config validation failed: {e}"))?;
+    config
+        .authorization
+        .validate()
+        .map_err(|e| anyhow::anyhow!("Authorization config validation failed: {e}"))?;
+
     let auth_provider = build_auth_provider(&config.auth)?;
     let authorization = build_authorization(
         &config.authorization,
