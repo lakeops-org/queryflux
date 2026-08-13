@@ -1229,6 +1229,19 @@ async fn main() -> Result<()> {
                         // DELETE on `/v1/statement/executing/...` did not stop secured Trino.
                         let backend_id = q.backend_query_id.clone();
                         let cluster = q.cluster_name.0.clone();
+                        let (engine_type, tgt_dialect) =
+                            if let Some(adapter) = state.adapter(&cluster).await {
+                                (adapter.engine_type(), adapter.translation_target_dialect())
+                            } else {
+                                state.engine_type_for_cluster(&cluster).await
+                            };
+                        state.record_executing_cancelled(
+                            &q,
+                            queryflux_core::query::FrontendProtocol::TrinoHttp,
+                            engine_type,
+                            tgt_dialect,
+                            "zombie_evicted: not polled for >5 min",
+                        );
                         if let Some(adapter) = state.adapter(&cluster).await {
                             tokio::spawn(async move {
                                 if let Err(e) = adapter.cancel_query(&backend_id).await {
@@ -1246,21 +1259,8 @@ async fn main() -> Result<()> {
                         }
 
                         state
-                            .metrics
-                            .on_query_finished(&q.cluster_group.0, &q.cluster_name.0);
-                        let cluster_manager = state.live.read().await.cluster_manager.clone();
-                        let _ = cluster_manager
-                            .release_cluster(&q.cluster_group, &q.cluster_name)
+                            .release_query_slot(&q.cluster_group, &q.cluster_name, &q.id.0)
                             .await;
-                        if let Some(cap) = &state.capacity_store {
-                            if let Err(e) = cap.release(&q.cluster_name.0, &q.id.0).await {
-                                state.metrics.on_coordination_failure("capacity_release");
-                                tracing::warn!(
-                                    "CapacityStore release failed for zombie query {}: {e}",
-                                    q.id
-                                );
-                            }
-                        }
                         let _ = state.persistence.delete(&q.backend_query_id).await;
                     }
                 }
@@ -1277,6 +1277,7 @@ async fn main() -> Result<()> {
     // deletes queued entries not accessed for > 5 minutes.
     tokio::spawn({
         let state = app_state.clone();
+        let distributed_backend = distributed_backend.clone();
         let mut shutdown_rx = shutdown_rx.clone();
         async move {
             const CLIENT_TIMEOUT_SECS: i64 = 300;
@@ -1285,15 +1286,46 @@ async fn main() -> Result<()> {
                 if !tick_or_shutdown(&mut interval, &mut shutdown_rx).await {
                     break;
                 }
+
+                let sweep_lock = match &distributed_backend {
+                    Some(backend) => match backend.try_sweep_lock("stale-queued-eviction").await {
+                        Ok(Some(lock)) => Some(lock),
+                        Ok(None) => continue,
+                        Err(e) => {
+                            state.metrics.on_coordination_failure("sweep_lock");
+                            tracing::warn!("Stale queued sweep lock failed, sweeping anyway: {e}");
+                            None
+                        }
+                    },
+                    None => None,
+                };
+
                 let cutoff = chrono::Utc::now() - chrono::Duration::seconds(CLIENT_TIMEOUT_SECS);
-                match state
-                    .persistence
-                    .delete_queued_not_accessed_since(cutoff)
-                    .await
-                {
-                    Ok(0) => {}
-                    Ok(n) => tracing::info!("Cleaned up {n} stale queued queries"),
-                    Err(e) => tracing::warn!("Queued query cleanup failed: {e}"),
+                let Ok(queued) = state.persistence.list_queued().await else {
+                    if let Some(lock) = sweep_lock {
+                        lock.release().await;
+                    }
+                    continue;
+                };
+                let mut cleaned = 0u64;
+                for q in queued {
+                    if q.last_accessed < cutoff {
+                        if let Ok(Some(taken)) = state.persistence.take_queued(&q.id).await {
+                            state.record_queued_terminal(
+                                &taken,
+                                queryflux_core::query::QueryStatus::Failed,
+                                "stale_queued_evicted: client disconnected before dispatch",
+                            );
+                            cleaned += 1;
+                        }
+                    }
+                }
+                if cleaned > 0 {
+                    tracing::info!("Cleaned up {cleaned} stale queued queries");
+                }
+
+                if let Some(lock) = sweep_lock {
+                    lock.release().await;
                 }
             }
         }

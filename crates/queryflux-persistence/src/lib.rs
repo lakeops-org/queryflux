@@ -54,6 +54,8 @@ pub trait Persistence: Send + Sync {
     async fn upsert_queued(&self, query: QueuedQuery) -> Result<()>;
     async fn get_queued(&self, id: &ProxyQueryId) -> Result<Option<QueuedQuery>>;
     async fn delete_queued(&self, id: &ProxyQueryId) -> Result<()>;
+    /// Atomically remove a queued query and return it when this caller wins the delete.
+    async fn take_queued(&self, id: &ProxyQueryId) -> Result<Option<QueuedQuery>>;
     async fn list_queued(&self) -> Result<Vec<QueuedQuery>>;
 
     /// Bump `last_accessed` to now for a queued query, keeping it alive in the

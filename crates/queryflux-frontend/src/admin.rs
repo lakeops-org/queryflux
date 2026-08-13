@@ -1087,14 +1087,8 @@ async fn collect_running_queries(
 async fn delete_queued_if_exists(
     persistence: &dyn queryflux_persistence::Persistence,
     id: &str,
-) -> queryflux_core::error::Result<bool> {
-    let qid = ProxyQueryId(id.to_string());
-    if persistence.get_queued(&qid).await?.is_some() {
-        persistence.delete_queued(&qid).await?;
-        Ok(true)
-    } else {
-        Ok(false)
-    }
+) -> queryflux_core::error::Result<Option<queryflux_core::query::QueuedQuery>> {
+    persistence.take_queued(&ProxyQueryId(id.to_string())).await
 }
 
 async fn find_executing_query(
@@ -1156,7 +1150,12 @@ async fn cancel_query_handler(
 
     let qid = ProxyQueryId(id.clone());
     match delete_queued_if_exists(persistence.as_ref(), &id).await {
-        Ok(true) => {
+        Ok(Some(queued)) => {
+            state.app.record_queued_terminal(
+                &queued,
+                queryflux_core::query::QueryStatus::Cancelled,
+                "admin cancelled",
+            );
             // A worker may have claimed and started executing between the first
             // lookup and this delete. Cancel that path too.
             match find_executing_query(persistence.as_ref(), &id).await {
@@ -1172,7 +1171,7 @@ async fn cancel_query_handler(
             info!(id = %qid, "Admin cancelled queued query");
             StatusCode::NO_CONTENT.into_response()
         }
-        Ok(false) => {
+        Ok(None) => {
             // Claimed and moved to executing after the first lookup.
             match find_executing_query(persistence.as_ref(), &id).await {
                 Ok(Some(executing)) => cancel_executing(&state, executing).await,
@@ -1188,32 +1187,37 @@ async fn cancel_executing(
     state: &AdminState,
     executing: queryflux_core::query::ExecutingQuery,
 ) -> Response {
-    let mut cancelled = false;
-    if let Some(adapter) = state.app.adapter(&executing.cluster_name.0).await {
-        match adapter.cancel_query(&executing.backend_query_id).await {
-            Ok(()) => cancelled = true,
-            Err(e) => {
-                warn!(
-                    id = %executing.id,
-                    backend = %executing.backend_query_id,
-                    "Admin adapter cancel failed: {e}"
-                );
-            }
-        }
-    } else {
+    let Some(adapter) = state.app.adapter(&executing.cluster_name.0).await else {
         warn!(
             id = %executing.id,
             cluster = %executing.cluster_name,
             "Admin cancel: no adapter for cluster"
         );
-    }
-    if !cancelled {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "failed to cancel query on backend",
+        )
+            .into_response();
+    };
+    if let Err(e) = adapter.cancel_query(&executing.backend_query_id).await {
+        warn!(
+            id = %executing.id,
+            backend = %executing.backend_query_id,
+            "Admin adapter cancel failed: {e}"
+        );
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             "failed to cancel query on backend",
         )
             .into_response();
     }
+    state.app.record_executing_cancelled(
+        &executing,
+        queryflux_core::query::FrontendProtocol::TrinoHttp,
+        adapter.engine_type(),
+        adapter.translation_target_dialect(),
+        "admin cancelled",
+    );
     state
         .app
         .release_query_slot(
@@ -2768,15 +2772,17 @@ mod tests {
 
         assert!(delete_queued_if_exists(store.as_ref(), "q-cancel")
             .await
-            .unwrap());
+            .unwrap()
+            .is_some());
         assert!(store
             .get_queued(&ProxyQueryId("q-cancel".into()))
             .await
             .unwrap()
             .is_none());
-        assert!(!delete_queued_if_exists(store.as_ref(), "missing")
+        assert!(delete_queued_if_exists(store.as_ref(), "missing")
             .await
-            .unwrap());
+            .unwrap()
+            .is_none());
     }
 
     #[test]

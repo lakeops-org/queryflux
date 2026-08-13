@@ -122,6 +122,8 @@ pub enum EngineType {
     Exasol,
     /// ADBC adapter backed by a SingleStore driver (MySQL-compatible dialect).
     SingleStore,
+    /// Query never reached a backend engine (still queued or evicted before dispatch).
+    Undispatched,
     /// Result served from cache — no backend engine involved.
     Cache,
 }
@@ -145,6 +147,7 @@ impl EngineType {
             EngineType::Redshift => SqlDialect::Redshift,
             EngineType::Exasol => SqlDialect::Exasol,
             EngineType::SingleStore => SqlDialect::MySql,
+            EngineType::Undispatched => SqlDialect::Generic,
             EngineType::Cache => SqlDialect::Generic,
         }
     }

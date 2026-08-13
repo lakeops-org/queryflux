@@ -764,16 +764,16 @@ pub async fn get_queued_statement(
     };
     let waited_secs = (Utc::now() - queued.creation_time).num_seconds().max(0) as u64;
     if waited_secs >= wait_timeout_secs {
-        if let Err(e) = state.persistence.delete_queued(&query_id).await {
-            warn!(id = %query_id, "Failed to delete queued query after capacity wait timeout: {e}");
-        }
-        if let Some(qc) = &state.queue_coordinator {
-            let _ = qc.release_claim(&query_id.0).await;
-        }
         let err = QueryFluxError::CapacityWaitTimeout {
             group: queued.cluster_group.0.clone(),
             timeout_secs: wait_timeout_secs,
         };
+        if let Ok(Some(taken)) = state.persistence.take_queued(&query_id).await {
+            state.record_queued_terminal(&taken, QueryStatus::Failed, &err.to_string());
+        }
+        if let Some(qc) = &state.queue_coordinator {
+            let _ = qc.release_claim(&query_id.0).await;
+        }
         return trino_error_response(&query_id.0, &err.to_string()).into_response();
     }
 
@@ -1405,6 +1405,13 @@ pub async fn delete_executing_statement(
         return (StatusCode::BAD_GATEWAY, "failed to cancel query on backend").into_response();
     }
 
+    state.record_executing_cancelled(
+        &executing,
+        FrontendProtocol::TrinoHttp,
+        adapter.engine_type(),
+        adapter.translation_target_dialect(),
+        "client cancelled",
+    );
     state
         .release_query_slot(
             &executing.cluster_group,

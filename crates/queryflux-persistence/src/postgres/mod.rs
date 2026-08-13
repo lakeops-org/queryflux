@@ -1421,6 +1421,23 @@ impl Persistence for PostgresStore {
         Ok(())
     }
 
+    async fn take_queued(&self, id: &ProxyQueryId) -> Result<Option<QueuedQuery>> {
+        let row: Option<(serde_json::Value,)> =
+            sqlx::query_as("DELETE FROM queued_queries WHERE id = $1 RETURNING data")
+                .bind(&id.0)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| QueryFluxError::Persistence(format!("take_queued: {e}")))?;
+        match row {
+            None => Ok(None),
+            Some((data,)) => {
+                let q = serde_json::from_value(data)
+                    .map_err(|e| QueryFluxError::Persistence(format!("Deserialize error: {e}")))?;
+                Ok(Some(q))
+            }
+        }
+    }
+
     async fn list_queued(&self) -> Result<Vec<QueuedQuery>> {
         let rows: Vec<(serde_json::Value,)> =
             sqlx::query_as("SELECT data FROM queued_queries ORDER BY created_at")
@@ -1519,7 +1536,7 @@ impl MetricsStore for PostgresStore {
         let query_tags_json = tags_to_json(&r.query_tags);
         let guard_actions_json =
             serde_json::to_value(&r.guard_actions).unwrap_or(serde_json::Value::Array(vec![]));
-        sqlx::query(
+        let insert_result = sqlx::query(
             r#"INSERT INTO query_records
                 (proxy_query_id, backend_query_id, cluster_group, cluster_name, engine_type,
                  frontend_protocol, source_dialect, target_dialect, was_translated, username,
@@ -1533,7 +1550,8 @@ impl MetricsStore for PostgresStore {
                  guard_actions, was_guard_blocked, cache_hit)
                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,
                        $21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,
-                       $36,$37,$38,$39,$40,$41,$42,$43)"#,
+                       $36,$37,$38,$39,$40,$41,$42,$43)
+               ON CONFLICT (proxy_query_id) DO NOTHING"#,
         )
         .bind(&r.proxy_query_id)
         .bind(&r.backend_query_id)
@@ -1581,6 +1599,9 @@ impl MetricsStore for PostgresStore {
         .execute(&self.pool)
         .await
         .map_err(|e| QueryFluxError::Persistence(format!("Insert query_records: {e}")))?;
+        if insert_result.rows_affected() == 0 {
+            return Ok(());
+        }
 
         // Upsert into query_digest_stats.
         if let Some(phash) = r.query_parameterized_hash {
@@ -2660,5 +2681,100 @@ mod tests {
 
         store.delete_queued(&ProxyQueryId(qid1)).await.unwrap();
         store.delete_queued(&ProxyQueryId(qid2)).await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn pg_take_queued_returns_row_once() {
+        let store = test_store().await;
+        let qid = unique_id("take");
+
+        store.upsert_queued(make_queued(&qid)).await.unwrap();
+        assert!(store
+            .take_queued(&ProxyQueryId(qid.clone()))
+            .await
+            .unwrap()
+            .is_some());
+        assert!(store
+            .take_queued(&ProxyQueryId(qid))
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn pg_record_query_keeps_first_terminal_row_per_proxy_id() {
+        use crate::{MetricsStore, QueryHistoryStore, QueryRecord};
+        use queryflux_core::query::{
+            ClusterGroupName, ClusterName, EngineType, FrontendProtocol, QueryStatus, SqlDialect,
+        };
+
+        let store = test_store().await;
+        let proxy_id = unique_id("dedup");
+        let mut first = QueryRecord {
+            proxy_query_id: proxy_id.clone(),
+            backend_query_id: None,
+            cluster_group: ClusterGroupName("g".into()),
+            cluster_name: ClusterName("c".into()),
+            cluster_group_config_id: None,
+            cluster_config_id: None,
+            engine_type: EngineType::Undispatched,
+            frontend_protocol: FrontendProtocol::TrinoHttp,
+            source_dialect: SqlDialect::Trino,
+            target_dialect: SqlDialect::Generic,
+            was_translated: false,
+            translated_sql: None,
+            user: None,
+            catalog: None,
+            database: None,
+            sql_preview: "SELECT 1".into(),
+            status: QueryStatus::Failed,
+            routing_trace: None,
+            queue_duration_ms: 100,
+            execution_duration_ms: 0,
+            rows_returned: None,
+            error_message: Some("capacity wait timeout".into()),
+            created_at: chrono::Utc::now(),
+            engine_stats: None,
+            query_tags: Default::default(),
+            query_hash: None,
+            query_parameterized_hash: Some(42),
+            translated_query_hash: None,
+            digest_text: Some("select 1".into()),
+            translated_digest_text: None,
+            agent_id: None,
+            conversation_id: None,
+            step_index: None,
+            tool_call_id: None,
+            query_intent: None,
+            guard_actions: vec![],
+            was_guard_blocked: false,
+            cache_hit: false,
+        };
+        store.record_query(first.clone()).await.unwrap();
+        first.status = QueryStatus::Cancelled;
+        first.error_message = Some("client cancelled".into());
+        store.record_query(first).await.unwrap();
+
+        let rows = store
+            .list_queries(&QueryFilters {
+                limit: 50,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].proxy_query_id, proxy_id);
+        assert!(rows[0].status.contains("Failed"));
+
+        let digest_count: (i64,) = sqlx::query_as(
+            "SELECT call_count FROM query_digest_stats WHERE query_parameterized_hash = $1",
+        )
+        .bind(42_i64)
+        .fetch_one(&store.pool)
+        .await
+        .unwrap();
+        assert_eq!(digest_count.0, 1);
     }
 }
