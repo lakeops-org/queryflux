@@ -34,7 +34,6 @@ use queryflux_metrics::{
     buffered_store::BufferedMetricsStore, prometheus_store::PrometheusMetrics, MetricsStore,
     MultiMetricsStore,
 };
-use queryflux_persistence::cluster_config::{UpsertClusterConfig, UpsertClusterGroupConfig};
 use queryflux_persistence::{
     in_memory::InMemoryPersistence, postgres::PostgresStore, AdminStore, BackendStore,
     DistributedBackendStore, KIND_GUARD,
@@ -212,40 +211,51 @@ async fn main() -> Result<()> {
     > = None;
 
     // --- When Postgres is active, load cluster/group config from DB ---
-    // Merge YAML-defined clusters and groups into Postgres on **every** startup when the
-    // file declares them (`clusters` / `clusterGroups` non-empty). This keeps Docker/Compose
-    // configs authoritative even if the volume already had older rows (e.g. switched engine).
-    // **Studio-first** setups omit those maps (or leave them empty) — then nothing is written
-    // here and the DB remains the source of truth for those resources.
+    // Seed YAML `clusters` / `clusterGroups` only for names that are not already in
+    // Postgres. Existing DB rows (Studio/admin edits) win and are never overwritten
+    // by a ConfigMap/Helm values restart. First boot with an empty DB still seeds
+    // from YAML. Omit those maps (or leave them empty) for Studio-only setups.
     if let Some(pg) = &backend {
         if !config.clusters.is_empty() {
-            info!("Applying cluster definitions from YAML to Postgres");
-            for (name, cfg) in &config.clusters {
-                match UpsertClusterConfig::from_core(cfg) {
-                    Ok(Some(upsert)) => {
-                        pg.upsert_cluster_config(name, &upsert)
-                            .await
-                            .with_context(|| format!("Upsert cluster '{name}' from YAML"))?;
-                    }
-                    Ok(None) => {}
-                    Err(e) => {
-                        return Err(anyhow::Error::from(e).context(format!(
-                            "cluster '{name}': serializing queryAuth for Postgres seed"
-                        )));
-                    }
-                }
+            let report = queryflux_persistence::yaml_seed::seed_clusters_from_yaml_if_missing(
+                pg.as_ref(),
+                &config.clusters,
+            )
+            .await
+            .context("Seed clusters from YAML")?;
+            if report.seeded > 0 {
+                info!(
+                    "Seeded {} cluster definition(s) from YAML into Postgres",
+                    report.seeded
+                );
+            } else if report.existing_before > 0 {
+                info!(
+                    existing = report.existing_before,
+                    "Skipping YAML cluster upsert — Postgres already has these cluster names"
+                );
             }
         }
         if !config.cluster_groups.is_empty() {
-            info!("Applying cluster group definitions from YAML to Postgres");
-            for (name, cfg) in &config.cluster_groups {
-                pg.upsert_group_config(name, &UpsertClusterGroupConfig::from_core(cfg))
-                    .await
-                    .with_context(|| format!("Upsert group '{name}' from YAML"))?;
+            let report = queryflux_persistence::yaml_seed::seed_groups_from_yaml_if_missing(
+                pg.as_ref(),
+                &config.cluster_groups,
+            )
+            .await
+            .context("Seed cluster groups from YAML")?;
+            if report.seeded > 0 {
+                info!(
+                    "Seeded {} cluster group definition(s) from YAML into Postgres",
+                    report.seeded
+                );
+            } else if report.existing_before > 0 {
+                info!(
+                    existing = report.existing_before,
+                    "Skipping YAML group upsert — Postgres already has these group names"
+                );
             }
         }
 
-        // Effective config comes from Postgres (YAML above only upserts keys that appear in the file).
+        // Effective config comes from Postgres (YAML above only seeds missing names).
         info!("Loading cluster and group configs from Postgres");
         let db_cluster_records = pg
             .list_cluster_configs()

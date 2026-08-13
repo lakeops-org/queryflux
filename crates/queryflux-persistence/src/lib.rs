@@ -7,6 +7,7 @@ pub mod query_history;
 pub mod routing_json;
 pub mod routing_slices;
 pub mod script_library;
+pub mod yaml_seed;
 
 use std::collections::HashMap;
 
@@ -159,6 +160,12 @@ pub trait ClusterConfigStore: Send + Sync {
         name: &str,
         cfg: &UpsertClusterConfig,
     ) -> Result<ClusterConfigRecord>;
+    /// Insert a cluster row only when `name` is absent. Returns true when inserted.
+    async fn insert_cluster_config_if_missing(
+        &self,
+        name: &str,
+        cfg: &UpsertClusterConfig,
+    ) -> Result<bool>;
     /// Deletes the cluster row and removes its id from every group's `members` array
     /// (Postgres) or drops its name from each group's member list (in-memory).
     async fn delete_cluster_config(&self, name: &str) -> Result<bool>;
@@ -179,6 +186,12 @@ pub trait ClusterConfigStore: Send + Sync {
         name: &str,
         cfg: &UpsertClusterGroupConfig,
     ) -> Result<ClusterGroupConfigRecord>;
+    /// Insert a group row only when `name` is absent. Returns true when inserted.
+    async fn insert_group_config_if_missing(
+        &self,
+        name: &str,
+        cfg: &UpsertClusterGroupConfig,
+    ) -> Result<bool>;
     async fn delete_group_config(&self, name: &str) -> Result<bool>;
     /// Returns the number of stored group configs (used for first-run seeding).
     async fn group_configs_count(&self) -> Result<i64>;
