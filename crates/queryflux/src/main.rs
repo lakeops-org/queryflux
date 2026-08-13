@@ -1226,6 +1226,13 @@ async fn main() -> Result<()> {
                         let backend_id = q.backend_query_id.clone();
                         let cluster = q.cluster_name.0.clone();
                         if let Some(adapter) = state.adapter(&cluster).await {
+                            state.record_executing_cancelled(
+                                &q,
+                                queryflux_core::query::FrontendProtocol::TrinoHttp,
+                                adapter.engine_type(),
+                                adapter.translation_target_dialect(),
+                                "zombie_evicted: not polled for >5 min",
+                            );
                             tokio::spawn(async move {
                                 if let Err(e) = adapter.cancel_query(&backend_id).await {
                                     tracing::debug!(
@@ -1234,6 +1241,13 @@ async fn main() -> Result<()> {
                                 }
                             });
                         } else {
+                            state.record_executing_cancelled(
+                                &q,
+                                queryflux_core::query::FrontendProtocol::TrinoHttp,
+                                queryflux_core::query::EngineType::Trino,
+                                queryflux_core::query::SqlDialect::Trino,
+                                "zombie_evicted: not polled for >5 min",
+                            );
                             tracing::debug!(
                                 cluster = %cluster,
                                 id = %q.backend_query_id,
@@ -1242,21 +1256,8 @@ async fn main() -> Result<()> {
                         }
 
                         state
-                            .metrics
-                            .on_query_finished(&q.cluster_group.0, &q.cluster_name.0);
-                        let cluster_manager = state.live.read().await.cluster_manager.clone();
-                        let _ = cluster_manager
-                            .release_cluster(&q.cluster_group, &q.cluster_name)
+                            .release_query_slot(&q.cluster_group, &q.cluster_name, &q.id.0)
                             .await;
-                        if let Some(cap) = &state.capacity_store {
-                            if let Err(e) = cap.release(&q.cluster_name.0, &q.id.0).await {
-                                state.metrics.on_coordination_failure("capacity_release");
-                                tracing::warn!(
-                                    "CapacityStore release failed for zombie query {}: {e}",
-                                    q.id
-                                );
-                            }
-                        }
                         let _ = state.persistence.delete(&q.backend_query_id).await;
                     }
                 }
@@ -1282,14 +1283,24 @@ async fn main() -> Result<()> {
                     break;
                 }
                 let cutoff = chrono::Utc::now() - chrono::Duration::seconds(CLIENT_TIMEOUT_SECS);
-                match state
-                    .persistence
-                    .delete_queued_not_accessed_since(cutoff)
-                    .await
-                {
-                    Ok(0) => {}
-                    Ok(n) => tracing::info!("Cleaned up {n} stale queued queries"),
-                    Err(e) => tracing::warn!("Queued query cleanup failed: {e}"),
+                let Ok(queued) = state.persistence.list_queued().await else {
+                    continue;
+                };
+                let mut cleaned = 0u64;
+                for q in queued {
+                    if q.last_accessed < cutoff {
+                        state.record_queued_terminal(
+                            &q,
+                            queryflux_core::query::QueryStatus::Failed,
+                            "stale_queued_evicted: client disconnected before dispatch",
+                        );
+                        if state.persistence.delete_queued(&q.id).await.is_ok() {
+                            cleaned += 1;
+                        }
+                    }
+                }
+                if cleaned > 0 {
+                    tracing::info!("Cleaned up {cleaned} stale queued queries");
                 }
             }
         }

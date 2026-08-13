@@ -8,8 +8,8 @@ use queryflux_core::{
     config::ClusterConfig,
     params::QueryParams,
     query::{
-        ClusterGroupName, ClusterName, EngineType, FrontendProtocol, ProxyQueryId,
-        QueryEngineStats, QueryStatus, SqlDialect,
+        ClusterGroupName, ClusterName, EngineType, ExecutingQuery, FrontendProtocol, ProxyQueryId,
+        QueryEngineStats, QueryStatus, QueuedQuery, SqlDialect,
     },
     session::{AgentContext, SessionContext},
     tags::QueryTags,
@@ -275,6 +275,124 @@ impl AppState {
             }
             let _ = metrics.record_query(record).await;
         });
+    }
+
+    /// Persist a `Cancelled` audit row for an executing query (client cancel, admin
+    /// cancel, or zombie eviction). Prefer calling this before deleting the
+    /// executing record so a raced poll completion still wins if it recorded first.
+    pub fn record_executing_cancelled(
+        &self,
+        executing: &ExecutingQuery,
+        protocol: FrontendProtocol,
+        engine_type: EngineType,
+        tgt_dialect: SqlDialect,
+        reason: &str,
+    ) {
+        let was_translated = executing.translated_sql.is_some();
+        let execution_ms = (Utc::now() - executing.creation_time)
+            .num_milliseconds()
+            .max(0) as u64;
+        let guard_actions: Vec<GuardAction> = serde_json::from_value(serde_json::Value::Array(
+            executing.submitted_guard_actions.clone(),
+        ))
+        .unwrap_or_default();
+        let session = SessionContext {
+            user: (!executing.submitted_by.is_empty()).then(|| executing.submitted_by.clone()),
+            ..Default::default()
+        };
+        let src_dialect = protocol.default_dialect();
+        let ctx = QueryContext {
+            query_id: executing.id.clone(),
+            sql: executing
+                .translated_sql
+                .as_deref()
+                .unwrap_or(&executing.sql)
+                .to_string(),
+            session,
+            protocol,
+            group: executing.cluster_group.clone(),
+            cluster: executing.cluster_name.clone(),
+            cluster_group_config_id: executing.cluster_group_config_id,
+            cluster_config_id: executing.cluster_config_id,
+            engine_type,
+            src_dialect,
+            tgt_dialect,
+            was_translated,
+            translated_sql: if was_translated {
+                Some(executing.sql.clone())
+            } else {
+                None
+            },
+            query_tags: executing.query_tags.clone(),
+            query_params: vec![],
+            agent_context: executing.agent_context.clone(),
+        };
+        self.record_query(
+            &ctx,
+            QueryOutcome {
+                backend_query_id: Some(executing.backend_query_id.0.clone()),
+                status: QueryStatus::Cancelled,
+                execution_ms,
+                rows: None,
+                error: Some(reason.to_string()),
+                routing_trace: None,
+                engine_stats: None,
+                guard_actions,
+                was_guard_blocked: executing.was_guard_blocked,
+                queue_duration_ms: 0,
+                cache_hit: false,
+            },
+        );
+    }
+
+    /// Persist a terminal audit row for a queued query that never reached an engine
+    /// (capacity wait timeout, stale client disconnect).
+    pub fn record_queued_terminal(&self, queued: &QueuedQuery, status: QueryStatus, reason: &str) {
+        let queue_duration_ms = (Utc::now() - queued.creation_time)
+            .num_milliseconds()
+            .max(0) as u64;
+        let session = {
+            let mut s = queued.session.clone();
+            if s.user.is_none() && !queued.submitted_by.is_empty() {
+                s.user = Some(queued.submitted_by.clone());
+            }
+            s
+        };
+        let dialect = queued.frontend_protocol.default_dialect();
+        let ctx = QueryContext {
+            query_id: queued.id.clone(),
+            sql: queued.sql.clone(),
+            session,
+            protocol: queued.frontend_protocol.clone(),
+            group: queued.cluster_group.clone(),
+            cluster: ClusterName("(not-dispatched)".into()),
+            cluster_group_config_id: None,
+            cluster_config_id: None,
+            engine_type: EngineType::Trino,
+            src_dialect: dialect.clone(),
+            tgt_dialect: dialect,
+            was_translated: false,
+            translated_sql: None,
+            query_tags: QueryTags::default(),
+            query_params: vec![],
+            agent_context: None,
+        };
+        self.record_query(
+            &ctx,
+            QueryOutcome {
+                backend_query_id: None,
+                status,
+                execution_ms: 0,
+                rows: None,
+                error: Some(reason.to_string()),
+                routing_trace: None,
+                engine_stats: None,
+                guard_actions: vec![],
+                was_guard_blocked: false,
+                queue_duration_ms,
+                cache_hit: false,
+            },
+        );
     }
 }
 
