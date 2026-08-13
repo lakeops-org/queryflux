@@ -7,7 +7,7 @@ use queryflux_core::{
     session::SessionContext,
 };
 
-use crate::RouterTrait;
+use crate::{RouterTrait, RoutingDecision};
 
 /// Routes based on Trino client tags (`X-Trino-Client-Tags` header).
 /// If the client sends any tag that matches a rule, that group is selected.
@@ -34,15 +34,15 @@ impl RouterTrait for ClientTagsRouter {
         session: &SessionContext,
         _frontend_protocol: &FrontendProtocol,
         _auth_ctx: Option<&queryflux_auth::AuthContext>,
-    ) -> Result<Option<ClusterGroupName>> {
+    ) -> Result<RoutingDecision> {
         // X-Trino-Client-Tags is a comma-separated list of tags stored in extra.
         if let Some(tags_header) = session.extra.get("x-trino-client-tags") {
             for tag in tags_header.split(',').map(|t| t.trim()) {
                 if let Some(group) = self.tag_to_group.get(tag) {
-                    return Ok(Some(group.clone()));
+                    return Ok(RoutingDecision::Route(group.clone()));
                 }
             }
         }
-        Ok(None)
+        Ok(RoutingDecision::NoMatch)
     }
 }

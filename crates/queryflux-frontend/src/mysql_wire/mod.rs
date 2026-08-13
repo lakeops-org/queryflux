@@ -43,6 +43,7 @@ use crate::abort::{wait_client_gone, AbortOnDrop};
 use crate::dispatch::{execute_to_sink, ResultSink};
 use crate::state::AppState;
 use crate::{FrontendListenerTrait, ShutdownRx, MAX_FRONTEND_MESSAGE_BYTES};
+use queryflux_routing::ChainRouteResult;
 
 // ── MySQL command bytes ───────────────────────────────────────────────────────
 
@@ -380,10 +381,19 @@ async fn handle_com_query(
             .route_with_trace(sql, session, &protocol, Some(&auth_ctx))
             .await
     };
-    let (group, _trace) = match routing_result {
+    let (chain_result, routing_trace) = match routing_result {
         Ok(r) => r,
         Err(e) => {
             write_packet(writer, start_seq, &build_err(1105, &e.to_string())).await?;
+            return Ok(());
+        }
+    };
+    let group = match chain_result {
+        ChainRouteResult::Routed(g) => g,
+        ChainRouteResult::Denied { message } => {
+            state.record_routing_deny(sql, session, protocol, &message, Some(routing_trace));
+            // 1227 = ER_SPECIFIC_ACCESS_DENIED_ERROR
+            write_packet(writer, start_seq, &build_err(1227, &message)).await?;
             return Ok(());
         }
     };

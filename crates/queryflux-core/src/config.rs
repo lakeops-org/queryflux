@@ -1258,7 +1258,24 @@ pub enum RouterConfig {
 #[serde(rename_all = "camelCase")]
 pub struct QueryRegexRule {
     pub regex: String,
-    pub target_group: String,
+    /// Cluster group to route to when [`Self::action`] is [`RegexRouteAction::Route`].
+    #[serde(default)]
+    pub target_group: Option<String>,
+    /// `route` (default) or `deny`.
+    #[serde(default)]
+    pub action: RegexRouteAction,
+    /// Client-visible message when [`Self::action`] is [`RegexRouteAction::Deny`].
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+/// Action taken when a [`QueryRegexRule`] matches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum RegexRouteAction {
+    #[default]
+    Route,
+    Deny,
 }
 
 /// A single rule in a [`RouterConfig::Tags`] router.
@@ -1481,7 +1498,8 @@ mod tests {
             RouterConfig::QueryRegex { rules } => {
                 assert_eq!(rules.len(), 1);
                 assert_eq!(rules[0].regex, "(?i)fact_");
-                assert_eq!(rules[0].target_group, "g-facts");
+                assert_eq!(rules[0].target_group.as_deref(), Some("g-facts"));
+                assert!(matches!(rules[0].action, super::RegexRouteAction::Route));
             }
             _ => panic!("expected queryRegex"),
         }

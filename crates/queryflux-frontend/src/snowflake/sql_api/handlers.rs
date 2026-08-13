@@ -27,6 +27,7 @@ use crate::snowflake::http::handlers::bindings::bindings_to_params;
 use crate::snowflake::http::handlers::common::parse_snowflake_json_body;
 use crate::snowflake::http::SnowflakeWireState;
 use crate::snowflake::in_flight::{CancelOutcome, SnowflakeExecParams, SpawnExecuteResult};
+use queryflux_routing::ChainRouteResult;
 
 // ---------------------------------------------------------------------------
 // ResultSink that accumulates Arrow batches into SQL API v2 jsonv2 format
@@ -239,7 +240,17 @@ pub async fn submit_statement(
             .await
     };
     let group = match group {
-        Ok(g) => g,
+        Ok(ChainRouteResult::Routed(g)) => g,
+        Ok(ChainRouteResult::Denied { message }) => {
+            state.app.record_routing_deny(
+                &sql,
+                &session_ctx,
+                FrontendProtocol::SnowflakeSqlApi,
+                &message,
+                None,
+            );
+            return sql_api_error(StatusCode::FORBIDDEN, "390201", &message);
+        }
         Err(e) => return sql_api_error(StatusCode::BAD_GATEWAY, "390000", &e.to_string()),
     };
 

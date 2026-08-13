@@ -26,6 +26,10 @@ pub enum QueryFluxError {
     #[error("Unauthorized: {0}")]
     Unauthorized(String),
 
+    /// Rejected by a routing deny rule before dispatch. Message is safe to show to clients.
+    #[error("{0}")]
+    Denied(String),
+
     #[error("Query not found: {0}")]
     QueryNotFound(String),
 

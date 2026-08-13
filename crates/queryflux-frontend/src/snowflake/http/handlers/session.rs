@@ -18,6 +18,7 @@ use crate::snowflake::http::handlers::common::{
     extract_snowflake_token, parse_snowflake_json_body,
 };
 use crate::snowflake::http::SnowflakeWireState;
+use queryflux_routing::ChainRouteResult;
 
 // ---------------------------------------------------------------------------
 // POST /session/v1/login-request
@@ -92,7 +93,17 @@ pub async fn login_request(
             .await
     };
     let group = match group {
-        Ok(g) => g,
+        Ok(ChainRouteResult::Routed(g)) => g,
+        Ok(ChainRouteResult::Denied { message }) => {
+            state.app.record_routing_deny(
+                "",
+                &session_ctx,
+                FrontendProtocol::SnowflakeHttp,
+                &message,
+                None,
+            );
+            return sf_error("390201", &message);
+        }
         Err(e) => return sf_error("390000", &format!("Routing error: {e}")),
     };
 

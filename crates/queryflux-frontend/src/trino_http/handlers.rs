@@ -26,6 +26,7 @@ use super::result_sink::TrinoHttpResultSink;
 use crate::dispatch::{dispatch_query, execute_to_sink, rewrite_trino_uri, DispatchOutcome};
 use crate::state::{AppState, QueryContext, QueryOutcome};
 use queryflux_persistence::QueueCoordinator;
+use queryflux_routing::ChainRouteResult;
 
 /// Stale-claim cutoff. Heartbeats must run more often than this while dispatch
 /// is in progress so a slow submit cannot look like a crashed replica.
@@ -162,6 +163,7 @@ fn client_safe_message(e: &QueryFluxError) -> &'static str {
         | Unauthorized(_)
         | QueryNotFound(_)
         | ClusterNotFound(_)
+        | Denied(_)
         | QueueFull { .. }
         | CapacityWaitTimeout { .. } => "",
         _ => "Internal error",
@@ -528,7 +530,7 @@ pub async fn post_statement(
             .route_with_trace(&sql, &session, &protocol, Some(&auth_ctx))
             .await
     };
-    let (group, _trace) = match routing_result {
+    let (chain_result, routing_trace) = match routing_result {
         Ok(r) => r,
         Err(e) => {
             warn!("Routing error: {e}");
@@ -541,6 +543,15 @@ pub async fn post_statement(
                 safe
             };
             return trino_error_response(&tmp_id.0, msg).into_response();
+        }
+    };
+    let group = match chain_result {
+        ChainRouteResult::Routed(g) => g,
+        ChainRouteResult::Denied { message } => {
+            warn!(%message, user = %auth_ctx.user, "Query denied by routing rule");
+            let query_id =
+                state.record_routing_deny(&sql, &session, protocol, &message, Some(routing_trace));
+            return trino_error_response(&query_id.0, &message).into_response();
         }
     };
 
