@@ -245,10 +245,8 @@ fn resolve_one_router_for_storage(v: &Value, id_to_name: &HashMap<i64, String>) 
                                 let mut out = Map::new();
                                 out.insert("regex".into(), regex);
                                 out.insert("action".into(), json!("deny"));
-                                if let Some(err) = rule.get("error") {
-                                    if !err.is_null() {
-                                        out.insert("error".into(), err.clone());
-                                    }
+                                if let Some(err) = rule.get("error").and_then(|e| e.as_str()) {
+                                    out.insert("error".into(), json!(err));
                                 }
                                 return Ok(Value::Object(out));
                             }

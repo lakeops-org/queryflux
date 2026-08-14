@@ -1987,14 +1987,15 @@ fn validate_live_config_refs(
                 refs.extend(user_to_group.values().map(String::as_str));
             }
             RouterConfig::QueryRegex { rules } => {
-                refs.extend(
-                    rules
-                        .iter()
-                        .filter(|r| {
-                            matches!(r.action, queryflux_core::config::RegexRouteAction::Route)
-                        })
-                        .filter_map(|r| r.target_group.as_deref()),
-                );
+                for rule in rules {
+                    if matches!(rule.action, queryflux_core::config::RegexRouteAction::Route) {
+                        if let Some(group) = rule.target_group.as_deref() {
+                            refs.push(group);
+                        } else {
+                            issues.push("queryRegex route rule requires targetGroup".to_string());
+                        }
+                    }
+                }
             }
             RouterConfig::Tags { rules } => {
                 refs.extend(rules.iter().map(|r| r.target_group.as_str()));

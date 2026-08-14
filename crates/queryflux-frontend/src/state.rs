@@ -387,7 +387,7 @@ impl AppState {
             translated_sql: None,
             query_tags: session.tags.clone(),
             query_params: vec![],
-            agent_context: session.agent_context.clone(),
+            agent_context: session.resolved_agent_context(),
         };
         self.record_query(
             &ctx,

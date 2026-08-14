@@ -228,10 +228,10 @@ pub async fn submit_statement(
         extra,
         agent_context: None,
     };
-    let group = {
+    let routing_result = {
         let live = state.app.live.read().await;
         live.router_chain
-            .route(
+            .route_with_trace(
                 &sql,
                 &session_ctx,
                 &FrontendProtocol::SnowflakeSqlApi,
@@ -239,19 +239,22 @@ pub async fn submit_statement(
             )
             .await
     };
+    let (group, routing_trace) = match routing_result {
+        Ok((result, trace)) => (result, trace),
+        Err(e) => return sql_api_error(StatusCode::BAD_GATEWAY, "390000", &e.to_string()),
+    };
     let group = match group {
-        Ok(ChainRouteResult::Routed(g)) => g,
-        Ok(ChainRouteResult::Denied { message }) => {
+        ChainRouteResult::Routed(g) => g,
+        ChainRouteResult::Denied { message } => {
             state.app.record_routing_deny(
                 &sql,
                 &session_ctx,
                 FrontendProtocol::SnowflakeSqlApi,
                 &message,
-                None,
+                Some(routing_trace),
             );
             return sql_api_error(StatusCode::FORBIDDEN, "390201", &message);
         }
-        Err(e) => return sql_api_error(StatusCode::BAD_GATEWAY, "390000", &e.to_string()),
     };
 
     let handle = Uuid::new_v4().to_string();

@@ -81,10 +81,10 @@ pub async fn login_request(
         extra: Default::default(),
         agent_context: None,
     };
-    let group = {
+    let routing_result = {
         let live = state.app.live.read().await;
         live.router_chain
-            .route(
+            .route_with_trace(
                 "",
                 &session_ctx,
                 &FrontendProtocol::SnowflakeHttp,
@@ -92,19 +92,22 @@ pub async fn login_request(
             )
             .await
     };
+    let (group, routing_trace) = match routing_result {
+        Ok((result, trace)) => (result, trace),
+        Err(e) => return sf_error("390000", &format!("Routing error: {e}")),
+    };
     let group = match group {
-        Ok(ChainRouteResult::Routed(g)) => g,
-        Ok(ChainRouteResult::Denied { message }) => {
+        ChainRouteResult::Routed(g) => g,
+        ChainRouteResult::Denied { message } => {
             state.app.record_routing_deny(
                 "",
                 &session_ctx,
                 FrontendProtocol::SnowflakeHttp,
                 &message,
-                None,
+                Some(routing_trace),
             );
             return sf_error("390201", &message);
         }
-        Err(e) => return sf_error("390000", &format!("Routing error: {e}")),
     };
 
     let token = state.sessions.create_session(

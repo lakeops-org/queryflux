@@ -84,6 +84,13 @@ impl QueryRegexRouter {
             .collect();
         Self { rules: compiled }
     }
+
+    /// Validate a regex pattern using the same engine as runtime routing.
+    pub fn validate_pattern(pattern: &str) -> std::result::Result<(), String> {
+        Regex::new(pattern)
+            .map(|_| ())
+            .map_err(|e| format!("invalid regex: {e}"))
+    }
 }
 
 #[async_trait]

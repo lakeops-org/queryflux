@@ -801,6 +801,11 @@ function NewRuleForm({
           return form.targetGroupId != null && form.tagKey.trim() !== "";
         case "regex":
           if (form.regex.trim() === "") return false;
+          try {
+            new RegExp(form.regex);
+          } catch {
+            return false;
+          }
           if (form.regexAction === "deny") return true;
           return form.targetGroupId != null;
         case "protocol":
@@ -813,11 +818,13 @@ function NewRuleForm({
     value: string,
     onChange: (v: string) => void,
     extraClass = "",
+    ariaLabel?: string,
   ) => (
     <input
       className={`px-2.5 py-1.5 text-xs rounded-lg border border-slate-200 bg-white text-slate-900 font-mono focus:outline-none focus:ring-2 focus:ring-indigo-300 ${extraClass}`}
       placeholder={placeholder}
       value={value}
+      aria-label={ariaLabel}
       onChange={(e) => onChange(e.target.value)}
     />
   );
@@ -934,6 +941,7 @@ function NewRuleForm({
                     form.denyError,
                     (v) => setForm((f) => ({ ...f, denyError: v })),
                     "w-full",
+                    "Denial message",
                   )}
                 </div>
               )}
@@ -1131,6 +1139,7 @@ function SortableChainRow({
               Deny
             </span>
             <input
+              aria-label="Denial message"
               className="w-full max-w-[220px] px-2 py-1 text-[11px] rounded-md border border-slate-200 bg-white text-slate-700 font-mono focus:outline-none focus:ring-2 focus:ring-indigo-300"
               placeholder="Query denied by routing rule"
               value={item.error}
@@ -1318,6 +1327,15 @@ export function RoutingEditor({ initialRouting, groups }: RoutingEditorProps) {
     setRoutingSaving(true);
     setRoutingMsg(null);
     try {
+      for (const item of chainItems) {
+        if (item.kind === "regex" && item.regex.trim() !== "") {
+          try {
+            new RegExp(item.regex);
+          } catch {
+            throw new Error(`Invalid regex pattern: ${item.regex}`);
+          }
+        }
+      }
       await putRoutingConfig({
         routingFallbackGroupId: routingFallbackId,
         routingFallback: "",

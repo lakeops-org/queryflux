@@ -148,10 +148,8 @@ pub fn expand_router_for_persistence(
                         def.insert("type".into(), json!("_qfRegexLeg"));
                         def.insert("regex".into(), json!(regex));
                         def.insert("action".into(), json!("deny"));
-                        if let Some(err) = r.get("error") {
-                            if !err.is_null() {
-                                def.insert("error".into(), err.clone());
-                            }
+                        if let Some(err) = r.get("error").and_then(|e| e.as_str()) {
+                            def.insert("error".into(), json!(err));
                         }
                         out.push((Value::Object(def), None));
                         continue;
@@ -416,10 +414,8 @@ fn merge_regex_chunk(
             let mut rule = Map::new();
             rule.insert("regex".into(), json!(regex));
             rule.insert("action".into(), json!("deny"));
-            if let Some(err) = leg.definition.get("error") {
-                if !err.is_null() {
-                    rule.insert("error".into(), err.clone());
-                }
+            if let Some(err) = leg.definition.get("error").and_then(|e| e.as_str()) {
+                rule.insert("error".into(), json!(err));
             }
             rules.push(Value::Object(rule));
             continue;
