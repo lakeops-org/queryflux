@@ -98,7 +98,8 @@ The chart also supports `env`, `envFrom`, `extraVolumes`, `extraVolumeMounts`, `
 ## Examples
 
 - `examples/external-config-values.yaml`: use a pre-created ConfigMap and Secret, and run the server-only image.
-- `examples/production-values.yaml`: shows ingress, TLS, HPA, PDB, ServiceMonitor, NetworkPolicy, resource requests, and topology spread settings.
+- `examples/production-values.yaml`: production checklist — TLS ingress, HPA, PDB, ServiceMonitor, NetworkPolicy, topology spread, `config.existingSecret`, and pre-created admin Secret (no default password in values).
+- `examples/production-config.yaml`: template for the config Secret referenced by production-values (`auth.required: true`, OIDC, Postgres URL). Create with `kubectl create secret generic queryflux-config --from-file=config.yaml=...`.
 - `examples/networkpolicy-values.yaml`: starter NetworkPolicy allowing clients, DNS, Postgres, and engines (tighten selectors before production).
 
 ## Validation

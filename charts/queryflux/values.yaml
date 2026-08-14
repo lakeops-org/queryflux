@@ -10,6 +10,8 @@
 #   6. resources          → set CPU/memory requests and limits
 #   7. ingress / TLS      → enable HTTPS termination
 #   8. config.existingSecret → use when config contains credentials
+#
+# Starter: examples/production-values.yaml + examples/production-config.yaml
 # ──────────────────────────────────────────────────────────────────────────────
 
 replicaCount: 1

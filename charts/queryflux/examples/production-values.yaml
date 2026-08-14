@@ -1,49 +1,42 @@
-# Production-oriented example. Replace hosts, TLS secret, and backend endpoints.
+# Production-oriented Helm values.
+#
+# Run the following from the repository root.
+# Before install:
+#   1. Create admin credentials Secret (do not put the password in values):
+#        kubectl create secret generic queryflux-admin \
+#          --from-literal=QUERYFLUX_ADMIN_USER=admin \
+#          --from-literal=QUERYFLUX_ADMIN_PASSWORD='<strong-password>'
+#   2. Copy ./charts/queryflux/examples/production-config.yaml, fill Postgres URL + OIDC (or static/
+#      LDAP), then create the config Secret:
+#        kubectl create secret generic queryflux-config \
+#          --from-file=config.yaml=./production-config.yaml
+#   3. Create / reuse a TLS secret for ingress (queryflux-tls below).
+#   4. helm install queryflux ./charts/queryflux \
+#        -f ./charts/queryflux/examples/production-values.yaml
+#
+# Covers the production checklist: TLS, auth.required (in config Secret),
+# Postgres URL via config.existingSecret, PDB, ServiceMonitor, HPA, and
+# non-default admin Secret.
+
 replicaCount: 2
 
 image:
-  tag: latest
+  # Empty tag → chart appVersion (pin a release tag in real deploys; avoid "latest").
+  tag: ""
   pullPolicy: IfNotPresent
 
-adminCredentials:
-  username: admin
-  password: change-this-before-installing
+# Admin credentials come from a pre-created Secret — never ship default admin/admin.
+existingSecret:
+  name: queryflux-admin
+  usernameKey: QUERYFLUX_ADMIN_USER
+  passwordKey: QUERYFLUX_ADMIN_PASSWORD
 
-# NOTE: config.data is rendered into a ConfigMap, so any secret embedded here
-# (such as the Postgres password in persistence.url) is stored in plaintext.
-# QueryFlux does not interpolate environment variables into the config file, so
-# for production put the full config (including the Postgres URL) into a Secret
-# and reference it instead:
-#   config:
-#     create: false
-#     existingSecret: queryflux-config   # Secret with a config.yaml key
+# Config (including Postgres URL and OIDC client material) lives in a Secret so
+# credentials are not stored in a ConfigMap. See examples/production-config.yaml.
 config:
-  data:
-    queryflux:
-      externalAddress: https://queryflux.example.com
-      frontends:
-        trinoHttp:
-          enabled: true
-          port: 8080
-      persistence:
-        type: postgres
-        # Placeholder — replace USERNAME/PASSWORD/HOST. Prefer config.existingSecret
-        # (see note above) so credentials are not stored in plaintext.
-        url: postgres://USERNAME:PASSWORD@postgres.queryflux.svc.cluster.local:5432/queryflux
-      adminApi:
-        port: 9000
-      queryHistoryRetentionDays: 30
-    clusterGroups:
-      trino-default:
-        engine: trino
-        maxRunningQueries: 100
-        clusters:
-          - name: trino-1
-            endpoint: http://trino.trino.svc.cluster.local:8080
-    routers:
-      - type: protocolBased
-        trinoHttp: trino-default
-    routingFallback: trino-default
+  create: false
+  existingSecret: queryflux-config
+  fileName: config.yaml
 
 ingress:
   enabled: true
@@ -121,6 +114,16 @@ resources:
 
 # Keep ≥ queryflux.shutdownDrainTimeoutSecs (default 30) + buffer.
 terminationGracePeriodSeconds: 45
+
+affinity:
+  podAntiAffinity:
+    preferredDuringSchedulingIgnoredDuringExecution:
+      - weight: 100
+        podAffinityTerm:
+          topologyKey: kubernetes.io/hostname
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: queryflux
 
 topologySpreadConstraints:
   - maxSkew: 1
