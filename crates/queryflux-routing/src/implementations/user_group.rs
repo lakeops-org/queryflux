@@ -7,7 +7,7 @@ use queryflux_core::{
     session::SessionContext,
 };
 
-use crate::RouterTrait;
+use crate::{RouterTrait, RoutingDecision};
 
 /// Routes by authenticated username → cluster group.
 ///
@@ -36,14 +36,14 @@ impl RouterTrait for UserGroupRouter {
         session: &SessionContext,
         _frontend_protocol: &FrontendProtocol,
         auth_ctx: Option<&queryflux_auth::AuthContext>,
-    ) -> Result<Option<ClusterGroupName>> {
+    ) -> Result<RoutingDecision> {
         let user = auth_ctx
             .map(|ctx| ctx.user.as_str())
             .or_else(|| session.user());
         if let Some(user) = user {
-            return Ok(self.mapping.get(user).cloned());
+            return Ok(self.mapping.get(user).cloned().into());
         }
-        Ok(None)
+        Ok(RoutingDecision::NoMatch)
     }
 }
 
@@ -83,7 +83,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(group, Some(ClusterGroupName("prod".into())));
+        assert_eq!(group, Some(ClusterGroupName("prod".into())).into());
     }
 
     #[tokio::test]
@@ -97,7 +97,7 @@ mod tests {
             .route("SELECT 1", &session, &FrontendProtocol::TrinoHttp, None)
             .await
             .unwrap();
-        assert_eq!(group, Some(ClusterGroupName("dev".into())));
+        assert_eq!(group, Some(ClusterGroupName("dev".into())).into());
     }
 
     #[tokio::test]
@@ -118,6 +118,6 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(group, None);
+        assert_eq!(group, RoutingDecision::NoMatch);
     }
 }

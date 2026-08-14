@@ -7,7 +7,7 @@ use queryflux_core::{
     session::SessionContext,
 };
 
-use crate::RouterTrait;
+use crate::{RouterTrait, RoutingDecision};
 
 /// Routes based on a specific HTTP header value.
 /// Only applies to Trino HTTP frontend (other protocols don't have arbitrary headers).
@@ -38,10 +38,10 @@ impl RouterTrait for HeaderRouter {
         session: &SessionContext,
         _frontend_protocol: &FrontendProtocol,
         _auth_ctx: Option<&queryflux_auth::AuthContext>,
-    ) -> Result<Option<ClusterGroupName>> {
+    ) -> Result<RoutingDecision> {
         if let Some(value) = session.extra.get(&self.header_name) {
-            return Ok(self.mapping.get(value).cloned());
+            return Ok(self.mapping.get(value).cloned().into());
         }
-        Ok(None)
+        Ok(RoutingDecision::NoMatch)
     }
 }

@@ -5,7 +5,7 @@ use queryflux_core::{
     session::SessionContext,
 };
 
-use crate::RouterTrait;
+use crate::{RouterTrait, RoutingDecision};
 
 /// Routes based on which frontend protocol the client used.
 /// Useful for directing MySQL-wire clients (StarRocks) to a different group
@@ -32,7 +32,7 @@ impl RouterTrait for ProtocolBasedRouter {
         _session: &SessionContext,
         frontend_protocol: &FrontendProtocol,
         _auth_ctx: Option<&queryflux_auth::AuthContext>,
-    ) -> Result<Option<ClusterGroupName>> {
+    ) -> Result<RoutingDecision> {
         let group = match frontend_protocol {
             FrontendProtocol::TrinoHttp => self.trino_http.clone(),
             FrontendProtocol::PostgresWire => self.postgres_wire.clone(),
@@ -42,6 +42,6 @@ impl RouterTrait for ProtocolBasedRouter {
             FrontendProtocol::SnowflakeHttp => self.snowflake_http.clone(),
             FrontendProtocol::SnowflakeSqlApi => self.snowflake_sql_api.clone(),
         };
-        Ok(group)
+        Ok(group.into())
     }
 }

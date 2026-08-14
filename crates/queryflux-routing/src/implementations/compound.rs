@@ -8,7 +8,7 @@ use queryflux_core::{
 };
 use regex::Regex;
 
-use crate::RouterTrait;
+use crate::{RouterTrait, RoutingDecision};
 
 enum CompiledCondition {
     Protocol(FrontendProtocol),
@@ -144,11 +144,11 @@ impl RouterTrait for CompoundRouter {
         session: &SessionContext,
         frontend_protocol: &FrontendProtocol,
         auth_ctx: Option<&AuthContext>,
-    ) -> Result<Option<ClusterGroupName>> {
+    ) -> Result<RoutingDecision> {
         if self.matches(sql, session, frontend_protocol, auth_ctx) {
-            Ok(Some(self.target.clone()))
+            Ok(RoutingDecision::Route(self.target.clone()))
         } else {
-            Ok(None)
+            Ok(RoutingDecision::NoMatch)
         }
     }
 }

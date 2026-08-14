@@ -8,7 +8,7 @@ use queryflux_core::{
     session::SessionContext,
 };
 
-use crate::RouterTrait;
+use crate::{RouterTrait, RoutingDecision};
 
 /// Routes queries using a user-supplied Python function.
 ///
@@ -50,7 +50,7 @@ impl RouterTrait for PythonScriptRouter {
         session: &SessionContext,
         frontend_protocol: &FrontendProtocol,
         auth_ctx: Option<&AuthContext>,
-    ) -> Result<Option<ClusterGroupName>> {
+    ) -> Result<RoutingDecision> {
         let sql = sql.to_string();
         let script = self.script.clone();
         let session = session.clone();
@@ -137,7 +137,7 @@ fn call_python_router(
     session: &SessionContext,
     protocol: FrontendProtocol,
     auth: Option<&AuthContext>,
-) -> Result<Option<ClusterGroupName>> {
+) -> Result<RoutingDecision> {
     Python::attach(|py| {
         let globals = PyDict::new(py);
         let cscript = std::ffi::CString::new(script)
@@ -163,13 +163,13 @@ fn call_python_router(
             })?;
 
         if result.is_none() {
-            return Ok(None);
+            return Ok(RoutingDecision::NoMatch);
         }
 
         let group: String = result.extract().map_err(|e| {
             QueryFluxError::Routing(format!("route() must return str or None: {e}"))
         })?;
 
-        Ok(Some(ClusterGroupName(group)))
+        Ok(RoutingDecision::Route(ClusterGroupName(group)))
     })
 }

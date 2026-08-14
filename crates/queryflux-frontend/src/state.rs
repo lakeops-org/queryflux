@@ -359,6 +359,55 @@ impl AppState {
         );
     }
 
+    /// Persist a `Denied` history row for a query rejected by a routing deny rule
+    /// before cluster selection / dispatch.
+    pub fn record_routing_deny(
+        &self,
+        sql: &str,
+        session: &SessionContext,
+        protocol: FrontendProtocol,
+        message: &str,
+        routing_trace: Option<RoutingTrace>,
+    ) -> ProxyQueryId {
+        let query_id = ProxyQueryId::new();
+        let dialect = protocol.default_dialect();
+        let ctx = QueryContext {
+            query_id: query_id.clone(),
+            sql: sql.to_string(),
+            session: session.clone(),
+            protocol,
+            group: ClusterGroupName(String::new()),
+            cluster: ClusterName(String::new()),
+            cluster_group_config_id: None,
+            cluster_config_id: None,
+            engine_type: EngineType::Undispatched,
+            src_dialect: dialect.clone(),
+            tgt_dialect: dialect,
+            was_translated: false,
+            translated_sql: None,
+            query_tags: session.tags.clone(),
+            query_params: vec![],
+            agent_context: session.resolved_agent_context(),
+        };
+        self.record_query(
+            &ctx,
+            QueryOutcome {
+                backend_query_id: None,
+                status: QueryStatus::Denied,
+                execution_ms: 0,
+                rows: None,
+                error: Some(message.to_string()),
+                routing_trace,
+                engine_stats: None,
+                guard_actions: vec![],
+                was_guard_blocked: false,
+                queue_duration_ms: 0,
+                cache_hit: false,
+            },
+        );
+        query_id
+    }
+
     /// Persist a terminal audit row for a queued query that never reached an engine
     /// (capacity wait timeout, stale client disconnect).
     pub fn record_queued_terminal(&self, queued: &QueuedQuery, status: QueryStatus, reason: &str) {

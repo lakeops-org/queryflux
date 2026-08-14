@@ -208,7 +208,11 @@ fn config_requires_translation(config: &ProxyConfig) -> bool {
             }
             RouterConfig::QueryRegex { rules } => {
                 for rule in rules {
-                    target_groups.push(rule.target_group.clone());
+                    if matches!(rule.action, queryflux_core::config::RegexRouteAction::Route) {
+                        if let Some(g) = &rule.target_group {
+                            target_groups.push(g.clone());
+                        }
+                    }
                 }
             }
             RouterConfig::Tags { rules } => {

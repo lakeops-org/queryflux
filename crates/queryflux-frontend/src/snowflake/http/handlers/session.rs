@@ -18,6 +18,7 @@ use crate::snowflake::http::handlers::common::{
     extract_snowflake_token, parse_snowflake_json_body,
 };
 use crate::snowflake::http::SnowflakeWireState;
+use queryflux_routing::ChainRouteResult;
 
 // ---------------------------------------------------------------------------
 // POST /session/v1/login-request
@@ -80,10 +81,10 @@ pub async fn login_request(
         extra: Default::default(),
         agent_context: None,
     };
-    let group = {
+    let routing_result = {
         let live = state.app.live.read().await;
         live.router_chain
-            .route(
+            .route_with_trace(
                 "",
                 &session_ctx,
                 &FrontendProtocol::SnowflakeHttp,
@@ -91,9 +92,22 @@ pub async fn login_request(
             )
             .await
     };
-    let group = match group {
-        Ok(g) => g,
+    let (group, routing_trace) = match routing_result {
+        Ok((result, trace)) => (result, trace),
         Err(e) => return sf_error("390000", &format!("Routing error: {e}")),
+    };
+    let group = match group {
+        ChainRouteResult::Routed(g) => g,
+        ChainRouteResult::Denied { message } => {
+            state.app.record_routing_deny(
+                "",
+                &session_ctx,
+                FrontendProtocol::SnowflakeHttp,
+                &message,
+                Some(routing_trace),
+            );
+            return sf_error("390201", &message);
+        }
     };
 
     let token = state.sessions.create_session(

@@ -2274,6 +2274,28 @@ async fn put_security_config_handler(
     }
 }
 
+/// Reject invalid query-regex patterns before persisting routing config.
+fn validate_query_regex_patterns(routers: &[serde_json::Value]) -> std::result::Result<(), String> {
+    use queryflux_routing::implementations::query_regex::QueryRegexRouter;
+
+    for router in routers {
+        if router.get("type").and_then(|t| t.as_str()) != Some("queryRegex") {
+            continue;
+        }
+        let Some(rules) = router.get("rules").and_then(|r| r.as_array()) else {
+            continue;
+        };
+        for rule in rules {
+            if let Some(regex) = rule.get("regex").and_then(|r| r.as_str()) {
+                if !regex.is_empty() {
+                    QueryRegexRouter::validate_pattern(regex)?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Replace the routing configuration.
 #[utoipa::path(
     put,
@@ -2327,6 +2349,10 @@ async fn put_routing_config_handler(
             format!("routingFallback '{fallback_name}' is not a known cluster group"),
         )
             .into_response();
+    }
+
+    if let Err(msg) = validate_query_regex_patterns(&body.routers) {
+        return (StatusCode::BAD_REQUEST, msg).into_response();
     }
 
     let fallback_gid = body.routing_fallback_group_id.or_else(|| {

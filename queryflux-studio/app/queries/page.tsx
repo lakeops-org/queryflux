@@ -84,6 +84,7 @@ export default async function QueriesPage({ searchParams }: Props) {
             <option value="Success">Success</option>
             <option value="Failed">Failed</option>
             <option value="Cancelled">Cancelled</option>
+            <option value="Denied">Denied</option>
           </select>
           <select
             name="engine"

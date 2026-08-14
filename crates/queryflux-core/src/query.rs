@@ -400,6 +400,8 @@ pub enum QueryStatus {
     Success,
     Failed,
     Cancelled,
+    /// Rejected by a routing deny rule before dispatch.
+    Denied,
 }
 
 #[cfg(test)]

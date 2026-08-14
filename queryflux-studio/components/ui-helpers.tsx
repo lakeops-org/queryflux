@@ -7,11 +7,13 @@ export function StatusBadge({ status }: { status: string }) {
     Success: "bg-emerald-50 text-emerald-700 ring-emerald-200",
     Failed: "bg-red-50 text-red-600 ring-red-200",
     Cancelled: "bg-slate-100 text-slate-500 ring-slate-200",
+    Denied: "bg-amber-50 text-amber-800 ring-amber-200",
   };
   const dots: Record<string, string> = {
     Success: "bg-emerald-400",
     Failed: "bg-red-400",
     Cancelled: "bg-slate-400",
+    Denied: "bg-amber-500",
   };
   const cls = styles[status] ?? "bg-slate-100 text-slate-500 ring-slate-200";
   const dot = dots[status] ?? "bg-slate-400";

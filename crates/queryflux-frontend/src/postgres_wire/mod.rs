@@ -35,6 +35,7 @@ use crate::abort::{wait_client_gone, AbortOnDrop};
 use crate::dispatch::{execute_to_sink, ResultSink};
 use crate::state::AppState;
 use crate::{FrontendListenerTrait, ShutdownRx, MAX_FRONTEND_MESSAGE_BYTES};
+use queryflux_routing::ChainRouteResult;
 
 // ── Postgres type OIDs (text-format only in V1) ───────────────────────────────
 
@@ -334,10 +335,20 @@ async fn handle_simple_query(
             .route_with_trace(sql, session, &protocol, Some(&auth_ctx))
             .await
     };
-    let (group, _trace) = match routing_result {
+    let (chain_result, routing_trace) = match routing_result {
         Ok(r) => r,
         Err(e) => {
             write_error_response(writer, "42000", &e.to_string()).await?;
+            write_msg(writer, b'Z', b"I").await?;
+            return Ok(());
+        }
+    };
+    let group = match chain_result {
+        ChainRouteResult::Routed(g) => g,
+        ChainRouteResult::Denied { message } => {
+            state.record_routing_deny(sql, session, protocol, &message, Some(routing_trace));
+            // 42501 = insufficient_privilege
+            write_error_response(writer, "42501", &message).await?;
             write_msg(writer, b'Z', b"I").await?;
             return Ok(());
         }

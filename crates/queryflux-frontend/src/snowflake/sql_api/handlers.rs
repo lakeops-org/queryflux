@@ -27,6 +27,7 @@ use crate::snowflake::http::handlers::bindings::bindings_to_params;
 use crate::snowflake::http::handlers::common::parse_snowflake_json_body;
 use crate::snowflake::http::SnowflakeWireState;
 use crate::snowflake::in_flight::{CancelOutcome, SnowflakeExecParams, SpawnExecuteResult};
+use queryflux_routing::ChainRouteResult;
 
 // ---------------------------------------------------------------------------
 // ResultSink that accumulates Arrow batches into SQL API v2 jsonv2 format
@@ -227,10 +228,10 @@ pub async fn submit_statement(
         extra,
         agent_context: None,
     };
-    let group = {
+    let routing_result = {
         let live = state.app.live.read().await;
         live.router_chain
-            .route(
+            .route_with_trace(
                 &sql,
                 &session_ctx,
                 &FrontendProtocol::SnowflakeSqlApi,
@@ -238,9 +239,22 @@ pub async fn submit_statement(
             )
             .await
     };
-    let group = match group {
-        Ok(g) => g,
+    let (group, routing_trace) = match routing_result {
+        Ok((result, trace)) => (result, trace),
         Err(e) => return sql_api_error(StatusCode::BAD_GATEWAY, "390000", &e.to_string()),
+    };
+    let group = match group {
+        ChainRouteResult::Routed(g) => g,
+        ChainRouteResult::Denied { message } => {
+            state.app.record_routing_deny(
+                &sql,
+                &session_ctx,
+                FrontendProtocol::SnowflakeSqlApi,
+                &message,
+                Some(routing_trace),
+            );
+            return sql_api_error(StatusCode::FORBIDDEN, "390201", &message);
+        }
     };
 
     let handle = Uuid::new_v4().to_string();

@@ -413,6 +413,8 @@ export interface RouterConfigEntry {
         target_group?: string;
         targetGroup?: string;
         targetGroupId?: number;
+        action?: "route" | "deny";
+        error?: string;
       }
     | TagRoutingRule
   >;

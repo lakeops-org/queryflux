@@ -46,6 +46,7 @@ use crate::abort::AbortOnDrop;
 use crate::dispatch::{execute_to_sink, ResultSink};
 use crate::state::AppState;
 use crate::{FrontendListenerTrait, ShutdownRx};
+use queryflux_routing::ChainRouteResult;
 
 // ── Frontend listener ─────────────────────────────────────────────────────────
 
@@ -213,7 +214,21 @@ impl FlightSqlService for QueryFluxFlightSql {
                 .route_with_trace(&sql, &session, &protocol, Some(&auth_ctx))
                 .await
         };
-        let (group, _trace) = routing_result.map_err(|e| Status::internal(e.to_string()))?;
+        let (chain_result, routing_trace) =
+            routing_result.map_err(|e| Status::internal(e.to_string()))?;
+        let group = match chain_result {
+            ChainRouteResult::Routed(g) => g,
+            ChainRouteResult::Denied { message } => {
+                self.state.record_routing_deny(
+                    &sql,
+                    &session,
+                    protocol,
+                    &message,
+                    Some(routing_trace),
+                );
+                return Err(Status::permission_denied(message));
+            }
+        };
 
         // Channel: sink sends RecordBatches; FlightDataEncoderBuilder encodes them.
         let (tx, rx) =

@@ -603,11 +603,7 @@ async fn main() -> Result<()> {
                 routers.push(Box::new(UserGroupRouter::new(mapping)));
             }
             RouterConfig::QueryRegex { rules } => {
-                let pairs = rules
-                    .iter()
-                    .map(|r| (r.regex.clone(), r.target_group.clone()))
-                    .collect();
-                routers.push(Box::new(QueryRegexRouter::new(pairs)));
+                routers.push(Box::new(QueryRegexRouter::from_rules(rules.clone())));
             }
             RouterConfig::Tags { rules } => {
                 routers.push(Box::new(TagsRouter::new(rules.clone())));
@@ -1991,7 +1987,15 @@ fn validate_live_config_refs(
                 refs.extend(user_to_group.values().map(String::as_str));
             }
             RouterConfig::QueryRegex { rules } => {
-                refs.extend(rules.iter().map(|r| r.target_group.as_str()));
+                for rule in rules {
+                    if matches!(rule.action, queryflux_core::config::RegexRouteAction::Route) {
+                        if let Some(group) = rule.target_group.as_deref() {
+                            refs.push(group);
+                        } else {
+                            issues.push("queryRegex route rule requires targetGroup".to_string());
+                        }
+                    }
+                }
             }
             RouterConfig::Tags { rules } => {
                 refs.extend(rules.iter().map(|r| r.target_group.as_str()));
@@ -2297,12 +2301,10 @@ async fn build_live_config(
                 ));
             }
             RouterConfig::QueryRegex { rules } => {
-                let pairs = rules
-                    .iter()
-                    .map(|r| (r.regex.clone(), r.target_group.clone()))
-                    .collect();
                 routers.push(Box::new(
-                    queryflux_routing::implementations::query_regex::QueryRegexRouter::new(pairs),
+                    queryflux_routing::implementations::query_regex::QueryRegexRouter::from_rules(
+                        rules.clone(),
+                    ),
                 ));
             }
             RouterConfig::Tags { rules } => {
