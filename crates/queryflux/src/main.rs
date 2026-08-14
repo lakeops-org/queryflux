@@ -2700,6 +2700,28 @@ async fn load_guard_script_bodies_from_admin(admin: &dyn AdminStore) -> HashMap<
         })
 }
 
+fn resolve_built_in_guard(
+    name: Option<&str>,
+    max_rows: Option<u64>,
+    applies_to: Option<Vec<String>>,
+) -> Box<dyn Guard> {
+    match name {
+        Some("read_only") => Box::new(ReadOnlyGuard),
+        Some("row_limit") => Box::new(RowLimitGuard { max_rows }),
+        Some("require_predicate") => Box::new(RequirePredicateGuard {
+            applies_to: applies_to.unwrap_or_default(),
+        }),
+        Some(other) => Box::new(MisconfiguredGuard {
+            guard_name: "built_in",
+            reason: format!("unsupported built_in guard name \"{other}\""),
+        }),
+        None => Box::new(MisconfiguredGuard {
+            guard_name: "built_in",
+            reason: "built_in guard is missing required field \"name\"".to_string(),
+        }),
+    }
+}
+
 fn resolve_python_guard_script(
     inline_script: Option<String>,
     script_id: Option<i64>,
@@ -2763,20 +2785,11 @@ fn build_chain_from_yaml_specs(
     for spec in specs {
         match &spec.kind {
             GuardKindConfig::BuiltIn => {
-                let Some(name) = spec.name.as_deref() else {
-                    tracing::error!("built_in guard is missing required field \"name\"; skipping");
-                    continue;
-                };
-                match name {
-                    "read_only" => guards.push(Box::new(ReadOnlyGuard)),
-                    "row_limit" => guards.push(Box::new(RowLimitGuard {
-                        max_rows: spec.max_rows,
-                    })),
-                    "require_predicate" => guards.push(Box::new(RequirePredicateGuard {
-                        applies_to: spec.applies_to.clone().unwrap_or_default(),
-                    })),
-                    other => tracing::warn!(name = other, "Unknown built-in guard name; skipping"),
-                }
+                guards.push(resolve_built_in_guard(
+                    spec.name.as_deref(),
+                    spec.max_rows,
+                    spec.applies_to.clone(),
+                ));
             }
             GuardKindConfig::PythonScript => {
                 let guard = resolve_python_guard_script(
@@ -2883,21 +2896,19 @@ fn build_chain_from_db_specs(
     let mut guards: Vec<Box<dyn Guard>> = Vec::new();
     for item in arr {
         let Some(spec) = parse_spec(item) else {
+            guards.push(Box::new(MisconfiguredGuard {
+                guard_name: "guard",
+                reason: "guard spec is not a valid object with a \"kind\" field".to_string(),
+            }));
             continue;
         };
         match spec.kind.as_str() {
             "built_in" => {
-                let name = spec.name.as_deref().unwrap_or("");
-                match name {
-                    "read_only" => guards.push(Box::new(ReadOnlyGuard)),
-                    "row_limit" => guards.push(Box::new(RowLimitGuard {
-                        max_rows: spec.max_rows,
-                    })),
-                    "require_predicate" => guards.push(Box::new(RequirePredicateGuard {
-                        applies_to: spec.applies_to.unwrap_or_default(),
-                    })),
-                    other => tracing::warn!(name = other, "Unknown built-in guard name; skipping"),
-                }
+                guards.push(resolve_built_in_guard(
+                    spec.name.as_deref(),
+                    spec.max_rows,
+                    spec.applies_to,
+                ));
             }
             "http_webhook" => {
                 guards.push(make_http_webhook_guard(
@@ -2920,7 +2931,10 @@ fn build_chain_from_db_specs(
                 );
                 guards.push(guard);
             }
-            other => tracing::warn!(kind = other, "Unknown guard kind; skipping"),
+            other => guards.push(Box::new(MisconfiguredGuard {
+                guard_name: "guard",
+                reason: format!("unsupported guard kind \"{other}\""),
+            })),
         }
     }
     if guards.is_empty() {
@@ -2980,6 +2994,139 @@ fn in_memory_metrics(
 
 #[cfg(test)]
 mod tests {
+    mod guard_chains {
+        use std::collections::HashMap;
+
+        use queryflux_core::config::{GuardKindConfig, GuardSpecConfig, GuardrailsConfig};
+        use queryflux_core::query::{ClusterGroupName, EngineType};
+        use queryflux_core::tags::QueryTags;
+        use queryflux_guardrails::context::{GuardContext, GuardLayer};
+
+        use super::super::{build_chain_from_db_specs, build_chain_from_yaml_specs};
+
+        fn plan_ctx<'a>(
+            engine: &'a EngineType,
+            group: &'a ClusterGroupName,
+            tags: &'a QueryTags,
+        ) -> GuardContext<'a> {
+            GuardContext {
+                sql: "SELECT 1",
+                translated_sql: "SELECT 1",
+                engine_type: engine,
+                cluster_group: group,
+                user: Some("alice"),
+                agent_context: None,
+                query_tags: tags,
+            }
+        }
+
+        #[tokio::test]
+        async fn yaml_unknown_built_in_denies_at_runtime() {
+            let engine = EngineType::DuckDb;
+            let group = ClusterGroupName("default".to_string());
+            let tags = QueryTags::new();
+            let specs = vec![GuardSpecConfig {
+                kind: GuardKindConfig::BuiltIn,
+                name: Some("does_not_exist".to_string()),
+                script_id: None,
+                script: None,
+                url: None,
+                timeout_ms: None,
+                retry_count: None,
+                fail_behavior: None,
+                headers: None,
+                max_rows: None,
+                applies_to: None,
+            }];
+            let chain = build_chain_from_yaml_specs(&specs, &HashMap::new())
+                .expect("chain should be built");
+            let ctx = plan_ctx(&engine, &group, &tags);
+            let (actions, blocked) = chain.run(&ctx, GuardLayer::Plan).await;
+            assert!(blocked);
+            assert_eq!(actions.len(), 1);
+            assert_eq!(actions[0].guard, "built_in");
+            assert_eq!(actions[0].action, "deny");
+        }
+
+        #[tokio::test]
+        async fn yaml_python_script_without_body_denies_at_runtime() {
+            let engine = EngineType::DuckDb;
+            let group = ClusterGroupName("default".to_string());
+            let tags = QueryTags::new();
+            let specs = vec![GuardSpecConfig {
+                kind: GuardKindConfig::PythonScript,
+                name: None,
+                script_id: None,
+                script: None,
+                url: None,
+                timeout_ms: None,
+                retry_count: None,
+                fail_behavior: None,
+                headers: None,
+                max_rows: None,
+                applies_to: None,
+            }];
+            let err = GuardrailsConfig {
+                global: specs.clone(),
+                groups: HashMap::new(),
+            }
+            .validate()
+            .expect_err("startup validation must reject");
+            assert!(err.contains("script"), "{err}");
+
+            // Misconfigured guards still deny if validation is bypassed (e.g. DB reload).
+            let chain = build_chain_from_yaml_specs(&specs, &HashMap::new())
+                .expect("chain should be built");
+            let ctx = plan_ctx(&engine, &group, &tags);
+            let (_, blocked) = chain.run(&ctx, GuardLayer::Plan).await;
+            assert!(blocked);
+        }
+
+        #[tokio::test]
+        async fn db_unknown_kind_denies_at_runtime() {
+            let engine = EngineType::DuckDb;
+            let group = ClusterGroupName("default".to_string());
+            let tags = QueryTags::new();
+            let specs = serde_json::json!([{ "kind": "future_kind" }]);
+            let chain =
+                build_chain_from_db_specs(&specs, &HashMap::new()).expect("chain should be built");
+            let ctx = plan_ctx(&engine, &group, &tags);
+            let (actions, blocked) = chain.run(&ctx, GuardLayer::Plan).await;
+            assert!(blocked);
+            assert_eq!(actions[0].guard, "guard");
+            assert!(actions[0]
+                .reason
+                .as_deref()
+                .unwrap_or("")
+                .contains("future_kind"));
+        }
+
+        #[tokio::test]
+        async fn inline_python_script_guard_allows() {
+            let engine = EngineType::DuckDb;
+            let group = ClusterGroupName("default".to_string());
+            let tags = QueryTags::new();
+            let specs = vec![GuardSpecConfig {
+                kind: GuardKindConfig::PythonScript,
+                name: None,
+                script_id: None,
+                script: Some("def check(ctx):\n    return {'action': 'allow'}".to_string()),
+                url: None,
+                timeout_ms: Some(500),
+                retry_count: None,
+                fail_behavior: None,
+                headers: None,
+                max_rows: None,
+                applies_to: None,
+            }];
+            let chain = build_chain_from_yaml_specs(&specs, &HashMap::new())
+                .expect("chain should be built");
+            let ctx = plan_ctx(&engine, &group, &tags);
+            let (_, blocked) = chain.run(&ctx, GuardLayer::Plan).await;
+            assert!(!blocked);
+        }
+    }
+
     mod in_memory_metrics {
         use std::sync::Arc;
 

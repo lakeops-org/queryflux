@@ -3901,6 +3901,7 @@ dependencies = [
  "async-trait",
  "queryflux-core",
  "serde_yaml",
+ "tempfile",
  "tokio",
  "tracing",
 ]
@@ -4050,6 +4051,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "tracing",
+ "url",
 ]
 
 [[package]]

@@ -83,10 +83,19 @@ impl GuardSpec {
                 Ok(())
             }
             GuardKind::HttpWebhook { url, .. } => {
-                if url.trim().is_empty() {
+                let raw = url.trim();
+                if raw.is_empty() {
                     return Err("http_webhook guard is missing required field \"url\"".to_string());
                 }
-                Ok(())
+                match url::Url::parse(raw) {
+                    Ok(parsed) => match parsed.scheme() {
+                        "http" | "https" => Ok(()),
+                        other => Err(format!(
+                            "http_webhook url must use http or https scheme, got \"{other}\""
+                        )),
+                    },
+                    Err(e) => Err(format!("http_webhook url is not a valid URL: {e}")),
+                }
             }
         }
     }
