@@ -415,8 +415,21 @@ impl AppState {
         trace: &mut queryflux_routing::chain::RoutingTrace,
         auth_ctx: &queryflux_auth::AuthContext,
     ) -> queryflux_core::error::Result<ClusterGroupName> {
-        let live = self.live.read().await;
-        crate::routing_resolve::resolve_routed_group(&live, routed, trace, auth_ctx).await
+        let (group_order, authorization) = {
+            let live = self.live.read().await;
+            if !trace.used_fallback {
+                return Ok(routed);
+            }
+            (live.group_order.clone(), live.authorization.clone())
+        };
+        crate::routing_resolve::resolve_routed_group(
+            &group_order,
+            authorization.as_ref(),
+            routed,
+            trace,
+            auth_ctx,
+        )
+        .await
     }
 
     /// Persist a terminal audit row for a queued query that never reached an engine

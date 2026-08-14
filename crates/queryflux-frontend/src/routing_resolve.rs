@@ -1,16 +1,18 @@
 //! Post-routing resolution: authorization-aware first-fit when the chain used fallback.
 
-use queryflux_auth::AuthContext;
+use queryflux_auth::{AuthContext, AuthorizationChecker};
 use queryflux_core::{error::QueryFluxError, query::ClusterGroupName};
 use queryflux_routing::chain::RoutingTrace;
-
-use crate::state::LiveConfig;
 
 /// When the router chain used its static fallback, pick the first cluster group in
 /// `group_order` the caller may access. Explicit router matches are returned as-is
 /// (dispatch enforces `allowUsers` / `allowGroups` separately).
+///
+/// Callers should snapshot `group_order` and `authorization` and drop any live-config
+/// lock before awaiting this — `check` may perform remote I/O (e.g. OpenFGA).
 pub async fn resolve_routed_group(
-    live: &LiveConfig,
+    group_order: &[String],
+    authorization: &dyn AuthorizationChecker,
     routed: ClusterGroupName,
     trace: &mut RoutingTrace,
     auth_ctx: &AuthContext,
@@ -19,8 +21,8 @@ pub async fn resolve_routed_group(
         return Ok(routed);
     }
 
-    for name in &live.group_order {
-        if live.authorization.check(auth_ctx, name).await {
+    for name in group_order {
+        if authorization.check(auth_ctx, name).await {
             if name != &trace.final_group {
                 trace.final_group = name.clone();
             }
@@ -137,9 +139,15 @@ mod tests {
             used_fallback: false,
         };
         let routed = ClusterGroupName("default".into());
-        let out = resolve_routed_group(&live, routed.clone(), &mut trace, &auth("alice", &[]))
-            .await
-            .unwrap();
+        let out = resolve_routed_group(
+            &live.group_order,
+            live.authorization.as_ref(),
+            routed.clone(),
+            &mut trace,
+            &auth("alice", &[]),
+        )
+        .await
+        .unwrap();
         assert_eq!(out, routed);
     }
 
@@ -167,7 +175,8 @@ mod tests {
             used_fallback: true,
         };
         let out = resolve_routed_group(
-            &live,
+            &live.group_order,
+            live.authorization.as_ref(),
             ClusterGroupName("default".into()),
             &mut trace,
             &auth("alice", &["team-a"]),
@@ -202,7 +211,8 @@ mod tests {
             used_fallback: true,
         };
         let err = resolve_routed_group(
-            &live,
+            &live.group_order,
+            live.authorization.as_ref(),
             ClusterGroupName("default".into()),
             &mut trace,
             &auth("bob", &[]),
@@ -223,7 +233,8 @@ mod tests {
             used_fallback: true,
         };
         let out = resolve_routed_group(
-            &live,
+            &live.group_order,
+            live.authorization.as_ref(),
             ClusterGroupName("default".into()),
             &mut trace,
             &auth("anyone", &[]),
