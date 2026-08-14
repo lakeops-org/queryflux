@@ -9,7 +9,9 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
 use queryflux_auth::Credentials;
-use queryflux_core::{query::FrontendProtocol, session::SessionContext, tags::QueryTags};
+use queryflux_core::{
+    error::QueryFluxError, query::FrontendProtocol, session::SessionContext, tags::QueryTags,
+};
 use serde_json::json;
 use tracing::warn;
 use uuid::Uuid;
@@ -92,11 +94,11 @@ pub async fn login_request(
             )
             .await
     };
-    let (group, routing_trace) = match routing_result {
-        Ok((result, trace)) => (result, trace),
+    let (chain_result, mut routing_trace) = match routing_result {
+        Ok(r) => r,
         Err(e) => return sf_error("390000", &format!("Routing error: {e}")),
     };
-    let group = match group {
+    let mut group = match chain_result {
         ChainRouteResult::Routed(g) => g,
         ChainRouteResult::Denied { message } => {
             state.app.record_routing_deny(
@@ -108,6 +110,15 @@ pub async fn login_request(
             );
             return sf_error("390201", &message);
         }
+    };
+    group = match state
+        .app
+        .resolve_routed_group(group, &mut routing_trace, &auth_ctx)
+        .await
+    {
+        Ok(g) => g,
+        Err(QueryFluxError::Unauthorized(msg)) => return sf_error("390201", &msg),
+        Err(e) => return sf_error("390000", &format!("Routing error: {e}")),
     };
 
     let token = state.sessions.create_session(

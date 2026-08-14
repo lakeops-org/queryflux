@@ -530,7 +530,7 @@ pub async fn post_statement(
             .route_with_trace(&sql, &session, &protocol, Some(&auth_ctx))
             .await
     };
-    let (chain_result, routing_trace) = match routing_result {
+    let (chain_result, mut routing_trace) = match routing_result {
         Ok(r) => r,
         Err(e) => {
             warn!("Routing error: {e}");
@@ -545,13 +545,29 @@ pub async fn post_statement(
             return trino_error_response(&tmp_id.0, msg).into_response();
         }
     };
-    let group = match chain_result {
+    let mut group = match chain_result {
         ChainRouteResult::Routed(g) => g,
         ChainRouteResult::Denied { message } => {
             warn!(%message, user = %auth_ctx.user, "Query denied by routing rule");
             let query_id =
                 state.record_routing_deny(&sql, &session, protocol, &message, Some(routing_trace));
             return trino_error_response(&query_id.0, &message).into_response();
+        }
+    };
+    group = match state
+        .resolve_routed_group(group, &mut routing_trace, &auth_ctx)
+        .await
+    {
+        Ok(g) => g,
+        Err(QueryFluxError::Unauthorized(msg)) => {
+            warn!(user = %auth_ctx.user, "{msg}");
+            let tmp_id = ProxyQueryId::new();
+            return trino_error_response(&tmp_id.0, &msg).into_response();
+        }
+        Err(e) => {
+            warn!("Routing resolution error: {e}");
+            let tmp_id = ProxyQueryId::new();
+            return trino_error_response(&tmp_id.0, &e.to_string()).into_response();
         }
     };
 

@@ -381,19 +381,33 @@ async fn handle_com_query(
             .route_with_trace(sql, session, &protocol, Some(&auth_ctx))
             .await
     };
-    let (chain_result, routing_trace) = match routing_result {
+    let (chain_result, mut routing_trace) = match routing_result {
         Ok(r) => r,
         Err(e) => {
             write_packet(writer, start_seq, &build_err(1105, &e.to_string())).await?;
             return Ok(());
         }
     };
-    let group = match chain_result {
+    let mut group = match chain_result {
         ChainRouteResult::Routed(g) => g,
         ChainRouteResult::Denied { message } => {
             state.record_routing_deny(sql, session, protocol, &message, Some(routing_trace));
             // 1227 = ER_SPECIFIC_ACCESS_DENIED_ERROR
             write_packet(writer, start_seq, &build_err(1227, &message)).await?;
+            return Ok(());
+        }
+    };
+    group = match state
+        .resolve_routed_group(group, &mut routing_trace, &auth_ctx)
+        .await
+    {
+        Ok(g) => g,
+        Err(QueryFluxError::Unauthorized(msg)) => {
+            write_packet(writer, start_seq, &build_err(1227, &msg)).await?;
+            return Ok(());
+        }
+        Err(e) => {
+            write_packet(writer, start_seq, &build_err(1105, &e.to_string())).await?;
             return Ok(());
         }
     };

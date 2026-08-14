@@ -12,7 +12,7 @@ use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
 use queryflux_auth::Credentials;
 use queryflux_core::{
-    error::Result,
+    error::{QueryFluxError, Result},
     query::{FrontendProtocol, QueryStats},
     session::SessionContext,
     tags::QueryTags,
@@ -239,11 +239,11 @@ pub async fn submit_statement(
             )
             .await
     };
-    let (group, routing_trace) = match routing_result {
-        Ok((result, trace)) => (result, trace),
+    let (chain_result, mut routing_trace) = match routing_result {
+        Ok(r) => r,
         Err(e) => return sql_api_error(StatusCode::BAD_GATEWAY, "390000", &e.to_string()),
     };
-    let group = match group {
+    let mut group = match chain_result {
         ChainRouteResult::Routed(g) => g,
         ChainRouteResult::Denied { message } => {
             state.app.record_routing_deny(
@@ -255,6 +255,17 @@ pub async fn submit_statement(
             );
             return sql_api_error(StatusCode::FORBIDDEN, "390201", &message);
         }
+    };
+    group = match state
+        .app
+        .resolve_routed_group(group, &mut routing_trace, &auth_ctx)
+        .await
+    {
+        Ok(g) => g,
+        Err(QueryFluxError::Unauthorized(msg)) => {
+            return sql_api_error(StatusCode::FORBIDDEN, "390201", &msg);
+        }
+        Err(e) => return sql_api_error(StatusCode::BAD_GATEWAY, "390000", &e.to_string()),
     };
 
     let handle = Uuid::new_v4().to_string();
