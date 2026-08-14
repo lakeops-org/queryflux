@@ -1,16 +1,18 @@
 # Production-oriented Helm values.
 #
+# Run the following from the repository root.
 # Before install:
 #   1. Create admin credentials Secret (do not put the password in values):
 #        kubectl create secret generic queryflux-admin \
 #          --from-literal=QUERYFLUX_ADMIN_USER=admin \
 #          --from-literal=QUERYFLUX_ADMIN_PASSWORD='<strong-password>'
-#   2. Copy examples/production-config.yaml, fill Postgres URL + OIDC (or static/
+#   2. Copy ./charts/queryflux/examples/production-config.yaml, fill Postgres URL + OIDC (or static/
 #      LDAP), then create the config Secret:
 #        kubectl create secret generic queryflux-config \
 #          --from-file=config.yaml=./production-config.yaml
 #   3. Create / reuse a TLS secret for ingress (queryflux-tls below).
-#   4. helm install queryflux ./charts/queryflux -f examples/production-values.yaml
+#   4. helm install queryflux ./charts/queryflux \
+#        -f ./charts/queryflux/examples/production-values.yaml
 #
 # Covers the production checklist: TLS, auth.required (in config Secret),
 # Postgres URL via config.existingSecret, PDB, ServiceMonitor, HPA, and
