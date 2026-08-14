@@ -137,6 +137,7 @@ mod tests {
             decisions: vec![],
             final_group: "default".into(),
             used_fallback: false,
+            denied: None,
         };
         let routed = ClusterGroupName("default".into());
         let out = resolve_routed_group(
@@ -173,6 +174,7 @@ mod tests {
             decisions: vec![],
             final_group: "default".into(),
             used_fallback: true,
+            denied: None,
         };
         let out = resolve_routed_group(
             &live.group_order,
@@ -209,6 +211,7 @@ mod tests {
             decisions: vec![],
             final_group: "default".into(),
             used_fallback: true,
+            denied: None,
         };
         let err = resolve_routed_group(
             &live.group_order,
@@ -231,6 +234,7 @@ mod tests {
             decisions: vec![],
             final_group: "default".into(),
             used_fallback: true,
+            denied: None,
         };
         let out = resolve_routed_group(
             &live.group_order,
