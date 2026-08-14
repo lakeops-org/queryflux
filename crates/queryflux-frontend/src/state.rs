@@ -408,6 +408,30 @@ impl AppState {
         query_id
     }
 
+    /// Apply authorization-aware first-fit when the router chain used fallback.
+    pub async fn resolve_routed_group(
+        &self,
+        routed: ClusterGroupName,
+        trace: &mut queryflux_routing::chain::RoutingTrace,
+        auth_ctx: &queryflux_auth::AuthContext,
+    ) -> queryflux_core::error::Result<ClusterGroupName> {
+        let (group_order, authorization) = {
+            let live = self.live.read().await;
+            if !trace.used_fallback {
+                return Ok(routed);
+            }
+            (live.group_order.clone(), live.authorization.clone())
+        };
+        crate::routing_resolve::resolve_routed_group(
+            &group_order,
+            authorization.as_ref(),
+            routed,
+            trace,
+            auth_ctx,
+        )
+        .await
+    }
+
     /// Persist a terminal audit row for a queued query that never reached an engine
     /// (capacity wait timeout, stale client disconnect).
     pub fn record_queued_terminal(&self, queued: &QueuedQuery, status: QueryStatus, reason: &str) {

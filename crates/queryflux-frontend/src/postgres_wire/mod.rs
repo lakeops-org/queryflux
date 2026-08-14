@@ -335,7 +335,7 @@ async fn handle_simple_query(
             .route_with_trace(sql, session, &protocol, Some(&auth_ctx))
             .await
     };
-    let (chain_result, routing_trace) = match routing_result {
+    let (chain_result, mut routing_trace) = match routing_result {
         Ok(r) => r,
         Err(e) => {
             write_error_response(writer, "42000", &e.to_string()).await?;
@@ -343,12 +343,28 @@ async fn handle_simple_query(
             return Ok(());
         }
     };
-    let group = match chain_result {
+    let mut group = match chain_result {
         ChainRouteResult::Routed(g) => g,
         ChainRouteResult::Denied { message } => {
             state.record_routing_deny(sql, session, protocol, &message, Some(routing_trace));
             // 42501 = insufficient_privilege
             write_error_response(writer, "42501", &message).await?;
+            write_msg(writer, b'Z', b"I").await?;
+            return Ok(());
+        }
+    };
+    group = match state
+        .resolve_routed_group(group, &mut routing_trace, &auth_ctx)
+        .await
+    {
+        Ok(g) => g,
+        Err(QueryFluxError::Unauthorized(msg)) => {
+            write_error_response(writer, "42501", &msg).await?;
+            write_msg(writer, b'Z', b"I").await?;
+            return Ok(());
+        }
+        Err(e) => {
+            write_error_response(writer, "42000", &e.to_string()).await?;
             write_msg(writer, b'Z', b"I").await?;
             return Ok(());
         }
