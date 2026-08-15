@@ -66,8 +66,25 @@ async fn tick_or_shutdown(
 #[tokio::main]
 async fn main() -> Result<()> {
     let config_path = match queryflux_cli::run_cli().await? {
-        Some(path) => path,
-        None => return Ok(()),
+        queryflux_cli::CliAction::Exit => return Ok(()),
+        queryflux_cli::CliAction::Migrate { config } => {
+            tracing_subscriber::fmt()
+                .with_env_filter(
+                    tracing_subscriber::EnvFilter::try_from_default_env()
+                        .unwrap_or_else(|_| "queryflux=info".into()),
+                )
+                .init();
+            let config = YamlFileConfigProvider::new(&config)
+                .load()
+                .await
+                .context("Failed to load config")?;
+            queryflux_persistence::run_persistence_migrations(&config.queryflux.persistence)
+                .await
+                .context("Migration failed")?;
+            tracing::info!("Migrations applied successfully");
+            return Ok(());
+        }
+        queryflux_cli::CliAction::Serve { config } => config,
     };
 
     // Load config before initializing the tracing subscriber so that
@@ -156,7 +173,14 @@ async fn main() -> Result<()> {
                     .await
                     .context("Failed to connect to Postgres")?,
             );
-            pg.migrate().await.context("Migration failed")?;
+            if conn.auto_migrate {
+                pg.migrate().await.context("Migration failed")?;
+            } else {
+                info!(
+                    "persistence.autoMigrate=false — skipping startup migrations \
+                     (apply with `queryflux migrate` or a Job)"
+                );
+            }
             let buffered = Arc::new(BufferedMetricsStore::new(
                 pg.clone() as Arc<dyn MetricsStore>,
                 100,
