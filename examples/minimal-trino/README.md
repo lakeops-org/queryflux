@@ -111,6 +111,8 @@ For multi-replica rollouts, set `autoMigrate: false` under `persistence` (with `
 
 If migrations never appear to run with a **pre-built registry image**, ensure that image was produced from this repo’s `docker/queryflux/Dockerfile` so the binary includes the migration bundle; otherwise build locally (see repo `docker/queryflux/Dockerfile` header) and set the image in `docker-compose.yml`.
 
+**sqlx → Refinery:** there is no automatic import from `_sqlx_migrations`. Wipe/recreate the Postgres volume (or database) before upgrading builds that used sqlx migrate; otherwise migrate fails closed with a clear error.
+
 ## Stop and reset
 
 ```bash

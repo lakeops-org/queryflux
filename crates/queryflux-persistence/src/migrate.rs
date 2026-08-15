@@ -12,6 +12,7 @@ use queryflux_core::{
     error::{QueryFluxError, Result},
 };
 use refinery::config::Config;
+use sqlx::postgres::PgPoolOptions;
 
 use crate::postgres::PostgresStore;
 
@@ -33,8 +34,61 @@ impl SchemaMigrator for PostgresStore {
     }
 }
 
+/// Fail closed when a DB still has sqlx's ledger but no Refinery history.
+///
+/// Replaying `V1__…` on such a database would fail on existing tables. There is
+/// intentionally no automatic import (clean break); wipe/recreate the DB instead.
+async fn reject_legacy_sqlx_migration_ledger(database_url: &str) -> Result<()> {
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(database_url)
+        .await
+        .map_err(|e| {
+            QueryFluxError::Persistence(format!("Failed to connect for migration check: {e}"))
+        })?;
+
+    let has_sqlx: bool = sqlx::query_scalar(
+        "SELECT EXISTS (
+            SELECT 1 FROM information_schema.tables
+            WHERE table_schema = current_schema()
+              AND table_name = '_sqlx_migrations'
+        )",
+    )
+    .fetch_one(&pool)
+    .await
+    .map_err(|e| QueryFluxError::Persistence(format!("Failed to inspect migration tables: {e}")))?;
+
+    if !has_sqlx {
+        return Ok(());
+    }
+
+    let has_refinery: bool = sqlx::query_scalar(
+        "SELECT EXISTS (
+            SELECT 1 FROM information_schema.tables
+            WHERE table_schema = current_schema()
+              AND table_name = 'refinery_schema_history'
+        )",
+    )
+    .fetch_one(&pool)
+    .await
+    .map_err(|e| QueryFluxError::Persistence(format!("Failed to inspect migration tables: {e}")))?;
+
+    if has_refinery {
+        return Ok(());
+    }
+
+    Err(QueryFluxError::Persistence(
+        "legacy `_sqlx_migrations` table found without `refinery_schema_history`. \
+         Recreate the Postgres database (or wipe the volume) before running migrations; \
+         there is no automatic sqlx→Refinery upgrade path"
+            .into(),
+    ))
+}
+
 /// Run Refinery migrations against a Postgres connection URL.
 pub(crate) async fn run_postgres_refinery_migrations(database_url: &str) -> Result<()> {
+    reject_legacy_sqlx_migration_ledger(database_url).await?;
+
     let mut config = Config::from_str(database_url).map_err(|e| {
         QueryFluxError::Persistence(format!("Invalid database URL for migrations: {e}"))
     })?;
@@ -57,9 +111,9 @@ pub async fn run_persistence_migrations(persistence: &PersistenceConfig) -> Resu
         PersistenceConfig::InMemory => Err(QueryFluxError::Persistence(
             "migrations require persistence.type = postgres (got inMemory)".into(),
         )),
-        PersistenceConfig::Redis { url } => Err(QueryFluxError::Persistence(format!(
-            "migrations require persistence.type = postgres (got redis, url: {url})"
-        ))),
+        PersistenceConfig::Redis { .. } => Err(QueryFluxError::Persistence(
+            "migrations require persistence.type = postgres (got redis)".into(),
+        )),
     }
 }
 
@@ -79,12 +133,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn migrate_rejects_redis() {
+    async fn migrate_rejects_redis_without_exposing_url() {
         let err = run_persistence_migrations(&PersistenceConfig::Redis {
-            url: "redis://localhost".into(),
+            url: "redis://:super-secret@localhost:6379/0".into(),
         })
         .await
         .expect_err("redis must fail");
-        assert!(err.to_string().contains("redis"), "unexpected error: {err}");
+        let msg = err.to_string();
+        assert!(msg.contains("redis"), "unexpected error: {msg}");
+        assert!(
+            !msg.contains("super-secret") && !msg.contains("redis://"),
+            "error must not leak Redis URL/credentials: {msg}"
+        );
     }
 }
