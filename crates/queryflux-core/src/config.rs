@@ -792,7 +792,7 @@ fn default_true() -> bool {
 
 /// Postgres persistence: set a single `url`, **or** `host`, `user`, `database`, and optionally
 /// `password` / `port` (default 5432). The URL form wins when both are present.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PostgresPersistenceConfig {
     /// Full `postgres://` connection string. When non-empty, `host` / `user` / … are ignored.
@@ -832,6 +832,31 @@ pub struct PostgresPersistenceConfig {
     /// runaway queries from holding pool connections indefinitely. Defaults to 60s.
     #[serde(default)]
     pub statement_timeout_secs: Option<u64>,
+    /// When true (default), QueryFlux runs sqlx migrations on server start.
+    /// Set false when migrations are applied separately via `queryflux migrate`
+    /// (or a Kubernetes Job) so multi-replica rollouts do not race on schema DDL.
+    #[serde(default = "default_true")]
+    pub auto_migrate: bool,
+}
+
+impl Default for PostgresPersistenceConfig {
+    fn default() -> Self {
+        Self {
+            url: None,
+            host: None,
+            port: None,
+            user: None,
+            password: None,
+            database: None,
+            pool_size: None,
+            query_pool_size: None,
+            coordination_pool_size: None,
+            admin_pool_size: None,
+            acquire_timeout_secs: None,
+            statement_timeout_secs: None,
+            auto_migrate: true,
+        }
+    }
 }
 
 impl PostgresPersistenceConfig {
@@ -1857,9 +1882,33 @@ queryflux:
                     conn.connection_url().unwrap(),
                     "postgres://a:b@localhost:5432/db"
                 );
+                assert!(conn.auto_migrate, "autoMigrate defaults to true");
             }
             _ => panic!("expected postgres"),
         }
+    }
+
+    #[test]
+    fn persistence_postgres_auto_migrate_can_be_disabled() {
+        let yaml = r#"
+queryflux:
+  persistence:
+    type: postgres
+    url: postgres://a:b@localhost:5432/db
+    autoMigrate: false
+"#;
+        let cfg: ProxyConfig = serde_yaml::from_str(yaml).unwrap();
+        match &cfg.queryflux.persistence {
+            PersistenceConfig::Postgres { conn } => {
+                assert!(!conn.auto_migrate);
+            }
+            _ => panic!("expected postgres"),
+        }
+    }
+
+    #[test]
+    fn postgres_persistence_default_auto_migrate_true() {
+        assert!(PostgresPersistenceConfig::default().auto_migrate);
     }
 
     #[test]

@@ -139,6 +139,9 @@ impl PostgresStore {
     }
 
     /// Run all migrations (persistence + metrics). Tracks applied migrations in `_sqlx_migrations`.
+    ///
+    /// Prefer [`crate::SchemaMigrator`] / [`crate::run_persistence_migrations`] from CLI and
+    /// other callers so non-Postgres backends can plug in the same interface later.
     pub async fn migrate(&self) -> Result<()> {
         sqlx::migrate!("src/postgres/migrations")
             .run(&self.admin_pool)

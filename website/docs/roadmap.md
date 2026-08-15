@@ -38,7 +38,7 @@ Everything below is implemented and available on the `main` branch.
 | | Graceful degradation when sqlglot is unavailable |
 | **Persistence** | In-memory store (`DashMap`) — single-instance, zero config |
 | | PostgreSQL store (JSONB) — production HA, shared state across replicas |
-| | SQL migrations via sqlx |
+| | SQL migrations via sqlx (`queryflux migrate` + optional autoMigrate on start) |
 | **Auth** | Authentication providers: none, static, OIDC, LDAP |
 | | Authorization: allow-all, simple policy, OpenFGA |
 | | Backend identity resolution (`BackendIdentityResolver`) |

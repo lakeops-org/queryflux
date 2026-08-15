@@ -2,6 +2,7 @@ pub mod cache_store;
 pub mod cluster_config;
 pub mod in_memory;
 pub mod metrics_store;
+pub mod migrate;
 pub mod postgres;
 pub mod query_history;
 pub mod routing_json;
@@ -29,6 +30,7 @@ use crate::{
 // Re-export so callers can do `queryflux_persistence::MetricsStore` etc.
 pub use cache_store::{CacheEntryMeta, CacheEntryRef, CacheStore};
 pub use metrics_store::{ClusterSnapshot, GuardAction, MetricsStore, QueryRecord};
+pub use migrate::{run_persistence_migrations, SchemaMigrator};
 pub use query_history::{AgentSummary, ConversationSummary, QuerySummary};
 pub use script_library::{
     is_valid_script_kind, UpsertUserScript, UserScriptRecord, KIND_GUARD, KIND_ROUTING,

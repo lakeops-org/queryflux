@@ -1,4 +1,4 @@
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use queryflux_config::{yaml::YamlFileConfigProvider, ConfigProvider};
 use queryflux_core::config::{EngineConfig, ProxyConfig, RouterConfig};
 use queryflux_core::query::{EngineType, FrontendProtocol, SqlDialect};
@@ -6,7 +6,7 @@ use queryflux_core::query::{EngineType, FrontendProtocol, SqlDialect};
 #[derive(Parser, Debug)]
 #[command(name = "queryflux", about = "Multi-engine SQL query proxy", version)]
 pub struct Cli {
-    #[arg(short, long, default_value = "config.yaml")]
+    #[arg(short, long, global = true, default_value = "config.yaml")]
     pub config: String,
 
     /// Validate config and runtime environment (Python/sqlglot) and exit
@@ -16,6 +16,32 @@ pub struct Cli {
     /// Install required Python dependencies (sqlglot) in a local .venv and exit
     #[arg(long)]
     pub install_deps: bool,
+
+    #[command(subcommand)]
+    pub command: Option<Commands>,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub enum Commands {
+    /// Run the QueryFlux server (default when no subcommand is given)
+    Serve,
+    /// Apply pending Postgres schema migrations and exit
+    Migrate,
+    /// Validate config and runtime environment (Python/sqlglot) and exit
+    Validate,
+    /// Install required Python dependencies (sqlglot) in a local .venv and exit
+    InstallDeps,
+}
+
+/// Outcome of CLI parsing / one-shot commands.
+#[derive(Debug)]
+pub enum CliAction {
+    /// Start the QueryFlux server with this config path.
+    Serve { config: String },
+    /// Run migrations for the config path and exit (handled by the binary).
+    Migrate { config: String },
+    /// One-shot command already finished successfully.
+    Exit,
 }
 
 /// Automate Python path setup if .venv exists and PYTHONPATH/PYO3_PYTHON are unset
@@ -364,22 +390,30 @@ async fn handle_validation(config_path: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The main entry point for the CLI. Returns the config path if execution should continue.
-pub async fn run_cli() -> anyhow::Result<Option<String>> {
+/// The main entry point for the CLI.
+pub async fn run_cli() -> anyhow::Result<CliAction> {
     let cli = Cli::parse();
 
     setup_env();
 
-    if cli.install_deps {
+    let install_deps = cli.install_deps || matches!(cli.command, Some(Commands::InstallDeps));
+    if install_deps {
         handle_install_deps()?;
         println!("\n✓ Dependency installation successful! You can now run QueryFlux.");
-        return Ok(None);
+        return Ok(CliAction::Exit);
     }
 
-    if cli.validate {
+    let validate = cli.validate || matches!(cli.command, Some(Commands::Validate));
+    if validate {
         handle_validation(&cli.config).await?;
-        return Ok(None);
+        return Ok(CliAction::Exit);
     }
 
-    Ok(Some(cli.config))
+    match cli.command {
+        Some(Commands::Migrate) => Ok(CliAction::Migrate { config: cli.config }),
+        Some(Commands::Serve) | None => Ok(CliAction::Serve { config: cli.config }),
+        Some(Commands::Validate) | Some(Commands::InstallDeps) => {
+            unreachable!("handled above")
+        }
+    }
 }

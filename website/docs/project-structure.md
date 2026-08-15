@@ -52,7 +52,7 @@ queryflux/
 | `queryflux-engine-adapters` | Trino, DuckDB, StarRocks, Athena, ADBC, … |
 | `queryflux-cluster-manager` | Cluster groups, load balancing, queueing |
 | `queryflux-routing` | Router chain, `routingFallback`, script routing |
-| `queryflux-persistence` | In-memory & PostgreSQL stores, migrations |
+| `queryflux-persistence` | In-memory & PostgreSQL stores, sqlx migrations (`queryflux migrate`) |
 | `queryflux-translation` | sqlglot via PyO3 |
 | `queryflux-metrics` | Prometheus instrumentation |
 | `queryflux-auth` | Auth providers & authorization plumbing |
