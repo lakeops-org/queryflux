@@ -832,7 +832,7 @@ pub struct PostgresPersistenceConfig {
     /// runaway queries from holding pool connections indefinitely. Defaults to 60s.
     #[serde(default)]
     pub statement_timeout_secs: Option<u64>,
-    /// When true (default), QueryFlux runs sqlx migrations on server start.
+    /// When true (default), QueryFlux runs Refinery migrations on server start.
     /// Set false when migrations are applied separately via `queryflux migrate`
     /// (or a Kubernetes Job) so multi-replica rollouts do not race on schema DDL.
     #[serde(default = "default_true")]

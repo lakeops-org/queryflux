@@ -1,15 +1,24 @@
 //! Schema migration runners for durable persistence backends.
 //!
-//! Postgres uses embedded sqlx migrations today. Future Redis / ClickHouse
+//! Postgres uses [Refinery](https://github.com/rust-db/refinery) with embedded SQL
+//! migrations and a `refinery_schema_history` ledger. Future Redis / ClickHouse
 //! backends can implement [`SchemaMigrator`] with their own version ledger.
+
+use std::str::FromStr;
 
 use async_trait::async_trait;
 use queryflux_core::{
     config::PersistenceConfig,
     error::{QueryFluxError, Result},
 };
+use refinery::config::Config;
 
 use crate::postgres::PostgresStore;
+
+mod embedded {
+    use refinery::embed_migrations;
+    embed_migrations!("migrations/postgres");
+}
 
 /// Applies pending schema migrations for a persistence backend.
 #[async_trait]
@@ -24,6 +33,18 @@ impl SchemaMigrator for PostgresStore {
     }
 }
 
+/// Run Refinery migrations against a Postgres connection URL.
+pub(crate) async fn run_postgres_refinery_migrations(database_url: &str) -> Result<()> {
+    let mut config = Config::from_str(database_url).map_err(|e| {
+        QueryFluxError::Persistence(format!("Invalid database URL for migrations: {e}"))
+    })?;
+    embedded::migrations::runner()
+        .run_async(&mut config)
+        .await
+        .map_err(|e| QueryFluxError::Persistence(format!("Migration failed: {e}")))?;
+    Ok(())
+}
+
 /// Connect using `persistence` config and run all pending schema migrations.
 ///
 /// Intended for `queryflux migrate`. Rejects in-memory and Redis configs.
@@ -31,8 +52,7 @@ pub async fn run_persistence_migrations(persistence: &PersistenceConfig) -> Resu
     match persistence {
         PersistenceConfig::Postgres { conn } => {
             let url = conn.connection_url().map_err(QueryFluxError::Persistence)?;
-            let store = PostgresStore::connect_from_config(&url, conn).await?;
-            SchemaMigrator::migrate(&store).await
+            run_postgres_refinery_migrations(&url).await
         }
         PersistenceConfig::InMemory => Err(QueryFluxError::Persistence(
             "migrations require persistence.type = postgres (got inMemory)".into(),

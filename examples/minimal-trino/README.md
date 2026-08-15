@@ -97,7 +97,7 @@ psql postgresql://queryflux:queryflux@localhost:5433/queryflux -c "SELECT COUNT(
 
 ## Database migrations
 
-Schema changes are **not** applied by Postgres’s `docker-entrypoint-initdb.d`. By default (`autoMigrate: true`), they run **inside the QueryFlux process** the first time it connects: embedded **sqlx** migrations create/update tables (including `_sqlx_migrations`, `query_records`, cluster config tables, etc.). If migration fails, QueryFlux exits and you’ll see **`Migration failed`** in `docker compose logs queryflux`.
+Schema changes are **not** applied by Postgres’s `docker-entrypoint-initdb.d`. By default (`autoMigrate: true`), they run **inside the QueryFlux process** the first time it connects: embedded **[Refinery](https://github.com/rust-db/refinery)** migrations create/update tables (including `refinery_schema_history`, `query_records`, cluster config tables, etc.). If migration fails, QueryFlux exits and you’ll see **`Migration failed`** in `docker compose logs queryflux`.
 
 You can also apply migrations as a one-shot without starting the server:
 

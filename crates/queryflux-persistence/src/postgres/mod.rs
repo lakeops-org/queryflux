@@ -138,16 +138,12 @@ impl PostgresStore {
         })
     }
 
-    /// Run all migrations (persistence + metrics). Tracks applied migrations in `_sqlx_migrations`.
+    /// Run all migrations via Refinery. Tracks applied migrations in `refinery_schema_history`.
     ///
     /// Prefer [`crate::SchemaMigrator`] / [`crate::run_persistence_migrations`] from CLI and
     /// other callers so non-Postgres backends can plug in the same interface later.
     pub async fn migrate(&self) -> Result<()> {
-        sqlx::migrate!("src/postgres/migrations")
-            .run(&self.admin_pool)
-            .await
-            .map_err(|e| QueryFluxError::Persistence(format!("Migration failed: {e}")))?;
-        Ok(())
+        crate::migrate::run_postgres_refinery_migrations(&self.database_url).await
     }
 }
 
