@@ -2756,21 +2756,44 @@ fn make_http_webhook_guard(
     fail_behavior: FailBehavior,
     headers: HashMap<String, String>,
 ) -> Box<dyn Guard> {
-    if url.trim().is_empty() {
+    let raw = url.trim();
+    if raw.is_empty() {
         tracing::warn!("http_webhook guard has empty URL; using MisconfiguredGuard");
-        Box::new(MisconfiguredGuard {
+        return Box::new(MisconfiguredGuard {
             guard_name: "http_webhook",
             reason: "http_webhook guard is missing required field \"url\"".to_string(),
-        })
-    } else {
-        Box::new(HttpWebhookGuard {
-            url,
-            timeout_ms,
-            retry_count,
-            fail_behavior,
-            headers,
-            client: reqwest::Client::new(),
-        })
+        });
+    }
+    match reqwest::Url::parse(raw) {
+        Ok(parsed) => match parsed.scheme() {
+            "http" | "https" => Box::new(HttpWebhookGuard {
+                url: raw.to_string(),
+                timeout_ms,
+                retry_count,
+                fail_behavior,
+                headers,
+                client: reqwest::Client::new(),
+            }),
+            other => {
+                tracing::warn!(
+                    scheme = other,
+                    "http_webhook guard URL must use http or https; using MisconfiguredGuard"
+                );
+                Box::new(MisconfiguredGuard {
+                    guard_name: "http_webhook",
+                    reason: format!(
+                        "http_webhook url must use http or https scheme, got \"{other}\""
+                    ),
+                })
+            }
+        },
+        Err(e) => {
+            tracing::warn!(error = %e, "http_webhook guard URL is invalid; using MisconfiguredGuard");
+            Box::new(MisconfiguredGuard {
+                guard_name: "http_webhook",
+                reason: format!("http_webhook url is not a valid URL: {e}"),
+            })
+        }
     }
 }
 
@@ -3124,6 +3147,92 @@ mod tests {
             let ctx = plan_ctx(&engine, &group, &tags);
             let (_, blocked) = chain.run(&ctx, GuardLayer::Plan).await;
             assert!(!blocked);
+        }
+
+        #[tokio::test]
+        async fn non_http_webhook_url_denies_even_when_fail_open() {
+            use queryflux_core::config::GuardFailBehaviorConfig;
+
+            let engine = EngineType::DuckDb;
+            let group = ClusterGroupName("default".to_string());
+            let tags = QueryTags::new();
+            let specs = vec![GuardSpecConfig {
+                kind: GuardKindConfig::HttpWebhook,
+                name: None,
+                script_id: None,
+                script: None,
+                url: Some("file:///tmp/policy".to_string()),
+                timeout_ms: Some(100),
+                retry_count: None,
+                fail_behavior: Some(GuardFailBehaviorConfig::Allow),
+                headers: None,
+                max_rows: None,
+                applies_to: None,
+            }];
+            let chain = build_chain_from_yaml_specs(&specs, &HashMap::new())
+                .expect("chain should be built");
+            let ctx = plan_ctx(&engine, &group, &tags);
+            let (actions, blocked) = chain.run(&ctx, GuardLayer::Plan).await;
+            assert!(blocked, "non-http(s) webhook URL must deny at construction");
+            assert_eq!(actions[0].guard, "http_webhook");
+            assert!(actions[0]
+                .reason
+                .as_deref()
+                .unwrap_or("")
+                .contains("http or https"));
+        }
+
+        #[tokio::test]
+        async fn http_webhook_url_is_accepted_and_can_fail_open() {
+            use queryflux_core::config::GuardFailBehaviorConfig;
+
+            let engine = EngineType::DuckDb;
+            let group = ClusterGroupName("default".to_string());
+            let tags = QueryTags::new();
+            let specs = vec![GuardSpecConfig {
+                kind: GuardKindConfig::HttpWebhook,
+                name: None,
+                script_id: None,
+                script: None,
+                url: Some("http://127.0.0.1:1/unreachable".to_string()),
+                timeout_ms: Some(100),
+                retry_count: Some(0),
+                fail_behavior: Some(GuardFailBehaviorConfig::Allow),
+                headers: None,
+                max_rows: None,
+                applies_to: None,
+            }];
+            let chain = build_chain_from_yaml_specs(&specs, &HashMap::new())
+                .expect("chain should be built");
+            let ctx = plan_ctx(&engine, &group, &tags);
+            let (_, blocked) = chain.run(&ctx, GuardLayer::Plan).await;
+            assert!(
+                !blocked,
+                "valid http(s) webhook with fail_open must allow when unreachable"
+            );
+        }
+
+        #[tokio::test]
+        async fn db_non_http_webhook_url_denies_at_runtime() {
+            let engine = EngineType::DuckDb;
+            let group = ClusterGroupName("default".to_string());
+            let tags = QueryTags::new();
+            let specs = serde_json::json!([{
+                "kind": "http_webhook",
+                "url": "ftp://evil.example/guard",
+                "fail_behavior": "allow"
+            }]);
+            let chain =
+                build_chain_from_db_specs(&specs, &HashMap::new()).expect("chain should be built");
+            let ctx = plan_ctx(&engine, &group, &tags);
+            let (actions, blocked) = chain.run(&ctx, GuardLayer::Plan).await;
+            assert!(blocked);
+            assert_eq!(actions[0].guard, "http_webhook");
+            assert!(actions[0]
+                .reason
+                .as_deref()
+                .unwrap_or("")
+                .contains("http or https"));
         }
     }
 

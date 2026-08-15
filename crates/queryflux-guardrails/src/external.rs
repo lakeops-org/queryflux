@@ -384,7 +384,7 @@ mod tests {
     async fn http_webhook_retries_then_denies_on_failure() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
+        let listener_task = tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
             let mut buf = [0_u8; 2048];
             let _ = socket.read(&mut buf).await.unwrap();
@@ -406,6 +406,12 @@ mod tests {
         let tc = TestCtx::new("SELECT 1");
         let result = guard.check(&tc.ctx()).await;
         assert!(matches!(result, GuardResult::Deny { .. }));
+
+        // retry_count: 1 => two attempts; wait for the listener to finish both accepts.
+        tokio::time::timeout(Duration::from_secs(2), listener_task)
+            .await
+            .expect("listener should accept both retry attempts before deadline")
+            .expect("listener task should complete without panic");
     }
 
     #[tokio::test]
