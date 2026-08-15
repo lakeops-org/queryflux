@@ -79,7 +79,11 @@ impl ProxyConfig {
     /// Fail-closed checks run before auth providers are constructed at startup.
     pub fn validate_startup_security(&self) -> std::result::Result<(), String> {
         self.auth.validate_for_required()?;
-        self.authorization.validate()
+        self.authorization.validate()?;
+        if let Some(guardrails) = &self.guardrails {
+            guardrails.validate()?;
+        }
+        Ok(())
     }
 }
 
@@ -266,10 +270,19 @@ impl GuardSpecConfig {
                 Ok(())
             }
             GuardKindConfig::HttpWebhook => {
-                if self.url.as_deref().unwrap_or_default().trim().is_empty() {
+                let raw = self.url.as_deref().unwrap_or_default().trim();
+                if raw.is_empty() {
                     return Err("http_webhook guard is missing required field \"url\"".to_string());
                 }
-                Ok(())
+                match url::Url::parse(raw) {
+                    Ok(parsed) => match parsed.scheme() {
+                        "http" | "https" => Ok(()),
+                        other => Err(format!(
+                            "http_webhook url must use http or https scheme, got \"{other}\""
+                        )),
+                    },
+                    Err(e) => Err(format!("http_webhook url is not a valid URL: {e}")),
+                }
             }
         }
     }
@@ -1685,6 +1698,38 @@ guardrails:
         assert!(matches!(spec.kind, GuardKindConfig::HttpWebhook));
         assert_eq!(spec.url.as_deref(), Some("https://policy.internal/guard"));
         assert_eq!(spec.timeout_ms, Some(500));
+    }
+
+    #[test]
+    fn guardrails_validation_rejects_non_http_url_scheme() {
+        let webhook = GuardSpecConfig {
+            kind: GuardKindConfig::HttpWebhook,
+            name: None,
+            script_id: None,
+            script: None,
+            url: Some("file:///etc/passwd".to_string()),
+            timeout_ms: None,
+            retry_count: None,
+            fail_behavior: None,
+            headers: None,
+            max_rows: None,
+            applies_to: None,
+        };
+        let err = webhook.validate().unwrap_err();
+        assert!(err.contains("http or https"), "{err}");
+    }
+
+    #[test]
+    fn startup_rejects_invalid_guardrails() {
+        let yaml = r#"
+queryflux: {}
+guardrails:
+  global:
+    - kind: http_webhook
+"#;
+        let cfg: ProxyConfig = serde_yaml::from_str(yaml).unwrap();
+        let err = cfg.validate_startup_security().unwrap_err();
+        assert!(err.contains("url"), "{err}");
     }
 
     #[test]

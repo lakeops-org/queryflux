@@ -362,4 +362,70 @@ mod tests {
             } if reason == "blocked by policy" && code == "POLICY_DENY"
         ));
     }
+
+    #[tokio::test]
+    async fn misconfigured_guard_denies() {
+        let guard = MisconfiguredGuard {
+            guard_name: "python_script",
+            reason: "missing script".to_string(),
+        };
+        let tc = TestCtx::new("SELECT 1");
+        let result = guard.check(&tc.ctx()).await;
+        assert!(matches!(
+            result,
+            GuardResult::Deny {
+                reason,
+                code: Some(code)
+            } if reason == "missing script" && code == "GUARD_CONFIG_ERROR"
+        ));
+    }
+
+    #[tokio::test]
+    async fn http_webhook_retries_then_denies_on_failure() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let listener_task = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = [0_u8; 2048];
+            let _ = socket.read(&mut buf).await.unwrap();
+            let response = "HTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
+            socket.write_all(response.as_bytes()).await.unwrap();
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let _ = socket.read(&mut buf).await.unwrap();
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
+
+        let guard = HttpWebhookGuard {
+            url: format!("http://{addr}/guard"),
+            timeout_ms: Some(500),
+            retry_count: 1,
+            fail_behavior: FailBehavior::Deny,
+            headers: HashMap::new(),
+            client: reqwest::Client::new(),
+        };
+        let tc = TestCtx::new("SELECT 1");
+        let result = guard.check(&tc.ctx()).await;
+        assert!(matches!(result, GuardResult::Deny { .. }));
+
+        // retry_count: 1 => two attempts; wait for the listener to finish both accepts.
+        tokio::time::timeout(Duration::from_secs(2), listener_task)
+            .await
+            .expect("listener should accept both retry attempts before deadline")
+            .expect("listener task should complete without panic");
+    }
+
+    #[tokio::test]
+    async fn http_webhook_fail_open_allows_on_unreachable() {
+        let guard = HttpWebhookGuard {
+            url: "http://127.0.0.1:1/unreachable".to_string(),
+            timeout_ms: Some(100),
+            retry_count: 0,
+            fail_behavior: FailBehavior::Allow,
+            headers: HashMap::new(),
+            client: reqwest::Client::new(),
+        };
+        let tc = TestCtx::new("SELECT 1");
+        let result = guard.check(&tc.ctx()).await;
+        assert!(!result.is_deny());
+    }
 }

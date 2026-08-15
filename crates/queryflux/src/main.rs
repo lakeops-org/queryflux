@@ -2697,6 +2697,28 @@ async fn load_guard_script_bodies_from_admin(admin: &dyn AdminStore) -> HashMap<
         })
 }
 
+fn resolve_built_in_guard(
+    name: Option<&str>,
+    max_rows: Option<u64>,
+    applies_to: Option<Vec<String>>,
+) -> Box<dyn Guard> {
+    match name {
+        Some("read_only") => Box::new(ReadOnlyGuard),
+        Some("row_limit") => Box::new(RowLimitGuard { max_rows }),
+        Some("require_predicate") => Box::new(RequirePredicateGuard {
+            applies_to: applies_to.unwrap_or_default(),
+        }),
+        Some(other) => Box::new(MisconfiguredGuard {
+            guard_name: "built_in",
+            reason: format!("unsupported built_in guard name \"{other}\""),
+        }),
+        None => Box::new(MisconfiguredGuard {
+            guard_name: "built_in",
+            reason: "built_in guard is missing required field \"name\"".to_string(),
+        }),
+    }
+}
+
 fn resolve_python_guard_script(
     inline_script: Option<String>,
     script_id: Option<i64>,
@@ -2731,21 +2753,44 @@ fn make_http_webhook_guard(
     fail_behavior: FailBehavior,
     headers: HashMap<String, String>,
 ) -> Box<dyn Guard> {
-    if url.trim().is_empty() {
+    let raw = url.trim();
+    if raw.is_empty() {
         tracing::warn!("http_webhook guard has empty URL; using MisconfiguredGuard");
-        Box::new(MisconfiguredGuard {
+        return Box::new(MisconfiguredGuard {
             guard_name: "http_webhook",
             reason: "http_webhook guard is missing required field \"url\"".to_string(),
-        })
-    } else {
-        Box::new(HttpWebhookGuard {
-            url,
-            timeout_ms,
-            retry_count,
-            fail_behavior,
-            headers,
-            client: reqwest::Client::new(),
-        })
+        });
+    }
+    match reqwest::Url::parse(raw) {
+        Ok(parsed) => match parsed.scheme() {
+            "http" | "https" => Box::new(HttpWebhookGuard {
+                url: raw.to_string(),
+                timeout_ms,
+                retry_count,
+                fail_behavior,
+                headers,
+                client: reqwest::Client::new(),
+            }),
+            other => {
+                tracing::warn!(
+                    scheme = other,
+                    "http_webhook guard URL must use http or https; using MisconfiguredGuard"
+                );
+                Box::new(MisconfiguredGuard {
+                    guard_name: "http_webhook",
+                    reason: format!(
+                        "http_webhook url must use http or https scheme, got \"{other}\""
+                    ),
+                })
+            }
+        },
+        Err(e) => {
+            tracing::warn!(error = %e, "http_webhook guard URL is invalid; using MisconfiguredGuard");
+            Box::new(MisconfiguredGuard {
+                guard_name: "http_webhook",
+                reason: format!("http_webhook url is not a valid URL: {e}"),
+            })
+        }
     }
 }
 
@@ -2760,20 +2805,11 @@ fn build_chain_from_yaml_specs(
     for spec in specs {
         match &spec.kind {
             GuardKindConfig::BuiltIn => {
-                let Some(name) = spec.name.as_deref() else {
-                    tracing::error!("built_in guard is missing required field \"name\"; skipping");
-                    continue;
-                };
-                match name {
-                    "read_only" => guards.push(Box::new(ReadOnlyGuard)),
-                    "row_limit" => guards.push(Box::new(RowLimitGuard {
-                        max_rows: spec.max_rows,
-                    })),
-                    "require_predicate" => guards.push(Box::new(RequirePredicateGuard {
-                        applies_to: spec.applies_to.clone().unwrap_or_default(),
-                    })),
-                    other => tracing::warn!(name = other, "Unknown built-in guard name; skipping"),
-                }
+                guards.push(resolve_built_in_guard(
+                    spec.name.as_deref(),
+                    spec.max_rows,
+                    spec.applies_to.clone(),
+                ));
             }
             GuardKindConfig::PythonScript => {
                 let guard = resolve_python_guard_script(
@@ -2880,21 +2916,19 @@ fn build_chain_from_db_specs(
     let mut guards: Vec<Box<dyn Guard>> = Vec::new();
     for item in arr {
         let Some(spec) = parse_spec(item) else {
+            guards.push(Box::new(MisconfiguredGuard {
+                guard_name: "guard",
+                reason: "guard spec is not a valid object with a \"kind\" field".to_string(),
+            }));
             continue;
         };
         match spec.kind.as_str() {
             "built_in" => {
-                let name = spec.name.as_deref().unwrap_or("");
-                match name {
-                    "read_only" => guards.push(Box::new(ReadOnlyGuard)),
-                    "row_limit" => guards.push(Box::new(RowLimitGuard {
-                        max_rows: spec.max_rows,
-                    })),
-                    "require_predicate" => guards.push(Box::new(RequirePredicateGuard {
-                        applies_to: spec.applies_to.unwrap_or_default(),
-                    })),
-                    other => tracing::warn!(name = other, "Unknown built-in guard name; skipping"),
-                }
+                guards.push(resolve_built_in_guard(
+                    spec.name.as_deref(),
+                    spec.max_rows,
+                    spec.applies_to,
+                ));
             }
             "http_webhook" => {
                 guards.push(make_http_webhook_guard(
@@ -2917,7 +2951,10 @@ fn build_chain_from_db_specs(
                 );
                 guards.push(guard);
             }
-            other => tracing::warn!(kind = other, "Unknown guard kind; skipping"),
+            other => guards.push(Box::new(MisconfiguredGuard {
+                guard_name: "guard",
+                reason: format!("unsupported guard kind \"{other}\""),
+            })),
         }
     }
     if guards.is_empty() {
@@ -2977,6 +3014,225 @@ fn in_memory_metrics(
 
 #[cfg(test)]
 mod tests {
+    mod guard_chains {
+        use std::collections::HashMap;
+
+        use queryflux_core::config::{GuardKindConfig, GuardSpecConfig, GuardrailsConfig};
+        use queryflux_core::query::{ClusterGroupName, EngineType};
+        use queryflux_core::tags::QueryTags;
+        use queryflux_guardrails::context::{GuardContext, GuardLayer};
+
+        use super::super::{build_chain_from_db_specs, build_chain_from_yaml_specs};
+
+        fn plan_ctx<'a>(
+            engine: &'a EngineType,
+            group: &'a ClusterGroupName,
+            tags: &'a QueryTags,
+        ) -> GuardContext<'a> {
+            GuardContext {
+                sql: "SELECT 1",
+                translated_sql: "SELECT 1",
+                engine_type: engine,
+                cluster_group: group,
+                user: Some("alice"),
+                agent_context: None,
+                query_tags: tags,
+            }
+        }
+
+        #[tokio::test]
+        async fn yaml_unknown_built_in_denies_at_runtime() {
+            let engine = EngineType::DuckDb;
+            let group = ClusterGroupName("default".to_string());
+            let tags = QueryTags::new();
+            let specs = vec![GuardSpecConfig {
+                kind: GuardKindConfig::BuiltIn,
+                name: Some("does_not_exist".to_string()),
+                script_id: None,
+                script: None,
+                url: None,
+                timeout_ms: None,
+                retry_count: None,
+                fail_behavior: None,
+                headers: None,
+                max_rows: None,
+                applies_to: None,
+            }];
+            let chain = build_chain_from_yaml_specs(&specs, &HashMap::new())
+                .expect("chain should be built");
+            let ctx = plan_ctx(&engine, &group, &tags);
+            let (actions, blocked) = chain.run(&ctx, GuardLayer::Plan).await;
+            assert!(blocked);
+            assert_eq!(actions.len(), 1);
+            assert_eq!(actions[0].guard, "built_in");
+            assert_eq!(actions[0].action, "deny");
+        }
+
+        #[tokio::test]
+        async fn yaml_python_script_without_body_denies_at_runtime() {
+            let engine = EngineType::DuckDb;
+            let group = ClusterGroupName("default".to_string());
+            let tags = QueryTags::new();
+            let specs = vec![GuardSpecConfig {
+                kind: GuardKindConfig::PythonScript,
+                name: None,
+                script_id: None,
+                script: None,
+                url: None,
+                timeout_ms: None,
+                retry_count: None,
+                fail_behavior: None,
+                headers: None,
+                max_rows: None,
+                applies_to: None,
+            }];
+            let err = GuardrailsConfig {
+                global: specs.clone(),
+                groups: HashMap::new(),
+            }
+            .validate()
+            .expect_err("startup validation must reject");
+            assert!(err.contains("script"), "{err}");
+
+            // Misconfigured guards still deny if validation is bypassed (e.g. DB reload).
+            let chain = build_chain_from_yaml_specs(&specs, &HashMap::new())
+                .expect("chain should be built");
+            let ctx = plan_ctx(&engine, &group, &tags);
+            let (_, blocked) = chain.run(&ctx, GuardLayer::Plan).await;
+            assert!(blocked);
+        }
+
+        #[tokio::test]
+        async fn db_unknown_kind_denies_at_runtime() {
+            let engine = EngineType::DuckDb;
+            let group = ClusterGroupName("default".to_string());
+            let tags = QueryTags::new();
+            let specs = serde_json::json!([{ "kind": "future_kind" }]);
+            let chain =
+                build_chain_from_db_specs(&specs, &HashMap::new()).expect("chain should be built");
+            let ctx = plan_ctx(&engine, &group, &tags);
+            let (actions, blocked) = chain.run(&ctx, GuardLayer::Plan).await;
+            assert!(blocked);
+            assert_eq!(actions[0].guard, "guard");
+            assert!(actions[0]
+                .reason
+                .as_deref()
+                .unwrap_or("")
+                .contains("future_kind"));
+        }
+
+        #[tokio::test]
+        async fn inline_python_script_guard_allows() {
+            let engine = EngineType::DuckDb;
+            let group = ClusterGroupName("default".to_string());
+            let tags = QueryTags::new();
+            let specs = vec![GuardSpecConfig {
+                kind: GuardKindConfig::PythonScript,
+                name: None,
+                script_id: None,
+                script: Some("def check(ctx):\n    return {'action': 'allow'}".to_string()),
+                url: None,
+                timeout_ms: Some(500),
+                retry_count: None,
+                fail_behavior: None,
+                headers: None,
+                max_rows: None,
+                applies_to: None,
+            }];
+            let chain = build_chain_from_yaml_specs(&specs, &HashMap::new())
+                .expect("chain should be built");
+            let ctx = plan_ctx(&engine, &group, &tags);
+            let (_, blocked) = chain.run(&ctx, GuardLayer::Plan).await;
+            assert!(!blocked);
+        }
+
+        #[tokio::test]
+        async fn non_http_webhook_url_denies_even_when_fail_open() {
+            use queryflux_core::config::GuardFailBehaviorConfig;
+
+            let engine = EngineType::DuckDb;
+            let group = ClusterGroupName("default".to_string());
+            let tags = QueryTags::new();
+            let specs = vec![GuardSpecConfig {
+                kind: GuardKindConfig::HttpWebhook,
+                name: None,
+                script_id: None,
+                script: None,
+                url: Some("file:///tmp/policy".to_string()),
+                timeout_ms: Some(100),
+                retry_count: None,
+                fail_behavior: Some(GuardFailBehaviorConfig::Allow),
+                headers: None,
+                max_rows: None,
+                applies_to: None,
+            }];
+            let chain = build_chain_from_yaml_specs(&specs, &HashMap::new())
+                .expect("chain should be built");
+            let ctx = plan_ctx(&engine, &group, &tags);
+            let (actions, blocked) = chain.run(&ctx, GuardLayer::Plan).await;
+            assert!(blocked, "non-http(s) webhook URL must deny at construction");
+            assert_eq!(actions[0].guard, "http_webhook");
+            assert!(actions[0]
+                .reason
+                .as_deref()
+                .unwrap_or("")
+                .contains("http or https"));
+        }
+
+        #[tokio::test]
+        async fn http_webhook_url_is_accepted_and_can_fail_open() {
+            use queryflux_core::config::GuardFailBehaviorConfig;
+
+            let engine = EngineType::DuckDb;
+            let group = ClusterGroupName("default".to_string());
+            let tags = QueryTags::new();
+            let specs = vec![GuardSpecConfig {
+                kind: GuardKindConfig::HttpWebhook,
+                name: None,
+                script_id: None,
+                script: None,
+                url: Some("http://127.0.0.1:1/unreachable".to_string()),
+                timeout_ms: Some(100),
+                retry_count: Some(0),
+                fail_behavior: Some(GuardFailBehaviorConfig::Allow),
+                headers: None,
+                max_rows: None,
+                applies_to: None,
+            }];
+            let chain = build_chain_from_yaml_specs(&specs, &HashMap::new())
+                .expect("chain should be built");
+            let ctx = plan_ctx(&engine, &group, &tags);
+            let (_, blocked) = chain.run(&ctx, GuardLayer::Plan).await;
+            assert!(
+                !blocked,
+                "valid http(s) webhook with fail_open must allow when unreachable"
+            );
+        }
+
+        #[tokio::test]
+        async fn db_non_http_webhook_url_denies_at_runtime() {
+            let engine = EngineType::DuckDb;
+            let group = ClusterGroupName("default".to_string());
+            let tags = QueryTags::new();
+            let specs = serde_json::json!([{
+                "kind": "http_webhook",
+                "url": "ftp://evil.example/guard",
+                "fail_behavior": "allow"
+            }]);
+            let chain =
+                build_chain_from_db_specs(&specs, &HashMap::new()).expect("chain should be built");
+            let ctx = plan_ctx(&engine, &group, &tags);
+            let (actions, blocked) = chain.run(&ctx, GuardLayer::Plan).await;
+            assert!(blocked);
+            assert_eq!(actions[0].guard, "http_webhook");
+            assert!(actions[0]
+                .reason
+                .as_deref()
+                .unwrap_or("")
+                .contains("http or https"));
+        }
+    }
+
     mod in_memory_metrics {
         use std::sync::Arc;
 
