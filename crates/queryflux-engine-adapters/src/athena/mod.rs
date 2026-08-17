@@ -489,13 +489,18 @@ impl AsyncAdapter for AthenaAdapter {
         &self,
         _backend_id: &BackendQueryId,
         _poll_token: Option<&str>,
+        _wire_auth: Option<&queryflux_core::query::StoredWireAuth>,
     ) -> Result<QueryPollResult> {
         Err(QueryFluxError::Engine(
             "Athena does not support async polling via this interface".to_string(),
         ))
     }
 
-    async fn cancel_query(&self, backend_id: &BackendQueryId) -> Result<()> {
+    async fn cancel_query(
+        &self,
+        backend_id: &BackendQueryId,
+        _wire_auth: Option<&queryflux_core::query::StoredWireAuth>,
+    ) -> Result<()> {
         let _ = self
             .client
             .stop_query_execution()

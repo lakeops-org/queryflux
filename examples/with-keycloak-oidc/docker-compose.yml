@@ -1,0 +1,107 @@
+# QueryFlux + Keycloak OIDC + Trino + Studio
+#
+# Demonstrates OIDC authentication with Keycloak as the identity provider.
+# Keycloak is pre-configured with a "queryflux" realm, two test users (alice, bob),
+# groups (data-team, analytics-team), and roles (engineer, analyst, admin).
+#
+# From this directory:
+#   docker compose up -d --wait
+#
+# Get a token and query:
+#   TOKEN=$(curl -s http://localhost:8180/realms/queryflux/protocol/openid-connect/token \
+#     -d grant_type=password -d client_id=queryflux \
+#     -d username=alice -d password=alice | jq -r .access_token)
+#
+#   curl -X POST http://localhost:8080/v1/statement \
+#     -H "Authorization: Bearer $TOKEN" -d "SELECT 1"
+#
+# Studio:          http://localhost:3000
+# Keycloak admin:  http://localhost:8180  (admin / admin)
+# Trino direct:    http://localhost:8081
+
+name: queryflux-example-keycloak-oidc
+
+services:
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.2
+    command: start-dev --import-realm --http-port=8080
+    ports:
+      - "8180:8080"
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: admin
+      KC_BOOTSTRAP_ADMIN_PASSWORD: admin
+      KC_HEALTH_ENABLED: "true"
+    volumes:
+      - ./keycloak-realm.json:/opt/keycloak/data/import/queryflux-realm.json:ro
+    healthcheck:
+      test: ["CMD-SHELL", "exec 3<>/dev/tcp/127.0.0.1/8080; echo -e 'GET /health/ready HTTP/1.1\\r\\nHost: localhost\\r\\nConnection: close\\r\\n\\r\\n' >&3; grep -q '200\\|\"status\":\"UP\"' <&3"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+
+  postgres:
+    image: postgres:16-alpine
+    ports:
+      - "5433:5432"
+    environment:
+      POSTGRES_DB: queryflux
+      POSTGRES_USER: queryflux
+      POSTGRES_PASSWORD: queryflux
+    volumes:
+      - queryflux-pg:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U queryflux"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  trino:
+    image: trinodb/trino:latest
+    environment:
+      - CATALOG_MANAGEMENT=dynamic
+    ports:
+      - "8081:8080"
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8080/v1/info"]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+      start_period: 30s
+
+  queryflux:
+    image: ghcr.io/lakeops-org/queryflux:latest
+    ports:
+      - "8080:8080"   # Trino HTTP (OIDC-protected)
+      - "9000:9000"   # Admin API
+      - "3000:3000"   # Studio
+    volumes:
+      - ./config.yaml:/etc/queryflux/config.yaml:ro
+    environment:
+      RUST_LOG: ${RUST_LOG:-queryflux=info,queryflux_frontend=info}
+      ADMIN_API_URL: http://queryflux:9000
+      ADMIN_API_USERNAME: admin
+      ADMIN_API_PASSWORD: admin
+    depends_on:
+      postgres:
+        condition: service_healthy
+      trino:
+        condition: service_healthy
+      keycloak:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "/opt/venv/bin/python3",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9000/health', timeout=3).read()",
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 15
+      start_period: 90s
+
+volumes:
+  queryflux-pg:

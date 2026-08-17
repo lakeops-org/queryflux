@@ -61,18 +61,28 @@ pub fn require_query_owner(auth: &AuthContext, submitted_by: &str) -> Result<()>
 /// Produced by `BackendIdentityResolver` from `(AuthContext, queryAuth config)`.
 /// Passed alongside `SessionContext` to adapter methods so adapters know how to
 /// authenticate the outgoing request to the backend engine.
-///
-/// Phase 1: only `ServiceAccount` is produced (no-op — adapters use their own
-/// `cluster.auth` config and continue forwarding `SessionContext` headers as today).
-/// Phase 4 adds `Impersonate`; Phase 6 adds `Bearer` (token exchange).
 #[derive(Debug, Clone)]
 pub enum QueryCredentials {
     /// Use the cluster's own service account (Type 1 credentials from `ClusterConfig.auth`).
     ///
     /// The adapter applies `cluster.auth` directly.
     /// For the Trino adapter, `SessionContext::TrinoHttp` headers (including the client's
-    /// `Authorization`) are still forwarded unchanged (implicit Trino HTTP client-header passthrough).
+    /// `Authorization`) are still forwarded unchanged (implicit Trino HTTP client-header passthrough)
+    /// when the cluster does not itself set HTTP auth — a deprecated-but-supported carryover
+    /// from before `passthrough` existed as an explicit mode.
     ServiceAccount,
+
+    /// Forward the client's own credential to the backend unchanged.
+    ///
+    /// Carries no payload: the actual value lives in `SessionContext.extra["authorization"]`
+    /// (either the client's original header, or a `Bearer {raw_token}` injected by dispatch
+    /// when the header is missing but an OIDC `raw_token` is available). Keeping the token
+    /// out of this enum means it never has to round-trip through `AuthContext` at the
+    /// adapter boundary — see Phase 0 critical bug #3.
+    ///
+    /// Adapters fail closed (return an auth error) if no forwardable credential is found —
+    /// this never silently degrades to `ServiceAccount`.
+    Passthrough,
 
     /// Service account authenticates to the backend; user identity injected via engine header.
     ///
@@ -87,7 +97,7 @@ pub enum QueryCredentials {
     /// Use a pre-resolved Bearer token (e.g. from OAuth token exchange).
     ///
     /// The adapter sets `Authorization: Bearer <token>` on the outgoing request.
-    /// Used by `tokenExchange` mode (Phase 6 — Snowflake, Databricks).
+    /// Used by `tokenExchange` mode.
     Bearer { token: String },
 }
 

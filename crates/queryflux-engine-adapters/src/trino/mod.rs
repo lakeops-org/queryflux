@@ -17,7 +17,7 @@ use queryflux_core::{
     error::{QueryFluxError, Result},
     query::{
         BackendQueryId, ClusterGroupName, ClusterName, EngineType, QueryEngineStats,
-        QueryExecution, QueryPollResult, QueryStatus,
+        QueryExecution, QueryPollResult, QueryStatus, StoredWireAuth,
     },
     session::SessionContext,
     tags::QueryTags,
@@ -148,10 +148,54 @@ impl TrinoAdapter {
     /// Other variants (AccessKey, KeyPair, RoleArn) do not set that header, so
     /// a client Authorization value must still be forwarded.
     fn cluster_sets_http_authorization(&self) -> bool {
-        matches!(
-            self.auth.as_ref(),
-            Some(ClusterAuth::Basic { .. } | ClusterAuth::Bearer { .. })
-        )
+        self.auth
+            .as_ref()
+            .is_some_and(ClusterAuth::sets_http_authorization)
+    }
+
+    /// Apply the resolved `QueryCredentials` on top of (or instead of) cluster auth, for
+    /// the initial submit — where the full `SessionContext` (and thus the client's own
+    /// `Authorization`/`raw_token`-derived header) is still available.
+    ///
+    /// `Passthrough` fails closed: if no forwardable client credential is found, this
+    /// returns `Err` rather than silently falling back to cluster/service-account identity.
+    fn apply_query_credentials(
+        &self,
+        builder: reqwest::RequestBuilder,
+        credentials: &queryflux_auth::QueryCredentials,
+        session: &SessionContext,
+    ) -> Result<reqwest::RequestBuilder> {
+        let wire_auth = crate::wire_auth::resolve_stored_wire_auth(
+            credentials,
+            session,
+            self.cluster_sets_http_authorization(),
+        );
+        if matches!(credentials, queryflux_auth::QueryCredentials::Passthrough)
+            && wire_auth.is_none()
+        {
+            return Err(QueryFluxError::Auth(
+                "passthrough requires a client Authorization header (or an OIDC raw_token) — none was available"
+                    .to_string(),
+            ));
+        }
+        Ok(self.apply_stored_wire_auth(builder, wire_auth.as_ref()))
+    }
+
+    /// Apply a previously-resolved [`StoredWireAuth`] — used for poll/cancel, where only
+    /// the persisted value (not the original `SessionContext`) survives.
+    /// `None` means "no per-user credential resolved at submit" — apply cluster auth alone.
+    fn apply_stored_wire_auth(
+        &self,
+        builder: reqwest::RequestBuilder,
+        wire_auth: Option<&StoredWireAuth>,
+    ) -> reqwest::RequestBuilder {
+        match wire_auth {
+            None => self.apply_cluster_auth(builder),
+            Some(StoredWireAuth::Authorization(value)) => builder.header("Authorization", value),
+            Some(StoredWireAuth::ImpersonateUser(user)) => self
+                .apply_cluster_auth(builder)
+                .header("X-Trino-User", user),
+        }
     }
 
     fn with_control_timeout(&self, builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
@@ -184,13 +228,15 @@ impl TrinoAdapter {
             if k_lower == "x-trino-client-tags" || k_lower == "x-trino-session" {
                 continue;
             }
-            // Security: never let a client `Authorization` header override HTTP
-            // cluster auth (basic/bearer). Other ClusterAuth variants do not set
-            // that header, so client passthrough must remain.
-            if k_lower == "authorization" && self.cluster_sets_http_authorization() {
+            // `Authorization` is never forwarded here — `apply_query_credentials` /
+            // `apply_stored_wire_auth` are the single source of truth for that header
+            // across every `QueryCredentials` mode (including the deprecated implicit
+            // passthrough carried under `ServiceAccount`). Forwarding it again from
+            // here would risk a duplicate or stale `Authorization` header.
+            if k_lower == "authorization" {
                 continue;
             }
-            if k_lower.starts_with("x-trino-") || k_lower == "authorization" {
+            if k_lower.starts_with("x-trino-") {
                 builder = builder.header(k, v);
             }
         }
@@ -239,12 +285,14 @@ impl TrinoAdapter {
     }
 
     /// Best-effort: `DELETE` Trino `nextUri` to cancel an in-flight query.
-    async fn cancel_at_next_uri(&self, next_uri: Option<&str>) {
+    async fn cancel_at_next_uri(&self, next_uri: Option<&str>, wire_auth: Option<&StoredWireAuth>) {
         let Some(uri) = next_uri else {
             return;
         };
         match self
-            .with_control_timeout(self.apply_cluster_auth(self.http_client.delete(uri)))
+            .with_control_timeout(
+                self.apply_stored_wire_auth(self.http_client.delete(uri), wire_auth),
+            )
             .send()
             .await
         {
@@ -295,7 +343,7 @@ impl AsyncAdapter for TrinoAdapter {
         &self,
         sql: &str,
         session: &SessionContext,
-        _credentials: &queryflux_auth::QueryCredentials,
+        credentials: &queryflux_auth::QueryCredentials,
         tags: &QueryTags,
         _params: &queryflux_core::params::QueryParams,
     ) -> Result<QueryExecution> {
@@ -303,7 +351,7 @@ impl AsyncAdapter for TrinoAdapter {
         debug!(cluster = %self.cluster_name, url = %url, "Submitting query to Trino");
 
         let mut req = self.http_client.post(&url).body(sql.to_string());
-        req = self.apply_cluster_auth(req);
+        req = self.apply_query_credentials(req, credentials, session)?;
         req = self.apply_session_headers(req, session, tags);
         req = self.with_control_timeout(req);
 
@@ -371,6 +419,7 @@ impl AsyncAdapter for TrinoAdapter {
         &self,
         _backend_id: &BackendQueryId,
         poll_token: Option<&str>,
+        wire_auth: Option<&StoredWireAuth>,
     ) -> Result<QueryPollResult> {
         let uri = match poll_token {
             Some(u) => u,
@@ -388,7 +437,7 @@ impl AsyncAdapter for TrinoAdapter {
         // page or its long-poll window elapses. A 30s client timeout would
         // abort a healthy running query.
         let resp = self
-            .apply_cluster_auth(self.http_client.get(uri))
+            .apply_stored_wire_auth(self.http_client.get(uri), wire_auth)
             .send()
             .await
             .map_err(|e| QueryFluxError::Engine(format!("Trino poll GET failed: {e}")))?;
@@ -440,11 +489,17 @@ impl AsyncAdapter for TrinoAdapter {
         })
     }
 
-    async fn cancel_query(&self, backend_id: &BackendQueryId) -> Result<()> {
+    async fn cancel_query(
+        &self,
+        backend_id: &BackendQueryId,
+        wire_auth: Option<&StoredWireAuth>,
+    ) -> Result<()> {
         // `DELETE /v1/query/{id}` cancels a running query without needing nextUri.
         let url = self.trino_url(&format!("/v1/query/{}", backend_id.0));
         let resp = self
-            .with_control_timeout(self.apply_cluster_auth(self.http_client.delete(&url)))
+            .with_control_timeout(
+                self.apply_stored_wire_auth(self.http_client.delete(&url), wire_auth),
+            )
             .send()
             .await
             .map_err(|e| QueryFluxError::Engine(format!("Trino cancel failed: {e}")))?;
@@ -478,6 +533,15 @@ impl AsyncAdapter for TrinoAdapter {
         use crate::SyncExecution;
         use queryflux_core::query::QueryPollResult;
         use tokio_stream::wrappers::ReceiverStream;
+
+        // Resolve once, before submit, so the exact same wire auth used for the initial
+        // POST is reused for every poll/cancel this execution performs — mirrors what
+        // `apply_query_credentials` derives internally for the POST itself.
+        let wire_auth = crate::wire_auth::resolve_stored_wire_auth(
+            credentials,
+            session,
+            self.cluster_sets_http_authorization(),
+        );
 
         let execution = self
             .submit_query(sql, session, credentials, tags, params)
@@ -514,13 +578,17 @@ impl AsyncAdapter for TrinoAdapter {
                     Ok(Some(batch)) => {
                         sent_any = true;
                         if batch_tx.send(Ok(batch)).await.is_err() {
-                            adapter.cancel_at_next_uri(poll_token.as_deref()).await;
+                            adapter
+                                .cancel_at_next_uri(poll_token.as_deref(), wire_auth.as_ref())
+                                .await;
                             return;
                         }
                     }
                     Ok(None) => {}
                     Err(e) => {
-                        adapter.cancel_at_next_uri(poll_token.as_deref()).await;
+                        adapter
+                            .cancel_at_next_uri(poll_token.as_deref(), wire_auth.as_ref())
+                            .await;
                         let _ = batch_tx.send(Err(e)).await;
                         return;
                     }
@@ -530,11 +598,13 @@ impl AsyncAdapter for TrinoAdapter {
             // Poll until the query is complete (poll_token becomes None).
             while poll_token.is_some() {
                 let result = adapter
-                    .poll_query(&backend_query_id, poll_token.as_deref())
+                    .poll_query(&backend_query_id, poll_token.as_deref(), wire_auth.as_ref())
                     .await;
                 match result {
                     Err(e) => {
-                        adapter.cancel_at_next_uri(poll_token.as_deref()).await;
+                        adapter
+                            .cancel_at_next_uri(poll_token.as_deref(), wire_auth.as_ref())
+                            .await;
                         let _ = batch_tx.send(Err(e)).await;
                         return;
                     }
@@ -551,20 +621,29 @@ impl AsyncAdapter for TrinoAdapter {
                             Ok(Some(batch)) => {
                                 sent_any = true;
                                 if batch_tx.send(Ok(batch)).await.is_err() {
-                                    adapter.cancel_at_next_uri(poll_token.as_deref()).await;
+                                    adapter
+                                        .cancel_at_next_uri(
+                                            poll_token.as_deref(),
+                                            wire_auth.as_ref(),
+                                        )
+                                        .await;
                                     return;
                                 }
                             }
                             Ok(None) => {}
                             Err(e) => {
-                                adapter.cancel_at_next_uri(poll_token.as_deref()).await;
+                                adapter
+                                    .cancel_at_next_uri(poll_token.as_deref(), wire_auth.as_ref())
+                                    .await;
                                 let _ = batch_tx.send(Err(e)).await;
                                 return;
                             }
                         }
                     }
                     Ok(QueryPollResult::Failed { message, .. }) => {
-                        adapter.cancel_at_next_uri(poll_token.as_deref()).await;
+                        adapter
+                            .cancel_at_next_uri(poll_token.as_deref(), wire_auth.as_ref())
+                            .await;
                         let _ = batch_tx.send(Err(QueryFluxError::Engine(message))).await;
                         return;
                     }
@@ -730,7 +809,7 @@ impl TrinoAdapter {
         if poll_token.is_none() {
             return;
         }
-        if let Err(e) = self.cancel_query(backend_query_id).await {
+        if let Err(e) = self.cancel_query(backend_query_id, None).await {
             debug!(
                 cluster = %self.cluster_name,
                 query_id = %backend_query_id,
@@ -795,7 +874,7 @@ impl TrinoAdapter {
             match self.poll_helper_page(uri.as_str()).await {
                 Ok((body, _next, Some(message))) => {
                     pages.push(body);
-                    let _ = self.cancel_query(backend_query_id).await;
+                    let _ = self.cancel_query(backend_query_id, None).await;
                     return Err(QueryFluxError::Catalog(message));
                 }
                 Ok((body, next, None)) => {
@@ -803,7 +882,7 @@ impl TrinoAdapter {
                     poll_token = next;
                 }
                 Err(e) => {
-                    let _ = self.cancel_query(backend_query_id).await;
+                    let _ = self.cancel_query(backend_query_id, None).await;
                     return Err(e);
                 }
             }
@@ -860,12 +939,12 @@ impl TrinoAdapter {
             let (b, next, err) = match self.poll_helper_page(uri.as_str()).await {
                 Ok(r) => r,
                 Err(_) => {
-                    let _ = self.cancel_query(&backend_query_id).await;
+                    let _ = self.cancel_query(&backend_query_id, None).await;
                     return None;
                 }
             };
             if err.is_some() {
-                let _ = self.cancel_query(&backend_query_id).await;
+                let _ = self.cancel_query(&backend_query_id, None).await;
                 return None;
             }
             if let Some(v) = trino_json_first_cell_u64_from_body(&b) {
@@ -1282,43 +1361,58 @@ mod tests {
         TRINO_CONTROL_TIMEOUT,
     };
     use crate::AsyncAdapter;
-    use queryflux_core::query::{BackendQueryId, ClusterGroupName, ClusterName, QueryPollResult};
+    use queryflux_auth::QueryCredentials;
+    use queryflux_core::query::{
+        BackendQueryId, ClusterGroupName, ClusterName, QueryPollResult, StoredWireAuth,
+    };
     use queryflux_core::session::SessionContext;
-    use queryflux_core::tags::QueryTags;
     use reqwest::{Client, StatusCode};
     use std::time::{Duration, Instant};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
-    #[test]
-    fn client_authorization_does_not_override_cluster_auth() {
-        let cluster_auth = Some(queryflux_core::config::ClusterAuth::Bearer {
-            token: "cluster-token".to_string(),
-        });
-        let adapter = TrinoAdapter {
+    fn adapter_with_auth(auth: Option<queryflux_core::config::ClusterAuth>) -> TrinoAdapter {
+        TrinoAdapter {
             cluster_name: ClusterName("c1".to_string()),
             group_name: ClusterGroupName("g1".to_string()),
             endpoint: "http://trino:8080".to_string(),
             http_client: Client::new(),
-            auth: cluster_auth,
-        };
+            auth,
+        }
+    }
 
+    fn session_with_authorization(value: &str) -> SessionContext {
         let mut session = SessionContext::default();
-        session.extra.insert(
-            "authorization".to_string(),
-            "Bearer client-token".to_string(),
-        );
+        session
+            .extra
+            .insert("authorization".to_string(), value.to_string());
+        session
+    }
 
-        let builder =
-            adapter.apply_cluster_auth(adapter.http_client.get("http://trino:8080/v1/statement"));
-        let builder = adapter.apply_session_headers(builder, &session, &QueryTags::new());
-        let req = builder.build().expect("request should build");
-
-        let auth = req
-            .headers()
-            .get("authorization")
+    fn header_value(req: &reqwest::Request, name: &str) -> String {
+        req.headers()
+            .get(name)
             .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
+            .unwrap_or("")
+            .to_string()
+    }
+
+    #[test]
+    fn service_account_does_not_let_client_authorization_override_cluster_auth() {
+        let adapter = adapter_with_auth(Some(queryflux_core::config::ClusterAuth::Bearer {
+            token: "cluster-token".to_string(),
+        }));
+        let session = session_with_authorization("Bearer client-token");
+
+        let builder = adapter
+            .apply_query_credentials(
+                adapter.http_client.get("http://trino:8080/v1/statement"),
+                &QueryCredentials::ServiceAccount,
+                &session,
+            )
+            .expect("serviceAccount never fails closed");
+        let req = builder.build().expect("request should build");
+        let auth = header_value(&req, "authorization");
 
         assert!(
             auth.contains("cluster-token"),
@@ -1331,40 +1425,156 @@ mod tests {
     }
 
     #[test]
-    fn client_authorization_passthrough_when_cluster_auth_is_not_http() {
-        let adapter = TrinoAdapter {
-            cluster_name: ClusterName("c1".to_string()),
-            group_name: ClusterGroupName("g1".to_string()),
-            endpoint: "http://trino:8080".to_string(),
-            http_client: Client::new(),
-            auth: Some(queryflux_core::config::ClusterAuth::AccessKey {
-                access_key_id: "AKIA".to_string(),
-                secret_access_key: "secret".to_string(),
-                session_token: None,
-            }),
-        };
+    fn service_account_forwards_client_authorization_when_cluster_auth_is_not_http() {
+        // Deprecated implicit passthrough: kept for backward compat with clusters that
+        // never set an explicit `queryAuth: passthrough`.
+        let adapter = adapter_with_auth(Some(queryflux_core::config::ClusterAuth::AccessKey {
+            access_key_id: "AKIA".to_string(),
+            secret_access_key: "secret".to_string(),
+            session_token: None,
+        }));
+        let session = session_with_authorization("Bearer client-token");
 
-        let mut session = SessionContext::default();
-        session.extra.insert(
-            "authorization".to_string(),
-            "Bearer client-token".to_string(),
-        );
-
-        let builder =
-            adapter.apply_cluster_auth(adapter.http_client.get("http://trino:8080/v1/statement"));
-        let builder = adapter.apply_session_headers(builder, &session, &QueryTags::new());
+        let builder = adapter
+            .apply_query_credentials(
+                adapter.http_client.get("http://trino:8080/v1/statement"),
+                &QueryCredentials::ServiceAccount,
+                &session,
+            )
+            .expect("serviceAccount never fails closed");
         let req = builder.build().expect("request should build");
-
-        let auth = req
-            .headers()
-            .get("authorization")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
+        let auth = header_value(&req, "authorization");
 
         assert!(
             auth.contains("client-token"),
             "client Authorization must pass through when cluster auth is not HTTP: {auth}"
         );
+    }
+
+    #[test]
+    fn passthrough_forwards_client_authorization_and_ignores_cluster_auth() {
+        let adapter = adapter_with_auth(Some(queryflux_core::config::ClusterAuth::Basic {
+            username: "svc".to_string(),
+            password: "svc-pass".to_string(),
+        }));
+        let session = session_with_authorization("Bearer client-token");
+
+        let builder = adapter
+            .apply_query_credentials(
+                adapter.http_client.get("http://trino:8080/v1/statement"),
+                &QueryCredentials::Passthrough,
+                &session,
+            )
+            .expect("client Authorization is present");
+        let req = builder.build().expect("request should build");
+        let auth = header_value(&req, "authorization");
+
+        assert_eq!(auth, "Bearer client-token");
+    }
+
+    #[test]
+    fn passthrough_fails_closed_without_a_client_credential() {
+        let adapter = adapter_with_auth(None);
+        let session = SessionContext::default();
+
+        let err = adapter
+            .apply_query_credentials(
+                adapter.http_client.get("http://trino:8080/v1/statement"),
+                &QueryCredentials::Passthrough,
+                &session,
+            )
+            .expect_err("passthrough with no client credential must fail closed");
+        assert!(matches!(
+            err,
+            queryflux_core::error::QueryFluxError::Auth(_)
+        ));
+    }
+
+    #[test]
+    fn impersonate_applies_cluster_auth_and_sets_trino_user_header() {
+        let adapter = adapter_with_auth(Some(queryflux_core::config::ClusterAuth::Basic {
+            username: "svc".to_string(),
+            password: "svc-pass".to_string(),
+        }));
+        // Client Authorization must be ignored/stripped under impersonate.
+        let session = session_with_authorization("Bearer client-token");
+
+        let builder = adapter
+            .apply_query_credentials(
+                adapter.http_client.get("http://trino:8080/v1/statement"),
+                &QueryCredentials::Impersonate {
+                    user: "alice".to_string(),
+                },
+                &session,
+            )
+            .expect("impersonate never fails closed");
+        let req = builder.build().expect("request should build");
+
+        let auth = header_value(&req, "authorization");
+        assert!(
+            auth.starts_with("Basic "),
+            "expected cluster basic auth, got: {auth}"
+        );
+        assert_eq!(header_value(&req, "x-trino-user"), "alice");
+    }
+
+    #[test]
+    fn bearer_token_exchange_sets_authorization_and_ignores_cluster_and_session_auth() {
+        let adapter = adapter_with_auth(Some(queryflux_core::config::ClusterAuth::Basic {
+            username: "svc".to_string(),
+            password: "svc-pass".to_string(),
+        }));
+        let session = session_with_authorization("Bearer client-token");
+
+        let builder = adapter
+            .apply_query_credentials(
+                adapter.http_client.get("http://trino:8080/v1/statement"),
+                &QueryCredentials::Bearer {
+                    token: "exchanged-token".to_string(),
+                },
+                &session,
+            )
+            .expect("bearer never fails closed");
+        let req = builder.build().expect("request should build");
+        let auth = header_value(&req, "authorization");
+
+        assert_eq!(auth, "Bearer exchanged-token");
+    }
+
+    #[test]
+    fn stored_wire_auth_reapplies_authorization_for_poll_and_cancel() {
+        let adapter = adapter_with_auth(Some(queryflux_core::config::ClusterAuth::Basic {
+            username: "svc".to_string(),
+            password: "svc-pass".to_string(),
+        }));
+
+        let builder = adapter.apply_stored_wire_auth(
+            adapter.http_client.get("http://trino:8080/v1/statement/x"),
+            Some(&StoredWireAuth::Authorization(
+                "Bearer exchanged-token".to_string(),
+            )),
+        );
+        let req = builder.build().expect("request should build");
+        assert_eq!(
+            header_value(&req, "authorization"),
+            "Bearer exchanged-token"
+        );
+    }
+
+    #[test]
+    fn stored_wire_auth_reapplies_impersonate_user_header() {
+        let adapter = adapter_with_auth(Some(queryflux_core::config::ClusterAuth::Basic {
+            username: "svc".to_string(),
+            password: "svc-pass".to_string(),
+        }));
+
+        let builder = adapter.apply_stored_wire_auth(
+            adapter.http_client.get("http://trino:8080/v1/statement/x"),
+            Some(&StoredWireAuth::ImpersonateUser("alice".to_string())),
+        );
+        let req = builder.build().expect("request should build");
+        assert!(header_value(&req, "authorization").starts_with("Basic "));
+        assert_eq!(header_value(&req, "x-trino-user"), "alice");
     }
 
     #[test]
@@ -1614,13 +1824,67 @@ mod tests {
         let poll_uri = format!("http://{addr}/v1/statement/executing/q1/1");
         let started = Instant::now();
         let result = adapter
-            .poll_query(&BackendQueryId("q1".into()), Some(&poll_uri))
+            .poll_query(&BackendQueryId("q1".into()), Some(&poll_uri), None)
             .await
             .expect("poll should succeed");
         assert!(
             started.elapsed() >= Duration::from_secs(2),
             "poll should wait for the backend long poll"
         );
+        assert!(matches!(result, QueryPollResult::Raw { .. }));
+    }
+
+    /// Poll/cancel must reuse the exact wire auth resolved at submit time — otherwise a
+    /// `passthrough`/`tokenExchange` query authenticates on the initial POST but 401s on
+    /// every subsequent poll GET, since those requests never carry the client's headers.
+    #[tokio::test]
+    async fn poll_reuses_stored_bearer_wire_auth() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            let mut buf = [0u8; 2048];
+            let n = stream.read(&mut buf).await.expect("read");
+            let req = String::from_utf8_lossy(&buf[..n]).to_string();
+            assert!(
+                req.to_lowercase()
+                    .contains("authorization: bearer exchanged-token"),
+                "poll GET must carry the stored wire auth, got headers: {req}"
+            );
+            let body = r#"{"id":"q1","infoUri":"http://trino.test/ui","stats":{"state":"FINISHED"},"warnings":[]}"#;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(resp.as_bytes()).await.expect("write");
+        });
+
+        // Cluster auth is Basic — if poll fell back to cluster auth instead of the stored
+        // wire auth, the header assertion above would see "Basic", not "Bearer exchanged-token".
+        let adapter = TrinoAdapter::new(
+            ClusterName("trino".into()),
+            ClusterGroupName("default".into()),
+            TrinoConfig {
+                endpoint: format!("http://{addr}"),
+                tls_skip_verify: false,
+                auth: Some(queryflux_core::config::ClusterAuth::Basic {
+                    username: "svc".to_string(),
+                    password: "svc-pass".to_string(),
+                }),
+            },
+        );
+        let poll_uri = format!("http://{addr}/v1/statement/executing/q1/1");
+        let wire_auth = StoredWireAuth::Authorization("Bearer exchanged-token".to_string());
+        let result = adapter
+            .poll_query(
+                &BackendQueryId("q1".into()),
+                Some(&poll_uri),
+                Some(&wire_auth),
+            )
+            .await
+            .expect("poll should succeed");
         assert!(matches!(result, QueryPollResult::Raw { .. }));
     }
 }

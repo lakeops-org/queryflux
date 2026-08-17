@@ -289,6 +289,26 @@ pub struct ExecutingQuery {
     /// existed — those are treated as legacy and not ownership-checked.
     #[serde(default)]
     pub submitted_by: String,
+    /// Wire-level credential resolved at submit time, so poll/cancel requests — which
+    /// don't repeat the client's original headers — can re-apply the same auth the
+    /// backend accepted for the initial submit. `None` means `serviceAccount`: the
+    /// adapter's static cluster auth is sufficient and there's nothing extra to persist.
+    /// Absent on rows written before this field existed (`serviceAccount`-equivalent).
+    #[serde(default)]
+    pub wire_auth: Option<StoredWireAuth>,
+}
+
+/// Wire-level auth material persisted alongside an [`ExecutingQuery`] so poll/cancel can
+/// re-apply the exact credential used at submit time. Deliberately smaller than
+/// `QueryCredentials` (queryflux-auth) — it holds only what must survive a process
+/// restart / different-replica poll, not the resolution logic that produced it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum StoredWireAuth {
+    /// Exact `Authorization` header value to send (passthrough forward, or a
+    /// tokenExchange-resolved Bearer token already formatted as `"Bearer {token}"`).
+    Authorization(String),
+    /// Trino-only: `X-Trino-User` value to re-inject on every poll/cancel (impersonate).
+    ImpersonateUser(String),
 }
 
 // --- Query execution result model ---

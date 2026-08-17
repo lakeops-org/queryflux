@@ -23,9 +23,11 @@ Every backend cluster has **two distinct credential relationships**, both config
 - Validated at startup: each engine accepts only its supported modes
 - Default when omitted: `serviceAccount` (falls back to Type 1 for everything)
 
-`queryAuth` has exactly **three explicit types**: `serviceAccount | impersonate | tokenExchange`
+`queryAuth` has **four explicit types**: `serviceAccount | passthrough | impersonate | tokenExchange`
 
-There is no `passthrough` type. For same-engine routing (Trino HTTP → Trino backend), the Trino adapter already forwards all headers stored in `SessionContext.extra` verbatim — including the client's `Authorization` header — without any special config. This implicit client header passthrough is the default today.
+`passthrough` forwards the client's own credential (Bearer/Basic) to the backend unchanged — the backend authenticates the user's own token, not a QueryFlux-vouched identity. It is **Trino-only in this release**; startup validation rejects it for engines whose adapters don't yet consume `QueryCredentials` (see the compatibility table below).
+
+Before `passthrough` existed as an explicit type, the Trino adapter forwarded all headers stored in `SessionContext.extra` verbatim whenever a cluster had no HTTP-setting `auth` of its own — including the client's `Authorization` header — regardless of `queryAuth`. That implicit behavior is **deprecated but still supported** for `serviceAccount`/omitted `queryAuth` on Trino clusters, for backward compatibility (a startup warning is emitted). New configs should set `queryAuth.type: passthrough` explicitly instead of relying on the implicit fallback.
 
 Health checks always use Type 1 (`auth`) directly, never `queryAuth`. This ensures they work even when a user's token is expired or missing.
 
@@ -65,8 +67,7 @@ clusters:
       clientId: queryflux-gateway
       clientSecret: "..."
 
-  # Trino→Trino same-IdP: no queryAuth needed.
-  # SessionContext headers (including Authorization) are forwarded implicitly.
+  # Trino→Trino same-IdP: forward the client's own credential explicitly.
   trino-analytics:
     engine: trino
     endpoint: https://trino-analytics.internal:8443
@@ -74,21 +75,22 @@ clusters:
       type: basic
       username: qf_svc
       password: "..."
-    # queryAuth omitted → serviceAccount default
-    # but Authorization header still forwarded by Trino adapter via SessionContext
+    queryAuth:
+      type: passthrough               # forward the client's Authorization unchanged
 ```
 
 **`queryAuth` engine compatibility** (startup validation rejects unsupported combinations):
 
-| Engine | `serviceAccount` | `impersonate` | `tokenExchange` |
-|--------|:---:|:---:|:---:|
-| Trino | ✅ | ✅ `X-Trino-User` (needs Trino file-based ACL) | — |
-| ClickHouse | ✅ | ❌ no trusted proxy mechanism | — |
-| StarRocks (MySQL wire) | ✅ | ❌ no wire mechanism | — |
-| StarRocks (HTTP, future) | ✅ | — | — |
-| Snowflake (future) | ✅ key-pair | ❌ | ✅ external OAuth |
-| Databricks (future) | ✅ | ❌ | ✅ OAuth U2M |
-| DuckDB | ✅ (no-op) | — | — |
+| Engine | `serviceAccount` | `passthrough` | `impersonate` | `tokenExchange` |
+|--------|:---:|:---:|:---:|:---:|
+| Trino | ✅ | ✅ | ✅ `X-Trino-User` (needs Trino file-based ACL) | ✅ |
+| ClickHouse | ✅ | ❌ not yet wired | ❌ no trusted proxy mechanism | ❌ not yet wired |
+| StarRocks (MySQL wire) | ✅ | ❌ no wire mechanism | ❌ no wire mechanism | ❌ no wire mechanism |
+| StarRocks (HTTP, future) | ✅ | — | — | — |
+| Snowflake / Databricks (ADBC, future) | ✅ | ❌ not yet wired | ❌ | ❌ not yet wired |
+| DuckDB | ✅ (no-op) | — | — | — |
+
+"Not yet wired" means the adapter does not yet consume `QueryCredentials` for that mode — startup validation rejects the config rather than silently accepting it and doing nothing. See the backend-identity plan for the phase that adds each one.
 
 **`BackendIdentityResolver` pseudocode:**
 
@@ -105,6 +107,14 @@ fn resolve(auth_ctx: &AuthContext, cluster: &ClusterConfig, type1: &ClusterAuth)
         serviceAccount =>
             ServiceAccountCreds(type1.clone())
 
+        passthrough =>
+            // No-op at the resolver: the adapter/dispatch layer resolves the actual
+            // forwarded credential from SessionContext.extra["authorization"], or a
+            // Bearer built from auth_ctx.raw_token when that header is missing.
+            // Fails closed (rejects the query) if neither is available — never
+            // silently substitutes ServiceAccountCreds.
+            PassthroughCreds
+
         impersonate =>
             // Use Type 1 credentials on the wire; inject user identity separately.
             // IMPORTANT: suppress the client's Authorization header — do NOT forward it.
@@ -117,7 +127,9 @@ fn resolve(auth_ctx: &AuthContext, cluster: &ClusterConfig, type1: &ClusterAuth)
 
         tokenExchange =>
             // Exchange auth_ctx.raw_token at the configured OAuth endpoint.
-            // Falls back to serviceAccount if raw_token is None.
+            // Fails closed (rejects the query) if raw_token is None or the exchange
+            // fails — never silently substitutes ServiceAccountCreds, since that would
+            // submit the query under the wrong principal.
             // Per-provider contract: see Layer 3 → tokenExchange section.
             exchange_token(auth_ctx.raw_token?, cluster.queryAuth.token_exchange_config)
     }
@@ -490,17 +502,25 @@ clusterGroups:
 
 All modes configured under `clusters[].queryAuth` (per-cluster, not per-group).
 
-### Implicit header forwarding (Trino HTTP → Trino, no config needed)
+### Deprecated: implicit header forwarding (Trino HTTP → Trino, no config needed)
 
-The Trino HTTP adapter forwards all headers stored in `SessionContext.extra` to the backend — including `Authorization` and `X-Trino-User`. No separate `queryAuth` entry is required for this path; the default `serviceAccount` fallback does not suppress these headers in the Trino adapter because the Trino adapter applies session headers after cluster auth.
+Before `passthrough` existed as an explicit `queryAuth` type, a Trino cluster with no HTTP-setting `cluster.auth` of its own would forward all headers stored in `SessionContext.extra` to the backend — including `Authorization` — regardless of `queryAuth`. This still works today for backward compatibility (a startup warning is emitted), but new configs should use `queryAuth: passthrough` explicitly instead — see the mode below.
 
-However: when `queryAuth: impersonate` is set on a Trino cluster, the adapter **must suppress the client's `Authorization` header** and use only Type 1 credentials for authentication. The `X-Trino-User` injection happens after the service account auth is applied. Failing to suppress the client `Authorization` would cause the backend to see conflicting auth credentials.
+When `queryAuth: impersonate` is set on a Trino cluster, the adapter **must suppress the client's `Authorization` header** and use only Type 1 credentials for authentication. The `X-Trino-User` injection happens after the service account auth is applied. Failing to suppress the client `Authorization` would cause the backend to see conflicting auth credentials.
 
 ### Mode: `serviceAccount`
 
 Use Type 1 credentials (`cluster.auth`) for query execution. User identity is known to QueryFlux (logged in audit/metrics) but the backend sees only the service account.
 
 Works for all engines. Default when `queryAuth` is omitted.
+
+### Mode: `passthrough` (Trino only in this release)
+
+Forward the client's own credential unchanged: the value already captured in `SessionContext.extra["authorization"]` (the client's original header), or — if that's missing but the frontend authenticated via OIDC — a `Bearer {auth_ctx.raw_token}` injected by dispatch before the adapter sees the request. The backend authenticates the user's own token; QueryFlux does not vouch for the identity beyond forwarding it.
+
+**Fails closed:** if neither a forwarded header nor a `raw_token` is available, the query is rejected with an auth error rather than silently falling back to `serviceAccount`.
+
+Startup validation rejects `passthrough` for engines whose adapters don't yet consume `QueryCredentials` — see the compatibility table above.
 
 ### Mode: `impersonate` (Trino only)
 
@@ -526,7 +546,7 @@ This is high operator burden. For OIDC deployments where Trino is configured wit
 
 ### Mode: `tokenExchange` (Snowflake, Databricks — future adapters)
 
-QueryFlux exchanges the user's OIDC JWT (`auth_ctx.raw_token`) for a backend-specific OAuth access token. Requires `OidcAuthProvider` on the frontend (so `raw_token` is populated). Falls back to `serviceAccount` if `raw_token` is absent.
+QueryFlux exchanges the user's OIDC JWT (`auth_ctx.raw_token`) for a backend-specific OAuth access token. Requires `OidcAuthProvider` on the frontend (so `raw_token` is populated). **Fails closed:** if `raw_token` is absent or the exchange fails, the query is rejected with an auth error — it never silently falls back to `serviceAccount`, since that would submit the query under the wrong principal.
 
 **Per-provider contract:**
 
@@ -630,7 +650,7 @@ auth:
 ### `queryflux-core/src/config.rs`
 - Add `AuthConfig` (provider + per-provider sub-configs)
 - Add `AuthorizationConfig` (openFga | none) to `ProxyConfig`
-- Add `QueryAuthConfig` enum (`serviceAccount | impersonate | tokenExchange`) to `ClusterConfig`
+- Add `QueryAuthConfig` enum (`serviceAccount | passthrough | impersonate | tokenExchange`) to `ClusterConfig`
 - Add **`authProfiles`** map + **`defaultAuthProfile`** optional field on `ClusterConfig`; support **`secretRef`** on credential fields (resolve at load/reload)
 - Replace `ClusterGroupConfig.members: Vec<String>` with **`Vec<ClusterGroupMember>`**: `{ cluster, connection?: EngineConnectionOptions, weight?, defaultAuthProfile? }`; serde **untagged** or custom deserializer to accept **legacy string OR object**
 - Add **`EngineConnectionOptions`** as a **tagged enum** (or per-engine struct union) listing **all supported per-engine connection types**; startup validation: each member’s `connection` matches `clusters[cluster].engine`

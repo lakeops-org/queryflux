@@ -700,25 +700,74 @@ async fn main() -> Result<()> {
         }
     }
 
-    // --- Startup validation: impersonate only valid for Trino ---
+    // --- Startup validation: engine × queryAuth support matrix ---
+    // Centralized in `query_auth_supported` so YAML load, Studio PUT, and this check can't
+    // drift apart. `passthrough`/`impersonate`/`tokenExchange` are Trino-only in this
+    // release — every other adapter still ignores `QueryCredentials`.
     for (name, cfg) in &config.clusters {
-        if matches!(
-            cfg.query_auth,
-            Some(queryflux_core::config::QueryAuthConfig::Impersonate)
-        ) {
-            let engine = cfg
-                .engine
-                .as_ref()
-                .map(|e| format!("{e:?}"))
-                .unwrap_or_default();
-            if !matches!(
-                cfg.engine,
-                Some(queryflux_core::config::EngineConfig::Trino)
-            ) {
-                anyhow::bail!(
-                    "cluster '{name}': queryAuth.type = impersonate is only supported for Trino, got {engine}"
-                );
+        if let Some(mode) = &cfg.query_auth {
+            if let Err(msg) =
+                queryflux_core::config::query_auth_supported(cfg.engine.as_ref(), mode)
+            {
+                anyhow::bail!("cluster '{name}': {msg}");
             }
+        }
+    }
+
+    // Deprecation warning: a cluster with no explicit `queryAuth` (or `serviceAccount`) and
+    // no HTTP-setting cluster auth still implicitly forwards the client's own Authorization
+    // header today, for backward compatibility. Operators should migrate to an explicit
+    // `queryAuth: passthrough` — this fallback may be removed in a future release.
+    for (name, cfg) in &config.clusters {
+        let is_implicit_passthrough_eligible = matches!(
+            cfg.query_auth,
+            None | Some(queryflux_core::config::QueryAuthConfig::ServiceAccount)
+        ) && matches!(
+            cfg.engine,
+            Some(queryflux_core::config::EngineConfig::Trino)
+        ) && !cfg
+            .auth
+            .as_ref()
+            .is_some_and(|a| a.sets_http_authorization());
+        if is_implicit_passthrough_eligible {
+            tracing::warn!(
+                "DEPRECATED: cluster '{name}' has no HTTP cluster auth and no explicit \
+                 queryAuth — it still implicitly forwards the client's Authorization header \
+                 (legacy behavior). Set queryAuth.type: passthrough explicitly; the implicit \
+                 fallback may be removed in a future release."
+            );
+        }
+    }
+
+    // Startup warning: with no gateway-level authorization policy, `passthrough` forwards
+    // whatever the client sent straight to the backend, and multiple cluster groups widen
+    // the blast radius of a single misconfigured or overly-permissive client credential.
+    if matches!(
+        config.authorization.provider,
+        queryflux_core::config::AuthorizationProviderConfig::None
+    ) && config.cluster_groups.len() > 1
+    {
+        let passthrough_clusters: Vec<&String> = config
+            .clusters
+            .iter()
+            .filter(|(_, cfg)| {
+                matches!(
+                    cfg.query_auth,
+                    Some(queryflux_core::config::QueryAuthConfig::Passthrough)
+                )
+            })
+            .map(|(name, _)| name)
+            .collect();
+        if !passthrough_clusters.is_empty() {
+            tracing::warn!(
+                clusters = ?passthrough_clusters,
+                "SECURITY: authorization.provider is 'none' and queryAuth: passthrough is set \
+                 on {} cluster(s) across {} cluster groups — QueryFlux is not enforcing any \
+                 access policy, so a client's own credential decides what it can reach on \
+                 every group it can route to. Configure authorization or narrow routing.",
+                passthrough_clusters.len(),
+                config.cluster_groups.len()
+            );
         }
     }
 
@@ -1253,6 +1302,7 @@ async fn main() -> Result<()> {
                         // (same path as client/admin cancel). The previous unauthenticated
                         // DELETE on `/v1/statement/executing/...` did not stop secured Trino.
                         let backend_id = q.backend_query_id.clone();
+                        let wire_auth = q.wire_auth.clone();
                         let cluster = q.cluster_name.0.clone();
                         let (engine_type, tgt_dialect) =
                             if let Some(adapter) = state.adapter(&cluster).await {
@@ -1269,7 +1319,9 @@ async fn main() -> Result<()> {
                         );
                         if let Some(adapter) = state.adapter(&cluster).await {
                             tokio::spawn(async move {
-                                if let Err(e) = adapter.cancel_query(&backend_id).await {
+                                if let Err(e) =
+                                    adapter.cancel_query(&backend_id, wire_auth.as_ref()).await
+                                {
                                     tracing::debug!(
                                         "Zombie cancel request failed (best-effort): {e}"
                                     );

@@ -5,9 +5,13 @@
 //! Resolution rules:
 //! - `auth_ctx.user == "anonymous"` or no `queryAuth` config → `ServiceAccount`
 //! - `queryAuth: serviceAccount`   → `ServiceAccount`
+//! - `queryAuth: passthrough`      → `Passthrough` (no-op at resolver — the adapter/dispatch
+//!   layer resolves the actual forwarded credential from `SessionContext`/`raw_token`)
 //! - `queryAuth: impersonate`      → `Impersonate { user }`
 //! - `queryAuth: tokenExchange`    → RFC 8693 token exchange → `Bearer { token }`
-//!   - Falls back to `ServiceAccount` when `raw_token` is absent.
+//!   - **Fails closed** when `raw_token` is absent or the exchange fails: returns `Err`,
+//!     never silently substitutes `ServiceAccount` (that would submit the query under the
+//!     wrong principal).
 //!   - Exchanged tokens are cached per (user, token_endpoint) until expiry − 30 s.
 
 use std::sync::Arc;
@@ -64,6 +68,8 @@ impl BackendIdentityResolver {
 
         let creds = match cluster_cfg.and_then(|c| c.query_auth.as_ref()) {
             None | Some(QueryAuthConfig::ServiceAccount) => QueryCredentials::ServiceAccount,
+
+            Some(QueryAuthConfig::Passthrough) => QueryCredentials::Passthrough,
 
             Some(QueryAuthConfig::Impersonate) => QueryCredentials::Impersonate {
                 user: auth_ctx.user.clone(),
@@ -187,5 +193,188 @@ impl BackendIdentityResolver {
 impl Default for BackendIdentityResolver {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    fn ctx(user: &str, raw_token: Option<&str>) -> AuthContext {
+        AuthContext {
+            user: user.to_string(),
+            groups: vec![],
+            roles: vec![],
+            raw_token: raw_token.map(str::to_string),
+        }
+    }
+
+    fn cluster_with(query_auth: Option<QueryAuthConfig>) -> ClusterConfig {
+        ClusterConfig {
+            query_auth,
+            ..Default::default()
+        }
+    }
+
+    /// Spawn a raw-socket mock HTTP endpoint that answers every accepted connection with
+    /// `body` once, then increments `hits`. Mirrors the pattern already used for HTTP-guard
+    /// tests in `queryflux-guardrails` — no mocking crate dependency needed.
+    async fn spawn_mock_endpoint(
+        status_line: &'static str,
+        body: String,
+    ) -> (String, Arc<AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits_clone = hits.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut buf = [0_u8; 4096];
+                let _ = socket.read(&mut buf).await;
+                let response = format!(
+                    "{status_line}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+                hits_clone.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+        (format!("http://{addr}/token"), hits)
+    }
+
+    fn token_exchange_cfg(endpoint: String) -> TokenExchangeConfig {
+        TokenExchangeConfig {
+            token_endpoint: endpoint,
+            client_id: "queryflux".to_string(),
+            client_secret: "secret".to_string(),
+            target_audience: None,
+            scope: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn no_cluster_config_is_service_account() {
+        let resolver = BackendIdentityResolver::new();
+        let creds = resolver.resolve(&ctx("alice", None), None).await.unwrap();
+        assert!(matches!(creds, QueryCredentials::ServiceAccount));
+    }
+
+    #[tokio::test]
+    async fn explicit_service_account() {
+        let resolver = BackendIdentityResolver::new();
+        let cluster = cluster_with(Some(QueryAuthConfig::ServiceAccount));
+        let creds = resolver
+            .resolve(&ctx("alice", None), Some(&cluster))
+            .await
+            .unwrap();
+        assert!(matches!(creds, QueryCredentials::ServiceAccount));
+    }
+
+    #[tokio::test]
+    async fn passthrough_resolves_to_passthrough_variant() {
+        let resolver = BackendIdentityResolver::new();
+        let cluster = cluster_with(Some(QueryAuthConfig::Passthrough));
+        let creds = resolver
+            .resolve(&ctx("alice", None), Some(&cluster))
+            .await
+            .unwrap();
+        assert!(matches!(creds, QueryCredentials::Passthrough));
+    }
+
+    #[tokio::test]
+    async fn impersonate_carries_the_authenticated_user() {
+        let resolver = BackendIdentityResolver::new();
+        let cluster = cluster_with(Some(QueryAuthConfig::Impersonate));
+        let creds = resolver
+            .resolve(&ctx("alice", None), Some(&cluster))
+            .await
+            .unwrap();
+        assert!(matches!(creds, QueryCredentials::Impersonate { user } if user == "alice"));
+    }
+
+    #[tokio::test]
+    async fn anonymous_is_always_service_account_regardless_of_query_auth() {
+        let resolver = BackendIdentityResolver::new();
+        let cluster = cluster_with(Some(QueryAuthConfig::Impersonate));
+        let creds = resolver
+            .resolve(&ctx("anonymous", None), Some(&cluster))
+            .await
+            .unwrap();
+        assert!(matches!(creds, QueryCredentials::ServiceAccount));
+    }
+
+    #[tokio::test]
+    async fn token_exchange_success_returns_bearer() {
+        let (endpoint, hits) = spawn_mock_endpoint(
+            "HTTP/1.1 200 OK",
+            r#"{"access_token":"exchanged-token","expires_in":3600}"#.to_string(),
+        )
+        .await;
+        let resolver = BackendIdentityResolver::new();
+        let cluster = cluster_with(Some(QueryAuthConfig::TokenExchange(token_exchange_cfg(
+            endpoint,
+        ))));
+        let creds = resolver
+            .resolve(&ctx("alice", Some("client-jwt")), Some(&cluster))
+            .await
+            .unwrap();
+        assert!(matches!(creds, QueryCredentials::Bearer { token } if token == "exchanged-token"));
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn token_exchange_missing_raw_token_fails_closed() {
+        let resolver = BackendIdentityResolver::new();
+        let cluster = cluster_with(Some(QueryAuthConfig::TokenExchange(token_exchange_cfg(
+            "http://127.0.0.1:1/token".to_string(), // never reached
+        ))));
+        let err = resolver
+            .resolve(&ctx("alice", None), Some(&cluster))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, QueryFluxError::Auth(_)));
+    }
+
+    #[tokio::test]
+    async fn token_exchange_server_error_fails_closed_not_service_account() {
+        let (endpoint, _hits) =
+            spawn_mock_endpoint("HTTP/1.1 500 Internal Server Error", "{}".to_string()).await;
+        let resolver = BackendIdentityResolver::new();
+        let cluster = cluster_with(Some(QueryAuthConfig::TokenExchange(token_exchange_cfg(
+            endpoint,
+        ))));
+        let err = resolver
+            .resolve(&ctx("alice", Some("client-jwt")), Some(&cluster))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, QueryFluxError::Auth(_)));
+    }
+
+    #[tokio::test]
+    async fn token_exchange_caches_token_across_resolves() {
+        let (endpoint, hits) = spawn_mock_endpoint(
+            "HTTP/1.1 200 OK",
+            r#"{"access_token":"cached-token","expires_in":3600}"#.to_string(),
+        )
+        .await;
+        let resolver = BackendIdentityResolver::new();
+        let cluster = cluster_with(Some(QueryAuthConfig::TokenExchange(token_exchange_cfg(
+            endpoint,
+        ))));
+        let auth_ctx = ctx("alice", Some("client-jwt"));
+
+        let first = resolver.resolve(&auth_ctx, Some(&cluster)).await.unwrap();
+        let second = resolver.resolve(&auth_ctx, Some(&cluster)).await.unwrap();
+        assert!(matches!(first, QueryCredentials::Bearer { token } if token == "cached-token"));
+        assert!(matches!(second, QueryCredentials::Bearer { token } if token == "cached-token"));
+        // Second resolve must hit the cache, not the token endpoint again.
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
     }
 }

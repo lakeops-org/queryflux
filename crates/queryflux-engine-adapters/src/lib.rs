@@ -5,6 +5,7 @@ pub mod duckdb;
 pub mod mysql_native;
 pub mod starrocks;
 pub mod trino;
+pub mod wire_auth;
 
 use std::pin::Pin;
 use std::sync::Arc;
@@ -316,8 +317,13 @@ pub trait AsyncAdapter: Send + Sync {
         &self,
         backend_id: &queryflux_core::query::BackendQueryId,
         poll_token: Option<&str>,
+        wire_auth: Option<&queryflux_core::query::StoredWireAuth>,
     ) -> Result<queryflux_core::query::QueryPollResult>;
-    async fn cancel_query(&self, backend_id: &queryflux_core::query::BackendQueryId) -> Result<()>;
+    async fn cancel_query(
+        &self,
+        backend_id: &queryflux_core::query::BackendQueryId,
+        wire_auth: Option<&queryflux_core::query::StoredWireAuth>,
+    ) -> Result<()>;
     fn engine_type(&self) -> queryflux_core::query::EngineType;
     fn translation_target_dialect(&self) -> queryflux_core::query::SqlDialect {
         self.engine_type().dialect()
@@ -422,10 +428,16 @@ impl AdapterKind {
         }
     }
 
-    pub async fn cancel_query(&self, backend_id: &BackendQueryId) -> Result<()> {
+    /// `wire_auth` is only meaningful for the `Async` branch (Trino) — sync adapters cancel
+    /// via their own connection/session and don't carry a separately-resolved wire credential.
+    pub async fn cancel_query(
+        &self,
+        backend_id: &BackendQueryId,
+        wire_auth: Option<&queryflux_core::query::StoredWireAuth>,
+    ) -> Result<()> {
         match self {
             Self::Sync(a) => a.cancel_query(backend_id).await,
-            Self::Async(a) => a.cancel_query(backend_id).await,
+            Self::Async(a) => a.cancel_query(backend_id, wire_auth).await,
         }
     }
 }

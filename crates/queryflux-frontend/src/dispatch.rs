@@ -16,12 +16,13 @@ use queryflux_core::{
     error::{QueryFluxError, Result},
     query::{
         ClusterGroupName, ClusterName, ExecutingQuery, FrontendProtocol, ProxyQueryId,
-        QueryEngineStats, QueryExecution, QueryStats, QueryStatus, QueuedQuery,
+        QueryEngineStats, QueryExecution, QueryStats, QueryStatus, QueuedQuery, StoredWireAuth,
     },
     session::SessionContext,
 };
 use queryflux_engine_adapters::{
-    AdapterKind, AsyncAdapter, BackendQueryIdSlot, ConnectionFormat, SyncAdapter,
+    wire_auth::resolve_stored_wire_auth, AdapterKind, AsyncAdapter, BackendQueryIdSlot,
+    ConnectionFormat, SyncAdapter,
 };
 use queryflux_guardrails::{GuardChain, GuardContext, GuardLayer};
 use queryflux_metrics::MetricsStore;
@@ -112,7 +113,7 @@ pub async fn dispatch_query(
     query_id: ProxyQueryId,
     sql: String,
     params: QueryParams,
-    session: SessionContext,
+    mut session: SessionContext,
     protocol: FrontendProtocol,
     group: ClusterGroupName,
     already_queued: bool,
@@ -265,6 +266,30 @@ pub async fn dispatch_query(
             return Err(e);
         }
     };
+
+    // Passthrough: forward the client's own Authorization if the frontend already
+    // captured one; otherwise inject a Bearer built from the OIDC raw_token so the
+    // backend still receives a per-user credential. The adapter fails closed if
+    // neither is available — this is best-effort enrichment, not the fail-closed check.
+    if matches!(credentials, QueryCredentials::Passthrough)
+        && !session.extra.contains_key("authorization")
+    {
+        if let Some(token) = &auth_ctx.raw_token {
+            session
+                .extra
+                .insert("authorization".to_string(), format!("Bearer {token}"));
+        }
+    }
+
+    // Resolved once here (mirroring what the Trino adapter derives internally for the
+    // POST itself) so the exact same wire auth can be persisted on `ExecutingQuery` and
+    // reused by poll/cancel, which never see the original `SessionContext` again.
+    let cluster_sets_http_auth = this_cluster_cfg
+        .as_ref()
+        .and_then(|c| c.auth.as_ref())
+        .is_some_and(|a| a.sets_http_authorization());
+    let wire_auth: Option<StoredWireAuth> =
+        resolve_stored_wire_auth(&credentials, &session, cluster_sets_http_auth);
 
     let adapter_kind = match state.adapter(&cluster_name.0).await {
         Some(a) => a,
@@ -467,6 +492,7 @@ pub async fn dispatch_query(
                 submitted_guard_actions,
                 was_guard_blocked: false,
                 submitted_by: auth_ctx.user.clone(),
+                wire_auth: wire_auth.clone(),
             };
 
             match execution {
@@ -483,8 +509,12 @@ pub async fn dispatch_query(
                         warn!(id = %query_id, "Failed to persist executing query: {e}");
                         let cancel_adapter = adapter.clone();
                         let cancel_id = backend_query_id.clone();
+                        let cancel_wire_auth = wire_auth.clone();
                         tokio::spawn(async move {
-                            if let Err(ce) = cancel_adapter.cancel_query(&cancel_id).await {
+                            if let Err(ce) = cancel_adapter
+                                .cancel_query(&cancel_id, cancel_wire_auth.as_ref())
+                                .await
+                            {
                                 warn!(backend = %cancel_id, "Best-effort cancel after persistence failure: {ce}");
                             }
                         });
@@ -1010,7 +1040,13 @@ fn spawn_sync_cancel(adapter: DispatchAdapter, id_slot: BackendQueryIdSlot) {
         return;
     };
     tokio::spawn(async move {
-        match tokio::time::timeout(SYNC_CANCEL_TIMEOUT, adapter.cancel_query(&id)).await {
+        // `execute_as_arrow` (the sync-bridge path for Trino reached via Postgres/MySQL/
+        // Flight wire) does not thread a resolved wire auth through this disconnect-cancel
+        // path yet — that's cross-frontend credential bridging, scoped to a later phase.
+        // Passthrough/impersonate/tokenExchange queries reached this way cancel with
+        // cluster auth only until then; the Trino HTTP frontend's own poll/cancel paths
+        // (in `dispatch_query` / `trino_http::handlers`) already reuse the real wire auth.
+        match tokio::time::timeout(SYNC_CANCEL_TIMEOUT, adapter.cancel_query(&id, None)).await {
             Err(_) => {
                 warn!(
                     backend = %id,
@@ -1065,10 +1101,14 @@ impl DispatchAdapter {
         }
     }
 
-    async fn cancel_query(&self, backend_id: &queryflux_core::query::BackendQueryId) -> Result<()> {
+    async fn cancel_query(
+        &self,
+        backend_id: &queryflux_core::query::BackendQueryId,
+        wire_auth: Option<&StoredWireAuth>,
+    ) -> Result<()> {
         match self {
             Self::Sync(a) => a.cancel_query(backend_id).await,
-            Self::Async(a) => a.cancel_query(backend_id).await,
+            Self::Async(a) => a.cancel_query(backend_id, wire_auth).await,
         }
     }
 
