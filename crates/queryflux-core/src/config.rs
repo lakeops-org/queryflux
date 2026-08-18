@@ -1271,6 +1271,13 @@ pub fn query_auth_supported(
     };
     match engine {
         Some(EngineConfig::Trino) => Ok(()),
+        Some(EngineConfig::ClickHouse) if matches!(mode, QueryAuthConfig::Impersonate) => Ok(()),
+        Some(EngineConfig::ClickHouse) => Err(format!(
+            "queryAuth.type = {mode_name} is not supported for ClickHouse in this release \
+             (only impersonate, self-hosted ClickHouse 25.11+ with \
+             access_control_improvements.allow_impersonate_user = 1 and GRANT IMPERSONATE — \
+             not supported on ClickHouse Cloud)"
+        )),
         Some(EngineConfig::Adbc)
             if matches!(mode, QueryAuthConfig::TokenExchange(_))
                 && driver.is_some_and(|d| ADBC_TOKEN_EXCHANGE_DRIVERS.contains(&d)) =>
@@ -1289,8 +1296,9 @@ pub fn query_auth_supported(
                 .map(|e| format!("{e:?}"))
                 .unwrap_or_else(|| "<unknown>".to_string());
             Err(format!(
-                "queryAuth.type = {mode_name} is only supported for Trino (and tokenExchange \
-                 for ADBC/snowflake) in this release, got {engine_name}"
+                "queryAuth.type = {mode_name} is only supported for Trino, ClickHouse \
+                 (impersonate only), and ADBC/snowflake (tokenExchange only) in this release, \
+                 got {engine_name}"
             ))
         }
     }
@@ -1617,7 +1625,7 @@ mod tests {
     }
 
     #[test]
-    fn passthrough_impersonate_token_exchange_allowed_only_for_trino() {
+    fn passthrough_impersonate_token_exchange_allowed_for_trino() {
         for mode in [
             QueryAuthConfig::Passthrough,
             QueryAuthConfig::Impersonate,
@@ -1628,14 +1636,32 @@ mod tests {
                 "Trino should support {mode:?}"
             );
             assert!(
-                query_auth_supported(Some(&EngineConfig::ClickHouse), None, &mode).is_err(),
-                "ClickHouse should not support {mode:?} in this release"
-            );
-            assert!(
                 query_auth_supported(None, None, &mode).is_err(),
                 "an unknown engine should not support {mode:?}"
             );
         }
+    }
+
+    #[test]
+    fn clickhouse_allows_only_impersonate() {
+        assert!(query_auth_supported(
+            Some(&EngineConfig::ClickHouse),
+            None,
+            &QueryAuthConfig::Impersonate
+        )
+        .is_ok());
+        assert!(query_auth_supported(
+            Some(&EngineConfig::ClickHouse),
+            None,
+            &QueryAuthConfig::Passthrough
+        )
+        .is_err());
+        assert!(query_auth_supported(
+            Some(&EngineConfig::ClickHouse),
+            None,
+            &token_exchange_mode()
+        )
+        .is_err());
     }
 
     #[test]

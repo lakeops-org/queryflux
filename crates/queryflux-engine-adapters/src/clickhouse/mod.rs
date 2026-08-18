@@ -508,6 +508,22 @@ fn escape_ident(ident: &str) -> String {
     format!("`{}`", ident.replace('\\', "\\\\").replace('`', "``"))
 }
 
+/// Wrap `sql` in `EXECUTE AS {user} {sql}` for `queryAuth: impersonate`.
+///
+/// Requires ClickHouse 25.11+ with `access_control_improvements.allow_impersonate_user = 1`
+/// and `GRANT IMPERSONATE ON {user} TO {service_account}` — QueryFlux cannot verify either
+/// remotely, so an unsupported/ungranted server surfaces this as an ordinary ClickHouse
+/// query error (caught by the normal error path in `execute_as_arrow`), not a startup
+/// failure. **Self-hosted only** — not supported on ClickHouse Cloud.
+///
+/// Only safe for a single statement: `EXECUTE AS` applies to the one query that follows it,
+/// so multi-statement `sql` would only impersonate the first statement while running the
+/// rest as the service account. QueryFlux's ClickHouse HTTP path already sends one
+/// statement per request, so this holds today but would need revisiting if that changes.
+fn wrap_execute_as(user: &str, sql: &str) -> String {
+    format!("EXECUTE AS {} {}", escape_ident(user), sql.trim())
+}
+
 /// True when `id` is safe to interpolate into `KILL QUERY WHERE query_id = '…'`.
 /// QueryFlux mints UUIDs; this also rejects anything a confused caller might pass.
 fn is_safe_query_id(id: &str) -> bool {
@@ -537,7 +553,7 @@ impl crate::SyncAdapter for ClickHouseAdapter {
         &self,
         sql: &str,
         session: &SessionContext,
-        _credentials: &queryflux_auth::QueryCredentials,
+        credentials: &queryflux_auth::QueryCredentials,
         tags: &QueryTags,
         // Dispatch interpolates params into the SQL before calling — this
         // adapter reports `supports_native_params() == false` (the default).
@@ -546,7 +562,14 @@ impl crate::SyncAdapter for ClickHouseAdapter {
     ) -> Result<SyncExecution> {
         let query_id = uuid::Uuid::new_v4().to_string();
         id_slot.publish(query_id.clone());
-        let mut req = self.query_request_with_id(sql, "ArrowStream", &query_id);
+        // `passthrough`/`tokenExchange` never reach here — startup validation
+        // (`query_auth_supported`) rejects them for ClickHouse, and `serviceAccount` is a
+        // no-op below. `impersonate` is the only mode ClickHouse adapts SQL for.
+        let effective_sql = match credentials {
+            queryflux_auth::QueryCredentials::Impersonate { user } => wrap_execute_as(user, sql),
+            _ => sql.to_string(),
+        };
+        let mut req = self.query_request_with_id(&effective_sql, "ArrowStream", &query_id);
         if let Some(db) = session.database() {
             req = req.query(&[("database", db)]);
         }
@@ -1060,6 +1083,30 @@ mod tests {
         assert_eq!(escape_ident("db"), "`db`");
         assert_eq!(escape_ident("we`ird"), "`we``ird`");
         assert_eq!(escape_ident(r"back\slash"), r"`back\\slash`");
+    }
+
+    #[test]
+    fn execute_as_wraps_sql_with_backtick_quoted_user() {
+        assert_eq!(
+            wrap_execute_as("alice", "SELECT 1"),
+            "EXECUTE AS `alice` SELECT 1"
+        );
+    }
+
+    #[test]
+    fn execute_as_quotes_a_user_needing_escaping() {
+        assert_eq!(
+            wrap_execute_as("we`ird", "SELECT 1"),
+            "EXECUTE AS `we``ird` SELECT 1"
+        );
+    }
+
+    #[test]
+    fn execute_as_trims_surrounding_whitespace_from_sql() {
+        assert_eq!(
+            wrap_execute_as("alice", "  SELECT 1  \n"),
+            "EXECUTE AS `alice` SELECT 1"
+        );
     }
 
     #[test]
