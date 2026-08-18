@@ -4122,6 +4122,7 @@ dependencies = [
  "aws-sdk-athena",
  "aws-types",
  "bytes",
+ "dashmap",
  "duckdb",
  "futures",
  "mysql_async",

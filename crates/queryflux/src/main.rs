@@ -702,13 +702,16 @@ async fn main() -> Result<()> {
 
     // --- Startup validation: engine × queryAuth support matrix ---
     // Centralized in `query_auth_supported` so YAML load, Studio PUT, and this check can't
-    // drift apart. `passthrough`/`impersonate`/`tokenExchange` are Trino-only in this
-    // release — every other adapter still ignores `QueryCredentials`.
+    // drift apart. `passthrough`/`impersonate` are Trino-only; `tokenExchange` is Trino or
+    // ADBC-with-an-OAuth-capable-driver (`cfg.driver`, only ever set for admin-API-created
+    // ADBC clusters — see `ClusterConfig::driver`).
     for (name, cfg) in &config.clusters {
         if let Some(mode) = &cfg.query_auth {
-            if let Err(msg) =
-                queryflux_core::config::query_auth_supported(cfg.engine.as_ref(), mode)
-            {
+            if let Err(msg) = queryflux_core::config::query_auth_supported(
+                cfg.engine.as_ref(),
+                cfg.driver.as_deref(),
+                mode,
+            ) {
                 anyhow::bail!("cluster '{name}': {msg}");
             }
         }

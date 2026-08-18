@@ -1134,6 +1134,14 @@ pub struct ClusterConfig {
     /// 1 GiB when omitted. Other engines ignore this.
     #[serde(default)]
     pub max_result_buffer_bytes: Option<u64>,
+    /// ADBC driver name (e.g. `"snowflake"`, `"flightsql"`) — only meaningful when
+    /// `engine` is [`EngineConfig::Adbc`]. ADBC clusters are admin-API-only (never YAML),
+    /// so this is populated from the persisted JSONB `driver` key, not deserialized from
+    /// this struct's own YAML/JSON representation. Used by [`query_auth_supported`] since
+    /// `EngineConfig::Adbc` alone doesn't say which underlying driver — and therefore
+    /// which OAuth-capable drivers — a cluster uses.
+    #[serde(default)]
+    pub driver: Option<String>,
     #[serde(default)]
     pub tls: Option<TlsConfig>,
     /// Type 1 credentials — service account used for health checks and (by default) query execution.
@@ -1232,35 +1240,57 @@ pub enum QueryAuthConfig {
     TokenExchange(TokenExchangeConfig),
 }
 
+/// ADBC drivers whose adapter code knows how to put an OAuth token into connection
+/// options via a per-identity sub-pool (see `AdbcAdapter`). Every other ADBC driver is
+/// `serviceAccount`-only — `EngineConfig::Adbc` alone can't tell drivers apart, so this
+/// list is what actually gates `tokenExchange` for ADBC clusters.
+const ADBC_TOKEN_EXCHANGE_DRIVERS: &[&str] = &["snowflake"];
+
 /// Centralizes the engine × `queryAuth` support matrix so YAML load, Studio PUT, and
 /// startup validation can't drift apart. Returns `Err` with an operator-facing message
-/// when `mode` is not implemented for `engine` yet.
+/// when `mode` is not implemented for `engine` (and, for ADBC, `driver`) yet.
 ///
-/// `serviceAccount` is always allowed. Every other mode is Trino-only in this release —
-/// ADBC/ClickHouse/StarRocks adapters do not yet consume `QueryCredentials`, so accepting
-/// the config silently would produce a cluster that claims per-user identity but never
-/// applies it.
+/// `serviceAccount` is always allowed. Trino supports every mode. ADBC supports
+/// `tokenExchange` only for drivers in [`ADBC_TOKEN_EXCHANGE_DRIVERS`] — `driver` is
+/// ignored for every other engine. Everything else (ClickHouse, StarRocks, and all other
+/// ADBC drivers) is `serviceAccount`-only in this release; accepting the config silently
+/// would produce a cluster that claims per-user identity but never applies it.
 pub fn query_auth_supported(
     engine: Option<&EngineConfig>,
+    driver: Option<&str>,
     mode: &QueryAuthConfig,
 ) -> Result<(), String> {
     if matches!(mode, QueryAuthConfig::ServiceAccount) {
         return Ok(());
     }
+    let mode_name = match mode {
+        QueryAuthConfig::Passthrough => "passthrough",
+        QueryAuthConfig::Impersonate => "impersonate",
+        QueryAuthConfig::TokenExchange(_) => "tokenExchange",
+        QueryAuthConfig::ServiceAccount => unreachable!("handled above"),
+    };
     match engine {
         Some(EngineConfig::Trino) => Ok(()),
+        Some(EngineConfig::Adbc)
+            if matches!(mode, QueryAuthConfig::TokenExchange(_))
+                && driver.is_some_and(|d| ADBC_TOKEN_EXCHANGE_DRIVERS.contains(&d)) =>
+        {
+            Ok(())
+        }
+        Some(EngineConfig::Adbc) => {
+            let driver_name = driver.unwrap_or("<unknown>");
+            Err(format!(
+                "queryAuth.type = {mode_name} is not supported for ADBC driver '{driver_name}' \
+                 in this release (only tokenExchange for {ADBC_TOKEN_EXCHANGE_DRIVERS:?})"
+            ))
+        }
         other => {
             let engine_name = other
                 .map(|e| format!("{e:?}"))
                 .unwrap_or_else(|| "<unknown>".to_string());
-            let mode_name = match mode {
-                QueryAuthConfig::Passthrough => "passthrough",
-                QueryAuthConfig::Impersonate => "impersonate",
-                QueryAuthConfig::TokenExchange(_) => "tokenExchange",
-                QueryAuthConfig::ServiceAccount => unreachable!("handled above"),
-            };
             Err(format!(
-                "queryAuth.type = {mode_name} is only supported for Trino in this release, got {engine_name}"
+                "queryAuth.type = {mode_name} is only supported for Trino (and tokenExchange \
+                 for ADBC/snowflake) in this release, got {engine_name}"
             ))
         }
     }
@@ -1565,14 +1595,25 @@ mod tests {
         ProxyConfig, QueryAuthConfig, RouterConfig, TokenExchangeConfig,
     };
 
+    fn token_exchange_mode() -> QueryAuthConfig {
+        QueryAuthConfig::TokenExchange(TokenExchangeConfig {
+            token_endpoint: "https://idp.example/token".to_string(),
+            client_id: "queryflux".to_string(),
+            client_secret: "secret".to_string(),
+            target_audience: None,
+            scope: None,
+        })
+    }
+
     #[test]
     fn service_account_is_allowed_for_every_engine_including_unknown() {
         assert!(query_auth_supported(
             Some(&EngineConfig::ClickHouse),
+            None,
             &QueryAuthConfig::ServiceAccount
         )
         .is_ok());
-        assert!(query_auth_supported(None, &QueryAuthConfig::ServiceAccount).is_ok());
+        assert!(query_auth_supported(None, None, &QueryAuthConfig::ServiceAccount).is_ok());
     }
 
     #[test]
@@ -1580,27 +1621,58 @@ mod tests {
         for mode in [
             QueryAuthConfig::Passthrough,
             QueryAuthConfig::Impersonate,
-            QueryAuthConfig::TokenExchange(TokenExchangeConfig {
-                token_endpoint: "https://idp.example/token".to_string(),
-                client_id: "queryflux".to_string(),
-                client_secret: "secret".to_string(),
-                target_audience: None,
-                scope: None,
-            }),
+            token_exchange_mode(),
         ] {
             assert!(
-                query_auth_supported(Some(&EngineConfig::Trino), &mode).is_ok(),
+                query_auth_supported(Some(&EngineConfig::Trino), None, &mode).is_ok(),
                 "Trino should support {mode:?}"
             );
             assert!(
-                query_auth_supported(Some(&EngineConfig::ClickHouse), &mode).is_err(),
+                query_auth_supported(Some(&EngineConfig::ClickHouse), None, &mode).is_err(),
                 "ClickHouse should not support {mode:?} in this release"
             );
             assert!(
-                query_auth_supported(None, &mode).is_err(),
+                query_auth_supported(None, None, &mode).is_err(),
                 "an unknown engine should not support {mode:?}"
             );
         }
+    }
+
+    #[test]
+    fn adbc_token_exchange_allowed_only_for_snowflake_driver() {
+        assert!(query_auth_supported(
+            Some(&EngineConfig::Adbc),
+            Some("snowflake"),
+            &token_exchange_mode()
+        )
+        .is_ok());
+        assert!(query_auth_supported(
+            Some(&EngineConfig::Adbc),
+            Some("postgresql"),
+            &token_exchange_mode()
+        )
+        .is_err());
+        assert!(
+            query_auth_supported(Some(&EngineConfig::Adbc), None, &token_exchange_mode()).is_err()
+        );
+    }
+
+    #[test]
+    fn adbc_passthrough_and_impersonate_rejected_even_for_snowflake_driver() {
+        // Only tokenExchange is wired for ADBC in this release — passthrough/impersonate
+        // are rejected regardless of driver.
+        assert!(query_auth_supported(
+            Some(&EngineConfig::Adbc),
+            Some("snowflake"),
+            &QueryAuthConfig::Passthrough
+        )
+        .is_err());
+        assert!(query_auth_supported(
+            Some(&EngineConfig::Adbc),
+            Some("snowflake"),
+            &QueryAuthConfig::Impersonate
+        )
+        .is_err());
     }
 
     #[test]

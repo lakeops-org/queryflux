@@ -6,6 +6,7 @@ use adbc_driver_manager::{ManagedDatabase, ManagedDriver};
 use arrow::array::Array;
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
+use dashmap::DashMap;
 use queryflux_core::{
     catalog::TableSchema,
     config::ClusterConfig,
@@ -268,6 +269,52 @@ impl crate::EngineConfigParseable for AdbcConfig {
 
 type AdbcPool = r2d2::Pool<AdbcConnectionManager<ManagedDatabase>>;
 
+/// Small per-user pool, built on demand for `tokenExchange` clusters. Kept separate from
+/// the static `pool` (Type 1 / `serviceAccount`) because its `ManagedDatabase` bakes in a
+/// per-user OAuth token at connection-option time — there is no way to swap credentials on
+/// a checked-out connection from a shared pool, so a distinct user needs a distinct
+/// `ManagedDatabase`. Small size + idle eviction keep this from growing unbounded across a
+/// long-running process; see `identity_pool_for_token`.
+struct IdentityPoolEntry {
+    pool: AdbcPool,
+    last_used: std::time::Instant,
+}
+
+/// Max connections per per-identity sub-pool. Deliberately small — this exists to amortize
+/// the OAuth-token-scoped connection setup cost across the handful of queries a user runs
+/// in quick succession, not to serve as a general-purpose pool.
+const IDENTITY_POOL_MAX_SIZE: u32 = 2;
+
+/// Evict a per-identity sub-pool after this long without use. Roughly matches how often the
+/// resolver's own token cache refreshes (tokens are typically short-lived), so a pool rarely
+/// outlives the token it was built for by much.
+const IDENTITY_POOL_IDLE_TTL: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+
+/// Per-driver OAuth connection-option keys for `tokenExchange`. Only `snowflake` is wired in
+/// this release — must stay in sync with `ADBC_TOKEN_EXCHANGE_DRIVERS` in
+/// `queryflux_core::config`, which is what actually gates which clusters can reach this code
+/// path (startup validation rejects `tokenExchange` for any other ADBC driver).
+fn oauth_token_options(
+    driver: &str,
+    token: &str,
+) -> Result<Vec<(OptionDatabase, adbc_core::options::OptionValue)>> {
+    match driver {
+        "snowflake" => Ok(vec![
+            (
+                OptionDatabase::Other("adbc.snowflake.sql.auth_type".to_string()),
+                "auth_oauth".into(),
+            ),
+            (
+                OptionDatabase::Other("adbc.snowflake.sql.client_option.auth_token".to_string()),
+                token.to_string().into(),
+            ),
+        ]),
+        other => Err(QueryFluxError::Engine(format!(
+            "ADBC driver '{other}' has no tokenExchange connection-option wiring in this release"
+        ))),
+    }
+}
+
 /// ADBC adapter — wraps any ADBC-compatible shared library driver.
 ///
 /// The driver is loaded once at construction via `load_from_name` (manifest-based, searches
@@ -277,6 +324,16 @@ pub struct AdbcAdapter {
     pub cluster_name: ClusterName,
     pub group_name: ClusterGroupName,
     pool: AdbcPool,
+    /// Kept (not dropped after `new()`) so per-identity `ManagedDatabase`s can be built on
+    /// demand — cheap to clone (`Arc` inside), see `adbc_driver_manager::ManagedDriver`.
+    driver: ManagedDriver,
+    /// Raw driver key (e.g. `"snowflake"`) — distinct from `engine_type`, which can be
+    /// overridden for `flightsql` via `flightSqlClusterDialect` and would then no longer
+    /// identify which OAuth option keys to use.
+    driver_name: String,
+    base_uri: String,
+    base_db_kwargs: Vec<(String, String)>,
+    identity_pools: Arc<DashMap<String, IdentityPoolEntry>>,
     engine_type: EngineType,
     translation_dialect: queryflux_core::query::SqlDialect,
 }
@@ -289,6 +346,9 @@ impl AdbcAdapter {
     ) -> Result<Self> {
         let engine_type = config.engine_type();
         let translation_dialect = config.flight_sql_translation_dialect();
+        let driver_name = config.driver.clone();
+        let base_uri = config.uri.clone();
+        let base_db_kwargs = config.db_kwargs.clone();
 
         let mut driver = ManagedDriver::load_from_name(
             &config.driver,
@@ -323,8 +383,9 @@ impl AdbcAdapter {
                 cluster_name.0
             ))
         })?;
-        // driver dropped here — ManagedDatabase holds Arc ref to driver internals,
-        // so the shared library remains loaded.
+        // `driver` is kept (not dropped) on the adapter so per-identity `ManagedDatabase`s
+        // can be built later for `tokenExchange` — see `identity_pool_for_token`. Cloning it
+        // is cheap (Arc-backed), and the shared library stays loaded via that Arc either way.
 
         let manager = AdbcConnectionManager::new(database);
         let pool = r2d2::Pool::builder()
@@ -341,9 +402,70 @@ impl AdbcAdapter {
             cluster_name,
             group_name,
             pool,
+            driver,
+            driver_name,
+            base_uri,
+            base_db_kwargs,
+            identity_pools: Arc::new(DashMap::new()),
             engine_type,
             translation_dialect,
         })
+    }
+
+    /// Return the small per-identity pool for `token`, building (and caching) it on first
+    /// use. Runs synchronously — call from a blocking context (`execute_as_arrow` already
+    /// dispatches into `spawn_blocking` for every query, so this rides along on that same
+    /// thread rather than needing its own).
+    ///
+    /// Sweeps idle entries on every call (same pattern as
+    /// `BackendIdentityResolver::exchange_token`'s cache) rather than running a background
+    /// task — the map holds at most one entry per active user, so this stays cheap.
+    fn identity_pool_for_token(&self, token: &str) -> Result<AdbcPool> {
+        let now = std::time::Instant::now();
+        if let Some(mut entry) = self.identity_pools.get_mut(token) {
+            entry.last_used = now;
+            return Ok(entry.pool.clone());
+        }
+
+        let opts = oauth_token_options(&self.driver_name, token)?;
+        let mut opts_with_uri = vec![(OptionDatabase::Uri, self.base_uri.clone().into())];
+        for (k, v) in &self.base_db_kwargs {
+            opts_with_uri.push((OptionDatabase::Other(k.clone()), v.clone().into()));
+        }
+        opts_with_uri.extend(opts);
+
+        let mut driver = self.driver.clone();
+        let database = driver.new_database_with_opts(opts_with_uri).map_err(|e| {
+            QueryFluxError::Engine(format!(
+                "cluster '{}': failed to create per-identity ADBC database: {e}",
+                self.cluster_name.0
+            ))
+        })?;
+        let manager = AdbcConnectionManager::new(database);
+        let pool = r2d2::Pool::builder()
+            .max_size(IDENTITY_POOL_MAX_SIZE)
+            .build(manager)
+            .map_err(|e| {
+                QueryFluxError::Engine(format!(
+                    "cluster '{}': failed to create per-identity ADBC connection pool: {e}",
+                    self.cluster_name.0
+                ))
+            })?;
+
+        self.identity_pools.insert(
+            token.to_string(),
+            IdentityPoolEntry {
+                pool: pool.clone(),
+                last_used: now,
+            },
+        );
+        // Evict idle entries — bounds the map across a long-running process without a
+        // separate background task. O(n) in the number of distinct recent identities,
+        // which for a per-user OAuth pool is small.
+        self.identity_pools
+            .retain(|_, e| now.duration_since(e.last_used) < IDENTITY_POOL_IDLE_TTL);
+
+        Ok(pool)
     }
 
     pub fn descriptor() -> EngineDescriptor {
@@ -488,7 +610,7 @@ impl SyncAdapter for AdbcAdapter {
         &self,
         sql: &str,
         _session: &SessionContext,
-        _credentials: &queryflux_auth::QueryCredentials,
+        credentials: &queryflux_auth::QueryCredentials,
         _tags: &QueryTags,
         params: &queryflux_core::params::QueryParams,
         _id_slot: &BackendQueryIdSlot,
@@ -503,7 +625,20 @@ impl SyncAdapter for AdbcAdapter {
             attempt_id = %uuid::Uuid::new_v4(),
             "Executing ADBC query"
         );
-        let pool = self.pool.clone();
+        // `Bearer` is the only non-serviceAccount `QueryCredentials` that can reach an ADBC
+        // adapter — startup validation (`query_auth_supported`) rejects `passthrough`/
+        // `impersonate` for every ADBC driver, so `tokenExchange` (resolved to `Bearer`) is
+        // the only other case to handle here. `identity_pool_for_token` is a cheap DashMap
+        // lookup on cache hits; the miss path calls the driver FFI to build a new database,
+        // which can block, but that only happens once per user per token-cache window, so
+        // it's run inline on the async executor rather than adding a second spawn_blocking
+        // just for this rare path.
+        let pool = match credentials {
+            queryflux_auth::QueryCredentials::Bearer { token } => {
+                self.identity_pool_for_token(token)?
+            }
+            _ => self.pool.clone(),
+        };
         let sql = sql.to_string();
         let param_batch = if params.is_empty() {
             None
@@ -803,9 +938,35 @@ impl EngineAdapterFactory for AdbcFactory {
 
 #[cfg(test)]
 mod tests {
-    use super::AdbcConfig;
+    use super::{oauth_token_options, AdbcConfig};
     use crate::EngineConfigParseable;
     use queryflux_core::query::{EngineType, SqlDialect};
+
+    #[test]
+    fn oauth_token_options_snowflake_sets_auth_type_and_token() {
+        let opts = oauth_token_options("snowflake", "the-token").expect("snowflake is wired");
+        let keys: Vec<String> = opts.iter().map(|(k, _)| format!("{k:?}")).collect();
+        assert!(
+            keys.iter()
+                .any(|k| k.contains("adbc.snowflake.sql.auth_type")),
+            "missing auth_type option, got: {keys:?}"
+        );
+        assert!(
+            keys.iter()
+                .any(|k| k.contains("adbc.snowflake.sql.client_option.auth_token")),
+            "missing auth_token option, got: {keys:?}"
+        );
+    }
+
+    #[test]
+    fn oauth_token_options_rejects_unwired_drivers() {
+        for driver in ["postgresql", "mysql", "flightsql", "databricks", "unknown"] {
+            assert!(
+                oauth_token_options(driver, "token").is_err(),
+                "driver '{driver}' should not be wired for tokenExchange yet"
+            );
+        }
+    }
 
     #[test]
     fn trino_driver_maps_to_trino_engine_type() {

@@ -146,6 +146,7 @@ pub fn cluster_config_from_persisted_json(
         max_wait_secs: None,
         tls: None,
         max_result_buffer_bytes: None,
+        driver: json_str(config, "driver"),
         auth,
         query_auth,
     }
