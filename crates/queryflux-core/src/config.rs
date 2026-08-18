@@ -1645,6 +1645,33 @@ mod tests {
     }
 
     #[test]
+    fn starrocks_and_duckdb_and_athena_are_service_account_only() {
+        // No wire mechanism (StarRocks MySQL wire), no per-user identity concept
+        // (DuckDB embedded, Athena IAM) — none of these get any mode beyond
+        // serviceAccount in this release. See Phase 5 in the backend-identity plan.
+        for engine in [
+            EngineConfig::StarRocks,
+            EngineConfig::DuckDb,
+            EngineConfig::DuckDbHttp,
+            EngineConfig::Athena,
+        ] {
+            for mode in [
+                QueryAuthConfig::Passthrough,
+                QueryAuthConfig::Impersonate,
+                token_exchange_mode(),
+            ] {
+                assert!(
+                    query_auth_supported(Some(&engine), None, &mode).is_err(),
+                    "{engine:?} should not support {mode:?} in this release"
+                );
+            }
+            assert!(
+                query_auth_supported(Some(&engine), None, &QueryAuthConfig::ServiceAccount).is_ok()
+            );
+        }
+    }
+
+    #[test]
     fn clickhouse_allows_only_impersonate() {
         assert!(query_auth_supported(
             Some(&EngineConfig::ClickHouse),

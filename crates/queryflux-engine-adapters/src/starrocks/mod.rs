@@ -475,6 +475,12 @@ impl SyncAdapter for StarRocksAdapter {
         Ok(())
     }
 
+    // `_credentials` is always `ServiceAccount` here — `query_auth_supported` rejects
+    // `passthrough`/`impersonate`/`tokenExchange` for StarRocks at startup, since the
+    // MySQL wire protocol this adapter speaks has no trusted-proxy or bearer-token
+    // mechanism. StarRocks 3.5+ has a JWT MySQL auth plugin that could support
+    // `passthrough` in principle, but wiring it is unstarted — see the backend-identity
+    // plan's Phase 5 (docs-first; no spike without a concrete deployment asking for it).
     async fn execute_as_arrow(
         &self,
         sql: &str,

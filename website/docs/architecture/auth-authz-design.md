@@ -621,23 +621,25 @@ Poll and cancel requests don't repeat the client's original headers, so the reso
 ## Engine-Specific Notes
 
 ### ClickHouse
-- No JWT/OIDC support; no impersonation mechanism
-- `X-ClickHouse-User` + `X-ClickHouse-Key` are full auth credentials (username + password), not impersonation headers
-- Only viable `queryAuth`: `serviceAccount`
-- ClickHouse Cloud: further restricted to password-only (no LDAP/Kerberos/cert)
+- No JWT/OIDC support; `X-ClickHouse-User` + `X-ClickHouse-Key` are full auth credentials (username + password), not impersonation headers — there is no trusted-proxy header on this engine
+- `impersonate` **is** viable via the `EXECUTE AS {user} {sql}` SQL statement — see "Mode: `impersonate`" above for the version/config/grant requirements (self-hosted ClickHouse 25.11+ only)
+- `passthrough`/`tokenExchange`: not wired in this release
+- ClickHouse Cloud: further restricted to password-only (no LDAP/Kerberos/cert), and does not support `EXECUTE AS` at all — `impersonate` is a self-hosted-only capability here
 
-**Trino HTTP frontend → ClickHouse backend:** Gateway **auth** still produces `AuthContext` (who the analyst is for authz and audit). Gateway **queryAuth** for the ClickHouse cluster resolves to **Type 1 service credentials** only. ClickHouse sees the service user, not the Trino username — unless operators add a custom integration (password mirroring, external authenticator). This is expected for heterogeneous routing.
+**Trino HTTP frontend → ClickHouse backend, `serviceAccount`:** Gateway **auth** still produces `AuthContext` (who the analyst is for authz and audit). Gateway **queryAuth** for the ClickHouse cluster resolves to **Type 1 service credentials** only. ClickHouse sees the service user, not the Trino username, unless `queryAuth: impersonate` is configured (see above) or operators add a custom integration (password mirroring, external authenticator).
 
 ### StarRocks
-- MySQL wire (port 9030, current adapter): password-based only; `serviceAccount` is the only option
-- HTTP API (ports 8030/8040, future adapter): StarRocks natively supports JWT and OAuth 2.0; a future HTTP adapter could use implicit header forwarding when StarRocks and QueryFlux share an IdP. This is a motivation for the HTTP adapter — it enables per-user identity for StarRocks Ranger policies
-- No impersonation mechanism exists on either interface
+- MySQL wire (port 9030, current adapter): password-based only; `serviceAccount` is the only option — no trusted-proxy header, no bearer-token support on this protocol
+- **StarRocks 3.5+ ships a JWT MySQL auth plugin** that could in principle support `passthrough` (StarRocks itself validates the client's JWT during the MySQL handshake, so QueryFlux would just need to forward the token instead of a password). This is genuinely feasible, unlike ClickHouse's/StarRocks's older MySQL wire, but wiring it is **unstarted** — it needs its own connection-option/handshake work in `mysql_native`, plus a startup-config toggle (proposed: `starrocksJwtPassthrough: true`, off by default) since it changes how the adapter authenticates every connection in the pool, not just per-query. No spike has been done because no deployment has asked for it yet; do the spike (or drop this note) once one does.
+- HTTP API (ports 8030/8040, future adapter): StarRocks natively supports JWT and OAuth 2.0 over this interface too; a future HTTP adapter could use implicit header forwarding when StarRocks and QueryFlux share an IdP — same motivation as the JWT MySQL plugin, different transport
+- No impersonation mechanism (no `EXECUTE AS`-equivalent) exists on either interface — `impersonate` is not viable for StarRocks regardless of which of the above ships
 
-### Snowflake (future adapter)
-- No header-based impersonation
-- Service account should use key-pair auth (RSA JWT), not password — Snowflake's recommended pattern for automated connections
-- `tokenExchange` or `serviceAccount` are the two options
+### Snowflake (ADBC driver)
+- No header-based impersonation on the ADBC wire — `impersonate` is rejected at startup for every ADBC driver
+- `tokenExchange` is wired: the resolved OAuth token is set via the driver's own connection options (`adbc.snowflake.sql.auth_type=auth_oauth`, `adbc.snowflake.sql.client_option.auth_token`), each user's token requiring its own `ManagedDatabase` (see the per-identity sub-pool design in the backend-identity plan's Phase 3a) since ADBC bakes connection options in at open time, not per-checkout
+- Service account (`serviceAccount` mode, Type 1) should use key-pair auth (RSA JWT), not password — Snowflake's recommended pattern for automated connections
 - Private keys must not be stored in config files in production; use `secretRef` to Secrets Manager
+- `passthrough` is not wired for ADBC in this release (only `tokenExchange`, only for the `snowflake` driver)
 
 ### Trino
 - Implicit header forwarding works for same-IdP deployments
