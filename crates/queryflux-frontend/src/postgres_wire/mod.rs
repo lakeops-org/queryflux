@@ -304,6 +304,13 @@ async fn handle_simple_query(
 
     let protocol = FrontendProtocol::PostgresWire;
 
+    // No `bearer_token` captured here — the Postgres wire startup message carries only a
+    // username (password auth, if any, happens in a separate AuthenticationMD5Password/
+    // cleartext exchange this handler doesn't thread through to `Credentials`). That means
+    // `AuthContext.raw_token` is always `None` for this frontend, so `queryAuth: passthrough`
+    // / `tokenExchange` on a backend cluster can never resolve a per-user credential when
+    // reached this way — only `serviceAccount` (and `impersonate`, backend-side) work.
+    // Use the Trino HTTP or Flight SQL frontend when per-user backend identity is required.
     let creds = Credentials {
         username: session.user().map(|s| s.to_string()),
         ..Default::default()

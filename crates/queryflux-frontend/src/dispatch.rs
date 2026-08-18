@@ -21,8 +21,8 @@ use queryflux_core::{
     session::SessionContext,
 };
 use queryflux_engine_adapters::{
-    wire_auth::resolve_stored_wire_auth, AdapterKind, AsyncAdapter, BackendQueryIdSlot,
-    ConnectionFormat, SyncAdapter,
+    wire_auth::{enrich_session_for_passthrough, resolve_stored_wire_auth},
+    AdapterKind, AsyncAdapter, BackendQueryIdSlot, ConnectionFormat, SyncAdapter,
 };
 use queryflux_guardrails::{GuardChain, GuardContext, GuardLayer};
 use queryflux_metrics::MetricsStore;
@@ -279,15 +279,7 @@ pub async fn dispatch_query(
     // captured one; otherwise inject a Bearer built from the OIDC raw_token so the
     // backend still receives a per-user credential. The adapter fails closed if
     // neither is available — this is best-effort enrichment, not the fail-closed check.
-    if matches!(credentials, QueryCredentials::Passthrough)
-        && !session.extra.contains_key("authorization")
-    {
-        if let Some(token) = &auth_ctx.raw_token {
-            session
-                .extra
-                .insert("authorization".to_string(), format!("Bearer {token}"));
-        }
-    }
+    enrich_session_for_passthrough(&mut session, &credentials, auth_ctx);
 
     // Resolved once here (mirroring what the Trino adapter derives internally for the
     // POST itself) so the exact same wire auth can be persisted on `ExecutingQuery` and
@@ -1419,21 +1411,12 @@ async fn setup_sync_query(
         }
     };
 
-    // Same enrichment as the async dispatch path: forward the client's own Authorization
-    // if the frontend already captured one; otherwise inject a Bearer built from the OIDC
-    // raw_token so the backend still receives a per-user credential. Without this, an
-    // OIDC-authenticated sync request (Postgres/MySQL/Flight wire) with no original
-    // Authorization header would resolve to Passthrough, find nothing forwardable, and
-    // fail closed — even though a raw_token was available to build one from.
-    if matches!(credentials, QueryCredentials::Passthrough)
-        && !session.extra.contains_key("authorization")
-    {
-        if let Some(token) = &auth_ctx.raw_token {
-            session
-                .extra
-                .insert("authorization".to_string(), format!("Bearer {token}"));
-        }
-    }
+    // Same enrichment as the async dispatch path: Flight SQL already forwards a client
+    // `Authorization` gRPC metadata header into `session.extra` verbatim, so this is only
+    // a no-op fallback for `passthrough` clusters when that header is missing but the
+    // caller authenticated via OIDC. `execute_as_arrow` (Trino reached via this sync
+    // bridge) resolves its own wire auth internally from this same session.
+    enrich_session_for_passthrough(&mut session, &credentials, auth_ctx);
 
     // Resolved the same way as the async dispatch path (after enrichment, so passthrough
     // benefits from it too), so a disconnect mid-query cancels with the identity the query

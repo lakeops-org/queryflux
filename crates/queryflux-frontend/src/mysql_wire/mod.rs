@@ -291,6 +291,12 @@ async fn handle_com_query(
     // Auth-complete early gate: all statement/metadata fast paths must still
     // be subject to authentication when `auth.required=true`.
     let protocol = FrontendProtocol::MySqlWire;
+    // No `bearer_token` captured here — the MySQL wire handshake password is not threaded
+    // through to `Credentials`, so `AuthContext.raw_token` is always `None` for this
+    // frontend. `queryAuth: passthrough` / `tokenExchange` on a backend cluster can never
+    // resolve a per-user credential when reached this way — only `serviceAccount` (and
+    // `impersonate`, backend-side) work. Use the Trino HTTP or Flight SQL frontend when
+    // per-user backend identity is required.
     let creds = Credentials {
         username: session.user().map(|s| s.to_string()),
         ..Default::default()
