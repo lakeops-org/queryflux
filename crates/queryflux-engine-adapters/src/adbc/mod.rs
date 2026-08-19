@@ -294,6 +294,15 @@ const IDENTITY_POOL_IDLE_TTL: std::time::Duration = std::time::Duration::from_se
 /// real OAuth token validation) — see `AdbcAdapter::identity_pool_for_token`.
 const IDENTITY_POOL_BUILD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// Cap on concurrent per-identity pool builds (across all tokens) in flight at once.
+/// `tokio::time::timeout` gives up on *waiting* for a `spawn_blocking` task, but does not
+/// cancel it — the underlying OS thread keeps running the driver FFI call until it returns
+/// (or hangs) regardless. Without a cap, a burst of distinct identities hitting a slow or
+/// unreachable OAuth endpoint at the same time could each leave a zombie build running,
+/// piling up on the shared tokio blocking thread pool. Combined with single-flighting
+/// same-token builds (below), this bounds worst-case blocking-thread usage from this path.
+const IDENTITY_POOL_MAX_CONCURRENT_BUILDS: usize = 8;
+
 /// Per-driver OAuth connection-option keys for `tokenExchange`. Only `snowflake` is wired in
 /// this release — must stay in sync with `ADBC_TOKEN_EXCHANGE_DRIVERS` in
 /// `queryflux_core::config`, which is what actually gates which clusters can reach this code
@@ -338,6 +347,14 @@ pub struct AdbcAdapter {
     base_uri: String,
     base_db_kwargs: Vec<(String, String)>,
     identity_pools: Arc<DashMap<String, IdentityPoolEntry>>,
+    /// Per-token single-flight locks — serializes concurrent cache-miss builds for the same
+    /// token so a burst of queries from one identity builds exactly one pool instead of
+    /// racing to build (and discard all but the last of) several. See
+    /// `identity_pool_for_token`.
+    identity_pool_build_locks: Arc<DashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// Caps total concurrent per-identity pool builds across all tokens. See
+    /// `IDENTITY_POOL_MAX_CONCURRENT_BUILDS`.
+    identity_pool_build_semaphore: Arc<tokio::sync::Semaphore>,
     engine_type: EngineType,
     translation_dialect: queryflux_core::query::SqlDialect,
 }
@@ -411,6 +428,10 @@ impl AdbcAdapter {
             base_uri,
             base_db_kwargs,
             identity_pools: Arc::new(DashMap::new()),
+            identity_pool_build_locks: Arc::new(DashMap::new()),
+            identity_pool_build_semaphore: Arc::new(tokio::sync::Semaphore::new(
+                IDENTITY_POOL_MAX_CONCURRENT_BUILDS,
+            )),
             engine_type,
             translation_dialect,
         })
@@ -430,15 +451,51 @@ impl AdbcAdapter {
     /// [`IDENTITY_POOL_BUILD_TIMEOUT`] — left unbounded, a slow or unreachable Snowflake
     /// OAuth endpoint would hang the query indefinitely instead of failing it.
     ///
-    /// Sweeps idle entries on every call (same pattern as
-    /// `BackendIdentityResolver::exchange_token`'s cache) rather than running a background
-    /// task — the map holds at most one entry per active user, so this stays cheap.
+    /// Concurrent cache misses for the *same* token are single-flighted through
+    /// `identity_pool_build_locks`: only the first caller actually builds; the rest wait on
+    /// the per-token lock and then hit the now-populated cache. Without this, a burst of
+    /// queries from one identity would each build (and all but one immediately discard) a
+    /// real Snowflake connection — wasted OAuth validation calls, not just wasted CPU.
+    /// `identity_pool_build_semaphore` additionally caps concurrent builds *across* distinct
+    /// tokens, since a timed-out build's `spawn_blocking` task keeps running rather than
+    /// being cancelled (see `IDENTITY_POOL_MAX_CONCURRENT_BUILDS`).
+    ///
+    /// Sweeps idle entries at the *start* of every call, before the cache-hit check —
+    /// sweeping only on the (rarer, in steady state) miss path would let an expired pool
+    /// stay reachable indefinitely as long as it kept getting cache hits.
     async fn identity_pool_for_token(&self, token: &str) -> Result<AdbcPool> {
         let now = std::time::Instant::now();
+        self.identity_pools
+            .retain(|_, e| now.duration_since(e.last_used) < IDENTITY_POOL_IDLE_TTL);
+
         if let Some(mut entry) = self.identity_pools.get_mut(token) {
             entry.last_used = now;
             return Ok(entry.pool.clone());
         }
+
+        let lock = self
+            .identity_pool_build_locks
+            .entry(token.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone();
+        let _build_guard = lock.lock().await;
+
+        // Re-check: another waiter may have just finished building this token's pool while
+        // we were waiting for the lock.
+        if let Some(mut entry) = self.identity_pools.get_mut(token) {
+            entry.last_used = std::time::Instant::now();
+            self.identity_pool_build_locks.remove(token);
+            return Ok(entry.pool.clone());
+        }
+
+        let permit = self
+            .identity_pool_build_semaphore
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|e| {
+                QueryFluxError::Engine(format!("identity pool build semaphore closed: {e}"))
+            })?;
 
         let driver_name = self.driver_name.clone();
         let mut driver = self.driver.clone();
@@ -448,6 +505,7 @@ impl AdbcAdapter {
         let token_owned = token.to_string();
 
         let build = tokio::task::spawn_blocking(move || -> Result<AdbcPool> {
+            let _permit = permit;
             let opts = oauth_token_options(&driver_name, &token_owned)?;
             let mut opts_with_uri = vec![(OptionDatabase::Uri, base_uri.into())];
             for (k, v) in &base_db_kwargs {
@@ -472,7 +530,7 @@ impl AdbcAdapter {
                 })
         });
 
-        let pool = tokio::time::timeout(IDENTITY_POOL_BUILD_TIMEOUT, build)
+        let result = tokio::time::timeout(IDENTITY_POOL_BUILD_TIMEOUT, build)
             .await
             .map_err(|_| {
                 QueryFluxError::Engine(format!(
@@ -482,29 +540,36 @@ impl AdbcAdapter {
                     self.cluster_name.0,
                     IDENTITY_POOL_BUILD_TIMEOUT.as_secs()
                 ))
-            })?
-            .map_err(|e| {
-                QueryFluxError::Engine(format!(
-                    "cluster '{}': per-identity ADBC connection task panicked: {e}",
-                    self.cluster_name.0
-                ))
-            })??;
+            })
+            .and_then(|joined| {
+                joined.map_err(|e| {
+                    QueryFluxError::Engine(format!(
+                        "cluster '{}': per-identity ADBC connection task panicked: {e}",
+                        self.cluster_name.0
+                    ))
+                })
+            })
+            .and_then(|built| built);
 
-        self.identity_pools.insert(
-            token.to_string(),
-            IdentityPoolEntry {
-                pool: pool.clone(),
-                last_used: now,
-            },
-        );
-        // Evict idle entries — bounds the map across a long-running process without a
-        // separate background task. O(n) in the number of distinct recent identities,
-        // which for a per-user OAuth pool is small.
-        let swept_at = std::time::Instant::now();
-        self.identity_pools
-            .retain(|_, e| swept_at.duration_since(e.last_used) < IDENTITY_POOL_IDLE_TTL);
+        // Populate the cache (on success) *before* releasing the single-flight lock, so a
+        // brand-new caller that arrives right after the lock is released is guaranteed to
+        // see the cache hit rather than racing to start a redundant build. Release the lock
+        // regardless of outcome — a build failure must not wedge every subsequent attempt
+        // for this token behind a lock nobody will ever release again (the `Arc<Mutex>`
+        // itself is dropped along with the map entry once every clone — including whichever
+        // waiters are still parked on `.lock().await` — has released it).
+        if let Ok(pool) = &result {
+            self.identity_pools.insert(
+                token.to_string(),
+                IdentityPoolEntry {
+                    pool: pool.clone(),
+                    last_used: std::time::Instant::now(),
+                },
+            );
+        }
+        self.identity_pool_build_locks.remove(token);
 
-        Ok(pool)
+        result
     }
 
     pub fn descriptor() -> EngineDescriptor {
