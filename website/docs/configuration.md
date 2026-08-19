@@ -58,6 +58,34 @@ routers:
 routingFallback: trino-default
 ```
 
+## Authentication, authorization & backend identity
+
+```yaml
+auth:
+  provider: oidc              # none | static | oidc | ldap
+  required: true
+  oidc:
+    issuer: https://keycloak.internal/realms/my-realm
+    jwksUri: https://keycloak.internal/realms/my-realm/protocol/openid-connect/certs
+    audience: queryflux
+
+authorization:
+  provider: none               # none | openfga
+
+clusters:
+  trino-1:
+    engine: trino
+    endpoint: https://trino.internal:8443
+    auth:                      # Type 1 — QueryFlux's own service credential
+      type: basic
+      username: qf_svc
+      password: "..."
+    queryAuth:
+      type: impersonate         # serviceAccount | passthrough | impersonate | tokenExchange
+```
+
+`auth` controls who can authenticate to QueryFlux; `authorization` controls which cluster groups they can route to; `clusters[].queryAuth` controls which identity the query runs as on the backend engine — independent of the client's own credential. See **[Authentication & identity](./authentication)** for the full picture, a decision guide for `queryAuth` modes, and per-engine setup requirements.
+
 ## Admin API
 
 ```yaml
