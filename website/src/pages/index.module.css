@@ -40,13 +40,6 @@ html[data-theme='dark'] .heroGlow {
   margin-right: auto;
 }
 
-.heroImage {
-  display: block;
-  width: min(100%, 920px);
-  height: auto;
-  margin: 0 auto 1.5rem;
-}
-
 .heroTitle {
   font-size: clamp(2.05rem, 4.4vw, 2.75rem);
   font-weight: 700;
@@ -167,9 +160,5 @@ html[data-theme='dark'] .ctaGhost:hover {
 @media screen and (max-width: 996px) {
   .hero {
     padding: 2.25rem 0 3rem;
-  }
-
-  .heroImage {
-    margin-bottom: 1.25rem;
   }
 }
