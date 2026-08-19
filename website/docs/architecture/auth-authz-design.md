@@ -86,10 +86,11 @@ clusters:
 | Engine | `serviceAccount` | `passthrough` | `impersonate` | `tokenExchange` |
 |--------|:---:|:---:|:---:|:---:|
 | Trino | ✅ | ✅ | ✅ `X-Trino-User` (needs Trino file-based ACL) | ✅ |
-| ClickHouse | ✅ | ❌ not yet wired | ❌ no trusted proxy mechanism | ❌ not yet wired |
+| ClickHouse | ✅ | ❌ not yet wired | ✅ `EXECUTE AS` (self-hosted 25.11+ only, see below) | ❌ not yet wired |
 | StarRocks (MySQL wire) | ✅ | ❌ no wire mechanism | ❌ no wire mechanism | ❌ no wire mechanism |
 | StarRocks (HTTP, future) | ✅ | — | — | — |
-| Snowflake / Databricks (ADBC, future) | ✅ | ❌ not yet wired | ❌ | ❌ not yet wired |
+| Snowflake (ADBC) | ✅ | ❌ not yet wired | ❌ | ✅ per-identity connection pool |
+| Databricks (ADBC, future) | ✅ | ❌ not yet wired | ❌ | ❌ not yet wired |
 | DuckDB | ✅ (no-op) | — | — | — |
 
 "Not yet wired" means the adapter does not yet consume `QueryCredentials` for that mode — startup validation rejects the config rather than silently accepting it and doing nothing. See the backend-identity plan for the phase that adds each one.
@@ -121,10 +122,12 @@ fn resolve(auth_ctx: &AuthContext, cluster: &ClusterConfig, type1: &ClusterAuth)
             // Use Type 1 credentials on the wire; inject user identity separately.
             // IMPORTANT: suppress the client's Authorization header — do NOT forward it.
             // Only Type 1 (service account) auth reaches the backend.
-            // User identity is injected via engine-specific header AFTER authentication.
+            // User identity is injected via an engine-specific mechanism AFTER
+            // authentication: Trino sets X-Trino-User; ClickHouse wraps the SQL as
+            // `EXECUTE AS {user} {sql}`.
             ImpersonateCreds {
                 service_auth: type1.clone(),  // resolved profile or cluster.auth
-                user: auth_ctx.user.clone(),    // injected as X-Trino-User (Trino only)
+                user: auth_ctx.user.clone(),
             }
 
         tokenExchange =>
@@ -524,11 +527,12 @@ Forward the client's own credential unchanged: the value already captured in `Se
 
 Startup validation rejects `passthrough` for engines whose adapters don't yet consume `QueryCredentials` — see the compatibility table above.
 
-### Mode: `impersonate` (Trino only)
+### Mode: `impersonate` (Trino, ClickHouse)
 
-Service account authenticates to the backend; user identity injected via `X-Trino-User` header.
+Service account authenticates to the backend; user identity injected via an engine-specific mechanism — a header for Trino, a SQL prefix for ClickHouse.
 
-**Authorization header handling:**
+**Trino:**
+
 1. Remove client's `Authorization` header from the outgoing request
 2. Apply `cluster.auth` (Type 1, Basic or Bearer) as the backend authentication
 3. Set `X-Trino-User: {auth_ctx.user}` header
@@ -544,7 +548,21 @@ http-server.access-control.config-files=/etc/trino/rules.json
 
 This is high operator burden. For OIDC deployments where Trino is configured with JWT auth pointing to the same IdP, prefer explicit `queryAuth: passthrough` over `impersonate` — omitting `queryAuth` relies on the deprecated implicit forwarding path (see above); new configs should never depend on it.
 
-**Only Trino supports `impersonate`.** ClickHouse's `X-ClickHouse-User` is an auth username requiring a matching password — it is not an impersonation header and has no trusted-proxy mechanism. StarRocks has no equivalent over MySQL wire. Startup validation rejects `impersonate` for any other engine type.
+**ClickHouse:**
+
+The adapter wraps the outgoing SQL as `EXECUTE AS {user} {sql}` — the service account (`cluster.auth`) still authenticates the HTTP request; `EXECUTE AS` re-scopes just that one query to run as `user`. Only safe for a single statement per request, which matches how QueryFlux's ClickHouse HTTP path already works.
+
+**ClickHouse-side requirements**, verified against the current upstream docs and changelog (not guessed):
+- **ClickHouse 25.11 or newer** — `EXECUTE AS` was added in that release ([`EXECUTE AS` documentation](https://clickhouse.com/docs/sql-reference/statements/execute_as), [25.11 release notes](https://clickhouse.com/blog/clickhouse-release-25-11)).
+- **Self-hosted only** — the current ClickHouse docs state `EXECUTE AS` is not supported on ClickHouse Cloud.
+- Server setting `access_control_improvements.allow_impersonate_user = 1`.
+- `GRANT IMPERSONATE ON {user} TO {service_account}` (or `GRANT IMPERSONATE ON * TO {service_account}` for all users).
+
+QueryFlux cannot verify any of these remotely at startup — an unsupported version, a Cloud endpoint, or a missing grant all surface as an ordinary ClickHouse query error at run time (not a startup failure), since `EXECUTE AS` is just SQL syntax as far as the adapter is concerned.
+
+**Cancelling an impersonated query needs `KILL QUERY` too.** `EXECUTE AS` re-scopes the query to run as `user`, so ClickHouse attributes it to `user`, not the service account. `cancel_query` issues `KILL QUERY WHERE query_id = …` using the service account's own connection (it doesn't re-apply per-query wire auth — there's nothing to re-apply for `impersonate`, since the identity is baked into the SQL text at submit time, not carried as a separate credential). By default, ClickHouse's `KILL QUERY` privilege only lets a user kill their *own* queries; killing a different user's requires the global `KILL QUERY` privilege, granted with `GRANT KILL QUERY ON *.* TO {service_account}`. Without it, cancelling an impersonated query fails server-side (`User {service_account} attempts to kill query created by {user}`) — caught by the existing best-effort cancel error handling (logged, ignored), so the query keeps running until it finishes on its own.
+
+**Only Trino and ClickHouse support `impersonate`.** StarRocks has no equivalent over MySQL wire (no trusted-proxy mechanism). Startup validation rejects `impersonate` for any other engine type.
 
 ### Mode: `tokenExchange` (Trino only in this release)
 
