@@ -5,7 +5,7 @@
 //! poll/cancel can re-apply the same credential). Kept out of any single adapter so the
 //! precedence rules stay identical across call sites instead of drifting.
 
-use queryflux_auth::QueryCredentials;
+use queryflux_auth::{AuthContext, QueryCredentials};
 use queryflux_core::query::StoredWireAuth;
 use queryflux_core::session::SessionContext;
 
@@ -55,6 +55,35 @@ pub fn resolve_stored_wire_auth(
         QueryCredentials::Bearer { token } => {
             Some(StoredWireAuth::Authorization(format!("Bearer {token}")))
         }
+    }
+}
+
+/// Best-effort passthrough enrichment: if `credentials` is `Passthrough` and the session
+/// doesn't already carry a forwardable `authorization` value (the frontend's own header,
+/// or one restored from a persisted queued session), inject `Bearer {raw_token}` when the
+/// caller authenticated via OIDC. No-op for every other credential mode, and a no-op when
+/// no `raw_token` is available — the adapter is responsible for failing closed on that.
+///
+/// Must run after `BackendIdentityResolver::resolve` (needs `credentials`) and before the
+/// adapter call (`session` must still be mutable at the call site). Shared by every
+/// dispatch path — the async Trino-HTTP path and the sync-bridge path used by Postgres/
+/// MySQL/Flight-wire frontends — so passthrough works the same way regardless of which
+/// frontend the query arrived on, as long as that frontend populates `raw_token`.
+pub fn enrich_session_for_passthrough(
+    session: &mut SessionContext,
+    credentials: &QueryCredentials,
+    auth_ctx: &AuthContext,
+) {
+    if !matches!(credentials, QueryCredentials::Passthrough) {
+        return;
+    }
+    if session.extra.contains_key("authorization") {
+        return;
+    }
+    if let Some(token) = &auth_ctx.raw_token {
+        session
+            .extra
+            .insert("authorization".to_string(), format!("Bearer {token}"));
     }
 }
 
@@ -138,5 +167,64 @@ mod tests {
             resolved,
             Some(StoredWireAuth::Authorization(v)) if v == "Bearer exchanged"
         ));
+    }
+
+    fn auth_ctx(raw_token: Option<&str>) -> AuthContext {
+        AuthContext {
+            user: "alice".to_string(),
+            groups: vec![],
+            roles: vec![],
+            raw_token: raw_token.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn enrich_injects_bearer_when_passthrough_and_no_header_and_raw_token_present() {
+        let mut session = session_with_auth(None);
+        enrich_session_for_passthrough(
+            &mut session,
+            &QueryCredentials::Passthrough,
+            &auth_ctx(Some("oidc-jwt")),
+        );
+        assert_eq!(
+            session.extra.get("authorization").map(String::as_str),
+            Some("Bearer oidc-jwt")
+        );
+    }
+
+    #[test]
+    fn enrich_does_not_overwrite_an_existing_authorization_header() {
+        let mut session = session_with_auth(Some("Bearer client-sent-token"));
+        enrich_session_for_passthrough(
+            &mut session,
+            &QueryCredentials::Passthrough,
+            &auth_ctx(Some("oidc-jwt")),
+        );
+        assert_eq!(
+            session.extra.get("authorization").map(String::as_str),
+            Some("Bearer client-sent-token")
+        );
+    }
+
+    #[test]
+    fn enrich_is_a_noop_without_a_raw_token() {
+        let mut session = session_with_auth(None);
+        enrich_session_for_passthrough(
+            &mut session,
+            &QueryCredentials::Passthrough,
+            &auth_ctx(None),
+        );
+        assert!(!session.extra.contains_key("authorization"));
+    }
+
+    #[test]
+    fn enrich_is_a_noop_for_non_passthrough_modes() {
+        let mut session = session_with_auth(None);
+        enrich_session_for_passthrough(
+            &mut session,
+            &QueryCredentials::ServiceAccount,
+            &auth_ctx(Some("oidc-jwt")),
+        );
+        assert!(!session.extra.contains_key("authorization"));
     }
 }
