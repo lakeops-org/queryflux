@@ -1,15 +1,13 @@
-//! Integration tests for `mysql_native::apply_passthrough_identity` (COM_CHANGE_USER)
-//! against a real MySQL-protocol server.
+//! Integration tests for `mysql_native::open_passthrough_connection` against a real
+//! MySQL-protocol server.
 //!
-//! These prove the actual, previously-unverified claim behind StarRocks `passthrough`:
-//! that `Conn::change_user()` re-authenticates an existing connection as a different user
-//! — with that user's real, distinct privileges enforced by the server — rather than just
-//! updating what `CURRENT_USER()` reports. StarRocks-specific behavior (the
-//! `authentication_ldap_simple` / `mysql_clear_password` plugin negotiation, TLS) isn't
-//! covered here — that needs a StarRocks+LDAP+TLS environment this crate doesn't provision.
-//! Plain MySQL already proves the generic mechanism: `change_user` + `continue_auth`
-//! correctly renegotiate authentication for a different identity, and privileges genuinely
-//! change with it.
+//! These prove the actual claim behind StarRocks `passthrough`: that a connection opened
+//! directly with the target user's credentials gets that user's real, distinct privileges
+//! enforced by the server. (An earlier design used `COM_CHANGE_USER` on a pooled
+//! connection instead — a live-StarRocks test caught a real `mysql_async` protocol bug in
+//! that path when it had to switch auth plugins mid-flight; see the doc comment on
+//! `open_passthrough_connection` for the full story. This file's tests were rewritten
+//! accordingly.)
 //!
 //! Requires a real MySQL server. All tests are `#[ignore]`d and skip gracefully if
 //! unreachable. Run with:
@@ -19,7 +17,6 @@
 //!     GRANT ALL PRIVILEGES ON *.* TO 'svc'@'%';
 //!     CREATE USER 'alice'@'%' IDENTIFIED BY 'alice-password';
 //!     GRANT SELECT ON *.* TO 'alice'@'%';
-//!     CREATE DATABASE IF NOT EXISTS passthrough_test;
 //!   SQL
 //!   MYSQL_TEST_URL=mysql://root:rootpass@127.0.0.1:13306 \
 //!     cargo test -p queryflux-engine-adapters --test mysql_native_passthrough -- --ignored
@@ -35,22 +32,27 @@ fn mysql_test_url() -> String {
         .unwrap_or_else(|_| "mysql://root:rootpass@127.0.0.1:13306".to_string())
 }
 
-fn opts_for(user: &str, pass: &str) -> Opts {
-    Opts::from(
-        OptsBuilder::from_opts(Opts::from_url(&mysql_test_url()).expect("valid test URL"))
-            .user(Some(user))
-            .pass(Some(pass)),
-    )
+/// `base_opts` mirrors what `StarRocksAdapter` stores: no user/pass baked in, so
+/// `open_passthrough_connection` can clone it and set its own.
+fn base_opts() -> Opts {
+    Opts::from(OptsBuilder::from_opts(
+        Opts::from_url(&mysql_test_url()).expect("valid test URL"),
+    ))
 }
 
-/// `svc` connects with root's own credentials — root created svc/alice with known
-/// passwords, so we connect back in as svc directly rather than reusing the root conn.
-async fn svc_conn() -> Option<mysql_async::Conn> {
-    match mysql_async::Conn::new(opts_for("svc", "svc-password")).await {
-        Ok(c) => Some(c),
+/// Reachability probe — connects as svc directly (not through `open_passthrough_connection`)
+/// just to decide whether to skip the suite.
+async fn mysql_reachable() -> bool {
+    let opts = Opts::from(
+        OptsBuilder::from_opts(base_opts())
+            .user(Some("svc"))
+            .pass(Some("svc-password")),
+    );
+    match mysql_async::Conn::new(opts).await {
+        Ok(_) => true,
         Err(e) => {
             eprintln!("SKIP: mysql_native_passthrough tests — MySQL not reachable or svc user not set up: {e}");
-            None
+            false
         }
     }
 }
@@ -74,53 +76,44 @@ async fn current_user(conn: &mut mysql_async::Conn) -> String {
 
 #[tokio::test]
 #[ignore = "requires a real MySQL server — see file header"]
-async fn com_change_user_reauthenticates_as_the_target_identity() {
-    let Some(mut conn) = svc_conn().await else {
+async fn passthrough_connection_authenticates_as_the_target_identity() {
+    if !mysql_reachable().await {
         return;
-    };
-    assert!(
-        current_user(&mut conn).await.starts_with("svc@"),
-        "baseline: connection should start out authenticated as svc"
-    );
+    }
 
-    queryflux_engine_adapters::mysql_native::apply_passthrough_identity(
-        &mut conn,
+    let mut conn = queryflux_engine_adapters::mysql_native::open_passthrough_connection(
+        &base_opts(),
         &QueryCredentials::Passthrough,
         &passthrough_session("alice", "alice-password"),
     )
     .await
-    .expect("COM_CHANGE_USER to alice should succeed");
+    .expect("open_passthrough_connection should succeed")
+    .expect("Passthrough credentials must yield Some(conn)");
 
     assert!(
         current_user(&mut conn).await.starts_with("alice@"),
-        "after COM_CHANGE_USER, the connection must report alice, not svc"
+        "the opened connection must be authenticated as alice, not the service account"
     );
 }
 
 #[tokio::test]
 #[ignore = "requires a real MySQL server — see file header"]
-async fn com_change_user_actually_changes_enforced_privileges_not_just_the_display_name() {
-    // This is the actual point of the feature: the backend must enforce alice's real
-    // grants, not just report her name while still running with svc's privileges.
-    let Some(mut conn) = svc_conn().await else {
+async fn passthrough_connection_privileges_are_actually_enforced_not_just_the_display_name() {
+    if !mysql_reachable().await {
         return;
-    };
+    }
 
-    // svc (ALL PRIVILEGES) can create a database.
-    conn.query_drop("CREATE DATABASE IF NOT EXISTS svc_only_db")
-        .await
-        .expect("svc should be able to create a database");
-
-    queryflux_engine_adapters::mysql_native::apply_passthrough_identity(
-        &mut conn,
+    let mut conn = queryflux_engine_adapters::mysql_native::open_passthrough_connection(
+        &base_opts(),
         &QueryCredentials::Passthrough,
         &passthrough_session("alice", "alice-password"),
     )
     .await
-    .expect("COM_CHANGE_USER to alice should succeed");
+    .expect("open_passthrough_connection should succeed")
+    .expect("Passthrough credentials must yield Some(conn)");
 
-    // alice (SELECT-only) must not be able to — if this succeeds, the connection is
-    // still effectively running as svc and the whole mechanism is a lie.
+    // alice (SELECT-only) must not be able to create a database — if this succeeds, the
+    // connection isn't really running with alice's privileges.
     let result = conn
         .query_drop("CREATE DATABASE IF NOT EXISTS alice_should_not_create_this")
         .await;
@@ -129,7 +122,6 @@ async fn com_change_user_actually_changes_enforced_privileges_not_just_the_displ
         "alice has SELECT-only privileges; CREATE DATABASE must be rejected by the server"
     );
 
-    // alice's actual allowed action still works on the same, re-authenticated connection.
     conn.query_drop("SELECT 1")
         .await
         .expect("alice should still be able to run a plain SELECT");
@@ -137,13 +129,13 @@ async fn com_change_user_actually_changes_enforced_privileges_not_just_the_displ
 
 #[tokio::test]
 #[ignore = "requires a real MySQL server — see file header"]
-async fn com_change_user_fails_closed_on_wrong_password() {
-    let Some(mut conn) = svc_conn().await else {
+async fn passthrough_connection_fails_closed_on_wrong_password() {
+    if !mysql_reachable().await {
         return;
-    };
+    }
 
-    let result = queryflux_engine_adapters::mysql_native::apply_passthrough_identity(
-        &mut conn,
+    let result = queryflux_engine_adapters::mysql_native::open_passthrough_connection(
+        &base_opts(),
         &QueryCredentials::Passthrough,
         &passthrough_session("alice", "definitely-the-wrong-password"),
     )
@@ -151,32 +143,31 @@ async fn com_change_user_fails_closed_on_wrong_password() {
 
     assert!(
         result.is_err(),
-        "COM_CHANGE_USER with the wrong password must fail, not silently authenticate"
+        "a wrong password must fail to open a connection, not silently authenticate"
     );
 }
 
 #[tokio::test]
 #[ignore = "requires a real MySQL server — see file header"]
-async fn service_account_credentials_never_trigger_change_user() {
-    let Some(mut conn) = svc_conn().await else {
+async fn service_account_credentials_never_open_a_passthrough_connection() {
+    if !mysql_reachable().await {
         return;
-    };
-    let before = current_user(&mut conn).await;
+    }
 
     // A session that happens to carry passthrough_* keys (e.g. left over from a prior
-    // passthrough query reusing the same SessionContext) must NOT trigger a user switch
-    // when credentials resolved to ServiceAccount for this particular query.
-    queryflux_engine_adapters::mysql_native::apply_passthrough_identity(
-        &mut conn,
+    // passthrough query reusing the same SessionContext) must NOT open a connection when
+    // credentials resolved to ServiceAccount for this particular query — the caller is
+    // expected to fall back to the shared pool instead.
+    let result = queryflux_engine_adapters::mysql_native::open_passthrough_connection(
+        &base_opts(),
         &QueryCredentials::ServiceAccount,
         &passthrough_session("alice", "alice-password"),
     )
     .await
-    .expect("ServiceAccount must be a no-op, never an error");
+    .expect("ServiceAccount must never error");
 
-    assert_eq!(
-        current_user(&mut conn).await,
-        before,
-        "ServiceAccount credentials must never change the connection's identity"
+    assert!(
+        result.is_none(),
+        "ServiceAccount credentials must resolve to None, not open a connection as alice"
     );
 }

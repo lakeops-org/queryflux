@@ -97,48 +97,60 @@ impl InflightConnGuard {
     }
 }
 
-/// Apply `queryAuth: passthrough` identity via `COM_CHANGE_USER`, using the LDAP-verified
-/// username/password `enrich_session_for_passthrough`
-/// (`queryflux_engine_adapters::wire_auth`) already put into `session.extra`. A no-op for
-/// every other `QueryCredentials` mode.
+/// For `queryAuth: passthrough`, open a **new** connection authenticated directly as the
+/// target user (`base_opts` with `user`/`pass` overridden from the LDAP-verified values
+/// `enrich_session_for_passthrough` — `queryflux_engine_adapters::wire_auth` — already put
+/// into `session.extra`). Returns `Ok(None)` for every other `QueryCredentials` mode, so the
+/// caller falls back to checking out a connection from the shared service-account pool.
 ///
 /// MySQL wire protocol authenticates the whole connection, not the individual query —
 /// there's no per-statement identity header like Trino's `X-Trino-User` or SQL prefix like
-/// ClickHouse's `EXECUTE AS`. `COM_CHANGE_USER` re-authenticates an existing connection as a
-/// different user instead of opening a new one — the same mechanism ProxySQL itself uses for
-/// per-user backend connections. Requires the pool's base `Opts` to already have
-/// `enable_cleartext_plugin(true)` set (StarRocks LDAP auth negotiates the standard
-/// `mysql_clear_password` plugin), which only happens when the cluster is confirmed to use
-/// TLS — see `StarRocksAdapter::new`.
+/// ClickHouse's `EXECUTE AS`.
 ///
-/// The re-authenticated connection is **never returned to the shared pool**: `mysql_async`
-/// detects the option change internally and evicts it (see `Conn::change_user` docs), so
-/// this trades connection reuse for correctness — every passthrough query pays a fresh
-/// `COM_CHANGE_USER` handshake, cheaper than a fresh TCP+TLS connection but not free. A
-/// small per-identity reuse cache (mirroring the ADBC/Snowflake sub-pool design) would be
-/// the next step if this becomes a bottleneck.
+/// **This used to be `COM_CHANGE_USER` on a pooled connection** — the mechanism ProxySQL
+/// itself uses for per-user backend connections, and cheaper in principle. A live-StarRocks
+/// integration test caught a real `mysql_async` bug in that path: when `COM_CHANGE_USER` has
+/// to switch auth plugins mid-flight (the pooled connection negotiated one plugin at its own
+/// handshake; the target user's `mysql_clear_password` — what StarRocks LDAP auth uses —
+/// differs), the call reports `Ok(())` but leaves the connection's packet sequence counter
+/// desynchronized: every query afterward fails with `packet out of order`. Reproduced with a
+/// minimal repro against real StarRocks; a target user needing the *same* plugin the pool
+/// already negotiated (verified with a plain-password StarRocks user) was unaffected — which
+/// is exactly why a change_user test against plain MySQL (`caching_sha2_password`
+/// throughout, no plugin switch ever needed) didn't catch it. A **fresh** connection
+/// authenticated directly as the target user has no such bug — confirmed against the same
+/// live server. Requires `base_opts` to already have `enable_cleartext_plugin(true)` set
+/// (only happens when the cluster is confirmed to use TLS — see `StarRocksAdapter::new`).
+///
+/// Cost: every passthrough query pays a fresh connection handshake instead of reusing a
+/// pooled one — in practice the same cost `COM_CHANGE_USER` already had, since a
+/// re-authenticated connection was never returned to the shared pool either (`mysql_async`
+/// evicts it once its options change). A small per-identity reuse cache (mirroring the
+/// ADBC/Snowflake sub-pool design) would be the next step if this becomes a bottleneck.
 ///
 /// Fails closed: `Passthrough` with no `passthrough_username`/`passthrough_password` in
 /// `session.extra` is an error, not a silent fall-through to the service account.
-pub async fn apply_passthrough_identity(
-    conn: &mut mysql_async::Conn,
+pub async fn open_passthrough_connection(
+    base_opts: &mysql_async::Opts,
     credentials: &QueryCredentials,
     session: &SessionContext,
-) -> Result<()> {
+) -> Result<Option<mysql_async::Conn>> {
     if !matches!(credentials, QueryCredentials::Passthrough) {
-        return Ok(());
+        return Ok(None);
     }
     let (username, password) = passthrough_credentials_from_session(session)?;
-    conn.change_user(
-        mysql_async::ChangeUserOpts::new()
-            .with_user(Some(username))
-            .with_pass(Some(password)),
-    )
-    .await
-    .map_err(|e| QueryFluxError::Auth(format!("mysql_native: COM_CHANGE_USER failed: {e}")))
+    let opts = mysql_async::Opts::from(
+        mysql_async::OptsBuilder::from_opts(base_opts.clone())
+            .user(Some(username))
+            .pass(Some(password)),
+    );
+    let conn = mysql_async::Conn::new(opts).await.map_err(|e| {
+        QueryFluxError::Auth(format!("mysql_native: passthrough connection failed: {e}"))
+    })?;
+    Ok(Some(conn))
 }
 
-/// Pure lookup half of [`apply_passthrough_identity`], split out so the fail-closed error
+/// Pure lookup half of [`open_passthrough_connection`], split out so the fail-closed error
 /// path is testable without a live MySQL connection.
 fn passthrough_credentials_from_session(session: &SessionContext) -> Result<(String, String)> {
     let missing = || {
@@ -169,6 +181,7 @@ fn passthrough_credentials_from_session(session: &SessionContext) -> Result<(Str
 #[allow(clippy::too_many_arguments)]
 pub async fn execute(
     pool: &Pool,
+    base_opts: &mysql_async::Opts,
     sql: &str,
     session: &SessionContext,
     credentials: &QueryCredentials,
@@ -177,11 +190,13 @@ pub async fn execute(
     id_slot: &BackendQueryIdSlot,
     inflight: &InflightConnIds,
 ) -> Result<NativeExecution> {
-    let mut conn = pool
-        .get_conn()
-        .await
-        .map_err(|e| QueryFluxError::Engine(format!("mysql_native: connection failed: {e}")))?;
-    apply_passthrough_identity(&mut conn, credentials, session).await?;
+    let mut conn = match open_passthrough_connection(base_opts, credentials, session).await? {
+        Some(conn) => conn,
+        None => pool
+            .get_conn()
+            .await
+            .map_err(|e| QueryFluxError::Engine(format!("mysql_native: connection failed: {e}")))?,
+    };
     let conn_id = conn.id();
     id_slot.publish(conn_id.to_string());
 

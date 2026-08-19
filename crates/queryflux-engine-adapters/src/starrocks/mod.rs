@@ -65,8 +65,10 @@ pub struct StarRocksConfig {
     pub endpoint: String,
     pub auth: Option<ClusterAuth>,
     pub pool_size: usize,
-    /// `passthrough` (LDAP `COM_CHANGE_USER`) or `None`/`serviceAccount` — `impersonate`/
-    /// `tokenExchange` are already rejected by `query_auth_supported` before construction.
+    /// `passthrough` (dedicated per-query LDAP connection — see
+    /// `mysql_native::open_passthrough_connection`) or `None`/`serviceAccount` —
+    /// `impersonate`/`tokenExchange` are already rejected by `query_auth_supported` before
+    /// construction.
     pub query_auth: Option<queryflux_core::config::QueryAuthConfig>,
 }
 
@@ -146,6 +148,10 @@ pub struct StarRocksAdapter {
     pool: Pool,
     /// Dedicated 1×1 pool for `health_check` so probes do not compete with query traffic.
     control_pool: Pool,
+    /// Base connection options (endpoint, TLS, `enable_cleartext_plugin`) with no user/pass
+    /// override — cloned and given a per-user `user`/`pass` by
+    /// `mysql_native::open_passthrough_connection` for `queryAuth: passthrough` queries.
+    base_opts: Opts,
     /// Connection ids that currently own an in-flight query. `cancel_query`
     /// skips `KILL QUERY` once the id is released (connection back in the pool).
     inflight: crate::mysql_native::InflightConnIds,
@@ -157,13 +163,14 @@ impl StarRocksAdapter {
         group_name: ClusterGroupName,
         config: StarRocksConfig,
     ) -> Result<Self> {
-        // `passthrough` re-authenticates connections mid-flight via COM_CHANGE_USER using a
-        // real StarRocks/LDAP password (see `mysql_native::apply_passthrough_identity`).
-        // That requires the `mysql_clear_password` plugin (StarRocks LDAP auth negotiates
-        // it), which sends the password with no hashing or encryption at the MySQL
-        // protocol layer — safe only over TLS. `enable_cleartext_plugin` is therefore
-        // gated on the endpoint already requesting TLS (`?require_ssl=true`), checked once
-        // below against the built `Opts`, not assumed.
+        // `passthrough` opens a dedicated connection per query authenticated directly as
+        // the target user, using a real StarRocks/LDAP password (see
+        // `mysql_native::open_passthrough_connection`). That requires the
+        // `mysql_clear_password` plugin (StarRocks LDAP auth negotiates it), which sends
+        // the password with no hashing or encryption at the MySQL protocol layer — safe
+        // only over TLS. `enable_cleartext_plugin` is therefore gated on the endpoint
+        // already requesting TLS (`?require_ssl=true`), checked once below against the
+        // built `Opts`, not assumed.
         let requires_passthrough = matches!(
             config.query_auth,
             Some(queryflux_core::config::QueryAuthConfig::Passthrough)
@@ -216,6 +223,7 @@ impl StarRocksAdapter {
                 cluster_name.0
             )));
         }
+        let base_opts = main_opts.clone();
         let pool = Pool::new(main_opts);
 
         let control_opts = Opts::from(make_builder()?.pool_opts(pool_opts_for(1)?));
@@ -226,6 +234,7 @@ impl StarRocksAdapter {
             group_name,
             pool,
             control_pool,
+            base_opts,
             inflight: crate::mysql_native::InflightConnIds::default(),
         })
     }
@@ -450,6 +459,7 @@ impl SyncAdapter for StarRocksAdapter {
     ) -> crate::Result<crate::NativeExecution> {
         crate::mysql_native::execute(
             &self.pool,
+            &self.base_opts,
             sql,
             session,
             credentials,
@@ -514,8 +524,8 @@ impl SyncAdapter for StarRocksAdapter {
     // `credentials` is `ServiceAccount` or `Passthrough` here — `query_auth_supported`
     // rejects `impersonate`/`tokenExchange` for StarRocks at startup (StarRocks' JWT MySQL
     // auth plugin is a separate, confirmed-infeasible path for `mysql_async` — see
-    // auth-authz-design.md "StarRocks"). `Passthrough` here means LDAP `COM_CHANGE_USER`,
-    // applied by `apply_passthrough_identity` below.
+    // auth-authz-design.md "StarRocks"). `Passthrough` here means a dedicated per-query
+    // LDAP connection, opened by `open_passthrough_connection` below.
     async fn execute_as_arrow(
         &self,
         sql: &str,
@@ -525,8 +535,16 @@ impl SyncAdapter for StarRocksAdapter {
         params: &queryflux_core::params::QueryParams,
         id_slot: &BackendQueryIdSlot,
     ) -> Result<SyncExecution> {
-        let mut conn = self.acquire_conn().await?;
-        crate::mysql_native::apply_passthrough_identity(&mut conn, credentials, session).await?;
+        let mut conn = match crate::mysql_native::open_passthrough_connection(
+            &self.base_opts,
+            credentials,
+            session,
+        )
+        .await?
+        {
+            Some(conn) => conn,
+            None => self.acquire_conn().await?,
+        };
         let conn_id = conn.id();
         id_slot.publish(conn_id.to_string());
 
