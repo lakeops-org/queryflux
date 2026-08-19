@@ -38,6 +38,11 @@ services:
       # token requested via localhost:8180 would carry an `iss` that config.yaml's
       # `auth.oidc.issuer: http://keycloak:8080/realms/queryflux` rejects.
       KC_HOSTNAME: http://keycloak:8080
+      # Split from KC_HOSTNAME on purpose: it fixes token issuers to the docker-network
+      # name, but the Admin Console is a browser UI the README has host users open at
+      # localhost:8180 — without this override, Keycloak would generate admin-console
+      # redirect/asset URLs using `keycloak:8080`, which a host browser cannot resolve.
+      KC_HOSTNAME_ADMIN: http://localhost:8180
     volumes:
       - ./keycloak-realm.json:/opt/keycloak/data/import/queryflux-realm.json:ro
     healthcheck:

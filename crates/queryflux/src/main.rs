@@ -1957,6 +1957,15 @@ fn unauthenticated_passthrough_clusters(
     ) {
         return Vec::new();
     }
+    // `build_authorization` still enforces a per-group SimpleAuthorizationPolicy when
+    // provider is `none` but any group declares an allow-list — mirror that check so this
+    // warning only fires on the genuinely allow-all case, not one that already has policy.
+    let has_any_policy = config.cluster_groups.values().any(|cfg| {
+        !cfg.authorization.allow_groups.is_empty() || !cfg.authorization.allow_users.is_empty()
+    });
+    if has_any_policy {
+        return Vec::new();
+    }
     config
         .clusters
         .iter()
@@ -3110,9 +3119,18 @@ mod tests {
         use serde_json::json;
 
         fn config(authorization_provider: &str, clusters: serde_json::Value) -> ProxyConfig {
+            config_with_groups(authorization_provider, clusters, json!({}))
+        }
+
+        fn config_with_groups(
+            authorization_provider: &str,
+            clusters: serde_json::Value,
+            cluster_groups: serde_json::Value,
+        ) -> ProxyConfig {
             serde_json::from_value(json!({
                 "queryflux": { "externalAddress": null },
                 "clusters": clusters,
+                "clusterGroups": cluster_groups,
                 "authorization": { "provider": authorization_provider },
             }))
             .expect("valid minimal ProxyConfig fixture")
@@ -3157,6 +3175,40 @@ mod tests {
                 }),
             );
             assert!(unauthenticated_passthrough_clusters(&cfg).is_empty());
+        }
+
+        #[test]
+        fn no_warning_when_a_group_allow_list_already_enforces_policy() {
+            // build_authorization treats provider:none + any group allow-list as an
+            // enforced SimpleAuthorizationPolicy, not allow-all — this check must agree,
+            // or the warning fires for deployments that already have the gap closed.
+            let cfg = config_with_groups(
+                "none",
+                passthrough_cluster(),
+                json!({
+                    "trino": {
+                        "members": ["trino-1"],
+                        "maxRunningQueries": 10,
+                        "authorization": { "allowGroups": ["data-team"] },
+                    }
+                }),
+            );
+            assert!(unauthenticated_passthrough_clusters(&cfg).is_empty());
+        }
+
+        #[test]
+        fn warns_when_groups_exist_but_none_declare_an_allow_list() {
+            let cfg = config_with_groups(
+                "none",
+                passthrough_cluster(),
+                json!({
+                    "trino": {
+                        "members": ["trino-1"],
+                        "maxRunningQueries": 10,
+                    }
+                }),
+            );
+            assert_eq!(unauthenticated_passthrough_clusters(&cfg), vec!["trino-1"]);
         }
     }
 

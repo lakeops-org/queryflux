@@ -1229,7 +1229,7 @@ async fn setup_sync_query(
     state: &Arc<AppState>,
     sql: String,
     params: QueryParams,
-    session: SessionContext,
+    mut session: SessionContext,
     protocol: FrontendProtocol,
     group: ClusterGroupName,
     auth_ctx: &AuthContext,
@@ -1419,10 +1419,27 @@ async fn setup_sync_query(
         }
     };
 
-    // Resolved the same way as the async dispatch path, so a disconnect mid-query
-    // cancels with the identity the query actually submitted under — not cluster auth —
-    // for passthrough/impersonate/tokenExchange queries reached via the sync bridge
-    // (Postgres/MySQL/Flight wire, or Trino's own `execute_as_arrow`).
+    // Same enrichment as the async dispatch path: forward the client's own Authorization
+    // if the frontend already captured one; otherwise inject a Bearer built from the OIDC
+    // raw_token so the backend still receives a per-user credential. Without this, an
+    // OIDC-authenticated sync request (Postgres/MySQL/Flight wire) with no original
+    // Authorization header would resolve to Passthrough, find nothing forwardable, and
+    // fail closed — even though a raw_token was available to build one from.
+    if matches!(credentials, QueryCredentials::Passthrough)
+        && !session.extra.contains_key("authorization")
+    {
+        if let Some(token) = &auth_ctx.raw_token {
+            session
+                .extra
+                .insert("authorization".to_string(), format!("Bearer {token}"));
+        }
+    }
+
+    // Resolved the same way as the async dispatch path (after enrichment, so passthrough
+    // benefits from it too), so a disconnect mid-query cancels with the identity the query
+    // actually submitted under — not cluster auth — for passthrough/impersonate/
+    // tokenExchange queries reached via the sync bridge (Postgres/MySQL/Flight wire, or
+    // Trino's own `execute_as_arrow`).
     let cluster_sets_http_auth = this_cluster_cfg
         .as_ref()
         .and_then(|c| c.auth.as_ref())
