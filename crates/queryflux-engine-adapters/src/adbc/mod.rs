@@ -290,6 +290,10 @@ const IDENTITY_POOL_MAX_SIZE: u32 = 2;
 /// outlives the token it was built for by much.
 const IDENTITY_POOL_IDLE_TTL: std::time::Duration = std::time::Duration::from_secs(15 * 60);
 
+/// Bound on building a per-identity `ManagedDatabase` (the driver FFI call that can involve
+/// real OAuth token validation) — see `AdbcAdapter::identity_pool_for_token`.
+const IDENTITY_POOL_BUILD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Per-driver OAuth connection-option keys for `tokenExchange`. Only `snowflake` is wired in
 /// this release — must stay in sync with `ADBC_TOKEN_EXCHANGE_DRIVERS` in
 /// `queryflux_core::config`, which is what actually gates which clusters can reach this code
@@ -413,44 +417,78 @@ impl AdbcAdapter {
     }
 
     /// Return the small per-identity pool for `token`, building (and caching) it on first
-    /// use. Runs synchronously — call from a blocking context (`execute_as_arrow` already
-    /// dispatches into `spawn_blocking` for every query, so this rides along on that same
-    /// thread rather than needing its own).
+    /// use.
+    ///
+    /// The cache-hit path is a cheap `DashMap` lookup, safe to call directly from async
+    /// context. The cache-miss path calls the driver FFI (`new_database_with_opts`) — a
+    /// genuinely blocking call (Snowflake's driver validates the OAuth token, which can
+    /// mean real network I/O), so it runs inside `spawn_blocking` rather than directly on
+    /// the async executor — an earlier version of this comment claimed it "rides along" on
+    /// `execute_as_arrow`'s own `spawn_blocking`, which was wrong: this is called *before*
+    /// that, so without its own `spawn_blocking` it would have blocked whatever tokio
+    /// worker thread happened to be running the query. Also bounded by
+    /// [`IDENTITY_POOL_BUILD_TIMEOUT`] — left unbounded, a slow or unreachable Snowflake
+    /// OAuth endpoint would hang the query indefinitely instead of failing it.
     ///
     /// Sweeps idle entries on every call (same pattern as
     /// `BackendIdentityResolver::exchange_token`'s cache) rather than running a background
     /// task — the map holds at most one entry per active user, so this stays cheap.
-    fn identity_pool_for_token(&self, token: &str) -> Result<AdbcPool> {
+    async fn identity_pool_for_token(&self, token: &str) -> Result<AdbcPool> {
         let now = std::time::Instant::now();
         if let Some(mut entry) = self.identity_pools.get_mut(token) {
             entry.last_used = now;
             return Ok(entry.pool.clone());
         }
 
-        let opts = oauth_token_options(&self.driver_name, token)?;
-        let mut opts_with_uri = vec![(OptionDatabase::Uri, self.base_uri.clone().into())];
-        for (k, v) in &self.base_db_kwargs {
-            opts_with_uri.push((OptionDatabase::Other(k.clone()), v.clone().into()));
-        }
-        opts_with_uri.extend(opts);
-
+        let driver_name = self.driver_name.clone();
         let mut driver = self.driver.clone();
-        let database = driver.new_database_with_opts(opts_with_uri).map_err(|e| {
-            QueryFluxError::Engine(format!(
-                "cluster '{}': failed to create per-identity ADBC database: {e}",
-                self.cluster_name.0
-            ))
-        })?;
-        let manager = AdbcConnectionManager::new(database);
-        let pool = r2d2::Pool::builder()
-            .max_size(IDENTITY_POOL_MAX_SIZE)
-            .build(manager)
-            .map_err(|e| {
+        let base_uri = self.base_uri.clone();
+        let base_db_kwargs = self.base_db_kwargs.clone();
+        let cluster_name = self.cluster_name.0.clone();
+        let token_owned = token.to_string();
+
+        let build = tokio::task::spawn_blocking(move || -> Result<AdbcPool> {
+            let opts = oauth_token_options(&driver_name, &token_owned)?;
+            let mut opts_with_uri = vec![(OptionDatabase::Uri, base_uri.into())];
+            for (k, v) in &base_db_kwargs {
+                opts_with_uri.push((OptionDatabase::Other(k.clone()), v.clone().into()));
+            }
+            opts_with_uri.extend(opts);
+
+            let database = driver.new_database_with_opts(opts_with_uri).map_err(|e| {
                 QueryFluxError::Engine(format!(
-                    "cluster '{}': failed to create per-identity ADBC connection pool: {e}",
-                    self.cluster_name.0
+                    "cluster '{cluster_name}': failed to create per-identity ADBC database: {e}"
                 ))
             })?;
+            let manager = AdbcConnectionManager::new(database);
+            r2d2::Pool::builder()
+                .max_size(IDENTITY_POOL_MAX_SIZE)
+                .build(manager)
+                .map_err(|e| {
+                    QueryFluxError::Engine(format!(
+                        "cluster '{cluster_name}': failed to create per-identity ADBC \
+                         connection pool: {e}"
+                    ))
+                })
+        });
+
+        let pool = tokio::time::timeout(IDENTITY_POOL_BUILD_TIMEOUT, build)
+            .await
+            .map_err(|_| {
+                QueryFluxError::Engine(format!(
+                    "cluster '{}': building a per-identity ADBC connection timed out after \
+                     {}s (the OAuth token validation may be slow or the identity backend \
+                     unreachable)",
+                    self.cluster_name.0,
+                    IDENTITY_POOL_BUILD_TIMEOUT.as_secs()
+                ))
+            })?
+            .map_err(|e| {
+                QueryFluxError::Engine(format!(
+                    "cluster '{}': per-identity ADBC connection task panicked: {e}",
+                    self.cluster_name.0
+                ))
+            })??;
 
         self.identity_pools.insert(
             token.to_string(),
@@ -462,8 +500,9 @@ impl AdbcAdapter {
         // Evict idle entries — bounds the map across a long-running process without a
         // separate background task. O(n) in the number of distinct recent identities,
         // which for a per-user OAuth pool is small.
+        let swept_at = std::time::Instant::now();
         self.identity_pools
-            .retain(|_, e| now.duration_since(e.last_used) < IDENTITY_POOL_IDLE_TTL);
+            .retain(|_, e| swept_at.duration_since(e.last_used) < IDENTITY_POOL_IDLE_TTL);
 
         Ok(pool)
     }
@@ -629,13 +668,11 @@ impl SyncAdapter for AdbcAdapter {
         // adapter — startup validation (`query_auth_supported`) rejects `passthrough`/
         // `impersonate` for every ADBC driver, so `tokenExchange` (resolved to `Bearer`) is
         // the only other case to handle here. `identity_pool_for_token` is a cheap DashMap
-        // lookup on cache hits; the miss path calls the driver FFI to build a new database,
-        // which can block, but that only happens once per user per token-cache window, so
-        // it's run inline on the async executor rather than adding a second spawn_blocking
-        // just for this rare path.
+        // lookup on cache hits; the miss path runs the blocking driver FFI call inside its
+        // own `spawn_blocking` with a timeout, not inline here.
         let pool = match credentials {
             queryflux_auth::QueryCredentials::Bearer { token } => {
-                self.identity_pool_for_token(token)?
+                self.identity_pool_for_token(token).await?
             }
             _ => self.pool.clone(),
         };
