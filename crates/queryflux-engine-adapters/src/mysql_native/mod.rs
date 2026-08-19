@@ -30,6 +30,10 @@ use crate::{BackendQueryIdSlot, NativeExecution};
 /// Number of rows per `NativeResultChunk`. Balances channel overhead vs. memory.
 const BATCH_SIZE: usize = 1_000;
 
+/// Bound on opening a `queryAuth: passthrough` connection — see
+/// [`open_passthrough_connection`].
+const PASSTHROUGH_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Pooled MySQL connection ids that currently own an in-flight query.
 ///
 /// `KILL QUERY <connection_id>` is only safe while this set contains the id.
@@ -130,6 +134,12 @@ impl InflightConnGuard {
 ///
 /// Fails closed: `Passthrough` with no `passthrough_username`/`passthrough_password` in
 /// `session.extra` is an error, not a silent fall-through to the service account.
+///
+/// Bounded by [`PASSTHROUGH_CONNECT_TIMEOUT`] — unlike the shared pool (whose checkout is
+/// already timeout-wrapped by each adapter, e.g. `StarRocksAdapter::acquire_conn`), nothing
+/// else protects this call. Left unbounded, a slow or unreachable identity backend on the
+/// server side (StarRocks' LDAP bind happens FE-side during the handshake this call
+/// performs) would hang the query indefinitely instead of failing it.
 pub async fn open_passthrough_connection(
     base_opts: &mysql_async::Opts,
     credentials: &QueryCredentials,
@@ -144,9 +154,18 @@ pub async fn open_passthrough_connection(
             .user(Some(username))
             .pass(Some(password)),
     );
-    let conn = mysql_async::Conn::new(opts).await.map_err(|e| {
-        QueryFluxError::Auth(format!("mysql_native: passthrough connection failed: {e}"))
-    })?;
+    let conn = tokio::time::timeout(PASSTHROUGH_CONNECT_TIMEOUT, mysql_async::Conn::new(opts))
+        .await
+        .map_err(|_| {
+            QueryFluxError::Auth(format!(
+                "mysql_native: passthrough connection timed out after {}s (the target \
+                 user's identity backend — e.g. LDAP — may be slow or unreachable)",
+                PASSTHROUGH_CONNECT_TIMEOUT.as_secs()
+            ))
+        })?
+        .map_err(|e| {
+            QueryFluxError::Auth(format!("mysql_native: passthrough connection failed: {e}"))
+        })?;
     Ok(Some(conn))
 }
 
@@ -453,6 +472,61 @@ mod tests {
             extra,
             ..Default::default()
         }
+    }
+
+    // ── open_passthrough_connection timeout ───────────────────────────────────
+
+    /// Proves `PASSTHROUGH_CONNECT_TIMEOUT` actually bounds the call, rather than trusting
+    /// that wrapping it in `tokio::time::timeout` was wired correctly. A raw listener that
+    /// accepts the TCP connection but never sends the MySQL handshake simulates a hung
+    /// identity backend (e.g. StarRocks blocked on a slow LDAP bind) — without this test,
+    /// this exact class of gap (a genuinely blocking/hanging call left unbounded) is what
+    /// slipped through review earlier in this same file's history.
+    ///
+    /// Slow by design (~`PASSTHROUGH_CONNECT_TIMEOUT`, currently 10s) — bounded from above
+    /// by an outer test-level timeout so a regression hangs the test suite for a fixed
+    /// window instead of forever.
+    #[tokio::test]
+    async fn open_passthrough_connection_times_out_on_a_hung_server() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            // Accept and hold the connection open, but never write the MySQL handshake —
+            // the client will sit waiting for server greeting bytes that never arrive.
+            if let Ok((socket, _)) = listener.accept().await {
+                std::future::pending::<()>().await;
+                drop(socket);
+            }
+        });
+
+        let base_opts = mysql_async::Opts::from(
+            mysql_async::OptsBuilder::default()
+                .ip_or_hostname(addr.ip().to_string())
+                .tcp_port(addr.port()),
+        );
+        let session = session_with(&[
+            ("passthrough_username", "alice"),
+            ("passthrough_password", "alice-password"),
+        ]);
+
+        let started = std::time::Instant::now();
+        let result = tokio::time::timeout(
+            PASSTHROUGH_CONNECT_TIMEOUT + std::time::Duration::from_secs(5),
+            open_passthrough_connection(&base_opts, &QueryCredentials::Passthrough, &session),
+        )
+        .await
+        .expect("open_passthrough_connection itself must return well within the outer bound — if this fires, the inner timeout isn't bounding the call at all");
+
+        assert!(
+            result.is_err(),
+            "a hung server must surface as an error, not a successful connection"
+        );
+        assert!(
+            started.elapsed() >= PASSTHROUGH_CONNECT_TIMEOUT,
+            "should not return before the configured timeout elapses"
+        );
     }
 
     #[test]
