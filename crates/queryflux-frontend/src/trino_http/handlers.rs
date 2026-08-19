@@ -1209,7 +1209,10 @@ pub async fn get_executing_statement(
     };
     let submit_was_guard_blocked = executing.was_guard_blocked;
 
-    let poll_result = match adapter.poll_query(&backend_id, Some(&trino_url)).await {
+    let poll_result = match adapter
+        .poll_query(&backend_id, Some(&trino_url), executing.wire_auth.as_ref())
+        .await
+    {
         Ok(r) => r,
         Err(e) => {
             if e.is_transient() {
@@ -1423,7 +1426,10 @@ pub async fn delete_executing_statement(
         return (StatusCode::BAD_GATEWAY, "failed to cancel query on backend").into_response();
     };
 
-    if let Err(e) = adapter.cancel_query(&executing.backend_query_id).await {
+    if let Err(e) = adapter
+        .cancel_query(&executing.backend_query_id, executing.wire_auth.as_ref())
+        .await
+    {
         warn!(
             id = %executing.id,
             backend = %executing.backend_query_id,
@@ -1523,11 +1529,16 @@ mod cancel_executing_statement_tests {
             &self,
             _backend_id: &BackendQueryId,
             _poll_token: Option<&str>,
+            _wire_auth: Option<&queryflux_core::query::StoredWireAuth>,
         ) -> Result<QueryPollResult> {
             Err(QueryFluxError::Engine("not used in cancel tests".into()))
         }
 
-        async fn cancel_query(&self, _backend_id: &BackendQueryId) -> Result<()> {
+        async fn cancel_query(
+            &self,
+            _backend_id: &BackendQueryId,
+            _wire_auth: Option<&queryflux_core::query::StoredWireAuth>,
+        ) -> Result<()> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             if self.fail {
                 Err(QueryFluxError::Engine("cancel rejected".into()))
@@ -1657,6 +1668,7 @@ mod cancel_executing_statement_tests {
             submitted_guard_actions: vec![],
             was_guard_blocked: false,
             submitted_by: "anonymous".into(),
+            wire_auth: None,
         };
         state
             .persistence

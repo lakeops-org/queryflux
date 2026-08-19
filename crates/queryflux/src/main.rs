@@ -700,26 +700,62 @@ async fn main() -> Result<()> {
         }
     }
 
-    // --- Startup validation: impersonate only valid for Trino ---
+    // --- Startup validation: engine × queryAuth support matrix ---
+    // Centralized in `query_auth_supported` so YAML load, Studio PUT, and this check can't
+    // drift apart. `passthrough`/`impersonate`/`tokenExchange` are Trino-only in this
+    // release — every other adapter still ignores `QueryCredentials`.
     for (name, cfg) in &config.clusters {
-        if matches!(
-            cfg.query_auth,
-            Some(queryflux_core::config::QueryAuthConfig::Impersonate)
-        ) {
-            let engine = cfg
-                .engine
-                .as_ref()
-                .map(|e| format!("{e:?}"))
-                .unwrap_or_default();
-            if !matches!(
-                cfg.engine,
-                Some(queryflux_core::config::EngineConfig::Trino)
-            ) {
-                anyhow::bail!(
-                    "cluster '{name}': queryAuth.type = impersonate is only supported for Trino, got {engine}"
-                );
+        if let Some(mode) = &cfg.query_auth {
+            if let Err(msg) =
+                queryflux_core::config::query_auth_supported(cfg.engine.as_ref(), mode)
+            {
+                anyhow::bail!("cluster '{name}': {msg}");
             }
         }
+    }
+
+    // Deprecation warning: a cluster with no explicit `queryAuth` (or `serviceAccount`) and
+    // no HTTP-setting cluster auth still implicitly forwards the client's own Authorization
+    // header today, for backward compatibility. Operators should migrate to an explicit
+    // `queryAuth: passthrough` — this fallback may be removed in a future release.
+    for (name, cfg) in &config.clusters {
+        let is_implicit_passthrough_eligible = matches!(
+            cfg.query_auth,
+            None | Some(queryflux_core::config::QueryAuthConfig::ServiceAccount)
+        ) && matches!(
+            cfg.engine,
+            Some(queryflux_core::config::EngineConfig::Trino)
+        ) && !cfg
+            .auth
+            .as_ref()
+            .is_some_and(|a| a.sets_http_authorization());
+        if is_implicit_passthrough_eligible {
+            tracing::warn!(
+                "DEPRECATED: cluster '{name}' has no HTTP cluster auth and no explicit \
+                 queryAuth — it still implicitly forwards the client's Authorization header \
+                 (legacy behavior). Set queryAuth.type: passthrough explicitly; the implicit \
+                 fallback may be removed in a future release."
+            );
+        }
+    }
+
+    // Startup warning: with no gateway-level authorization policy, `passthrough` forwards
+    // whatever the client sent straight to the backend. The gap exists regardless of how
+    // many cluster groups there are — a single-group deployment is the common default, so
+    // gating on `cluster_groups.len() > 1` hid the warning for exactly the most likely
+    // misconfiguration. Group count only changes the blast radius, not whether the gap
+    // exists, so it's now informational in the message rather than a gate.
+    let passthrough_clusters = unauthenticated_passthrough_clusters(&config);
+    if !passthrough_clusters.is_empty() {
+        tracing::warn!(
+            clusters = ?passthrough_clusters,
+            "SECURITY: authorization.provider is 'none' and queryAuth: passthrough is set \
+             on {} cluster(s) across {} cluster group(s) — QueryFlux is not enforcing any \
+             access policy, so a client's own credential decides what it can reach on \
+             every group it can route to. Configure authorization or narrow routing.",
+            passthrough_clusters.len(),
+            config.cluster_groups.len()
+        );
     }
 
     let identity_resolver = Arc::new(BackendIdentityResolver::new());
@@ -1253,6 +1289,7 @@ async fn main() -> Result<()> {
                         // (same path as client/admin cancel). The previous unauthenticated
                         // DELETE on `/v1/statement/executing/...` did not stop secured Trino.
                         let backend_id = q.backend_query_id.clone();
+                        let wire_auth = q.wire_auth.clone();
                         let cluster = q.cluster_name.0.clone();
                         let (engine_type, tgt_dialect) =
                             if let Some(adapter) = state.adapter(&cluster).await {
@@ -1269,7 +1306,9 @@ async fn main() -> Result<()> {
                         );
                         if let Some(adapter) = state.adapter(&cluster).await {
                             tokio::spawn(async move {
-                                if let Err(e) = adapter.cancel_query(&backend_id).await {
+                                if let Err(e) =
+                                    adapter.cancel_query(&backend_id, wire_auth.as_ref()).await
+                                {
                                     tracing::debug!(
                                         "Zombie cancel request failed (best-effort): {e}"
                                     );
@@ -1903,6 +1942,42 @@ type GroupStatesMap = HashMap<
         Arc<dyn queryflux_cluster_manager::strategy::ClusterSelectionStrategy>,
     ),
 >;
+
+/// Clusters with `queryAuth: passthrough` when `authorization.provider` is `none` — the
+/// gateway enforces no access policy, so a client's own credential decides what it can
+/// reach. Returned regardless of `cluster_groups.len()`: a single-group deployment (the
+/// common default) has this gap just as much as a multi-group one, it's just narrower in
+/// blast radius, which is why the caller reports the group count rather than gating on it.
+fn unauthenticated_passthrough_clusters(
+    config: &queryflux_core::config::ProxyConfig,
+) -> Vec<&String> {
+    if !matches!(
+        config.authorization.provider,
+        queryflux_core::config::AuthorizationProviderConfig::None
+    ) {
+        return Vec::new();
+    }
+    // `build_authorization` still enforces a per-group SimpleAuthorizationPolicy when
+    // provider is `none` but any group declares an allow-list — mirror that check so this
+    // warning only fires on the genuinely allow-all case, not one that already has policy.
+    let has_any_policy = config.cluster_groups.values().any(|cfg| {
+        !cfg.authorization.allow_groups.is_empty() || !cfg.authorization.allow_users.is_empty()
+    });
+    if has_any_policy {
+        return Vec::new();
+    }
+    config
+        .clusters
+        .iter()
+        .filter(|(_, cfg)| {
+            matches!(
+                cfg.query_auth,
+                Some(queryflux_core::config::QueryAuthConfig::Passthrough)
+            )
+        })
+        .map(|(name, _)| name)
+        .collect()
+}
 
 /// Convert optional Postgres `BIGINT` (`max_running_queries`) to `Option<u64>`.
 /// Negative values fail fast (invalid row).
@@ -3038,6 +3113,105 @@ fn in_memory_metrics(
 
 #[cfg(test)]
 mod tests {
+    mod unauthenticated_passthrough_warning {
+        use super::super::unauthenticated_passthrough_clusters;
+        use queryflux_core::config::ProxyConfig;
+        use serde_json::json;
+
+        fn config(authorization_provider: &str, clusters: serde_json::Value) -> ProxyConfig {
+            config_with_groups(authorization_provider, clusters, json!({}))
+        }
+
+        fn config_with_groups(
+            authorization_provider: &str,
+            clusters: serde_json::Value,
+            cluster_groups: serde_json::Value,
+        ) -> ProxyConfig {
+            serde_json::from_value(json!({
+                "queryflux": { "externalAddress": null },
+                "clusters": clusters,
+                "clusterGroups": cluster_groups,
+                "authorization": { "provider": authorization_provider },
+            }))
+            .expect("valid minimal ProxyConfig fixture")
+        }
+
+        fn passthrough_cluster() -> serde_json::Value {
+            json!({
+                "trino-1": {
+                    "engine": "trino",
+                    "endpoint": "http://trino:8080",
+                    "queryAuth": { "type": "passthrough" },
+                }
+            })
+        }
+
+        #[test]
+        fn warns_even_with_a_single_cluster_group() {
+            // Regression: this used to be gated on `cluster_groups.len() > 1`, hiding the
+            // warning for the common single-group default — exactly the most likely
+            // deployment to have this gap.
+            let cfg = config("none", passthrough_cluster());
+            assert_eq!(cfg.cluster_groups.len(), 0);
+            let flagged = unauthenticated_passthrough_clusters(&cfg);
+            assert_eq!(flagged, vec!["trino-1"]);
+        }
+
+        #[test]
+        fn no_warning_when_authorization_is_configured() {
+            let cfg = config("openfga", passthrough_cluster());
+            assert!(unauthenticated_passthrough_clusters(&cfg).is_empty());
+        }
+
+        #[test]
+        fn no_warning_without_any_passthrough_cluster() {
+            let cfg = config(
+                "none",
+                json!({
+                    "trino-1": {
+                        "engine": "trino",
+                        "endpoint": "http://trino:8080",
+                    }
+                }),
+            );
+            assert!(unauthenticated_passthrough_clusters(&cfg).is_empty());
+        }
+
+        #[test]
+        fn no_warning_when_a_group_allow_list_already_enforces_policy() {
+            // build_authorization treats provider:none + any group allow-list as an
+            // enforced SimpleAuthorizationPolicy, not allow-all — this check must agree,
+            // or the warning fires for deployments that already have the gap closed.
+            let cfg = config_with_groups(
+                "none",
+                passthrough_cluster(),
+                json!({
+                    "trino": {
+                        "members": ["trino-1"],
+                        "maxRunningQueries": 10,
+                        "authorization": { "allowGroups": ["data-team"] },
+                    }
+                }),
+            );
+            assert!(unauthenticated_passthrough_clusters(&cfg).is_empty());
+        }
+
+        #[test]
+        fn warns_when_groups_exist_but_none_declare_an_allow_list() {
+            let cfg = config_with_groups(
+                "none",
+                passthrough_cluster(),
+                json!({
+                    "trino": {
+                        "members": ["trino-1"],
+                        "maxRunningQueries": 10,
+                    }
+                }),
+            );
+            assert_eq!(unauthenticated_passthrough_clusters(&cfg), vec!["trino-1"]);
+        }
+    }
+
     mod guard_chains {
         use std::collections::HashMap;
 

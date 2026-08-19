@@ -1199,7 +1199,10 @@ async fn cancel_executing(
         )
             .into_response();
     };
-    if let Err(e) = adapter.cancel_query(&executing.backend_query_id).await {
+    if let Err(e) = adapter
+        .cancel_query(&executing.backend_query_id, executing.wire_auth.as_ref())
+        .await
+    {
         warn!(
             id = %executing.id,
             backend = %executing.backend_query_id,
@@ -1672,6 +1675,21 @@ async fn get_cluster_config_handler(
     }
 }
 
+/// Mirrors the startup validation in `main.rs` for clusters loaded from YAML — the
+/// engine × `queryAuth` matrix must reject the same combinations here, at the moment an
+/// operator saves them through Studio, not only at the next process restart.
+fn validate_query_auth_for_upsert(body: &UpsertClusterConfig) -> std::result::Result<(), String> {
+    let engine = queryflux_core::engine_registry::parse_engine_key(&body.engine_key)
+        .map_err(|e| e.to_string())?;
+    let query_auth =
+        queryflux_core::engine_registry::parse_query_auth_from_config_json(&body.config)
+            .map_err(|e| e.to_string())?;
+    if let Some(mode) = &query_auth {
+        queryflux_core::config::query_auth_supported(Some(&engine), mode)?;
+    }
+    Ok(())
+}
+
 /// Create or fully replace a cluster configuration.
 #[utoipa::path(
     put,
@@ -1691,6 +1709,9 @@ async fn upsert_cluster_config_handler(
     Json(body): Json<UpsertClusterConfig>,
 ) -> impl IntoResponse {
     let pg = require_store!(state);
+    if let Err(e) = validate_query_auth_for_upsert(&body) {
+        return (StatusCode::BAD_REQUEST, e).into_response();
+    }
     match pg.upsert_cluster_config(&name, &body).await {
         Ok(r) => {
             notify_live_config_reload(&state);
@@ -2748,6 +2769,7 @@ mod tests {
                 submitted_guard_actions: vec![],
                 was_guard_blocked: false,
                 submitted_by: "alice".into(),
+                wire_auth: None,
             })
             .await
             .unwrap();

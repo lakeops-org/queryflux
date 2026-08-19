@@ -574,6 +574,7 @@ mod record_terminal_tests {
             submitted_guard_actions: vec![],
             was_guard_blocked: false,
             submitted_by: "bob".into(),
+            wire_auth: None,
         };
         state.record_executing_cancelled(
             &executing,

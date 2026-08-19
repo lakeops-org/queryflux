@@ -1096,7 +1096,7 @@ pub enum EngineConfig {
     Adbc,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ClusterConfig {
     pub engine: Option<EngineConfig>,
@@ -1191,6 +1191,16 @@ pub enum ClusterAuth {
     },
 }
 
+impl ClusterAuth {
+    /// True when this auth type sets the HTTP `Authorization` header itself (Basic/Bearer).
+    /// `AccessKey`/`KeyPair`/`RoleArn` do not set that header, so a client's own
+    /// `Authorization` may still need to be forwarded under `serviceAccount` for
+    /// backward compatibility with today's implicit passthrough behavior.
+    pub fn sets_http_authorization(&self) -> bool {
+        matches!(self, ClusterAuth::Basic { .. } | ClusterAuth::Bearer { .. })
+    }
+}
+
 /// How QueryFlux authenticates a specific user's query to this backend cluster (Type 2).
 ///
 /// Resolved per-request from `AuthContext` + this config. Default when omitted: `serviceAccount`.
@@ -1201,15 +1211,59 @@ pub enum QueryAuthConfig {
     /// User identity is known to QueryFlux (audit/metrics) but backend sees only the service account.
     #[serde(rename = "serviceAccount")]
     ServiceAccount,
+    /// Forward the client's own credential (Bearer/Basic) to the backend unchanged — the
+    /// backend authenticates the user's own token, not a QueryFlux-vouched identity.
+    /// **Trino only in this release** — startup validation rejects this for other engines
+    /// until their adapters are wired (see `query_auth_supported`).
+    #[serde(rename = "passthrough")]
+    Passthrough,
     /// Service account authenticates to the backend; user identity injected via `X-Trino-User`.
     /// **Trino only** — startup validation rejects this for other engines.
     #[serde(rename = "impersonate")]
     Impersonate,
-    /// Exchange the user's OIDC JWT for a backend-scoped OAuth token.
+    /// Exchange the user's OIDC JWT (RFC 8693) for a backend-scoped OAuth token.
     /// Requires `OidcAuthProvider` on the frontend (so `raw_token` is populated).
-    /// Falls back to `serviceAccount` when `raw_token` is absent.
+    /// **Fails closed**: if `raw_token` is absent or the exchange fails, the query is
+    /// rejected with an auth error — it never silently falls back to `serviceAccount`,
+    /// since that would submit the query under the wrong principal.
+    /// **Trino only in this release** — startup validation rejects this for other engines
+    /// until their adapters are wired (see `query_auth_supported`).
     #[serde(rename = "tokenExchange")]
     TokenExchange(TokenExchangeConfig),
+}
+
+/// Centralizes the engine × `queryAuth` support matrix so YAML load, Studio PUT, and
+/// startup validation can't drift apart. Returns `Err` with an operator-facing message
+/// when `mode` is not implemented for `engine` yet.
+///
+/// `serviceAccount` is always allowed. Every other mode is Trino-only in this release —
+/// ADBC/ClickHouse/StarRocks adapters do not yet consume `QueryCredentials`, so accepting
+/// the config silently would produce a cluster that claims per-user identity but never
+/// applies it.
+pub fn query_auth_supported(
+    engine: Option<&EngineConfig>,
+    mode: &QueryAuthConfig,
+) -> Result<(), String> {
+    if matches!(mode, QueryAuthConfig::ServiceAccount) {
+        return Ok(());
+    }
+    match engine {
+        Some(EngineConfig::Trino) => Ok(()),
+        other => {
+            let engine_name = other
+                .map(|e| format!("{e:?}"))
+                .unwrap_or_else(|| "<unknown>".to_string());
+            let mode_name = match mode {
+                QueryAuthConfig::Passthrough => "passthrough",
+                QueryAuthConfig::Impersonate => "impersonate",
+                QueryAuthConfig::TokenExchange(_) => "tokenExchange",
+                QueryAuthConfig::ServiceAccount => unreachable!("handled above"),
+            };
+            Err(format!(
+                "queryAuth.type = {mode_name} is only supported for Trino in this release, got {engine_name}"
+            ))
+        }
+    }
 }
 
 /// Configuration for the OAuth 2.0 token exchange flow (RFC 8693).
@@ -1505,10 +1559,65 @@ fn default_cache_ttl() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        AuthConfig, AuthProviderConfig, AuthorizationConfig, AuthorizationProviderConfig,
-        GuardKindConfig, GuardSpecConfig, LdapConfig, OidcConfig, OpenFgaConfig, PersistenceConfig,
-        PostgresPersistenceConfig, ProxyConfig, RouterConfig,
+        query_auth_supported, AuthConfig, AuthProviderConfig, AuthorizationConfig,
+        AuthorizationProviderConfig, ClusterAuth, EngineConfig, GuardKindConfig, GuardSpecConfig,
+        LdapConfig, OidcConfig, OpenFgaConfig, PersistenceConfig, PostgresPersistenceConfig,
+        ProxyConfig, QueryAuthConfig, RouterConfig, TokenExchangeConfig,
     };
+
+    #[test]
+    fn service_account_is_allowed_for_every_engine_including_unknown() {
+        assert!(query_auth_supported(
+            Some(&EngineConfig::ClickHouse),
+            &QueryAuthConfig::ServiceAccount
+        )
+        .is_ok());
+        assert!(query_auth_supported(None, &QueryAuthConfig::ServiceAccount).is_ok());
+    }
+
+    #[test]
+    fn passthrough_impersonate_token_exchange_allowed_only_for_trino() {
+        for mode in [
+            QueryAuthConfig::Passthrough,
+            QueryAuthConfig::Impersonate,
+            QueryAuthConfig::TokenExchange(TokenExchangeConfig {
+                token_endpoint: "https://idp.example/token".to_string(),
+                client_id: "queryflux".to_string(),
+                client_secret: "secret".to_string(),
+                target_audience: None,
+                scope: None,
+            }),
+        ] {
+            assert!(
+                query_auth_supported(Some(&EngineConfig::Trino), &mode).is_ok(),
+                "Trino should support {mode:?}"
+            );
+            assert!(
+                query_auth_supported(Some(&EngineConfig::ClickHouse), &mode).is_err(),
+                "ClickHouse should not support {mode:?} in this release"
+            );
+            assert!(
+                query_auth_supported(None, &mode).is_err(),
+                "an unknown engine should not support {mode:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn cluster_auth_sets_http_authorization_matches_basic_and_bearer_only() {
+        assert!(ClusterAuth::Basic {
+            username: "u".into(),
+            password: "p".into()
+        }
+        .sets_http_authorization());
+        assert!(ClusterAuth::Bearer { token: "t".into() }.sets_http_authorization());
+        assert!(!ClusterAuth::AccessKey {
+            access_key_id: "a".into(),
+            secret_access_key: "s".into(),
+            session_token: None
+        }
+        .sets_http_authorization());
+    }
 
     #[test]
     fn router_config_deserializes_admin_style_json_routers_array() {

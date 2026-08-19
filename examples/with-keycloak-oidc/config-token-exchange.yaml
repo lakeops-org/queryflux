@@ -1,0 +1,75 @@
+queryflux:
+  externalAddress: http://localhost:8080
+  frontends:
+    trinoHttp:
+      enabled: true
+      port: 8080
+  persistence:
+    type: postgres
+    url: postgres://queryflux:queryflux@postgres:5432/queryflux
+  adminApi:
+    port: 9000
+
+auth:
+  provider: oidc
+  required: true
+  oidc:
+    issuer: http://keycloak:8080/realms/queryflux
+    jwksUri: http://keycloak:8080/realms/queryflux/protocol/openid-connect/certs
+    audience: queryflux
+    groupsClaim: groups
+    rolesClaim: roles
+
+authorization:
+  provider: none
+
+clusters:
+  trino-1:
+    engine: trino
+    enabled: true
+    endpoint: http://trino:8080
+    # Type 2 — exchange the client's Keycloak JWT (RFC 8693) for a Trino-scoped token
+    # before every query, instead of forwarding the client's original token as-is
+    # (passthrough) or authenticating as a fixed service account (impersonate).
+    queryAuth:
+      type: tokenExchange
+      tokenEndpoint: http://keycloak:8080/realms/queryflux/protocol/openid-connect/token
+      clientId: queryflux
+      clientSecret: change_me
+      targetAudience: queryflux
+
+clusterGroups:
+  trino:
+    enabled: true
+    maxRunningQueries: 100
+    members: [trino-1]
+    strategy:
+      type: roundRobin
+    authorization:
+      allowGroups: [data-team, analytics-team]
+
+routers:
+  - type: protocolBased
+    trinoHttp: trino
+
+routingFallback: trino
+
+translation:
+  errorOnUnsupported: false
+
+# NOTE — this config is a reference for the `tokenExchange` shape, not a turnkey demo:
+# the `queryflux` client in keycloak-realm.json is a public client with no secret and
+# Keycloak's token-exchange feature is not enabled on the container (docker-compose.yml
+# starts Keycloak with plain `start-dev`, no `--features=token-exchange`). To actually
+# exercise this mode you need:
+#   1. Keycloak started with `--features=token-exchange` (or `preview`).
+#   2. A confidential client with a secret (replace `clientSecret: change_me`) that has
+#      the "Token Exchange" permission granted on the target client/audience.
+# See website/docs/architecture/auth-authz-design.md → "Mode: tokenExchange" for the
+# per-provider contract (grant type, subject token type, audience/scope).
+#
+# Even once token exchange is enabled at Keycloak, Trino itself still needs its own JWT
+# or OAuth2 authenticator configured to actually validate the exchanged token (signature,
+# issuer, `targetAudience` above matching Trino's required audience) — this stack's Trino
+# container has no authentication configured at all, so it accepts the exchanged token
+# (or any request) without checking it. See the README's "Production hardening" note.

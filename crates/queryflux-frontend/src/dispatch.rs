@@ -16,12 +16,13 @@ use queryflux_core::{
     error::{QueryFluxError, Result},
     query::{
         ClusterGroupName, ClusterName, ExecutingQuery, FrontendProtocol, ProxyQueryId,
-        QueryEngineStats, QueryExecution, QueryStats, QueryStatus, QueuedQuery,
+        QueryEngineStats, QueryExecution, QueryStats, QueryStatus, QueuedQuery, StoredWireAuth,
     },
     session::SessionContext,
 };
 use queryflux_engine_adapters::{
-    AdapterKind, AsyncAdapter, BackendQueryIdSlot, ConnectionFormat, SyncAdapter,
+    wire_auth::resolve_stored_wire_auth, AdapterKind, AsyncAdapter, BackendQueryIdSlot,
+    ConnectionFormat, SyncAdapter,
 };
 use queryflux_guardrails::{GuardChain, GuardContext, GuardLayer};
 use queryflux_metrics::MetricsStore;
@@ -112,7 +113,7 @@ pub async fn dispatch_query(
     query_id: ProxyQueryId,
     sql: String,
     params: QueryParams,
-    session: SessionContext,
+    mut session: SessionContext,
     protocol: FrontendProtocol,
     group: ClusterGroupName,
     already_queued: bool,
@@ -132,6 +133,7 @@ pub async fn dispatch_query(
         guard_chain,
         group_guard_chain,
         cluster_cfg,
+        adapters,
         max_queued_queries,
     ) = {
         let live = state.live.read().await;
@@ -151,6 +153,13 @@ pub async fn dispatch_query(
             // cluster_cfg resolved after cluster selection below; captured here
             // so credential resolution uses the same config generation.
             live.cluster_configs.clone(),
+            // adapters snapshotted from the same read guard as cluster_cfg — a config
+            // update landing between credential resolution and adapter selection could
+            // otherwise resolve credentials against one config generation and submit
+            // through an adapter built from a newer one (e.g. HTTP auth removed between
+            // the two reads would make credential resolution and the Trino adapter's own
+            // internal derivation disagree on whether to forward client Authorization).
+            live.adapters.clone(),
             live.group_max_queued_queries
                 .get(&group.0)
                 .copied()
@@ -266,7 +275,31 @@ pub async fn dispatch_query(
         }
     };
 
-    let adapter_kind = match state.adapter(&cluster_name.0).await {
+    // Passthrough: forward the client's own Authorization if the frontend already
+    // captured one; otherwise inject a Bearer built from the OIDC raw_token so the
+    // backend still receives a per-user credential. The adapter fails closed if
+    // neither is available — this is best-effort enrichment, not the fail-closed check.
+    if matches!(credentials, QueryCredentials::Passthrough)
+        && !session.extra.contains_key("authorization")
+    {
+        if let Some(token) = &auth_ctx.raw_token {
+            session
+                .extra
+                .insert("authorization".to_string(), format!("Bearer {token}"));
+        }
+    }
+
+    // Resolved once here (mirroring what the Trino adapter derives internally for the
+    // POST itself) so the exact same wire auth can be persisted on `ExecutingQuery` and
+    // reused by poll/cancel, which never see the original `SessionContext` again.
+    let cluster_sets_http_auth = this_cluster_cfg
+        .as_ref()
+        .and_then(|c| c.auth.as_ref())
+        .is_some_and(|a| a.sets_http_authorization());
+    let wire_auth: Option<StoredWireAuth> =
+        resolve_stored_wire_auth(&credentials, &session, cluster_sets_http_auth);
+
+    let adapter_kind = match adapters.get(&cluster_name.0).cloned() {
         Some(a) => a,
         None => {
             slot.release().await;
@@ -467,6 +500,7 @@ pub async fn dispatch_query(
                 submitted_guard_actions,
                 was_guard_blocked: false,
                 submitted_by: auth_ctx.user.clone(),
+                wire_auth: wire_auth.clone(),
             };
 
             match execution {
@@ -483,8 +517,12 @@ pub async fn dispatch_query(
                         warn!(id = %query_id, "Failed to persist executing query: {e}");
                         let cancel_adapter = adapter.clone();
                         let cancel_id = backend_query_id.clone();
+                        let cancel_wire_auth = wire_auth.clone();
                         tokio::spawn(async move {
-                            if let Err(ce) = cancel_adapter.cancel_query(&cancel_id).await {
+                            if let Err(ce) = cancel_adapter
+                                .cancel_query(&cancel_id, cancel_wire_auth.as_ref())
+                                .await
+                            {
                                 warn!(backend = %cancel_id, "Best-effort cancel after persistence failure: {ce}");
                             }
                         });
@@ -929,6 +967,9 @@ impl Drop for ClusterSlotGuard {
 struct SyncCancelGuard {
     adapter: DispatchAdapter,
     id_slot: BackendQueryIdSlot,
+    /// The wire auth resolved at submit time — reused so cancellation on disconnect uses
+    /// the same identity the query was submitted under, not cluster auth.
+    wire_auth: Option<StoredWireAuth>,
     state: Option<Arc<AppState>>,
     ctx: Option<QueryContext>,
     start: Instant,
@@ -939,6 +980,7 @@ impl SyncCancelGuard {
     fn new(
         adapter: DispatchAdapter,
         id_slot: BackendQueryIdSlot,
+        wire_auth: Option<StoredWireAuth>,
         state: Arc<AppState>,
         ctx: QueryContext,
         start: Instant,
@@ -946,6 +988,7 @@ impl SyncCancelGuard {
         Self {
             adapter,
             id_slot,
+            wire_auth,
             state: Some(state),
             ctx: Some(ctx),
             start,
@@ -968,7 +1011,11 @@ impl SyncCancelGuard {
         self.disarmed = true;
         self.state = None;
         self.ctx = None;
-        spawn_sync_cancel(self.adapter.clone(), self.id_slot.clone());
+        spawn_sync_cancel(
+            self.adapter.clone(),
+            self.id_slot.clone(),
+            self.wire_auth.clone(),
+        );
     }
 }
 
@@ -978,7 +1025,11 @@ impl Drop for SyncCancelGuard {
             return;
         }
         self.disarmed = true;
-        spawn_sync_cancel(self.adapter.clone(), self.id_slot.clone());
+        spawn_sync_cancel(
+            self.adapter.clone(),
+            self.id_slot.clone(),
+            self.wire_auth.clone(),
+        );
         if let (Some(state), Some(ctx)) = (self.state.take(), self.ctx.take()) {
             let backend_query_id = self.id_slot.get().map(|id| id.0);
             state.record_query(
@@ -1005,12 +1056,21 @@ impl Drop for SyncCancelGuard {
 /// timeouts (ClickHouse / StarRocks pool checkout) so a hung backend cannot leak tasks.
 const SYNC_CANCEL_TIMEOUT: Duration = Duration::from_secs(10);
 
-fn spawn_sync_cancel(adapter: DispatchAdapter, id_slot: BackendQueryIdSlot) {
+fn spawn_sync_cancel(
+    adapter: DispatchAdapter,
+    id_slot: BackendQueryIdSlot,
+    wire_auth: Option<StoredWireAuth>,
+) {
     let Some(id) = id_slot.get() else {
         return;
     };
     tokio::spawn(async move {
-        match tokio::time::timeout(SYNC_CANCEL_TIMEOUT, adapter.cancel_query(&id)).await {
+        match tokio::time::timeout(
+            SYNC_CANCEL_TIMEOUT,
+            adapter.cancel_query(&id, wire_auth.as_ref()),
+        )
+        .await
+        {
             Err(_) => {
                 warn!(
                     backend = %id,
@@ -1065,10 +1125,14 @@ impl DispatchAdapter {
         }
     }
 
-    async fn cancel_query(&self, backend_id: &queryflux_core::query::BackendQueryId) -> Result<()> {
+    async fn cancel_query(
+        &self,
+        backend_id: &queryflux_core::query::BackendQueryId,
+        wire_auth: Option<&StoredWireAuth>,
+    ) -> Result<()> {
         match self {
             Self::Sync(a) => a.cancel_query(backend_id).await,
-            Self::Async(a) => a.cancel_query(backend_id).await,
+            Self::Async(a) => a.cancel_query(backend_id, wire_auth).await,
         }
     }
 
@@ -1118,6 +1182,9 @@ struct SyncQuerySetup {
     params: QueryParams,
     /// Guard actions collected by the guard chain (allow/warn). Merged into QueryOutcome.
     guard_actions: Vec<queryflux_persistence::GuardAction>,
+    /// The wire auth resolved at submit time — reused by `SyncCancelGuard` so a client
+    /// disconnect cancels with the same identity the query was submitted under.
+    wire_auth: Option<StoredWireAuth>,
 }
 
 /// The outcome of executing a sync query — everything record_query needs.
@@ -1162,14 +1229,14 @@ async fn setup_sync_query(
     state: &Arc<AppState>,
     sql: String,
     params: QueryParams,
-    session: SessionContext,
+    mut session: SessionContext,
     protocol: FrontendProtocol,
     group: ClusterGroupName,
     auth_ctx: &AuthContext,
 ) -> Result<SyncQuerySetup> {
     let query_id = ProxyQueryId::new();
 
-    let (cluster_manager, group_fixups, group_default_tags, cluster_configs, wait_timeout_secs) = {
+    let (cluster_manager, group_fixups, group_default_tags, wait_timeout_secs) = {
         let live = state.live.read().await;
         let wait_timeout_secs = live
             .group_capacity_wait_timeout_secs
@@ -1186,7 +1253,6 @@ async fn setup_sync_query(
                 .get(&group.0)
                 .cloned()
                 .unwrap_or_default(),
-            live.cluster_configs.clone(),
             wait_timeout_secs,
         )
     };
@@ -1199,7 +1265,7 @@ async fn setup_sync_query(
     let wait_start = Utc::now();
     let deadline = wait_start + chrono::Duration::seconds(wait_timeout_secs as i64);
     let mut seq: u64 = 0;
-    let (cluster_name, adapter) = loop {
+    let (cluster_name, adapter, this_cluster_cfg) = loop {
         if Utc::now() >= deadline {
             return Err(QueryFluxError::CapacityWaitTimeout {
                 group: group.0.clone(),
@@ -1226,9 +1292,24 @@ async fn setup_sync_query(
                     }
                     CapacityGrant::Granted => {}
                 }
-                match state.adapter(&name.0).await {
-                    Some(AdapterKind::Sync(a)) => break (name, DispatchAdapter::Sync(a)),
-                    Some(AdapterKind::Async(a)) => break (name, DispatchAdapter::Async(a)),
+                // Read the adapter and its cluster config from the same lock acquisition —
+                // this loop can spin for a while waiting on capacity, so a config update
+                // landing mid-wait must not let a fresh adapter get paired with a stale
+                // (or vice versa) cluster config for credential resolution below.
+                let (adapter_for_cluster, cluster_cfg_for_cluster) = {
+                    let live = state.live.read().await;
+                    (
+                        live.adapters.get(&name.0).cloned(),
+                        live.cluster_configs.get(&name.0).cloned(),
+                    )
+                };
+                match adapter_for_cluster {
+                    Some(AdapterKind::Sync(a)) => {
+                        break (name, DispatchAdapter::Sync(a), cluster_cfg_for_cluster)
+                    }
+                    Some(AdapterKind::Async(a)) => {
+                        break (name, DispatchAdapter::Async(a), cluster_cfg_for_cluster)
+                    }
                     None => {
                         let _ = cluster_manager.release_cluster(&group, &name).await;
                         if let Some(cap) = &state.capacity_store {
@@ -1326,7 +1407,6 @@ async fn setup_sync_query(
 
     let was_translated = translated != sql;
 
-    let this_cluster_cfg = cluster_configs.get(&cluster_name.0).cloned();
     let credentials = match state
         .identity_resolver
         .resolve(auth_ctx, this_cluster_cfg.as_ref())
@@ -1338,6 +1418,34 @@ async fn setup_sync_query(
             return Err(e);
         }
     };
+
+    // Same enrichment as the async dispatch path: forward the client's own Authorization
+    // if the frontend already captured one; otherwise inject a Bearer built from the OIDC
+    // raw_token so the backend still receives a per-user credential. Without this, an
+    // OIDC-authenticated sync request (Postgres/MySQL/Flight wire) with no original
+    // Authorization header would resolve to Passthrough, find nothing forwardable, and
+    // fail closed — even though a raw_token was available to build one from.
+    if matches!(credentials, QueryCredentials::Passthrough)
+        && !session.extra.contains_key("authorization")
+    {
+        if let Some(token) = &auth_ctx.raw_token {
+            session
+                .extra
+                .insert("authorization".to_string(), format!("Bearer {token}"));
+        }
+    }
+
+    // Resolved the same way as the async dispatch path (after enrichment, so passthrough
+    // benefits from it too), so a disconnect mid-query cancels with the identity the query
+    // actually submitted under — not cluster auth — for passthrough/impersonate/
+    // tokenExchange queries reached via the sync bridge (Postgres/MySQL/Flight wire, or
+    // Trino's own `execute_as_arrow`).
+    let cluster_sets_http_auth = this_cluster_cfg
+        .as_ref()
+        .and_then(|c| c.auth.as_ref())
+        .is_some_and(|a| a.sets_http_authorization());
+    let wire_auth: Option<StoredWireAuth> =
+        resolve_stored_wire_auth(&credentials, &session, cluster_sets_http_auth);
 
     // Fallback interpolation: when the adapter does not support native params,
     // substitute `?` placeholders with typed literals now so the adapter receives
@@ -1385,6 +1493,7 @@ async fn setup_sync_query(
         credentials,
         params: effective_params,
         guard_actions: vec![],
+        wire_auth,
     })
 }
 
@@ -1983,6 +2092,7 @@ async fn execute_to_sink_inner(
     let mut cancel = SyncCancelGuard::new(
         setup.adapter.clone(),
         id_slot.clone(),
+        setup.wire_auth.clone(),
         state.clone(),
         setup.ctx.clone(),
         setup.start,
