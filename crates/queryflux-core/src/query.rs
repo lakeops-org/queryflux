@@ -302,13 +302,33 @@ pub struct ExecutingQuery {
 /// re-apply the exact credential used at submit time. Deliberately smaller than
 /// `QueryCredentials` (queryflux-auth) — it holds only what must survive a process
 /// restart / different-replica poll, not the resolution logic that produced it.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// `Authorization` holds a live, reusable bearer/basic credential and is persisted as
+/// part of `ExecutingQuery` in the `executing_queries.data` JSONB column (plaintext at
+/// rest — see the "Persisted wire credentials" note in `auth-authz-design.md` for the
+/// accepted residual risk and the encryption-at-rest follow-up). `Debug` is implemented
+/// by hand below to redact it, so it never leaks through `{:?}` logging even though it's
+/// not encrypted at rest.
+#[derive(Clone, Serialize, Deserialize)]
 pub enum StoredWireAuth {
     /// Exact `Authorization` header value to send (passthrough forward, or a
     /// tokenExchange-resolved Bearer token already formatted as `"Bearer {token}"`).
     Authorization(String),
     /// Trino-only: `X-Trino-User` value to re-inject on every poll/cancel (impersonate).
     ImpersonateUser(String),
+}
+
+impl std::fmt::Debug for StoredWireAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            StoredWireAuth::Authorization(_) => {
+                f.debug_tuple("Authorization").field(&"<redacted>").finish()
+            }
+            StoredWireAuth::ImpersonateUser(user) => {
+                f.debug_tuple("ImpersonateUser").field(user).finish()
+            }
+        }
+    }
 }
 
 // --- Query execution result model ---
@@ -428,6 +448,22 @@ pub enum QueryStatus {
 mod submitted_by_serde_tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn stored_wire_auth_debug_redacts_the_authorization_value() {
+        let auth = StoredWireAuth::Authorization("Bearer super-secret-token".to_string());
+        let rendered = format!("{auth:?}");
+        assert!(!rendered.contains("super-secret-token"));
+        assert!(rendered.contains("redacted"));
+    }
+
+    #[test]
+    fn stored_wire_auth_debug_does_not_redact_the_impersonate_username() {
+        // Not a secret — matches what's already visible on the wire as X-Trino-User.
+        let auth = StoredWireAuth::ImpersonateUser("alice".to_string());
+        let rendered = format!("{auth:?}");
+        assert!(rendered.contains("alice"));
+    }
 
     #[test]
     fn executing_query_missing_submitted_by_defaults_empty() {

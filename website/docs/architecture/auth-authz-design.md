@@ -25,6 +25,8 @@ Every backend cluster has **two distinct credential relationships**, both config
 
 `queryAuth` has **four explicit types**: `serviceAccount | passthrough | impersonate | tokenExchange`
 
+**Anonymous requests fail closed for explicit per-user modes.** An unauthenticated (`AuthContext.user == "anonymous"`) request only ever resolves to `serviceAccount` — there is no per-user credential to forward, impersonate, or exchange. If a cluster is explicitly configured with `passthrough`, `impersonate`, or `tokenExchange`, an anonymous request is rejected with an auth error rather than silently executing under the service account.
+
 `passthrough` forwards the client's own credential (Bearer/Basic) to the backend unchanged — the backend authenticates the user's own token, not a QueryFlux-vouched identity. It is **Trino-only in this release**; startup validation rejects it for engines whose adapters don't yet consume `QueryCredentials` (see the compatibility table below).
 
 Before `passthrough` existed as an explicit type, the Trino adapter forwarded all headers stored in `SessionContext.extra` verbatim whenever a cluster had no HTTP-setting `auth` of its own — including the client's `Authorization` header — regardless of `queryAuth`. That implicit behavior is **deprecated but still supported** for `serviceAccount`/omitted `queryAuth` on Trino clusters, for backward compatibility (a startup warning is emitted). New configs should set `queryAuth.type: passthrough` explicitly instead of relying on the implicit fallback.
@@ -540,41 +542,60 @@ Service account authenticates to the backend; user identity injected via `X-Trin
 http-server.access-control.config-files=/etc/trino/rules.json
 ```
 
-This is high operator burden. For OIDC deployments where Trino is configured with JWT auth pointing to the same IdP, prefer omitting `queryAuth` (implicit header forwarding) over `impersonate`.
+This is high operator burden. For OIDC deployments where Trino is configured with JWT auth pointing to the same IdP, prefer explicit `queryAuth: passthrough` over `impersonate` — omitting `queryAuth` relies on the deprecated implicit forwarding path (see above); new configs should never depend on it.
 
 **Only Trino supports `impersonate`.** ClickHouse's `X-ClickHouse-User` is an auth username requiring a matching password — it is not an impersonation header and has no trusted-proxy mechanism. StarRocks has no equivalent over MySQL wire. Startup validation rejects `impersonate` for any other engine type.
 
-### Mode: `tokenExchange` (Snowflake, Databricks — future adapters)
+### Mode: `tokenExchange` (Trino only in this release)
 
-QueryFlux exchanges the user's OIDC JWT (`auth_ctx.raw_token`) for a backend-specific OAuth access token. Requires `OidcAuthProvider` on the frontend (so `raw_token` is populated). **Fails closed:** if `raw_token` is absent or the exchange fails, the query is rejected with an auth error — it never silently falls back to `serviceAccount`, since that would submit the query under the wrong principal.
+QueryFlux exchanges the user's OIDC JWT (`auth_ctx.raw_token`) for a backend-specific OAuth access token via RFC 8693 token exchange. Requires `OidcAuthProvider` on the frontend (so `raw_token` is populated). **Fails closed:** if `raw_token` is absent or the exchange fails, the query is rejected with an auth error — it never silently falls back to `serviceAccount`, since that would submit the query under the wrong principal.
+
+Startup validation rejects `tokenExchange` for engines whose adapters don't yet consume it — see the compatibility table above.
 
 **Per-provider contract:**
 
 | Provider | Grant type | Subject token type | Audience / scope |
 |----------|-----------|-------------------|-----------------|
 | Keycloak token exchange | `urn:ietf:params:oauth:grant-type:token-exchange` | `urn:ietf:params:oauth:token-type:access_token` | `audience: &lt;target-client-id&gt;` |
-| Snowflake external OAuth | `urn:ietf:params:oauth:grant-type:token-exchange` | `urn:ietf:params:oauth:token-type:access_token` | `scope: session:role:&lt;ROLE&gt;` |
-| Databricks OAuth U2M | `urn:ietf:params:oauth:grant-type:token-exchange` | `urn:ietf:params:oauth:token-type:access_token` | `scope: all-apis` |
 
-Each provider must be registered as an OAuth client in the same IdP as QueryFlux. The exchanged token is used as `Authorization: Bearer &lt;exchanged_token&gt;` in the adapter request. Token caching (with TTL from `expires_in`) should be implemented to avoid an exchange call on every query.
+The provider must be registered as an OAuth client in the same IdP as QueryFlux. The exchanged token is used as `Authorization: Bearer &lt;exchanged_token&gt;` in the adapter request. Exchanged tokens are cached (keyed by the full effective grant — user, endpoint, client, audience, scope, and a digest of the raw subject token — until `expires_in` minus a buffer) to avoid an exchange call on every query.
 
 ```yaml
 clusters:
-  snowflake-prod:
-    engine: snowflake           # future adapter
+  trino-1:
+    engine: trino
     auth:
-      type: keyPair
-      username: QF_SVC
-      privateKeyPem: "..."
+      type: bearer
+      token: "..."               # QueryFlux's own service credential to Trino
     queryAuth:
       type: tokenExchange
       tokenEndpoint: https://keycloak.internal/realms/my-realm/protocol/openid-connect/token
       clientId: queryflux-gateway
       clientSecret: "..."
-      # provider-specific extras:
-      targetAudience: snowflake-client   # for Keycloak exchange
-      # scope: session:role:ANALYST      # for direct Snowflake OAuth
+      targetAudience: trino-client   # Keycloak target client ID
 ```
+
+#### Future: Snowflake, Databricks
+
+Non-Trino OAuth-based engines are natural `tokenExchange` targets once their adapters consume `QueryCredentials::Bearer`:
+
+| Provider | Grant type | Subject token type | Audience / scope |
+|----------|-----------|-------------------|-----------------|
+| Snowflake external OAuth | `urn:ietf:params:oauth:grant-type:token-exchange` | `urn:ietf:params:oauth:token-type:access_token` | `scope: session:role:&lt;ROLE&gt;` |
+| Databricks OAuth U2M | `urn:ietf:params:oauth:grant-type:token-exchange` | `urn:ietf:params:oauth:token-type:access_token` | `scope: all-apis` |
+
+The same `queryAuth: tokenExchange` config shape applies — only the `targetAudience`/`scope` and the engine's own OAuth registration differ.
+
+### Persisted wire credentials (poll/cancel reuse)
+
+Poll and cancel requests don't repeat the client's original headers, so the resolved wire credential is persisted on `ExecutingQuery.wire_auth` (`StoredWireAuth::Authorization` for passthrough/tokenExchange's `Authorization` value, `StoredWireAuth::ImpersonateUser` for impersonate's username) at submit time and re-applied on every subsequent poll/cancel — including after a replica restart, since `ExecutingQuery` is durably stored.
+
+**Residual risk:** with a Postgres persistence backend, `ExecutingQuery` (including `wire_auth`) is serialized into the `executing_queries.data` JSONB column **unencrypted**. A `StoredWireAuth::Authorization` value is a live, reusable bearer/basic credential for the duration of the query — anyone with read access to that column (DB backups, replication, a database-level compromise) could reuse it. This is an accepted, documented gap, not an oversight:
+
+- The row exists only while the query is executing/queued — it's deleted once the query reaches a terminal state, bounding (not eliminating) the exposure window.
+- `StoredWireAuth`'s `Debug` implementation is hand-written to redact the `Authorization` value, so it never leaks through incidental `{:?}` logging even though it isn't encrypted at rest.
+- Admin-facing DTOs and query-history conversions never include `wire_auth` — it exists only in the internal `ExecutingQuery` record.
+- Encryption-at-rest for this column (envelope encryption via a KMS, or a short-lived protected-credential-store reference instead of the raw value) is a real follow-up, deliberately not implemented in this release — it needs an explicit key-management decision this codebase doesn't otherwise make.
 
 ---
 

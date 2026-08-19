@@ -220,6 +220,7 @@ impl TrinoAdapter {
         mut builder: reqwest::RequestBuilder,
         session: &SessionContext,
         tags: &QueryTags,
+        credentials: &queryflux_auth::QueryCredentials,
     ) -> reqwest::RequestBuilder {
         for (k, v) in &session.extra {
             let k_lower = k.to_lowercase();
@@ -234,6 +235,21 @@ impl TrinoAdapter {
             // passthrough carried under `ServiceAccount`). Forwarding it again from
             // here would risk a duplicate or stale `Authorization` header.
             if k_lower == "authorization" {
+                continue;
+            }
+            // Under `Impersonate`, `apply_query_credentials` already set `X-Trino-User`
+            // from the verified `auth_ctx.user`. `reqwest::RequestBuilder::header` appends
+            // rather than replaces, so forwarding the client's own unverified `x-trino-user`
+            // here too would send Trino two values for the same header — letting a client
+            // pick an arbitrary user depending on which one Trino's server happens to read.
+            // For every other mode there is no verified per-user identity to defer to, so
+            // the client-declared value is still the intended "trusted proxy" username.
+            if k_lower == "x-trino-user"
+                && matches!(
+                    credentials,
+                    queryflux_auth::QueryCredentials::Impersonate { .. }
+                )
+            {
                 continue;
             }
             if k_lower.starts_with("x-trino-") {
@@ -352,7 +368,7 @@ impl AsyncAdapter for TrinoAdapter {
 
         let mut req = self.http_client.post(&url).body(sql.to_string());
         req = self.apply_query_credentials(req, credentials, session)?;
-        req = self.apply_session_headers(req, session, tags);
+        req = self.apply_session_headers(req, session, tags, credentials);
         req = self.with_control_timeout(req);
 
         let resp = req
@@ -1366,6 +1382,7 @@ mod tests {
         BackendQueryId, ClusterGroupName, ClusterName, QueryPollResult, StoredWireAuth,
     };
     use queryflux_core::session::SessionContext;
+    use queryflux_core::tags::QueryTags;
     use reqwest::{Client, StatusCode};
     use std::time::{Duration, Instant};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1539,6 +1556,76 @@ mod tests {
         let auth = header_value(&req, "authorization");
 
         assert_eq!(auth, "Bearer exchanged-token");
+    }
+
+    #[test]
+    fn impersonate_never_sends_duplicate_x_trino_user_header_from_client() {
+        // A client can send its own x-trino-user header on the wire (e.g. a JDBC/CLI
+        // client, or an attacker). Under Impersonate, apply_query_credentials already set
+        // it to the verified auth_ctx.user — apply_session_headers must not append the
+        // client's raw value again, or Trino could end up honoring whichever of the two
+        // duplicate headers it happens to read.
+        let adapter = adapter_with_auth(Some(queryflux_core::config::ClusterAuth::Basic {
+            username: "svc".to_string(),
+            password: "svc-pass".to_string(),
+        }));
+        let mut session = SessionContext::default();
+        session
+            .extra
+            .insert("x-trino-user".to_string(), "attacker-supplied".to_string());
+        let credentials = QueryCredentials::Impersonate {
+            user: "alice".to_string(),
+        };
+
+        let mut builder = adapter
+            .apply_query_credentials(
+                adapter.http_client.get("http://trino:8080/v1/statement"),
+                &credentials,
+                &session,
+            )
+            .expect("impersonate never fails closed");
+        builder = adapter.apply_session_headers(builder, &session, &QueryTags::new(), &credentials);
+        let req = builder.build().expect("request should build");
+
+        let values: Vec<&str> = req
+            .headers()
+            .get_all("x-trino-user")
+            .iter()
+            .map(|v| v.to_str().unwrap_or(""))
+            .collect();
+        assert_eq!(
+            values,
+            vec!["alice"],
+            "expected exactly one x-trino-user header carrying the verified identity"
+        );
+    }
+
+    #[test]
+    fn service_account_still_forwards_client_x_trino_user_for_trusted_proxy_flow() {
+        // Non-impersonate modes have no verified per-user identity to defer to instead —
+        // the client-declared x-trino-user is the intended "trusted proxy" username and
+        // must keep flowing through, unlike under Impersonate.
+        let adapter = adapter_with_auth(Some(queryflux_core::config::ClusterAuth::Basic {
+            username: "svc".to_string(),
+            password: "svc-pass".to_string(),
+        }));
+        let mut session = SessionContext::default();
+        session
+            .extra
+            .insert("x-trino-user".to_string(), "bob".to_string());
+        let credentials = QueryCredentials::ServiceAccount;
+
+        let mut builder = adapter
+            .apply_query_credentials(
+                adapter.http_client.get("http://trino:8080/v1/statement"),
+                &credentials,
+                &session,
+            )
+            .expect("serviceAccount never fails closed");
+        builder = adapter.apply_session_headers(builder, &session, &QueryTags::new(), &credentials);
+        let req = builder.build().expect("request should build");
+
+        assert_eq!(header_value(&req, "x-trino-user"), "bob");
     }
 
     #[test]

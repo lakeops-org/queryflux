@@ -740,35 +740,22 @@ async fn main() -> Result<()> {
     }
 
     // Startup warning: with no gateway-level authorization policy, `passthrough` forwards
-    // whatever the client sent straight to the backend, and multiple cluster groups widen
-    // the blast radius of a single misconfigured or overly-permissive client credential.
-    if matches!(
-        config.authorization.provider,
-        queryflux_core::config::AuthorizationProviderConfig::None
-    ) && config.cluster_groups.len() > 1
-    {
-        let passthrough_clusters: Vec<&String> = config
-            .clusters
-            .iter()
-            .filter(|(_, cfg)| {
-                matches!(
-                    cfg.query_auth,
-                    Some(queryflux_core::config::QueryAuthConfig::Passthrough)
-                )
-            })
-            .map(|(name, _)| name)
-            .collect();
-        if !passthrough_clusters.is_empty() {
-            tracing::warn!(
-                clusters = ?passthrough_clusters,
-                "SECURITY: authorization.provider is 'none' and queryAuth: passthrough is set \
-                 on {} cluster(s) across {} cluster groups — QueryFlux is not enforcing any \
-                 access policy, so a client's own credential decides what it can reach on \
-                 every group it can route to. Configure authorization or narrow routing.",
-                passthrough_clusters.len(),
-                config.cluster_groups.len()
-            );
-        }
+    // whatever the client sent straight to the backend. The gap exists regardless of how
+    // many cluster groups there are — a single-group deployment is the common default, so
+    // gating on `cluster_groups.len() > 1` hid the warning for exactly the most likely
+    // misconfiguration. Group count only changes the blast radius, not whether the gap
+    // exists, so it's now informational in the message rather than a gate.
+    let passthrough_clusters = unauthenticated_passthrough_clusters(&config);
+    if !passthrough_clusters.is_empty() {
+        tracing::warn!(
+            clusters = ?passthrough_clusters,
+            "SECURITY: authorization.provider is 'none' and queryAuth: passthrough is set \
+             on {} cluster(s) across {} cluster group(s) — QueryFlux is not enforcing any \
+             access policy, so a client's own credential decides what it can reach on \
+             every group it can route to. Configure authorization or narrow routing.",
+            passthrough_clusters.len(),
+            config.cluster_groups.len()
+        );
     }
 
     let identity_resolver = Arc::new(BackendIdentityResolver::new());
@@ -1956,6 +1943,33 @@ type GroupStatesMap = HashMap<
     ),
 >;
 
+/// Clusters with `queryAuth: passthrough` when `authorization.provider` is `none` — the
+/// gateway enforces no access policy, so a client's own credential decides what it can
+/// reach. Returned regardless of `cluster_groups.len()`: a single-group deployment (the
+/// common default) has this gap just as much as a multi-group one, it's just narrower in
+/// blast radius, which is why the caller reports the group count rather than gating on it.
+fn unauthenticated_passthrough_clusters(
+    config: &queryflux_core::config::ProxyConfig,
+) -> Vec<&String> {
+    if !matches!(
+        config.authorization.provider,
+        queryflux_core::config::AuthorizationProviderConfig::None
+    ) {
+        return Vec::new();
+    }
+    config
+        .clusters
+        .iter()
+        .filter(|(_, cfg)| {
+            matches!(
+                cfg.query_auth,
+                Some(queryflux_core::config::QueryAuthConfig::Passthrough)
+            )
+        })
+        .map(|(name, _)| name)
+        .collect()
+}
+
 /// Convert optional Postgres `BIGINT` (`max_running_queries`) to `Option<u64>`.
 /// Negative values fail fast (invalid row).
 fn max_running_queries_u64_from_db(cluster: &str, v: Option<i64>) -> Result<Option<u64>> {
@@ -3090,6 +3104,62 @@ fn in_memory_metrics(
 
 #[cfg(test)]
 mod tests {
+    mod unauthenticated_passthrough_warning {
+        use super::super::unauthenticated_passthrough_clusters;
+        use queryflux_core::config::ProxyConfig;
+        use serde_json::json;
+
+        fn config(authorization_provider: &str, clusters: serde_json::Value) -> ProxyConfig {
+            serde_json::from_value(json!({
+                "queryflux": { "externalAddress": null },
+                "clusters": clusters,
+                "authorization": { "provider": authorization_provider },
+            }))
+            .expect("valid minimal ProxyConfig fixture")
+        }
+
+        fn passthrough_cluster() -> serde_json::Value {
+            json!({
+                "trino-1": {
+                    "engine": "trino",
+                    "endpoint": "http://trino:8080",
+                    "queryAuth": { "type": "passthrough" },
+                }
+            })
+        }
+
+        #[test]
+        fn warns_even_with_a_single_cluster_group() {
+            // Regression: this used to be gated on `cluster_groups.len() > 1`, hiding the
+            // warning for the common single-group default — exactly the most likely
+            // deployment to have this gap.
+            let cfg = config("none", passthrough_cluster());
+            assert_eq!(cfg.cluster_groups.len(), 0);
+            let flagged = unauthenticated_passthrough_clusters(&cfg);
+            assert_eq!(flagged, vec!["trino-1"]);
+        }
+
+        #[test]
+        fn no_warning_when_authorization_is_configured() {
+            let cfg = config("openfga", passthrough_cluster());
+            assert!(unauthenticated_passthrough_clusters(&cfg).is_empty());
+        }
+
+        #[test]
+        fn no_warning_without_any_passthrough_cluster() {
+            let cfg = config(
+                "none",
+                json!({
+                    "trino-1": {
+                        "engine": "trino",
+                        "endpoint": "http://trino:8080",
+                    }
+                }),
+            );
+            assert!(unauthenticated_passthrough_clusters(&cfg).is_empty());
+        }
+    }
+
     mod guard_chains {
         use std::collections::HashMap;
 

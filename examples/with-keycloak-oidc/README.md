@@ -74,8 +74,11 @@ curl -X POST http://localhost:8080/v1/statement \
 Paste the token at [jwt.io](https://jwt.io) or decode it locally:
 
 ```bash
-echo $TOKEN | cut -d. -f2 | base64 -d 2>/dev/null | jq .
+python3 -c 'import base64,json,sys; p=sys.stdin.read().strip().split(".")[1]; print(json.dumps(json.loads(base64.urlsafe_b64decode(p + "=" * (-len(p) % 4))), indent=2))' <<<"$TOKEN"
 ```
+
+(JWT payloads are base64url-encoded with padding stripped — plain `base64 -d` can reject a
+valid token that contains `-`/`_` characters or needs padding restored.)
 
 You'll see claims like:
 
@@ -121,10 +124,21 @@ clusterGroups:
 ## Backend identity modes
 
 This example's `config.yaml` uses `queryAuth: passthrough` — QueryFlux forwards the
-client's own Keycloak Bearer token to Trino unchanged, since both sides trust the same
-IdP. Trino has three other `queryAuth` modes available (see
+client's own Keycloak Bearer token to Trino unchanged. Trino has three other `queryAuth`
+modes available (see
 [auth-authz-design.md](../../website/docs/architecture/auth-authz-design.md) for the
 full picture):
+
+> **Production hardening:** the Trino container in this stack has no authentication
+> configured at all (see the "Trino direct | (no auth)" row above) — it accepts the
+> forwarded token, and any other request, without validating it. The security boundary
+> in this demo is entirely QueryFlux's own OIDC verification; Trino itself does not check
+> the token's signature, issuer, or audience. `passthrough` and `tokenExchange` only
+> become a real backend-level security boundary once Trino is configured with its own
+> JWT or OAuth2 authenticator validating against the same Keycloak realm — see
+> [Trino's authentication docs](https://trino.io/docs/current/security/authentication-types.html).
+> Without that, a network path that reaches Trino directly (bypassing QueryFlux, as the
+> `8081` port here demonstrates) has no authentication at all.
 
 | Mode | File | Backend sees |
 |------|------|--------------|

@@ -67,3 +67,9 @@ translation:
 #      the "Token Exchange" permission granted on the target client/audience.
 # See website/docs/architecture/auth-authz-design.md → "Mode: tokenExchange" for the
 # per-provider contract (grant type, subject token type, audience/scope).
+#
+# Even once token exchange is enabled at Keycloak, Trino itself still needs its own JWT
+# or OAuth2 authenticator configured to actually validate the exchanged token (signature,
+# issuer, `targetAudience` above matching Trino's required audience) — this stack's Trino
+# container has no authentication configured at all, so it accepts the exchanged token
+# (or any request) without checking it. See the README's "Production hardening" note.
