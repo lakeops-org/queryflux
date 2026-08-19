@@ -206,8 +206,8 @@ const config: Config = {
       copyright: `Copyright © ${new Date().getFullYear()} QueryFlux contributors. QueryFlux documentation — Apache-2.0.`,
     },
     prism: {
-      theme: prismThemes.github,
-      darkTheme: prismThemes.dracula,
+      theme: prismThemes.nightOwlLight,
+      darkTheme: prismThemes.nightOwl,
       additionalLanguages: ['rust', 'yaml', 'bash', 'python'],
     },
     // https://docusaurus.io/docs/seo#global-metadata — site-wide defaults; per-page title/description/OG come from Layout or doc frontmatter

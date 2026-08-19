@@ -9,6 +9,7 @@ import HomepageFeatures from '@site/src/components/HomepageFeatures';
 import HomepageUseCases from '@site/src/components/HomepageUseCases';
 import HomepageBenefits from '@site/src/components/HomepageBenefits';
 import HomepageNextSteps from '@site/src/components/HomepageNextSteps';
+import HomepageHeroVisual from '@site/src/components/HomepageHeroVisual';
 import StatsStrip from '@site/src/components/StatsStrip';
 import PageSeo from '@site/src/components/PageSeo';
 import styles from './index.module.css';
@@ -20,6 +21,7 @@ function HomepageHeader(): ReactNode {
     <header className={styles.hero}>
       <div className={styles.heroGlow} aria-hidden />
       <div className={clsx('container', styles.heroInner)}>
+        <HomepageHeroVisual />
         <Heading as="h1" className={styles.heroTitle}>
           <span className={styles.heroTitleQuery}>Query</span>
           <span className={styles.heroTitleFlux}>Flux</span>
