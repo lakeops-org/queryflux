@@ -1,9 +1,11 @@
 import type {ReactNode} from 'react';
 import clsx from 'clsx';
 import Link from '@docusaurus/Link';
+import useBaseUrl from '@docusaurus/useBaseUrl';
 import useDocusaurusContext from '@docusaurus/useDocusaurusContext';
 import Layout from '@theme/Layout';
 import Heading from '@theme/Heading';
+import ThemedImage from '@theme/ThemedImage';
 
 import HomepageFeatures from '@site/src/components/HomepageFeatures';
 import HomepageUseCases from '@site/src/components/HomepageUseCases';
@@ -20,11 +22,23 @@ function HomepageHeader(): ReactNode {
     <header className={styles.hero}>
       <div className={styles.heroGlow} aria-hidden />
       <div className={clsx('container', styles.heroInner)}>
+        <ThemedImage
+          className={styles.heroImage}
+          sources={{
+            light: useBaseUrl('/img/queryflux-hero-banner.png'),
+            dark: useBaseUrl('/img/queryflux-hero-banner.svg'),
+          }}
+          alt="QueryFlux — multi-engine SQL routing in Rust, connecting clients to Trino, DuckDB, StarRocks, Snowflake, Databricks, and more"
+          width={1024}
+          height={682}
+          decoding="async"
+        />
+        {/* The image already carries the "QueryFlux" wordmark + "One Query. Any
+            Engine." tagline — an H1 repeating the name right below it would just
+            be noise. The H1 is the one thing the image can't say: what it does. */}
         <Heading as="h1" className={styles.heroTitle}>
-          <span className={styles.heroTitleQuery}>Query</span>
-          <span className={styles.heroTitleFlux}>Flux</span>
+          {siteConfig.tagline}
         </Heading>
-        <p className={styles.heroTagline}>{siteConfig.tagline}</p>
         <p className={styles.heroLeadin}>
           One front door for SQL clients — Trino, PostgreSQL, MySQL, and Flight on
           the wire; Trino, DuckDB, StarRocks, and more behind it. Route by rules,

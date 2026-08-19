@@ -13,38 +13,34 @@ QueryFlux is a universal SQL query proxy and router. It accepts queries from cli
 
 ## High-Level Flow
 
-```
-Client (Trino CLI / psql / mysql / DBI)
-        │  native protocol
-        ▼
-┌───────────────────┐
-│  Frontend Listener │  ← speaks the client's wire protocol
-└────────┬──────────┘
-         │ SQL + SessionContext
-         ▼
-┌───────────────────┐
-│   Router Chain    │  ← selects target cluster group
-└────────┬──────────┘
-         │ ClusterGroupName
-         ▼
-┌───────────────────┐
-│ ClusterGroupManager│ ← load-balances across clusters; queues if at capacity
-└────────┬──────────┘
-         │ ClusterName
-         ▼
-┌───────────────────┐
-│ Translation Service│ ← sqlglot via PyO3; skipped when dialects match
-└────────┬──────────┘
-         │ translated SQL
-         ▼
-┌───────────────────┐
-│  Engine Adapter   │  ← speaks the backend engine's native protocol
-└────────┬──────────┘
-         │ QueryExecution (Async | Sync)
-         ▼
-┌───────────────────┐
-│   Persistence     │  ← stores in-flight state for async engines
-└───────────────────┘
+```mermaid
+%%{init: {'theme': 'base', 'themeVariables': {
+  'primaryColor': '#f5f3ff',
+  'primaryTextColor': '#3b0764',
+  'primaryBorderColor': '#7c3aed',
+  'lineColor': '#8b5cf6',
+  'fontFamily': 'Manrope Variable, Manrope, system-ui, sans-serif'
+}}}%%
+flowchart TD
+    Client(["Client<br/>Trino CLI / psql / mysql / DBI"])
+    Frontend["Frontend Listener<br/><i>speaks the client's wire protocol</i>"]
+    Router["Router Chain<br/><i>selects target cluster group</i>"]
+    ClusterMgr["ClusterGroupManager<br/><i>load-balances across clusters; queues if at capacity</i>"]
+    Translation["Translation Service<br/><i>sqlglot via PyO3; skipped when dialects match</i>"]
+    Adapter["Engine Adapter<br/><i>speaks the backend engine's native protocol</i>"]
+    Persistence[("Persistence<br/><i>stores in-flight state for async engines</i>")]
+
+    Client -->|native protocol| Frontend
+    Frontend -->|SQL + SessionContext| Router
+    Router -->|ClusterGroupName| ClusterMgr
+    ClusterMgr -->|ClusterName| Translation
+    Translation -->|translated SQL| Adapter
+    Adapter -->|"QueryExecution (Async \| Sync)"| Persistence
+
+    classDef stage fill:#faf5ff,stroke:#7c3aed,stroke-width:1.5px,color:#3b0764,rx:8,ry:8
+    class Frontend,Router,ClusterMgr,Translation,Adapter stage
+    classDef endpoint fill:#7c3aed,stroke:#5b21b6,stroke-width:1.5px,color:#fff
+    class Client,Persistence endpoint
 ```
 
 The frontend never knows which engine it's talking to. The engine adapter never knows which client protocol was used. The dispatch layer in the middle is the only place that bridges them.
