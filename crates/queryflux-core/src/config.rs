@@ -1225,8 +1225,10 @@ pub enum QueryAuthConfig {
     /// until their adapters are wired (see `query_auth_supported`).
     #[serde(rename = "passthrough")]
     Passthrough,
-    /// Service account authenticates to the backend; user identity injected via `X-Trino-User`.
-    /// **Trino only** — startup validation rejects this for other engines.
+    /// Service account authenticates to the backend; user identity injected via an
+    /// engine-specific mechanism — Trino's `X-Trino-User` header, or ClickHouse's
+    /// `EXECUTE AS {user} {sql}` (self-hosted 25.11+ only, requires `GRANT IMPERSONATE`).
+    /// **Trino and ClickHouse** — startup validation rejects this for other engines.
     #[serde(rename = "impersonate")]
     Impersonate,
     /// Exchange the user's OIDC JWT (RFC 8693) for a backend-scoped OAuth token.
@@ -1234,8 +1236,8 @@ pub enum QueryAuthConfig {
     /// **Fails closed**: if `raw_token` is absent or the exchange fails, the query is
     /// rejected with an auth error — it never silently falls back to `serviceAccount`,
     /// since that would submit the query under the wrong principal.
-    /// **Trino only in this release** — startup validation rejects this for other engines
-    /// until their adapters are wired (see `query_auth_supported`).
+    /// **Trino, and ADBC/Snowflake** in this release — startup validation rejects this for
+    /// other engines/drivers until their adapters are wired (see `query_auth_supported`).
     #[serde(rename = "tokenExchange")]
     TokenExchange(TokenExchangeConfig),
 }

@@ -553,7 +553,7 @@ This is high operator burden. For OIDC deployments where Trino is configured wit
 The adapter wraps the outgoing SQL as `EXECUTE AS {user} {sql}` — the service account (`cluster.auth`) still authenticates the HTTP request; `EXECUTE AS` re-scopes just that one query to run as `user`. Only safe for a single statement per request, which matches how QueryFlux's ClickHouse HTTP path already works.
 
 **ClickHouse-side requirements**, verified against the current upstream docs and changelog (not guessed):
-- **ClickHouse 25.11 or newer** — `EXECUTE AS` was added in that release ([clickhouse#39048](https://github.com/ClickHouse/ClickHouse/issues/39048)).
+- **ClickHouse 25.11 or newer** — `EXECUTE AS` was added in that release ([`EXECUTE AS` documentation](https://clickhouse.com/docs/sql-reference/statements/execute_as), [25.11 release notes](https://clickhouse.com/blog/clickhouse-release-25-11)).
 - **Self-hosted only** — the current ClickHouse docs state `EXECUTE AS` is not supported on ClickHouse Cloud.
 - Server setting `access_control_improvements.allow_impersonate_user = 1`.
 - `GRANT IMPERSONATE ON {user} TO {service_account}` (or `GRANT IMPERSONATE ON * TO {service_account}` for all users).
