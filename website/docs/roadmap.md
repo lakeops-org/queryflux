@@ -25,8 +25,9 @@ Everything below is implemented and available on the `main` branch.
 | **Backends** | Trino — async HTTP polling, transparent `nextUri` proxying |
 | | DuckDB — embedded, in-process, Arrow result sets |
 | | StarRocks — MySQL wire, sync Arrow path |
+| | ClickHouse — HTTP interface, sync Arrow path |
 | | Athena — AWS SDK async, `StartQueryExecution` → `GetQueryResults` |
-| | ADBC — generic Arrow Database Connectivity driver (Trino, DuckDB, and more) |
+| | ADBC — generic Arrow Database Connectivity driver (Trino, DuckDB, Snowflake, and more) |
 | **Routing** | `protocolBased`, `header`, `queryRegex`, `tags`, `pythonScript`, `compound` routers |
 | | Router chain with ordered evaluation and `routingFallback` |
 | | `route_with_trace` for per-request routing debug traces |
@@ -41,7 +42,8 @@ Everything below is implemented and available on the `main` branch.
 | | Schema migrations via Refinery (`queryflux migrate` + optional autoMigrate on start) |
 | **Auth** | Authentication providers: none, static, OIDC, LDAP |
 | | Authorization: allow-all, simple policy, OpenFGA |
-| | Backend identity resolution (`BackendIdentityResolver`) |
+| | Backend identity (`queryAuth`): `serviceAccount`, `passthrough`, `impersonate`, `tokenExchange` — see **[Authentication & identity](./authentication)** |
+| | Trino: all four modes. ClickHouse: `impersonate` (`EXECUTE AS`, self-hosted 25.11+). StarRocks: `passthrough` (LDAP, TLS-required). Snowflake (ADBC): `tokenExchange` (per-identity connection pool) |
 | **Observability** | Prometheus metrics: queries, duration, translation, running, queued |
 | | Grafana dashboard (auto-provisioned) |
 | | QueryFlux Studio — Next.js UI: clusters, query history, engine registry |
@@ -62,13 +64,9 @@ Today's translation is **dialect-only**: `sqlglot.transpile(sql, read=src, write
 
 The plan: wire `SchemaContext` (populated from catalog discovery via `EngineAdapterTrait::list_tables` / `describe_table`) into the dispatch path so the translator can call `sqlglot.optimizer.optimize` with a `MappingSchema`. Dialect-only remains the fallback when the schema is unavailable or optimization fails.
 
-### ClickHouse backend + HTTP frontend
+### ClickHouse HTTP frontend
 
-ClickHouse is a natural fit for the QueryFlux engine set — high-throughput columnar OLAP, HTTP-native protocol, wide adoption alongside Trino and StarRocks in modern lake deployments. The plan:
-
-- **Backend adapter**: ClickHouse HTTP protocol, sync Arrow path (similar to StarRocks).
-- **Frontend**: ClickHouse HTTP interface so native ClickHouse clients can connect to QueryFlux without any driver change.
-- **Dialect translation**: Trino → ClickHouse SQL via sqlglot.
+The ClickHouse **backend** adapter (HTTP protocol, sync Arrow path, `queryAuth: impersonate` via `EXECUTE AS`) is done. Still planned: a ClickHouse HTTP **frontend** so native ClickHouse clients can connect to QueryFlux directly, without any driver change — the same pattern the Snowflake frontend already uses for Snowflake-native clients.
 
 ### Routing telemetry in Studio
 

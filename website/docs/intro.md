@@ -25,6 +25,7 @@ The ideas mirror what proxies like [ProxySQL](https://proxysql.com/documentation
 | --- | --- |
 | **[Getting started](/docs/getting-started)** | Run QueryFlux with Docker Compose, connect a SQL client, smoke-test Trino HTTP. |
 | **[QueryFlux Studio](/docs/studio)** | Use the web UI for clusters, routing, query history, and admin security. |
+| **[Authentication & identity](./authentication)** | Set up OIDC/LDAP client auth and choose a backend identity mode (passthrough, impersonate, token exchange). |
 | **[Configuration](/docs/configuration)** | Edit `config.yaml` — frontends, cluster groups, routers, persistence, admin API. |
 
 ---
@@ -99,7 +100,8 @@ Use these when you already know what you are looking for:
 | **Metrics and health** | **[Observability](/docs/architecture/observability)** |
 | **Wire protocols** | **[Frontends](/docs/architecture/frontends/overview)** |
 | **Extending engines** | **[Adding engine support](/docs/architecture/adding-engine-support)** |
-| **Auth model** | **[Auth & authorization design](/docs/architecture/auth-authz-design)** |
+| **Auth setup** | **[Authentication & identity](./authentication)** |
+| **Auth internals** | **[Auth & authorization design](/docs/architecture/auth-authz-design)** |
 
 ---
 

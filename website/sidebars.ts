@@ -14,7 +14,7 @@ const sidebars: SidebarsConfig = {
       type: 'category',
       label: 'Guides',
       collapsed: false,
-      items: ['getting-started', 'studio'],
+      items: ['getting-started', 'studio', 'authentication'],
     },
     {
       type: 'category',
