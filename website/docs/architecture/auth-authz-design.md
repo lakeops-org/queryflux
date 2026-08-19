@@ -560,6 +560,8 @@ The adapter wraps the outgoing SQL as `EXECUTE AS {user} {sql}` — the service 
 
 QueryFlux cannot verify any of these remotely at startup — an unsupported version, a Cloud endpoint, or a missing grant all surface as an ordinary ClickHouse query error at run time (not a startup failure), since `EXECUTE AS` is just SQL syntax as far as the adapter is concerned.
 
+**Cancelling an impersonated query needs `KILL QUERY` too.** `EXECUTE AS` re-scopes the query to run as `user`, so ClickHouse attributes it to `user`, not the service account. `cancel_query` issues `KILL QUERY WHERE query_id = …` using the service account's own connection (it doesn't re-apply per-query wire auth — there's nothing to re-apply for `impersonate`, since the identity is baked into the SQL text at submit time, not carried as a separate credential). By default, ClickHouse's `KILL QUERY` privilege only lets a user kill their *own* queries; killing a different user's requires the global `KILL QUERY` privilege, granted with `GRANT KILL QUERY ON *.* TO {service_account}`. Without it, cancelling an impersonated query fails server-side (`User {service_account} attempts to kill query created by {user}`) — caught by the existing best-effort cancel error handling (logged, ignored), so the query keeps running until it finishes on its own.
+
 **Only Trino and ClickHouse support `impersonate`.** StarRocks has no equivalent over MySQL wire (no trusted-proxy mechanism). Startup validation rejects `impersonate` for any other engine type.
 
 ### Mode: `tokenExchange` (Trino only in this release)
