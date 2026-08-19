@@ -1685,7 +1685,11 @@ fn validate_query_auth_for_upsert(body: &UpsertClusterConfig) -> std::result::Re
         queryflux_core::engine_registry::parse_query_auth_from_config_json(&body.config)
             .map_err(|e| e.to_string())?;
     if let Some(mode) = &query_auth {
-        queryflux_core::config::query_auth_supported(Some(&engine), mode)?;
+        // ADBC's `driver` key lives in the raw config JSON, not on `EngineConfig` itself —
+        // `query_auth_supported` needs it to tell an OAuth-capable driver (e.g. snowflake)
+        // apart from one that isn't.
+        let driver = body.config.get("driver").and_then(|v| v.as_str());
+        queryflux_core::config::query_auth_supported(Some(&engine), driver, mode)?;
     }
     Ok(())
 }

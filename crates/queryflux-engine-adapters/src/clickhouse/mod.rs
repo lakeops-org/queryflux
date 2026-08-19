@@ -834,6 +834,7 @@ mod tests {
             tls: None,
             max_wait_secs: None,
             max_result_buffer_bytes: None,
+            driver: None,
             auth: None,
             query_auth: None,
         };

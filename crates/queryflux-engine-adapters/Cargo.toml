@@ -29,3 +29,4 @@ adbc_core = "0.23"
 adbc_driver_manager = "0.23"
 r2d2 = "0.8"
 r2d2_adbc = { git = "https://github.com/amitgilad3/r2d2-adbc.git" }
+dashmap = { workspace = true }
