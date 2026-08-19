@@ -77,13 +77,28 @@ pub fn enrich_session_for_passthrough(
     if !matches!(credentials, QueryCredentials::Passthrough) {
         return;
     }
-    if session.extra.contains_key("authorization") {
-        return;
+    // HTTP-shaped (Trino): forward the client's own Authorization, or synthesize one from
+    // an OIDC raw_token if the frontend didn't already capture a header.
+    if !session.extra.contains_key("authorization") {
+        if let Some(token) = &auth_ctx.raw_token {
+            session
+                .extra
+                .insert("authorization".to_string(), format!("Bearer {token}"));
+        }
     }
-    if let Some(token) = &auth_ctx.raw_token {
+    // MySQL-wire-shaped (StarRocks and any future mysql_native consumer): username +
+    // password for COM_CHANGE_USER. Only ever populated when `raw_password` came from a
+    // provider that verified it against the same identity backend the target cluster
+    // authenticates against (LdapAuthProvider) — see `AuthContext::raw_password`.
+    if let Some(password) = &auth_ctx.raw_password {
         session
             .extra
-            .insert("authorization".to_string(), format!("Bearer {token}"));
+            .entry("passthrough_username".to_string())
+            .or_insert_with(|| auth_ctx.user.clone());
+        session
+            .extra
+            .entry("passthrough_password".to_string())
+            .or_insert_with(|| password.clone());
     }
 }
 
@@ -175,6 +190,17 @@ mod tests {
             groups: vec![],
             roles: vec![],
             raw_token: raw_token.map(str::to_string),
+            ..Default::default()
+        }
+    }
+
+    fn auth_ctx_with_password(raw_password: Option<&str>) -> AuthContext {
+        AuthContext {
+            user: "alice".to_string(),
+            groups: vec![],
+            roles: vec![],
+            raw_password: raw_password.map(str::to_string),
+            ..Default::default()
         }
     }
 
@@ -226,5 +252,73 @@ mod tests {
             &auth_ctx(Some("oidc-jwt")),
         );
         assert!(!session.extra.contains_key("authorization"));
+    }
+
+    #[test]
+    fn enrich_injects_mysql_username_and_password_when_raw_password_present() {
+        let mut session = session_with_auth(None);
+        enrich_session_for_passthrough(
+            &mut session,
+            &QueryCredentials::Passthrough,
+            &auth_ctx_with_password(Some("ldap-verified-pw")),
+        );
+        assert_eq!(
+            session
+                .extra
+                .get("passthrough_username")
+                .map(String::as_str),
+            Some("alice")
+        );
+        assert_eq!(
+            session
+                .extra
+                .get("passthrough_password")
+                .map(String::as_str),
+            Some("ldap-verified-pw")
+        );
+    }
+
+    #[test]
+    fn enrich_does_not_inject_mysql_credentials_without_raw_password() {
+        let mut session = session_with_auth(None);
+        enrich_session_for_passthrough(
+            &mut session,
+            &QueryCredentials::Passthrough,
+            &auth_ctx_with_password(None),
+        );
+        assert!(!session.extra.contains_key("passthrough_username"));
+        assert!(!session.extra.contains_key("passthrough_password"));
+    }
+
+    #[test]
+    fn enrich_does_not_overwrite_existing_mysql_passthrough_credentials() {
+        let mut session = session_with_auth(None);
+        session.extra.insert(
+            "passthrough_username".to_string(),
+            "already-set".to_string(),
+        );
+        session.extra.insert(
+            "passthrough_password".to_string(),
+            "already-set-pw".to_string(),
+        );
+        enrich_session_for_passthrough(
+            &mut session,
+            &QueryCredentials::Passthrough,
+            &auth_ctx_with_password(Some("new-pw")),
+        );
+        assert_eq!(
+            session
+                .extra
+                .get("passthrough_username")
+                .map(String::as_str),
+            Some("already-set")
+        );
+        assert_eq!(
+            session
+                .extra
+                .get("passthrough_password")
+                .map(String::as_str),
+            Some("already-set-pw")
+        );
     }
 }

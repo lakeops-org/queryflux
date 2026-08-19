@@ -73,6 +73,7 @@ mod tests {
             groups: vec![],
             roles: vec![],
             raw_token: None,
+            ..Default::default()
         };
         let group = router
             .route(
@@ -108,6 +109,7 @@ mod tests {
             groups: vec![],
             roles: vec![],
             raw_token: None,
+            ..Default::default()
         };
         let group = router
             .route(

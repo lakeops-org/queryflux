@@ -164,6 +164,7 @@ impl TestHarness {
                         endpoint: sr_url,
                         auth: None,
                         pool_size: 2,
+                        query_auth: None,
                     },
                 )
                 .map_err(|e| anyhow!("StarRocks adapter: {e}"))?,
@@ -672,6 +673,7 @@ impl WireTestHarness {
                     endpoint: sr_url,
                     auth: None,
                     pool_size: 2,
+                    query_auth: None,
                 },
             )
             .map_err(|e| anyhow!("StarRocks adapter: {e}"))?,

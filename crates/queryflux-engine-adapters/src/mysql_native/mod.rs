@@ -97,6 +97,70 @@ impl InflightConnGuard {
     }
 }
 
+/// Apply `queryAuth: passthrough` identity via `COM_CHANGE_USER`, using the LDAP-verified
+/// username/password `enrich_session_for_passthrough`
+/// (`queryflux_engine_adapters::wire_auth`) already put into `session.extra`. A no-op for
+/// every other `QueryCredentials` mode.
+///
+/// MySQL wire protocol authenticates the whole connection, not the individual query —
+/// there's no per-statement identity header like Trino's `X-Trino-User` or SQL prefix like
+/// ClickHouse's `EXECUTE AS`. `COM_CHANGE_USER` re-authenticates an existing connection as a
+/// different user instead of opening a new one — the same mechanism ProxySQL itself uses for
+/// per-user backend connections. Requires the pool's base `Opts` to already have
+/// `enable_cleartext_plugin(true)` set (StarRocks LDAP auth negotiates the standard
+/// `mysql_clear_password` plugin), which only happens when the cluster is confirmed to use
+/// TLS — see `StarRocksAdapter::new`.
+///
+/// The re-authenticated connection is **never returned to the shared pool**: `mysql_async`
+/// detects the option change internally and evicts it (see `Conn::change_user` docs), so
+/// this trades connection reuse for correctness — every passthrough query pays a fresh
+/// `COM_CHANGE_USER` handshake, cheaper than a fresh TCP+TLS connection but not free. A
+/// small per-identity reuse cache (mirroring the ADBC/Snowflake sub-pool design) would be
+/// the next step if this becomes a bottleneck.
+///
+/// Fails closed: `Passthrough` with no `passthrough_username`/`passthrough_password` in
+/// `session.extra` is an error, not a silent fall-through to the service account.
+pub async fn apply_passthrough_identity(
+    conn: &mut mysql_async::Conn,
+    credentials: &QueryCredentials,
+    session: &SessionContext,
+) -> Result<()> {
+    if !matches!(credentials, QueryCredentials::Passthrough) {
+        return Ok(());
+    }
+    let (username, password) = passthrough_credentials_from_session(session)?;
+    conn.change_user(
+        mysql_async::ChangeUserOpts::new()
+            .with_user(Some(username))
+            .with_pass(Some(password)),
+    )
+    .await
+    .map_err(|e| QueryFluxError::Auth(format!("mysql_native: COM_CHANGE_USER failed: {e}")))
+}
+
+/// Pure lookup half of [`apply_passthrough_identity`], split out so the fail-closed error
+/// path is testable without a live MySQL connection.
+fn passthrough_credentials_from_session(session: &SessionContext) -> Result<(String, String)> {
+    let missing = || {
+        QueryFluxError::Auth(
+            "passthrough requires a verified username/password (e.g. from LdapAuthProvider) \
+             — none was available"
+                .to_string(),
+        )
+    };
+    let username = session
+        .extra
+        .get("passthrough_username")
+        .cloned()
+        .ok_or_else(missing)?;
+    let password = session
+        .extra
+        .get("passthrough_password")
+        .cloned()
+        .ok_or_else(missing)?;
+    Ok((username, password))
+}
+
 /// Execute `sql` against `pool` and return a stream of `NativeResultChunk`s.
 ///
 /// The connection is acquired, session is set up (USE database, @query_tag), the query
@@ -107,7 +171,7 @@ pub async fn execute(
     pool: &Pool,
     sql: &str,
     session: &SessionContext,
-    _credentials: &QueryCredentials,
+    credentials: &QueryCredentials,
     tags: &QueryTags,
     params: &QueryParams,
     id_slot: &BackendQueryIdSlot,
@@ -117,6 +181,7 @@ pub async fn execute(
         .get_conn()
         .await
         .map_err(|e| QueryFluxError::Engine(format!("mysql_native: connection failed: {e}")))?;
+    apply_passthrough_identity(&mut conn, credentials, session).await?;
     let conn_id = conn.id();
     id_slot.publish(conn_id.to_string());
 
@@ -360,6 +425,49 @@ mod tests {
     use super::*;
     use mysql_async::consts::ColumnType;
     use queryflux_core::params::QueryParam;
+    use std::collections::HashMap;
+
+    // ── passthrough_credentials_from_session ──────────────────────────────────
+
+    fn session_with(pairs: &[(&str, &str)]) -> SessionContext {
+        let mut extra = HashMap::new();
+        for (k, v) in pairs {
+            extra.insert(k.to_string(), v.to_string());
+        }
+        SessionContext {
+            extra,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn passthrough_credentials_extracted_when_both_present() {
+        let session = session_with(&[
+            ("passthrough_username", "alice"),
+            ("passthrough_password", "s3cret"),
+        ]);
+        let (user, pass) = passthrough_credentials_from_session(&session).unwrap();
+        assert_eq!(user, "alice");
+        assert_eq!(pass, "s3cret");
+    }
+
+    #[test]
+    fn passthrough_credentials_fail_closed_without_username() {
+        let session = session_with(&[("passthrough_password", "s3cret")]);
+        assert!(passthrough_credentials_from_session(&session).is_err());
+    }
+
+    #[test]
+    fn passthrough_credentials_fail_closed_without_password() {
+        let session = session_with(&[("passthrough_username", "alice")]);
+        assert!(passthrough_credentials_from_session(&session).is_err());
+    }
+
+    #[test]
+    fn passthrough_credentials_fail_closed_with_neither() {
+        let session = session_with(&[]);
+        assert!(passthrough_credentials_from_session(&session).is_err());
+    }
 
     // ── query_param_to_mysql_value ────────────────────────────────────────────
 

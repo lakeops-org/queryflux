@@ -412,6 +412,7 @@ mod tests {
             groups: vec![],
             roles: vec![],
             raw_token: None,
+            ..Default::default()
         }
     }
 
@@ -421,6 +422,7 @@ mod tests {
             groups: groups.iter().map(|s| s.to_string()).collect(),
             roles: roles.iter().map(|s| s.to_string()).collect(),
             raw_token: None,
+            ..Default::default()
         }
     }
 

@@ -245,6 +245,7 @@ mod tests {
             groups: vec![],
             roles: vec![],
             raw_token: raw_token.map(str::to_string),
+            ..Default::default()
         }
     }
 
