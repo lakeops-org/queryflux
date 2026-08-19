@@ -29,6 +29,11 @@ const config: Config = {
 
   onBrokenLinks: 'throw',
 
+  markdown: {
+    mermaid: true,
+  },
+  themes: ['@docusaurus/theme-mermaid'],
+
   // https://docusaurus.io/docs/seo — global <head> injection
   headTags: [
     {
