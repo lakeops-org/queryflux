@@ -24,7 +24,7 @@ pub struct Credentials {
 /// This is the canonical subject for all downstream decisions:
 /// routing (identity-aware routers), authorization (OpenFGA / allow-lists),
 /// audit logs, and backend credential resolution.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AuthContext {
     /// Canonical username. Never empty — `NoneAuthProvider` falls back to `"anonymous"`.
     pub user: String,
@@ -37,6 +37,17 @@ pub struct AuthContext {
     /// The original JWT, kept for `tokenExchange` backend mode.
     /// `None` when using `NoneAuthProvider` or `StaticAuthProvider`.
     pub raw_token: Option<String>,
+    /// The verified plaintext password, kept only for `passthrough` on MySQL-wire backends
+    /// (StarRocks LDAP `COM_CHANGE_USER` — see `mysql_native::apply_passthrough_identity`).
+    ///
+    /// **Only ever set by a provider that just verified this password against the same
+    /// identity backend a `passthrough` cluster would also authenticate against** —
+    /// currently `LdapAuthProvider` only. `StaticAuthProvider` deliberately leaves this
+    /// `None` even though it also sees a password: its password map is QueryFlux's own
+    /// local config, not necessarily valid against any backend, so treating it as
+    /// forwardable would be a real vulnerability, not just a missed optimization.
+    #[serde(default, skip_serializing)]
+    pub raw_password: Option<String>,
 }
 
 /// Reject poll/cancel/dequeue when the caller is not the query owner.
@@ -111,6 +122,7 @@ mod tests {
             groups: vec![],
             roles: vec![],
             raw_token: None,
+            ..Default::default()
         }
     }
 

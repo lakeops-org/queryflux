@@ -63,6 +63,7 @@ mod tests {
             groups: groups.iter().map(|g| g.to_string()).collect(),
             roles: vec![],
             raw_token: None,
+            ..Default::default()
         }
     }
 

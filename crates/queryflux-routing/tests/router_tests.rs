@@ -741,6 +741,7 @@ async fn compound_user_prefers_auth_context_over_session_header() {
         groups: vec![],
         roles: vec![],
         raw_token: None,
+        ..Default::default()
     };
     let result = router
         .route(
@@ -886,6 +887,7 @@ def route(query, ctx):
         groups: vec!["admins".to_string()],
         roles: vec![],
         raw_token: None,
+        ..Default::default()
     };
     let out = router
         .route(

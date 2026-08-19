@@ -65,11 +65,18 @@ pub struct StarRocksConfig {
     pub endpoint: String,
     pub auth: Option<ClusterAuth>,
     pub pool_size: usize,
+    /// `passthrough` (dedicated per-query LDAP connection — see
+    /// `mysql_native::open_passthrough_connection`) or `None`/`serviceAccount` —
+    /// `impersonate`/`tokenExchange` are already rejected by `query_auth_supported` before
+    /// construction.
+    pub query_auth: Option<queryflux_core::config::QueryAuthConfig>,
 }
 
 impl crate::EngineConfigParseable for StarRocksConfig {
     fn from_json(json: &serde_json::Value, cluster_name: &str) -> crate::Result<Self> {
-        use queryflux_core::engine_registry::{json_str, parse_auth_from_config_json};
+        use queryflux_core::engine_registry::{
+            json_str, parse_auth_from_config_json, parse_query_auth_from_config_json,
+        };
         let endpoint = json_str(json, "endpoint").ok_or_else(|| {
             queryflux_core::error::QueryFluxError::Engine(format!(
                 "cluster '{cluster_name}': missing endpoint"
@@ -87,11 +94,17 @@ impl crate::EngineConfigParseable for StarRocksConfig {
                 )));
             }
         }
+        let query_auth = parse_query_auth_from_config_json(json).map_err(|e| {
+            queryflux_core::error::QueryFluxError::Engine(format!(
+                "cluster '{cluster_name}': invalid queryAuth ({e})"
+            ))
+        })?;
         let pool_size = parse_pool_size_from_json(json, cluster_name)?;
         Ok(Self {
             endpoint,
             auth,
             pool_size,
+            query_auth,
         })
     }
 
@@ -112,6 +125,7 @@ impl crate::EngineConfigParseable for StarRocksConfig {
             endpoint,
             auth: cfg.auth.clone(),
             pool_size: cfg.pool_size.unwrap_or(DEFAULT_STARROCKS_POOL_SIZE).max(1),
+            query_auth: cfg.query_auth.clone(),
         })
     }
 }
@@ -134,6 +148,10 @@ pub struct StarRocksAdapter {
     pool: Pool,
     /// Dedicated 1×1 pool for `health_check` so probes do not compete with query traffic.
     control_pool: Pool,
+    /// Base connection options (endpoint, TLS, `enable_cleartext_plugin`) with no user/pass
+    /// override — cloned and given a per-user `user`/`pass` by
+    /// `mysql_native::open_passthrough_connection` for `queryAuth: passthrough` queries.
+    base_opts: Opts,
     /// Connection ids that currently own an in-flight query. `cancel_query`
     /// skips `KILL QUERY` once the id is released (connection back in the pool).
     inflight: crate::mysql_native::InflightConnIds,
@@ -145,6 +163,19 @@ impl StarRocksAdapter {
         group_name: ClusterGroupName,
         config: StarRocksConfig,
     ) -> Result<Self> {
+        // `passthrough` opens a dedicated connection per query authenticated directly as
+        // the target user, using a real StarRocks/LDAP password (see
+        // `mysql_native::open_passthrough_connection`). That requires the
+        // `mysql_clear_password` plugin (StarRocks LDAP auth negotiates it), which sends
+        // the password with no hashing or encryption at the MySQL protocol layer — safe
+        // only over TLS. `enable_cleartext_plugin` is therefore gated on the endpoint
+        // already requesting TLS (`?require_ssl=true`), checked once below against the
+        // built `Opts`, not assumed.
+        let requires_passthrough = matches!(
+            config.query_auth,
+            Some(queryflux_core::config::QueryAuthConfig::Passthrough)
+        );
+
         let make_builder = || -> Result<OptsBuilder> {
             // Always disable Unix socket preference — StarRocks doesn't support the
             // `@@socket` system variable that mysql_async queries when prefer_socket=true.
@@ -157,6 +188,9 @@ impl StarRocksAdapter {
             let mut b = OptsBuilder::from_opts(base_opts).prefer_socket(false);
             if let Some(ClusterAuth::Basic { username, password }) = &config.auth {
                 b = b.user(Some(username.clone())).pass(Some(password.clone()));
+            }
+            if requires_passthrough {
+                b = b.enable_cleartext_plugin(true);
             }
             Ok(b)
         };
@@ -180,6 +214,16 @@ impl StarRocksAdapter {
                 .clone()
                 .pool_opts(pool_opts_for(config.pool_size)?),
         );
+        if requires_passthrough && main_opts.ssl_opts().is_none() {
+            return Err(QueryFluxError::Engine(format!(
+                "cluster '{}': queryAuth: passthrough requires TLS on the StarRocks endpoint \
+                 (add ?require_ssl=true to the connection URL) — LDAP passthrough sends the \
+                 password in cleartext at the MySQL protocol layer and must not run \
+                 unencrypted",
+                cluster_name.0
+            )));
+        }
+        let base_opts = main_opts.clone();
         let pool = Pool::new(main_opts);
 
         let control_opts = Opts::from(make_builder()?.pool_opts(pool_opts_for(1)?));
@@ -190,6 +234,7 @@ impl StarRocksAdapter {
             group_name,
             pool,
             control_pool,
+            base_opts,
             inflight: crate::mysql_native::InflightConnIds::default(),
         })
     }
@@ -414,6 +459,7 @@ impl SyncAdapter for StarRocksAdapter {
     ) -> crate::Result<crate::NativeExecution> {
         crate::mysql_native::execute(
             &self.pool,
+            &self.base_opts,
             sql,
             session,
             credentials,
@@ -475,16 +521,30 @@ impl SyncAdapter for StarRocksAdapter {
         Ok(())
     }
 
+    // `credentials` is `ServiceAccount` or `Passthrough` here — `query_auth_supported`
+    // rejects `impersonate`/`tokenExchange` for StarRocks at startup (StarRocks' JWT MySQL
+    // auth plugin is a separate, confirmed-infeasible path for `mysql_async` — see
+    // auth-authz-design.md "StarRocks"). `Passthrough` here means a dedicated per-query
+    // LDAP connection, opened by `open_passthrough_connection` below.
     async fn execute_as_arrow(
         &self,
         sql: &str,
         session: &SessionContext,
-        _credentials: &queryflux_auth::QueryCredentials,
+        credentials: &queryflux_auth::QueryCredentials,
         tags: &QueryTags,
         params: &queryflux_core::params::QueryParams,
         id_slot: &BackendQueryIdSlot,
     ) -> Result<SyncExecution> {
-        let mut conn = self.acquire_conn().await?;
+        let mut conn = match crate::mysql_native::open_passthrough_connection(
+            &self.base_opts,
+            credentials,
+            session,
+        )
+        .await?
+        {
+            Some(conn) => conn,
+            None => self.acquire_conn().await?,
+        };
         let conn_id = conn.id();
         id_slot.publish(conn_id.to_string());
 
@@ -1020,5 +1080,59 @@ mod tests {
         assert!(kill_query_sql("12; DROP").is_none());
         assert!(kill_query_sql("-1").is_none());
         assert!(kill_query_sql("1e2").is_none());
+    }
+
+    // ── passthrough requires TLS ──────────────────────────────────────────────
+    // `mysql_async::Pool::new` doesn't eagerly connect, so these construct a real
+    // `StarRocksAdapter` against an unreachable host without needing a live server.
+
+    fn config(
+        endpoint: &str,
+        query_auth: Option<queryflux_core::config::QueryAuthConfig>,
+    ) -> StarRocksConfig {
+        StarRocksConfig {
+            endpoint: endpoint.to_string(),
+            auth: None,
+            pool_size: 1,
+            query_auth,
+        }
+    }
+
+    #[test]
+    fn passthrough_without_tls_is_rejected_at_construction() {
+        let cfg = config(
+            "mysql://svc@127.0.0.1:1/db",
+            Some(queryflux_core::config::QueryAuthConfig::Passthrough),
+        );
+        let result =
+            StarRocksAdapter::new(ClusterName("sr".into()), ClusterGroupName("g".into()), cfg);
+        match result {
+            Ok(_) => panic!("passthrough without require_ssl must fail construction"),
+            Err(e) => assert!(
+                e.to_string().contains("TLS"),
+                "expected a TLS-requirement error, got: {e}"
+            ),
+        }
+    }
+
+    #[test]
+    fn passthrough_with_require_ssl_is_accepted_at_construction() {
+        let cfg = config(
+            "mysql://svc@127.0.0.1:1/db?require_ssl=true",
+            Some(queryflux_core::config::QueryAuthConfig::Passthrough),
+        );
+        assert!(
+            StarRocksAdapter::new(ClusterName("sr".into()), ClusterGroupName("g".into()), cfg)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn service_account_does_not_require_tls() {
+        let cfg = config("mysql://svc@127.0.0.1:1/db", None);
+        assert!(
+            StarRocksAdapter::new(ClusterName("sr".into()), ClusterGroupName("g".into()), cfg)
+                .is_ok()
+        );
     }
 }

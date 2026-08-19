@@ -1280,6 +1280,17 @@ pub fn query_auth_supported(
              access_control_improvements.allow_impersonate_user = 1 and GRANT IMPERSONATE — \
              not supported on ClickHouse Cloud)"
         )),
+        // `passthrough` here means LDAP-password `COM_CHANGE_USER`, not a bearer token —
+        // see `mysql_native::apply_passthrough_identity`. Only valid when the cluster's own
+        // TLS + `enable_cleartext_plugin` requirements are met; the adapter constructor
+        // (`StarRocksAdapter::new`) enforces that, not this function (it doesn't have the
+        // connection URL). `impersonate`/`tokenExchange` have no StarRocks mechanism.
+        Some(EngineConfig::StarRocks) if matches!(mode, QueryAuthConfig::Passthrough) => Ok(()),
+        Some(EngineConfig::StarRocks) => Err(format!(
+            "queryAuth.type = {mode_name} is not supported for StarRocks in this release \
+             (only passthrough, which requires TLS on the cluster endpoint — see \
+             auth-authz-design.md \"StarRocks\")"
+        )),
         Some(EngineConfig::Adbc)
             if matches!(mode, QueryAuthConfig::TokenExchange(_))
                 && driver.is_some_and(|d| ADBC_TOKEN_EXCHANGE_DRIVERS.contains(&d)) =>
@@ -1299,8 +1310,8 @@ pub fn query_auth_supported(
                 .unwrap_or_else(|| "<unknown>".to_string());
             Err(format!(
                 "queryAuth.type = {mode_name} is only supported for Trino, ClickHouse \
-                 (impersonate only), and ADBC/snowflake (tokenExchange only) in this release, \
-                 got {engine_name}"
+                 (impersonate only), StarRocks (passthrough only), and ADBC/snowflake \
+                 (tokenExchange only) in this release, got {engine_name}"
             ))
         }
     }
@@ -1642,6 +1653,57 @@ mod tests {
                 "an unknown engine should not support {mode:?}"
             );
         }
+    }
+
+    #[test]
+    fn duckdb_and_athena_are_service_account_only() {
+        // No per-user identity concept (DuckDB embedded, Athena IAM) — neither gets any
+        // mode beyond serviceAccount in this release.
+        for engine in [
+            EngineConfig::DuckDb,
+            EngineConfig::DuckDbHttp,
+            EngineConfig::Athena,
+        ] {
+            for mode in [
+                QueryAuthConfig::Passthrough,
+                QueryAuthConfig::Impersonate,
+                token_exchange_mode(),
+            ] {
+                assert!(
+                    query_auth_supported(Some(&engine), None, &mode).is_err(),
+                    "{engine:?} should not support {mode:?} in this release"
+                );
+            }
+            assert!(
+                query_auth_supported(Some(&engine), None, &QueryAuthConfig::ServiceAccount).is_ok()
+            );
+        }
+    }
+
+    #[test]
+    fn starrocks_allows_only_passthrough() {
+        assert!(query_auth_supported(
+            Some(&EngineConfig::StarRocks),
+            None,
+            &QueryAuthConfig::Passthrough
+        )
+        .is_ok());
+        assert!(query_auth_supported(
+            Some(&EngineConfig::StarRocks),
+            None,
+            &QueryAuthConfig::Impersonate
+        )
+        .is_err());
+        assert!(
+            query_auth_supported(Some(&EngineConfig::StarRocks), None, &token_exchange_mode())
+                .is_err()
+        );
+        assert!(query_auth_supported(
+            Some(&EngineConfig::StarRocks),
+            None,
+            &QueryAuthConfig::ServiceAccount
+        )
+        .is_ok());
     }
 
     #[test]

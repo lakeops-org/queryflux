@@ -2137,6 +2137,7 @@ mod queue_limit_tests {
             groups: vec![],
             roles: vec![],
             raw_token: None,
+            ..Default::default()
         };
         let group = ClusterGroupName("default".into());
 
@@ -2191,6 +2192,7 @@ mod queue_limit_tests {
             groups: vec![],
             roles: vec![],
             raw_token: None,
+            ..Default::default()
         };
         let group = ClusterGroupName("default".into());
         let id = ProxyQueryId::new();
@@ -2268,6 +2270,7 @@ mod queue_limit_tests {
             groups: vec![],
             roles: vec![],
             raw_token: None,
+            ..Default::default()
         };
         let group = ClusterGroupName("default".into());
 
@@ -2363,6 +2366,7 @@ mod capacity_wait_tests {
             groups: vec![],
             roles: vec![],
             raw_token: None,
+            ..Default::default()
         };
         let started = Instant::now();
         let result = setup_sync_query(

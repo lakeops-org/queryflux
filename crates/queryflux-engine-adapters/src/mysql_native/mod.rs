@@ -30,6 +30,10 @@ use crate::{BackendQueryIdSlot, NativeExecution};
 /// Number of rows per `NativeResultChunk`. Balances channel overhead vs. memory.
 const BATCH_SIZE: usize = 1_000;
 
+/// Bound on opening a `queryAuth: passthrough` connection — see
+/// [`open_passthrough_connection`].
+const PASSTHROUGH_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Pooled MySQL connection ids that currently own an in-flight query.
 ///
 /// `KILL QUERY <connection_id>` is only safe while this set contains the id.
@@ -97,6 +101,97 @@ impl InflightConnGuard {
     }
 }
 
+/// For `queryAuth: passthrough`, open a **new** connection authenticated directly as the
+/// target user (`base_opts` with `user`/`pass` overridden from the LDAP-verified values
+/// `enrich_session_for_passthrough` — `queryflux_engine_adapters::wire_auth` — already put
+/// into `session.extra`). Returns `Ok(None)` for every other `QueryCredentials` mode, so the
+/// caller falls back to checking out a connection from the shared service-account pool.
+///
+/// MySQL wire protocol authenticates the whole connection, not the individual query —
+/// there's no per-statement identity header like Trino's `X-Trino-User` or SQL prefix like
+/// ClickHouse's `EXECUTE AS`.
+///
+/// **This used to be `COM_CHANGE_USER` on a pooled connection** — the mechanism ProxySQL
+/// itself uses for per-user backend connections, and cheaper in principle. A live-StarRocks
+/// integration test caught a real `mysql_async` bug in that path: when `COM_CHANGE_USER` has
+/// to switch auth plugins mid-flight (the pooled connection negotiated one plugin at its own
+/// handshake; the target user's `mysql_clear_password` — what StarRocks LDAP auth uses —
+/// differs), the call reports `Ok(())` but leaves the connection's packet sequence counter
+/// desynchronized: every query afterward fails with `packet out of order`. Reproduced with a
+/// minimal repro against real StarRocks; a target user needing the *same* plugin the pool
+/// already negotiated (verified with a plain-password StarRocks user) was unaffected — which
+/// is exactly why a change_user test against plain MySQL (`caching_sha2_password`
+/// throughout, no plugin switch ever needed) didn't catch it. A **fresh** connection
+/// authenticated directly as the target user has no such bug — confirmed against the same
+/// live server. Requires `base_opts` to already have `enable_cleartext_plugin(true)` set
+/// (only happens when the cluster is confirmed to use TLS — see `StarRocksAdapter::new`).
+///
+/// Cost: every passthrough query pays a fresh connection handshake instead of reusing a
+/// pooled one — in practice the same cost `COM_CHANGE_USER` already had, since a
+/// re-authenticated connection was never returned to the shared pool either (`mysql_async`
+/// evicts it once its options change). A small per-identity reuse cache (mirroring the
+/// ADBC/Snowflake sub-pool design) would be the next step if this becomes a bottleneck.
+///
+/// Fails closed: `Passthrough` with no `passthrough_username`/`passthrough_password` in
+/// `session.extra` is an error, not a silent fall-through to the service account.
+///
+/// Bounded by [`PASSTHROUGH_CONNECT_TIMEOUT`] — unlike the shared pool (whose checkout is
+/// already timeout-wrapped by each adapter, e.g. `StarRocksAdapter::acquire_conn`), nothing
+/// else protects this call. Left unbounded, a slow or unreachable identity backend on the
+/// server side (StarRocks' LDAP bind happens FE-side during the handshake this call
+/// performs) would hang the query indefinitely instead of failing it.
+pub async fn open_passthrough_connection(
+    base_opts: &mysql_async::Opts,
+    credentials: &QueryCredentials,
+    session: &SessionContext,
+) -> Result<Option<mysql_async::Conn>> {
+    if !matches!(credentials, QueryCredentials::Passthrough) {
+        return Ok(None);
+    }
+    let (username, password) = passthrough_credentials_from_session(session)?;
+    let opts = mysql_async::Opts::from(
+        mysql_async::OptsBuilder::from_opts(base_opts.clone())
+            .user(Some(username))
+            .pass(Some(password)),
+    );
+    let conn = tokio::time::timeout(PASSTHROUGH_CONNECT_TIMEOUT, mysql_async::Conn::new(opts))
+        .await
+        .map_err(|_| {
+            QueryFluxError::Auth(format!(
+                "mysql_native: passthrough connection timed out after {}s (the target \
+                 user's identity backend — e.g. LDAP — may be slow or unreachable)",
+                PASSTHROUGH_CONNECT_TIMEOUT.as_secs()
+            ))
+        })?
+        .map_err(|e| {
+            QueryFluxError::Auth(format!("mysql_native: passthrough connection failed: {e}"))
+        })?;
+    Ok(Some(conn))
+}
+
+/// Pure lookup half of [`open_passthrough_connection`], split out so the fail-closed error
+/// path is testable without a live MySQL connection.
+fn passthrough_credentials_from_session(session: &SessionContext) -> Result<(String, String)> {
+    let missing = || {
+        QueryFluxError::Auth(
+            "passthrough requires a verified username/password (e.g. from LdapAuthProvider) \
+             — none was available"
+                .to_string(),
+        )
+    };
+    let username = session
+        .extra
+        .get("passthrough_username")
+        .cloned()
+        .ok_or_else(missing)?;
+    let password = session
+        .extra
+        .get("passthrough_password")
+        .cloned()
+        .ok_or_else(missing)?;
+    Ok((username, password))
+}
+
 /// Execute `sql` against `pool` and return a stream of `NativeResultChunk`s.
 ///
 /// The connection is acquired, session is set up (USE database, @query_tag), the query
@@ -105,18 +200,22 @@ impl InflightConnGuard {
 #[allow(clippy::too_many_arguments)]
 pub async fn execute(
     pool: &Pool,
+    base_opts: &mysql_async::Opts,
     sql: &str,
     session: &SessionContext,
-    _credentials: &QueryCredentials,
+    credentials: &QueryCredentials,
     tags: &QueryTags,
     params: &QueryParams,
     id_slot: &BackendQueryIdSlot,
     inflight: &InflightConnIds,
 ) -> Result<NativeExecution> {
-    let mut conn = pool
-        .get_conn()
-        .await
-        .map_err(|e| QueryFluxError::Engine(format!("mysql_native: connection failed: {e}")))?;
+    let mut conn = match open_passthrough_connection(base_opts, credentials, session).await? {
+        Some(conn) => conn,
+        None => pool
+            .get_conn()
+            .await
+            .map_err(|e| QueryFluxError::Engine(format!("mysql_native: connection failed: {e}")))?,
+    };
     let conn_id = conn.id();
     id_slot.publish(conn_id.to_string());
 
@@ -360,6 +459,104 @@ mod tests {
     use super::*;
     use mysql_async::consts::ColumnType;
     use queryflux_core::params::QueryParam;
+    use std::collections::HashMap;
+
+    // ── passthrough_credentials_from_session ──────────────────────────────────
+
+    fn session_with(pairs: &[(&str, &str)]) -> SessionContext {
+        let mut extra = HashMap::new();
+        for (k, v) in pairs {
+            extra.insert(k.to_string(), v.to_string());
+        }
+        SessionContext {
+            extra,
+            ..Default::default()
+        }
+    }
+
+    // ── open_passthrough_connection timeout ───────────────────────────────────
+
+    /// Proves `PASSTHROUGH_CONNECT_TIMEOUT` actually bounds the call, rather than trusting
+    /// that wrapping it in `tokio::time::timeout` was wired correctly. A raw listener that
+    /// accepts the TCP connection but never sends the MySQL handshake simulates a hung
+    /// identity backend (e.g. StarRocks blocked on a slow LDAP bind) — without this test,
+    /// this exact class of gap (a genuinely blocking/hanging call left unbounded) is what
+    /// slipped through review earlier in this same file's history.
+    ///
+    /// Slow by design (~`PASSTHROUGH_CONNECT_TIMEOUT`, currently 10s) — bounded from above
+    /// by an outer test-level timeout so a regression hangs the test suite for a fixed
+    /// window instead of forever.
+    #[tokio::test]
+    async fn open_passthrough_connection_times_out_on_a_hung_server() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            // Accept and hold the connection open, but never write the MySQL handshake —
+            // the client will sit waiting for server greeting bytes that never arrive.
+            if let Ok((socket, _)) = listener.accept().await {
+                std::future::pending::<()>().await;
+                drop(socket);
+            }
+        });
+
+        let base_opts = mysql_async::Opts::from(
+            mysql_async::OptsBuilder::default()
+                .ip_or_hostname(addr.ip().to_string())
+                .tcp_port(addr.port()),
+        );
+        let session = session_with(&[
+            ("passthrough_username", "alice"),
+            ("passthrough_password", "alice-password"),
+        ]);
+
+        let started = std::time::Instant::now();
+        let result = tokio::time::timeout(
+            PASSTHROUGH_CONNECT_TIMEOUT + std::time::Duration::from_secs(5),
+            open_passthrough_connection(&base_opts, &QueryCredentials::Passthrough, &session),
+        )
+        .await
+        .expect("open_passthrough_connection itself must return well within the outer bound — if this fires, the inner timeout isn't bounding the call at all");
+
+        assert!(
+            result.is_err(),
+            "a hung server must surface as an error, not a successful connection"
+        );
+        assert!(
+            started.elapsed() >= PASSTHROUGH_CONNECT_TIMEOUT,
+            "should not return before the configured timeout elapses"
+        );
+    }
+
+    #[test]
+    fn passthrough_credentials_extracted_when_both_present() {
+        let session = session_with(&[
+            ("passthrough_username", "alice"),
+            ("passthrough_password", "s3cret"),
+        ]);
+        let (user, pass) = passthrough_credentials_from_session(&session).unwrap();
+        assert_eq!(user, "alice");
+        assert_eq!(pass, "s3cret");
+    }
+
+    #[test]
+    fn passthrough_credentials_fail_closed_without_username() {
+        let session = session_with(&[("passthrough_password", "s3cret")]);
+        assert!(passthrough_credentials_from_session(&session).is_err());
+    }
+
+    #[test]
+    fn passthrough_credentials_fail_closed_without_password() {
+        let session = session_with(&[("passthrough_username", "alice")]);
+        assert!(passthrough_credentials_from_session(&session).is_err());
+    }
+
+    #[test]
+    fn passthrough_credentials_fail_closed_with_neither() {
+        let session = session_with(&[]);
+        assert!(passthrough_credentials_from_session(&session).is_err());
+    }
 
     // ── query_param_to_mysql_value ────────────────────────────────────────────
 

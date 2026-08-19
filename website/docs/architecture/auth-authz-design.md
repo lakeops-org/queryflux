@@ -87,7 +87,7 @@ clusters:
 |--------|:---:|:---:|:---:|:---:|
 | Trino | ✅ | ✅ | ✅ `X-Trino-User` (needs Trino file-based ACL) | ✅ |
 | ClickHouse | ✅ | ❌ not yet wired | ✅ `EXECUTE AS` (self-hosted 25.11+ only, see below) | ❌ not yet wired |
-| StarRocks (MySQL wire) | ✅ | ❌ no wire mechanism | ❌ no wire mechanism | ❌ no wire mechanism |
+| StarRocks (MySQL wire) | ✅ | ✅ dedicated per-query LDAP connection (requires TLS; see below) | ❌ no wire mechanism | ❌ no wire mechanism |
 | StarRocks (HTTP, future) | ✅ | — | — | — |
 | Snowflake (ADBC) | ✅ | ❌ not yet wired | ❌ | ✅ per-identity connection pool |
 | Databricks (ADBC, future) | ✅ | ❌ not yet wired | ❌ | ❌ not yet wired |
@@ -519,11 +519,14 @@ Use Type 1 credentials (`cluster.auth`) for query execution. User identity is kn
 
 Works for all engines. Default when `queryAuth` is omitted.
 
-### Mode: `passthrough` (Trino only in this release)
+### Mode: `passthrough` (Trino, StarRocks)
 
-Forward the client's own credential unchanged: the value already captured in `SessionContext.extra["authorization"]` (the client's original header), or — if that's missing but the frontend authenticated via OIDC — a `Bearer {auth_ctx.raw_token}` injected by dispatch before the adapter sees the request. The backend authenticates the user's own token; QueryFlux does not vouch for the identity beyond forwarding it.
+Forward the client's own credential unchanged. The shape of "the client's own credential" is engine-specific — `enrich_session_for_passthrough` (`queryflux-engine-adapters::wire_auth`) populates both shapes from `AuthContext` before the adapter runs, and each adapter reads whichever one applies:
 
-**Fails closed:** if neither a forwarded header nor a `raw_token` is available, the query is rejected with an auth error rather than silently falling back to `serviceAccount`.
+- **Trino (HTTP-shaped):** the value already captured in `SessionContext.extra["authorization"]` (the client's original header), or — if that's missing but the frontend authenticated via OIDC — a `Bearer {auth_ctx.raw_token}` injected by dispatch. The backend authenticates the user's own token; QueryFlux does not vouch for the identity beyond forwarding it.
+- **StarRocks (MySQL-wire-shaped):** `session.extra["passthrough_username"]`/`["passthrough_password"]`, sourced from `AuthContext.raw_password` (only ever populated by `LdapAuthProvider`, which just verified it via a real LDAP bind) and used to open a dedicated connection directly as that user — see "StarRocks" below for why this shape is necessary, what it costs, and why it's a fresh connection rather than `COM_CHANGE_USER` on a pooled one.
+
+**Fails closed:** if the engine-appropriate credential isn't available, the query is rejected with an auth error rather than silently falling back to `serviceAccount`.
 
 Startup validation rejects `passthrough` for engines whose adapters don't yet consume `QueryCredentials` — see the compatibility table above.
 
@@ -621,23 +624,36 @@ Poll and cancel requests don't repeat the client's original headers, so the reso
 ## Engine-Specific Notes
 
 ### ClickHouse
-- No JWT/OIDC support; no impersonation mechanism
-- `X-ClickHouse-User` + `X-ClickHouse-Key` are full auth credentials (username + password), not impersonation headers
-- Only viable `queryAuth`: `serviceAccount`
-- ClickHouse Cloud: further restricted to password-only (no LDAP/Kerberos/cert)
+- No JWT/OIDC support; `X-ClickHouse-User` + `X-ClickHouse-Key` are full auth credentials (username + password), not impersonation headers — there is no trusted-proxy header on this engine
+- `impersonate` **is** viable via the `EXECUTE AS {user} {sql}` SQL statement — see "Mode: `impersonate`" above for the version/config/grant requirements (self-hosted ClickHouse 25.11+ only)
+- `passthrough`/`tokenExchange`: not wired in this release
+- ClickHouse Cloud: further restricted to password-only (no LDAP/Kerberos/cert), and does not support `EXECUTE AS` at all — `impersonate` is a self-hosted-only capability here
 
-**Trino HTTP frontend → ClickHouse backend:** Gateway **auth** still produces `AuthContext` (who the analyst is for authz and audit). Gateway **queryAuth** for the ClickHouse cluster resolves to **Type 1 service credentials** only. ClickHouse sees the service user, not the Trino username — unless operators add a custom integration (password mirroring, external authenticator). This is expected for heterogeneous routing.
+**Trino HTTP frontend → ClickHouse backend, `serviceAccount`:** Gateway **auth** still produces `AuthContext` (who the analyst is for authz and audit). Gateway **queryAuth** for the ClickHouse cluster resolves to **Type 1 service credentials** only. ClickHouse sees the service user, not the Trino username, unless `queryAuth: impersonate` is configured (see above) or operators add a custom integration (password mirroring, external authenticator).
 
 ### StarRocks
-- MySQL wire (port 9030, current adapter): password-based only; `serviceAccount` is the only option
-- HTTP API (ports 8030/8040, future adapter): StarRocks natively supports JWT and OAuth 2.0; a future HTTP adapter could use implicit header forwarding when StarRocks and QueryFlux share an IdP. This is a motivation for the HTTP adapter — it enables per-user identity for StarRocks Ranger policies
-- No impersonation mechanism exists on either interface
+- MySQL wire (port 9030, current adapter): `serviceAccount` always works. `passthrough` is wired via a dedicated per-query LDAP connection — see below. No impersonation mechanism (no `EXECUTE AS`-equivalent) exists on this protocol; `impersonate` is not viable for StarRocks.
+- **`passthrough` (LDAP `authentication_ldap_simple`) — wired, verified against a real StarRocks+LDAP server, gated on TLS:**
+  - MySQL wire protocol authenticates the *whole connection*, not the individual query — there's no per-statement identity header (Trino) or SQL prefix (ClickHouse). The only way to make StarRocks enforce a specific user's permissions is a connection actually authenticated as that user.
+  - **Mechanism: a dedicated connection per passthrough query, opened directly with the target user's LDAP credentials** (`mysql_native::open_passthrough_connection`) — not `COM_CHANGE_USER` on a pooled connection. That was the original design (the same mechanism [ProxySQL](https://proxysql.com/) uses for per-user backend connections, and cheaper in principle), until a live-StarRocks integration test caught a real `mysql_async` bug: `change_user` to an LDAP user reported `Ok(())` but left the connection's packet sequence counter desynchronized — every query afterward failed with `packet out of order`. Root cause, isolated with a minimal repro: `COM_CHANGE_USER` needing to switch auth plugins mid-flight (the pooled connection's own plugin vs. the target user's `mysql_clear_password`) breaks specifically in `mysql_async`'s auth-switch-during-change-user handling — a `change_user` to a plain-password user needing no plugin switch worked fine, and so did a *fresh* connection authenticated directly as the LDAP user. Fixed by using the fresh-connection approach, confirmed against the same live server (including that StarRocks actually enforces the target user's real, distinct grants — not just reports their name).
+  - StarRocks LDAP auth negotiates the standard `mysql_clear_password` plugin — confirmed via StarRocks' own docs — which `mysql_async` also supports, gated behind `enable_cleartext_plugin(true)`.
+  - **Sends the password with no hashing or encryption at the MySQL protocol layer.** `StarRocksAdapter::new` refuses to start a `passthrough`-configured cluster unless the endpoint URL already requests TLS (`?require_ssl=true`) — checked against the built `mysql_async::Opts`, not assumed.
+  - Cost: every passthrough query pays a fresh connection handshake — in practice the same cost the original `change_user` design already had, since a re-authenticated connection was never returned to the shared pool either. A per-identity reuse cache (mirroring the ADBC/Snowflake sub-pool) is the natural next step if this becomes a bottleneck.
+  - `AuthContext.raw_password` — new, and populated **only** by `LdapAuthProvider` (the password was just verified by a real LDAP bind). `StaticAuthProvider` deliberately never populates it: its password map is QueryFlux's own local config, not necessarily valid against any backend.
+  - Bounded by a 10s connect timeout (`mysql_native::PASSTHROUGH_CONNECT_TIMEOUT`) — a slow or unreachable LDAP server (StarRocks binds to LDAP FE-side, during the handshake this call performs) fails the query instead of hanging it indefinitely. Verified with a test that actually forces the timeout to fire (a raw listener that accepts the TCP connection but never completes the handshake), not just that the code compiles.
+  - **Operator requirement: the service account (`cluster.auth`) needs StarRocks' `OPERATE` system privilege.** `cancel_query` issues `KILL QUERY` from the service account's own connection, but StarRocks requires `OPERATE` to kill a query owned by a *different* user — which every passthrough query is, from the service account's point of view. Without it, cancelling a passthrough query fails silently (the existing `KILL QUERY` error path is best-effort/logged only, matching how backend-side cancel failures are handled for every engine) — the client believes the query is cancelled while it keeps running server-side.
+- **StarRocks 3.5+'s JWT MySQL auth (`authentication_jwt` on the user, `authentication_openid-connect_client` plugin on the wire) is verified infeasible for `mysql_native` as built — this is the mechanism that stays undone, not LDAP.** Checked both sides:
+  - StarRocks' own docs specify the client must implement the `authentication_openid-connect-client` plugin and pass the token via `--authentication-openid-connect-client-id-token-file=<path>` — Oracle's official `mysql` CLI **9.2+** does this; it is a vendor-specific extension, not standard MySQL wire protocol.
+  - `mysql_async` 0.36.1 hardcodes exactly five auth plugins (`mysql_native_password`, `caching_sha2_password`, `mysql_old_password`, `mysql_clear_password`, `ed25519`). Confirmed at the source level: any other plugin name — including StarRocks' JWT plugin — falls into `AuthPlugin::Other`, whose `gen_data()` returns `None` (mysql_common `packets/mod.rs`) and whose continuation-handshake arm returns `DriverError::UnknownAuthPlugin` outright (mysql_async `conn/mod.rs`). The connection attempt fails immediately; there is no configuration path around this, unlike LDAP's `mysql_clear_password`.
+  - Making this work means implementing an undocumented (from `mysql_async`'s side) vendor protocol extension — either patching/forking `mysql_async` or hand-rolling this part of the MySQL wire protocol.
+- HTTP API (ports 8030/8040, future adapter): StarRocks natively supports JWT and OAuth 2.0 over this interface too; a future HTTP adapter could use implicit header forwarding when StarRocks and QueryFlux share an IdP — the likely path to JWT-based StarRocks passthrough, since the MySQL-wire route is blocked.
 
-### Snowflake (future adapter)
-- No header-based impersonation
-- Service account should use key-pair auth (RSA JWT), not password — Snowflake's recommended pattern for automated connections
-- `tokenExchange` or `serviceAccount` are the two options
+### Snowflake (ADBC driver)
+- No header-based impersonation on the ADBC wire — `impersonate` is rejected at startup for every ADBC driver
+- `tokenExchange` is wired: the resolved OAuth token is set via the driver's own connection options (`adbc.snowflake.sql.auth_type=auth_oauth`, `adbc.snowflake.sql.client_option.auth_token`), each user's token requiring its own `ManagedDatabase` (see the per-identity sub-pool design in the backend-identity plan's Phase 3a) since ADBC bakes connection options in at open time, not per-checkout
+- Service account (`serviceAccount` mode, Type 1) should use key-pair auth (RSA JWT), not password — Snowflake's recommended pattern for automated connections
 - Private keys must not be stored in config files in production; use `secretRef` to Secrets Manager
+- `passthrough` is not wired for ADBC in this release (only `tokenExchange`, only for the `snowflake` driver)
 
 ### Trino
 - Implicit header forwarding works for same-IdP deployments

@@ -68,6 +68,7 @@ impl AuthProvider for NoneAuthProvider {
             groups: vec![],
             roles: vec![],
             raw_token: creds.bearer_token.clone(),
+            raw_password: None,
         })
     }
 }
@@ -116,6 +117,7 @@ impl AuthProvider for StaticAuthProvider {
                     groups: vec![],
                     roles: vec![],
                     raw_token: None,
+                    raw_password: None,
                 });
             }
         };
@@ -137,11 +139,15 @@ impl AuthProvider for StaticAuthProvider {
             )));
         }
 
+        // `raw_password` deliberately stays None: this password only proves the caller
+        // knows QueryFlux's own local static-user entry, not any credential a backend
+        // would recognize. See the field doc on `AuthContext::raw_password`.
         Ok(AuthContext {
             user: username.to_string(),
             groups: entry.groups.clone(),
             roles: entry.roles.clone(),
             raw_token: None,
+            raw_password: None,
         })
     }
 }
@@ -229,6 +235,7 @@ impl AuthProvider for OidcAuthProvider {
                     groups: vec![],
                     roles: vec![],
                     raw_token: None,
+                    raw_password: None,
                 });
             }
         };
@@ -302,6 +309,7 @@ impl AuthProvider for OidcAuthProvider {
             groups,
             roles,
             raw_token: Some(token.to_string()),
+            raw_password: None,
         })
     }
 }
