@@ -55,7 +55,12 @@ export function subResourceFieldSpec(driver: string): SubResourceFieldSpec | nul
         required: true,
       };
     case "redshift":
-      return null;
+      return {
+        overrideKey: "workgroup",
+        label: "Workgroup",
+        placeholder: "my-workgroup",
+        required: true,
+      };
     default:
       return null;
   }
@@ -69,6 +74,8 @@ export function saasVariantsSectionTitle(driver: string): string {
       return "SQL warehouses";
     case "bigquery":
       return "Projects";
+    case "redshift":
+      return "Workgroups";
     default:
       return "Variants";
   }

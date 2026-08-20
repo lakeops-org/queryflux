@@ -2902,7 +2902,10 @@ queryflux:
         // match a warehouse literally named "ETLXWH".
         assert_eq!(super::escape_sql_like_pattern("ETL_WH"), "ETL\\_WH");
         assert_eq!(super::escape_sql_like_pattern("100%_DONE"), "100\\%\\_DONE");
-        assert_eq!(super::escape_sql_like_pattern("back\\slash"), "back\\\\slash");
+        assert_eq!(
+            super::escape_sql_like_pattern("back\\slash"),
+            "back\\\\slash"
+        );
     }
 
     #[test]

@@ -3,6 +3,10 @@ use queryflux_core::query::ClusterName;
 
 use super::introspection::AdbcIntrospection;
 
+/// Safety cap on `/api/2.0/sql/history/queries` pages walked per reconcile
+/// call — bounds worst-case latency on the 30s reconcile tick.
+const DATABRICKS_RECONCILE_MAX_PAGES: u32 = 10;
+
 /// REST-based introspection for Databricks SQL Warehouses.
 /// Avoids waking the warehouse via SQL `SELECT 1` or system tables.
 pub struct DatabricksIntrospection {
@@ -106,48 +110,83 @@ impl AdbcIntrospection for DatabricksIntrospection {
 
     /// Reconciliation via `GET /api/2.0/sql/history/queries`.
     /// Returns the count of RUNNING queries for this warehouse.
+    ///
+    /// The endpoint is paginated (`has_next_page` / `next_page_token`); a single
+    /// page can undercount a busy warehouse, so this walks pages up to
+    /// [`DATABRICKS_RECONCILE_MAX_PAGES`] — generous for a query count, and
+    /// bounded so a runaway `next_page_token` chain can't hang the 30s reconcile tick.
     async fn fetch_running_query_count(&self) -> Option<u64> {
         let url = format!("{}/api/2.0/sql/history/queries", self.workspace_url);
-        let filter = serde_json::json!({
-            "filter_by": {
-                "statuses": ["RUNNING"],
-                "warehouse_ids": [&self.warehouse_id]
-            }
-        });
-        match self
-            .http
-            .get(&url)
-            .bearer_auth(&self.auth_token)
-            .json(&filter)
-            .send()
-            .await
-        {
-            Ok(resp) if resp.status().is_success() => {
-                if let Ok(body) = resp.json::<serde_json::Value>().await {
-                    body.get("res")
-                        .and_then(|v| v.as_array())
-                        .map(|arr| arr.len() as u64)
-                } else {
-                    None
+        let mut total = 0u64;
+        let mut page_token: Option<String> = None;
+        for _ in 0..DATABRICKS_RECONCILE_MAX_PAGES {
+            let mut body = serde_json::json!({
+                "filter_by": {
+                    "statuses": ["RUNNING"],
+                    "warehouse_ids": [&self.warehouse_id]
                 }
+            });
+            if let Some(token) = &page_token {
+                body["page_token"] = serde_json::Value::String(token.clone());
             }
-            Ok(resp) => {
-                tracing::warn!(
-                    warehouse_id = %self.warehouse_id,
-                    status = %resp.status(),
-                    "Databricks REST reconcile query failed"
-                );
-                None
+
+            let resp = match self
+                .http
+                .get(&url)
+                .bearer_auth(&self.auth_token)
+                .json(&body)
+                .send()
+                .await
+            {
+                Ok(resp) if resp.status().is_success() => resp,
+                Ok(resp) => {
+                    tracing::warn!(
+                        warehouse_id = %self.warehouse_id,
+                        status = %resp.status(),
+                        "Databricks REST reconcile query failed"
+                    );
+                    return if total > 0 { Some(total) } else { None };
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        warehouse_id = %self.warehouse_id,
+                        error = %e,
+                        "Databricks REST reconcile request error"
+                    );
+                    return if total > 0 { Some(total) } else { None };
+                }
+            };
+
+            let Ok(json) = resp.json::<serde_json::Value>().await else {
+                return if total > 0 { Some(total) } else { None };
+            };
+            total += json
+                .get("res")
+                .and_then(|v| v.as_array())
+                .map(|arr| arr.len() as u64)
+                .unwrap_or(0);
+
+            let has_next = json
+                .get("has_next_page")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            if !has_next {
+                return Some(total);
             }
-            Err(e) => {
-                tracing::warn!(
-                    warehouse_id = %self.warehouse_id,
-                    error = %e,
-                    "Databricks REST reconcile request error"
-                );
-                None
+            page_token = json
+                .get("next_page_token")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            if page_token.is_none() {
+                return Some(total);
             }
         }
+        tracing::warn!(
+            warehouse_id = %self.warehouse_id,
+            max_pages = DATABRICKS_RECONCILE_MAX_PAGES,
+            "Databricks REST reconcile hit page cap — running count may be undercounted"
+        );
+        Some(total)
     }
 }
 

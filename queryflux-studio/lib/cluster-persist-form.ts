@@ -137,6 +137,9 @@ export function persistedClusterConfigToFlat(
   flat.poolSize = jsonScalarToString(config.poolSize);
   flat.maxResultBufferBytes = jsonScalarToString(config.maxResultBufferBytes);
 
+  flat.healthCheckQuery = jsonScalarToString(config.healthCheckQuery);
+  flat.reconcileQuery = jsonScalarToString(config.reconcileQuery);
+
   if (descriptor) {
     for (const f of descriptor.configFields) {
       if (flat[f.key] === undefined) flat[f.key] = "";
@@ -277,6 +280,9 @@ export function mergeClusterConfigFromFlat(
       else delete out.maxResultBufferBytes;
     } else delete out.maxResultBufferBytes;
   }
+
+  setOrDel("healthCheckQuery", flat.healthCheckQuery, "healthCheckQuery");
+  setOrDel("reconcileQuery", flat.reconcileQuery, "reconcileQuery");
 
   return out;
 }

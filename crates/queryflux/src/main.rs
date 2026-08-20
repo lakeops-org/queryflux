@@ -2153,7 +2153,9 @@ fn unauthenticated_passthrough_clusters(
 /// startup/reload path that expands a persisted cluster record into runtime
 /// clusters, so the parsing behavior (and its `unwrap_or_default` on malformed
 /// JSON) stays identical everywhere instead of drifting across call sites.
-fn parse_cluster_variants(variants_json: &serde_json::Value) -> Vec<queryflux_core::config::ClusterVariant> {
+fn parse_cluster_variants(
+    variants_json: &serde_json::Value,
+) -> Vec<queryflux_core::config::ClusterVariant> {
     serde_json::from_value(variants_json.clone()).unwrap_or_default()
 }
 

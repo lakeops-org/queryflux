@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
-import type { ClusterConfigRecord, ClusterDisplayRow } from "@/lib/api-types";
+import type { ClusterConfigRecord, ClusterDisplayRow, ClusterVariant } from "@/lib/api-types";
 import {
   deleteClusterConfig,
   getClusterConfig,
@@ -336,6 +336,11 @@ function ClusterDialog({
   const [editMaxInput, setEditMaxInput] = useState("");
   const [editFlat, setEditFlat] = useState<Record<string, string>>({});
   const [editClusterName, setEditClusterName] = useState("");
+  // `undefined` = untouched this edit session — save falls back to the
+  // persisted record's variants (see `buildClusterUpsertFromForm`).
+  const [editVariants, setEditVariants] = useState<ClusterVariant[] | undefined>(
+    undefined,
+  );
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
   const [deleting, setDeleting] = useState(false);
@@ -398,6 +403,7 @@ function ClusterDialog({
       ),
     );
     setEditClusterName(persisted.name);
+    setEditVariants(undefined);
     setEditing(true);
   }
 
@@ -405,6 +411,7 @@ function ClusterDialog({
     setEditing(false);
     setSaveError(null);
     setEditClusterName("");
+    setEditVariants(undefined);
   }
 
   function closeOrDismissDeleteConfirm() {
@@ -496,9 +503,10 @@ function ClusterDialog({
     const driver =
       editFlat.driver ??
       String((persisted.config as Record<string, unknown>).driver ?? "");
+    const effectiveVariants = editVariants ?? persisted.variants;
     if (isSaasVariantDriver(driver)) {
       const variantErrs = validateVariantRows(
-        variantsToRows(persisted.variants, driver),
+        variantsToRows(effectiveVariants, driver),
         driver,
       );
       if (variantErrs.length > 0) {
@@ -518,6 +526,7 @@ function ClusterDialog({
         buildClusterUpsertFromForm(persisted, editFlat, {
           enabled: editEnabled,
           maxRunningQueriesInput: editMaxInput,
+          variants: editVariants,
         }),
       );
       setPersisted(newRecord);
@@ -735,6 +744,8 @@ function ClusterDialog({
               editMaxInput={editMaxInput}
               editFlat={editFlat}
               onPatchFlat={(patch) => setEditFlat((prev) => ({ ...prev, ...patch }))}
+              variants={editVariants ?? persisted.variants}
+              onVariantsChange={setEditVariants}
               onToggleEnabled={() => setEditEnabled((v) => !v)}
               onChangeMaxInput={setEditMaxInput}
               saveError={saveError}
@@ -1111,6 +1122,8 @@ function EngineEditForm({
   editMaxInput,
   editFlat,
   onPatchFlat,
+  variants,
+  onVariantsChange,
   onToggleEnabled,
   onChangeMaxInput,
   saveError,
@@ -1126,6 +1139,8 @@ function EngineEditForm({
   editMaxInput: string;
   editFlat: Record<string, string>;
   onPatchFlat: (patch: Record<string, string>) => void;
+  variants: ClusterVariant[] | undefined;
+  onVariantsChange: (variants: ClusterVariant[]) => void;
   onToggleEnabled: () => void;
   onChangeMaxInput: (v: string) => void;
   saveError: string | null;
@@ -1251,7 +1266,10 @@ function EngineEditForm({
       <VariantsSection
         persisted={persisted}
         baseClusterName={editClusterName}
+        editFlat={editFlat}
         onPatchFlat={onPatchFlat}
+        variants={variants}
+        onVariantsChange={onVariantsChange}
       />
 
       {saveError && (
@@ -1290,29 +1308,34 @@ function EngineEditForm({
 function VariantsSection({
   persisted,
   baseClusterName,
-  onPatchFlat: _onPatchFlat,
+  editFlat,
+  onPatchFlat,
+  variants,
+  onVariantsChange,
 }: {
   persisted: ClusterConfigRecord;
   baseClusterName: string;
+  editFlat: Record<string, string>;
   onPatchFlat: (patch: Record<string, string>) => void;
+  variants: ClusterVariant[] | undefined;
+  onVariantsChange: (variants: ClusterVariant[]) => void;
 }) {
   const isAdbc = persisted.engineKey === "adbc";
   const driver = ((persisted.config as Record<string, unknown>).driver as string) ?? "";
   const saasDriver = isSaasVariantDriver(driver);
 
+  // Local UI state for the row/textarea editors; `variants` (via
+  // `onVariantsChange`) is the actual source of truth that gets saved —
+  // these mirror it for editing but never mutate `persisted` directly, so
+  // Cancel naturally discards edits (the parent's `editVariants` state just
+  // resets, `persisted` is never touched).
   const [variantRows, setVariantRows] = useState(() =>
-    saasDriver ? variantsToRows(persisted.variants, driver) : [],
+    saasDriver ? variantsToRows(variants, driver) : [],
   );
   const [variantsJson, setVariantsJson] = useState(() =>
-    !saasDriver && persisted.variants && (persisted.variants as unknown[]).length > 0
-      ? JSON.stringify(persisted.variants, null, 2)
+    !saasDriver && variants && variants.length > 0
+      ? JSON.stringify(variants, null, 2)
       : "",
-  );
-  const [healthCheckQuery, setHealthCheckQuery] = useState(
-    () => ((persisted.config as Record<string, unknown>).healthCheckQuery as string) ?? "",
-  );
-  const [reconcileQuery, setReconcileQuery] = useState(
-    () => ((persisted.config as Record<string, unknown>).reconcileQuery as string) ?? "",
   );
   const [variantsError, setVariantsError] = useState<string | null>(null);
   const [variantFieldErrors, setVariantFieldErrors] = useState<string[]>([]);
@@ -1321,42 +1344,33 @@ function VariantsSection({
     setVariantRows(rows);
     const errors = validateVariantRows(rows, driver);
     setVariantFieldErrors(errors);
-    persisted.variants = rowsToVariants(rows, driver);
+    onVariantsChange(rowsToVariants(rows, driver));
   }
 
-  useEffect(() => {
-    if (saasDriver) return;
-    if (variantsJson.trim()) {
-      try {
-        const parsed = JSON.parse(variantsJson);
-        if (!Array.isArray(parsed)) {
-          setVariantsError("Variants must be a JSON array");
-          return;
-        }
-        persisted.variants = parsed;
-        setVariantsError(null);
-      } catch {
-        setVariantsError("Invalid JSON");
-      }
-    } else {
-      persisted.variants = [];
+  function onVariantsJsonChange(text: string) {
+    setVariantsJson(text);
+    if (!text.trim()) {
       setVariantsError(null);
+      onVariantsChange([]);
+      return;
     }
-  }, [variantsJson, persisted, saasDriver]);
-
-  useEffect(() => {
-    const cfg = persisted.config as Record<string, unknown>;
-    if (healthCheckQuery.trim()) cfg.healthCheckQuery = healthCheckQuery.trim();
-    else delete cfg.healthCheckQuery;
-  }, [healthCheckQuery, persisted.config]);
-
-  useEffect(() => {
-    const cfg = persisted.config as Record<string, unknown>;
-    if (reconcileQuery.trim()) cfg.reconcileQuery = reconcileQuery.trim();
-    else delete cfg.reconcileQuery;
-  }, [reconcileQuery, persisted.config]);
+    try {
+      const parsed = JSON.parse(text);
+      if (!Array.isArray(parsed)) {
+        setVariantsError("Variants must be a JSON array");
+        return;
+      }
+      setVariantsError(null);
+      onVariantsChange(parsed as ClusterVariant[]);
+    } catch {
+      setVariantsError("Invalid JSON");
+    }
+  }
 
   if (!isAdbc) return null;
+
+  const healthCheckQuery = editFlat.healthCheckQuery ?? "";
+  const reconcileQuery = editFlat.reconcileQuery ?? "";
 
   return (
     <div className="mt-4 space-y-3">
@@ -1381,7 +1395,7 @@ function VariantsSection({
               </label>
               <textarea
                 value={variantsJson}
-                onChange={(e) => setVariantsJson(e.target.value)}
+                onChange={(e) => onVariantsJsonChange(e.target.value)}
                 placeholder={`[\n  { "name": "analytics", "overrides": { "warehouse": "ANALYTICS_WH" } }\n]`}
                 rows={4}
                 className="w-full text-xs font-mono bg-white border border-slate-200 rounded-lg px-2.5 py-1.5 focus:outline-none focus:ring-2 focus:ring-indigo-300 focus:border-indigo-400 resize-y"
@@ -1401,8 +1415,8 @@ function VariantsSection({
           driver={driver}
           healthCheckQuery={healthCheckQuery}
           reconcileQuery={reconcileQuery}
-          onHealthCheckQueryChange={setHealthCheckQuery}
-          onReconcileQueryChange={setReconcileQuery}
+          onHealthCheckQueryChange={(v) => onPatchFlat({ healthCheckQuery: v })}
+          onReconcileQueryChange={(v) => onPatchFlat({ reconcileQuery: v })}
         />
       </div>
     </div>
