@@ -28,7 +28,13 @@ pub fn try_from_adbc_config(
 #[async_trait]
 impl AdbcIntrospection for RedshiftIntrospection {
     async fn health_check(&self) -> bool {
-        true
+        // Same connection the reconcile probe already pays for every 30s
+        // (it also reaches the leader node) — an unconditional `true` would
+        // never catch an unreachable cluster (network/auth/paused endpoint).
+        let pool = self.pool.clone();
+        tokio::task::spawn_blocking(move || sql_helpers::query_batches(&pool, "SELECT 1").is_some())
+            .await
+            .unwrap_or(false)
     }
 
     async fn fetch_running_query_count(&self) -> Option<u64> {

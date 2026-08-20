@@ -2566,17 +2566,18 @@ async fn build_live_config(
             };
             let engine_type = EngineType::from(&engine);
             // For expanded variants, use the variant-specific max_running_queries if set.
-            let max_q =
-                if let Some((_, variant_max, _, _)) = expanded_configs.get(member_name.as_str()) {
-                    variant_max.unwrap_or_else(|| {
-                        max_running_queries_u64_from_db(member_name, record.max_running_queries)
-                            .unwrap_or(None)
-                            .unwrap_or(group_config.max_running_queries)
-                    })
-                } else {
-                    max_running_queries_u64_from_db(member_name, record.max_running_queries)?
-                        .unwrap_or(group_config.max_running_queries)
-                };
+            // `?` (not `.unwrap_or_else` — a closure can't propagate `?` out of this
+            // function) so an invalid `max_running_queries` on the base record rejects
+            // the reload here exactly like the non-variant fallback, instead of
+            // silently falling back to the group default.
+            let variant_max_override = expanded_configs
+                .get(member_name.as_str())
+                .and_then(|(_, variant_max, _, _)| *variant_max);
+            let max_q = match variant_max_override {
+                Some(v) => v,
+                None => max_running_queries_u64_from_db(member_name, record.max_running_queries)?
+                    .unwrap_or(group_config.max_running_queries),
+            };
             // For expanded variants, use merged config for endpoint resolution.
             let effective_config = expanded_configs
                 .get(member_name.as_str())

@@ -12,6 +12,19 @@ pub struct BigQueryIntrospection {
     region: Option<String>,
 }
 
+/// Extracts the project ID from a BigQuery ADBC URI
+/// (`bigquery://[host[:port]]/<project_id>[?params]` — the project ID is the
+/// last path segment; the host is optional, e.g. `bigquery:///my-project`).
+/// A bare `<project_id>` with no scheme or slashes is also accepted.
+fn project_id_from_uri(uri: &str) -> Option<String> {
+    let without_query = uri.split('?').next().unwrap_or(uri);
+    let path = without_query
+        .strip_prefix("bigquery://")
+        .unwrap_or(without_query);
+    let project = path.rsplit('/').find(|s| !s.is_empty())?;
+    (!project.is_empty()).then(|| project.to_string())
+}
+
 pub fn try_from_adbc_config(
     cluster_name: &ClusterName,
     uri: &str,
@@ -20,7 +33,7 @@ pub fn try_from_adbc_config(
 ) -> Option<BigQueryIntrospection> {
     let project_id = sql_helpers::db_kwarg(db_kwargs, "project_id")
         .or_else(|| sql_helpers::db_kwarg(db_kwargs, "project"))
-        .or_else(|| uri.split('/').next().map(str::to_string))
+        .or_else(|| project_id_from_uri(uri))
         .filter(|p| !p.is_empty())?;
     let region = sql_helpers::db_kwarg(db_kwargs, "location")
         .or_else(|| sql_helpers::db_kwarg(db_kwargs, "region"));
@@ -64,8 +77,17 @@ impl BigQueryIntrospection {
 #[async_trait]
 impl AdbcIntrospection for BigQueryIntrospection {
     async fn health_check(&self) -> bool {
-        // Metadata queries are cheap; no warehouse to wake.
-        true
+        // A metadata-only probe — no slot cost, no warehouse to wake — but
+        // still validates connectivity/auth/project access, unlike an
+        // unconditional `true` which would never catch an unreachable project.
+        let pool = self.pool.clone();
+        let sql = format!(
+            "SELECT 1 FROM `{}`.INFORMATION_SCHEMA.SCHEMATA LIMIT 1",
+            self.project_id
+        );
+        tokio::task::spawn_blocking(move || sql_helpers::query_batches(&pool, &sql).is_some())
+            .await
+            .unwrap_or(false)
     }
 
     async fn fetch_running_query_count(&self) -> Option<u64> {
@@ -113,13 +135,35 @@ mod tests {
             sql_helpers::db_kwarg(&kwargs, "project_id").as_deref(),
             Some("from-kw")
         );
+    }
+
+    #[test]
+    fn project_id_from_uri_parses_official_adbc_format() {
+        // bigquery://[host[:port]]/<project_id>[?params] — project ID is the
+        // last path segment, not the first (the host is optional).
         assert_eq!(
-            "my-proj/dataset"
-                .split('/')
-                .next()
-                .map(str::to_string)
-                .as_deref(),
-            Some("my-proj")
+            project_id_from_uri("bigquery:///my-project-123").as_deref(),
+            Some("my-project-123")
         );
+        assert_eq!(
+            project_id_from_uri(
+                "bigquery://bigquery.googleapis.com/my-project-123?OAuthType=0&DatasetId=analytics"
+            )
+            .as_deref(),
+            Some("my-project-123")
+        );
+        assert_eq!(
+            project_id_from_uri("my-project-123").as_deref(),
+            Some("my-project-123")
+        );
+    }
+
+    #[test]
+    fn project_id_from_uri_does_not_return_scheme() {
+        // Regression: `uri.split('/').next()` on "bigquery://host/project"
+        // used to return "bigquery:" (the scheme) instead of the project ID.
+        let project = project_id_from_uri("bigquery://bigquery.googleapis.com/real-project");
+        assert_ne!(project.as_deref(), Some("bigquery:"));
+        assert_eq!(project.as_deref(), Some("real-project"));
     }
 }

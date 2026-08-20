@@ -2690,6 +2690,25 @@ queryflux:
         );
     }
 
+    /// A non-object `base_config` (e.g. a corrupted JSONB row) must not panic
+    /// the dbKwargs-injection unwrap: `deep_merge`'s non-object branch always
+    /// replaces `merged` with `variant.overrides` wholesale, and the caller
+    /// only reaches that unwrap when `variant.overrides.is_object()` already
+    /// held — so `merged` is guaranteed to be an object either way.
+    #[test]
+    fn expand_variants_non_object_base_config_does_not_panic() {
+        let base = serde_json::Value::String("not an object".into());
+        let variants = vec![super::ClusterVariant {
+            name: "wh1".into(),
+            overrides: serde_json::json!({"warehouse": "WH1"}),
+            max_running_queries: None,
+        }];
+        let result =
+            super::expand_cluster_variants("sf", &base, "adbc", &variants, None, None).unwrap();
+        assert_eq!(result[0].expanded_name, "sf::wh1");
+        assert!(result[0].merged_config.is_object());
+    }
+
     #[test]
     fn expand_variants_deep_merge() {
         let base = serde_json::json!({

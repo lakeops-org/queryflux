@@ -341,6 +341,10 @@ function ClusterDialog({
   const [editVariants, setEditVariants] = useState<ClusterVariant[] | undefined>(
     undefined,
   );
+  // Non-null while the raw variants-JSON textarea (non-SaaS drivers) holds
+  // unparseable input — save() must block until this clears, otherwise the
+  // stale last-valid `editVariants` would be persisted silently.
+  const [editVariantsError, setEditVariantsError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
   const [deleting, setDeleting] = useState(false);
@@ -404,6 +408,7 @@ function ClusterDialog({
     );
     setEditClusterName(persisted.name);
     setEditVariants(undefined);
+    setEditVariantsError(null);
     setEditing(true);
   }
 
@@ -412,6 +417,7 @@ function ClusterDialog({
     setSaveError(null);
     setEditClusterName("");
     setEditVariants(undefined);
+    setEditVariantsError(null);
   }
 
   function closeOrDismissDeleteConfirm() {
@@ -497,6 +503,10 @@ function ClusterDialog({
     );
     if (schemaErrs.length > 0) {
       setSaveError(schemaErrs.join(" "));
+      return;
+    }
+    if (editVariantsError) {
+      setSaveError(editVariantsError);
       return;
     }
 
@@ -746,6 +756,7 @@ function ClusterDialog({
               onPatchFlat={(patch) => setEditFlat((prev) => ({ ...prev, ...patch }))}
               variants={editVariants ?? persisted.variants}
               onVariantsChange={setEditVariants}
+              onVariantsErrorChange={setEditVariantsError}
               onToggleEnabled={() => setEditEnabled((v) => !v)}
               onChangeMaxInput={setEditMaxInput}
               saveError={saveError}
@@ -1124,6 +1135,7 @@ function EngineEditForm({
   onPatchFlat,
   variants,
   onVariantsChange,
+  onVariantsErrorChange,
   onToggleEnabled,
   onChangeMaxInput,
   saveError,
@@ -1141,6 +1153,7 @@ function EngineEditForm({
   onPatchFlat: (patch: Record<string, string>) => void;
   variants: ClusterVariant[] | undefined;
   onVariantsChange: (variants: ClusterVariant[]) => void;
+  onVariantsErrorChange: (error: string | null) => void;
   onToggleEnabled: () => void;
   onChangeMaxInput: (v: string) => void;
   saveError: string | null;
@@ -1270,6 +1283,7 @@ function EngineEditForm({
         onPatchFlat={onPatchFlat}
         variants={variants}
         onVariantsChange={onVariantsChange}
+        onVariantsErrorChange={onVariantsErrorChange}
       />
 
       {saveError && (
@@ -1312,6 +1326,7 @@ function VariantsSection({
   onPatchFlat,
   variants,
   onVariantsChange,
+  onVariantsErrorChange,
 }: {
   persisted: ClusterConfigRecord;
   baseClusterName: string;
@@ -1319,9 +1334,14 @@ function VariantsSection({
   onPatchFlat: (patch: Record<string, string>) => void;
   variants: ClusterVariant[] | undefined;
   onVariantsChange: (variants: ClusterVariant[]) => void;
+  onVariantsErrorChange: (error: string | null) => void;
 }) {
   const isAdbc = persisted.engineKey === "adbc";
-  const driver = ((persisted.config as Record<string, unknown>).driver as string) ?? "";
+  // Match save()'s driver resolution: an in-progress driver edit in `editFlat`
+  // takes precedence over the persisted value, so the variant rows/labels
+  // shown here stay consistent with what save-time validation checks against.
+  const driver =
+    editFlat.driver ?? ((persisted.config as Record<string, unknown>).driver as string) ?? "";
   const saasDriver = isSaasVariantDriver(driver);
 
   // Local UI state for the row/textarea editors; `variants` (via
@@ -1351,19 +1371,25 @@ function VariantsSection({
     setVariantsJson(text);
     if (!text.trim()) {
       setVariantsError(null);
+      onVariantsErrorChange(null);
       onVariantsChange([]);
       return;
     }
     try {
       const parsed = JSON.parse(text);
       if (!Array.isArray(parsed)) {
-        setVariantsError("Variants must be a JSON array");
+        const err = "Variants must be a JSON array";
+        setVariantsError(err);
+        onVariantsErrorChange(err);
         return;
       }
       setVariantsError(null);
+      onVariantsErrorChange(null);
       onVariantsChange(parsed as ClusterVariant[]);
     } catch {
-      setVariantsError("Invalid JSON");
+      const err = "Invalid variants JSON — fix or clear it before saving.";
+      setVariantsError(err);
+      onVariantsErrorChange(err);
     }
   }
 

@@ -50,6 +50,6 @@ export function healthCheckQueryPlaceholder(driver: string, saasDriver: boolean)
       ? driver === "databricks"
         ? "Built-in REST health check (leave empty)"
         : "Leave empty for built-in driver introspection"
-      : "Leave empty to skip health checks")
+      : "Leave empty to use the default SELECT 1 health check")
   );
 }

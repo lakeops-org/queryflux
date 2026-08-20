@@ -142,8 +142,8 @@ Leave both fields **empty** to use **built-in defaults** (applied automatically 
 | Driver | Default health | Default reconcile |
 |---|---|---|
 | Snowflake | `SHOW WAREHOUSES LIKE '{warehouse}'` | Same SHOW (reads `running` column) |
-| BigQuery | Always healthy (no SQL) | `COUNT(*)` from `INFORMATION_SCHEMA.JOBS_BY_PROJECT` |
-| Redshift | Always healthy | `SELECT COUNT(*) FROM stv_recents WHERE status = 'Running'` |
+| BigQuery | `SELECT 1 FROM INFORMATION_SCHEMA.SCHEMATA LIMIT 1` (metadata only) | `COUNT(*)` from `INFORMATION_SCHEMA.JOBS_BY_PROJECT` |
+| Redshift | `SELECT 1` (same connection reconcile already uses) | `SELECT COUNT(*) FROM stv_recents WHERE status = 'Running'` |
 | Databricks | REST warehouse status | REST query history (no SQL defaults) |
 | Trino / StarRocks / ClickHouse (ADBC) | `SELECT 1` | Engine-specific `COUNT` SQL |
 | Native Trino / StarRocks | Adapter `SELECT 1` / health | System table `COUNT` SQL |
@@ -152,7 +152,7 @@ Custom `healthCheckQuery` / `reconcileQuery` **override** these defaults when se
 
 ### Resolution order — health check
 
-```
+```text
 1. custom healthCheckQuery (if set)  →  execute via ADBC pool
 2. adapter.health_check()            →  AdbcIntrospection or SELECT 1
 ```
@@ -163,7 +163,7 @@ Unhealthy clusters are excluded from `acquire_cluster` until the next successful
 
 Reconcile is **separate** from capacity admission. In distributed mode, `try_acquire` / `release` use Postgres leases only; they do not update `cluster_capacity_counters.running`.
 
-```
+```text
 1. Distributed + not sweep lock owner    →  read cluster_capacity_counters.running (CapacityStore::active_count)
 2. Distributed + sweep lock owner        →  backend reconcile → publish_running_count → local state
 3. Single instance                       →  backend reconcile → local state only
@@ -181,8 +181,8 @@ For SaaS ADBC drivers, QueryFlux avoids naive `SELECT 1` health checks that woul
 |---|---|---|---|
 | **Databricks** | REST `GET /sql/warehouses/{id}` | REST query history API | No |
 | **Snowflake** | `SHOW WAREHOUSES LIKE '{wh}'` → parse `state` | Same SHOW → parse `running` | No (cloud services) |
-| **BigQuery** | Always healthy | `INFORMATION_SCHEMA.JOBS_BY_PROJECT` COUNT | No (metadata) |
-| **Redshift** | Always healthy | `stv_recents` COUNT | Connects to leader |
+| **BigQuery** | `INFORMATION_SCHEMA.SCHEMATA` metadata probe | `INFORMATION_SCHEMA.JOBS_BY_PROJECT` COUNT | No (metadata) |
+| **Redshift** | `SELECT 1` (leader node) | `stv_recents` COUNT | Connects to leader |
 | **Trino / StarRocks / ClickHouse** | `SELECT 1` | Built-in system-table SQL | Yes (self-hosted) |
 | **Other ADBC** | `SELECT 1` | `None` (local counters only) | Depends |
 
@@ -194,8 +194,8 @@ Custom `healthCheckQuery` / `reconcileQuery` **override** runtime defaults when 
 |---|---|---|
 | Snowflake | `SHOW WAREHOUSES LIKE '{{sub_resource}}'` | Leave empty (built-in uses SHOW `running` column) |
 | Databricks | Leave empty (REST) | Leave empty (REST) |
-| BigQuery | Leave empty (always healthy) | Leave empty (JOBS_BY_PROJECT) |
-| Redshift | Leave empty (always healthy) | Leave empty (`stv_recents`) |
+| BigQuery | Leave empty (built-in metadata probe) | Leave empty (JOBS_BY_PROJECT) |
+| Redshift | Leave empty (built-in `SELECT 1`) | Leave empty (`stv_recents`) |
 | Trino / StarRocks | Leave empty (`SELECT 1`) | Leave empty (native adapter SQL) |
 
 ### Snowflake note

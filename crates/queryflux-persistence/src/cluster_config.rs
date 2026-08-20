@@ -229,6 +229,13 @@ impl UpsertClusterConfig {
             config.insert("queryAuth".into(), serde_json::to_value(qa)?);
         }
 
+        if let Some(v) = &cfg.health_check_query {
+            config.insert("healthCheckQuery".into(), v.clone().into());
+        }
+        if let Some(v) = &cfg.reconcile_query {
+            config.insert("reconcileQuery".into(), v.clone().into());
+        }
+
         let variants = if cfg.variants.is_empty() {
             serde_json::Value::Array(Vec::new())
         } else {
@@ -493,6 +500,30 @@ mod tests {
         assert_eq!(
             upsert.config.get("maxResultBufferBytes"),
             Some(&serde_json::json!(65536))
+        );
+    }
+
+    /// YAML-seeded clusters with custom probe SQL must keep it across the
+    /// first Postgres write — otherwise they silently reload with driver
+    /// defaults instead of the operator's `healthCheckQuery`/`reconcileQuery`.
+    #[test]
+    fn cluster_from_core_preserves_probe_queries() {
+        let cfg: ClusterConfig = serde_json::from_value(serde_json::json!({
+            "engine": "adbc",
+            "healthCheckQuery": "SHOW WAREHOUSES LIKE 'WH1'",
+            "reconcileQuery": "SELECT COUNT(*) FROM stv_recents WHERE status = 'Running'",
+        }))
+        .unwrap();
+        let upsert = UpsertClusterConfig::from_core(&cfg).unwrap().unwrap();
+        assert_eq!(
+            upsert.config.get("healthCheckQuery"),
+            Some(&serde_json::json!("SHOW WAREHOUSES LIKE 'WH1'"))
+        );
+        assert_eq!(
+            upsert.config.get("reconcileQuery"),
+            Some(&serde_json::json!(
+                "SELECT COUNT(*) FROM stv_recents WHERE status = 'Running'"
+            ))
         );
     }
 }
