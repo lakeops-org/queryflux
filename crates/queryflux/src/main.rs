@@ -2339,6 +2339,11 @@ async fn build_live_config(
         group_states.insert(group_key, (states, strategy));
     }
     group_order.sort();
+    // Drop cached strategies for groups that no longer exist, so a deleted-then-recreated
+    // group name can't inherit the old group's strategy if the new one's build ever fails.
+    cache
+        .strategies
+        .retain(|name, _| cluster_groups.contains_key(name.as_str()));
 
     let health_check_targets = health_targets_from_groups(&group_states, &cache.adapters);
     cache.cluster_states = health_check_targets

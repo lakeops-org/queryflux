@@ -89,6 +89,21 @@ impl ClusterGroupManager for SimpleClusterGroupManager {
             strategy.pick(&candidates).unwrap_or(0)
         };
         let (_, chosen) = eligible[picked_local_idx];
+        // A blocking-dispatch strategy yields at the `.await` above; another task can
+        // fill `chosen` to capacity or a health check can mark it unhealthy in that
+        // window. Re-validate before admitting the query, falling back to any other
+        // still-eligible member rather than trusting a snapshot that may be stale.
+        let chosen = if chosen.is_enabled() && chosen.is_healthy() && !chosen.is_at_capacity() {
+            chosen
+        } else {
+            match eligible
+                .iter()
+                .find(|(_, c)| c.is_enabled() && c.is_healthy() && !c.is_at_capacity())
+            {
+                Some((_, c)) => *c,
+                None => return Ok(None),
+            }
+        };
         chosen.increment_running();
         Ok(Some(chosen.cluster_name.clone()))
     }

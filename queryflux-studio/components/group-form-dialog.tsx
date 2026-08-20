@@ -743,7 +743,10 @@ export function GroupFormDialog({
             {strategyKind === "pythonScript" ? (
               <div>
                 <div className="flex items-center justify-between mb-1.5">
-                  <label className="block text-[11px] font-semibold text-slate-500 uppercase tracking-wide">
+                  <label
+                    htmlFor="group-python-script"
+                    className="block text-[11px] font-semibold text-slate-500 uppercase tracking-wide"
+                  >
                     Python body
                   </label>
                   <button
@@ -755,6 +758,7 @@ export function GroupFormDialog({
                   </button>
                 </div>
                 <textarea
+                  id="group-python-script"
                   value={clusterStrategyScript}
                   onChange={(e) => setClusterStrategyScript(e.target.value)}
                   placeholder={CLUSTER_STRATEGY_SCRIPT_TEMPLATE}
@@ -772,10 +776,14 @@ export function GroupFormDialog({
                 </p>
 
                 <div className="mt-3">
-                  <label className="block text-[11px] font-semibold text-slate-500 uppercase tracking-wide mb-1.5">
+                  <label
+                    htmlFor="group-python-script-file"
+                    className="block text-[11px] font-semibold text-slate-500 uppercase tracking-wide mb-1.5"
+                  >
                     Script file path (optional)
                   </label>
                   <input
+                    id="group-python-script-file"
                     value={clusterStrategyScriptFile}
                     onChange={(e) => setClusterStrategyScriptFile(e.target.value)}
                     placeholder="/etc/queryflux/select-cluster.py"

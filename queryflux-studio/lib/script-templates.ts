@@ -1,9 +1,9 @@
 /**
  * Starter bodies for user_scripts rows. Must match runtime contracts:
  * - translation_fixup: sqlglot AST transform
- * - routing: PythonScriptRouter `route(query, ctx)` (see docs/routing-and-clusters.md)
+ * - routing: PythonScriptRouter `route(query, ctx)` (see website/docs/architecture/routing-and-clusters.md)
  * - guard: GuardChain `check(ctx)` returns {"action": "allow"|"warn"|"deny", ...}
- * - clusterStrategy: PythonScriptStrategy `select_cluster(candidates)` (see docs/routing-and-clusters.md)
+ * - clusterStrategy: PythonScriptStrategy `select_cluster(candidates)` (see website/docs/architecture/routing-and-clusters.md)
  */
 
 export const TRANSLATION_FIXUP_TEMPLATE = `# Do not remove the imports below — they are required by the proxy.
