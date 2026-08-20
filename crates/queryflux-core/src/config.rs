@@ -34,6 +34,17 @@ pub enum StrategyConfig {
         /// cluster_name → relative weight (e.g. { "trino-1": 3, "trino-2": 1 }).
         weights: HashMap<String, u32>,
     },
+    /// Run operator-supplied Python for groups the built-in strategies can't express.
+    /// Script must define `def select_cluster(candidates: list[dict]) -> str | None`,
+    /// returning a member cluster name or `None` to fall back to the first candidate.
+    #[serde(rename = "pythonScript")]
+    #[serde(rename_all = "camelCase")]
+    PythonScript {
+        #[serde(default)]
+        script: Option<String>,
+        #[serde(default)]
+        script_file: Option<String>,
+    },
 }
 
 /// Root configuration for a QueryFlux deployment.
@@ -1613,7 +1624,7 @@ mod tests {
         query_auth_supported, AuthConfig, AuthProviderConfig, AuthorizationConfig,
         AuthorizationProviderConfig, ClusterAuth, EngineConfig, GuardKindConfig, GuardSpecConfig,
         LdapConfig, OidcConfig, OpenFgaConfig, PersistenceConfig, PostgresPersistenceConfig,
-        ProxyConfig, QueryAuthConfig, RouterConfig, TokenExchangeConfig,
+        ProxyConfig, QueryAuthConfig, RouterConfig, StrategyConfig, TokenExchangeConfig,
     };
 
     fn token_exchange_mode() -> QueryAuthConfig {
@@ -1819,6 +1830,43 @@ mod tests {
             } => {
                 assert!(script.contains("def route"));
                 assert!(script_file.is_none());
+            }
+            _ => panic!("expected pythonScript"),
+        }
+    }
+
+    #[test]
+    fn strategy_config_python_script_deserializes_and_roundtrips() {
+        let j = r#"{"type":"pythonScript","script":"def select_cluster(c):\n return None\n"}"#;
+        let strategy: StrategyConfig = serde_json::from_str(j).expect("strategy JSON");
+        match &strategy {
+            StrategyConfig::PythonScript {
+                script,
+                script_file,
+            } => {
+                assert_eq!(
+                    script.as_deref(),
+                    Some("def select_cluster(c):\n return None\n")
+                );
+                assert!(script_file.is_none());
+            }
+            _ => panic!("expected pythonScript"),
+        }
+        let out = serde_json::to_value(&strategy).unwrap();
+        assert_eq!(out["type"], "pythonScript");
+    }
+
+    #[test]
+    fn strategy_config_python_script_accepts_script_file() {
+        let j = r#"{"type":"pythonScript","scriptFile":"/etc/queryflux/select.py"}"#;
+        let strategy: StrategyConfig = serde_json::from_str(j).expect("strategy JSON");
+        match &strategy {
+            StrategyConfig::PythonScript {
+                script,
+                script_file,
+            } => {
+                assert!(script.is_none());
+                assert_eq!(script_file.as_deref(), Some("/etc/queryflux/select.py"));
             }
             _ => panic!("expected pythonScript"),
         }

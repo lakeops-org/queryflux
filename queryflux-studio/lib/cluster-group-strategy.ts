@@ -2,8 +2,8 @@
  * Cluster group routing strategies — mirrors `queryflux_core::config::StrategyConfig`
  * (`#[serde(rename_all = "camelCase", tag = "type")]`).
  *
- * Supported `type` values: `roundRobin`, `leastLoaded`, `failover`, `engineAffinity`, `weighted`.
- * `null` / omitted strategy in Postgres = round robin (same as explicit `roundRobin`).
+ * Supported `type` values: `roundRobin`, `leastLoaded`, `failover`, `engineAffinity`, `weighted`,
+ * `pythonScript`. `null` / omitted strategy in Postgres = round robin (same as explicit `roundRobin`).
  */
 
 import { buildEngineAffinityOptionsFromManifest } from "@/lib/studio-engines/manifest";
@@ -14,7 +14,8 @@ export type StrategyKind =
   | "leastLoaded"
   | "failover"
   | "engineAffinity"
-  | "weighted";
+  | "weighted"
+  | "pythonScript";
 
 export const STRATEGY_OPTIONS: {
   value: StrategyKind;
@@ -55,6 +56,12 @@ export const STRATEGY_OPTIONS: {
     description:
       "Spread load by relative weights per cluster name (JSON object, e.g. {\"trino-a\": 3, \"trino-b\": 1}).",
   },
+  {
+    value: "pythonScript",
+    label: "Python script (internal routing)",
+    description:
+      "None of the above fit? Write def select_cluster(candidates) -> str | None to pick a member cluster yourself.",
+  },
 ];
 
 /** JSON / YAML engine keys accepted in `engineAffinity.preference` (camelCase). */
@@ -69,39 +76,48 @@ export function parseStrategyRecord(
   kind: StrategyKind;
   enginePreferenceCsv: string;
   weightedJson: string;
+  script: string;
+  scriptFile: string;
 } {
+  const empty = { enginePreferenceCsv: "", weightedJson: "{}", script: "", scriptFile: "" };
   if (!strategy || typeof strategy !== "object") {
-    return { kind: "default", enginePreferenceCsv: "", weightedJson: "{}" };
+    return { kind: "default", ...empty };
   }
   const t = strategy.type;
   if (t === "roundRobin") {
-    return { kind: "roundRobin", enginePreferenceCsv: "", weightedJson: "{}" };
+    return { kind: "roundRobin", ...empty };
   }
   if (t === "leastLoaded") {
-    return { kind: "leastLoaded", enginePreferenceCsv: "", weightedJson: "{}" };
+    return { kind: "leastLoaded", ...empty };
   }
   if (t === "failover") {
-    return { kind: "failover", enginePreferenceCsv: "", weightedJson: "{}" };
+    return { kind: "failover", ...empty };
   }
   if (t === "engineAffinity") {
     const pref = strategy.preference;
     const csv = Array.isArray(pref)
       ? pref.map((x) => String(x).trim()).filter(Boolean).join(", ")
       : "";
-    return { kind: "engineAffinity", enginePreferenceCsv: csv, weightedJson: "{}" };
+    return { kind: "engineAffinity", ...empty, enginePreferenceCsv: csv };
   }
   if (t === "weighted") {
     const w = strategy.weights;
     if (w && typeof w === "object" && !Array.isArray(w)) {
-      return {
-        kind: "weighted",
-        enginePreferenceCsv: "",
-        weightedJson: JSON.stringify(w, null, 2),
-      };
+      return { kind: "weighted", ...empty, weightedJson: JSON.stringify(w, null, 2) };
     }
-    return { kind: "weighted", enginePreferenceCsv: "", weightedJson: "{}" };
+    return { kind: "weighted", ...empty };
   }
-  return { kind: "default", enginePreferenceCsv: "", weightedJson: "{}" };
+  if (t === "pythonScript") {
+    const script = strategy.script;
+    const scriptFile = strategy.scriptFile;
+    return {
+      kind: "pythonScript",
+      ...empty,
+      script: typeof script === "string" ? script : "",
+      scriptFile: typeof scriptFile === "string" ? scriptFile : "",
+    };
+  }
+  return { kind: "default", ...empty };
 }
 
 function parseEnginePreferenceCsv(csv: string): string[] {
@@ -115,6 +131,8 @@ export function buildStrategyPayload(
   kind: StrategyKind,
   enginePreferenceCsv: string,
   weightedJson: string,
+  script: string = "",
+  scriptFile: string = "",
 ): Record<string, unknown> | null {
   switch (kind) {
     case "default":
@@ -172,6 +190,22 @@ export function buildStrategyPayload(
       }
       return { type: "weighted", weights };
     }
+    case "pythonScript": {
+      const trimmedScript = script.trim();
+      const trimmedFile = scriptFile.trim();
+      if (trimmedScript === "" && trimmedFile === "") {
+        throw new Error(
+          "Python script strategy requires either a script body (defining select_cluster(candidates)) or a script file path.",
+        );
+      }
+      // scriptFile takes precedence over an inline script at runtime when both are set
+      // (crates/queryflux-cluster-manager/src/strategy.rs) — emit both so a save that only
+      // touched an unrelated field doesn't silently drop whichever one is populated.
+      const payload: Record<string, unknown> = { type: "pythonScript" };
+      if (trimmedScript !== "") payload.script = trimmedScript;
+      if (trimmedFile !== "") payload.scriptFile = trimmedFile;
+      return payload;
+    }
     default:
       return null;
   }
@@ -180,6 +214,9 @@ export function buildStrategyPayload(
 /** Short label for tables / summaries. */
 export function formatStrategySummary(strategy: Record<string, unknown> | null): string {
   const { kind, enginePreferenceCsv, weightedJson } = parseStrategyRecord(strategy);
+  if (kind === "pythonScript") {
+    return STRATEGY_OPTIONS.find((o) => o.value === "pythonScript")?.label ?? "Python script";
+  }
   const base = STRATEGY_OPTIONS.find((o) => o.value === kind)?.label ?? "Round robin";
   if (kind === "engineAffinity" && enginePreferenceCsv.trim()) {
     return `${base} (${enginePreferenceCsv.replace(/\s*,\s*/g, " → ")})`;
