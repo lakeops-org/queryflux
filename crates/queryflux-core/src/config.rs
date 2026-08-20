@@ -1205,12 +1205,17 @@ pub fn variant_field_to_db_kwarg(driver: &str, key: &str) -> Option<&'static str
 }
 
 /// Resolves the sub-resource name from variant overrides for `{{sub_resource}}` substitution.
-fn resolve_sub_resource(driver: &str, overrides: &serde_json::Value) -> Option<String> {
-    let primary_keys: &[&str] = match driver {
+/// `driver_or_engine` is the ADBC driver name for ADBC clusters, or the
+/// `engine_key` itself for non-ADBC engines that have their own sub-resource
+/// concept (Athena's `workgroup` — one account/region shared across named
+/// workgroups, the same shape as an ADBC SaaS driver's warehouse/project).
+fn resolve_sub_resource(driver_or_engine: &str, overrides: &serde_json::Value) -> Option<String> {
+    let primary_keys: &[&str] = match driver_or_engine {
         "snowflake" => &["warehouse"],
         "databricks" => &["httpPath"],
         "bigquery" => &["project"],
         "redshift" => &["workgroup"],
+        "athena" => &["workgroup"],
         _ => &[],
     };
     for key in primary_keys {
@@ -1474,7 +1479,14 @@ pub fn expand_cluster_variants(
             }
         }
 
-        let sub_resource = resolve_sub_resource(driver, &variant.overrides);
+        // Non-ADBC engines (e.g. Athena) have no `driver` field; fall back to
+        // `engine_key` so they can still have a sub-resource concept.
+        let driver_or_engine = if driver.is_empty() {
+            engine_key
+        } else {
+            driver
+        };
+        let sub_resource = resolve_sub_resource(driver_or_engine, &variant.overrides);
         let default_hcq = default_health_check_query(engine_key, &merged);
         let default_rq = default_reconcile_query(engine_key, &merged);
         let hcq = effective_probe_query(health_check_query, default_hcq, sub_resource.as_deref());
@@ -2865,6 +2877,27 @@ queryflux:
             Some("primary")
         );
         assert!(result[0].merged_config.get("dbKwargs").is_none());
+    }
+
+    #[test]
+    fn athena_variants_substitute_sub_resource_from_workgroup() {
+        // Athena has no `driver` field, so resolve_sub_resource must fall back
+        // to engine_key — otherwise {{sub_resource}} in a custom probe query
+        // would never get substituted for Athena workgroup variants.
+        let base = serde_json::json!({"endpoint": "http://localhost:8080"});
+        let variants = vec![super::ClusterVariant {
+            name: "etl".into(),
+            overrides: serde_json::json!({"workgroup": "etl-workgroup"}),
+            max_running_queries: None,
+        }];
+        let hcq = "-- checking {{sub_resource}}";
+        let result =
+            super::expand_cluster_variants("athena", &base, "athena", &variants, Some(hcq), None)
+                .unwrap();
+        assert_eq!(
+            result[0].health_check_query.as_deref(),
+            Some("-- checking etl-workgroup")
+        );
     }
 
     #[test]

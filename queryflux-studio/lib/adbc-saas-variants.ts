@@ -1,11 +1,18 @@
 import type { ClusterVariant } from "@/lib/api-types";
 
-/** ADBC SaaS drivers that expand into sub-resource variants (warehouses, projects, …). */
+/**
+ * Drivers/engines with a structured "one account, many named sub-resources"
+ * variant editor (warehouses, projects, workgroups, …). Mostly ADBC driver
+ * names, plus "athena" — Athena isn't ADBC, but its `workgroup` field is the
+ * same shape (one AWS account/region shared across named workgroups), so it
+ * reuses this same lookup and editor rather than a parallel implementation.
+ */
 export const SAAS_VARIANT_DRIVERS = [
   "snowflake",
   "databricks",
   "bigquery",
   "redshift",
+  "athena",
 ] as const;
 
 export type SaasVariantDriver = (typeof SAAS_VARIANT_DRIVERS)[number];
@@ -61,6 +68,13 @@ export function subResourceFieldSpec(driver: string): SubResourceFieldSpec | nul
         placeholder: "my-workgroup",
         required: true,
       };
+    case "athena":
+      return {
+        overrideKey: "workgroup",
+        label: "Workgroup",
+        placeholder: "my-athena-workgroup",
+        required: true,
+      };
     default:
       return null;
   }
@@ -75,6 +89,7 @@ export function saasVariantsSectionTitle(driver: string): string {
     case "bigquery":
       return "Projects";
     case "redshift":
+    case "athena":
       return "Workgroups";
     default:
       return "Variants";

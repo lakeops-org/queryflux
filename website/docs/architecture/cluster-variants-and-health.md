@@ -99,6 +99,12 @@ At startup and on hot reload, `expand_cluster_variants()` in `queryflux-core` pr
 | BigQuery | `project` | `project_id` |
 | Redshift | `workgroup` | `workgroup` |
 
+### Athena
+
+Athena isn't ADBC, but its `workgroup` field is the same "one account/region, many named sub-resources" shape as the ADBC SaaS drivers above, so it gets the same **generic-key** override path and Studio's structured variants editor (`SAAS_VARIANT_DRIVERS` treats `"athena"` as a pseudo-driver for this purpose only — it has no `dbKwargs` and no ADBC virtual-field mapping). `{{sub_resource}}` substitutes the variant's `workgroup` the same way it substitutes a warehouse or project for ADBC drivers.
+
+Health checks are the one thing that doesn't carry over: Athena's adapter probes via the native `GetWorkGroup` AWS API call (already per-variant correct, since each variant's adapter is built from its own merged `workgroup`), not SQL — a custom `healthCheckQuery`/`reconcileQuery` set on an Athena cluster is accepted but never executed, so Studio doesn't show those fields for Athena.
+
 ### Group membership
 
 Reference **expanded** names in `clusterGroups.members`:

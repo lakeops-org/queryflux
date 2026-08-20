@@ -510,9 +510,13 @@ function ClusterDialog({
       return;
     }
 
+    // Athena has no config.driver field — it uses the pseudo "athena" key,
+    // same as VariantsSection, so its workgroup variants validate here too.
     const driver =
-      editFlat.driver ??
-      String((persisted.config as Record<string, unknown>).driver ?? "");
+      persisted.engineKey === "athena"
+        ? "athena"
+        : (editFlat.driver ??
+          String((persisted.config as Record<string, unknown>).driver ?? ""));
     const effectiveVariants = editVariants ?? persisted.variants;
     if (isSaasVariantDriver(driver)) {
       const variantErrs = validateVariantRows(
@@ -1337,11 +1341,18 @@ function VariantsSection({
   onVariantsErrorChange: (error: string | null) => void;
 }) {
   const isAdbc = persisted.engineKey === "adbc";
-  // Match save()'s driver resolution: an in-progress driver edit in `editFlat`
-  // takes precedence over the persisted value, so the variant rows/labels
-  // shown here stay consistent with what save-time validation checks against.
-  const driver =
-    editFlat.driver ?? ((persisted.config as Record<string, unknown>).driver as string) ?? "";
+  const isAthena = persisted.engineKey === "athena";
+  // Athena isn't ADBC and has no `config.driver` field — it uses the pseudo
+  // "athena" key so it can share `subResourceFieldSpec`/`SAAS_VARIANT_DRIVERS`
+  // with the ADBC SaaS drivers (its `workgroup` field is the same "one
+  // account, many named sub-resources" shape as their warehouse/project keys).
+  // For ADBC, match save()'s driver resolution: an in-progress driver edit in
+  // `editFlat` takes precedence over the persisted value, so the variant
+  // rows/labels shown here stay consistent with what save-time validation
+  // checks against.
+  const driver = isAthena
+    ? "athena"
+    : (editFlat.driver ?? ((persisted.config as Record<string, unknown>).driver as string) ?? "");
   const saasDriver = isSaasVariantDriver(driver);
 
   // Local UI state for the row/textarea editors; `variants` (via
@@ -1393,7 +1404,7 @@ function VariantsSection({
     }
   }
 
-  if (!isAdbc) return null;
+  if (!isAdbc && !isAthena) return null;
 
   const healthCheckQuery = editFlat.healthCheckQuery ?? "";
   const reconcileQuery = editFlat.reconcileQuery ?? "";
@@ -1437,13 +1448,15 @@ function VariantsSection({
           )}
         </div>
 
-        <AdbcHealthReconcileFields
-          driver={driver}
-          healthCheckQuery={healthCheckQuery}
-          reconcileQuery={reconcileQuery}
-          onHealthCheckQueryChange={(v) => onPatchFlat({ healthCheckQuery: v })}
-          onReconcileQueryChange={(v) => onPatchFlat({ reconcileQuery: v })}
-        />
+        {isAdbc && (
+          <AdbcHealthReconcileFields
+            driver={driver}
+            healthCheckQuery={healthCheckQuery}
+            reconcileQuery={reconcileQuery}
+            onHealthCheckQueryChange={(v) => onPatchFlat({ healthCheckQuery: v })}
+            onReconcileQueryChange={(v) => onPatchFlat({ reconcileQuery: v })}
+          />
+        )}
       </div>
     </div>
   );

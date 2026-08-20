@@ -219,7 +219,11 @@ export function AddClusterDialog({ open, onClose }: Props) {
         return;
       }
     }
-    const adbcDriver = selected.adbcDriver ?? flat.driver ?? "";
+    // Athena has no adbcDriver/config.driver — it uses the pseudo "athena"
+    // key so its workgroup variants share subResourceFieldSpec with the
+    // ADBC SaaS drivers (see adbc-saas-variants.ts).
+    const adbcDriver =
+      selected.engineKey === "athena" ? "athena" : selected.adbcDriver ?? flat.driver ?? "";
     if (isSaasVariantDriver(adbcDriver)) {
       const variantErrs = validateVariantRows(variantRows, adbcDriver);
       if (variantErrs.length > 0) {
@@ -261,9 +265,10 @@ export function AddClusterDialog({ open, onClose }: Props) {
       !descriptor ||
       !descriptor.implemented);
 
-  const adbcDriver = selected?.adbcDriver ?? flat.driver ?? "";
-  const saasAdbc = isSaasVariantDriver(adbcDriver);
   const isAdbc = selected?.engineKey === "adbc";
+  const isAthena = selected?.engineKey === "athena";
+  const adbcDriver = isAthena ? "athena" : selected?.adbcDriver ?? flat.driver ?? "";
+  const saasAdbc = isSaasVariantDriver(adbcDriver);
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
@@ -595,10 +600,14 @@ export function AddClusterDialog({ open, onClose }: Props) {
                     </div>
                   ) : null}
 
-                  {isAdbc ? (
+                  {isAdbc || isAthena ? (
                     <div className="space-y-2 pt-2 border-t border-slate-100">
                       <p className="text-[10px] font-semibold text-slate-400 uppercase tracking-widest">
-                        {saasAdbc ? "Warehouses & health" : "Health & reconcile"}
+                        {saasAdbc && isAdbc
+                          ? "Warehouses & health"
+                          : saasAdbc
+                            ? "Workgroups"
+                            : "Health & reconcile"}
                       </p>
                       <div className="bg-slate-50 rounded-xl border border-slate-100 divide-y divide-slate-100">
                         {saasAdbc ? (
@@ -612,13 +621,15 @@ export function AddClusterDialog({ open, onClose }: Props) {
                             />
                           </div>
                         ) : null}
-                        <AdbcHealthReconcileFields
-                          driver={adbcDriver}
-                          healthCheckQuery={healthCheckQuery}
-                          reconcileQuery={reconcileQuery}
-                          onHealthCheckQueryChange={setHealthCheckQuery}
-                          onReconcileQueryChange={setReconcileQuery}
-                        />
+                        {isAdbc && (
+                          <AdbcHealthReconcileFields
+                            driver={adbcDriver}
+                            healthCheckQuery={healthCheckQuery}
+                            reconcileQuery={reconcileQuery}
+                            onHealthCheckQueryChange={setHealthCheckQuery}
+                            onReconcileQueryChange={setReconcileQuery}
+                          />
+                        )}
                       </div>
                     </div>
                   ) : null}
