@@ -2,7 +2,6 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use clap::Parser;
 use queryflux_auth::{
     AllowAllAuthorization, BackendIdentityResolver, LdapAuthProvider, NoneAuthProvider,
     OidcAuthProvider, OpenFgaAuthorizationClient, SimpleAuthorizationPolicy, StaticAuthProvider,
@@ -35,7 +34,6 @@ use queryflux_metrics::{
     buffered_store::BufferedMetricsStore, prometheus_store::PrometheusMetrics, MetricsStore,
     MultiMetricsStore,
 };
-use queryflux_persistence::cluster_config::{UpsertClusterConfig, UpsertClusterGroupConfig};
 use queryflux_persistence::{
     in_memory::InMemoryPersistence, postgres::PostgresStore, AdminStore, BackendStore,
     DistributedBackendStore, KIND_GUARD,
@@ -45,6 +43,7 @@ use queryflux_routing::{
     implementations::{
         compound::CompoundRouter, header::HeaderRouter, protocol_based::ProtocolBasedRouter,
         python_script::PythonScriptRouter, query_regex::QueryRegexRouter, tags::TagsRouter,
+        user_group::UserGroupRouter,
     },
     RouterTrait,
 };
@@ -53,20 +52,44 @@ use tracing::info;
 
 mod registered_engines;
 
-#[derive(Parser)]
-#[command(name = "queryflux", about = "Multi-engine SQL query proxy")]
-struct Cli {
-    #[arg(short, long, default_value = "config.yaml")]
-    config: String,
+/// Returns `true` when the interval fired (continue work), `false` on shutdown.
+async fn tick_or_shutdown(
+    interval: &mut tokio::time::Interval,
+    shutdown: &mut tokio::sync::watch::Receiver<bool>,
+) -> bool {
+    tokio::select! {
+        _ = shutdown.wait_for(|v| *v) => false,
+        _ = interval.tick() => true,
+    }
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let cli = Cli::parse();
+    let config_path = match queryflux_cli::run_cli().await? {
+        queryflux_cli::CliAction::Exit => return Ok(()),
+        queryflux_cli::CliAction::Migrate { config } => {
+            tracing_subscriber::fmt()
+                .with_env_filter(
+                    tracing_subscriber::EnvFilter::try_from_default_env()
+                        .unwrap_or_else(|_| "queryflux=info".into()),
+                )
+                .init();
+            let config = YamlFileConfigProvider::new(&config)
+                .load()
+                .await
+                .context("Failed to load config")?;
+            queryflux_persistence::run_persistence_migrations(&config.queryflux.persistence)
+                .await
+                .context("Migration failed")?;
+            tracing::info!("Migrations applied successfully");
+            return Ok(());
+        }
+        queryflux_cli::CliAction::Serve { config } => config,
+    };
 
     // Load config before initializing the tracing subscriber so that
     // `otlpEndpoint` from the config file can feed the OTel layer.
-    let mut config = YamlFileConfigProvider::new(&cli.config)
+    let mut config = YamlFileConfigProvider::new(&config_path)
         .load()
         .await
         .context("Failed to load config")?;
@@ -116,7 +139,7 @@ async fn main() -> Result<()> {
         }
     }
 
-    info!("QueryFlux starting — loaded config from: {}", cli.config);
+    info!("QueryFlux starting — loaded config from: {}", config_path);
 
     let external_address = config
         .queryflux
@@ -146,16 +169,18 @@ async fn main() -> Result<()> {
                 .connection_url()
                 .map_err(|m| anyhow::anyhow!("Invalid postgres persistence config: {m}"))?;
             let pg = Arc::new(
-                PostgresStore::connect_with_pool_opts(
-                    &url,
-                    conn.pool_size,
-                    conn.acquire_timeout_secs,
-                    conn.statement_timeout_secs,
-                )
-                .await
-                .context("Failed to connect to Postgres")?,
+                PostgresStore::connect_from_config(&url, conn)
+                    .await
+                    .context("Failed to connect to Postgres")?,
             );
-            pg.migrate().await.context("Migration failed")?;
+            if conn.auto_migrate {
+                pg.migrate().await.context("Migration failed")?;
+            } else {
+                info!(
+                    "persistence.autoMigrate=false — skipping startup migrations \
+                     (apply with `queryflux migrate` or a Job)"
+                );
+            }
             let buffered = Arc::new(BufferedMetricsStore::new(
                 pg.clone() as Arc<dyn MetricsStore>,
                 100,
@@ -171,19 +196,25 @@ async fn main() -> Result<()> {
                 metrics as Arc<dyn MetricsStore>,
             )
         }
-        _ => {
+        queryflux_core::config::PersistenceConfig::Redis { url } => {
+            anyhow::bail!(
+                "persistence.type = redis is not implemented (configured url: {url}). \
+                 Use type: postgres or type: inMemory."
+            );
+        }
+        queryflux_core::config::PersistenceConfig::InMemory => {
             let mem = Arc::new(InMemoryPersistence::new());
             mem_store = Some(mem.clone());
             (
-                mem as Arc<dyn queryflux_persistence::Persistence>,
-                prometheus.clone() as Arc<dyn MetricsStore>,
+                mem.clone() as Arc<dyn queryflux_persistence::Persistence>,
+                in_memory_metrics(prometheus.clone(), mem),
             )
         }
     };
 
     // The durable backend behind the proxy, type-erased so that everything south
-    // of this point is wired against traits. A future backend (e.g. Redis) only
-    // needs to implement `BackendStore` and be constructed in the match above.
+    // of this point is wired against traits. Redis is intentionally rejected above
+    // until a real `BackendStore` implementation exists (no silent in-memory fallback).
     // `None` in in-memory mode, which intentionally has no durable config source.
     let backend: Option<Arc<dyn BackendStore>> = pg_store.clone().map(|pg| pg as _);
     // Multi-replica coordination is optional: only backends that also implement
@@ -199,40 +230,51 @@ async fn main() -> Result<()> {
     > = None;
 
     // --- When Postgres is active, load cluster/group config from DB ---
-    // Merge YAML-defined clusters and groups into Postgres on **every** startup when the
-    // file declares them (`clusters` / `clusterGroups` non-empty). This keeps Docker/Compose
-    // configs authoritative even if the volume already had older rows (e.g. switched engine).
-    // **Studio-first** setups omit those maps (or leave them empty) — then nothing is written
-    // here and the DB remains the source of truth for those resources.
+    // Seed YAML `clusters` / `clusterGroups` only for names that are not already in
+    // Postgres. Existing DB rows (Studio/admin edits) win and are never overwritten
+    // by a ConfigMap/Helm values restart. First boot with an empty DB still seeds
+    // from YAML. Omit those maps (or leave them empty) for Studio-only setups.
     if let Some(pg) = &backend {
         if !config.clusters.is_empty() {
-            info!("Applying cluster definitions from YAML to Postgres");
-            for (name, cfg) in &config.clusters {
-                match UpsertClusterConfig::from_core(cfg) {
-                    Ok(Some(upsert)) => {
-                        pg.upsert_cluster_config(name, &upsert)
-                            .await
-                            .with_context(|| format!("Upsert cluster '{name}' from YAML"))?;
-                    }
-                    Ok(None) => {}
-                    Err(e) => {
-                        return Err(anyhow::Error::from(e).context(format!(
-                            "cluster '{name}': serializing queryAuth for Postgres seed"
-                        )));
-                    }
-                }
+            let report = queryflux_persistence::yaml_seed::seed_clusters_from_yaml_if_missing(
+                pg.as_ref(),
+                &config.clusters,
+            )
+            .await
+            .context("Seed clusters from YAML")?;
+            if report.seeded > 0 {
+                info!(
+                    "Seeded {} cluster definition(s) from YAML into Postgres",
+                    report.seeded
+                );
+            } else if report.existing_before > 0 {
+                info!(
+                    existing = report.existing_before,
+                    "Skipping YAML cluster upsert — Postgres already has these cluster names"
+                );
             }
         }
         if !config.cluster_groups.is_empty() {
-            info!("Applying cluster group definitions from YAML to Postgres");
-            for (name, cfg) in &config.cluster_groups {
-                pg.upsert_group_config(name, &UpsertClusterGroupConfig::from_core(cfg))
-                    .await
-                    .with_context(|| format!("Upsert group '{name}' from YAML"))?;
+            let report = queryflux_persistence::yaml_seed::seed_groups_from_yaml_if_missing(
+                pg.as_ref(),
+                &config.cluster_groups,
+            )
+            .await
+            .context("Seed cluster groups from YAML")?;
+            if report.seeded > 0 {
+                info!(
+                    "Seeded {} cluster group definition(s) from YAML into Postgres",
+                    report.seeded
+                );
+            } else if report.existing_before > 0 {
+                info!(
+                    existing = report.existing_before,
+                    "Skipping YAML group upsert — Postgres already has these group names"
+                );
             }
         }
 
-        // Effective config comes from Postgres (YAML above only upserts keys that appear in the file).
+        // Effective config comes from Postgres (YAML above only seeds missing names).
         info!("Loading cluster and group configs from Postgres");
         let db_cluster_records = pg
             .list_cluster_configs()
@@ -286,8 +328,7 @@ async fn main() -> Result<()> {
             );
 
             // Expand variants: insert a ClusterConfig for each expanded name.
-            let variants: Vec<queryflux_core::config::ClusterVariant> =
-                serde_json::from_value(r.variants.clone()).unwrap_or_default();
+            let variants = parse_cluster_variants(&r.variants);
             if variants.is_empty() {
                 let mut base_cfg = base_cfg;
                 queryflux_core::config::apply_default_probe_queries(
@@ -296,20 +337,28 @@ async fn main() -> Result<()> {
                     &r.config,
                 );
                 clusters.insert(r.name.clone(), base_cfg);
-            } else if let Ok(expanded) = queryflux_core::config::expand_cluster_variants(
-                &r.name,
-                &r.config,
-                &r.engine_key,
-                &variants,
-                base_cfg.health_check_query.as_deref(),
-                base_cfg.reconcile_query.as_deref(),
-            ) {
-                for exp in expanded {
-                    let mut variant_cfg = base_cfg.clone();
-                    variant_cfg.max_running_queries = exp.max_running_queries.or(max_running);
-                    variant_cfg.health_check_query = exp.health_check_query;
-                    variant_cfg.reconcile_query = exp.reconcile_query;
-                    clusters.insert(exp.expanded_name, variant_cfg);
+            } else {
+                match queryflux_core::config::expand_cluster_variants(
+                    &r.name,
+                    &r.config,
+                    &r.engine_key,
+                    &variants,
+                    base_cfg.health_check_query.as_deref(),
+                    base_cfg.reconcile_query.as_deref(),
+                ) {
+                    Ok(expanded) => {
+                        for exp in expanded {
+                            let mut variant_cfg = base_cfg.clone();
+                            variant_cfg.max_running_queries =
+                                exp.max_running_queries.or(max_running);
+                            variant_cfg.health_check_query = exp.health_check_query;
+                            variant_cfg.reconcile_query = exp.reconcile_query;
+                            clusters.insert(exp.expanded_name, variant_cfg);
+                        }
+                    }
+                    Err(err) => {
+                        tracing::error!(cluster = %r.name, error = %err, "Variant expansion failed — cluster omitted");
+                    }
                 }
             }
         }
@@ -330,13 +379,17 @@ async fn main() -> Result<()> {
             .collect();
 
         // Apply persisted security overrides (`security_settings` / `security_config` key).
+        // The migration seeds `{}`; that is not an override — keep YAML.
         if let Ok(Some(v)) = pg.get_proxy_setting("security_config").await {
-            let (auth_cfg, authz_cfg) = parse_security_setting(&v);
-            if let Some(auth_cfg) = auth_cfg {
-                config.auth = auth_cfg;
-            }
-            if let Some(authz_cfg) = authz_cfg {
-                config.authorization = authz_cfg;
+            if !queryflux_core::security_setting::is_blank_security_setting(&v) {
+                let (auth_cfg, authz_cfg) =
+                    queryflux_core::security_setting::parse_security_setting(&v);
+                if let Some(auth_cfg) = auth_cfg {
+                    config.auth = auth_cfg;
+                }
+                if let Some(authz_cfg) = authz_cfg {
+                    config.authorization = authz_cfg;
+                }
             }
         }
         let mut routing_from_db = false;
@@ -421,19 +474,8 @@ async fn main() -> Result<()> {
             }
 
             // Parse variants from the JSONB column.
-            let variants: Vec<queryflux_core::config::ClusterVariant> =
-                serde_json::from_value(record.variants.clone()).unwrap_or_default();
-
-            let health_check_query = record
-                .config
-                .get("healthCheckQuery")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
-            let reconcile_query = record
-                .config
-                .get("reconcileQuery")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
+            let variants = parse_cluster_variants(&record.variants);
+            let (health_check_query, reconcile_query) = extract_base_probe_queries(&record.config);
 
             if variants.is_empty() {
                 // No variants — build a single adapter as before.
@@ -659,12 +701,15 @@ async fn main() -> Result<()> {
                     .collect();
                 routers.push(Box::new(HeaderRouter::new(header_name.clone(), mapping)));
             }
-            RouterConfig::QueryRegex { rules } => {
-                let pairs = rules
+            RouterConfig::UserGroup { user_to_group } => {
+                let mapping = user_to_group
                     .iter()
-                    .map(|r| (r.regex.clone(), r.target_group.clone()))
+                    .map(|(k, v)| (k.clone(), ClusterGroupName(v.clone())))
                     .collect();
-                routers.push(Box::new(QueryRegexRouter::new(pairs)));
+                routers.push(Box::new(UserGroupRouter::new(mapping)));
+            }
+            RouterConfig::QueryRegex { rules } => {
+                routers.push(Box::new(QueryRegexRouter::from_rules(rules.clone())));
             }
             RouterConfig::Tags { rules } => {
                 routers.push(Box::new(TagsRouter::new(rules.clone())));
@@ -692,16 +737,21 @@ async fn main() -> Result<()> {
                     target_group.clone(),
                 )));
             }
-            _ => {
-                tracing::warn!("Router type not yet implemented, skipping");
-            }
         }
     }
 
     let router_chain = RouterChain::new(routers, fallback);
 
+    config
+        .validate_startup_security()
+        .map_err(|e| anyhow::anyhow!("Startup security validation failed: {e}"))?;
+
     let auth_provider = build_auth_provider(&config.auth)?;
-    let authorization = build_authorization(&config.authorization, &config.cluster_groups)?;
+    let authorization = build_authorization(
+        &config.authorization,
+        &config.cluster_groups,
+        operators_from_auth(&config.auth),
+    )?;
 
     // --- Production safety warnings ---
     if matches!(
@@ -732,26 +782,65 @@ async fn main() -> Result<()> {
         }
     }
 
-    // --- Startup validation: impersonate only valid for Trino ---
+    // --- Startup validation: engine × queryAuth support matrix ---
+    // Centralized in `query_auth_supported` so YAML load, Studio PUT, and this check can't
+    // drift apart. `passthrough`/`impersonate` are Trino-only; `tokenExchange` is Trino or
+    // ADBC-with-an-OAuth-capable-driver (`cfg.driver`, only ever set for admin-API-created
+    // ADBC clusters — see `ClusterConfig::driver`).
     for (name, cfg) in &config.clusters {
-        if matches!(
-            cfg.query_auth,
-            Some(queryflux_core::config::QueryAuthConfig::Impersonate)
-        ) {
-            let engine = cfg
-                .engine
-                .as_ref()
-                .map(|e| format!("{e:?}"))
-                .unwrap_or_default();
-            if !matches!(
-                cfg.engine,
-                Some(queryflux_core::config::EngineConfig::Trino)
+        if let Some(mode) = &cfg.query_auth {
+            if let Err(msg) = queryflux_core::config::query_auth_supported(
+                cfg.engine.as_ref(),
+                cfg.driver.as_deref(),
+                mode,
             ) {
-                anyhow::bail!(
-                    "cluster '{name}': queryAuth.type = impersonate is only supported for Trino, got {engine}"
-                );
+                anyhow::bail!("cluster '{name}': {msg}");
             }
         }
+    }
+
+    // Deprecation warning: a cluster with no explicit `queryAuth` (or `serviceAccount`) and
+    // no HTTP-setting cluster auth still implicitly forwards the client's own Authorization
+    // header today, for backward compatibility. Operators should migrate to an explicit
+    // `queryAuth: passthrough` — this fallback may be removed in a future release.
+    for (name, cfg) in &config.clusters {
+        let is_implicit_passthrough_eligible = matches!(
+            cfg.query_auth,
+            None | Some(queryflux_core::config::QueryAuthConfig::ServiceAccount)
+        ) && matches!(
+            cfg.engine,
+            Some(queryflux_core::config::EngineConfig::Trino)
+        ) && !cfg
+            .auth
+            .as_ref()
+            .is_some_and(|a| a.sets_http_authorization());
+        if is_implicit_passthrough_eligible {
+            tracing::warn!(
+                "DEPRECATED: cluster '{name}' has no HTTP cluster auth and no explicit \
+                 queryAuth — it still implicitly forwards the client's Authorization header \
+                 (legacy behavior). Set queryAuth.type: passthrough explicitly; the implicit \
+                 fallback may be removed in a future release."
+            );
+        }
+    }
+
+    // Startup warning: with no gateway-level authorization policy, `passthrough` forwards
+    // whatever the client sent straight to the backend. The gap exists regardless of how
+    // many cluster groups there are — a single-group deployment is the common default, so
+    // gating on `cluster_groups.len() > 1` hid the warning for exactly the most likely
+    // misconfiguration. Group count only changes the blast radius, not whether the gap
+    // exists, so it's now informational in the message rather than a gate.
+    let passthrough_clusters = unauthenticated_passthrough_clusters(&config);
+    if !passthrough_clusters.is_empty() {
+        tracing::warn!(
+            clusters = ?passthrough_clusters,
+            "SECURITY: authorization.provider is 'none' and queryAuth: passthrough is set \
+             on {} cluster(s) across {} cluster group(s) — QueryFlux is not enforcing any \
+             access policy, so a client's own credential decides what it can reach on \
+             every group it can route to. Configure authorization or narrow routing.",
+            passthrough_clusters.len(),
+            config.cluster_groups.len()
+        );
     }
 
     let identity_resolver = Arc::new(BackendIdentityResolver::new());
@@ -808,6 +897,17 @@ async fn main() -> Result<()> {
         .filter(|(_, g)| !g.default_tags.is_empty())
         .map(|(name, g)| (name.clone(), g.default_tags.clone()))
         .collect();
+    let group_max_queued_queries: HashMap<String, Option<u64>> = config
+        .cluster_groups
+        .iter()
+        .filter(|(_, g)| g.max_queued_queries.is_some())
+        .map(|(name, g)| (name.clone(), g.max_queued_queries))
+        .collect();
+    let group_capacity_wait_timeout_secs: HashMap<String, u64> = config
+        .cluster_groups
+        .iter()
+        .map(|(name, g)| (name.clone(), g.capacity_wait_timeout_secs_or_default()))
+        .collect();
     let group_cache_settings: HashMap<String, queryflux_core::config::GroupCacheConfig> = config
         .cluster_groups
         .iter()
@@ -844,6 +944,8 @@ async fn main() -> Result<()> {
         group_order,
         group_translation_scripts,
         group_default_tags,
+        group_max_queued_queries,
+        group_capacity_wait_timeout_secs,
         group_cache_settings,
         auth_provider,
         authorization,
@@ -856,25 +958,15 @@ async fn main() -> Result<()> {
     {
         let mut m: HashMap<String, String> = HashMap::new();
         for r in records {
-            let variants: Vec<queryflux_core::config::ClusterVariant> =
-                serde_json::from_value(r.variants.clone()).unwrap_or_default();
+            let variants = parse_cluster_variants(&r.variants);
             if variants.is_empty() {
                 m.insert(
                     r.name.clone(),
                     serde_json::to_string(&(r.engine_key.as_str(), &r.config)).unwrap_or_default(),
                 );
             } else {
-                let health_check_query = r
-                    .config
-                    .get("healthCheckQuery")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string());
-                let reconcile_query = r
-                    .config
-                    .get("reconcileQuery")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string());
-                if let Ok(expanded) = queryflux_core::config::expand_cluster_variants(
+                let (health_check_query, reconcile_query) = extract_base_probe_queries(&r.config);
+                match queryflux_core::config::expand_cluster_variants(
                     &r.name,
                     &r.config,
                     &r.engine_key,
@@ -882,12 +974,17 @@ async fn main() -> Result<()> {
                     health_check_query.as_deref(),
                     reconcile_query.as_deref(),
                 ) {
-                    for exp in expanded {
-                        m.insert(
-                            exp.expanded_name,
-                            serde_json::to_string(&(r.engine_key.as_str(), &exp.merged_config))
-                                .unwrap_or_default(),
-                        );
+                    Ok(expanded) => {
+                        for exp in expanded {
+                            m.insert(
+                                exp.expanded_name,
+                                serde_json::to_string(&(r.engine_key.as_str(), &exp.merged_config))
+                                    .unwrap_or_default(),
+                            );
+                        }
+                    }
+                    Err(err) => {
+                        tracing::error!(cluster = %r.name, error = %err, "Variant expansion failed — cluster omitted");
                     }
                 }
             }
@@ -1029,7 +1126,7 @@ async fn main() -> Result<()> {
     let admin_store: Option<Arc<dyn AdminStore>> = backend
         .clone()
         .map(|b| b as Arc<dyn AdminStore>)
-        .or_else(|| mem_store.map(|m| m as Arc<dyn AdminStore>));
+        .or_else(|| mem_store.clone().map(|m| m as Arc<dyn AdminStore>));
     let security_config = Arc::new(AdminSecurityConfigDto::from_config(
         &config.auth,
         &config.authorization,
@@ -1048,17 +1145,24 @@ async fn main() -> Result<()> {
     );
 
     // Build admin credentials — env vars take precedence over YAML.
-    let admin_username =
-        std::env::var("QUERYFLUX_ADMIN_USER").unwrap_or_else(|_| config.admin_api.username.clone());
+    // Bootstrap lives on `queryflux.adminApi`, not the unused top-level `adminApi`.
+    let admin_username = std::env::var("QUERYFLUX_ADMIN_USER")
+        .unwrap_or_else(|_| config.queryflux.admin_api.username.clone());
     let admin_password = std::env::var("QUERYFLUX_ADMIN_PASSWORD")
-        .unwrap_or_else(|_| config.admin_api.password.clone());
+        .unwrap_or_else(|_| config.queryflux.admin_api.password.clone());
     let settings_store = backend
         .clone()
-        .map(|b| b as Arc<dyn queryflux_persistence::ProxySettingsStore>);
+        .map(|b| b as Arc<dyn queryflux_persistence::ProxySettingsStore>)
+        .or_else(|| {
+            mem_store
+                .clone()
+                .map(|m| m as Arc<dyn queryflux_persistence::ProxySettingsStore>)
+        });
     let admin_creds = Arc::new(queryflux_auth::AdminCredentialsManager::new(
         admin_username,
         admin_password,
         settings_store,
+        backend.is_some(),
     ));
 
     let test_cluster_fn: TestClusterFn = Arc::new(|engine_key, config_json| {
@@ -1096,19 +1200,22 @@ async fn main() -> Result<()> {
         test_cluster_fn,
         cors_origins,
         app_state.result_cache.clone(),
-    );
-
-    // --- Start Trino HTTP frontend ---
-    let trino_port = config.queryflux.frontends.trino_http.port;
-    let frontend = TrinoHttpFrontend::new(
         app_state.clone(),
-        trino_port,
-        config.queryflux.frontends.trino_http.max_connections,
     );
 
-    info!(
-        "QueryFlux ready — Trino HTTP on :{trino_port}, admin/metrics on :{admin_port}, external address: {external_address}"
-    );
+    // --- Start Trino HTTP frontend (honors frontends.trinoHttp.enabled) ---
+    let trino_cfg = config.queryflux.frontends.trino_http.clone();
+    let trino_port = trino_cfg.port;
+
+    if trino_cfg.enabled {
+        info!(
+            "QueryFlux ready — Trino HTTP on :{trino_port}, admin/metrics on :{admin_port}, external address: {external_address}"
+        );
+    } else {
+        info!(
+            "QueryFlux ready — Trino HTTP disabled, admin/metrics on :{admin_port}, external address: {external_address}"
+        );
+    }
 
     if distributed {
         if config
@@ -1155,10 +1262,13 @@ async fn main() -> Result<()> {
         let prometheus = prometheus.clone();
         let backend = backend.clone();
         let distributed_backend = distributed_backend.clone();
+        let mut shutdown_rx = shutdown_rx.clone();
         async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
             loop {
-                interval.tick().await;
+                if !tick_or_shutdown(&mut interval, &mut shutdown_rx).await {
+                    break;
+                }
                 let cluster_manager = state.live.read().await.cluster_manager.clone();
                 let Ok(snapshots) = cluster_manager.all_cluster_states().await else {
                     continue;
@@ -1222,10 +1332,13 @@ async fn main() -> Result<()> {
     // is 300s — five missed beats). Leases of crashed replicas stop heartbeating and expire.
     if let Some(cap) = app_state.capacity_store.clone() {
         let state = app_state.clone();
+        let mut shutdown_rx = shutdown_rx.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
             loop {
-                interval.tick().await;
+                if !tick_or_shutdown(&mut interval, &mut shutdown_rx).await {
+                    break;
+                }
                 if let Err(e) = cap.heartbeat(&state.instance_id).await {
                     state.metrics.on_coordination_failure("capacity_heartbeat");
                     tracing::warn!("Capacity lease heartbeat failed: {e}");
@@ -1243,11 +1356,14 @@ async fn main() -> Result<()> {
     tokio::spawn({
         let state = app_state.clone();
         let distributed_backend = distributed_backend.clone();
+        let mut shutdown_rx = shutdown_rx.clone();
         async move {
             const CLIENT_TIMEOUT_SECS: i64 = 300; // matches Trino's query.client.timeout default
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(120));
             loop {
-                interval.tick().await;
+                if !tick_or_shutdown(&mut interval, &mut shutdown_rx).await {
+                    break;
+                }
 
                 // Single-owner sweep: the eviction and lease expiry below are global
                 // (idempotent, but redundant on every replica), so only the replica
@@ -1294,37 +1410,46 @@ async fn main() -> Result<()> {
                             "Evicting zombie executing query — not polled for >5 min"
                         );
 
-                        // Best-effort cancel on the backend engine so the query
-                        // doesn't keep consuming cluster resources.
-                        if let Some(base_url) = &q.poll_base_url {
-                            let cancel_url =
-                                format!("{base_url}/v1/statement/executing/{}", q.backend_query_id);
-                            let client = state.http_client.clone();
+                        // Best-effort cancel on the backend with cluster credentials
+                        // (same path as client/admin cancel). The previous unauthenticated
+                        // DELETE on `/v1/statement/executing/...` did not stop secured Trino.
+                        let backend_id = q.backend_query_id.clone();
+                        let wire_auth = q.wire_auth.clone();
+                        let cluster = q.cluster_name.0.clone();
+                        let (engine_type, tgt_dialect) =
+                            if let Some(adapter) = state.adapter(&cluster).await {
+                                (adapter.engine_type(), adapter.translation_target_dialect())
+                            } else {
+                                state.engine_type_for_cluster(&cluster).await
+                            };
+                        state.record_executing_cancelled(
+                            &q,
+                            queryflux_core::query::FrontendProtocol::TrinoHttp,
+                            engine_type,
+                            tgt_dialect,
+                            "zombie_evicted: not polled for >5 min",
+                        );
+                        if let Some(adapter) = state.adapter(&cluster).await {
                             tokio::spawn(async move {
-                                if let Err(e) = client.delete(&cancel_url).send().await {
+                                if let Err(e) =
+                                    adapter.cancel_query(&backend_id, wire_auth.as_ref()).await
+                                {
                                     tracing::debug!(
                                         "Zombie cancel request failed (best-effort): {e}"
                                     );
                                 }
                             });
+                        } else {
+                            tracing::debug!(
+                                cluster = %cluster,
+                                id = %q.backend_query_id,
+                                "No adapter available for zombie cancel"
+                            );
                         }
 
                         state
-                            .metrics
-                            .on_query_finished(&q.cluster_group.0, &q.cluster_name.0);
-                        let cluster_manager = state.live.read().await.cluster_manager.clone();
-                        let _ = cluster_manager
-                            .release_cluster(&q.cluster_group, &q.cluster_name)
+                            .release_query_slot(&q.cluster_group, &q.cluster_name, &q.id.0)
                             .await;
-                        if let Some(cap) = &state.capacity_store {
-                            if let Err(e) = cap.release(&q.cluster_name.0, &q.id.0).await {
-                                state.metrics.on_coordination_failure("capacity_release");
-                                tracing::warn!(
-                                    "CapacityStore release failed for zombie query {}: {e}",
-                                    q.id
-                                );
-                            }
-                        }
                         let _ = state.persistence.delete(&q.backend_query_id).await;
                     }
                 }
@@ -1341,20 +1466,55 @@ async fn main() -> Result<()> {
     // deletes queued entries not accessed for > 5 minutes.
     tokio::spawn({
         let state = app_state.clone();
+        let distributed_backend = distributed_backend.clone();
+        let mut shutdown_rx = shutdown_rx.clone();
         async move {
             const CLIENT_TIMEOUT_SECS: i64 = 300;
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(120));
             loop {
-                interval.tick().await;
+                if !tick_or_shutdown(&mut interval, &mut shutdown_rx).await {
+                    break;
+                }
+
+                let sweep_lock = match &distributed_backend {
+                    Some(backend) => match backend.try_sweep_lock("stale-queued-eviction").await {
+                        Ok(Some(lock)) => Some(lock),
+                        Ok(None) => continue,
+                        Err(e) => {
+                            state.metrics.on_coordination_failure("sweep_lock");
+                            tracing::warn!("Stale queued sweep lock failed, sweeping anyway: {e}");
+                            None
+                        }
+                    },
+                    None => None,
+                };
+
                 let cutoff = chrono::Utc::now() - chrono::Duration::seconds(CLIENT_TIMEOUT_SECS);
-                match state
-                    .persistence
-                    .delete_queued_not_accessed_since(cutoff)
-                    .await
-                {
-                    Ok(0) => {}
-                    Ok(n) => tracing::info!("Cleaned up {n} stale queued queries"),
-                    Err(e) => tracing::warn!("Queued query cleanup failed: {e}"),
+                let Ok(queued) = state.persistence.list_queued().await else {
+                    if let Some(lock) = sweep_lock {
+                        lock.release().await;
+                    }
+                    continue;
+                };
+                let mut cleaned = 0u64;
+                for q in queued {
+                    if q.last_accessed < cutoff {
+                        if let Ok(Some(taken)) = state.persistence.take_queued(&q.id).await {
+                            state.record_queued_terminal(
+                                &taken,
+                                queryflux_core::query::QueryStatus::Failed,
+                                "stale_queued_evicted: client disconnected before dispatch",
+                            );
+                            cleaned += 1;
+                        }
+                    }
+                }
+                if cleaned > 0 {
+                    tracing::info!("Cleaned up {cleaned} stale queued queries");
+                }
+
+                if let Some(lock) = sweep_lock {
+                    lock.release().await;
                 }
             }
         }
@@ -1370,12 +1530,17 @@ async fn main() -> Result<()> {
             .map(|c| c.cleanup_interval_secs)
             .unwrap_or(300);
         if interval_secs > 0 {
+            let mut shutdown_rx = shutdown_rx.clone();
             tokio::spawn(async move {
                 let mut interval =
                     tokio::time::interval(std::time::Duration::from_secs(interval_secs));
-                interval.tick().await;
+                if !tick_or_shutdown(&mut interval, &mut shutdown_rx).await {
+                    return;
+                }
                 loop {
-                    interval.tick().await;
+                    if !tick_or_shutdown(&mut interval, &mut shutdown_rx).await {
+                        break;
+                    }
                     match cache.cleanup_expired().await {
                         Ok(0) => {}
                         Ok(n) => {
@@ -1389,22 +1554,27 @@ async fn main() -> Result<()> {
     }
 
     // Background task: enforce query_history_retention_days — runs hourly and deletes
-    // query_records rows older than the configured retention window.
+    // query_records, query_digest_stats, and cluster_snapshots older than the window.
     // Only active when Postgres is configured and retention_days is set.
     if let (Some(backend), Some(retention_days)) = (
         backend.clone(),
         config.queryflux.query_history_retention_days,
     ) {
+        let mut shutdown_rx = shutdown_rx.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600));
-            interval.tick().await; // skip the first immediate tick at startup
+            if !tick_or_shutdown(&mut interval, &mut shutdown_rx).await {
+                return;
+            }
             loop {
-                interval.tick().await;
+                if !tick_or_shutdown(&mut interval, &mut shutdown_rx).await {
+                    break;
+                }
                 let cutoff = chrono::Utc::now() - chrono::Duration::days(retention_days as i64);
                 match backend.purge_old_query_records(cutoff).await {
                     Ok(0) => {}
                     Ok(n) => {
-                        tracing::info!("Purged {n} query records older than {retention_days} days")
+                        tracing::info!("Purged {n} history rows older than {retention_days} days")
                     }
                     Err(e) => tracing::warn!("Query history purge failed: {e}"),
                 }
@@ -1424,7 +1594,9 @@ async fn main() -> Result<()> {
         let cache = adapter_reload_cache.clone();
         let notify = config_reload_notify.clone();
         let admin_for_reload = admin_store_for_reload;
+        let metrics = app_state.metrics.clone();
         let periodic_secs = config.queryflux.periodic_config_reload_interval_secs();
+        let mut shutdown_rx = shutdown_rx.clone();
 
         // Subscribe to distributed config revision changes (push where the
         // backend supports it, e.g. Postgres LISTEN/NOTIFY).
@@ -1449,6 +1621,7 @@ async fn main() -> Result<()> {
                 backend: &Arc<dyn BackendStore>,
                 cache: &tokio::sync::Mutex<AdapterReloadCache>,
                 live: &Arc<tokio::sync::RwLock<LiveConfig>>,
+                metrics: &Arc<dyn MetricsStore>,
             ) {
                 let mut cache_guard = cache.lock().await;
                 // Snapshot the pieces a reload must never silently weaken; the
@@ -1462,18 +1635,22 @@ async fn main() -> Result<()> {
                         group_guard_chains: l.group_guard_chains.clone(),
                     }
                 };
-                match reload_live_config(backend, &mut cache_guard, &prev).await {
+                match reload_live_config(backend, &mut cache_guard, &prev, metrics).await {
                     Ok(new_live) => {
                         *live.write().await = new_live;
                         tracing::info!("Live config reloaded from backend");
                     }
-                    Err(e) => tracing::warn!("Config reload failed: {e}"),
+                    Err(e) => {
+                        metrics.on_config_reload_failure("reload");
+                        tracing::warn!("Config reload failed: {e}");
+                    }
                 }
             }
 
             async fn reload_guard_chain_from_admin(
                 admin: &Option<Arc<dyn AdminStore>>,
                 live: &Arc<tokio::sync::RwLock<LiveConfig>>,
+                metrics: &Arc<dyn MetricsStore>,
             ) {
                 if let Some(store) = admin {
                     let guard_script_bodies =
@@ -1491,7 +1668,10 @@ async fn main() -> Result<()> {
                             w.guard_chain = None;
                             w.group_guard_chains = HashMap::new();
                         }
-                        Err(e) => tracing::warn!("Guard chain reload failed: {e}"),
+                        Err(e) => {
+                            metrics.on_config_reload_failure("guard_reload");
+                            tracing::warn!("Guard chain reload failed: {e}");
+                        }
                     }
                 }
             }
@@ -1501,16 +1681,17 @@ async fn main() -> Result<()> {
                 cache: &tokio::sync::Mutex<AdapterReloadCache>,
                 live: &Arc<tokio::sync::RwLock<LiveConfig>>,
                 admin: &Option<Arc<dyn AdminStore>>,
+                metrics: &Arc<dyn MetricsStore>,
             ) {
                 if let Some(backend) = backend {
-                    do_reload(backend, cache, live).await;
+                    do_reload(backend, cache, live, metrics).await;
                 } else {
                     // YAML-mode reload contract: without a Postgres backend, routing rules,
                     // cluster configs, and adapters are fixed at startup from the YAML file
                     // and cannot change at runtime. Only guard chains (stored in the admin
                     // store) can be hot-reloaded via the admin API. Routing or cluster
                     // changes in YAML require a process restart.
-                    reload_guard_chain_from_admin(admin, live).await;
+                    reload_guard_chain_from_admin(admin, live, metrics).await;
                 }
             }
 
@@ -1553,6 +1734,7 @@ async fn main() -> Result<()> {
             match periodic_secs {
                 None => loop {
                     tokio::select! {
+                        _ = shutdown_rx.wait_for(|v| *v) => break,
                         _ = notify.notified() => {
                             tracing::debug!("Config reload triggered by local admin write");
                         }
@@ -1561,7 +1743,7 @@ async fn main() -> Result<()> {
                         }
                     }
                     coalesce_revisions(&mut revision_rx).await;
-                    do_reload_or_guard(&backend, &cache, &live, &admin_for_reload).await;
+                    do_reload_or_guard(&backend, &cache, &live, &admin_for_reload, &metrics).await;
                 },
                 Some(interval_secs) => {
                     let mut interval =
@@ -1569,6 +1751,7 @@ async fn main() -> Result<()> {
                     interval.tick().await; // skip the first immediate tick — startup already loaded
                     loop {
                         tokio::select! {
+                            _ = shutdown_rx.wait_for(|v| *v) => break,
                             _ = interval.tick() => {}
                             _ = notify.notified() => {
                                 tracing::debug!("Config reload triggered by local admin write");
@@ -1578,7 +1761,8 @@ async fn main() -> Result<()> {
                             }
                         }
                         coalesce_revisions(&mut revision_rx).await;
-                        do_reload_or_guard(&backend, &cache, &live, &admin_for_reload).await;
+                        do_reload_or_guard(&backend, &cache, &live, &admin_for_reload, &metrics)
+                            .await;
                     }
                 }
             }
@@ -1590,10 +1774,13 @@ async fn main() -> Result<()> {
     // ADBC SaaS backends without a custom query skip health checks (always healthy).
     tokio::spawn({
         let state = app_state.clone();
+        let mut shutdown_rx = shutdown_rx.clone();
         async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
             loop {
-                interval.tick().await;
+                if !tick_or_shutdown(&mut interval, &mut shutdown_rx).await {
+                    break;
+                }
                 let (targets, custom_health) = {
                     let live = state.live.read().await;
                     (
@@ -1635,10 +1822,13 @@ async fn main() -> Result<()> {
     tokio::spawn({
         let state = app_state.clone();
         let distributed_backend = distributed_backend.clone();
+        let mut shutdown_rx = shutdown_rx.clone();
         async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
             loop {
-                interval.tick().await;
+                if !tick_or_shutdown(&mut interval, &mut shutdown_rx).await {
+                    break;
+                }
                 let (targets, custom_reconcile) = {
                     let live = state.live.read().await;
                     (
@@ -1722,9 +1912,18 @@ async fn main() -> Result<()> {
     // finish in-flight requests), wire-based frontends break their accept loop, and
     // tonic (Flight SQL) uses `serve_with_shutdown`.
     let mut trino_handle = tokio::spawn({
-        let fe = frontend;
+        let state = app_state.clone();
         let rx = shutdown_rx.clone();
-        async move { fe.listen(rx).await }
+        let cfg = trino_cfg;
+        async move {
+            if cfg.enabled {
+                TrinoHttpFrontend::new(state, cfg.port, cfg.max_connections)
+                    .listen(rx)
+                    .await
+            } else {
+                std::future::pending::<queryflux_core::error::Result<()>>().await
+            }
+        }
     });
     let mut admin_handle = tokio::spawn({
         let rx = shutdown_rx.clone();
@@ -1914,6 +2113,67 @@ type GroupStatesMap = HashMap<
     ),
 >;
 
+/// Clusters with `queryAuth: passthrough` when `authorization.provider` is `none` — the
+/// gateway enforces no access policy, so a client's own credential decides what it can
+/// reach. Returned regardless of `cluster_groups.len()`: a single-group deployment (the
+/// common default) has this gap just as much as a multi-group one, it's just narrower in
+/// blast radius, which is why the caller reports the group count rather than gating on it.
+fn unauthenticated_passthrough_clusters(
+    config: &queryflux_core::config::ProxyConfig,
+) -> Vec<&String> {
+    if !matches!(
+        config.authorization.provider,
+        queryflux_core::config::AuthorizationProviderConfig::None
+    ) {
+        return Vec::new();
+    }
+    // `build_authorization` still enforces a per-group SimpleAuthorizationPolicy when
+    // provider is `none` but any group declares an allow-list — mirror that check so this
+    // warning only fires on the genuinely allow-all case, not one that already has policy.
+    let has_any_policy = config.cluster_groups.values().any(|cfg| {
+        !cfg.authorization.allow_groups.is_empty() || !cfg.authorization.allow_users.is_empty()
+    });
+    if has_any_policy {
+        return Vec::new();
+    }
+    config
+        .clusters
+        .iter()
+        .filter(|(_, cfg)| {
+            matches!(
+                cfg.query_auth,
+                Some(queryflux_core::config::QueryAuthConfig::Passthrough)
+            )
+        })
+        .map(|(name, _)| name)
+        .collect()
+}
+
+/// Parses the `variants` JSONB column into `ClusterVariant`s. Shared by every
+/// startup/reload path that expands a persisted cluster record into runtime
+/// clusters, so the parsing behavior (and its `unwrap_or_default` on malformed
+/// JSON) stays identical everywhere instead of drifting across call sites.
+fn parse_cluster_variants(variants_json: &serde_json::Value) -> Vec<queryflux_core::config::ClusterVariant> {
+    serde_json::from_value(variants_json.clone()).unwrap_or_default()
+}
+
+/// Extracts the base `healthCheckQuery` / `reconcileQuery` overrides from a
+/// cluster's persisted `config` JSONB blob, ahead of variant expansion (which
+/// applies driver defaults and `{{sub_resource}}` substitution on top). Shared
+/// by every call site that needs these two fields before calling
+/// `expand_cluster_variants`.
+fn extract_base_probe_queries(config_json: &serde_json::Value) -> (Option<String>, Option<String>) {
+    let health_check_query = config_json
+        .get("healthCheckQuery")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let reconcile_query = config_json
+        .get("reconcileQuery")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    (health_check_query, reconcile_query)
+}
+
 /// Convert optional Postgres `BIGINT` (`max_running_queries`) to `Option<u64>`.
 /// Negative values fail fast (invalid row).
 fn max_running_queries_u64_from_db(cluster: &str, v: Option<i64>) -> Result<Option<u64>> {
@@ -2021,7 +2281,15 @@ fn validate_live_config_refs(
                 refs.extend(user_to_group.values().map(String::as_str));
             }
             RouterConfig::QueryRegex { rules } => {
-                refs.extend(rules.iter().map(|r| r.target_group.as_str()));
+                for rule in rules {
+                    if matches!(rule.action, queryflux_core::config::RegexRouteAction::Route) {
+                        if let Some(group) = rule.target_group.as_deref() {
+                            refs.push(group);
+                        } else {
+                            issues.push("queryRegex route rule requires targetGroup".to_string());
+                        }
+                    }
+                }
             }
             RouterConfig::Tags { rules } => {
                 refs.extend(rules.iter().map(|r| r.target_group.as_str()));
@@ -2110,22 +2378,12 @@ async fn build_live_config(
     let mut expanded_configs: HashMap<String, ExpandedVariantConfig> = HashMap::new();
 
     for record in cluster_records {
-        let variants: Vec<queryflux_core::config::ClusterVariant> =
-            serde_json::from_value(record.variants.clone()).unwrap_or_default();
+        let variants = parse_cluster_variants(&record.variants);
 
         if variants.is_empty() {
             all_cluster_names.insert(record.name.clone());
         } else {
-            let health_check_query = record
-                .config
-                .get("healthCheckQuery")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
-            let reconcile_query = record
-                .config
-                .get("reconcileQuery")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
+            let (health_check_query, reconcile_query) = extract_base_probe_queries(&record.config);
             match queryflux_core::config::expand_cluster_variants(
                 &record.name,
                 &record.config,
@@ -2161,10 +2419,8 @@ async fn build_live_config(
     // Build adapters — reuse when serialized cluster config is unchanged.
     // First handle base (non-variant) records.
     for record in cluster_records {
-        let variants: Vec<queryflux_core::config::ClusterVariant> =
-            serde_json::from_value(record.variants.clone()).unwrap_or_default();
-        if !variants.is_empty() {
-            continue; // handled below
+        if !parse_cluster_variants(&record.variants).is_empty() {
+            continue; // has variants — handled below
         }
 
         let cluster_name_str = &record.name;
@@ -2410,8 +2666,7 @@ async fn build_live_config(
             query_auth.clone(),
         );
 
-        let variants: Vec<queryflux_core::config::ClusterVariant> =
-            serde_json::from_value(r.variants.clone()).unwrap_or_default();
+        let variants = parse_cluster_variants(&r.variants);
         if variants.is_empty() {
             let mut base_cfg = base_cfg;
             apply_default_probe_queries(&mut base_cfg, &r.engine_key, &r.config);
@@ -2478,13 +2733,20 @@ async fn build_live_config(
                     ),
                 ));
             }
-            RouterConfig::QueryRegex { rules } => {
-                let pairs = rules
+            RouterConfig::UserGroup { user_to_group } => {
+                let mapping = user_to_group
                     .iter()
-                    .map(|r| (r.regex.clone(), r.target_group.clone()))
+                    .map(|(k, v)| (k.clone(), ClusterGroupName(v.clone())))
                     .collect();
                 routers.push(Box::new(
-                    queryflux_routing::implementations::query_regex::QueryRegexRouter::new(pairs),
+                    queryflux_routing::implementations::user_group::UserGroupRouter::new(mapping),
+                ));
+            }
+            RouterConfig::QueryRegex { rules } => {
+                routers.push(Box::new(
+                    queryflux_routing::implementations::query_regex::QueryRegexRouter::from_rules(
+                        rules.clone(),
+                    ),
                 ));
             }
             RouterConfig::Tags { rules } => {
@@ -2524,9 +2786,6 @@ async fn build_live_config(
                     ),
                 ));
             }
-            _ => {
-                tracing::warn!("Reload: router type not yet implemented, skipping");
-            }
         }
     }
     let router_chain = RouterChain::new(routers, fallback);
@@ -2535,6 +2794,17 @@ async fn build_live_config(
         .iter()
         .filter(|(_, g)| !g.default_tags.is_empty())
         .map(|(name, g)| (name.clone(), g.default_tags.clone()))
+        .collect();
+
+    let group_max_queued_queries: HashMap<String, Option<u64>> = cluster_groups
+        .iter()
+        .filter(|(_, g)| g.max_queued_queries.is_some())
+        .map(|(name, g)| (name.clone(), g.max_queued_queries))
+        .collect();
+
+    let group_capacity_wait_timeout_secs: HashMap<String, u64> = cluster_groups
+        .iter()
+        .map(|(name, g)| (name.clone(), g.capacity_wait_timeout_secs_or_default()))
         .collect();
 
     let group_cache_settings: HashMap<String, queryflux_core::config::GroupCacheConfig> =
@@ -2595,9 +2865,11 @@ async fn build_live_config(
         group_order,
         group_translation_scripts,
         group_default_tags,
+        group_max_queued_queries,
+        group_capacity_wait_timeout_secs,
         group_cache_settings,
         auth_provider: Arc::new(NoneAuthProvider::new(false)),
-        authorization: Arc::new(AllowAllAuthorization),
+        authorization: Arc::new(AllowAllAuthorization::default()),
     })
 }
 
@@ -2620,6 +2892,7 @@ async fn reload_live_config(
     pg: &Arc<dyn BackendStore>,
     cache: &mut AdapterReloadCache,
     prev: &PreservedLive,
+    metrics: &Arc<dyn MetricsStore>,
 ) -> Result<LiveConfig> {
     let cluster_records = pg
         .list_cluster_configs()
@@ -2631,9 +2904,7 @@ async fn reload_live_config(
         .collect();
     // Also map expanded variant names to their parent's DB ID.
     for r in &cluster_records {
-        let variants: Vec<queryflux_core::config::ClusterVariant> =
-            serde_json::from_value(r.variants.clone()).unwrap_or_default();
-        for v in &variants {
+        for v in &parse_cluster_variants(&r.variants) {
             cluster_ids_by_name.insert(format!("{}::{}", r.name, v.name), r.id);
         }
     }
@@ -2716,6 +2987,7 @@ async fn reload_live_config(
         }
         Ok(None) => {}
         Err(e) => {
+            metrics.on_config_reload_failure("guard_reload");
             tracing::warn!("Reload: guardrails_config read failed; keeping previous chains: {e}")
         }
     }
@@ -2724,79 +2996,60 @@ async fn reload_live_config(
     // any parse/build failure keep the carried-over providers — a reload must
     // never fall back to permissive defaults.
     match pg.get_proxy_setting("security_config").await {
+        Ok(Some(v)) if queryflux_core::security_setting::is_blank_security_setting(&v) => {}
         Ok(Some(v)) => {
-            let (auth_cfg, authz_cfg) = parse_security_setting(&v);
-            match auth_cfg.map(|cfg| build_auth_provider(&cfg)) {
+            let (auth_cfg, authz_cfg) =
+                queryflux_core::security_setting::parse_security_setting(&v);
+            match auth_cfg.as_ref().map(|cfg| build_auth_provider(cfg)) {
                 Some(Ok(provider)) => live.auth_provider = provider,
                 Some(Err(e)) => {
+                    metrics.on_config_reload_failure("auth_rebuild");
                     tracing::warn!("Reload: failed to rebuild auth provider; keeping previous: {e}")
                 }
-                None => tracing::warn!(
-                    "Reload: security_config has no recognizable auth section; keeping previous"
-                ),
-            }
-            match authz_cfg.map(|cfg| build_authorization(&cfg, &cluster_groups)) {
-                Some(Ok(checker)) => live.authorization = checker,
-                Some(Err(e)) => {
-                    tracing::warn!("Reload: failed to rebuild authorization; keeping previous: {e}")
+                None => {
+                    metrics.on_config_reload_failure("auth_rebuild");
+                    tracing::warn!(
+                        "Reload: security_config has no recognizable auth section; keeping previous"
+                    );
                 }
-                None => tracing::warn!(
-                    "Reload: security_config has no recognizable authorization section; keeping previous"
-                ),
+            }
+            match auth_cfg {
+                Some(auth) => {
+                    let operators = operators_from_auth(&auth);
+                    match authz_cfg.map(|cfg| build_authorization(&cfg, &cluster_groups, operators))
+                    {
+                        Some(Ok(checker)) => live.authorization = checker,
+                        Some(Err(e)) => {
+                            metrics.on_config_reload_failure("authz_rebuild");
+                            tracing::warn!(
+                                "Reload: failed to rebuild authorization; keeping previous: {e}"
+                            )
+                        }
+                        None => {
+                            metrics.on_config_reload_failure("authz_rebuild");
+                            tracing::warn!(
+                            "Reload: security_config has no recognizable authorization section; keeping previous"
+                        );
+                        }
+                    }
+                }
+                None if authz_cfg.is_some() => {
+                    metrics.on_config_reload_failure("authz_rebuild");
+                    tracing::warn!(
+                        "Reload: security_config has authorization but no auth section; keeping previous authorization (operator policy unchanged)"
+                    );
+                }
+                None => {}
             }
         }
         Ok(None) => {}
         Err(e) => {
+            metrics.on_config_reload_failure("auth_rebuild");
             tracing::warn!("Reload: security_config read failed; keeping previous auth: {e}")
         }
     }
 
     Ok(live)
-}
-
-/// Parse the persisted `security_config` proxy setting into typed configs.
-///
-/// `PUT /admin/config/security` stores the flat `UpsertSecurityConfig` shape
-/// (`auth_provider`, `auth_required`, `authorization_provider`, ...); earlier
-/// builds wrapped typed configs under `authConfig` / `authorizationConfig`.
-/// Accept both so existing rows keep working. Returns `None` for a section
-/// that is absent or fails to parse.
-fn parse_security_setting(
-    v: &serde_json::Value,
-) -> (
-    Option<queryflux_core::config::AuthConfig>,
-    Option<queryflux_core::config::AuthorizationConfig>,
-) {
-    use serde_json::{json, Value};
-
-    let auth = if let Some(wrapped) = v.get("authConfig") {
-        serde_json::from_value(wrapped.clone()).ok()
-    } else if v.get("auth_provider").is_some() {
-        serde_json::from_value(json!({
-            "provider": v.get("auth_provider").cloned().unwrap_or(Value::Null),
-            "required": v.get("auth_required").cloned().unwrap_or(Value::Bool(false)),
-            "oidc": v.get("oidc").cloned().unwrap_or(Value::Null),
-            "ldap": v.get("ldap").cloned().unwrap_or(Value::Null),
-            "staticUsers": v.get("static_users").cloned().unwrap_or(Value::Null),
-        }))
-        .ok()
-    } else {
-        None
-    };
-
-    let authz = if let Some(wrapped) = v.get("authorizationConfig") {
-        serde_json::from_value(wrapped.clone()).ok()
-    } else if v.get("authorization_provider").is_some() {
-        serde_json::from_value(json!({
-            "provider": v.get("authorization_provider").cloned().unwrap_or(Value::Null),
-            "openfga": v.get("openfga").cloned().unwrap_or(Value::Null),
-        }))
-        .ok()
-    } else {
-        None
-    };
-
-    (auth, authz)
 }
 
 fn build_auth_provider(
@@ -2838,11 +3091,28 @@ fn build_auth_provider(
     })
 }
 
+fn operators_from_auth(
+    auth: &queryflux_core::config::AuthConfig,
+) -> queryflux_auth::OperatorPolicy {
+    queryflux_auth::OperatorPolicy::from_lists(
+        auth.operator_roles.clone(),
+        auth.operator_groups.clone(),
+    )
+}
+
 fn build_authorization(
     authz: &queryflux_core::config::AuthorizationConfig,
     cluster_groups: &HashMap<String, queryflux_core::config::ClusterGroupConfig>,
+    operators: queryflux_auth::OperatorPolicy,
 ) -> Result<Arc<dyn queryflux_auth::AuthorizationChecker>> {
     use queryflux_core::config::AuthorizationProviderConfig;
+    if !operators.roles.is_empty() || !operators.groups.is_empty() {
+        info!(
+            operator_roles = ?operators.roles,
+            operator_groups = ?operators.groups,
+            "Query operators configured (may cancel any query)"
+        );
+    }
     Ok(match &authz.provider {
         AuthorizationProviderConfig::None => {
             let policies = cluster_groups
@@ -2855,10 +3125,10 @@ fn build_authorization(
             });
             if has_any_policy {
                 info!("Authorization: simple allow-list policy");
-                Arc::new(SimpleAuthorizationPolicy::new(policies))
+                Arc::new(SimpleAuthorizationPolicy::new(policies).with_operators(operators))
             } else {
                 info!("Authorization: allow-all (no allow-lists configured)");
-                Arc::new(AllowAllAuthorization)
+                Arc::new(AllowAllAuthorization::with_operators(operators))
             }
         }
         AuthorizationProviderConfig::OpenFga => {
@@ -2866,7 +3136,7 @@ fn build_authorization(
                 "authorization.provider = openfga requires authorization.openfga to be configured",
             )?;
             info!(url = %openfga_cfg.url, store_id = %openfga_cfg.store_id, "Authorization: OpenFGA");
-            Arc::new(OpenFgaAuthorizationClient::new(openfga_cfg))
+            Arc::new(OpenFgaAuthorizationClient::new(openfga_cfg).with_operators(operators))
         }
     })
 }
@@ -2887,6 +3157,28 @@ async fn load_guard_script_bodies_from_admin(admin: &dyn AdminStore) -> HashMap<
             tracing::warn!("Failed to load guard scripts from persistence: {e}");
             HashMap::new()
         })
+}
+
+fn resolve_built_in_guard(
+    name: Option<&str>,
+    max_rows: Option<u64>,
+    applies_to: Option<Vec<String>>,
+) -> Box<dyn Guard> {
+    match name {
+        Some("read_only") => Box::new(ReadOnlyGuard),
+        Some("row_limit") => Box::new(RowLimitGuard { max_rows }),
+        Some("require_predicate") => Box::new(RequirePredicateGuard {
+            applies_to: applies_to.unwrap_or_default(),
+        }),
+        Some(other) => Box::new(MisconfiguredGuard {
+            guard_name: "built_in",
+            reason: format!("unsupported built_in guard name \"{other}\""),
+        }),
+        None => Box::new(MisconfiguredGuard {
+            guard_name: "built_in",
+            reason: "built_in guard is missing required field \"name\"".to_string(),
+        }),
+    }
 }
 
 fn resolve_python_guard_script(
@@ -2923,21 +3215,44 @@ fn make_http_webhook_guard(
     fail_behavior: FailBehavior,
     headers: HashMap<String, String>,
 ) -> Box<dyn Guard> {
-    if url.trim().is_empty() {
+    let raw = url.trim();
+    if raw.is_empty() {
         tracing::warn!("http_webhook guard has empty URL; using MisconfiguredGuard");
-        Box::new(MisconfiguredGuard {
+        return Box::new(MisconfiguredGuard {
             guard_name: "http_webhook",
             reason: "http_webhook guard is missing required field \"url\"".to_string(),
-        })
-    } else {
-        Box::new(HttpWebhookGuard {
-            url,
-            timeout_ms,
-            retry_count,
-            fail_behavior,
-            headers,
-            client: reqwest::Client::new(),
-        })
+        });
+    }
+    match reqwest::Url::parse(raw) {
+        Ok(parsed) => match parsed.scheme() {
+            "http" | "https" => Box::new(HttpWebhookGuard {
+                url: raw.to_string(),
+                timeout_ms,
+                retry_count,
+                fail_behavior,
+                headers,
+                client: reqwest::Client::new(),
+            }),
+            other => {
+                tracing::warn!(
+                    scheme = other,
+                    "http_webhook guard URL must use http or https; using MisconfiguredGuard"
+                );
+                Box::new(MisconfiguredGuard {
+                    guard_name: "http_webhook",
+                    reason: format!(
+                        "http_webhook url must use http or https scheme, got \"{other}\""
+                    ),
+                })
+            }
+        },
+        Err(e) => {
+            tracing::warn!(error = %e, "http_webhook guard URL is invalid; using MisconfiguredGuard");
+            Box::new(MisconfiguredGuard {
+                guard_name: "http_webhook",
+                reason: format!("http_webhook url is not a valid URL: {e}"),
+            })
+        }
     }
 }
 
@@ -2952,20 +3267,11 @@ fn build_chain_from_yaml_specs(
     for spec in specs {
         match &spec.kind {
             GuardKindConfig::BuiltIn => {
-                let Some(name) = spec.name.as_deref() else {
-                    tracing::error!("built_in guard is missing required field \"name\"; skipping");
-                    continue;
-                };
-                match name {
-                    "read_only" => guards.push(Box::new(ReadOnlyGuard)),
-                    "row_limit" => guards.push(Box::new(RowLimitGuard {
-                        max_rows: spec.max_rows,
-                    })),
-                    "require_predicate" => guards.push(Box::new(RequirePredicateGuard {
-                        applies_to: spec.applies_to.clone().unwrap_or_default(),
-                    })),
-                    other => tracing::warn!(name = other, "Unknown built-in guard name; skipping"),
-                }
+                guards.push(resolve_built_in_guard(
+                    spec.name.as_deref(),
+                    spec.max_rows,
+                    spec.applies_to.clone(),
+                ));
             }
             GuardKindConfig::PythonScript => {
                 let guard = resolve_python_guard_script(
@@ -3072,21 +3378,19 @@ fn build_chain_from_db_specs(
     let mut guards: Vec<Box<dyn Guard>> = Vec::new();
     for item in arr {
         let Some(spec) = parse_spec(item) else {
+            guards.push(Box::new(MisconfiguredGuard {
+                guard_name: "guard",
+                reason: "guard spec is not a valid object with a \"kind\" field".to_string(),
+            }));
             continue;
         };
         match spec.kind.as_str() {
             "built_in" => {
-                let name = spec.name.as_deref().unwrap_or("");
-                match name {
-                    "read_only" => guards.push(Box::new(ReadOnlyGuard)),
-                    "row_limit" => guards.push(Box::new(RowLimitGuard {
-                        max_rows: spec.max_rows,
-                    })),
-                    "require_predicate" => guards.push(Box::new(RequirePredicateGuard {
-                        applies_to: spec.applies_to.unwrap_or_default(),
-                    })),
-                    other => tracing::warn!(name = other, "Unknown built-in guard name; skipping"),
-                }
+                guards.push(resolve_built_in_guard(
+                    spec.name.as_deref(),
+                    spec.max_rows,
+                    spec.applies_to,
+                ));
             }
             "http_webhook" => {
                 guards.push(make_http_webhook_guard(
@@ -3109,7 +3413,10 @@ fn build_chain_from_db_specs(
                 );
                 guards.push(guard);
             }
-            other => tracing::warn!(kind = other, "Unknown guard kind; skipping"),
+            other => guards.push(Box::new(MisconfiguredGuard {
+                guard_name: "guard",
+                reason: format!("unsupported guard kind \"{other}\""),
+            })),
         }
     }
     if guards.is_empty() {
@@ -3199,60 +3506,418 @@ fn apply_reconcile_to_cluster_state(
     }
 }
 
+/// Metrics chain for in-memory persistence: Prometheus plus the in-memory store
+/// itself. The in-memory store must be part of the chain — the admin API serves
+/// `/admin/queries` and `/admin/stats` from it, so recording only to Prometheus
+/// leaves query history and the Studio dashboard permanently empty.
+fn in_memory_metrics(
+    prometheus: Arc<PrometheusMetrics>,
+    mem: Arc<InMemoryPersistence>,
+) -> Arc<dyn MetricsStore> {
+    Arc::new(MultiMetricsStore::new(vec![
+        prometheus as Arc<dyn MetricsStore>,
+        mem as Arc<dyn MetricsStore>,
+    ]))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::parse_security_setting;
-    use queryflux_core::config::{AuthProviderConfig, AuthorizationProviderConfig};
-    use serde_json::json;
+    mod unauthenticated_passthrough_warning {
+        use super::super::unauthenticated_passthrough_clusters;
+        use queryflux_core::config::ProxyConfig;
+        use serde_json::json;
 
-    /// The shape `PUT /admin/config/security` actually persists
-    /// (flat `UpsertSecurityConfig` fields).
-    #[test]
-    fn parse_security_setting_flat_admin_shape() {
-        let v = json!({
-            "auth_provider": "static",
-            "auth_required": true,
-            "oidc": null,
-            "ldap": null,
-            "static_users": { "users": { "alice": { "password": "pw" } } },
-            "authorization_provider": "none",
-            "openfga": null,
-        });
-        let (auth, authz) = parse_security_setting(&v);
-        let auth = auth.expect("auth section should parse");
-        assert!(matches!(auth.provider, AuthProviderConfig::Static));
-        assert!(auth.required);
-        assert!(auth.static_users.is_some());
-        let authz = authz.expect("authz section should parse");
-        assert!(matches!(authz.provider, AuthorizationProviderConfig::None));
+        fn config(authorization_provider: &str, clusters: serde_json::Value) -> ProxyConfig {
+            config_with_groups(authorization_provider, clusters, json!({}))
+        }
+
+        fn config_with_groups(
+            authorization_provider: &str,
+            clusters: serde_json::Value,
+            cluster_groups: serde_json::Value,
+        ) -> ProxyConfig {
+            serde_json::from_value(json!({
+                "queryflux": { "externalAddress": null },
+                "clusters": clusters,
+                "clusterGroups": cluster_groups,
+                "authorization": { "provider": authorization_provider },
+            }))
+            .expect("valid minimal ProxyConfig fixture")
+        }
+
+        fn passthrough_cluster() -> serde_json::Value {
+            json!({
+                "trino-1": {
+                    "engine": "trino",
+                    "endpoint": "http://trino:8080",
+                    "queryAuth": { "type": "passthrough" },
+                }
+            })
+        }
+
+        #[test]
+        fn warns_even_with_a_single_cluster_group() {
+            // Regression: this used to be gated on `cluster_groups.len() > 1`, hiding the
+            // warning for the common single-group default — exactly the most likely
+            // deployment to have this gap.
+            let cfg = config("none", passthrough_cluster());
+            assert_eq!(cfg.cluster_groups.len(), 0);
+            let flagged = unauthenticated_passthrough_clusters(&cfg);
+            assert_eq!(flagged, vec!["trino-1"]);
+        }
+
+        #[test]
+        fn no_warning_when_authorization_is_configured() {
+            let cfg = config("openfga", passthrough_cluster());
+            assert!(unauthenticated_passthrough_clusters(&cfg).is_empty());
+        }
+
+        #[test]
+        fn no_warning_without_any_passthrough_cluster() {
+            let cfg = config(
+                "none",
+                json!({
+                    "trino-1": {
+                        "engine": "trino",
+                        "endpoint": "http://trino:8080",
+                    }
+                }),
+            );
+            assert!(unauthenticated_passthrough_clusters(&cfg).is_empty());
+        }
+
+        #[test]
+        fn no_warning_when_a_group_allow_list_already_enforces_policy() {
+            // build_authorization treats provider:none + any group allow-list as an
+            // enforced SimpleAuthorizationPolicy, not allow-all — this check must agree,
+            // or the warning fires for deployments that already have the gap closed.
+            let cfg = config_with_groups(
+                "none",
+                passthrough_cluster(),
+                json!({
+                    "trino": {
+                        "members": ["trino-1"],
+                        "maxRunningQueries": 10,
+                        "authorization": { "allowGroups": ["data-team"] },
+                    }
+                }),
+            );
+            assert!(unauthenticated_passthrough_clusters(&cfg).is_empty());
+        }
+
+        #[test]
+        fn warns_when_groups_exist_but_none_declare_an_allow_list() {
+            let cfg = config_with_groups(
+                "none",
+                passthrough_cluster(),
+                json!({
+                    "trino": {
+                        "members": ["trino-1"],
+                        "maxRunningQueries": 10,
+                    }
+                }),
+            );
+            assert_eq!(unauthenticated_passthrough_clusters(&cfg), vec!["trino-1"]);
+        }
     }
 
-    /// Legacy wrapped shape from earlier builds.
-    #[test]
-    fn parse_security_setting_wrapped_legacy_shape() {
-        let v = json!({
-            "authConfig": { "provider": "none", "required": true },
-            "authorizationConfig": { "provider": "openfga", "openfga": {
-                "url": "http://fga:8080", "storeId": "s1", "model": null
-            }},
-        });
-        let (auth, authz) = parse_security_setting(&v);
-        let auth = auth.expect("wrapped auth should parse");
-        assert!(matches!(auth.provider, AuthProviderConfig::None));
-        assert!(auth.required);
-        let authz = authz.expect("wrapped authz should parse");
-        assert!(matches!(
-            authz.provider,
-            AuthorizationProviderConfig::OpenFga
-        ));
+    mod guard_chains {
+        use std::collections::HashMap;
+
+        use queryflux_core::config::{GuardKindConfig, GuardSpecConfig, GuardrailsConfig};
+        use queryflux_core::query::{ClusterGroupName, EngineType};
+        use queryflux_core::tags::QueryTags;
+        use queryflux_guardrails::context::{GuardContext, GuardLayer};
+
+        use super::super::{build_chain_from_db_specs, build_chain_from_yaml_specs};
+
+        fn plan_ctx<'a>(
+            engine: &'a EngineType,
+            group: &'a ClusterGroupName,
+            tags: &'a QueryTags,
+        ) -> GuardContext<'a> {
+            GuardContext {
+                sql: "SELECT 1",
+                translated_sql: "SELECT 1",
+                engine_type: engine,
+                cluster_group: group,
+                user: Some("alice"),
+                agent_context: None,
+                query_tags: tags,
+            }
+        }
+
+        #[tokio::test]
+        async fn yaml_unknown_built_in_denies_at_runtime() {
+            let engine = EngineType::DuckDb;
+            let group = ClusterGroupName("default".to_string());
+            let tags = QueryTags::new();
+            let specs = vec![GuardSpecConfig {
+                kind: GuardKindConfig::BuiltIn,
+                name: Some("does_not_exist".to_string()),
+                script_id: None,
+                script: None,
+                url: None,
+                timeout_ms: None,
+                retry_count: None,
+                fail_behavior: None,
+                headers: None,
+                max_rows: None,
+                applies_to: None,
+            }];
+            let chain = build_chain_from_yaml_specs(&specs, &HashMap::new())
+                .expect("chain should be built");
+            let ctx = plan_ctx(&engine, &group, &tags);
+            let (actions, blocked) = chain.run(&ctx, GuardLayer::Plan).await;
+            assert!(blocked);
+            assert_eq!(actions.len(), 1);
+            assert_eq!(actions[0].guard, "built_in");
+            assert_eq!(actions[0].action, "deny");
+        }
+
+        #[tokio::test]
+        async fn yaml_python_script_without_body_denies_at_runtime() {
+            let engine = EngineType::DuckDb;
+            let group = ClusterGroupName("default".to_string());
+            let tags = QueryTags::new();
+            let specs = vec![GuardSpecConfig {
+                kind: GuardKindConfig::PythonScript,
+                name: None,
+                script_id: None,
+                script: None,
+                url: None,
+                timeout_ms: None,
+                retry_count: None,
+                fail_behavior: None,
+                headers: None,
+                max_rows: None,
+                applies_to: None,
+            }];
+            let err = GuardrailsConfig {
+                global: specs.clone(),
+                groups: HashMap::new(),
+            }
+            .validate()
+            .expect_err("startup validation must reject");
+            assert!(err.contains("script"), "{err}");
+
+            // Misconfigured guards still deny if validation is bypassed (e.g. DB reload).
+            let chain = build_chain_from_yaml_specs(&specs, &HashMap::new())
+                .expect("chain should be built");
+            let ctx = plan_ctx(&engine, &group, &tags);
+            let (_, blocked) = chain.run(&ctx, GuardLayer::Plan).await;
+            assert!(blocked);
+        }
+
+        #[tokio::test]
+        async fn db_unknown_kind_denies_at_runtime() {
+            let engine = EngineType::DuckDb;
+            let group = ClusterGroupName("default".to_string());
+            let tags = QueryTags::new();
+            let specs = serde_json::json!([{ "kind": "future_kind" }]);
+            let chain =
+                build_chain_from_db_specs(&specs, &HashMap::new()).expect("chain should be built");
+            let ctx = plan_ctx(&engine, &group, &tags);
+            let (actions, blocked) = chain.run(&ctx, GuardLayer::Plan).await;
+            assert!(blocked);
+            assert_eq!(actions[0].guard, "guard");
+            assert!(actions[0]
+                .reason
+                .as_deref()
+                .unwrap_or("")
+                .contains("future_kind"));
+        }
+
+        #[tokio::test]
+        async fn inline_python_script_guard_allows() {
+            let engine = EngineType::DuckDb;
+            let group = ClusterGroupName("default".to_string());
+            let tags = QueryTags::new();
+            let specs = vec![GuardSpecConfig {
+                kind: GuardKindConfig::PythonScript,
+                name: None,
+                script_id: None,
+                script: Some("def check(ctx):\n    return {'action': 'allow'}".to_string()),
+                url: None,
+                timeout_ms: Some(500),
+                retry_count: None,
+                fail_behavior: None,
+                headers: None,
+                max_rows: None,
+                applies_to: None,
+            }];
+            let chain = build_chain_from_yaml_specs(&specs, &HashMap::new())
+                .expect("chain should be built");
+            let ctx = plan_ctx(&engine, &group, &tags);
+            let (_, blocked) = chain.run(&ctx, GuardLayer::Plan).await;
+            assert!(!blocked);
+        }
+
+        #[tokio::test]
+        async fn non_http_webhook_url_denies_even_when_fail_open() {
+            use queryflux_core::config::GuardFailBehaviorConfig;
+
+            let engine = EngineType::DuckDb;
+            let group = ClusterGroupName("default".to_string());
+            let tags = QueryTags::new();
+            let specs = vec![GuardSpecConfig {
+                kind: GuardKindConfig::HttpWebhook,
+                name: None,
+                script_id: None,
+                script: None,
+                url: Some("file:///tmp/policy".to_string()),
+                timeout_ms: Some(100),
+                retry_count: None,
+                fail_behavior: Some(GuardFailBehaviorConfig::Allow),
+                headers: None,
+                max_rows: None,
+                applies_to: None,
+            }];
+            let chain = build_chain_from_yaml_specs(&specs, &HashMap::new())
+                .expect("chain should be built");
+            let ctx = plan_ctx(&engine, &group, &tags);
+            let (actions, blocked) = chain.run(&ctx, GuardLayer::Plan).await;
+            assert!(blocked, "non-http(s) webhook URL must deny at construction");
+            assert_eq!(actions[0].guard, "http_webhook");
+            assert!(actions[0]
+                .reason
+                .as_deref()
+                .unwrap_or("")
+                .contains("http or https"));
+        }
+
+        #[tokio::test]
+        async fn http_webhook_url_is_accepted_and_can_fail_open() {
+            use queryflux_core::config::GuardFailBehaviorConfig;
+
+            let engine = EngineType::DuckDb;
+            let group = ClusterGroupName("default".to_string());
+            let tags = QueryTags::new();
+            let specs = vec![GuardSpecConfig {
+                kind: GuardKindConfig::HttpWebhook,
+                name: None,
+                script_id: None,
+                script: None,
+                url: Some("http://127.0.0.1:1/unreachable".to_string()),
+                timeout_ms: Some(100),
+                retry_count: Some(0),
+                fail_behavior: Some(GuardFailBehaviorConfig::Allow),
+                headers: None,
+                max_rows: None,
+                applies_to: None,
+            }];
+            let chain = build_chain_from_yaml_specs(&specs, &HashMap::new())
+                .expect("chain should be built");
+            let ctx = plan_ctx(&engine, &group, &tags);
+            let (_, blocked) = chain.run(&ctx, GuardLayer::Plan).await;
+            assert!(
+                !blocked,
+                "valid http(s) webhook with fail_open must allow when unreachable"
+            );
+        }
+
+        #[tokio::test]
+        async fn db_non_http_webhook_url_denies_at_runtime() {
+            let engine = EngineType::DuckDb;
+            let group = ClusterGroupName("default".to_string());
+            let tags = QueryTags::new();
+            let specs = serde_json::json!([{
+                "kind": "http_webhook",
+                "url": "ftp://evil.example/guard",
+                "fail_behavior": "allow"
+            }]);
+            let chain =
+                build_chain_from_db_specs(&specs, &HashMap::new()).expect("chain should be built");
+            let ctx = plan_ctx(&engine, &group, &tags);
+            let (actions, blocked) = chain.run(&ctx, GuardLayer::Plan).await;
+            assert!(blocked);
+            assert_eq!(actions[0].guard, "http_webhook");
+            assert!(actions[0]
+                .reason
+                .as_deref()
+                .unwrap_or("")
+                .contains("http or https"));
+        }
     }
 
-    /// Unrecognizable value: both sections None so the caller preserves
-    /// the previous providers instead of weakening to permissive defaults.
-    #[test]
-    fn parse_security_setting_unrecognized_yields_none() {
-        let (auth, authz) = parse_security_setting(&json!({ "something": "else" }));
-        assert!(auth.is_none());
-        assert!(authz.is_none());
+    mod in_memory_metrics {
+        use std::sync::Arc;
+
+        use queryflux_core::query::{
+            ClusterGroupName, ClusterName, EngineType, FrontendProtocol, QueryStatus, SqlDialect,
+        };
+        use queryflux_metrics::{prometheus_store::PrometheusMetrics, QueryRecord};
+        use queryflux_persistence::{
+            in_memory::InMemoryPersistence, query_history::QueryFilters, QueryHistoryStore,
+        };
+
+        fn sample_record() -> QueryRecord {
+            QueryRecord {
+                proxy_query_id: "q-1".into(),
+                backend_query_id: None,
+                cluster_group: ClusterGroupName("duckdb-local".to_string()),
+                cluster_name: ClusterName("duckdb-1".to_string()),
+                cluster_group_config_id: None,
+                cluster_config_id: None,
+                engine_type: EngineType::DuckDb,
+                frontend_protocol: FrontendProtocol::TrinoHttp,
+                source_dialect: SqlDialect::Trino,
+                target_dialect: SqlDialect::DuckDb,
+                was_translated: false,
+                translated_sql: None,
+                user: None,
+                catalog: None,
+                database: None,
+                sql_preview: "SELECT 1".into(),
+                status: QueryStatus::Success,
+                routing_trace: None,
+                queue_duration_ms: 0,
+                execution_duration_ms: 1,
+                rows_returned: Some(1),
+                error_message: None,
+                created_at: chrono::Utc::now(),
+                engine_stats: None,
+                query_tags: Default::default(),
+                query_hash: None,
+                query_parameterized_hash: None,
+                translated_query_hash: None,
+                digest_text: None,
+                translated_digest_text: None,
+                agent_id: None,
+                conversation_id: None,
+                step_index: None,
+                tool_call_id: None,
+                query_intent: None,
+                guard_actions: Vec::new(),
+                was_guard_blocked: false,
+                cache_hit: false,
+            }
+        }
+
+        /// Regression test: with in-memory persistence, queries recorded through
+        /// the metrics chain must land in the same store the admin API reads
+        /// (`/admin/queries`, `/admin/stats`). Wiring Prometheus alone leaves the
+        /// dashboard and query history permanently empty.
+        #[tokio::test]
+        async fn records_query_history_in_backing_store() {
+            let prometheus = Arc::new(PrometheusMetrics::new().expect("prometheus init"));
+            let mem = Arc::new(InMemoryPersistence::new());
+            let metrics = super::super::in_memory_metrics(prometheus, mem.clone());
+
+            metrics
+                .record_query(sample_record())
+                .await
+                .expect("record_query");
+
+            // `limit: 0` is the `Default` value and returns nothing; the HTTP
+            // layer fills it via serde's `default_limit` (50) instead.
+            let filters = QueryFilters {
+                limit: 50,
+                ..Default::default()
+            };
+            let rows = mem.list_queries(&filters).await.expect("list_queries");
+            assert_eq!(rows.len(), 1, "query must be visible to the admin API");
+            assert_eq!(rows[0].sql_preview, "SELECT 1");
+        }
     }
 }

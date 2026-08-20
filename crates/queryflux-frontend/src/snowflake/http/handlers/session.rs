@@ -9,7 +9,9 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
 use queryflux_auth::Credentials;
-use queryflux_core::{query::FrontendProtocol, session::SessionContext, tags::QueryTags};
+use queryflux_core::{
+    error::QueryFluxError, query::FrontendProtocol, session::SessionContext, tags::QueryTags,
+};
 use serde_json::json;
 use tracing::warn;
 use uuid::Uuid;
@@ -18,6 +20,7 @@ use crate::snowflake::http::handlers::common::{
     extract_snowflake_token, parse_snowflake_json_body,
 };
 use crate::snowflake::http::SnowflakeWireState;
+use queryflux_routing::ChainRouteResult;
 
 // ---------------------------------------------------------------------------
 // POST /session/v1/login-request
@@ -53,6 +56,10 @@ pub async fn login_request(
     {
         Ok(ctx) => ctx,
         Err(e) => {
+            state
+                .app
+                .metrics
+                .on_auth_failure(&format!("{:?}", FrontendProtocol::SnowflakeHttp));
             warn!(user = %login_name, "Snowflake wire login failed: {e}");
             return (
                 StatusCode::UNAUTHORIZED,
@@ -76,10 +83,10 @@ pub async fn login_request(
         extra: Default::default(),
         agent_context: None,
     };
-    let group = {
+    let routing_result = {
         let live = state.app.live.read().await;
         live.router_chain
-            .route(
+            .route_with_trace(
                 "",
                 &session_ctx,
                 &FrontendProtocol::SnowflakeHttp,
@@ -87,8 +94,30 @@ pub async fn login_request(
             )
             .await
     };
-    let group = match group {
+    let (chain_result, mut routing_trace) = match routing_result {
+        Ok(r) => r,
+        Err(e) => return sf_error("390000", &format!("Routing error: {e}")),
+    };
+    let mut group = match chain_result {
+        ChainRouteResult::Routed(g) => g,
+        ChainRouteResult::Denied { message } => {
+            state.app.record_routing_deny(
+                "",
+                &session_ctx,
+                FrontendProtocol::SnowflakeHttp,
+                &message,
+                Some(routing_trace),
+            );
+            return sf_error("390201", &message);
+        }
+    };
+    group = match state
+        .app
+        .resolve_routed_group(group, &mut routing_trace, &auth_ctx)
+        .await
+    {
         Ok(g) => g,
+        Err(QueryFluxError::Unauthorized(msg)) => return sf_error("390201", &msg),
         Err(e) => return sf_error("390000", &format!("Routing error: {e}")),
     };
 

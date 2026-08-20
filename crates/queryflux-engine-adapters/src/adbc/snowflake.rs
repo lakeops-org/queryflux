@@ -38,7 +38,7 @@ impl SnowflakeIntrospection {
     pub(crate) fn show_warehouses_sql(warehouse: &str) -> String {
         format!(
             "SHOW WAREHOUSES LIKE '{}'",
-            sql_helpers::escape_sql_literal(warehouse)
+            sql_helpers::escape_sql_literal(&sql_helpers::escape_sql_like_pattern(warehouse))
         )
     }
 
@@ -141,6 +141,15 @@ mod tests {
         assert_eq!(
             SnowflakeIntrospection::show_warehouses_sql("WH'A"),
             "SHOW WAREHOUSES LIKE 'WH''A'"
+        );
+    }
+
+    #[test]
+    fn show_warehouses_sql_escapes_like_wildcards() {
+        // Unescaped, "ETL_WH" would also LIKE-match a warehouse named "ETLXWH".
+        assert_eq!(
+            SnowflakeIntrospection::show_warehouses_sql("ETL_WH"),
+            r"SHOW WAREHOUSES LIKE 'ETL\_WH'"
         );
     }
 

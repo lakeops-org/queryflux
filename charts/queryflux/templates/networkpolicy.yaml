@@ -1,4 +1,11 @@
 {{- if .Values.networkPolicy.enabled }}
+{{- $types := .Values.networkPolicy.policyTypes | default (list) }}
+{{- if and (has "Ingress" $types) (empty .Values.networkPolicy.ingress) }}
+{{- fail "networkPolicy.enabled with policyTypes including Ingress requires non-empty networkPolicy.ingress (empty rules deny all traffic). Copy rules from charts/queryflux/examples/networkpolicy-values.yaml or examples/production-values.yaml" }}
+{{- end }}
+{{- if and (has "Egress" $types) (empty .Values.networkPolicy.egress) }}
+{{- fail "networkPolicy.enabled with policyTypes including Egress requires non-empty networkPolicy.egress (empty rules deny all traffic). Copy rules from charts/queryflux/examples/networkpolicy-values.yaml or examples/production-values.yaml" }}
+{{- end }}
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:

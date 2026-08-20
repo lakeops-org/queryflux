@@ -1,8 +1,8 @@
 //! Snowflake HTTP wire v1 query handlers.
 //!
 //! POST /queries/v1/query-request            — execute SQL, return Arrow IPC
-//! GET  /queries/v1/query-monitoring-request — async poll stub (always empty)
-//! DELETE /queries/v1/:query_id              — cancel stub (no-op for sync execution)
+//! GET  /queries/v1/query-monitoring-request — list in-flight queries for session
+//! DELETE /queries/v1/:query_id              — cancel in-flight query
 
 use std::sync::Arc;
 
@@ -23,13 +23,14 @@ use serde_json::json;
 use tracing::warn;
 use uuid::Uuid;
 
-use crate::dispatch::{execute_to_sink, ResultSink};
+use crate::dispatch::ResultSink;
 use crate::snowflake::http::format::sf_query_response;
 use crate::snowflake::http::handlers::bindings::bindings_to_params;
 use crate::snowflake::http::handlers::common::{
     extract_snowflake_token, parse_snowflake_json_body,
 };
 use crate::snowflake::http::SnowflakeWireState;
+use crate::snowflake::in_flight::{CancelOutcome, SnowflakeExecParams, SpawnExecuteResult};
 
 // ---------------------------------------------------------------------------
 // SnowflakeSink — accumulates Arrow batches, serialises via sf_query_response
@@ -164,25 +165,49 @@ pub async fn query_request(
     };
 
     let query_id = Uuid::new_v4().to_string();
-    let mut sink = SnowflakeSink::new();
 
-    if let Err(e) = execute_to_sink(
-        &state.app,
+    let exec = SnowflakeExecParams {
         sql,
         params,
         session_ctx,
-        FrontendProtocol::SnowflakeHttp,
+        protocol: FrontendProtocol::SnowflakeHttp,
         group,
-        &mut sink,
-        &auth_ctx,
+        auth_ctx: auth_ctx.clone(),
+    };
+
+    match crate::snowflake::in_flight::spawn_execute(
+        &state.app,
+        &state.in_flight,
+        query_id.clone(),
+        auth_ctx.user.clone(),
+        exec,
+        SnowflakeSink::new,
     )
     .await
     {
-        warn!(query_id = %query_id, "Snowflake wire query error: {e}");
-        sink.error = Some(e.to_string());
+        SpawnExecuteResult::Completed(Ok(()), sink) => {
+            sink.into_response(&query_id, &database, &schema_name)
+        }
+        SpawnExecuteResult::Completed(Err(e), mut sink) => {
+            warn!(query_id = %query_id, "Snowflake wire query error: {e}");
+            sink.error = Some(e.to_string());
+            sink.into_response(&query_id, &database, &schema_name)
+        }
+        SpawnExecuteResult::Cancelled => (
+            StatusCode::OK,
+            axum::Json(json!({
+                "data": null,
+                "message": "Query cancelled.",
+                "success": false,
+                "code": "000630"
+            })),
+        )
+            .into_response(),
+        SpawnExecuteResult::JoinFailed(e) => {
+            warn!(query_id = %query_id, "Snowflake wire query task failed: {e}");
+            sf_error("390000", &format!("Query execution failed: {e}"))
+        }
     }
-
-    sink.into_response(&query_id, &database, &schema_name)
 }
 
 // ---------------------------------------------------------------------------
@@ -190,13 +215,34 @@ pub async fn query_request(
 // ---------------------------------------------------------------------------
 
 pub async fn query_monitoring_request(
-    State(_state): State<SnowflakeWireState>,
-    _headers: HeaderMap,
+    State(state): State<SnowflakeWireState>,
+    headers: HeaderMap,
 ) -> Response {
+    let token = match extract_snowflake_token(&headers) {
+        Some(t) => t,
+        None => return unauthorized(),
+    };
+
+    let user = match state.sessions.validate_session(&token) {
+        Some((_, session)) => session.auth_ctx.user.clone(),
+        None => return unauthorized(),
+    };
+
+    let ids = state.in_flight.ids_for_owner(&user);
+    let queries: Vec<_> = ids
+        .into_iter()
+        .map(|id| {
+            json!({
+                "id": id,
+                "status": "RUNNING",
+            })
+        })
+        .collect();
+
     (
         StatusCode::OK,
         axum::Json(json!({
-            "data": {"queries": []},
+            "data": {"queries": queries},
             "message": null,
             "success": true,
             "code": null
@@ -210,20 +256,42 @@ pub async fn query_monitoring_request(
 // ---------------------------------------------------------------------------
 
 pub async fn cancel_query(
-    State(_state): State<SnowflakeWireState>,
-    _headers: HeaderMap,
-    Path(_query_id): Path<String>,
+    State(state): State<SnowflakeWireState>,
+    headers: HeaderMap,
+    Path(query_id): Path<String>,
 ) -> Response {
-    (
-        StatusCode::OK,
-        axum::Json(json!({
-            "data": null,
-            "message": null,
-            "success": true,
-            "code": null
-        })),
-    )
-        .into_response()
+    let token = match extract_snowflake_token(&headers) {
+        Some(t) => t,
+        None => return unauthorized(),
+    };
+
+    let auth_ctx = match state.sessions.validate_session(&token) {
+        Some((_, session)) => session.auth_ctx.clone(),
+        None => return unauthorized(),
+    };
+
+    match state.in_flight.cancel(&query_id, &auth_ctx) {
+        CancelOutcome::Aborted | CancelOutcome::NotFound => (
+            StatusCode::OK,
+            axum::Json(json!({
+                "data": null,
+                "message": null,
+                "success": true,
+                "code": null
+            })),
+        )
+            .into_response(),
+        CancelOutcome::Forbidden => (
+            StatusCode::FORBIDDEN,
+            axum::Json(json!({
+                "data": null,
+                "message": "Query belongs to a different user.",
+                "success": false,
+                "code": "390403"
+            })),
+        )
+            .into_response(),
+    }
 }
 
 // ---------------------------------------------------------------------------

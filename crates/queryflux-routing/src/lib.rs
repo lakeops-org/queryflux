@@ -9,16 +9,43 @@ use queryflux_core::{
     session::SessionContext,
 };
 
-/// A router inspects an incoming query and optionally returns the target cluster group.
+/// Outcome of a single router's evaluation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RoutingDecision {
+    /// Router did not match — try the next router in the chain.
+    NoMatch,
+    /// Route the query to this cluster group.
+    Route(ClusterGroupName),
+    /// Reject the query before dispatch with a client-visible message.
+    Deny { message: String },
+}
+
+impl From<Option<ClusterGroupName>> for RoutingDecision {
+    fn from(value: Option<ClusterGroupName>) -> Self {
+        match value {
+            Some(group) => Self::Route(group),
+            None => Self::NoMatch,
+        }
+    }
+}
+
+/// Final outcome of evaluating the full router chain (after fallback).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChainRouteResult {
+    Routed(ClusterGroupName),
+    Denied { message: String },
+}
+
+/// A router inspects an incoming query and returns a routing decision.
 ///
-/// Routers are evaluated in order (a chain). The first router that returns `Some` wins.
-/// If all routers return `None`, the routing fallback group from config is used.
+/// Routers are evaluated in order (a chain). The first `Route` or `Deny` wins.
+/// If all routers return `NoMatch`, the routing fallback group from config is used.
 #[async_trait]
 pub trait RouterTrait: Send + Sync {
     /// Short name used in routing traces (e.g. `"Header"`, `"QueryRegex"`).
     fn type_name(&self) -> &'static str;
 
-    /// Route an incoming query to a cluster group.
+    /// Route an incoming query.
     ///
     /// `auth_ctx` is `None` during Phase 1 (NoneAuthProvider, no threading yet) and
     /// `Some` once authentication is wired into all frontends (Phase 2+).
@@ -30,5 +57,5 @@ pub trait RouterTrait: Send + Sync {
         session: &SessionContext,
         frontend_protocol: &FrontendProtocol,
         auth_ctx: Option<&AuthContext>,
-    ) -> Result<Option<ClusterGroupName>>;
+    ) -> Result<RoutingDecision>;
 }

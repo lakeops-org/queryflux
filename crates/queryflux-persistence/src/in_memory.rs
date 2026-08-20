@@ -187,6 +187,9 @@ impl Persistence for InMemoryPersistence {
         self.queued.remove(&id.0);
         Ok(())
     }
+    async fn take_queued(&self, id: &ProxyQueryId) -> Result<Option<QueuedQuery>> {
+        Ok(self.queued.remove(&id.0).map(|(_, q)| q))
+    }
     async fn list_queued(&self) -> Result<Vec<QueuedQuery>> {
         Ok(self.queued.iter().map(|e| e.value().clone()).collect())
     }
@@ -245,6 +248,12 @@ impl MetricsStore for InMemoryPersistence {
     async fn record_query(&self, record: QueryRecord) -> Result<()> {
         let summary = self.record_to_summary(record);
         let mut records = self.query_records.write().unwrap();
+        if records
+            .iter()
+            .any(|r| r.proxy_query_id == summary.proxy_query_id)
+        {
+            return Ok(());
+        }
         if records.len() >= QUERY_RECORDS_MAX {
             // Evict the oldest quarter to amortize the cost of repeated trimming.
             let drain_count = QUERY_RECORDS_MAX / 4;
@@ -400,10 +409,20 @@ impl QueryHistoryStore for InMemoryPersistence {
     }
 
     async fn purge_old_query_records(&self, older_than: DateTime<Utc>) -> Result<u64> {
-        let mut records = self.query_records.write().unwrap();
-        let before = records.len();
-        records.retain(|r| r.created_at >= older_than);
-        Ok((before - records.len()) as u64)
+        let mut deleted = 0u64;
+        {
+            let mut records = self.query_records.write().unwrap();
+            let before = records.len();
+            records.retain(|r| r.created_at >= older_than);
+            deleted += (before - records.len()) as u64;
+        }
+        {
+            let mut snaps = self._snapshots.write().unwrap();
+            let before = snaps.len();
+            snaps.retain(|s| s.recorded_at >= older_than);
+            deleted += (before - snaps.len()) as u64;
+        }
+        Ok(deleted)
     }
 }
 
@@ -451,6 +470,32 @@ impl ClusterConfigStore for InMemoryPersistence {
         self.cluster_configs
             .insert(name.to_string(), record.clone());
         Ok(record)
+    }
+
+    async fn insert_cluster_config_if_missing(
+        &self,
+        name: &str,
+        cfg: &UpsertClusterConfig,
+    ) -> Result<bool> {
+        let now = Utc::now();
+        match self.cluster_configs.entry(name.to_string()) {
+            dashmap::mapref::entry::Entry::Occupied(_) => Ok(false),
+            dashmap::mapref::entry::Entry::Vacant(v) => {
+                let id = self.next_cluster_id.fetch_add(1, Ordering::Relaxed);
+                v.insert(ClusterConfigRecord {
+                    id,
+                    name: name.to_string(),
+                    engine_key: cfg.engine_key.clone(),
+                    enabled: cfg.enabled,
+                    max_running_queries: cfg.max_running_queries,
+                    config: cfg.config.clone(),
+                    variants: cfg.variants.clone(),
+                    created_at: now,
+                    updated_at: now,
+                });
+                Ok(true)
+            }
+        }
     }
 
     async fn delete_cluster_config(&self, name: &str) -> Result<bool> {
@@ -535,6 +580,57 @@ impl ClusterConfigStore for InMemoryPersistence {
         };
         self.group_configs.insert(name.to_string(), record.clone());
         Ok(record)
+    }
+
+    async fn insert_group_config_if_missing(
+        &self,
+        name: &str,
+        cfg: &UpsertClusterGroupConfig,
+    ) -> Result<bool> {
+        let now = Utc::now();
+        match self.group_configs.entry(name.to_string()) {
+            dashmap::mapref::entry::Entry::Occupied(_) => Ok(false),
+            dashmap::mapref::entry::Entry::Vacant(v) => {
+                for m in &cfg.members {
+                    if !self.cluster_configs.contains_key(m) {
+                        return Err(queryflux_core::error::QueryFluxError::Persistence(format!(
+                            "Unknown cluster '{m}' in group members (clusters must exist first)"
+                        )));
+                    }
+                }
+                for sid in &cfg.translation_script_ids {
+                    let ok = self
+                        .user_scripts
+                        .get(sid)
+                        .map(|r| r.kind == KIND_TRANSLATION_FIXUP)
+                        .unwrap_or(false);
+                    if !ok {
+                        return Err(queryflux_core::error::QueryFluxError::Persistence(format!(
+                            "Unknown or invalid translation script id {sid}"
+                        )));
+                    }
+                }
+
+                let id = self.next_group_id.fetch_add(1, Ordering::Relaxed);
+                v.insert(ClusterGroupConfigRecord {
+                    id,
+                    name: name.to_string(),
+                    enabled: cfg.enabled,
+                    members: cfg.members.clone(),
+                    max_running_queries: cfg.max_running_queries,
+                    max_queued_queries: cfg.max_queued_queries,
+                    strategy: cfg.strategy.clone(),
+                    allow_groups: cfg.allow_groups.clone(),
+                    allow_users: cfg.allow_users.clone(),
+                    translation_script_ids: cfg.translation_script_ids.clone(),
+                    default_tags: cfg.default_tags.clone(),
+                    cache: cfg.cache.clone(),
+                    created_at: now,
+                    updated_at: now,
+                });
+                Ok(true)
+            }
+        }
     }
 
     async fn delete_group_config(&self, name: &str) -> Result<bool> {
@@ -881,6 +977,10 @@ impl QueueCoordinator for InMemoryPersistence {
 
     async fn release_claim(&self, _query_id: &str) -> Result<()> {
         Ok(())
+    }
+
+    async fn refresh_claim(&self, query_id: &str, _instance_id: &str) -> Result<bool> {
+        Ok(self.queued.contains_key(query_id))
     }
 
     async fn list_unclaimed(&self, _stale_before: DateTime<Utc>) -> Result<Vec<QueuedQuery>> {
@@ -1264,7 +1364,22 @@ mod tests {
             creation_time: chrono::Utc::now(),
             last_accessed: chrono::Utc::now(),
             sequence: 0,
+            submitted_by: String::new(),
         }
+    }
+
+    #[tokio::test]
+    async fn queued_submitted_by_survives_upsert() {
+        let store = InMemoryPersistence::new();
+        let mut q = make_queued("q-owner");
+        q.submitted_by = "alice".to_string();
+        store.upsert_queued(q).await.unwrap();
+        let got = store
+            .get_queued(&ProxyQueryId("q-owner".into()))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(got.submitted_by, "alice");
     }
 
     #[tokio::test]
@@ -1288,6 +1403,18 @@ mod tests {
             .await
             .unwrap();
         assert!(claimed.is_none());
+    }
+
+    #[tokio::test]
+    async fn queue_refresh_claim_true_while_queued() {
+        let store = InMemoryPersistence::new();
+        store.upsert_queued(make_queued("q-hb")).await.unwrap();
+        assert!(store.refresh_claim("q-hb", "inst-1").await.unwrap());
+        store
+            .delete_queued(&ProxyQueryId("q-hb".into()))
+            .await
+            .unwrap();
+        assert!(!store.refresh_claim("q-hb", "inst-1").await.unwrap());
     }
 
     #[tokio::test]
@@ -1377,5 +1504,117 @@ mod tests {
         let store = InMemoryPersistence::new();
         let unclaimed = store.list_unclaimed(chrono::Utc::now()).await.unwrap();
         assert!(unclaimed.is_empty());
+    }
+
+    #[tokio::test]
+    async fn purge_old_query_records_drops_old_snapshots() {
+        use queryflux_core::query::{ClusterGroupName, ClusterName, EngineType};
+
+        let store = InMemoryPersistence::new();
+        let cutoff = Utc::now() - chrono::Duration::days(1);
+        let old = ClusterSnapshot {
+            cluster_name: ClusterName("c1".into()),
+            group_name: ClusterGroupName("g1".into()),
+            engine_type: EngineType::Trino,
+            running_queries: 0,
+            queued_queries: 0,
+            max_running_queries: 10,
+            recorded_at: cutoff - chrono::Duration::hours(1),
+        };
+        let fresh = ClusterSnapshot {
+            recorded_at: Utc::now(),
+            ..old.clone()
+        };
+        store.record_cluster_snapshot(old).await.unwrap();
+        store.record_cluster_snapshot(fresh).await.unwrap();
+
+        let n = store.purge_old_query_records(cutoff).await.unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(store._snapshots.read().unwrap().len(), 1);
+        assert!(store._snapshots.read().unwrap()[0].recorded_at >= cutoff);
+    }
+
+    #[tokio::test]
+    async fn take_queued_returns_row_once() {
+        use queryflux_core::query::ProxyQueryId;
+
+        let store = InMemoryPersistence::new();
+        store.upsert_queued(make_queued("q-take")).await.unwrap();
+        assert!(store
+            .take_queued(&ProxyQueryId("q-take".into()))
+            .await
+            .unwrap()
+            .is_some());
+        assert!(store
+            .take_queued(&ProxyQueryId("q-take".into()))
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn record_query_keeps_first_terminal_row_per_proxy_id() {
+        use crate::query_history::QueryFilters;
+        use crate::{MetricsStore, QueryHistoryStore, QueryRecord};
+        use queryflux_core::query::{
+            ClusterGroupName, ClusterName, EngineType, FrontendProtocol, QueryStatus, SqlDialect,
+        };
+
+        let store = InMemoryPersistence::new();
+        let mut first = QueryRecord {
+            proxy_query_id: "proxy-dedup".into(),
+            backend_query_id: None,
+            cluster_group: ClusterGroupName("g".into()),
+            cluster_name: ClusterName("c".into()),
+            cluster_group_config_id: None,
+            cluster_config_id: None,
+            engine_type: EngineType::Undispatched,
+            frontend_protocol: FrontendProtocol::TrinoHttp,
+            source_dialect: SqlDialect::Trino,
+            target_dialect: SqlDialect::Generic,
+            was_translated: false,
+            translated_sql: None,
+            user: None,
+            catalog: None,
+            database: None,
+            sql_preview: "SELECT 1".into(),
+            status: QueryStatus::Failed,
+            routing_trace: None,
+            queue_duration_ms: 100,
+            execution_duration_ms: 0,
+            rows_returned: None,
+            error_message: Some("capacity wait timeout".into()),
+            created_at: Utc::now(),
+            engine_stats: None,
+            query_tags: Default::default(),
+            query_hash: None,
+            query_parameterized_hash: None,
+            translated_query_hash: None,
+            digest_text: None,
+            translated_digest_text: None,
+            agent_id: None,
+            conversation_id: None,
+            step_index: None,
+            tool_call_id: None,
+            query_intent: None,
+            guard_actions: vec![],
+            was_guard_blocked: false,
+            cache_hit: false,
+        };
+        store.record_query(first.clone()).await.unwrap();
+        first.status = QueryStatus::Cancelled;
+        first.error_message = Some("client cancelled".into());
+        store.record_query(first).await.unwrap();
+
+        let rows = store
+            .list_queries(&QueryFilters {
+                limit: 50,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].proxy_query_id, "proxy-dedup");
+        assert!(rows[0].status.contains("Failed"));
     }
 }

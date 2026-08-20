@@ -3,6 +3,7 @@
 /// Backends are optional and discovered via connectivity / env:
 ///   TRINO_URL         — default http://localhost:18081
 ///   STARROCKS_URL     — default mysql://root@localhost:9030 (matches docker-compose.test.yml)
+///   CLICKHOUSE_URL    — default http://localhost:18123 (ClickHouse HTTP interface)
 ///
 /// Lakekeeper / Iceberg (optional):
 ///   LAKEKEEPER_URL, MINIO_ENDPOINT — StarRocks external catalog DDL only.
@@ -29,15 +30,20 @@ use queryflux_core::{
     query::{ClusterGroupName, ClusterName, EngineType},
 };
 use queryflux_engine_adapters::{
-    duckdb::{DuckDbAdapter, DuckDbConfig},
+    clickhouse::{ClickHouseAdapter, ClickHouseConfig},
+    duckdb::{DuckDbAdapter, DuckDbConfig, DEFAULT_MAX_RESULT_BUFFER_BYTES},
     starrocks::StarRocksAdapter,
     trino::TrinoAdapter,
     AdapterKind,
 };
 use queryflux_frontend::{
+    flight_sql::FlightSqlFrontend,
+    mysql_wire::MysqlWireFrontend,
+    postgres_wire::PostgresWireFrontend,
     snowflake::SnowflakeFrontend,
     state::LiveConfig,
     trino_http::{state::AppState, TrinoHttpFrontend},
+    FrontendListenerTrait, ShutdownRx,
 };
 use queryflux_metrics::{ClusterSnapshot, MetricsStore, QueryRecord};
 use queryflux_persistence::in_memory::InMemoryPersistence;
@@ -71,6 +77,7 @@ pub const GROUP_STARROCKS: &str = "starrocks";
 pub const GROUP_DUCKDB: &str = "duckdb";
 /// Set when Lakekeeper port is reachable (Iceberg tables seeded by e2e tests via Trino).
 pub const GROUP_LAKEKEEPER: &str = "lakekeeper";
+pub const GROUP_CLICKHOUSE: &str = "clickhouse";
 
 pub struct TestHarness {
     pub port: u16,
@@ -157,6 +164,7 @@ impl TestHarness {
                         endpoint: sr_url,
                         auth: None,
                         pool_size: 2,
+                        query_auth: None,
                     },
                 )
                 .map_err(|e| anyhow!("StarRocks adapter: {e}"))?,
@@ -198,6 +206,44 @@ impl TestHarness {
             adapters.insert(cluster.0.clone(), AdapterKind::Sync(sr));
         }
 
+        // --- ClickHouse (HTTP interface, Arrow result path) ---
+        let ch_url = std::env::var("CLICKHOUSE_URL")
+            .unwrap_or_else(|_| "http://localhost:18123".to_string());
+        if is_clickhouse_ready(&ch_url).await {
+            let group = ClusterGroupName(GROUP_CLICKHOUSE.to_string());
+            let cluster = ClusterName("clickhouse-1".to_string());
+            let state = Arc::new(ClusterState::new(
+                cluster.clone(),
+                group.clone(),
+                None,
+                None,
+                EngineType::ClickHouse,
+                Some(ch_url.clone()),
+                8,
+                true,
+            ));
+            let adapter = Arc::new(
+                ClickHouseAdapter::new(
+                    cluster.clone(),
+                    group.clone(),
+                    ClickHouseConfig {
+                        endpoint: ch_url,
+                        auth: None,
+                        tls_skip_verify: false,
+                        max_result_buffer_bytes:
+                            queryflux_engine_adapters::clickhouse::DEFAULT_MAX_RESULT_BUFFER_BYTES,
+                    },
+                )
+                .map_err(|e| anyhow!("ClickHouse adapter: {e}"))?,
+            );
+            group_states.insert(group.clone(), (vec![state], strategy_from_config(None)));
+            group_members.insert(GROUP_CLICKHOUSE.to_string(), vec![cluster.0.clone()]);
+            group_order.push(GROUP_CLICKHOUSE.to_string());
+            adapters.insert(cluster.0.clone(), AdapterKind::Sync(adapter));
+            available_groups.push(GROUP_CLICKHOUSE.to_string());
+            header_map.insert(GROUP_CLICKHOUSE.to_string(), group);
+        }
+
         // --- DuckDB (always available — embedded, in-memory, no external dependency) ---
         {
             let group = ClusterGroupName(GROUP_DUCKDB.to_string());
@@ -219,6 +265,8 @@ impl TestHarness {
                     DuckDbConfig {
                         database_path: None,
                         motherduck_token: None,
+                        pool_size: 1,
+                        max_result_buffer_bytes: DEFAULT_MAX_RESULT_BUFFER_BYTES,
                     },
                 )
                 .map_err(|e| anyhow!("DuckDB adapter: {e}"))?,
@@ -289,9 +337,12 @@ impl TestHarness {
             group_order,
             group_translation_scripts: HashMap::new(),
             group_default_tags: HashMap::new(),
+            group_max_queued_queries: HashMap::new(),
+            group_capacity_wait_timeout_secs: HashMap::new(),
             group_cache_settings: HashMap::new(),
             auth_provider: Arc::new(NoneAuthProvider::new(false)) as Arc<dyn AuthProvider>,
-            authorization: Arc::new(AllowAllAuthorization) as Arc<dyn AuthorizationChecker>,
+            authorization: Arc::new(AllowAllAuthorization::default())
+                as Arc<dyn AuthorizationChecker>,
         };
         let records = Arc::new(Mutex::new(Vec::<QueryRecord>::new()));
         let state = Arc::new(AppState {
@@ -361,6 +412,10 @@ impl TestHarness {
         self.records.lock().expect("lock records").clear();
     }
 
+    pub fn snapshot_records(&self) -> Vec<QueryRecord> {
+        self.records.lock().expect("lock records").clone()
+    }
+
     pub async fn wait_for_record<F>(&self, predicate: F) -> Option<QueryRecord>
     where
         F: Fn(&QueryRecord) -> bool,
@@ -423,6 +478,15 @@ async fn is_starrocks_ready(url: &str) -> bool {
     port_is_open(host, port).await
 }
 
+async fn is_clickhouse_ready(url: &str) -> bool {
+    let Ok(parsed) = reqwest::Url::parse(url) else {
+        return false;
+    };
+    let host = parsed.host_str().unwrap_or("localhost");
+    let port = parsed.port().unwrap_or(8123);
+    port_is_open(host, port).await
+}
+
 async fn is_lakekeeper_ready(url: &str) -> bool {
     let Ok(parsed) = reqwest::Url::parse(url) else {
         return false;
@@ -473,6 +537,8 @@ impl WireTestHarness {
                 DuckDbConfig {
                     database_path: None,
                     motherduck_token: None,
+                    pool_size: 1,
+                    max_result_buffer_bytes: DEFAULT_MAX_RESULT_BUFFER_BYTES,
                 },
             )
             .map_err(|e| anyhow!("DuckDB adapter: {e}"))?,
@@ -516,9 +582,12 @@ impl WireTestHarness {
             group_order: vec![GROUP_DUCKDB.to_string()],
             group_translation_scripts: HashMap::new(),
             group_default_tags: HashMap::new(),
+            group_max_queued_queries: HashMap::new(),
+            group_capacity_wait_timeout_secs: HashMap::new(),
             group_cache_settings: HashMap::new(),
             auth_provider: Arc::new(NoneAuthProvider::new(false)) as Arc<dyn AuthProvider>,
-            authorization: Arc::new(AllowAllAuthorization) as Arc<dyn AuthorizationChecker>,
+            authorization: Arc::new(AllowAllAuthorization::default())
+                as Arc<dyn AuthorizationChecker>,
         };
 
         let state = Arc::new(AppState {
@@ -608,6 +677,7 @@ impl WireTestHarness {
                     endpoint: sr_url,
                     auth: None,
                     pool_size: 2,
+                    query_auth: None,
                 },
             )
             .map_err(|e| anyhow!("StarRocks adapter: {e}"))?,
@@ -651,9 +721,12 @@ impl WireTestHarness {
             group_order: vec![GROUP_STARROCKS.to_string()],
             group_translation_scripts: HashMap::new(),
             group_default_tags: HashMap::new(),
+            group_max_queued_queries: HashMap::new(),
+            group_capacity_wait_timeout_secs: HashMap::new(),
             group_cache_settings: HashMap::new(),
             auth_provider: Arc::new(NoneAuthProvider::new(false)) as Arc<dyn AuthProvider>,
-            authorization: Arc::new(AllowAllAuthorization) as Arc<dyn AuthorizationChecker>,
+            authorization: Arc::new(AllowAllAuthorization::default())
+                as Arc<dyn AuthorizationChecker>,
         };
 
         let state = Arc::new(AppState {
@@ -724,4 +797,152 @@ impl MetricsStore for NullMetrics {
     async fn record_cluster_snapshot(&self, _s: ClusterSnapshot) -> QfResult<()> {
         Ok(())
     }
+}
+
+// ---------------------------------------------------------------------------
+// ProtocolWireHarness — MySQL wire, Postgres wire, and Flight SQL on DuckDB.
+// ---------------------------------------------------------------------------
+
+pub struct ProtocolWireHarness {
+    pub mysql_port: u16,
+    pub postgres_port: u16,
+    pub flight_port: u16,
+    _shutdown_tx: tokio::sync::watch::Sender<bool>,
+}
+
+impl ProtocolWireHarness {
+    pub async fn new() -> Result<Self> {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter("error")
+            .try_init();
+
+        let group = ClusterGroupName(GROUP_DUCKDB.to_string());
+        let cluster = ClusterName("duckdb-wire-proto-1".to_string());
+        let cs = Arc::new(ClusterState::new(
+            cluster.clone(),
+            group.clone(),
+            None,
+            None,
+            EngineType::DuckDb,
+            None,
+            4,
+            true,
+        ));
+        let adapter = Arc::new(
+            DuckDbAdapter::new(
+                cluster.clone(),
+                group.clone(),
+                DuckDbConfig {
+                    database_path: None,
+                    motherduck_token: None,
+                    pool_size: 2,
+                    max_result_buffer_bytes: DEFAULT_MAX_RESULT_BUFFER_BYTES,
+                },
+            )
+            .map_err(|e| anyhow!("DuckDB adapter: {e}"))?,
+        );
+
+        let mut group_states: HashMap<ClusterGroupName, _> = HashMap::new();
+        group_states.insert(group.clone(), (vec![cs], strategy_from_config(None)));
+        let mut adapters: HashMap<String, AdapterKind> = HashMap::new();
+        adapters.insert(cluster.0.clone(), AdapterKind::Sync(adapter));
+
+        let duckdb_group = group.clone();
+        let router = Box::new(ProtocolBasedRouter {
+            trino_http: None,
+            postgres_wire: Some(duckdb_group.clone()),
+            mysql_wire: Some(duckdb_group.clone()),
+            clickhouse_http: None,
+            flight_sql: Some(duckdb_group.clone()),
+            snowflake_http: None,
+            snowflake_sql_api: None,
+        });
+
+        let cluster_manager = Arc::new(SimpleClusterGroupManager::new(group_states));
+        let translation = Arc::new(TranslationService::disabled());
+        let router_chain = RouterChain::new(vec![router], group.clone());
+
+        let live_config = LiveConfig {
+            router_chain,
+            guard_chain: None,
+            group_guard_chains: HashMap::new(),
+            cluster_manager,
+            adapters,
+            health_check_targets: vec![],
+            custom_health_queries: HashMap::new(),
+            custom_reconcile_queries: HashMap::new(),
+            cluster_configs: HashMap::new(),
+            group_members: HashMap::from([(GROUP_DUCKDB.to_string(), vec![cluster.0.clone()])]),
+            group_order: vec![GROUP_DUCKDB.to_string()],
+            group_translation_scripts: HashMap::new(),
+            group_default_tags: HashMap::new(),
+            group_max_queued_queries: HashMap::new(),
+            group_capacity_wait_timeout_secs: HashMap::new(),
+            group_cache_settings: HashMap::new(),
+            auth_provider: Arc::new(NoneAuthProvider::new(false)) as Arc<dyn AuthProvider>,
+            authorization: Arc::new(AllowAllAuthorization::default())
+                as Arc<dyn AuthorizationChecker>,
+        };
+
+        let state = Arc::new(AppState {
+            external_address: "http://127.0.0.1:0".to_string(),
+            live: Arc::new(tokio::sync::RwLock::new(live_config)),
+            persistence: Arc::new(InMemoryPersistence::new()),
+            translation,
+            metrics: Arc::new(NullMetrics),
+            identity_resolver: Arc::new(BackendIdentityResolver::new()),
+            capacity_store: None,
+            queue_coordinator: None,
+            instance_id: "wire-proto-harness".to_string(),
+            http_client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(30))
+                .build()
+                .expect("build http client"),
+            result_cache: Arc::new(queryflux_cache::noop::NoopResultCache),
+        });
+
+        let mysql_port = bind_ephemeral_port().await?;
+        let postgres_port = bind_ephemeral_port().await?;
+        let flight_port = bind_ephemeral_port().await?;
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+        spawn_wire_frontend(
+            MysqlWireFrontend::new(state.clone(), mysql_port, None),
+            shutdown_rx.clone(),
+        );
+        spawn_wire_frontend(
+            PostgresWireFrontend::new(state.clone(), postgres_port, None),
+            shutdown_rx.clone(),
+        );
+        spawn_wire_frontend(
+            FlightSqlFrontend::new(state, flight_port, None),
+            shutdown_rx,
+        );
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        Ok(Self {
+            mysql_port,
+            postgres_port,
+            flight_port,
+            _shutdown_tx: shutdown_tx,
+        })
+    }
+}
+
+async fn bind_ephemeral_port() -> Result<u16> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let port = listener.local_addr()?.port();
+    drop(listener);
+    Ok(port)
+}
+
+fn spawn_wire_frontend<F>(frontend: F, shutdown: ShutdownRx)
+where
+    F: FrontendListenerTrait + Send + Sync + 'static,
+{
+    tokio::spawn(async move {
+        let _ = frontend.listen(shutdown).await;
+    });
 }

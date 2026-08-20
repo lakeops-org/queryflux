@@ -2,11 +2,13 @@ pub mod cache_store;
 pub mod cluster_config;
 pub mod in_memory;
 pub mod metrics_store;
+pub mod migrate;
 pub mod postgres;
 pub mod query_history;
 pub mod routing_json;
 pub mod routing_slices;
 pub mod script_library;
+pub mod yaml_seed;
 
 use std::collections::HashMap;
 
@@ -28,6 +30,7 @@ use crate::{
 // Re-export so callers can do `queryflux_persistence::MetricsStore` etc.
 pub use cache_store::{CacheEntryMeta, CacheEntryRef, CacheStore};
 pub use metrics_store::{ClusterSnapshot, GuardAction, MetricsStore, QueryRecord};
+pub use migrate::{run_persistence_migrations, SchemaMigrator};
 pub use query_history::{AgentSummary, ConversationSummary, QuerySummary};
 pub use script_library::{
     is_valid_script_kind, UpsertUserScript, UserScriptRecord, KIND_GUARD, KIND_ROUTING,
@@ -54,6 +57,8 @@ pub trait Persistence: Send + Sync {
     async fn upsert_queued(&self, query: QueuedQuery) -> Result<()>;
     async fn get_queued(&self, id: &ProxyQueryId) -> Result<Option<QueuedQuery>>;
     async fn delete_queued(&self, id: &ProxyQueryId) -> Result<()>;
+    /// Atomically remove a queued query and return it when this caller wins the delete.
+    async fn take_queued(&self, id: &ProxyQueryId) -> Result<Option<QueuedQuery>>;
     async fn list_queued(&self) -> Result<Vec<QueuedQuery>>;
 
     /// Bump `last_accessed` to now for a queued query, keeping it alive in the
@@ -129,8 +134,9 @@ pub trait QueryHistoryStore: Send + Sync {
     /// All query records belonging to a conversation, ordered by step_index.
     async fn get_conversation(&self, conversation_id: &str) -> Result<Vec<QuerySummary>>;
 
-    /// Delete all query records created before `older_than` (history retention).
-    /// Returns the number of records deleted.
+    /// Delete history older than `older_than`: `query_records` (`created_at`),
+    /// `query_digest_stats` (`last_seen`), and `cluster_snapshots` (`recorded_at`).
+    /// Returns the total number of rows deleted across those tables.
     async fn purge_old_query_records(&self, older_than: DateTime<Utc>) -> Result<u64>;
 }
 
@@ -156,6 +162,12 @@ pub trait ClusterConfigStore: Send + Sync {
         name: &str,
         cfg: &UpsertClusterConfig,
     ) -> Result<ClusterConfigRecord>;
+    /// Insert a cluster row only when `name` is absent. Returns true when inserted.
+    async fn insert_cluster_config_if_missing(
+        &self,
+        name: &str,
+        cfg: &UpsertClusterConfig,
+    ) -> Result<bool>;
     /// Deletes the cluster row and removes its id from every group's `members` array
     /// (Postgres) or drops its name from each group's member list (in-memory).
     async fn delete_cluster_config(&self, name: &str) -> Result<bool>;
@@ -176,6 +188,12 @@ pub trait ClusterConfigStore: Send + Sync {
         name: &str,
         cfg: &UpsertClusterGroupConfig,
     ) -> Result<ClusterGroupConfigRecord>;
+    /// Insert a group row only when `name` is absent. Returns true when inserted.
+    async fn insert_group_config_if_missing(
+        &self,
+        name: &str,
+        cfg: &UpsertClusterGroupConfig,
+    ) -> Result<bool>;
     async fn delete_group_config(&self, name: &str) -> Result<bool>;
     /// Returns the number of stored group configs (used for first-run seeding).
     async fn group_configs_count(&self) -> Result<i64>;
@@ -342,6 +360,7 @@ pub trait CapacityStore: Send + Sync {
     /// Release all capacity leases held by `instance_id`. Called during graceful
     /// shutdown so the departing replica's slots are immediately available to
     /// other replicas instead of waiting for the stale-lease expiry sweep.
+    /// Returns the number of leases released.
     async fn release_all_for_instance(&self, instance_id: &str) -> Result<u64>;
 }
 
@@ -376,6 +395,15 @@ pub trait QueueCoordinator: Send + Sync {
     /// Release a claim without executing (e.g. capacity still unavailable
     /// or the claiming instance is shutting down).
     async fn release_claim(&self, query_id: &str) -> Result<()>;
+
+    /// Refresh `claimed_at` if `instance_id` still owns the claim.
+    ///
+    /// Dispatch can take longer than the stale-claim cutoff. Callers must
+    /// heartbeat while they hold the claim so another replica does not
+    /// take over and double-dispatch.
+    ///
+    /// Returns `true` if this instance still owns the claim.
+    async fn refresh_claim(&self, query_id: &str, instance_id: &str) -> Result<bool>;
 
     /// List queued queries that are not currently claimed by any instance.
     /// Claims older than `stale_before` count as unclaimed.

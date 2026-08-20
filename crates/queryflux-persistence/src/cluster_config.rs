@@ -181,6 +181,9 @@ impl UpsertClusterConfig {
         if let Some(n) = cfg.pool_size {
             config.insert("poolSize".into(), serde_json::json!(n));
         }
+        if let Some(n) = cfg.max_result_buffer_bytes {
+            config.insert("maxResultBufferBytes".into(), serde_json::json!(n));
+        }
 
         match &cfg.auth {
             Some(ClusterAuth::Basic { username, password }) => {
@@ -314,6 +317,8 @@ impl ClusterGroupConfigRecord {
             strategy,
             max_running_queries: self.max_running_queries as u64,
             max_queued_queries: self.max_queued_queries.map(|v| v as u64),
+            // Not persisted in Postgres yet; YAML LiveConfig path supplies the value.
+            capacity_wait_timeout_secs: None,
             authorization: queryflux_core::config::ClusterGroupAuthorizationConfig {
                 allow_groups: self.allow_groups.clone(),
                 allow_users: self.allow_users.clone(),
@@ -368,6 +373,7 @@ mod tests {
             strategy: None,
             max_running_queries: 10,
             max_queued_queries: None,
+            capacity_wait_timeout_secs: None,
             authorization: queryflux_core::config::ClusterGroupAuthorizationConfig {
                 allow_groups: vec![],
                 allow_users: vec![],
@@ -468,5 +474,25 @@ mod tests {
         );
         assert_eq!(core_out.default_tags.get("batch"), Some(&None));
         assert_eq!(core_out.default_tags.len(), 2);
+    }
+
+    /// The YAML→Postgres seed runs on every startup with a full-replace of the
+    /// config JSONB — any ClusterConfig field it drops silently vanishes in
+    /// Postgres mode (and wipes a Studio-set value on restart).
+    #[test]
+    fn cluster_from_core_preserves_pool_size_and_result_buffer_cap() {
+        let cfg: ClusterConfig = serde_json::from_value(serde_json::json!({
+            "engine": "clickHouse",
+            "endpoint": "http://ch:8123",
+            "poolSize": 4,
+            "maxResultBufferBytes": 65536,
+        }))
+        .unwrap();
+        let upsert = UpsertClusterConfig::from_core(&cfg).unwrap().unwrap();
+        assert_eq!(upsert.config.get("poolSize"), Some(&serde_json::json!(4)));
+        assert_eq!(
+            upsert.config.get("maxResultBufferBytes"),
+            Some(&serde_json::json!(65536))
+        );
     }
 }

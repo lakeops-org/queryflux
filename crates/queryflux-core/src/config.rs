@@ -75,6 +75,18 @@ pub struct ProxyConfig {
     pub guardrails: Option<GuardrailsConfig>,
 }
 
+impl ProxyConfig {
+    /// Fail-closed checks run before auth providers are constructed at startup.
+    pub fn validate_startup_security(&self) -> std::result::Result<(), String> {
+        self.auth.validate_for_required()?;
+        self.authorization.validate()?;
+        if let Some(guardrails) = &self.guardrails {
+            guardrails.validate()?;
+        }
+        Ok(())
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Guardrails configuration
 // ---------------------------------------------------------------------------
@@ -258,10 +270,19 @@ impl GuardSpecConfig {
                 Ok(())
             }
             GuardKindConfig::HttpWebhook => {
-                if self.url.as_deref().unwrap_or_default().trim().is_empty() {
+                let raw = self.url.as_deref().unwrap_or_default().trim();
+                if raw.is_empty() {
                     return Err("http_webhook guard is missing required field \"url\"".to_string());
                 }
-                Ok(())
+                match url::Url::parse(raw) {
+                    Ok(parsed) => match parsed.scheme() {
+                        "http" | "https" => Ok(()),
+                        other => Err(format!(
+                            "http_webhook url must use http or https scheme, got \"{other}\""
+                        )),
+                    },
+                    Err(e) => Err(format!("http_webhook url is not a valid URL: {e}")),
+                }
             }
         }
     }
@@ -308,6 +329,12 @@ pub struct AuthConfig {
     pub ldap: Option<LdapConfig>,
     #[serde(default)]
     pub static_users: Option<StaticUsersConfig>,
+    /// IdP roles that may cancel any in-flight or queued query (not poll).
+    #[serde(default)]
+    pub operator_roles: Vec<String>,
+    /// IdP groups that may cancel any in-flight or queued query (not poll).
+    #[serde(default)]
+    pub operator_groups: Vec<String>,
 }
 
 impl Default for AuthConfig {
@@ -318,6 +345,92 @@ impl Default for AuthConfig {
             oidc: None,
             ldap: None,
             static_users: None,
+            operator_roles: Vec::new(),
+            operator_groups: Vec::new(),
+        }
+    }
+}
+
+impl AuthConfig {
+    /// Fail closed when `required` is true but the selected provider is incomplete.
+    ///
+    /// When `required` is false (dev/trusted networks), incomplete provider blocks
+    /// are not rejected here — `build_auth_provider` may still fail later.
+    pub fn validate_for_required(&self) -> std::result::Result<(), String> {
+        if !self.required {
+            return Ok(());
+        }
+        match self.provider {
+            AuthProviderConfig::None => Err("auth.required is true but auth.provider is 'none' — \
+                 set provider to oidc, ldap, or static"
+                .into()),
+            AuthProviderConfig::Static => {
+                let Some(users) = &self.static_users else {
+                    return Err("auth.required is true and auth.provider is 'static' but \
+                         auth.staticUsers is missing"
+                        .into());
+                };
+                if users.users.is_empty() {
+                    return Err("auth.required is true and auth.provider is 'static' but \
+                         auth.staticUsers.users is empty"
+                        .into());
+                }
+                Ok(())
+            }
+            AuthProviderConfig::Oidc => {
+                let Some(oidc) = &self.oidc else {
+                    return Err("auth.required is true and auth.provider is 'oidc' but \
+                         auth.oidc is missing"
+                        .into());
+                };
+                if oidc.issuer.trim().is_empty() {
+                    return Err(
+                        "auth.oidc.issuer must not be empty when auth.required is true".into(),
+                    );
+                }
+                if oidc.jwks_uri.trim().is_empty() {
+                    return Err(
+                        "auth.oidc.jwksUri must not be empty when auth.required is true".into(),
+                    );
+                }
+                match &oidc.audience {
+                    Some(aud) if !aud.trim().is_empty() => Ok(()),
+                    _ => Err("auth.oidc.audience is required when auth.required is true \
+                         (fail closed — no JWT accepted without an audience)"
+                        .into()),
+                }
+            }
+            AuthProviderConfig::Ldap => {
+                let Some(ldap) = &self.ldap else {
+                    return Err("auth.required is true and auth.provider is 'ldap' but \
+                         auth.ldap is missing"
+                        .into());
+                };
+                if ldap.url.trim().is_empty() {
+                    return Err("auth.ldap.url must not be empty when auth.required is true".into());
+                }
+                let user_dn_template = ldap
+                    .user_dn_template
+                    .as_deref()
+                    .filter(|template| !template.trim().is_empty());
+                if let Some(template) = user_dn_template {
+                    if !template.contains("{}") {
+                        return Err("auth.ldap.userDnTemplate must contain '{}' when \
+                             auth.required is true"
+                            .into());
+                    }
+                } else if ldap.user_search_base.trim().is_empty() {
+                    return Err("auth.ldap must set userDnTemplate or userSearchBase when \
+                         auth.required is true"
+                        .into());
+                }
+                if user_dn_template.is_none() && ldap.user_search_filter.trim().is_empty() {
+                    return Err("auth.ldap.userSearchFilter must not be empty when \
+                         auth.required is true"
+                        .into());
+                }
+                Ok(())
+            }
         }
     }
 }
@@ -439,6 +552,30 @@ impl Default for AuthorizationConfig {
     }
 }
 
+impl AuthorizationConfig {
+    /// Refuse OpenFGA when the provider is selected but URL/store are incomplete.
+    pub fn validate(&self) -> std::result::Result<(), String> {
+        match self.provider {
+            AuthorizationProviderConfig::None => Ok(()),
+            AuthorizationProviderConfig::OpenFga => {
+                let Some(fga) = &self.openfga else {
+                    return Err(
+                        "authorization.provider is 'openfga' but authorization.openfga is missing"
+                            .into(),
+                    );
+                };
+                if fga.url.trim().is_empty() {
+                    return Err("authorization.openfga.url must not be empty".into());
+                }
+                if fga.store_id.trim().is_empty() {
+                    return Err("authorization.openfga.storeId must not be empty".into());
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub enum AuthorizationProviderConfig {
@@ -500,8 +637,9 @@ pub struct QueryFluxConfig {
     /// when the admin API notifies after Studio or other writes.
     #[serde(default)]
     pub config_reload_interval_secs: Option<u64>,
-    /// Number of days to retain query history records. When set, a background task
-    /// runs hourly and deletes `query_records` rows older than this many days.
+    /// Number of days to retain query history. When set, a background task runs
+    /// hourly and deletes `query_records` (`created_at`), `query_digest_stats`
+    /// (`last_seen`), and `cluster_snapshots` (`recorded_at`) older than this many days.
     /// Only takes effect when Postgres persistence is configured.
     /// Omit or set to `null` to keep history indefinitely.
     #[serde(default)]
@@ -654,7 +792,7 @@ fn default_true() -> bool {
 
 /// Postgres persistence: set a single `url`, **or** `host`, `user`, `database`, and optionally
 /// `password` / `port` (default 5432). The URL form wins when both are present.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PostgresPersistenceConfig {
     /// Full `postgres://` connection string. When non-empty, `host` / `user` / … are ignored.
@@ -670,12 +808,22 @@ pub struct PostgresPersistenceConfig {
     pub password: Option<String>,
     #[serde(default)]
     pub database: Option<String>,
-    /// Max connections in the sqlx pool (`poolSize` in YAML). Omit for the
-    /// sqlx default (10). The pool serves the dispatch hot path (capacity
-    /// acquire/release per query) plus persistence, admin, LISTEN/NOTIFY,
-    /// and sweeps — raise this before adding replicas under high QPS.
+    /// Legacy total connection budget (`poolSize` in YAML), **inclusive of** the
+    /// dedicated `PgListener` connection. When the per-workload pool sizes below
+    /// are omitted, one slot is reserved for LISTEN and the remainder is split
+    /// 60% query / 20% coordination / 20% admin (minimum 1 each). Must be at least
+    /// 4. Ignored when any workload-specific pool size is set.
     #[serde(default)]
     pub pool_size: Option<u32>,
+    /// Hot-path pool for executing/queued query state (`queryPoolSize`).
+    #[serde(default)]
+    pub query_pool_size: Option<u32>,
+    /// Pool for distributed capacity, queue claims, and sweep locks (`coordinationPoolSize`).
+    #[serde(default)]
+    pub coordination_pool_size: Option<u32>,
+    /// Pool for admin API, metrics, cache metadata, and config reload reads (`adminPoolSize`).
+    #[serde(default)]
+    pub admin_pool_size: Option<u32>,
     /// Max seconds to wait for a connection from the pool before returning an error.
     /// Defaults to 30 seconds.
     #[serde(default)]
@@ -684,6 +832,31 @@ pub struct PostgresPersistenceConfig {
     /// runaway queries from holding pool connections indefinitely. Defaults to 60s.
     #[serde(default)]
     pub statement_timeout_secs: Option<u64>,
+    /// When true (default), QueryFlux runs Refinery migrations on server start.
+    /// Set false when migrations are applied separately via `queryflux migrate`
+    /// (or a Kubernetes Job) so multi-replica rollouts do not race on schema DDL.
+    #[serde(default = "default_true")]
+    pub auto_migrate: bool,
+}
+
+impl Default for PostgresPersistenceConfig {
+    fn default() -> Self {
+        Self {
+            url: None,
+            host: None,
+            port: None,
+            user: None,
+            password: None,
+            database: None,
+            pool_size: None,
+            query_pool_size: None,
+            coordination_pool_size: None,
+            admin_pool_size: None,
+            acquire_timeout_secs: None,
+            statement_timeout_secs: None,
+            auto_migrate: true,
+        }
+    }
 }
 
 impl PostgresPersistenceConfig {
@@ -741,6 +914,53 @@ impl PostgresPersistenceConfig {
 
         Ok(url.to_string())
     }
+
+    /// Dedicated `PgListener` connections held outside the three sqlx pools.
+    pub const LISTENER_CONNECTIONS: u32 = 1;
+    /// Minimum legacy `poolSize`: 3 isolated pools (1 each) + 1 LISTEN connection.
+    pub const MIN_LEGACY_POOL_SIZE: u32 = 4;
+
+    /// Resolve isolated pool sizes for query, coordination, and admin workloads.
+    ///
+    /// Legacy `poolSize` is inclusive of [`Self::LISTENER_CONNECTIONS`]. Workload-specific
+    /// sizes (`queryPoolSize` / …) are pool-only; the listener is extra in that mode.
+    pub fn resolve_pool_sizes(&self) -> Result<(u32, u32, u32), String> {
+        const DEFAULT_TOTAL: u32 = 10;
+
+        if self.query_pool_size.is_some()
+            || self.coordination_pool_size.is_some()
+            || self.admin_pool_size.is_some()
+        {
+            return Ok((
+                self.query_pool_size.unwrap_or(6).max(1),
+                self.coordination_pool_size.unwrap_or(2).max(1),
+                self.admin_pool_size.unwrap_or(2).max(1),
+            ));
+        }
+
+        let total = self.pool_size.unwrap_or(DEFAULT_TOTAL);
+        if total < Self::MIN_LEGACY_POOL_SIZE {
+            return Err(format!(
+                "postgres persistence: poolSize must be at least {} \
+                 (3 isolated pools + {} LISTEN connection); got {total}",
+                Self::MIN_LEGACY_POOL_SIZE,
+                Self::LISTENER_CONNECTIONS
+            ));
+        }
+
+        let pool_budget = total - Self::LISTENER_CONNECTIONS;
+        let coordination = (pool_budget * 20 / 100).max(1);
+        let admin = (pool_budget * 20 / 100).max(1);
+        let query = pool_budget
+            .saturating_sub(coordination)
+            .saturating_sub(admin)
+            .max(1);
+        debug_assert!(
+            query + coordination + admin + Self::LISTENER_CONNECTIONS <= total,
+            "legacy poolSize split must not exceed configured budget"
+        );
+        Ok((query, coordination, admin))
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -749,9 +969,9 @@ pub enum PersistenceConfig {
     #[default]
     #[serde(rename = "inMemory")]
     InMemory,
-    Redis {
-        url: String,
-    },
+    /// Reserved for a future Redis backend. QueryFlux rejects this at startup
+    /// (no silent fallback to in-memory).
+    Redis { url: String },
     Postgres {
         #[serde(flatten)]
         conn: PostgresPersistenceConfig,
@@ -803,6 +1023,9 @@ impl Default for AdminApiConfig {
 
 // --- Cluster groups ---
 
+/// Default proxy-side wait for cluster capacity (`capacityWaitTimeoutSecs`).
+pub const DEFAULT_CAPACITY_WAIT_TIMEOUT_SECS: u64 = 300;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ClusterGroupConfig {
@@ -817,6 +1040,10 @@ pub struct ClusterGroupConfig {
     pub max_running_queries: u64,
     #[serde(default)]
     pub max_queued_queries: Option<u64>,
+    /// Max seconds a query may wait for capacity (sync spin or async queue).
+    /// Defaults to [`DEFAULT_CAPACITY_WAIT_TIMEOUT_SECS`] when omitted.
+    #[serde(default)]
+    pub capacity_wait_timeout_secs: Option<u64>,
     /// Simple authorization policy (used when `authorization.provider: none`).
     /// If both lists are empty/absent, all authenticated users are allowed.
     #[serde(default)]
@@ -829,6 +1056,16 @@ pub struct ClusterGroupConfig {
     /// Query result cache configuration for this group. Omit to disable caching.
     #[serde(default)]
     pub cache: Option<GroupCacheConfig>,
+}
+
+impl ClusterGroupConfig {
+    /// Resolved capacity wait timeout; omitted / zero → [`DEFAULT_CAPACITY_WAIT_TIMEOUT_SECS`].
+    pub fn capacity_wait_timeout_secs_or_default(&self) -> u64 {
+        match self.capacity_wait_timeout_secs {
+            Some(n) if n > 0 => n,
+            _ => DEFAULT_CAPACITY_WAIT_TIMEOUT_SECS,
+        }
+    }
 }
 
 /// Simple allow-list authorization for a cluster group.
@@ -859,7 +1096,7 @@ pub enum EngineConfig {
     Adbc,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ClusterConfig {
     pub engine: Option<EngineConfig>,
@@ -887,6 +1124,24 @@ pub struct ClusterConfig {
     /// Default Athena catalog. Defaults to `"AwsDataCatalog"` when omitted.
     #[serde(default)]
     pub catalog: Option<String>,
+    /// Max seconds QueryFlux will poll Athena for query completion
+    /// (`maxWaitSecs` in JSON/YAML). Defaults to 600 (10 minutes) when omitted.
+    /// On timeout the proxy calls `StopQueryExecution`.
+    #[serde(default)]
+    pub max_wait_secs: Option<u64>,
+    /// Max bytes of a single query result QueryFlux buffers in memory
+    /// (`maxResultBufferBytes` in JSON/YAML). ClickHouse only; defaults to
+    /// 1 GiB when omitted. Other engines ignore this.
+    #[serde(default)]
+    pub max_result_buffer_bytes: Option<u64>,
+    /// ADBC driver name (e.g. `"snowflake"`, `"flightsql"`) — only meaningful when
+    /// `engine` is [`EngineConfig::Adbc`]. ADBC clusters are admin-API-only (never YAML),
+    /// so this is populated from the persisted JSONB `driver` key, not deserialized from
+    /// this struct's own YAML/JSON representation. Used by [`query_auth_supported`] since
+    /// `EngineConfig::Adbc` alone doesn't say which underlying driver — and therefore
+    /// which OAuth-capable drivers — a cluster uses.
+    #[serde(default)]
+    pub driver: Option<String>,
     #[serde(default)]
     pub tls: Option<TlsConfig>,
     /// Type 1 credentials — service account used for health checks and (by default) query execution.
@@ -944,6 +1199,7 @@ pub fn variant_field_to_db_kwarg(driver: &str, key: &str) -> Option<&'static str
         ("snowflake", "schema") => Some("adbc.snowflake.sql.schema"),
         ("databricks", "httpPath") => Some("http_path"),
         ("bigquery", "project") => Some("project_id"),
+        ("redshift", "workgroup") => Some("workgroup"),
         _ => None,
     }
 }
@@ -954,6 +1210,7 @@ fn resolve_sub_resource(driver: &str, overrides: &serde_json::Value) -> Option<S
         "snowflake" => &["warehouse"],
         "databricks" => &["httpPath"],
         "bigquery" => &["project"],
+        "redshift" => &["workgroup"],
         _ => &[],
     };
     for key in primary_keys {
@@ -966,6 +1223,18 @@ fn resolve_sub_resource(driver: &str, overrides: &serde_json::Value) -> Option<S
 
 fn escape_sql_literal(s: &str) -> String {
     s.replace('\'', "''")
+}
+
+/// Escapes `\`, `%`, and `_` so a name embedded in a `LIKE` pattern matches
+/// only that exact name — `_` and `%` are SQL wildcards, so an unescaped
+/// name like `ETL_WH` would also match `ETLXWH`. Snowflake's `SHOW ... LIKE`
+/// clause honors `\` as the default escape character, same as the `LIKE`
+/// predicate. Callers still need [`escape_sql_literal`] afterward to embed
+/// the result in a single-quoted string.
+fn escape_sql_like_pattern(s: &str) -> String {
+    s.replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
 }
 
 fn json_db_kwarg(config: &serde_json::Value, key: &str) -> Option<String> {
@@ -1034,7 +1303,7 @@ pub fn default_reconcile_query(engine_key: &str, config: &serde_json::Value) -> 
                     let wh = resolve_adbc_sub_resource(driver, config)?;
                     Some(format!(
                         "SHOW WAREHOUSES LIKE '{}'",
-                        escape_sql_literal(&wh)
+                        escape_sql_literal(&escape_sql_like_pattern(&wh))
                     ))
                 }
                 "bigquery" => {
@@ -1075,7 +1344,7 @@ pub fn default_health_check_query(engine_key: &str, config: &serde_json::Value) 
             let wh = resolve_adbc_sub_resource(driver, config)?;
             Some(format!(
                 "SHOW WAREHOUSES LIKE '{}'",
-                escape_sql_literal(&wh)
+                escape_sql_literal(&escape_sql_like_pattern(&wh))
             ))
         }
         _ => None,
@@ -1269,6 +1538,16 @@ pub enum ClusterAuth {
     },
 }
 
+impl ClusterAuth {
+    /// True when this auth type sets the HTTP `Authorization` header itself (Basic/Bearer).
+    /// `AccessKey`/`KeyPair`/`RoleArn` do not set that header, so a client's own
+    /// `Authorization` may still need to be forwarded under `serviceAccount` for
+    /// backward compatibility with today's implicit passthrough behavior.
+    pub fn sets_http_authorization(&self) -> bool {
+        matches!(self, ClusterAuth::Basic { .. } | ClusterAuth::Bearer { .. })
+    }
+}
+
 /// How QueryFlux authenticates a specific user's query to this backend cluster (Type 2).
 ///
 /// Resolved per-request from `AuthContext` + this config. Default when omitted: `serviceAccount`.
@@ -1279,15 +1558,102 @@ pub enum QueryAuthConfig {
     /// User identity is known to QueryFlux (audit/metrics) but backend sees only the service account.
     #[serde(rename = "serviceAccount")]
     ServiceAccount,
-    /// Service account authenticates to the backend; user identity injected via `X-Trino-User`.
-    /// **Trino only** — startup validation rejects this for other engines.
+    /// Forward the client's own credential (Bearer/Basic) to the backend unchanged — the
+    /// backend authenticates the user's own token, not a QueryFlux-vouched identity.
+    /// **Trino only in this release** — startup validation rejects this for other engines
+    /// until their adapters are wired (see `query_auth_supported`).
+    #[serde(rename = "passthrough")]
+    Passthrough,
+    /// Service account authenticates to the backend; user identity injected via an
+    /// engine-specific mechanism — Trino's `X-Trino-User` header, or ClickHouse's
+    /// `EXECUTE AS {user} {sql}` (self-hosted 25.11+ only, requires `GRANT IMPERSONATE`).
+    /// **Trino and ClickHouse** — startup validation rejects this for other engines.
     #[serde(rename = "impersonate")]
     Impersonate,
-    /// Exchange the user's OIDC JWT for a backend-scoped OAuth token.
+    /// Exchange the user's OIDC JWT (RFC 8693) for a backend-scoped OAuth token.
     /// Requires `OidcAuthProvider` on the frontend (so `raw_token` is populated).
-    /// Falls back to `serviceAccount` when `raw_token` is absent.
+    /// **Fails closed**: if `raw_token` is absent or the exchange fails, the query is
+    /// rejected with an auth error — it never silently falls back to `serviceAccount`,
+    /// since that would submit the query under the wrong principal.
+    /// **Trino, and ADBC/Snowflake** in this release — startup validation rejects this for
+    /// other engines/drivers until their adapters are wired (see `query_auth_supported`).
     #[serde(rename = "tokenExchange")]
     TokenExchange(TokenExchangeConfig),
+}
+
+/// ADBC drivers whose adapter code knows how to put an OAuth token into connection
+/// options via a per-identity sub-pool (see `AdbcAdapter`). Every other ADBC driver is
+/// `serviceAccount`-only — `EngineConfig::Adbc` alone can't tell drivers apart, so this
+/// list is what actually gates `tokenExchange` for ADBC clusters.
+const ADBC_TOKEN_EXCHANGE_DRIVERS: &[&str] = &["snowflake"];
+
+/// Centralizes the engine × `queryAuth` support matrix so YAML load, Studio PUT, and
+/// startup validation can't drift apart. Returns `Err` with an operator-facing message
+/// when `mode` is not implemented for `engine` (and, for ADBC, `driver`) yet.
+///
+/// `serviceAccount` is always allowed. Trino supports every mode. ADBC supports
+/// `tokenExchange` only for drivers in [`ADBC_TOKEN_EXCHANGE_DRIVERS`] — `driver` is
+/// ignored for every other engine. Everything else (ClickHouse, StarRocks, and all other
+/// ADBC drivers) is `serviceAccount`-only in this release; accepting the config silently
+/// would produce a cluster that claims per-user identity but never applies it.
+pub fn query_auth_supported(
+    engine: Option<&EngineConfig>,
+    driver: Option<&str>,
+    mode: &QueryAuthConfig,
+) -> Result<(), String> {
+    if matches!(mode, QueryAuthConfig::ServiceAccount) {
+        return Ok(());
+    }
+    let mode_name = match mode {
+        QueryAuthConfig::Passthrough => "passthrough",
+        QueryAuthConfig::Impersonate => "impersonate",
+        QueryAuthConfig::TokenExchange(_) => "tokenExchange",
+        QueryAuthConfig::ServiceAccount => unreachable!("handled above"),
+    };
+    match engine {
+        Some(EngineConfig::Trino) => Ok(()),
+        Some(EngineConfig::ClickHouse) if matches!(mode, QueryAuthConfig::Impersonate) => Ok(()),
+        Some(EngineConfig::ClickHouse) => Err(format!(
+            "queryAuth.type = {mode_name} is not supported for ClickHouse in this release \
+             (only impersonate, self-hosted ClickHouse 25.11+ with \
+             access_control_improvements.allow_impersonate_user = 1 and GRANT IMPERSONATE — \
+             not supported on ClickHouse Cloud)"
+        )),
+        // `passthrough` here means LDAP-password `COM_CHANGE_USER`, not a bearer token —
+        // see `mysql_native::apply_passthrough_identity`. Only valid when the cluster's own
+        // TLS + `enable_cleartext_plugin` requirements are met; the adapter constructor
+        // (`StarRocksAdapter::new`) enforces that, not this function (it doesn't have the
+        // connection URL). `impersonate`/`tokenExchange` have no StarRocks mechanism.
+        Some(EngineConfig::StarRocks) if matches!(mode, QueryAuthConfig::Passthrough) => Ok(()),
+        Some(EngineConfig::StarRocks) => Err(format!(
+            "queryAuth.type = {mode_name} is not supported for StarRocks in this release \
+             (only passthrough, which requires TLS on the cluster endpoint — see \
+             auth-authz-design.md \"StarRocks\")"
+        )),
+        Some(EngineConfig::Adbc)
+            if matches!(mode, QueryAuthConfig::TokenExchange(_))
+                && driver.is_some_and(|d| ADBC_TOKEN_EXCHANGE_DRIVERS.contains(&d)) =>
+        {
+            Ok(())
+        }
+        Some(EngineConfig::Adbc) => {
+            let driver_name = driver.unwrap_or("<unknown>");
+            Err(format!(
+                "queryAuth.type = {mode_name} is not supported for ADBC driver '{driver_name}' \
+                 in this release (only tokenExchange for {ADBC_TOKEN_EXCHANGE_DRIVERS:?})"
+            ))
+        }
+        other => {
+            let engine_name = other
+                .map(|e| format!("{e:?}"))
+                .unwrap_or_else(|| "<unknown>".to_string());
+            Err(format!(
+                "queryAuth.type = {mode_name} is only supported for Trino, ClickHouse \
+                 (impersonate only), StarRocks (passthrough only), and ADBC/snowflake \
+                 (tokenExchange only) in this release, got {engine_name}"
+            ))
+        }
+    }
 }
 
 /// Configuration for the OAuth 2.0 token exchange flow (RFC 8693).
@@ -1374,7 +1740,24 @@ pub enum RouterConfig {
 #[serde(rename_all = "camelCase")]
 pub struct QueryRegexRule {
     pub regex: String,
-    pub target_group: String,
+    /// Cluster group to route to when [`Self::action`] is [`RegexRouteAction::Route`].
+    #[serde(default)]
+    pub target_group: Option<String>,
+    /// `route` (default) or `deny`.
+    #[serde(default)]
+    pub action: RegexRouteAction,
+    /// Client-visible message when [`Self::action`] is [`RegexRouteAction::Deny`].
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+/// Action taken when a [`QueryRegexRule`] matches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum RegexRouteAction {
+    #[default]
+    Route,
+    Deny,
 }
 
 /// A single rule in a [`RouterConfig::Tags`] router.
@@ -1566,9 +1949,176 @@ fn default_cache_ttl() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        GuardKindConfig, GuardSpecConfig, PersistenceConfig, PostgresPersistenceConfig,
-        ProxyConfig, RouterConfig,
+        query_auth_supported, AuthConfig, AuthProviderConfig, AuthorizationConfig,
+        AuthorizationProviderConfig, ClusterAuth, EngineConfig, GuardKindConfig, GuardSpecConfig,
+        LdapConfig, OidcConfig, OpenFgaConfig, PersistenceConfig, PostgresPersistenceConfig,
+        ProxyConfig, QueryAuthConfig, RouterConfig, TokenExchangeConfig,
     };
+
+    fn token_exchange_mode() -> QueryAuthConfig {
+        QueryAuthConfig::TokenExchange(TokenExchangeConfig {
+            token_endpoint: "https://idp.example/token".to_string(),
+            client_id: "queryflux".to_string(),
+            client_secret: "secret".to_string(),
+            target_audience: None,
+            scope: None,
+        })
+    }
+
+    #[test]
+    fn service_account_is_allowed_for_every_engine_including_unknown() {
+        assert!(query_auth_supported(
+            Some(&EngineConfig::ClickHouse),
+            None,
+            &QueryAuthConfig::ServiceAccount
+        )
+        .is_ok());
+        assert!(query_auth_supported(None, None, &QueryAuthConfig::ServiceAccount).is_ok());
+    }
+
+    #[test]
+    fn passthrough_impersonate_token_exchange_allowed_for_trino() {
+        for mode in [
+            QueryAuthConfig::Passthrough,
+            QueryAuthConfig::Impersonate,
+            token_exchange_mode(),
+        ] {
+            assert!(
+                query_auth_supported(Some(&EngineConfig::Trino), None, &mode).is_ok(),
+                "Trino should support {mode:?}"
+            );
+            assert!(
+                query_auth_supported(None, None, &mode).is_err(),
+                "an unknown engine should not support {mode:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn duckdb_and_athena_are_service_account_only() {
+        // No per-user identity concept (DuckDB embedded, Athena IAM) — neither gets any
+        // mode beyond serviceAccount in this release.
+        for engine in [
+            EngineConfig::DuckDb,
+            EngineConfig::DuckDbHttp,
+            EngineConfig::Athena,
+        ] {
+            for mode in [
+                QueryAuthConfig::Passthrough,
+                QueryAuthConfig::Impersonate,
+                token_exchange_mode(),
+            ] {
+                assert!(
+                    query_auth_supported(Some(&engine), None, &mode).is_err(),
+                    "{engine:?} should not support {mode:?} in this release"
+                );
+            }
+            assert!(
+                query_auth_supported(Some(&engine), None, &QueryAuthConfig::ServiceAccount).is_ok()
+            );
+        }
+    }
+
+    #[test]
+    fn starrocks_allows_only_passthrough() {
+        assert!(query_auth_supported(
+            Some(&EngineConfig::StarRocks),
+            None,
+            &QueryAuthConfig::Passthrough
+        )
+        .is_ok());
+        assert!(query_auth_supported(
+            Some(&EngineConfig::StarRocks),
+            None,
+            &QueryAuthConfig::Impersonate
+        )
+        .is_err());
+        assert!(
+            query_auth_supported(Some(&EngineConfig::StarRocks), None, &token_exchange_mode())
+                .is_err()
+        );
+        assert!(query_auth_supported(
+            Some(&EngineConfig::StarRocks),
+            None,
+            &QueryAuthConfig::ServiceAccount
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn clickhouse_allows_only_impersonate() {
+        assert!(query_auth_supported(
+            Some(&EngineConfig::ClickHouse),
+            None,
+            &QueryAuthConfig::Impersonate
+        )
+        .is_ok());
+        assert!(query_auth_supported(
+            Some(&EngineConfig::ClickHouse),
+            None,
+            &QueryAuthConfig::Passthrough
+        )
+        .is_err());
+        assert!(query_auth_supported(
+            Some(&EngineConfig::ClickHouse),
+            None,
+            &token_exchange_mode()
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn adbc_token_exchange_allowed_only_for_snowflake_driver() {
+        assert!(query_auth_supported(
+            Some(&EngineConfig::Adbc),
+            Some("snowflake"),
+            &token_exchange_mode()
+        )
+        .is_ok());
+        assert!(query_auth_supported(
+            Some(&EngineConfig::Adbc),
+            Some("postgresql"),
+            &token_exchange_mode()
+        )
+        .is_err());
+        assert!(
+            query_auth_supported(Some(&EngineConfig::Adbc), None, &token_exchange_mode()).is_err()
+        );
+    }
+
+    #[test]
+    fn adbc_passthrough_and_impersonate_rejected_even_for_snowflake_driver() {
+        // Only tokenExchange is wired for ADBC in this release — passthrough/impersonate
+        // are rejected regardless of driver.
+        assert!(query_auth_supported(
+            Some(&EngineConfig::Adbc),
+            Some("snowflake"),
+            &QueryAuthConfig::Passthrough
+        )
+        .is_err());
+        assert!(query_auth_supported(
+            Some(&EngineConfig::Adbc),
+            Some("snowflake"),
+            &QueryAuthConfig::Impersonate
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn cluster_auth_sets_http_authorization_matches_basic_and_bearer_only() {
+        assert!(ClusterAuth::Basic {
+            username: "u".into(),
+            password: "p".into()
+        }
+        .sets_http_authorization());
+        assert!(ClusterAuth::Bearer { token: "t".into() }.sets_http_authorization());
+        assert!(!ClusterAuth::AccessKey {
+            access_key_id: "a".into(),
+            secret_access_key: "s".into(),
+            session_token: None
+        }
+        .sets_http_authorization());
+    }
 
     #[test]
     fn router_config_deserializes_admin_style_json_routers_array() {
@@ -1596,7 +2146,8 @@ mod tests {
             RouterConfig::QueryRegex { rules } => {
                 assert_eq!(rules.len(), 1);
                 assert_eq!(rules[0].regex, "(?i)fact_");
-                assert_eq!(rules[0].target_group, "g-facts");
+                assert_eq!(rules[0].target_group.as_deref(), Some("g-facts"));
+                assert!(matches!(rules[0].action, super::RegexRouteAction::Route));
             }
             _ => panic!("expected queryRegex"),
         }
@@ -1785,6 +2336,38 @@ guardrails:
     }
 
     #[test]
+    fn guardrails_validation_rejects_non_http_url_scheme() {
+        let webhook = GuardSpecConfig {
+            kind: GuardKindConfig::HttpWebhook,
+            name: None,
+            script_id: None,
+            script: None,
+            url: Some("file:///etc/passwd".to_string()),
+            timeout_ms: None,
+            retry_count: None,
+            fail_behavior: None,
+            headers: None,
+            max_rows: None,
+            applies_to: None,
+        };
+        let err = webhook.validate().unwrap_err();
+        assert!(err.contains("http or https"), "{err}");
+    }
+
+    #[test]
+    fn startup_rejects_invalid_guardrails() {
+        let yaml = r#"
+queryflux: {}
+guardrails:
+  global:
+    - kind: http_webhook
+"#;
+        let cfg: ProxyConfig = serde_yaml::from_str(yaml).unwrap();
+        let err = cfg.validate_startup_security().unwrap_err();
+        assert!(err.contains("url"), "{err}");
+    }
+
+    #[test]
     fn guardrails_validation_requires_external_guard_fields() {
         let yaml = r#"
 queryflux: {}
@@ -1800,6 +2383,71 @@ guardrails:
             .validate()
             .expect_err("missing external fields should fail");
         assert!(err.contains("script"));
+    }
+
+    fn assert_legacy_budget_inclusive_of_listener(cfg: &PostgresPersistenceConfig) {
+        let total = cfg.pool_size.unwrap_or(10);
+        let (query, coordination, admin) = cfg.resolve_pool_sizes().unwrap();
+        assert!(
+            query + coordination + admin + PostgresPersistenceConfig::LISTENER_CONNECTIONS <= total,
+            "pools ({query}+{coordination}+{admin}) + listener must not exceed poolSize {total}"
+        );
+    }
+
+    #[test]
+    fn postgres_pool_sizes_split_legacy_total() {
+        let c = PostgresPersistenceConfig {
+            pool_size: Some(20),
+            ..Default::default()
+        };
+        assert_eq!(c.resolve_pool_sizes().unwrap(), (13, 3, 3));
+        assert_legacy_budget_inclusive_of_listener(&c);
+    }
+
+    #[test]
+    fn postgres_pool_sizes_default_total_includes_listener() {
+        let c = PostgresPersistenceConfig::default();
+        assert_eq!(c.resolve_pool_sizes().unwrap(), (7, 1, 1));
+        let with_ten = PostgresPersistenceConfig {
+            pool_size: Some(10),
+            ..Default::default()
+        };
+        assert_eq!(with_ten.resolve_pool_sizes().unwrap(), (7, 1, 1));
+        assert_legacy_budget_inclusive_of_listener(&with_ten);
+    }
+
+    #[test]
+    fn postgres_pool_sizes_minimum_legacy_total() {
+        let c = PostgresPersistenceConfig {
+            pool_size: Some(4),
+            ..Default::default()
+        };
+        assert_eq!(c.resolve_pool_sizes().unwrap(), (1, 1, 1));
+        assert_legacy_budget_inclusive_of_listener(&c);
+    }
+
+    #[test]
+    fn postgres_pool_sizes_rejects_legacy_total_below_four() {
+        for n in [0, 1, 2, 3] {
+            let c = PostgresPersistenceConfig {
+                pool_size: Some(n),
+                ..Default::default()
+            };
+            let err = c.resolve_pool_sizes().unwrap_err();
+            assert!(err.contains("at least 4"), "poolSize {n}: {err}");
+        }
+    }
+
+    #[test]
+    fn postgres_pool_sizes_explicit_workloads() {
+        let c = PostgresPersistenceConfig {
+            query_pool_size: Some(12),
+            coordination_pool_size: Some(3),
+            admin_pool_size: Some(5),
+            pool_size: Some(99),
+            ..Default::default()
+        };
+        assert_eq!(c.resolve_pool_sizes().unwrap(), (12, 3, 5));
     }
 
     #[test]
@@ -1844,9 +2492,33 @@ queryflux:
                     conn.connection_url().unwrap(),
                     "postgres://a:b@localhost:5432/db"
                 );
+                assert!(conn.auto_migrate, "autoMigrate defaults to true");
             }
             _ => panic!("expected postgres"),
         }
+    }
+
+    #[test]
+    fn persistence_postgres_auto_migrate_can_be_disabled() {
+        let yaml = r#"
+queryflux:
+  persistence:
+    type: postgres
+    url: postgres://a:b@localhost:5432/db
+    autoMigrate: false
+"#;
+        let cfg: ProxyConfig = serde_yaml::from_str(yaml).unwrap();
+        match &cfg.queryflux.persistence {
+            PersistenceConfig::Postgres { conn } => {
+                assert!(!conn.auto_migrate);
+            }
+            _ => panic!("expected postgres"),
+        }
+    }
+
+    #[test]
+    fn postgres_persistence_default_auto_migrate_true() {
+        assert!(PostgresPersistenceConfig::default().auto_migrate);
     }
 
     #[test]
@@ -2136,6 +2808,10 @@ queryflux:
             super::variant_field_to_db_kwarg("bigquery", "project"),
             Some("project_id")
         );
+        assert_eq!(
+            super::variant_field_to_db_kwarg("redshift", "workgroup"),
+            Some("workgroup")
+        );
         assert_eq!(super::variant_field_to_db_kwarg("unknown", "foo"), None);
     }
 
@@ -2200,7 +2876,7 @@ queryflux:
         });
         assert_eq!(
             super::default_reconcile_query("adbc", &sf).as_deref(),
-            Some("SHOW WAREHOUSES LIKE 'ANALYTICS_WH'")
+            Some(r"SHOW WAREHOUSES LIKE 'ANALYTICS\_WH'")
         );
 
         let bq = serde_json::json!({
@@ -2221,6 +2897,24 @@ queryflux:
     }
 
     #[test]
+    fn escape_sql_like_pattern_escapes_wildcards() {
+        // `_` and `%` are LIKE wildcards — an unescaped "ETL_WH" would also
+        // match a warehouse literally named "ETLXWH".
+        assert_eq!(super::escape_sql_like_pattern("ETL_WH"), "ETL\\_WH");
+        assert_eq!(super::escape_sql_like_pattern("100%_DONE"), "100\\%\\_DONE");
+        assert_eq!(super::escape_sql_like_pattern("back\\slash"), "back\\\\slash");
+    }
+
+    #[test]
+    fn default_health_check_query_escapes_warehouse_wildcards() {
+        let cfg = serde_json::json!({ "driver": "snowflake", "warehouse": "ETL_WH" });
+        assert_eq!(
+            super::default_health_check_query("adbc", &cfg).as_deref(),
+            Some(r"SHOW WAREHOUSES LIKE 'ETL\_WH'")
+        );
+    }
+
+    #[test]
     fn apply_default_probe_queries_fills_reconcile_only_when_unset() {
         let mut cfg = super::ClusterConfig {
             engine: Some(super::EngineConfig::Adbc),
@@ -2233,6 +2927,9 @@ queryflux:
             s3_output_location: None,
             workgroup: None,
             catalog: None,
+            max_wait_secs: None,
+            max_result_buffer_bytes: None,
+            driver: None,
             tls: None,
             auth: None,
             query_auth: None,
@@ -2302,5 +2999,129 @@ queryflux:
             result[0].health_check_query.as_deref(),
             Some("SELECT 1 WHERE x = '{{sub_resource}}'")
         );
+    }
+
+    #[test]
+    fn auth_required_none_provider_fails_validation() {
+        let auth = AuthConfig {
+            required: true,
+            provider: AuthProviderConfig::None,
+            ..Default::default()
+        };
+        assert!(auth.validate_for_required().is_err());
+    }
+
+    #[test]
+    fn auth_required_oidc_needs_audience() {
+        let auth = AuthConfig {
+            required: true,
+            provider: AuthProviderConfig::Oidc,
+            oidc: Some(OidcConfig {
+                issuer: "https://idp.example".into(),
+                jwks_uri: "https://idp.example/jwks".into(),
+                audience: None,
+                groups_claim: "groups".into(),
+                roles_claim: None,
+            }),
+            ..Default::default()
+        };
+        let err = auth.validate_for_required().unwrap_err();
+        assert!(err.contains("audience"), "{err}");
+    }
+
+    #[test]
+    fn auth_required_oidc_ok_with_audience() {
+        let auth = AuthConfig {
+            required: true,
+            provider: AuthProviderConfig::Oidc,
+            oidc: Some(OidcConfig {
+                issuer: "https://idp.example".into(),
+                jwks_uri: "https://idp.example/jwks".into(),
+                audience: Some("queryflux".into()),
+                groups_claim: "groups".into(),
+                roles_claim: None,
+            }),
+            ..Default::default()
+        };
+        assert!(auth.validate_for_required().is_ok());
+    }
+
+    #[test]
+    fn auth_not_required_skips_provider_checks() {
+        let auth = AuthConfig {
+            required: false,
+            provider: AuthProviderConfig::Oidc,
+            oidc: None,
+            ..Default::default()
+        };
+        assert!(auth.validate_for_required().is_ok());
+    }
+
+    #[test]
+    fn auth_required_ldap_user_dn_template_needs_placeholder() {
+        let auth = AuthConfig {
+            required: true,
+            provider: AuthProviderConfig::Ldap,
+            ldap: Some(LdapConfig {
+                url: "ldap://ldap.internal:389".into(),
+                bind_dn: String::new(),
+                bind_password: None,
+                user_search_base: String::new(),
+                user_search_filter: "(uid={})".into(),
+                user_dn_template: Some("cn=admin,ou=users,dc=example,dc=com".into()),
+                group_search_base: None,
+                group_name_attribute: "cn".into(),
+            }),
+            ..Default::default()
+        };
+        let err = auth.validate_for_required().unwrap_err();
+        assert!(err.contains("userDnTemplate"), "{err}");
+    }
+
+    #[test]
+    fn auth_required_ldap_search_mode_needs_filter() {
+        let auth = AuthConfig {
+            required: true,
+            provider: AuthProviderConfig::Ldap,
+            ldap: Some(LdapConfig {
+                url: "ldap://ldap.internal:389".into(),
+                bind_dn: String::new(),
+                bind_password: None,
+                user_search_base: "ou=users,dc=example,dc=com".into(),
+                user_search_filter: String::new(),
+                user_dn_template: None,
+                group_search_base: None,
+                group_name_attribute: "cn".into(),
+            }),
+            ..Default::default()
+        };
+        let err = auth.validate_for_required().unwrap_err();
+        assert!(err.contains("userSearchFilter"), "{err}");
+    }
+
+    #[test]
+    fn startup_rejects_required_auth_none_provider() {
+        let yaml = r#"
+queryflux: {}
+auth:
+  required: true
+  provider: none
+"#;
+        let cfg: ProxyConfig = serde_yaml::from_str(yaml).unwrap();
+        let err = cfg.validate_startup_security().unwrap_err();
+        assert!(err.contains("auth.required"), "{err}");
+    }
+
+    #[test]
+    fn openfga_provider_requires_url_and_store() {
+        let authz = AuthorizationConfig {
+            provider: AuthorizationProviderConfig::OpenFga,
+            openfga: Some(OpenFgaConfig {
+                url: "".into(),
+                store_id: "store".into(),
+                credentials: None,
+            }),
+        };
+        assert!(authz.validate().is_err());
     }
 }

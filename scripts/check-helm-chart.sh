@@ -23,6 +23,8 @@ required_files=(
   "README.md"
   "examples/external-config-values.yaml"
   "examples/production-values.yaml"
+  "examples/production-config.yaml"
+  "examples/networkpolicy-values.yaml"
   "values.yaml"
   "values.schema.json"
   "templates/_helpers.tpl"
@@ -75,9 +77,21 @@ $output"
 run_helm "helm lint" helm lint "$CHART_DIR"
 run_helm "helm template" helm template queryflux "$CHART_DIR"
 
-for values_file in "$CHART_DIR"/examples/*.yaml; do
+for values_file in "$CHART_DIR"/examples/*-values.yaml; do
   run_helm "helm lint --values $values_file" helm lint "$CHART_DIR" --values "$values_file"
   run_helm "helm template --values $values_file" helm template queryflux "$CHART_DIR" --values "$values_file"
 done
+
+# Enabled NetworkPolicy with empty rules must fail (deny-all lockout).
+empty_np_err=""
+if empty_np_err="$(helm template queryflux "$CHART_DIR" \
+  --set networkPolicy.enabled=true \
+  --set-json 'networkPolicy.ingress=[]' \
+  --set-json 'networkPolicy.egress=[]' 2>&1)"; then
+  fail "enabled NetworkPolicy with empty ingress/egress must fail render"
+fi
+echo "$empty_np_err" | grep -q 'non-empty networkPolicy' \
+  || fail "enabled empty NetworkPolicy must fail with a clear message:
+$empty_np_err"
 
 echo "helm chart check passed"

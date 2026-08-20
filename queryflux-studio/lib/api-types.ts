@@ -354,11 +354,21 @@ export interface SecurityConfigDto {
   ldap: LdapConfigDto | null;
   /** Count of users when provider = "static". Passwords are never exposed. */
   static_user_count: number | null;
+  /** Usernames + groups/roles so a re-save does not wipe users. No passwords. */
+  static_user_summaries?: Array<{
+    username: string;
+    groups: string[];
+    roles: string[];
+  }>;
   /** "none" | "openfga" */
   authorization_provider: string;
   openfga: OpenFgaConfigDto | null;
   /** Per-cluster-group allow-lists (used when authorization_provider = "none"). */
   group_authorization: Record<string, GroupAuthzDto>;
+  /** IdP roles that may cancel any query. */
+  operator_roles?: string[];
+  /** IdP groups that may cancel any query. */
+  operator_groups?: string[];
 }
 
 export interface RoutingConfigDto {
@@ -414,6 +424,8 @@ export interface RouterConfigEntry {
         target_group?: string;
         targetGroup?: string;
         targetGroupId?: number;
+        action?: "route" | "deny";
+        error?: string;
       }
     | TagRoutingRule
   >;
@@ -454,6 +466,8 @@ export interface UpsertSecurityConfig {
   } | null;
   static_users?: Record<string, { password: string; groups?: string[]; roles?: string[] }> | null;
   authorization_provider: string;
+  operator_roles?: string[];
+  operator_groups?: string[];
   openfga?: {
     url: string;
     store_id: string;

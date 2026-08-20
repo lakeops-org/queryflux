@@ -1,4 +1,5 @@
 pub mod http;
+pub mod in_flight;
 pub mod sql_api;
 
 use std::sync::Arc;
@@ -17,6 +18,7 @@ use http::{
     session_store::{SnowflakeHttpSessionPolicy, SnowflakeSessionStore},
     SnowflakeWireState,
 };
+use in_flight::SnowflakeInFlightRegistry;
 
 /// Snowflake frontend — serves both the HTTP wire protocol v1
 /// (`/session/v1/*`, `/queries/v1/*`) and the SQL API v2 (`/api/v2/statements`)
@@ -28,6 +30,7 @@ pub struct SnowflakeFrontend {
     state: Arc<AppState>,
     cfg: SnowflakeHttpFrontendConfig,
     sessions: Arc<SnowflakeSessionStore>,
+    in_flight: Arc<SnowflakeInFlightRegistry>,
 }
 
 impl SnowflakeFrontend {
@@ -53,10 +56,12 @@ impl SnowflakeFrontend {
             },
         };
         let sessions = Arc::new(SnowflakeSessionStore::new(policy));
+        let in_flight = SnowflakeInFlightRegistry::new();
         Self {
             state,
             cfg,
             sessions,
+            in_flight,
         }
     }
 
@@ -64,12 +69,12 @@ impl SnowflakeFrontend {
         let wire_state = SnowflakeWireState {
             app: self.state.clone(),
             sessions: self.sessions.clone(),
+            in_flight: self.in_flight.clone(),
         };
-        // Both sub-routers are resolved to Router<()> via .with_state() before merging.
-        // SQL API v2 handlers extract State<Arc<AppState>>; wire v1 handlers extract
-        // State<SnowflakeWireState>. FromRef<SnowflakeWireState> for Arc<AppState> lets
-        // the SQL API handlers work with the SnowflakeWireState directly.
-        let sql_api = sql_api::routes().with_state(wire_state.app.clone());
+        // Both sub-routers use SnowflakeWireState. SQL API v2 handlers extract
+        // State<SnowflakeWireState> (or Arc<AppState> via FromRef). Wire v1 handlers
+        // extract State<SnowflakeWireState> directly.
+        let sql_api = sql_api::routes().with_state(wire_state.clone());
         let wire = http::routes().with_state(wire_state);
         sql_api.merge(wire)
     }

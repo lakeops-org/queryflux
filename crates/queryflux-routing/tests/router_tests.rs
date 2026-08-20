@@ -20,7 +20,7 @@ use queryflux_routing::{
         compound::CompoundRouter, header::HeaderRouter, protocol_based::ProtocolBasedRouter,
         python_script::PythonScriptRouter, query_regex::QueryRegexRouter, tags::TagsRouter,
     },
-    RouterTrait,
+    ChainRouteResult, RouterTrait, RoutingDecision,
 };
 
 // ---------------------------------------------------------------------------
@@ -88,7 +88,7 @@ async fn header_router_matches() {
         .route("SELECT 1", &session, &FrontendProtocol::TrinoHttp, None)
         .await
         .unwrap();
-    assert_eq!(result, Some(group("analytics-group")));
+    assert_eq!(result, RoutingDecision::Route(group("analytics-group")));
 }
 
 #[tokio::test]
@@ -102,7 +102,7 @@ async fn header_router_value_not_in_mapping() {
         .route("SELECT 1", &session, &FrontendProtocol::TrinoHttp, None)
         .await
         .unwrap();
-    assert_eq!(result, None);
+    assert_eq!(result, RoutingDecision::NoMatch);
 }
 
 #[tokio::test]
@@ -116,7 +116,7 @@ async fn header_router_absent() {
         .route("SELECT 1", &session, &FrontendProtocol::TrinoHttp, None)
         .await
         .unwrap();
-    assert_eq!(result, None);
+    assert_eq!(result, RoutingDecision::NoMatch);
 }
 
 #[tokio::test]
@@ -135,7 +135,7 @@ async fn header_router_non_trino_session() {
         )
         .await
         .unwrap();
-    assert_eq!(result, None);
+    assert_eq!(result, RoutingDecision::NoMatch);
 }
 
 // ---------------------------------------------------------------------------
@@ -158,7 +158,7 @@ async fn protocol_router_trino_http() {
         .route("SELECT 1", &session, &FrontendProtocol::TrinoHttp, None)
         .await
         .unwrap();
-    assert_eq!(result, Some(group("trino-group")));
+    assert_eq!(result, RoutingDecision::Route(group("trino-group")));
 }
 
 #[tokio::test]
@@ -181,7 +181,7 @@ async fn protocol_router_postgres_wire() {
         )
         .await
         .unwrap();
-    assert_eq!(result, Some(group("pg-group")));
+    assert_eq!(result, RoutingDecision::Route(group("pg-group")));
 }
 
 #[tokio::test]
@@ -204,7 +204,7 @@ async fn protocol_router_unconfigured() {
         )
         .await
         .unwrap();
-    assert_eq!(result, None);
+    assert_eq!(result, RoutingDecision::NoMatch);
 }
 
 #[tokio::test]
@@ -227,7 +227,7 @@ async fn protocol_router_mysql_wire() {
         )
         .await
         .unwrap();
-    assert_eq!(result, Some(group("mysql-group")));
+    assert_eq!(result, RoutingDecision::Route(group("mysql-group")));
 }
 
 #[tokio::test]
@@ -250,7 +250,7 @@ async fn protocol_router_clickhouse_http() {
         )
         .await
         .unwrap();
-    assert_eq!(result, Some(group("ch-group")));
+    assert_eq!(result, RoutingDecision::Route(group("ch-group")));
 }
 
 #[tokio::test]
@@ -274,7 +274,7 @@ async fn protocol_router_flight_sql() {
         )
         .await
         .unwrap();
-    assert_eq!(result, Some(group("sf-analytics")));
+    assert_eq!(result, RoutingDecision::Route(group("sf-analytics")));
 }
 
 #[tokio::test]
@@ -297,7 +297,7 @@ async fn protocol_router_snowflake_http() {
         )
         .await
         .unwrap();
-    assert_eq!(result, Some(group("sf-wire")));
+    assert_eq!(result, RoutingDecision::Route(group("sf-wire")));
 }
 
 #[tokio::test]
@@ -320,7 +320,7 @@ async fn protocol_router_snowflake_sql_api() {
         )
         .await
         .unwrap();
-    assert_eq!(result, Some(group("sf-rest")));
+    assert_eq!(result, RoutingDecision::Route(group("sf-rest")));
 }
 
 // ---------------------------------------------------------------------------
@@ -361,7 +361,7 @@ async fn tags_trino_key_only_match() {
         .route("SELECT 1", &session, &FrontendProtocol::TrinoHttp, None)
         .await
         .unwrap();
-    assert_eq!(result, Some(group("premium-group")));
+    assert_eq!(result, RoutingDecision::Route(group("premium-group")));
 }
 
 #[tokio::test]
@@ -380,7 +380,7 @@ async fn tags_kv_match_postgres() {
         .route("SELECT 1", &session, &FrontendProtocol::PostgresWire, None)
         .await
         .unwrap();
-    assert_eq!(result, Some(group("analytics-group")));
+    assert_eq!(result, RoutingDecision::Route(group("analytics-group")));
 }
 
 #[tokio::test]
@@ -395,7 +395,7 @@ async fn tags_kv_wrong_value_no_match() {
         .route("SELECT 1", &session, &FrontendProtocol::TrinoHttp, None)
         .await
         .unwrap();
-    assert_eq!(result, None);
+    assert_eq!(result, RoutingDecision::NoMatch);
 }
 
 #[tokio::test]
@@ -406,7 +406,7 @@ async fn tags_no_tags_no_match() {
         .route("SELECT 1", &session, &FrontendProtocol::TrinoHttp, None)
         .await
         .unwrap();
-    assert_eq!(result, None);
+    assert_eq!(result, RoutingDecision::NoMatch);
 }
 
 #[tokio::test]
@@ -424,7 +424,7 @@ async fn tags_and_logic_partial_no_match() {
         .route("SELECT 1", &session, &FrontendProtocol::MySqlWire, None)
         .await
         .unwrap();
-    assert_eq!(result, None);
+    assert_eq!(result, RoutingDecision::NoMatch);
 }
 
 // ---------------------------------------------------------------------------
@@ -447,7 +447,7 @@ async fn query_regex_match() {
         )
         .await
         .unwrap();
-    assert_eq!(result, Some(group("orders-group")));
+    assert_eq!(result, RoutingDecision::Route(group("orders-group")));
 }
 
 #[tokio::test]
@@ -466,7 +466,7 @@ async fn query_regex_no_match() {
         )
         .await
         .unwrap();
-    assert_eq!(result, None);
+    assert_eq!(result, RoutingDecision::NoMatch);
 }
 
 #[tokio::test]
@@ -489,7 +489,7 @@ async fn query_regex_first_match_wins() {
         )
         .await
         .unwrap();
-    assert_eq!(result, Some(group("orders-group")));
+    assert_eq!(result, RoutingDecision::Route(group("orders-group")));
 }
 
 #[tokio::test]
@@ -509,7 +509,7 @@ async fn query_regex_invalid_regex_skipped() {
         )
         .await
         .unwrap();
-    assert_eq!(result, Some(group("orders-group")));
+    assert_eq!(result, RoutingDecision::Route(group("orders-group")));
 }
 
 #[tokio::test]
@@ -527,7 +527,7 @@ async fn query_regex_matches_under_postgres_protocol() {
         )
         .await
         .unwrap();
-    assert_eq!(result, Some(group("cust-group")));
+    assert_eq!(result, RoutingDecision::Route(group("cust-group")));
 }
 
 // ---------------------------------------------------------------------------
@@ -553,7 +553,7 @@ async fn compound_all_both_match() {
         .route("SELECT 1", &session, &FrontendProtocol::TrinoHttp, None)
         .await
         .unwrap();
-    assert_eq!(result, Some(group("premium-group")));
+    assert_eq!(result, RoutingDecision::Route(group("premium-group")));
 }
 
 #[tokio::test]
@@ -576,7 +576,7 @@ async fn compound_all_one_fails() {
         .route("SELECT 1", &session, &FrontendProtocol::TrinoHttp, None)
         .await
         .unwrap();
-    assert_eq!(result, None);
+    assert_eq!(result, RoutingDecision::NoMatch);
 }
 
 #[tokio::test]
@@ -599,7 +599,7 @@ async fn compound_any_first_matches() {
         .route("SELECT 1", &session, &FrontendProtocol::TrinoHttp, None)
         .await
         .unwrap();
-    assert_eq!(result, Some(group("any-group")));
+    assert_eq!(result, RoutingDecision::Route(group("any-group")));
 }
 
 #[tokio::test]
@@ -622,7 +622,7 @@ async fn compound_any_none_match() {
         .route("SELECT 1", &session, &FrontendProtocol::TrinoHttp, None)
         .await
         .unwrap();
-    assert_eq!(result, None);
+    assert_eq!(result, RoutingDecision::NoMatch);
 }
 
 #[tokio::test]
@@ -639,7 +639,7 @@ async fn compound_client_tag_condition() {
         .route("SELECT 1", &session, &FrontendProtocol::TrinoHttp, None)
         .await
         .unwrap();
-    assert_eq!(result, Some(group("team-a-group")));
+    assert_eq!(result, RoutingDecision::Route(group("team-a-group")));
 }
 
 #[tokio::test]
@@ -661,7 +661,7 @@ async fn compound_query_regex_condition() {
         )
         .await
         .unwrap();
-    assert_eq!(result, Some(group("lineitem-group")));
+    assert_eq!(result, RoutingDecision::Route(group("lineitem-group")));
 }
 
 #[tokio::test]
@@ -679,7 +679,7 @@ async fn compound_header_condition_trino_http() {
         .route("SELECT 1", &session, &FrontendProtocol::TrinoHttp, None)
         .await
         .unwrap();
-    assert_eq!(result, Some(group("batch-group")));
+    assert_eq!(result, RoutingDecision::Route(group("batch-group")));
 }
 
 #[tokio::test]
@@ -702,7 +702,7 @@ async fn compound_header_condition_clickhouse_http() {
         )
         .await
         .unwrap();
-    assert_eq!(result, Some(group("olap-group")));
+    assert_eq!(result, RoutingDecision::Route(group("olap-group")));
 }
 
 #[tokio::test]
@@ -723,7 +723,7 @@ async fn compound_user_matches_mysql_session_user() {
         )
         .await
         .unwrap();
-    assert_eq!(result, Some(group("mysql-users")));
+    assert_eq!(result, RoutingDecision::Route(group("mysql-users")));
 }
 
 #[tokio::test]
@@ -741,6 +741,7 @@ async fn compound_user_prefers_auth_context_over_session_header() {
         groups: vec![],
         roles: vec![],
         raw_token: None,
+        ..Default::default()
     };
     let result = router
         .route(
@@ -751,7 +752,7 @@ async fn compound_user_prefers_auth_context_over_session_header() {
         )
         .await
         .unwrap();
-    assert_eq!(result, Some(group("auth-wins")));
+    assert_eq!(result, RoutingDecision::Route(group("auth-wins")));
 }
 
 #[tokio::test]
@@ -772,7 +773,7 @@ async fn compound_protocol_mysql_wire() {
         )
         .await
         .unwrap();
-    assert_eq!(result, Some(group("mysql-only")));
+    assert_eq!(result, RoutingDecision::Route(group("mysql-only")));
 }
 
 #[tokio::test]
@@ -793,7 +794,7 @@ async fn compound_protocol_clickhouse_http() {
         )
         .await
         .unwrap();
-    assert_eq!(result, Some(group("ch-only")));
+    assert_eq!(result, RoutingDecision::Route(group("ch-only")));
 }
 
 #[tokio::test]
@@ -814,7 +815,7 @@ async fn compound_protocol_flight_sql() {
         )
         .await
         .unwrap();
-    assert_eq!(result, Some(group("flight-only")));
+    assert_eq!(result, RoutingDecision::Route(group("flight-only")));
 }
 
 #[tokio::test]
@@ -825,7 +826,7 @@ async fn compound_empty_conditions_never_matches() {
         .route("SELECT 1", &session, &FrontendProtocol::TrinoHttp, None)
         .await
         .unwrap();
-    assert_eq!(result, None);
+    assert_eq!(result, RoutingDecision::NoMatch);
 }
 
 #[tokio::test]
@@ -846,7 +847,7 @@ async fn compound_only_invalid_regex_conditions_never_matches() {
         )
         .await
         .unwrap();
-    assert_eq!(result, None);
+    assert_eq!(result, RoutingDecision::NoMatch);
 }
 
 // ---------------------------------------------------------------------------
@@ -867,7 +868,7 @@ def route(query, ctx):
         .route("SELECT 1", &session, &FrontendProtocol::TrinoHttp, None)
         .await
         .unwrap();
-    assert_eq!(out, Some(group("g-trino")));
+    assert_eq!(out, RoutingDecision::Route(group("g-trino")));
 }
 
 #[tokio::test]
@@ -886,6 +887,7 @@ def route(query, ctx):
         groups: vec!["admins".to_string()],
         roles: vec![],
         raw_token: None,
+        ..Default::default()
     };
     let out = router
         .route(
@@ -896,7 +898,7 @@ def route(query, ctx):
         )
         .await
         .unwrap();
-    assert_eq!(out, Some(group("admin-group")));
+    assert_eq!(out, RoutingDecision::Route(group("admin-group")));
 }
 
 #[tokio::test]
@@ -911,7 +913,7 @@ def route(query, ctx):
         .route("SELECT 1", &session, &FrontendProtocol::TrinoHttp, None)
         .await
         .unwrap();
-    assert_eq!(out, None);
+    assert_eq!(out, RoutingDecision::NoMatch);
 }
 
 // ---------------------------------------------------------------------------
@@ -938,7 +940,7 @@ async fn chain_first_router_matches() {
         .route_with_trace("SELECT 1", &session, &FrontendProtocol::TrinoHttp, None)
         .await
         .unwrap();
-    assert_eq!(result, group("analytics-group"));
+    assert_eq!(result, ChainRouteResult::Routed(group("analytics-group")));
     assert!(!trace.used_fallback);
 }
 
@@ -956,7 +958,7 @@ async fn chain_fallback_when_no_match() {
         .route_with_trace("SELECT 1", &session, &FrontendProtocol::TrinoHttp, None)
         .await
         .unwrap();
-    assert_eq!(result, group("fallback-group"));
+    assert_eq!(result, ChainRouteResult::Routed(group("fallback-group")));
     assert!(trace.used_fallback);
 }
 
@@ -1009,7 +1011,7 @@ async fn chain_second_router_matches() {
         .route_with_trace("SELECT 1", &session, &FrontendProtocol::TrinoHttp, None)
         .await
         .unwrap();
-    assert_eq!(result, group("second-group"));
+    assert_eq!(result, ChainRouteResult::Routed(group("second-group")));
     assert!(!trace.used_fallback);
     assert_eq!(trace.decisions.len(), 2);
     assert!(!trace.decisions[0].matched); // first router missed
@@ -1036,7 +1038,7 @@ async fn chain_short_circuits_after_first_match() {
         .route_with_trace("SELECT 1", &session, &FrontendProtocol::TrinoHttp, None)
         .await
         .unwrap();
-    assert_eq!(result, group("priority-group"));
+    assert_eq!(result, ChainRouteResult::Routed(group("priority-group")));
     assert!(!trace.used_fallback);
     assert_eq!(
         trace.decisions.len(),
@@ -1066,7 +1068,7 @@ async fn chain_regex_then_header_first_wins_on_both_match() {
         .route_with_trace("SELECT 1", &session, &FrontendProtocol::TrinoHttp, None)
         .await
         .unwrap();
-    assert_eq!(result, group("regex-group"));
+    assert_eq!(result, ChainRouteResult::Routed(group("regex-group")));
     assert_eq!(trace.decisions.len(), 1);
     assert!(trace.decisions[0].matched);
 }
@@ -1091,7 +1093,7 @@ async fn chain_regex_miss_then_header_match() {
         .route_with_trace("SELECT 1", &session, &FrontendProtocol::TrinoHttp, None)
         .await
         .unwrap();
-    assert_eq!(result, group("api-group"));
+    assert_eq!(result, ChainRouteResult::Routed(group("api-group")));
     assert_eq!(trace.decisions.len(), 2);
     assert!(!trace.decisions[0].matched);
     assert!(trace.decisions[1].matched);
@@ -1122,8 +1124,44 @@ async fn chain_protocol_based_then_header_fallback() {
         .route_with_trace("SELECT 1", &session, &FrontendProtocol::TrinoHttp, None)
         .await
         .unwrap();
-    assert_eq!(result, group("tenant-acme"));
+    assert_eq!(result, ChainRouteResult::Routed(group("tenant-acme")));
     assert_eq!(trace.decisions.len(), 2);
     assert!(!trace.decisions[0].matched);
     assert!(trace.decisions[1].matched);
+}
+
+#[tokio::test]
+async fn chain_deny_short_circuits_before_later_routers() {
+    use queryflux_core::config::{QueryRegexRule, RegexRouteAction};
+
+    let chain = RouterChain::new(
+        vec![
+            Box::new(QueryRegexRouter::from_rules(vec![QueryRegexRule {
+                regex: r"(?i)^\s*DROP".into(),
+                target_group: None,
+                action: RegexRouteAction::Deny,
+                error: Some("DDL denied".into()),
+            }])),
+            Box::new(HeaderRouter::new(
+                "x-group".to_string(),
+                HashMap::from([("analytics".to_string(), group("analytics-group"))]),
+            )),
+        ],
+        group("fallback-group"),
+    );
+    let session = trino_session(&[("x-group", "analytics")]);
+    let (result, trace) = chain
+        .route_with_trace("DROP TABLE t", &session, &FrontendProtocol::TrinoHttp, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        result,
+        ChainRouteResult::Denied {
+            message: "DDL denied".into()
+        }
+    );
+    assert_eq!(trace.denied.as_deref(), Some("DDL denied"));
+    assert!(trace.final_group.is_empty());
+    assert_eq!(trace.decisions.len(), 1);
+    assert!(trace.decisions[0].matched);
 }

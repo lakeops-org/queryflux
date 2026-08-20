@@ -7,10 +7,10 @@ pub mod resolver;
 
 pub use admin_credentials::AdminCredentialsManager;
 pub use authorization::{
-    AllowAllAuthorization, AuthorizationChecker, OpenFgaAuthorizationClient,
-    SimpleAuthorizationPolicy,
+    allow_query_action, is_query_owner, AllowAllAuthorization, AuthorizationChecker,
+    OpenFgaAuthorizationClient, OperatorPolicy, QueryAction, QueryAuthz, SimpleAuthorizationPolicy,
 };
-pub use credentials::{AuthContext, Credentials, QueryCredentials};
+pub use credentials::{require_query_owner, AuthContext, Credentials, QueryCredentials};
 pub use ldap::LdapAuthProvider;
 pub use provider::{AuthProvider, NoneAuthProvider, OidcAuthProvider, StaticAuthProvider};
 pub use resolver::BackendIdentityResolver;

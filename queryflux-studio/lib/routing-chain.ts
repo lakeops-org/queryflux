@@ -22,7 +22,16 @@ export type ChainItem =
       tagValue: string;
       targetGroupId: number | null;
     }
-  | { id: string; kind: "regex"; regex: string; targetGroupId: number | null }
+  | {
+      id: string;
+      kind: "regex";
+      regex: string;
+      /** `route` (default) or `deny`. */
+      action: "route" | "deny";
+      /** Client-visible message when action is deny. */
+      error: string;
+      targetGroupId: number | null;
+    }
   | {
       id: string;
       kind: "compound";
@@ -152,14 +161,19 @@ export function routersToChainItems(
       case "queryRegex": {
         for (const rule of router.rules ?? []) {
           if (!rule || typeof rule !== "object" || !("regex" in rule)) continue;
+          const action = rule.action === "deny" ? "deny" : "route";
           const tgName = rule.targetGroup ?? rule.target_group;
           const gid =
-            (typeof rule.targetGroupId === "number" ? rule.targetGroupId : undefined) ??
-            cellToGroupId(tgName, byName);
+            action === "deny"
+              ? null
+              : (typeof rule.targetGroupId === "number" ? rule.targetGroupId : undefined) ??
+                cellToGroupId(tgName, byName);
           out.push({
             id: uid(),
             kind: "regex",
             regex: rule.regex,
+            action,
+            error: typeof rule.error === "string" ? rule.error : "",
             targetGroupId: gid,
           });
         }
@@ -260,6 +274,19 @@ export function chainItemsToRouters(items: ChainItem[]): RouterConfigEntry[] {
         break;
       }
       case "regex": {
+        if (item.action === "deny") {
+          result.push({
+            type: "queryRegex",
+            rules: [
+              {
+                regex: item.regex,
+                action: "deny",
+                ...(item.error.trim() !== "" ? { error: item.error.trim() } : {}),
+              },
+            ],
+          });
+          break;
+        }
         if (item.targetGroupId == null) continue;
         result.push({
           type: "queryRegex",

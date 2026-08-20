@@ -1,8 +1,6 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use aws_sdk_sts;
-
 use arrow::array::{
     ArrayRef, BooleanBuilder, Float32Builder, Float64Builder, Int64Builder, StringBuilder,
 };
@@ -22,7 +20,7 @@ use queryflux_core::{
 };
 use tracing::warn;
 
-use crate::{AdapterKind, AsyncAdapter};
+use crate::{AdapterKind, AsyncAdapter, BackendQueryIdSlot};
 
 /// Parsed and validated configuration for an Athena cluster.
 pub struct AthenaConfig {
@@ -30,7 +28,38 @@ pub struct AthenaConfig {
     pub s3_output_location: String,
     pub workgroup: Option<String>,
     pub catalog: Option<String>,
+    /// Max seconds to poll for query completion before `StopQueryExecution`.
+    pub max_wait_secs: u64,
     pub auth: Option<ClusterAuth>,
+}
+
+/// Default proxy-side wait for Athena completion (`maxWaitSecs`).
+pub const DEFAULT_ATHENA_MAX_WAIT_SECS: u64 = 600;
+const ATHENA_POLL_INTERVAL: Duration = Duration::from_millis(500);
+/// Bound for best-effort `StopQueryExecution` after the main wait deadline expires.
+const ATHENA_STOP_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Parse optional `maxWaitSecs` (positive integer seconds). Defaults to
+/// [`DEFAULT_ATHENA_MAX_WAIT_SECS`].
+fn parse_max_wait_secs_from_json(json: &serde_json::Value, cluster_name: &str) -> Result<u64> {
+    match json.get("maxWaitSecs") {
+        None => Ok(DEFAULT_ATHENA_MAX_WAIT_SECS),
+        Some(v) => v.as_u64().filter(|&n| n >= 1).ok_or_else(|| {
+            QueryFluxError::Engine(format!(
+                "cluster '{cluster_name}': maxWaitSecs must be a positive integer"
+            ))
+        }),
+    }
+}
+
+fn resolve_max_wait_secs(raw: Option<u64>, cluster_name: &str) -> Result<u64> {
+    match raw {
+        None => Ok(DEFAULT_ATHENA_MAX_WAIT_SECS),
+        Some(n) if n >= 1 => Ok(n),
+        Some(_) => Err(QueryFluxError::Engine(format!(
+            "cluster '{cluster_name}': maxWaitSecs must be a positive integer"
+        ))),
+    }
 }
 
 impl crate::EngineConfigParseable for AthenaConfig {
@@ -67,6 +96,7 @@ impl crate::EngineConfigParseable for AthenaConfig {
             s3_output_location,
             workgroup: json_str(json, "workgroup"),
             catalog: json_str(json, "catalog"),
+            max_wait_secs: parse_max_wait_secs_from_json(json, cluster_name)?,
             auth,
         })
     }
@@ -98,6 +128,7 @@ impl crate::EngineConfigParseable for AthenaConfig {
             s3_output_location,
             workgroup: cfg.workgroup.clone(),
             catalog: cfg.catalog.clone(),
+            max_wait_secs: resolve_max_wait_secs(cfg.max_wait_secs, cluster_name)?,
             auth,
         })
     }
@@ -132,7 +163,8 @@ use queryflux_core::engine_registry::{
 ///
 /// Auth: set `auth.type: accessKey` for static credentials. When omitted the default
 /// AWS credential chain is used (env vars `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`,
-/// ECS task role, EC2 instance profile, etc.).
+/// ECS task role, EC2 instance profile, etc.). RoleArn auth uses a refreshing
+/// `AssumeRoleProvider` so temporary STS credentials renew before expiry.
 pub struct AthenaAdapter {
     pub cluster_name: ClusterName,
     pub group_name: ClusterGroupName,
@@ -142,6 +174,8 @@ pub struct AthenaAdapter {
     workgroup: String,
     /// Default Glue catalog. Defaults to `AwsDataCatalog`.
     catalog: String,
+    /// Proxy-side max wait for completion (`maxWaitSecs`).
+    max_wait: Duration,
 }
 
 impl AthenaAdapter {
@@ -181,37 +215,23 @@ impl AthenaAdapter {
                 role_arn,
                 external_id,
             }) => {
-                // First load the base config from the default credential chain,
-                // then use STS AssumeRole to obtain temporary credentials.
+                // Refreshing AssumeRole provider: temporary STS credentials expire
+                // (default 1h). A one-shot AssumeRole left the Athena client with
+                // static creds that never refreshed.
                 let base_config = aws_config::defaults(BehaviorVersion::latest())
                     .region(aws_region.clone())
                     .load()
                     .await;
-                let sts_client = aws_sdk_sts::Client::new(&base_config);
-                let mut assume = sts_client
-                    .assume_role()
-                    .role_arn(&role_arn)
-                    .role_session_name("queryflux-session");
+                let mut role_builder = aws_config::sts::AssumeRoleProvider::builder(&role_arn)
+                    .session_name("queryflux-session")
+                    .configure(&base_config);
                 if let Some(eid) = external_id {
-                    assume = assume.external_id(eid);
+                    role_builder = role_builder.external_id(eid);
                 }
-                let resp = assume
-                    .send()
-                    .await
-                    .map_err(|e| QueryFluxError::Engine(format!("STS AssumeRole failed: {e}")))?;
-                let creds_resp = resp.credentials().ok_or_else(|| {
-                    QueryFluxError::Engine("STS returned no credentials".to_string())
-                })?;
-                let creds = Credentials::new(
-                    creds_resp.access_key_id(),
-                    creds_resp.secret_access_key(),
-                    Some(creds_resp.session_token().to_string()),
-                    None,
-                    "queryflux-role-arn",
-                );
+                let provider = role_builder.build().await;
                 aws_config::defaults(BehaviorVersion::latest())
                     .region(aws_region.clone())
-                    .credentials_provider(creds)
+                    .credentials_provider(provider)
                     .load()
                     .await
             }
@@ -242,22 +262,72 @@ impl AthenaAdapter {
             catalog: config
                 .catalog
                 .unwrap_or_else(|| "AwsDataCatalog".to_string()),
+            max_wait: Duration::from_secs(config.max_wait_secs),
         })
     }
 
+    async fn stop_query_best_effort(&self, execution_id: &str) {
+        let stop = self
+            .client
+            .stop_query_execution()
+            .query_execution_id(execution_id)
+            .send();
+        match tokio::time::timeout(ATHENA_STOP_TIMEOUT, stop).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => {
+                warn!(
+                    execution_id = %execution_id,
+                    error = %aws_err(&e),
+                    "Athena StopQueryExecution failed (ignored)"
+                );
+            }
+            Err(_) => {
+                warn!(
+                    execution_id = %execution_id,
+                    "Athena StopQueryExecution timed out (ignored)"
+                );
+            }
+        }
+    }
+
     /// Poll until the given query execution reaches a terminal state.
-    /// Returns `Ok(())` on success, `Err` on failure or cancellation.
+    /// Returns `Ok(())` on success, `Err` on failure, cancellation, or timeout.
+    ///
+    /// Athena workgroups may enforce their own runtime limits; `maxWaitSecs`
+    /// also stops the proxy from looping forever if status stays non-terminal,
+    /// and issues `StopQueryExecution` on timeout.
     async fn wait_for_completion(&self, execution_id: &str) -> Result<()> {
+        let deadline = tokio::time::Instant::now() + self.max_wait;
         loop {
-            let resp = self
+            if tokio::time::Instant::now() >= deadline {
+                self.stop_query_best_effort(execution_id).await;
+                return Err(QueryFluxError::Engine(format!(
+                    "Athena query {execution_id} exceeded max wait of {}s",
+                    self.max_wait.as_secs()
+                )));
+            }
+
+            let get = self
                 .client
                 .get_query_execution()
                 .query_execution_id(execution_id)
-                .send()
-                .await
-                .map_err(|e| {
-                    QueryFluxError::Engine(format!("Athena GetQueryExecution: {}", aws_err(&e)))
-                })?;
+                .send();
+            let resp = match tokio::time::timeout_at(deadline, get).await {
+                Ok(Ok(resp)) => resp,
+                Ok(Err(e)) => {
+                    return Err(QueryFluxError::Engine(format!(
+                        "Athena GetQueryExecution: {}",
+                        aws_err(&e)
+                    )));
+                }
+                Err(_) => {
+                    self.stop_query_best_effort(execution_id).await;
+                    return Err(QueryFluxError::Engine(format!(
+                        "Athena query {execution_id} exceeded max wait of {}s",
+                        self.max_wait.as_secs()
+                    )));
+                }
+            };
 
             let state = resp
                 .query_execution()
@@ -284,52 +354,75 @@ impl AthenaAdapter {
                         "Athena query was cancelled".to_string(),
                     ));
                 }
-                _ => tokio::time::sleep(Duration::from_millis(500)).await,
+                _ => {
+                    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                    let sleep_for = ATHENA_POLL_INTERVAL.min(remaining);
+                    if sleep_for.is_zero() {
+                        continue;
+                    }
+                    tokio::time::sleep(sleep_for).await;
+                }
             }
         }
     }
 
-    /// Fetch all pages of `GetQueryResults` and return (column_names, column_types, data_rows).
-    /// The first row returned by Athena is always the header row — we skip it.
-    async fn fetch_all_results(
-        &self,
-        execution_id: &str,
-    ) -> Result<(Vec<String>, Vec<String>, Vec<Vec<Option<String>>>)> {
+    /// Stream `GetQueryResults` pages as Arrow RecordBatches (one batch per API page).
+    async fn stream_results(
+        client: aws_sdk_athena::Client,
+        execution_id: String,
+        batch_tx: tokio::sync::mpsc::Sender<Result<RecordBatch>>,
+        stats_tx: tokio::sync::oneshot::Sender<Option<queryflux_core::query::QueryEngineStats>>,
+    ) {
         let mut col_names: Vec<String> = Vec::new();
         let mut col_types: Vec<String> = Vec::new();
-        let mut all_rows: Vec<Vec<Option<String>>> = Vec::new();
+        let mut schema: Option<Arc<ArrowSchema>> = None;
         let mut next_token: Option<String> = None;
         let mut first_page = true;
+        let mut sent_any = false;
 
         loop {
-            let mut req = self
-                .client
-                .get_query_results()
-                .query_execution_id(execution_id);
-            if let Some(t) = next_token {
-                req = req.next_token(t);
+            let mut req = client.get_query_results().query_execution_id(&execution_id);
+            if let Some(ref t) = next_token {
+                req = req.next_token(t.clone());
             }
-            let resp = req.send().await.map_err(|e| {
-                QueryFluxError::Engine(format!("Athena GetQueryResults: {}", aws_err(&e)))
-            })?;
+            let resp = match req.send().await {
+                Ok(r) => r,
+                Err(e) => {
+                    let _ = batch_tx
+                        .send(Err(QueryFluxError::Engine(format!(
+                            "Athena GetQueryResults: {}",
+                            aws_err(&e)
+                        ))))
+                        .await;
+                    let _ = stats_tx.send(None);
+                    return;
+                }
+            };
 
-            let result_set = resp.result_set();
-
-            // Extract column metadata from the first page only.
             if first_page {
-                if let Some(meta) = result_set.and_then(|rs| rs.result_set_metadata()) {
+                if let Some(meta) = resp.result_set().and_then(|rs| rs.result_set_metadata()) {
                     for col in meta.column_info() {
                         col_names.push(col.name().to_string());
                         col_types.push(col.r#type().to_string());
                     }
                 }
                 first_page = false;
+                if col_names.is_empty() {
+                    let _ = stats_tx.send(None);
+                    return;
+                }
+                let fields: Vec<Field> = col_names
+                    .iter()
+                    .zip(col_types.iter())
+                    .map(|(name, ty)| Field::new(name, athena_type_to_arrow(ty), true))
+                    .collect();
+                schema = Some(Arc::new(ArrowSchema::new(fields)));
             }
 
-            if let Some(rs) = result_set {
+            let mut page_rows: Vec<Vec<Option<String>>> = Vec::new();
+            if let Some(rs) = resp.result_set() {
                 for (row_idx, row) in rs.rows().iter().enumerate() {
-                    // Athena always puts the header as the first row of the first page.
-                    if row_idx == 0 && all_rows.is_empty() {
+                    if !sent_any && row_idx == 0 {
                         continue;
                     }
                     let cells: Vec<Option<String>> = row
@@ -337,7 +430,26 @@ impl AthenaAdapter {
                         .iter()
                         .map(|d| d.var_char_value().map(|s| s.to_string()))
                         .collect();
-                    all_rows.push(cells);
+                    page_rows.push(cells);
+                }
+            }
+
+            if let Some(ref schema) = schema {
+                if !page_rows.is_empty() {
+                    match rows_to_record_batch(schema, &page_rows) {
+                        Ok(batch) => {
+                            sent_any = true;
+                            if batch_tx.send(Ok(batch)).await.is_err() {
+                                let _ = stats_tx.send(None);
+                                return;
+                            }
+                        }
+                        Err(e) => {
+                            let _ = batch_tx.send(Err(e)).await;
+                            let _ = stats_tx.send(None);
+                            return;
+                        }
+                    }
                 }
             }
 
@@ -347,7 +459,14 @@ impl AthenaAdapter {
             }
         }
 
-        Ok((col_names, col_types, all_rows))
+        if !sent_any {
+            if let Some(schema) = schema {
+                let batch = RecordBatch::new_empty(schema);
+                let _ = batch_tx.send(Ok(batch)).await;
+            }
+        }
+
+        let _ = stats_tx.send(None);
     }
 }
 
@@ -370,13 +489,18 @@ impl AsyncAdapter for AthenaAdapter {
         &self,
         _backend_id: &BackendQueryId,
         _poll_token: Option<&str>,
+        _wire_auth: Option<&queryflux_core::query::StoredWireAuth>,
     ) -> Result<QueryPollResult> {
         Err(QueryFluxError::Engine(
             "Athena does not support async polling via this interface".to_string(),
         ))
     }
 
-    async fn cancel_query(&self, backend_id: &BackendQueryId) -> Result<()> {
+    async fn cancel_query(
+        &self,
+        backend_id: &BackendQueryId,
+        _wire_auth: Option<&queryflux_core::query::StoredWireAuth>,
+    ) -> Result<()> {
         let _ = self
             .client
             .stop_query_execution()
@@ -393,9 +517,10 @@ impl AsyncAdapter for AthenaAdapter {
         _credentials: &queryflux_auth::QueryCredentials,
         _tags: &queryflux_core::tags::QueryTags,
         params: &queryflux_core::params::QueryParams,
+        id_slot: &BackendQueryIdSlot,
     ) -> crate::Result<crate::SyncExecution> {
         use crate::SyncExecution;
-        use futures::stream;
+        use tokio_stream::wrappers::ReceiverStream;
 
         let ctx = aws_sdk_athena::types::QueryExecutionContext::builder()
             .catalog(&self.catalog)
@@ -429,40 +554,20 @@ impl AsyncAdapter for AthenaAdapter {
             .query_execution_id()
             .ok_or_else(|| QueryFluxError::Engine("Athena returned no execution ID".to_string()))?
             .to_string();
+        id_slot.publish(execution_id.clone());
 
         self.wait_for_completion(&execution_id).await?;
 
-        let (col_names, col_types, rows) = self.fetch_all_results(&execution_id).await?;
+        let (batch_tx, batch_rx) = tokio::sync::mpsc::channel::<Result<RecordBatch>>(8);
+        let (stats_tx, stats_rx) = tokio::sync::oneshot::channel();
+        let client = self.client.clone();
+        tokio::spawn(async move {
+            AthenaAdapter::stream_results(client, execution_id, batch_tx, stats_tx).await;
+        });
 
-        let (tx, rx) = tokio::sync::oneshot::channel();
-
-        if col_names.is_empty() {
-            let _ = tx.send(None);
-            return Ok(SyncExecution {
-                stream: Box::pin(stream::empty()),
-                stats: rx,
-            });
-        }
-
-        let fields: Vec<Field> = col_names
-            .iter()
-            .zip(col_types.iter())
-            .map(|(name, ty)| Field::new(name, athena_type_to_arrow(ty), true))
-            .collect();
-        let schema = Arc::new(ArrowSchema::new(fields));
-
-        let mut columns: Vec<ArrayRef> = Vec::with_capacity(schema.fields().len());
-        for (col_idx, field) in schema.fields().iter().enumerate() {
-            columns.push(build_column(field.data_type(), &rows, col_idx)?);
-        }
-
-        let batch = RecordBatch::try_new(schema, columns)
-            .map_err(|e| QueryFluxError::Engine(format!("Athena RecordBatch failed: {e}")))?;
-
-        let _ = tx.send(None);
         Ok(SyncExecution {
-            stream: Box::pin(stream::iter(std::iter::once(Ok(batch)))),
-            stats: rx,
+            stream: Box::pin(ReceiverStream::new(batch_rx)),
+            stats: stats_rx,
         })
     }
 
@@ -659,6 +764,18 @@ fn athena_type_to_arrow(athena_type: &str) -> DataType {
     }
 }
 
+fn rows_to_record_batch(
+    schema: &Arc<ArrowSchema>,
+    rows: &[Vec<Option<String>>],
+) -> Result<RecordBatch> {
+    let mut columns: Vec<ArrayRef> = Vec::with_capacity(schema.fields().len());
+    for (col_idx, field) in schema.fields().iter().enumerate() {
+        columns.push(build_column(field.data_type(), rows, col_idx)?);
+    }
+    RecordBatch::try_new(Arc::clone(schema), columns)
+        .map_err(|e| QueryFluxError::Engine(format!("Athena RecordBatch failed: {e}")))
+}
+
 fn build_column(dt: &DataType, rows: &[Vec<Option<String>>], col_idx: usize) -> Result<ArrayRef> {
     match dt {
         DataType::Boolean => {
@@ -774,6 +891,14 @@ impl AthenaAdapter {
                     field_type: FieldType::Text,
                     required: false,
                     example: Some("AwsDataCatalog"),
+                },
+                ConfigField {
+                    key: "maxWaitSecs",
+                    label: "Max wait (seconds)",
+                    description: "Max seconds QueryFlux polls Athena before cancelling the query. Defaults to 600 (10 minutes).",
+                    field_type: FieldType::Number,
+                    required: false,
+                    example: Some("600"),
                 },
                 ConfigField {
                     key: "auth.type",
@@ -903,5 +1028,86 @@ mod tests {
     #[test]
     fn null_emits_null_string() {
         assert_eq!(query_param_to_athena_string(&QueryParam::Null), "NULL");
+    }
+
+    #[test]
+    fn wait_for_completion_bound_defaults_to_ten_minutes() {
+        assert_eq!(DEFAULT_ATHENA_MAX_WAIT_SECS, 600);
+        assert_eq!(ATHENA_POLL_INTERVAL, Duration::from_millis(500));
+        assert!(ATHENA_POLL_INTERVAL < Duration::from_secs(DEFAULT_ATHENA_MAX_WAIT_SECS));
+    }
+
+    #[test]
+    fn max_wait_secs_parses_from_json() {
+        use crate::EngineConfigParseable;
+        use serde_json::json;
+
+        let cfg = AthenaConfig::from_json(
+            &json!({
+                "region": "us-east-1",
+                "s3OutputLocation": "s3://bucket/results/"
+            }),
+            "athena-1",
+        )
+        .expect("defaults");
+        assert_eq!(cfg.max_wait_secs, DEFAULT_ATHENA_MAX_WAIT_SECS);
+
+        let cfg = AthenaConfig::from_json(
+            &json!({
+                "region": "us-east-1",
+                "s3OutputLocation": "s3://bucket/results/",
+                "maxWaitSecs": 120
+            }),
+            "athena-1",
+        )
+        .expect("override");
+        assert_eq!(cfg.max_wait_secs, 120);
+
+        for bad in [json!(0), json!(-1), json!("600"), json!(null)] {
+            let err = AthenaConfig::from_json(
+                &json!({
+                    "region": "us-east-1",
+                    "s3OutputLocation": "s3://bucket/results/",
+                    "maxWaitSecs": bad
+                }),
+                "athena-1",
+            )
+            .map(|_| ())
+            .unwrap_err();
+            assert!(err.to_string().contains("maxWaitSecs"));
+        }
+    }
+
+    #[test]
+    fn rows_to_record_batch_builds_typed_columns() {
+        use arrow::array::{Array, AsArray};
+        use arrow::datatypes::{DataType, Field, Int64Type, Schema as ArrowSchema};
+
+        let fields = vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("name", DataType::Utf8, true),
+        ];
+        let schema = Arc::new(ArrowSchema::new(fields));
+        let rows = vec![
+            vec![Some("1".into()), Some("alice".into())],
+            vec![Some("2".into()), None],
+        ];
+        let batch = rows_to_record_batch(&schema, &rows).expect("batch");
+        assert_eq!(batch.num_rows(), 2);
+        let ids = batch.column(0).as_primitive::<Int64Type>();
+        assert_eq!(ids.value(0), 1);
+        assert_eq!(ids.value(1), 2);
+        let names = batch.column(1).as_string::<i32>();
+        assert_eq!(names.value(0), "alice");
+        assert!(names.is_null(1));
+    }
+
+    #[test]
+    fn rows_to_record_batch_empty_yields_zero_rows() {
+        let fields = vec![Field::new("x", DataType::Utf8, true)];
+        let schema = Arc::new(ArrowSchema::new(fields));
+        let batch = rows_to_record_batch(&schema, &[]).expect("batch");
+        assert_eq!(batch.num_rows(), 0);
+        assert_eq!(batch.num_columns(), 1);
     }
 }

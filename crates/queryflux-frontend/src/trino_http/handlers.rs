@@ -9,7 +9,7 @@ use axum::{
 };
 use bytes::Bytes;
 use chrono::Utc;
-use queryflux_auth::Credentials;
+use queryflux_auth::{Credentials, QueryAction, QueryAuthz};
 use queryflux_core::{
     error::QueryFluxError,
     query::{BackendQueryId, FrontendProtocol, ProxyQueryId, QueryPollResult, QueryStatus},
@@ -25,6 +25,101 @@ use tracing::{error, info, warn};
 use super::result_sink::TrinoHttpResultSink;
 use crate::dispatch::{dispatch_query, execute_to_sink, rewrite_trino_uri, DispatchOutcome};
 use crate::state::{AppState, QueryContext, QueryOutcome};
+use queryflux_persistence::QueueCoordinator;
+use queryflux_routing::ChainRouteResult;
+
+/// Stale-claim cutoff. Heartbeats must run more often than this while dispatch
+/// is in progress so a slow submit cannot look like a crashed replica.
+const QUEUE_CLAIM_TIMEOUT_SECS: i64 = 60;
+const QUEUE_CLAIM_HEARTBEAT_SECS: u64 = 15;
+
+/// Refreshes `claimed_at` until dropped so another replica cannot take over.
+struct QueueClaimHeartbeat {
+    stop: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+impl QueueClaimHeartbeat {
+    fn start(qc: Arc<dyn QueueCoordinator>, query_id: String, instance_id: String) -> Self {
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let mut interval =
+                tokio::time::interval(Duration::from_secs(QUEUE_CLAIM_HEARTBEAT_SECS));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            interval.tick().await;
+            loop {
+                tokio::select! {
+                    _ = &mut rx => break,
+                    _ = interval.tick() => {
+                        match qc.refresh_claim(&query_id, &instance_id).await {
+                            Ok(true) => {}
+                            Ok(false) => {
+                                warn!(id = %query_id, "Queue claim lost during dispatch");
+                                break;
+                            }
+                            Err(e) => {
+                                warn!(id = %query_id, "Queue claim refresh failed: {e}");
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        Self { stop: Some(tx) }
+    }
+}
+
+impl Drop for QueueClaimHeartbeat {
+    fn drop(&mut self) {
+        if let Some(tx) = self.stop.take() {
+            let _ = tx.send(());
+        }
+    }
+}
+
+async fn allow_query_action_or_forbid(
+    state: &AppState,
+    auth_ctx: &queryflux_auth::AuthContext,
+    action: QueryAction,
+    submitted_by: &str,
+    group: &str,
+) -> Option<Response<Body>> {
+    let authz = state.live.read().await.authorization.clone();
+    let query = QueryAuthz {
+        submitted_by: submitted_by.to_string(),
+        group: group.to_string(),
+    };
+    if authz.check_query(auth_ctx, action, &query).await {
+        return None;
+    }
+    warn!(
+        action = ?action,
+        user = %auth_ctx.user,
+        owner = %submitted_by,
+        group,
+        "Query action denied"
+    );
+    Some(StatusCode::FORBIDDEN.into_response())
+}
+
+/// Restore backend auth stripped from persisted queued sessions.
+///
+/// Called only after the dequeue caller is verified as the query owner.
+fn session_for_queued_dispatch(
+    mut session: SessionContext,
+    headers: &HeaderMap,
+    auth_ctx: &queryflux_auth::AuthContext,
+) -> SessionContext {
+    if let Some(v) = headers.get("authorization").and_then(|h| h.to_str().ok()) {
+        session
+            .extra
+            .insert("authorization".to_string(), v.to_string());
+    } else if let Some(token) = &auth_ctx.raw_token {
+        session
+            .extra
+            .insert("authorization".to_string(), format!("Bearer {token}"));
+    }
+    session
+}
 
 fn trino_error_response(query_id: &str, message: &str) -> Response<Body> {
     let resp = queryflux_engine_adapters::trino::api::TrinoResponse {
@@ -63,7 +158,14 @@ fn client_safe_message(e: &QueryFluxError) -> &'static str {
         Engine(_) => "Backend engine error",
         Routing(_) | NoClusterGroupAvailable(_) => "Query routing failed",
         Config(_) => "Configuration error",
-        Auth(_) | Unauthorized(_) | QueryNotFound(_) | ClusterNotFound(_) => "",
+        // Empty → caller forwards Display (QueueFull / CapacityWaitTimeout detail).
+        Auth(_)
+        | Unauthorized(_)
+        | QueryNotFound(_)
+        | ClusterNotFound(_)
+        | Denied(_)
+        | QueueFull { .. }
+        | CapacityWaitTimeout { .. } => "",
         _ => "Internal error",
     }
 }
@@ -395,11 +497,6 @@ pub async fn post_statement(
     // Intercept SET SESSION query_tags/query_tag before routing to backend.
     // Trino doesn't know these properties; QueryFlux handles them locally and
     // returns X-Trino-Set-Session so the CLI carries the value in subsequent requests.
-    if let Some((prop_key, prop_val)) = try_parse_set_session_tags(&sql) {
-        let query_id = ProxyQueryId::new();
-        return set_session_response(&query_id.0, &prop_key, &prop_val).into_response();
-    }
-
     let session = extract_session(&headers);
     let protocol = FrontendProtocol::TrinoHttp;
 
@@ -409,10 +506,20 @@ pub async fn post_statement(
     let auth_ctx = match auth_provider.authenticate(&creds).await {
         Ok(ctx) => ctx,
         Err(e) => {
+            state
+                .metrics
+                .on_auth_failure(&format!("{:?}", FrontendProtocol::TrinoHttp));
             warn!("Authentication failed: {e}");
             return StatusCode::UNAUTHORIZED.into_response();
         }
     };
+
+    // Auth-complete fast path: `SET SESSION query_tag(s)` is handled locally by QueryFlux,
+    // but must still require authentication when `auth.required=true`.
+    if let Some((prop_key, prop_val)) = try_parse_set_session_tags(&sql) {
+        let query_id = ProxyQueryId::new();
+        return set_session_response(&query_id.0, &prop_key, &prop_val).into_response();
+    }
 
     // 2. Route — first matching router wins.
     // `route_with_trace` is CPU-bound (regex match, header lookup); holding the read lock
@@ -423,7 +530,7 @@ pub async fn post_statement(
             .route_with_trace(&sql, &session, &protocol, Some(&auth_ctx))
             .await
     };
-    let (group, _trace) = match routing_result {
+    let (chain_result, mut routing_trace) = match routing_result {
         Ok(r) => r,
         Err(e) => {
             warn!("Routing error: {e}");
@@ -436,6 +543,31 @@ pub async fn post_statement(
                 safe
             };
             return trino_error_response(&tmp_id.0, msg).into_response();
+        }
+    };
+    let mut group = match chain_result {
+        ChainRouteResult::Routed(g) => g,
+        ChainRouteResult::Denied { message } => {
+            warn!(%message, user = %auth_ctx.user, "Query denied by routing rule");
+            let query_id =
+                state.record_routing_deny(&sql, &session, protocol, &message, Some(routing_trace));
+            return trino_error_response(&query_id.0, &message).into_response();
+        }
+    };
+    group = match state
+        .resolve_routed_group(group, &mut routing_trace, &auth_ctx)
+        .await
+    {
+        Ok(g) => g,
+        Err(QueryFluxError::Unauthorized(msg)) => {
+            warn!(user = %auth_ctx.user, "{msg}");
+            let tmp_id = ProxyQueryId::new();
+            return trino_error_response(&tmp_id.0, &msg).into_response();
+        }
+        Err(e) => {
+            warn!("Routing resolution error: {e}");
+            let tmp_id = ProxyQueryId::new();
+            return trino_error_response(&tmp_id.0, &e.to_string()).into_response();
         }
     };
 
@@ -627,6 +759,9 @@ pub async fn get_queued_statement(
     let auth_ctx = match auth_provider.authenticate(&creds).await {
         Ok(ctx) => ctx,
         Err(e) => {
+            state
+                .metrics
+                .on_auth_failure(&format!("{:?}", FrontendProtocol::TrinoHttp));
             warn!("Queued poll auth failed: {e}");
             return StatusCode::UNAUTHORIZED.into_response();
         }
@@ -634,21 +769,75 @@ pub async fn get_queued_statement(
 
     let query_id = ProxyQueryId(id);
 
+    // Load first so we can reject a non-owner *before* taking a distributed
+    // claim (otherwise an attacker could pin the row for the claim TTL).
+    let queued = match state.persistence.get_queued(&query_id).await {
+        Ok(Some(q)) => q,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(e) => {
+            warn!("Persistence error: {e}");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+
+    // Fail on wall-clock wait from enqueue (`creation_time`), not `last_accessed`
+    // (polls refresh last_accessed and would otherwise wait forever).
+    let wait_timeout_secs = {
+        let live = state.live.read().await;
+        live.group_capacity_wait_timeout_secs
+            .get(&queued.cluster_group.0)
+            .copied()
+            .unwrap_or(queryflux_core::config::DEFAULT_CAPACITY_WAIT_TIMEOUT_SECS)
+    };
+    let waited_secs = (Utc::now() - queued.creation_time).num_seconds().max(0) as u64;
+    if waited_secs >= wait_timeout_secs {
+        let err = QueryFluxError::CapacityWaitTimeout {
+            group: queued.cluster_group.0.clone(),
+            timeout_secs: wait_timeout_secs,
+        };
+        if let Ok(Some(taken)) = state.persistence.take_queued(&query_id).await {
+            state.record_queued_terminal(&taken, QueryStatus::Failed, &err.to_string());
+        }
+        if let Some(qc) = &state.queue_coordinator {
+            let _ = qc.release_claim(&query_id.0).await;
+        }
+        return trino_error_response(&query_id.0, &err.to_string()).into_response();
+    }
+
+    if let Some(resp) = allow_query_action_or_forbid(
+        &state,
+        &auth_ctx,
+        QueryAction::Dequeue,
+        &queued.submitted_by,
+        &queued.cluster_group.0,
+    )
+    .await
+    {
+        return resp;
+    }
+
     // In distributed mode, try to claim ownership of this queued query so only
     // one replica dispatches it. If another replica already claimed it, return
     // a "still queued" response and let the client poll again.
     //
     // Claims are held only for the duration of one dispatch attempt. A claim
     // older than the timeout means the claiming replica crashed mid-dispatch,
-    // so it is treated as abandoned and taken over.
-    const QUEUE_CLAIM_TIMEOUT_SECS: i64 = 60;
+    // so it is treated as abandoned and taken over. Heartbeat while dispatch
+    // runs so a slow submit cannot look like a crash.
+    let mut claim_heartbeat = None;
     if let Some(qc) = &state.queue_coordinator {
         let stale_before = chrono::Utc::now() - chrono::Duration::seconds(QUEUE_CLAIM_TIMEOUT_SECS);
         match qc
             .try_claim(&query_id.0, &state.instance_id, stale_before)
             .await
         {
-            Ok(Some(_)) => {} // claimed successfully, proceed with dispatch
+            Ok(Some(_)) => {
+                claim_heartbeat = Some(QueueClaimHeartbeat::start(
+                    qc.clone(),
+                    query_id.0.clone(),
+                    state.instance_id.clone(),
+                ));
+            }
             Ok(None) => {
                 // `None` means either claimed by another replica or the row no
                 // longer exists (finished/cleaned up). Distinguish them: a
@@ -710,15 +899,7 @@ pub async fn get_queued_statement(
             }
         }
     }
-
-    let queued = match state.persistence.get_queued(&query_id).await {
-        Ok(Some(q)) => q,
-        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
-        Err(e) => {
-            warn!("Persistence error: {e}");
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-        }
-    };
+    let _claim_heartbeat = claim_heartbeat;
 
     if let Err(e) = state
         .persistence
@@ -731,7 +912,7 @@ pub async fn get_queued_statement(
     queued_backoff_delay(seq).await;
 
     let sql = queued.sql.clone();
-    let session = queued.session.clone();
+    let session = session_for_queued_dispatch(queued.session.clone(), &headers, &auth_ctx);
     let protocol = queued.frontend_protocol.clone();
     let group = queued.cluster_group.clone();
 
@@ -744,6 +925,21 @@ pub async fn get_queued_statement(
             }
         }
     };
+
+    // Admin cancel deletes the queued row. Abort if it disappeared after claim
+    // so dequeue cannot dispatch a query that already returned 204.
+    match state.persistence.get_queued(&query_id).await {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            release_claim(&state, &query_id.0).await;
+            return StatusCode::NOT_FOUND.into_response();
+        }
+        Err(e) => {
+            warn!("Persistence error re-checking queued query before dispatch: {e}");
+            release_claim(&state, &query_id.0).await;
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    }
 
     let use_cache_path = {
         let live = state.live.read().await;
@@ -854,6 +1050,9 @@ pub async fn get_executing_statement(
     let auth_ctx = match auth_provider.authenticate(&creds).await {
         Ok(ctx) => ctx,
         Err(e) => {
+            state
+                .metrics
+                .on_auth_failure(&format!("{:?}", FrontendProtocol::TrinoHttp));
             warn!("Poll auth failed: {e}");
             return StatusCode::UNAUTHORIZED.into_response();
         }
@@ -883,13 +1082,16 @@ pub async fn get_executing_statement(
         }
     };
 
-    // TODO: verify query ownership once submitter_user is stored in ExecutingQuery
-    if auth_ctx.user != "anonymous" {
-        tracing::debug!(
-            id = %executing.id,
-            poll_user = %auth_ctx.user,
-            "Authenticated poll request — ownership check deferred until submitter is persisted"
-        );
+    if let Some(resp) = allow_query_action_or_forbid(
+        &state,
+        &auth_ctx,
+        QueryAction::Poll,
+        &executing.submitted_by,
+        &executing.cluster_group.0,
+    )
+    .await
+    {
+        return resp;
     }
 
     let adapter = match state.adapter(&executing.cluster_name.0).await {
@@ -1007,7 +1209,10 @@ pub async fn get_executing_statement(
     };
     let submit_was_guard_blocked = executing.was_guard_blocked;
 
-    let poll_result = match adapter.poll_query(&backend_id, Some(&trino_url)).await {
+    let poll_result = match adapter
+        .poll_query(&backend_id, Some(&trino_url), executing.wire_auth.as_ref())
+        .await
+    {
         Ok(r) => r,
         Err(e) => {
             if e.is_transient() {
@@ -1172,6 +1377,9 @@ pub async fn delete_executing_statement(
     let auth_ctx = match auth_provider.authenticate(&creds).await {
         Ok(ctx) => ctx,
         Err(e) => {
+            state
+                .metrics
+                .on_auth_failure(&format!("{:?}", FrontendProtocol::TrinoHttp));
             warn!("Cancel auth failed: {e}");
             return StatusCode::UNAUTHORIZED.into_response();
         }
@@ -1188,40 +1396,411 @@ pub async fn delete_executing_statement(
     };
     let backend_id = BackendQueryId(trino_id);
 
-    if let Ok(Some(executing)) = state.persistence.get(&backend_id).await {
-        // TODO: verify query ownership once submitter_user is stored in ExecutingQuery
-        if auth_ctx.user != "anonymous" {
-            tracing::debug!(
-                id = %executing.id,
-                cancel_user = %auth_ctx.user,
-                "Authenticated cancel request — ownership check deferred until submitter is persisted"
-            );
+    let executing = match state.persistence.get(&backend_id).await {
+        Ok(Some(q)) => q,
+        Ok(None) => return StatusCode::NO_CONTENT.into_response(),
+        Err(e) => {
+            warn!("Persistence error on cancel: {e}");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
+    };
 
-        let trino_url = format!(
-            "{}/v1/statement/{}",
-            executing
-                .poll_base_url
-                .as_deref()
-                .unwrap_or_default()
-                .trim_end_matches('/'),
-            trino_path
+    if let Some(resp) = allow_query_action_or_forbid(
+        &state,
+        &auth_ctx,
+        QueryAction::Cancel,
+        &executing.submitted_by,
+        &executing.cluster_group.0,
+    )
+    .await
+    {
+        return resp;
+    }
+
+    let Some(adapter) = state.adapter(&executing.cluster_name.0).await else {
+        warn!(
+            id = %executing.id,
+            cluster = %executing.cluster_name,
+            "No adapter for cluster; refusing to release slot without backend cancel"
         );
-        let _ = state.http_client.delete(&trino_url).send().await;
+        return (StatusCode::BAD_GATEWAY, "failed to cancel query on backend").into_response();
+    };
 
-        state
-            .release_query_slot(
-                &executing.cluster_group,
-                &executing.cluster_name,
-                &executing.id.0,
-            )
-            .await;
-        if let Err(e) = state.persistence.delete(&backend_id).await {
-            warn!(id = %executing.id, "Failed to delete executing record on cancel: {e}");
-        }
+    if let Err(e) = adapter
+        .cancel_query(&executing.backend_query_id, executing.wire_auth.as_ref())
+        .await
+    {
+        warn!(
+            id = %executing.id,
+            backend = %executing.backend_query_id,
+            "Cancel with cluster credentials failed: {e}"
+        );
+        return (StatusCode::BAD_GATEWAY, "failed to cancel query on backend").into_response();
+    }
+
+    state.record_executing_cancelled(
+        &executing,
+        FrontendProtocol::TrinoHttp,
+        adapter.engine_type(),
+        adapter.translation_target_dialect(),
+        "client cancelled",
+    );
+    state
+        .release_query_slot(
+            &executing.cluster_group,
+            &executing.cluster_name,
+            &executing.id.0,
+        )
+        .await;
+    if let Err(e) = state.persistence.delete(&backend_id).await {
+        warn!(id = %executing.id, "Failed to delete executing record on cancel: {e}");
     }
 
     StatusCode::NO_CONTENT.into_response()
+}
+
+#[cfg(test)]
+mod queue_claim_heartbeat_tests {
+    use super::{QUEUE_CLAIM_HEARTBEAT_SECS, QUEUE_CLAIM_TIMEOUT_SECS};
+
+    #[test]
+    fn heartbeat_interval_is_well_below_stale_claim_timeout() {
+        assert!(
+            QUEUE_CLAIM_HEARTBEAT_SECS * 2 <= QUEUE_CLAIM_TIMEOUT_SECS as u64,
+            "heartbeat must run at least twice within the stale-claim window"
+        );
+    }
+}
+
+#[cfg(test)]
+mod cancel_executing_statement_tests {
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    use async_trait::async_trait;
+    use axum::extract::{Path, State};
+    use axum::http::{HeaderMap, StatusCode};
+    use axum::response::IntoResponse;
+    use chrono::Utc;
+    use queryflux_auth::{
+        AllowAllAuthorization, AuthProvider, AuthorizationChecker, BackendIdentityResolver,
+        NoneAuthProvider,
+    };
+    use queryflux_cluster_manager::{
+        cluster_state::ClusterState, simple::SimpleClusterGroupManager,
+    };
+    use queryflux_core::{
+        error::{QueryFluxError, Result},
+        query::{
+            BackendQueryId, ClusterGroupName, ClusterName, EngineType, ExecutingQuery,
+            ProxyQueryId, QueryExecution, QueryPollResult, SqlDialect,
+        },
+    };
+    use queryflux_engine_adapters::{AdapterKind, AsyncAdapter};
+    use queryflux_metrics::NoopMetricsStore;
+    use queryflux_persistence::in_memory::InMemoryPersistence;
+    use queryflux_routing::chain::RouterChain;
+    use queryflux_translation::TranslationService;
+    use tokio::sync::RwLock;
+
+    use super::delete_executing_statement;
+    use crate::state::{AppState, LiveConfig};
+
+    struct CancelStubAdapter {
+        calls: Arc<AtomicUsize>,
+        fail: bool,
+    }
+
+    #[async_trait]
+    impl AsyncAdapter for CancelStubAdapter {
+        async fn submit_query(
+            &self,
+            _sql: &str,
+            _session: &queryflux_core::session::SessionContext,
+            _credentials: &queryflux_auth::QueryCredentials,
+            _tags: &queryflux_core::tags::QueryTags,
+            _params: &queryflux_core::params::QueryParams,
+        ) -> Result<QueryExecution> {
+            Err(QueryFluxError::Engine("not used in cancel tests".into()))
+        }
+
+        async fn poll_query(
+            &self,
+            _backend_id: &BackendQueryId,
+            _poll_token: Option<&str>,
+            _wire_auth: Option<&queryflux_core::query::StoredWireAuth>,
+        ) -> Result<QueryPollResult> {
+            Err(QueryFluxError::Engine("not used in cancel tests".into()))
+        }
+
+        async fn cancel_query(
+            &self,
+            _backend_id: &BackendQueryId,
+            _wire_auth: Option<&queryflux_core::query::StoredWireAuth>,
+        ) -> Result<()> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if self.fail {
+                Err(QueryFluxError::Engine("cancel rejected".into()))
+            } else {
+                Ok(())
+            }
+        }
+
+        fn engine_type(&self) -> EngineType {
+            EngineType::Trino
+        }
+
+        fn translation_target_dialect(&self) -> SqlDialect {
+            SqlDialect::Trino
+        }
+
+        async fn health_check(&self) -> bool {
+            true
+        }
+
+        async fn list_catalogs(&self) -> Result<Vec<String>> {
+            Ok(vec![])
+        }
+
+        async fn list_databases(&self, _catalog: &str) -> Result<Vec<String>> {
+            Ok(vec![])
+        }
+
+        async fn list_tables(&self, _catalog: &str, _database: &str) -> Result<Vec<String>> {
+            Ok(vec![])
+        }
+
+        async fn describe_table(
+            &self,
+            _catalog: &str,
+            _database: &str,
+            _table: &str,
+        ) -> Result<Option<queryflux_core::catalog::TableSchema>> {
+            Ok(None)
+        }
+    }
+
+    fn test_cluster_names() -> (ClusterGroupName, ClusterName) {
+        (
+            ClusterGroupName("default".into()),
+            ClusterName("trino".into()),
+        )
+    }
+
+    async fn test_state(adapter: Option<AdapterKind>) -> Arc<AppState> {
+        let (group_name, cluster_name) = test_cluster_names();
+        let cluster_state = Arc::new(ClusterState::new(
+            cluster_name.clone(),
+            group_name.clone(),
+            None,
+            None,
+            EngineType::Trino,
+            Some("http://trino.test:8080".into()),
+            10,
+            true,
+        ));
+        let mut adapters = HashMap::new();
+        if let Some(adapter) = adapter {
+            adapters.insert(cluster_name.0.clone(), adapter);
+        }
+        let mut group_members = HashMap::new();
+        group_members.insert(group_name.0.clone(), vec![cluster_name.0.clone()]);
+        let mut groups = HashMap::new();
+        groups.insert(
+            group_name.clone(),
+            (
+                vec![cluster_state],
+                Arc::new(queryflux_cluster_manager::strategy::RoundRobinStrategy::new())
+                    as Arc<dyn queryflux_cluster_manager::strategy::ClusterSelectionStrategy>,
+            ),
+        );
+        let live = LiveConfig {
+            router_chain: RouterChain::new(vec![], group_name.clone()),
+            guard_chain: None,
+            group_guard_chains: HashMap::new(),
+            cluster_manager: Arc::new(SimpleClusterGroupManager::new(groups)),
+            adapters,
+            health_check_targets: vec![],
+            custom_health_queries: HashMap::new(),
+            custom_reconcile_queries: HashMap::new(),
+            cluster_configs: HashMap::new(),
+            group_members,
+            group_order: vec![group_name.0.clone()],
+            group_translation_scripts: HashMap::new(),
+            group_default_tags: HashMap::new(),
+            group_max_queued_queries: HashMap::new(),
+            group_capacity_wait_timeout_secs: HashMap::new(),
+            group_cache_settings: HashMap::new(),
+            auth_provider: Arc::new(NoneAuthProvider::new(false)) as Arc<dyn AuthProvider>,
+            authorization: Arc::new(AllowAllAuthorization::default())
+                as Arc<dyn AuthorizationChecker>,
+        };
+        Arc::new(AppState {
+            external_address: "http://127.0.0.1:8080".into(),
+            live: Arc::new(RwLock::new(live)),
+            persistence: Arc::new(InMemoryPersistence::new()),
+            translation: Arc::new(TranslationService::disabled()),
+            metrics: Arc::new(NoopMetricsStore),
+            identity_resolver: Arc::new(BackendIdentityResolver::new()),
+            capacity_store: None,
+            queue_coordinator: None,
+            instance_id: "test".into(),
+            http_client: reqwest::Client::new(),
+            result_cache: Arc::new(queryflux_cache::noop::NoopResultCache),
+        })
+    }
+
+    async fn seed_executing(state: &AppState, backend_id: &str) {
+        let (group_name, cluster_name) = test_cluster_names();
+        let executing = ExecutingQuery {
+            id: ProxyQueryId("proxy-1".into()),
+            sql: "SELECT 1".into(),
+            translated_sql: None,
+            cluster_group: group_name,
+            cluster_name,
+            cluster_group_config_id: None,
+            cluster_config_id: None,
+            backend_query_id: BackendQueryId(backend_id.into()),
+            poll_base_url: None,
+            creation_time: Utc::now(),
+            last_accessed: Utc::now(),
+            query_tags: HashMap::new(),
+            agent_context: None,
+            submitted_guard_actions: vec![],
+            was_guard_blocked: false,
+            submitted_by: "anonymous".into(),
+            wire_auth: None,
+        };
+        state
+            .persistence
+            .upsert(executing)
+            .await
+            .expect("seed executing query");
+    }
+
+    #[tokio::test]
+    async fn cancel_removes_executing_record_after_adapter_succeeds() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let adapter = AdapterKind::Async(Arc::new(CancelStubAdapter {
+            calls: calls.clone(),
+            fail: false,
+        }));
+        let state = test_state(Some(adapter)).await;
+        seed_executing(&state, "trino-q-ok").await;
+
+        let resp = delete_executing_statement(
+            State(state.clone()),
+            Path("executing/trino-q-ok".into()),
+            HeaderMap::new(),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(
+            state
+                .persistence
+                .get(&BackendQueryId("trino-q-ok".into()))
+                .await
+                .expect("get")
+                .is_none(),
+            "executing record must be deleted only after backend cancel succeeds"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_keeps_executing_record_when_adapter_fails() {
+        let adapter = AdapterKind::Async(Arc::new(CancelStubAdapter {
+            calls: Arc::new(AtomicUsize::new(0)),
+            fail: true,
+        }));
+        let state = test_state(Some(adapter)).await;
+        seed_executing(&state, "trino-q-fail").await;
+
+        let resp = delete_executing_statement(
+            State(state.clone()),
+            Path("executing/trino-q-fail".into()),
+            HeaderMap::new(),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        assert!(
+            state
+                .persistence
+                .get(&BackendQueryId("trino-q-fail".into()))
+                .await
+                .expect("get")
+                .is_some(),
+            "slot must not be released when backend cancel fails"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_refuses_when_cluster_adapter_missing() {
+        let state = test_state(None).await;
+        seed_executing(&state, "trino-q-no-adapter").await;
+
+        let resp = delete_executing_statement(
+            State(state.clone()),
+            Path("executing/trino-q-no-adapter".into()),
+            HeaderMap::new(),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        assert!(state
+            .persistence
+            .get(&BackendQueryId("trino-q-no-adapter".into()))
+            .await
+            .expect("get")
+            .is_some());
+    }
+}
+
+#[cfg(test)]
+mod auth_fast_path_tests {
+    use axum::extract::State;
+    use axum::http::{HeaderMap, HeaderValue, StatusCode};
+    use axum::response::IntoResponse;
+    use bytes::Bytes;
+
+    use super::post_statement;
+    use crate::state::test_fixtures;
+
+    #[tokio::test]
+    async fn set_session_fast_path_rejects_unauthenticated_when_required() {
+        let state = test_fixtures::app_state(true);
+        let resp = post_statement(
+            State(state),
+            HeaderMap::new(),
+            Bytes::from("SET SESSION query_tags = 'team=eng'"),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn set_session_fast_path_allows_authenticated_user() {
+        let state = test_fixtures::app_state(true);
+        let mut headers = HeaderMap::new();
+        headers.insert("X-Trino-User", HeaderValue::from_static("alice"));
+        let resp = post_statement(
+            State(state),
+            headers,
+            Bytes::from("SET SESSION query_tags = 'team=eng'"),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
 }
 
 #[cfg(test)]

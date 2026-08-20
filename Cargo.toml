@@ -17,10 +17,11 @@ members = [
     "crates/queryflux-metrics",
     "crates/queryflux-fingerprint",
     "crates/queryflux-guardrails",
+    "crates/queryflux-cli",
 ]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/lakeops-org/queryflux"
@@ -83,6 +84,7 @@ queryflux-metrics = { path = "crates/queryflux-metrics" }
 queryflux-fingerprint = { path = "crates/queryflux-fingerprint" }
 queryflux-guardrails = { path = "crates/queryflux-guardrails" }
 queryflux-cache = { path = "crates/queryflux-cache" }
+queryflux-cli = { path = "crates/queryflux-cli" }
 
 # OpenDAL — storage abstraction for cache backend
 opendal = { version = "0.53", features = ["services-fs", "services-s3", "services-gcs"] }

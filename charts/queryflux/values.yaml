@@ -10,6 +10,8 @@
 #   6. resources          → set CPU/memory requests and limits
 #   7. ingress / TLS      → enable HTTPS termination
 #   8. config.existingSecret → use when config contains credentials
+#
+# Starter: examples/production-values.yaml + examples/production-config.yaml
 # ──────────────────────────────────────────────────────────────────────────────
 
 replicaCount: 1
@@ -180,6 +182,16 @@ livenessProbe:
   timeoutSeconds: 2
   failureThreshold: 6
 
+# Delays liveness/readiness until the process is ready (e.g. slow startup with
+# large configs). Default allows up to ~5 minutes (periodSeconds * failureThreshold).
+startupProbe:
+  httpGet:
+    path: /readyz
+    port: admin
+  periodSeconds: 5
+  timeoutSeconds: 2
+  failureThreshold: 60
+
 readinessProbe:
   httpGet:
     path: /readyz
@@ -188,6 +200,10 @@ readinessProbe:
   periodSeconds: 5
   timeoutSeconds: 2
   failureThreshold: 6
+
+# Must be ≥ queryflux.shutdownDrainTimeoutSecs (default 30) plus a buffer so
+# Kubernetes does not SIGKILL mid-drain.
+terminationGracePeriodSeconds: 45
 
 autoscaling:
   enabled: false
@@ -202,6 +218,9 @@ pdb:
   maxUnavailable: 1
 
 networkPolicy:
+  # Keep false unless you supply non-empty ingress/egress for every declared
+  # policyType. Empty rules + enabled = deny-all; the chart fails install then.
+  # See examples/networkpolicy-values.yaml.
   enabled: false
   policyTypes:
     - Ingress

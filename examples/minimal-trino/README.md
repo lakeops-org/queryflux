@@ -97,11 +97,21 @@ psql postgresql://queryflux:queryflux@localhost:5433/queryflux -c "SELECT COUNT(
 
 ## Database migrations
 
-Schema changes are **not** applied by Postgres’s `docker-entrypoint-initdb.d`. They run **inside the QueryFlux process** the first time it connects: embedded **sqlx** migrations in the binary create/update tables (including `_sqlx_migrations`, `query_records`, cluster config tables, etc.). If migration fails, QueryFlux exits and you’ll see **`Migration failed`** in `docker compose logs queryflux`.
+Schema changes are **not** applied by Postgres’s `docker-entrypoint-initdb.d`. By default (`autoMigrate: true`), they run **inside the QueryFlux process** the first time it connects: embedded **[Refinery](https://github.com/rust-db/refinery)** migrations create/update tables (including `refinery_schema_history`, `query_records`, cluster config tables, etc.). If migration fails, QueryFlux exits and you’ll see **`Migration failed`** in `docker compose logs queryflux`.
 
-`docker compose up -d --wait` waits until **QueryFlux** reports healthy on `:9000/health` — that only happens after migrations and startup succeed. If the DB volume is empty and you only inspect Postgres before QueryFlux has finished starting, tables may not exist yet.
+You can also apply migrations as a one-shot without starting the server:
+
+```bash
+queryflux migrate -c /path/to/config.yaml
+```
+
+For multi-replica rollouts, set `autoMigrate: false` under `persistence` (with `type: postgres`) and run `queryflux migrate` (or a Kubernetes Job with the same image/command) **before** rolling pods so only one process applies DDL.
+
+`docker compose up -d --wait` waits until **QueryFlux** reports healthy on `:9000/health` — that only happens after migrations (when auto-migrate is on) and startup succeed. If the DB volume is empty and you only inspect Postgres before QueryFlux has finished starting, tables may not exist yet.
 
 If migrations never appear to run with a **pre-built registry image**, ensure that image was produced from this repo’s `docker/queryflux/Dockerfile` so the binary includes the migration bundle; otherwise build locally (see repo `docker/queryflux/Dockerfile` header) and set the image in `docker-compose.yml`.
+
+**sqlx → Refinery:** there is no automatic import from `_sqlx_migrations`. Wipe/recreate the Postgres volume (or database) before upgrading builds that used sqlx migrate; otherwise migrate fails closed with a clear error.
 
 ## Stop and reset
 

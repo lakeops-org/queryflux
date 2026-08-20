@@ -138,6 +138,11 @@ pub trait MetricsStore: Send + Sync {
     /// A sustained spike can indicate a credential-stuffing attack.
     fn on_auth_failure(&self, _protocol: &str) {}
 
+    /// Called when a hot-reload soft-fails and last-good config is retained.
+    /// `stage` is a low-cardinality label such as `reload`, `auth_rebuild`,
+    /// `authz_rebuild`, or `guard_reload`.
+    fn on_config_reload_failure(&self, _stage: &str) {}
+
     /// Called when a queue admission is rejected because `maxQueuedQueries` was reached.
     fn on_queue_full(&self, _cluster_group: &str) {}
 

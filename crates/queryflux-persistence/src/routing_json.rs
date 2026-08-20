@@ -237,6 +237,19 @@ fn resolve_one_router_for_storage(v: &Value, id_to_name: &HashMap<i64, String>) 
                     arr.iter()
                         .map(|rule| {
                             let regex = field(rule, "regex", "regex").cloned().unwrap_or(json!(""));
+                            let action = rule
+                                .get("action")
+                                .and_then(|a| a.as_str())
+                                .unwrap_or("route");
+                            if action.eq_ignore_ascii_case("deny") {
+                                let mut out = Map::new();
+                                out.insert("regex".into(), regex);
+                                out.insert("action".into(), json!("deny"));
+                                if let Some(err) = rule.get("error").and_then(|e| e.as_str()) {
+                                    out.insert("error".into(), json!(err));
+                                }
+                                return Ok(Value::Object(out));
+                            }
                             let tg = field(rule, "targetGroup", "target_group")
                                 .or_else(|| rule.get("targetGroupId"));
                             let name = group_value_to_name(tg.unwrap_or(&Value::Null), id_to_name)?;

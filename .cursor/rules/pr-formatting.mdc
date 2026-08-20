@@ -1,0 +1,33 @@
+---
+description: Run all formatting checks before creating or updating a PR
+alwaysApply: true
+---
+
+# Format and Clippy before every PR
+
+Before **creating, updating, or pushing** a branch for a pull request:
+
+1. **Format Rust** (matches CI `Check formatting` job):
+   ```bash
+   cargo fmt --all
+   cargo fmt --all -- --check
+   ```
+
+2. **Clippy** (matches CI `Clippy` job; warnings are errors):
+   ```bash
+   CARGO_TARGET_DIR=target cargo clippy --workspace --all-targets --all-features --exclude queryflux-bench -- -D warnings
+   ```
+   Or `make clippy` / `make lint`. Put `#[cfg(test)] mod tests` at the **end** of the file (`clippy::items_after_test_module`). See `.cursor/skills/clippy-ci/SKILL.md`.
+
+3. **Include formatted/fixed files in the commit** if fmt or Clippy changed anything.
+
+4. **Do not push** until both `cargo fmt --all -- --check` and Clippy exit 0.
+
+5. When also running compile/tests locally, prefer the workspace target dir if the sandbox cache breaks DuckDB builds:
+   ```bash
+   CARGO_TARGET_DIR=target cargo test …
+   ```
+
+CI uses Rust **1.91.1**. Formatting is `cargo fmt --all -- --check`. There is no separate Prettier step for `queryflux-studio` today.
+
+If formatting CI fails with checkout/SSL errors (not a diff from rustfmt), re-run the failed workflow after confirming local `cargo fmt --all -- --check` passes.

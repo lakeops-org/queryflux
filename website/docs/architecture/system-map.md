@@ -13,23 +13,34 @@ QueryFlux is a universal SQL query proxy and router. It accepts queries from cli
 
 ## High-level flow
 
-A query crosses five stages inside QueryFlux. The client only speaks its native protocol; the backend only sees translated SQL on its own wire format.
-
 ```mermaid
-flowchart LR
-    C["① Client"]
-    F["② Frontend"]
-    R["③ Router"]
-    M["④ Cluster manager"]
-    T["⑤ Translation"]
-    E["⑥ Engine"]
+%%{init: {'theme': 'base', 'themeVariables': {
+  'primaryColor': '#f5f3ff',
+  'primaryTextColor': '#3b0764',
+  'primaryBorderColor': '#7c3aed',
+  'lineColor': '#8b5cf6',
+  'fontFamily': 'Manrope Variable, Manrope, system-ui, sans-serif'
+}}}%%
+flowchart TD
+    Client(["Client<br/>Trino CLI / psql / mysql / DBI"])
+    Frontend["Frontend Listener<br/><i>speaks the client's wire protocol</i>"]
+    Router["Router Chain<br/><i>selects target cluster group</i>"]
+    ClusterMgr["ClusterGroupManager<br/><i>load-balances across clusters; queues if at capacity</i>"]
+    Translation["Translation Service<br/><i>sqlglot via PyO3; skipped when dialects match</i>"]
+    Adapter["Engine Adapter<br/><i>speaks the backend engine's native protocol</i>"]
+    Persistence[("Persistence<br/><i>stores in-flight state for async engines</i>")]
 
-    C -->|wire protocol| F
-    F -->|SQL + SessionContext| R
-    R -->|cluster group| M
-    M -->|cluster + capacity| T
-    T -->|dialect fixup| E
-    E -->|results| C
+    Client -->|native protocol| Frontend
+    Frontend -->|SQL + SessionContext| Router
+    Router -->|ClusterGroupName| ClusterMgr
+    ClusterMgr -->|ClusterName| Translation
+    Translation -->|translated SQL| Adapter
+    Adapter -->|"QueryExecution (Async \| Sync)"| Persistence
+
+    classDef stage fill:#faf5ff,stroke:#7c3aed,stroke-width:1.5px,color:#3b0764,rx:8,ry:8
+    class Frontend,Router,ClusterMgr,Translation,Adapter stage
+    classDef endpoint fill:#7c3aed,stroke:#5b21b6,stroke-width:1.5px,color:#fff
+    class Client,Persistence endpoint
 ```
 
 | Step | Component | What happens |
@@ -172,25 +183,21 @@ QueryExecution::Sync { result: QueryPollResult }
 | Trino | Async | Submit → poll `nextUri` until done |
 | DuckDB | Sync | Runs on `spawn_blocking`, result available immediately |
 | StarRocks | Sync | MySQL protocol, single round-trip |
-| ClickHouse | — | Planned |
+| ClickHouse | Sync | HTTP interface, `ArrowStream` response decoded to Arrow record batches |
 
-### EngineAdapterTrait (`queryflux-engine-adapters`)
+### Engine adapters (`queryflux-engine-adapters`)
+
+There is no single `EngineAdapterTrait`. Engines implement **`SyncAdapter`** (DuckDB, StarRocks, ClickHouse, ADBC) or **`AsyncAdapter`** (Trino, Athena).
 
 ```rust
-pub trait EngineAdapterTrait: Send + Sync {
-    async fn submit_query(&self, sql: &str, session: &SessionContext) -> Result<QueryExecution>;
-    async fn poll_query(&self, backend_id: &BackendQueryId, next_uri: Option<&str>) -> Result<QueryPollResult>;
-    async fn cancel_query(&self, backend_id: &BackendQueryId) -> Result<()>;
-    async fn health_check(&self) -> bool;
-    fn engine_type(&self) -> EngineType;
+// SyncAdapter — execute_as_arrow / optional execute_native
+async fn cancel_query(&self, backend_id: &BackendQueryId) -> Result<()>; // default no-op
 
-    // Catalog discovery — feeds schema context for translation
-    async fn list_catalogs(&self) -> Result<Vec<String>>;
-    async fn list_databases(&self, catalog: &str) -> Result<Vec<String>>;
-    async fn list_tables(&self, catalog: &str, db: &str) -> Result<Vec<String>>;
-    async fn describe_table(&self, catalog: &str, db: &str, table: &str) -> Result<Option<TableSchema>>;
-}
+// AsyncAdapter — submit_query + poll_query
+async fn cancel_query(&self, backend_id: &BackendQueryId) -> Result<()>; // required
 ```
+
+On the sync path, dispatch holds a `SyncCancelGuard`. Adapters publish a `BackendQueryId` into a shared slot as soon as the engine id is known (before the blocking wait). If the client disconnects, the guard calls `cancel_query` (ClickHouse `KILL QUERY WHERE query_id = …`, StarRocks `KILL QUERY <connection_id>`, DuckDB `interrupt()`, Athena `StopQueryExecution`, Trino `DELETE /v1/query/{id}`). DuckDB HTTP and ADBC have no cross-thread kill API — cancel is a documented no-op; dropping the HTTP request is best-effort.
 
 ### RouterTrait (`queryflux-routing`)
 
@@ -243,7 +250,7 @@ pub trait RouterTrait: Send + Sync {
 | DuckDB | **Done** | `Arrow` | Sync embedded — `spawn_blocking` + Arrow result set |
 | StarRocks | **Done** | `MysqlWire` | Sync — `mysql_async` pool; native path (zero Arrow) for MySQL wire clients |
 | Athena | **Done** | `Arrow` | Async AWS SDK — `StartQueryExecution` → poll → `GetQueryResults` |
-| ClickHouse | Planned | `MysqlWire` / `Arrow` / `ClickHouseHttp` | Depends on configured connection type |
+| ClickHouse | **Done** | `Arrow` | Sync — HTTP interface (`default_format=ArrowStream`), Arrow result set |
 
 ### Routers
 
@@ -430,4 +437,5 @@ curl -s -X POST http://localhost:8080/v1/statement \
 | P1 | Athena backend | **Done** |
 | P1 | Authentication / authorization (`queryflux-auth`) | **Done** |
 | P2 | Wire `SchemaContext` from catalog into dispatch | Planned |
-| P3 | ClickHouse HTTP backend + frontend | Planned |
+| P3 | ClickHouse backend (HTTP, Arrow) | **Done** |
+| P3 | ClickHouse HTTP frontend | Planned |
