@@ -268,14 +268,22 @@ mod tests {
         use arrow::datatypes::{DataType, Field, Schema};
         use std::sync::Arc;
 
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            "state",
-            DataType::Utf8,
-            false,
-        )]));
-        let batch =
-            RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(vec!["STARTED"]))])
-                .unwrap();
+        // Must include a matching `name` column — otherwise find_named_row
+        // returns None before ever reaching the missing-`running`-column path
+        // this test is meant to exercise (see the exact-match requirement
+        // added above).
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, false),
+            Field::new("state", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["ANALYTICS_WH"])),
+                Arc::new(StringArray::from(vec!["STARTED"])),
+            ],
+        )
+        .unwrap();
         assert!(
             SnowflakeIntrospection::parse_show_warehouses_running(&[batch], "ANALYTICS_WH")
                 .is_none()
