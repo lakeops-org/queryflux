@@ -7,6 +7,26 @@ use super::introspection::AdbcIntrospection;
 /// call — bounds worst-case latency on the 30s reconcile tick.
 const DATABRICKS_RECONCILE_MAX_PAGES: u32 = 10;
 
+/// Query-string params for `GET /api/2.0/sql/history/queries`. Despite being
+/// a `GET`, `filter_by.*` and `page_token` must be sent as flattened URL
+/// query parameters, not a JSON request body — confirmed against the
+/// Databricks Go/Python/Java SDK source, which all serialize `filter_by` as
+/// dotted query params (e.g. `filter_by.warehouse_ids=<id>`) rather than a
+/// body. A JSON body silently returns unfiltered/unpaginated results.
+fn history_query_params(
+    warehouse_id: &str,
+    page_token: Option<&str>,
+) -> Vec<(&'static str, String)> {
+    let mut params = vec![
+        ("filter_by.statuses", "RUNNING".to_string()),
+        ("filter_by.warehouse_ids", warehouse_id.to_string()),
+    ];
+    if let Some(token) = page_token {
+        params.push(("page_token", token.to_string()));
+    }
+    params
+}
+
 /// REST-based introspection for Databricks SQL Warehouses.
 /// Avoids waking the warehouse via SQL `SELECT 1` or system tables.
 pub struct DatabricksIntrospection {
@@ -120,21 +140,13 @@ impl AdbcIntrospection for DatabricksIntrospection {
         let mut total = 0u64;
         let mut page_token: Option<String> = None;
         for _ in 0..DATABRICKS_RECONCILE_MAX_PAGES {
-            let mut body = serde_json::json!({
-                "filter_by": {
-                    "statuses": ["RUNNING"],
-                    "warehouse_ids": [&self.warehouse_id]
-                }
-            });
-            if let Some(token) = &page_token {
-                body["page_token"] = serde_json::Value::String(token.clone());
-            }
+            let params = history_query_params(&self.warehouse_id, page_token.as_deref());
 
             let resp = match self
                 .http
                 .get(&url)
                 .bearer_auth(&self.auth_token)
-                .json(&body)
+                .query(&params)
                 .send()
                 .await
             {
@@ -240,5 +252,47 @@ mod tests {
             ],
         );
         assert!(intro.is_some());
+    }
+
+    #[test]
+    fn history_query_params_first_page() {
+        let params = history_query_params("wh-id", None);
+        assert_eq!(
+            params,
+            vec![
+                ("filter_by.statuses", "RUNNING".to_string()),
+                ("filter_by.warehouse_ids", "wh-id".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn history_query_params_includes_page_token() {
+        let params = history_query_params("wh-id", Some("tok123"));
+        assert_eq!(
+            params,
+            vec![
+                ("filter_by.statuses", "RUNNING".to_string()),
+                ("filter_by.warehouse_ids", "wh-id".to_string()),
+                ("page_token", "tok123".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn history_query_params_encode_as_expected_url_query_string() {
+        // Regression: filter_by.* and page_token must land in the URL query
+        // string (not a JSON body) — this is what a real reqwest request
+        // actually sends on the wire.
+        let params = history_query_params("wh-id", Some("tok 123"));
+        let req = reqwest::Client::new()
+            .get("https://dbc.example.com/api/2.0/sql/history/queries")
+            .query(&params)
+            .build()
+            .unwrap();
+        let query = req.url().query().unwrap();
+        assert!(query.contains("filter_by.statuses=RUNNING"));
+        assert!(query.contains("filter_by.warehouse_ids=wh-id"));
+        assert!(query.contains("page_token=tok+123") || query.contains("page_token=tok%20123"));
     }
 }

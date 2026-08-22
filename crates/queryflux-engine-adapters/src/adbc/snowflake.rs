@@ -35,21 +35,49 @@ pub fn try_from_adbc_config(
 }
 
 impl SnowflakeIntrospection {
+    /// `SHOW ... LIKE` has no `ESCAPE` clause support (unlike the standard SQL
+    /// `LIKE` predicate), so `_`/`%` in `warehouse` remain live wildcards —
+    /// e.g. `LIKE 'ETL_WH'` can also match a warehouse literally named
+    /// `ETLXWH`. A backslash here would be taken literally rather than as an
+    /// escape character, so trying to escape wildcards would make the query
+    /// match *nothing*, including the intended warehouse — worse than the
+    /// over-matching it would prevent. [`find_named_row`] compensates by
+    /// preferring an exact `name` match among whatever rows come back.
     pub(crate) fn show_warehouses_sql(warehouse: &str) -> String {
         format!(
             "SHOW WAREHOUSES LIKE '{}'",
-            sql_helpers::escape_sql_literal(&sql_helpers::escape_sql_like_pattern(warehouse))
+            sql_helpers::escape_sql_literal(warehouse)
         )
+    }
+
+    /// `LIKE` can return multiple rows (see [`show_warehouses_sql`]); prefer
+    /// the row whose `name` exactly matches (case-insensitive — Snowflake
+    /// identifiers are case-insensitive unless quoted) over blindly taking
+    /// the first row.
+    fn find_named_row<'a>(
+        batches: &'a [arrow::record_batch::RecordBatch],
+        warehouse: &str,
+    ) -> Option<(&'a arrow::record_batch::RecordBatch, usize)> {
+        for batch in batches {
+            for row in 0..batch.num_rows() {
+                if let Some(name) = sql_helpers::cell_str(batch, "name", row) {
+                    if name.eq_ignore_ascii_case(warehouse) {
+                        return Some((batch, row));
+                    }
+                }
+            }
+        }
+        batches.iter().find(|b| b.num_rows() > 0).map(|b| (b, 0))
     }
 
     pub(crate) fn parse_show_warehouses_health(
         batches: &[arrow::record_batch::RecordBatch],
+        warehouse: &str,
     ) -> bool {
-        let batch = match batches.first() {
-            Some(b) if b.num_rows() > 0 => b,
-            _ => return false,
+        let Some((batch, row)) = Self::find_named_row(batches, warehouse) else {
+            return false;
         };
-        let state = match sql_helpers::cell_str(batch, "state", 0) {
+        let state = match sql_helpers::cell_str(batch, "state", row) {
             Some(s) => s.to_ascii_uppercase(),
             None => return false,
         };
@@ -61,9 +89,10 @@ impl SnowflakeIntrospection {
 
     pub(crate) fn parse_show_warehouses_running(
         batches: &[arrow::record_batch::RecordBatch],
+        warehouse: &str,
     ) -> Option<u64> {
-        let batch = batches.first()?;
-        sql_helpers::cell_u64(batch, "running", 0)
+        let (batch, row) = Self::find_named_row(batches, warehouse)?;
+        sql_helpers::cell_u64(batch, "running", row)
     }
 
     fn instance_show_warehouses_sql(&self) -> String {
@@ -76,10 +105,11 @@ impl AdbcIntrospection for SnowflakeIntrospection {
     async fn health_check(&self) -> bool {
         let pool = self.pool.clone();
         let sql = self.instance_show_warehouses_sql();
+        let warehouse = self.warehouse.clone();
         tokio::task::spawn_blocking(move || {
             let batches = sql_helpers::query_batches(&pool, &sql)?;
             Some(SnowflakeIntrospection::parse_show_warehouses_health(
-                &batches,
+                &batches, &warehouse,
             ))
         })
         .await
@@ -91,9 +121,10 @@ impl AdbcIntrospection for SnowflakeIntrospection {
     async fn fetch_running_query_count(&self) -> Option<u64> {
         let pool = self.pool.clone();
         let sql = self.instance_show_warehouses_sql();
+        let warehouse = self.warehouse.clone();
         tokio::task::spawn_blocking(move || {
             let batches = sql_helpers::query_batches(&pool, &sql)?;
-            SnowflakeIntrospection::parse_show_warehouses_running(&batches)
+            SnowflakeIntrospection::parse_show_warehouses_running(&batches, &warehouse)
         })
         .await
         .ok()
@@ -145,11 +176,13 @@ mod tests {
     }
 
     #[test]
-    fn show_warehouses_sql_escapes_like_wildcards() {
-        // Unescaped, "ETL_WH" would also LIKE-match a warehouse named "ETLXWH".
+    fn show_warehouses_sql_does_not_backslash_escape_wildcards() {
+        // SHOW ... LIKE has no ESCAPE support — a backslash would be taken
+        // literally, so escaping here would make the query match nothing at
+        // all (worse than the over-matching escaping would have prevented).
         assert_eq!(
             SnowflakeIntrospection::show_warehouses_sql("ETL_WH"),
-            r"SHOW WAREHOUSES LIKE 'ETL\_WH'"
+            "SHOW WAREHOUSES LIKE 'ETL_WH'"
         );
     }
 
@@ -158,7 +191,7 @@ mod tests {
         for state in ["SUSPENDED", "STARTED", "Resuming", "running"] {
             let batch = snowflake_show_warehouses_batch(state, 0);
             assert!(
-                SnowflakeIntrospection::parse_show_warehouses_health(&[batch]),
+                SnowflakeIntrospection::parse_show_warehouses_health(&[batch], "ANALYTICS_WH"),
                 "state {state} should be healthy"
             );
         }
@@ -166,20 +199,49 @@ mod tests {
 
     #[test]
     fn health_rejects_missing_row_and_bad_state() {
-        assert!(!SnowflakeIntrospection::parse_show_warehouses_health(&[]));
+        assert!(!SnowflakeIntrospection::parse_show_warehouses_health(
+            &[],
+            "ANALYTICS_WH"
+        ));
         let stopped = snowflake_show_warehouses_batch("STOPPED", 0);
-        assert!(!SnowflakeIntrospection::parse_show_warehouses_health(&[
-            stopped
-        ]));
+        assert!(!SnowflakeIntrospection::parse_show_warehouses_health(
+            &[stopped],
+            "ANALYTICS_WH"
+        ));
     }
 
     #[test]
     fn running_count_from_show_warehouses() {
         let batch = snowflake_show_warehouses_batch("STARTED", 5);
         assert_eq!(
-            SnowflakeIntrospection::parse_show_warehouses_running(&[batch]),
+            SnowflakeIntrospection::parse_show_warehouses_running(&[batch], "ANALYTICS_WH"),
             Some(5)
         );
+    }
+
+    #[test]
+    fn health_and_running_prefer_exact_name_match_over_first_row() {
+        // LIKE 'ETL_WH' can also match "ETLXWH" (or, alphabetically, sort
+        // before the intended warehouse) — the exact-name row must win over
+        // whatever row happens to come back first.
+        let decoy = snowflake_show_warehouses_batch("SUSPENDED", 99);
+        let mut target = snowflake_show_warehouses_batch("STARTED", 3);
+        {
+            use arrow::array::StringArray;
+            use std::sync::Arc;
+            let schema = target.schema();
+            let mut cols = target.columns().to_vec();
+            cols[0] = Arc::new(StringArray::from(vec!["ETL_WH"]));
+            target = RecordBatch::try_new(schema, cols).unwrap();
+        }
+        let batches = vec![decoy, target];
+        assert_eq!(
+            SnowflakeIntrospection::parse_show_warehouses_running(&batches, "ETL_WH"),
+            Some(3)
+        );
+        assert!(SnowflakeIntrospection::parse_show_warehouses_health(
+            &batches, "ETL_WH"
+        ));
     }
 
     #[test]
@@ -196,6 +258,9 @@ mod tests {
         let batch =
             RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(vec!["STARTED"]))])
                 .unwrap();
-        assert!(SnowflakeIntrospection::parse_show_warehouses_running(&[batch]).is_none());
+        assert!(
+            SnowflakeIntrospection::parse_show_warehouses_running(&[batch], "ANALYTICS_WH")
+                .is_none()
+        );
     }
 }

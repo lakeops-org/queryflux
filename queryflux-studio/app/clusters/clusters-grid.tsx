@@ -23,6 +23,7 @@ import { hiddenAdbcFieldKeysForDriver } from "@/lib/adbc-driver-spec";
 import {
   isSaasVariantDriver,
   rowsToVariants,
+  saasVariantsSectionTitle,
   validateVariantRows,
   variantsToRows,
 } from "@/lib/adbc-saas-variants";
@@ -1412,7 +1413,9 @@ function VariantsSection({
   return (
     <div className="mt-4 space-y-3">
       <p className="text-[10px] font-semibold text-slate-400 uppercase tracking-widest">
-        {saasDriver ? "Warehouses & health" : "Variants & health"}
+        {saasDriver
+          ? `${saasVariantsSectionTitle(driver)}${isAdbc ? " & health" : ""}`
+          : "Variants & health"}
       </p>
 
       <div className="bg-slate-50 rounded-xl border border-slate-100 divide-y divide-slate-100">

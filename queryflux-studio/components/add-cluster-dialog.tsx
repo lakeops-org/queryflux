@@ -13,6 +13,7 @@ import { AdbcHealthReconcileFields, AdbcSaasVariantsEditor, EngineClusterConfig 
 import {
   isSaasVariantDriver,
   rowsToVariants,
+  saasVariantsSectionTitle,
   validateVariantRows,
   type VariantRow,
 } from "@/lib/adbc-saas-variants";
@@ -603,11 +604,9 @@ export function AddClusterDialog({ open, onClose }: Props) {
                   {isAdbc || isAthena ? (
                     <div className="space-y-2 pt-2 border-t border-slate-100">
                       <p className="text-[10px] font-semibold text-slate-400 uppercase tracking-widest">
-                        {saasAdbc && isAdbc
-                          ? "Warehouses & health"
-                          : saasAdbc
-                            ? "Workgroups"
-                            : "Health & reconcile"}
+                        {saasAdbc
+                          ? `${saasVariantsSectionTitle(adbcDriver)}${isAdbc ? " & health" : ""}`
+                          : "Health & reconcile"}
                       </p>
                       <div className="bg-slate-50 rounded-xl border border-slate-100 divide-y divide-slate-100">
                         {saasAdbc ? (

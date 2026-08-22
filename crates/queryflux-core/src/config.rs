@@ -1230,18 +1230,6 @@ fn escape_sql_literal(s: &str) -> String {
     s.replace('\'', "''")
 }
 
-/// Escapes `\`, `%`, and `_` so a name embedded in a `LIKE` pattern matches
-/// only that exact name — `_` and `%` are SQL wildcards, so an unescaped
-/// name like `ETL_WH` would also match `ETLXWH`. Snowflake's `SHOW ... LIKE`
-/// clause honors `\` as the default escape character, same as the `LIKE`
-/// predicate. Callers still need [`escape_sql_literal`] afterward to embed
-/// the result in a single-quoted string.
-fn escape_sql_like_pattern(s: &str) -> String {
-    s.replace('\\', "\\\\")
-        .replace('%', "\\%")
-        .replace('_', "\\_")
-}
-
 fn json_db_kwarg(config: &serde_json::Value, key: &str) -> Option<String> {
     config
         .get("dbKwargs")
@@ -1308,7 +1296,7 @@ pub fn default_reconcile_query(engine_key: &str, config: &serde_json::Value) -> 
                     let wh = resolve_adbc_sub_resource(driver, config)?;
                     Some(format!(
                         "SHOW WAREHOUSES LIKE '{}'",
-                        escape_sql_literal(&escape_sql_like_pattern(&wh))
+                        escape_sql_literal(&wh)
                     ))
                 }
                 "bigquery" => {
@@ -1349,7 +1337,7 @@ pub fn default_health_check_query(engine_key: &str, config: &serde_json::Value) 
             let wh = resolve_adbc_sub_resource(driver, config)?;
             Some(format!(
                 "SHOW WAREHOUSES LIKE '{}'",
-                escape_sql_literal(&escape_sql_like_pattern(&wh))
+                escape_sql_literal(&wh)
             ))
         }
         _ => None,
@@ -2928,7 +2916,7 @@ queryflux:
         });
         assert_eq!(
             super::default_reconcile_query("adbc", &sf).as_deref(),
-            Some(r"SHOW WAREHOUSES LIKE 'ANALYTICS\_WH'")
+            Some("SHOW WAREHOUSES LIKE 'ANALYTICS_WH'")
         );
 
         let bq = serde_json::json!({
@@ -2949,23 +2937,19 @@ queryflux:
     }
 
     #[test]
-    fn escape_sql_like_pattern_escapes_wildcards() {
-        // `_` and `%` are LIKE wildcards — an unescaped "ETL_WH" would also
-        // match a warehouse literally named "ETLXWH".
-        assert_eq!(super::escape_sql_like_pattern("ETL_WH"), "ETL\\_WH");
-        assert_eq!(super::escape_sql_like_pattern("100%_DONE"), "100\\%\\_DONE");
-        assert_eq!(
-            super::escape_sql_like_pattern("back\\slash"),
-            "back\\\\slash"
-        );
-    }
-
-    #[test]
-    fn default_health_check_query_escapes_warehouse_wildcards() {
+    fn default_health_check_query_does_not_backslash_escape_wildcards() {
+        // Snowflake's `SHOW ... LIKE` clause has no ESCAPE support (confirmed
+        // against Snowflake's docs — unlike the standard LIKE predicate used
+        // in SELECT/WHERE). A backslash here would be taken literally, so
+        // `SHOW WAREHOUSES LIKE 'ETL\_WH'` would match nothing at all rather
+        // than the intended "ETL_WH" warehouse. `_`/`%` in a warehouse name
+        // remain LIKE wildcards (can over-match, e.g. "ETL_WH" also matching
+        // "ETLXWH") — a known, pre-existing limitation of SHOW ... LIKE, not
+        // something we can escape our way out of.
         let cfg = serde_json::json!({ "driver": "snowflake", "warehouse": "ETL_WH" });
         assert_eq!(
             super::default_health_check_query("adbc", &cfg).as_deref(),
-            Some(r"SHOW WAREHOUSES LIKE 'ETL\_WH'")
+            Some("SHOW WAREHOUSES LIKE 'ETL_WH'")
         );
     }
 

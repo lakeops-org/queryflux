@@ -132,6 +132,8 @@ In Studio, the group member picker may still list base cluster names — type ex
 
 Two background loops in the QueryFlux binary run every **30 seconds** for each runtime cluster (including expanded variants). Both read from `LiveConfig.health_check_targets` and optional per-cluster custom SQL maps populated at reload.
 
+`healthCheckQuery` / `reconcileQuery` and the "override runtime defaults" behavior described below apply to **ADBC** clusters only — they're executed as SQL over the ADBC connection pool. **Athena is the one exception**: it accepts and stores these fields (variant expansion still substitutes `{{sub_resource}}` into them), but never executes them — its health check is a native `GetWorkGroup` AWS API call, not SQL. See [Athena](#athena) above.
+
 ### Optional config fields
 
 Set on the **base** cluster config (inherited by all variants, with placeholder substitution):

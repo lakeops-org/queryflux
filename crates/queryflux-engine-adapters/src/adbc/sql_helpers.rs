@@ -28,19 +28,6 @@ pub(crate) fn escape_sql_literal(value: &str) -> String {
     value.replace('\'', "''")
 }
 
-/// Escapes `\`, `%`, and `_` so a name embedded in a `LIKE` pattern matches
-/// only that exact name — `_` and `%` are SQL wildcards, so an unescaped
-/// name like `ETL_WH` would also match `ETLXWH`. Snowflake's `SHOW ... LIKE`
-/// clause honors `\` as the default escape character, same as the `LIKE`
-/// predicate. Callers still need [`escape_sql_literal`] afterward to embed
-/// the result in a single-quoted string.
-pub(crate) fn escape_sql_like_pattern(value: &str) -> String {
-    value
-        .replace('\\', "\\\\")
-        .replace('%', "\\%")
-        .replace('_', "\\_")
-}
-
 pub(crate) fn query_batches(pool: &AdbcPool, sql: &str) -> Option<Vec<RecordBatch>> {
     let mut conn = pool.get().ok()?;
     let mut stmt = conn.new_statement().ok()?;
@@ -122,12 +109,6 @@ mod tests {
     #[test]
     fn escape_sql_literal_doubles_quotes() {
         assert_eq!(escape_sql_literal("ANALYTICS'WH"), "ANALYTICS''WH");
-    }
-
-    #[test]
-    fn escape_sql_like_pattern_escapes_wildcards() {
-        assert_eq!(escape_sql_like_pattern("ETL_WH"), "ETL\\_WH");
-        assert_eq!(escape_sql_like_pattern("100%_DONE"), "100\\%\\_DONE");
     }
 
     #[test]
