@@ -1622,6 +1622,8 @@ mod cancel_executing_statement_tests {
             cluster_manager: Arc::new(SimpleClusterGroupManager::new(groups)),
             adapters,
             health_check_targets: vec![],
+            custom_health_queries: HashMap::new(),
+            custom_reconcile_queries: HashMap::new(),
             cluster_configs: HashMap::new(),
             group_members,
             group_order: vec![group_name.0.clone()],

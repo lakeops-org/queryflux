@@ -46,6 +46,7 @@ const sidebars: SidebarsConfig = {
         'architecture/system-map',
         'architecture/query-translation',
         'architecture/routing-and-clusters',
+        'architecture/cluster-variants-and-health',
         'architecture/caching',
         'architecture/query-tags',
         'architecture/query-params',

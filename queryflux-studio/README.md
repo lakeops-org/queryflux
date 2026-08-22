@@ -32,7 +32,8 @@ Use the **QueryFlux Studio** section in **[website/docs/architecture/adding-supp
 | `lib/engine-registry.ts` | Registry helpers + `ENGINE_REGISTRY` from manifest |
 | `lib/engine-registry-types.ts` | `EngineDescriptor` and field/auth unions |
 | `components/engine-catalog.ts` | Engines grid + `findEngineByType` (studio slots + static dialects) |
-| `components/cluster-config/` | Cluster form router, generic row renderer, custom engine panels |
-| `lib/cluster-persist-form.ts` | Flat form ↔ persisted `config` JSON |
+| `components/cluster-config/` | Cluster form router, generic row renderer, custom engine panels, SaaS warehouse editor, health/reconcile fields |
+| `lib/adbc-saas-variants.ts` | Warehouse variant rows ↔ `ClusterVariant` conversion and validation |
+| `lib/cluster-persist-form.ts` | Flat form ↔ persisted `config` JSON (including `variants`, `healthCheckQuery`, `reconcileQuery`) |
 
 For Next.js framework docs, see [nextjs.org/docs](https://nextjs.org/docs).

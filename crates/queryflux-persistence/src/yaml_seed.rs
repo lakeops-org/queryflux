@@ -91,6 +91,7 @@ mod tests {
                 "endpoint": "http://studio-trino:8080",
                 "poolSize": pool_size,
             }),
+            variants: serde_json::json!([]),
         }
     }
 

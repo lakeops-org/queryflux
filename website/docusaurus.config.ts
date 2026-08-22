@@ -115,6 +115,12 @@ const config: Config = {
     ],
   ],
 
+  themes: ['@docusaurus/theme-mermaid'],
+
+  markdown: {
+    mermaid: true,
+  },
+
   themeConfig: {
     // Default og/twitter image (homepage hero banner); width/height in metadata below.
     image: 'img/queryflux-hero-banner.png',

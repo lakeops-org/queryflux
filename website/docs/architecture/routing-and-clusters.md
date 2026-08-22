@@ -177,7 +177,18 @@ Eligible candidates are always **healthy**, **enabled**, and **not at capacity**
 
 ## Health and runtime updates
 
-Each `ClusterState` tracks health (`is_healthy`), updated by background health checks in the main binary. Unhealthy clusters are excluded from acquisition.
+Each `ClusterState` tracks health (`is_healthy`) and a running-query counter (`running_queries`). Background tasks in the main binary update both every **30 seconds**:
+
+- **Health checks** mark clusters unhealthy when probes fail; unhealthy clusters are excluded from acquisition.
+- **Reconciliation** aligns `running_queries` with backend ground truth (engine introspection or optional custom SQL). In **distributed mode**, one replica publishes counts to Postgres (`cluster_capacity_counters.running`); other replicas read that value instead of querying backends.
+
+For SaaS ADBC backends (Snowflake, Databricks, BigQuery, Redshift), QueryFlux uses **built-in introspection** that avoids waking auto-suspending warehouses (REST APIs or metadata queries instead of naive `SELECT 1`). Operators can override behavior with optional `healthCheckQuery` and `reconcileQuery` on the cluster config.
+
+**Distributed admission** (Postgres persistence, multiple replicas) is separate from reconcile: `maxRunningQueries` is enforced fleet-wide via **capacity leases** (`cluster_capacity_leases`), not via the `running` counter. See **[Cluster variants, health checks & reconciliation](./cluster-variants-and-health#distributed-mode-and-capacitystore)**.
+
+**Cluster variants** expand one persisted config into multiple runtime clusters (`base::warehouse-name`), each with its own adapter and health/reconcile targets. Reference expanded names in group `members`.
+
+See **[Cluster variants, health checks & reconciliation](./cluster-variants-and-health)** for YAML/API examples, resolution order, distributed `CapacityStore` behavior, and Studio UI.
 
 The `ClusterGroupManager` trait also supports **`update_cluster`** (enable/disable, change `max_running_queries`) for admin-driven changes.
 
@@ -196,4 +207,4 @@ So **routing and cluster selection** are shared concepts; the **result delivery*
 - **Cluster manager + strategy** answer: *which replica/instance in that pool?*
 - **Translation** (separate doc) then aligns SQL with that instance’s engine.
 
-See [system-map.md](system-map.md) for the full component diagram and [query-translation.md](query-translation.md) for dialect conversion details.
+See [system-map.md](system-map.md) for the high-level query flow, persistence model, and component status, and [query-translation.md](query-translation.md) for dialect conversion details.

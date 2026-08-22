@@ -66,7 +66,7 @@ Details: **[Frontends](/docs/architecture/frontends/overview)** and **[Snowflake
 
 Rules are evaluated in order. The first match selects a **cluster group**. You can match on protocol, HTTP headers, SQL text (regex), Trino client tags, compound logic, or **Python** for custom routing. A **fallback** group catches everything else.
 
-Details: **[Routing and clusters](/docs/architecture/routing-and-clusters)**.
+Details: **[Routing and clusters](./architecture/routing-and-clusters)**. For multi-warehouse expansion (Snowflake/Databricks variants), health checks, and running-query reconciliation, see **[Cluster variants, health checks & reconciliation](./architecture/cluster-variants-and-health)**.
 
 ### 3. Dispatch and dialect translation
 

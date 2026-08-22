@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
-import type { ClusterConfigRecord, ClusterDisplayRow } from "@/lib/api-types";
+import type { ClusterConfigRecord, ClusterDisplayRow, ClusterVariant } from "@/lib/api-types";
 import {
   deleteClusterConfig,
   getClusterConfig,
@@ -20,7 +20,14 @@ import {
   validateEngineSpecific,
 } from "@/lib/cluster-persist-form";
 import { hiddenAdbcFieldKeysForDriver } from "@/lib/adbc-driver-spec";
-import { EngineClusterConfig } from "@/components/cluster-config";
+import {
+  isSaasVariantDriver,
+  rowsToVariants,
+  saasVariantsSectionTitle,
+  validateVariantRows,
+  variantsToRows,
+} from "@/lib/adbc-saas-variants";
+import { AdbcHealthReconcileFields, AdbcSaasVariantsEditor, EngineClusterConfig } from "@/components/cluster-config";
 import {
   findEngineDescriptor,
   validateClusterConfig,
@@ -330,6 +337,15 @@ function ClusterDialog({
   const [editMaxInput, setEditMaxInput] = useState("");
   const [editFlat, setEditFlat] = useState<Record<string, string>>({});
   const [editClusterName, setEditClusterName] = useState("");
+  // `undefined` = untouched this edit session — save falls back to the
+  // persisted record's variants (see `buildClusterUpsertFromForm`).
+  const [editVariants, setEditVariants] = useState<ClusterVariant[] | undefined>(
+    undefined,
+  );
+  // Non-null while the raw variants-JSON textarea (non-SaaS drivers) holds
+  // unparseable input — save() must block until this clears, otherwise the
+  // stale last-valid `editVariants` would be persisted silently.
+  const [editVariantsError, setEditVariantsError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
   const [deleting, setDeleting] = useState(false);
@@ -392,6 +408,8 @@ function ClusterDialog({
       ),
     );
     setEditClusterName(persisted.name);
+    setEditVariants(undefined);
+    setEditVariantsError(null);
     setEditing(true);
   }
 
@@ -399,6 +417,8 @@ function ClusterDialog({
     setEditing(false);
     setSaveError(null);
     setEditClusterName("");
+    setEditVariants(undefined);
+    setEditVariantsError(null);
   }
 
   function closeOrDismissDeleteConfirm() {
@@ -486,6 +506,29 @@ function ClusterDialog({
       setSaveError(schemaErrs.join(" "));
       return;
     }
+    if (editVariantsError) {
+      setSaveError(editVariantsError);
+      return;
+    }
+
+    // Athena has no config.driver field — it uses the pseudo "athena" key,
+    // same as VariantsSection, so its workgroup variants validate here too.
+    const driver =
+      persisted.engineKey === "athena"
+        ? "athena"
+        : (editFlat.driver ??
+          String((persisted.config as Record<string, unknown>).driver ?? ""));
+    const effectiveVariants = editVariants ?? persisted.variants;
+    if (isSaasVariantDriver(driver)) {
+      const variantErrs = validateVariantRows(
+        variantsToRows(effectiveVariants, driver),
+        driver,
+      );
+      if (variantErrs.length > 0) {
+        setSaveError(variantErrs.join(" "));
+        return;
+      }
+    }
 
     setSaving(true);
     setSaveError(null);
@@ -498,6 +541,7 @@ function ClusterDialog({
         buildClusterUpsertFromForm(persisted, editFlat, {
           enabled: editEnabled,
           maxRunningQueriesInput: editMaxInput,
+          variants: editVariants,
         }),
       );
       setPersisted(newRecord);
@@ -715,6 +759,9 @@ function ClusterDialog({
               editMaxInput={editMaxInput}
               editFlat={editFlat}
               onPatchFlat={(patch) => setEditFlat((prev) => ({ ...prev, ...patch }))}
+              variants={editVariants ?? persisted.variants}
+              onVariantsChange={setEditVariants}
+              onVariantsErrorChange={setEditVariantsError}
               onToggleEnabled={() => setEditEnabled((v) => !v)}
               onChangeMaxInput={setEditMaxInput}
               saveError={saveError}
@@ -1091,6 +1138,9 @@ function EngineEditForm({
   editMaxInput,
   editFlat,
   onPatchFlat,
+  variants,
+  onVariantsChange,
+  onVariantsErrorChange,
   onToggleEnabled,
   onChangeMaxInput,
   saveError,
@@ -1106,6 +1156,9 @@ function EngineEditForm({
   editMaxInput: string;
   editFlat: Record<string, string>;
   onPatchFlat: (patch: Record<string, string>) => void;
+  variants: ClusterVariant[] | undefined;
+  onVariantsChange: (variants: ClusterVariant[]) => void;
+  onVariantsErrorChange: (error: string | null) => void;
   onToggleEnabled: () => void;
   onChangeMaxInput: (v: string) => void;
   saveError: string | null;
@@ -1228,6 +1281,16 @@ function EngineEditForm({
         )}
       </div>
 
+      <VariantsSection
+        persisted={persisted}
+        baseClusterName={editClusterName}
+        editFlat={editFlat}
+        onPatchFlat={onPatchFlat}
+        variants={variants}
+        onVariantsChange={onVariantsChange}
+        onVariantsErrorChange={onVariantsErrorChange}
+      />
+
       {saveError && (
         <p className="mt-2 text-xs text-red-500 flex items-center gap-1">
           <AlertCircle size={11} /> {saveError}
@@ -1252,6 +1315,151 @@ function EngineEditForm({
           {saving ? <Loader2 size={12} className="animate-spin" /> : null}
           {saving ? "Saving…" : "Save changes"}
         </button>
+      </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Variants & custom queries section (shown on ADBC clusters)
+// ---------------------------------------------------------------------------
+
+function VariantsSection({
+  persisted,
+  baseClusterName,
+  editFlat,
+  onPatchFlat,
+  variants,
+  onVariantsChange,
+  onVariantsErrorChange,
+}: {
+  persisted: ClusterConfigRecord;
+  baseClusterName: string;
+  editFlat: Record<string, string>;
+  onPatchFlat: (patch: Record<string, string>) => void;
+  variants: ClusterVariant[] | undefined;
+  onVariantsChange: (variants: ClusterVariant[]) => void;
+  onVariantsErrorChange: (error: string | null) => void;
+}) {
+  const isAdbc = persisted.engineKey === "adbc";
+  const isAthena = persisted.engineKey === "athena";
+  // Athena isn't ADBC and has no `config.driver` field — it uses the pseudo
+  // "athena" key so it can share `subResourceFieldSpec`/`SAAS_VARIANT_DRIVERS`
+  // with the ADBC SaaS drivers (its `workgroup` field is the same "one
+  // account, many named sub-resources" shape as their warehouse/project keys).
+  // For ADBC, match save()'s driver resolution: an in-progress driver edit in
+  // `editFlat` takes precedence over the persisted value, so the variant
+  // rows/labels shown here stay consistent with what save-time validation
+  // checks against.
+  const driver = isAthena
+    ? "athena"
+    : (editFlat.driver ?? ((persisted.config as Record<string, unknown>).driver as string) ?? "");
+  const saasDriver = isSaasVariantDriver(driver);
+
+  // Local UI state for the row/textarea editors; `variants` (via
+  // `onVariantsChange`) is the actual source of truth that gets saved —
+  // these mirror it for editing but never mutate `persisted` directly, so
+  // Cancel naturally discards edits (the parent's `editVariants` state just
+  // resets, `persisted` is never touched).
+  const [variantRows, setVariantRows] = useState(() =>
+    saasDriver ? variantsToRows(variants, driver) : [],
+  );
+  const [variantsJson, setVariantsJson] = useState(() =>
+    !saasDriver && variants && variants.length > 0
+      ? JSON.stringify(variants, null, 2)
+      : "",
+  );
+  const [variantsError, setVariantsError] = useState<string | null>(null);
+  const [variantFieldErrors, setVariantFieldErrors] = useState<string[]>([]);
+
+  function syncSaasVariants(rows: typeof variantRows) {
+    setVariantRows(rows);
+    const errors = validateVariantRows(rows, driver);
+    setVariantFieldErrors(errors);
+    onVariantsChange(rowsToVariants(rows, driver));
+  }
+
+  function onVariantsJsonChange(text: string) {
+    setVariantsJson(text);
+    if (!text.trim()) {
+      setVariantsError(null);
+      onVariantsErrorChange(null);
+      onVariantsChange([]);
+      return;
+    }
+    try {
+      const parsed = JSON.parse(text);
+      if (!Array.isArray(parsed)) {
+        const err = "Variants must be a JSON array";
+        setVariantsError(err);
+        onVariantsErrorChange(err);
+        return;
+      }
+      setVariantsError(null);
+      onVariantsErrorChange(null);
+      onVariantsChange(parsed as ClusterVariant[]);
+    } catch {
+      const err = "Invalid variants JSON — fix or clear it before saving.";
+      setVariantsError(err);
+      onVariantsErrorChange(err);
+    }
+  }
+
+  if (!isAdbc && !isAthena) return null;
+
+  const healthCheckQuery = editFlat.healthCheckQuery ?? "";
+  const reconcileQuery = editFlat.reconcileQuery ?? "";
+
+  return (
+    <div className="mt-4 space-y-3">
+      <p className="text-[10px] font-semibold text-slate-400 uppercase tracking-widest">
+        {saasDriver
+          ? `${saasVariantsSectionTitle(driver)}${isAdbc ? " & health" : ""}`
+          : "Variants & health"}
+      </p>
+
+      <div className="bg-slate-50 rounded-xl border border-slate-100 divide-y divide-slate-100">
+        <div className="flex flex-col px-4 py-3 gap-1.5">
+          {saasDriver ? (
+            <AdbcSaasVariantsEditor
+              driver={driver}
+              baseClusterName={baseClusterName.trim() || persisted.name}
+              rows={variantRows}
+              onChange={syncSaasVariants}
+              errors={variantFieldErrors}
+            />
+          ) : (
+            <>
+              <label className="text-[11px] text-slate-600 font-medium">
+                Variants (JSON)
+              </label>
+              <textarea
+                value={variantsJson}
+                onChange={(e) => onVariantsJsonChange(e.target.value)}
+                placeholder={`[\n  { "name": "analytics", "overrides": { "warehouse": "ANALYTICS_WH" } }\n]`}
+                rows={4}
+                className="w-full text-xs font-mono bg-white border border-slate-200 rounded-lg px-2.5 py-1.5 focus:outline-none focus:ring-2 focus:ring-indigo-300 focus:border-indigo-400 resize-y"
+              />
+              {variantsError && (
+                <p className="text-[10px] text-red-500">{variantsError}</p>
+              )}
+              <p className="text-[10px] text-slate-400">
+                Each variant expands into a separate cluster named{" "}
+                <code className="font-mono">base::variant</code>.
+              </p>
+            </>
+          )}
+        </div>
+
+        {isAdbc && (
+          <AdbcHealthReconcileFields
+            driver={driver}
+            healthCheckQuery={healthCheckQuery}
+            reconcileQuery={reconcileQuery}
+            onHealthCheckQueryChange={(v) => onPatchFlat({ healthCheckQuery: v })}
+            onReconcileQueryChange={(v) => onPatchFlat({ reconcileQuery: v })}
+          />
+        )}
       </div>
     </div>
   );

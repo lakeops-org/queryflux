@@ -346,8 +346,16 @@ pub trait CapacityStore: Send + Sync {
     /// Reclaim slots whose owning instance has not heartbeated since `cutoff`.
     async fn expire_stale(&self, cutoff: DateTime<Utc>) -> Result<u64>;
 
-    /// Current number of active (non-expired) slots for a cluster.
+    /// Current published running query count for a cluster (engine reconcile
+    /// ground truth in `cluster_capacity_counters.running`). Updated by the
+    /// single-owner reconcile sweep; not incremented by capacity leases.
     async fn active_count(&self, cluster_name: &str) -> Result<u64>;
+
+    /// Publish engine ground-truth running count after a reconcile sweep.
+    async fn publish_running_count(&self, cluster_name: &str, count: u64) -> Result<()>;
+
+    /// Active QueryFlux capacity leases for a cluster (global admission control).
+    async fn active_lease_count(&self, cluster_name: &str) -> Result<u64>;
 
     /// Release all capacity leases held by `instance_id`. Called during graceful
     /// shutdown so the departing replica's slots are immediately available to
@@ -523,7 +531,7 @@ impl<T: Persistence + MetricsStore + AdminStore + CacheStore + Send + Sync> Back
 
 /// Extension of [`BackendStore`] for backends that can coordinate multiple
 /// QueryFlux replicas (global capacity leases, single-owner queue claims,
-/// sweep locks, and distributed-mode capability flags).
+/// sweep locks, engine reconcile publication, and distributed-mode capability flags).
 ///
 /// Wired only when present: startup holds `Option<Arc<dyn DistributedBackendStore>>`
 /// alongside `Option<Arc<dyn BackendStore>>`. Postgres satisfies both; a

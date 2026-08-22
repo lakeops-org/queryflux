@@ -14,6 +14,7 @@ This section describes how QueryFlux is put together: why it exists, how SQL is 
 | [System map](system-map.md) | End-to-end query lifecycle, major crates, and component status (high level). |
 | [Query translation](query-translation.md) | Dialect detection, sqlglot integration, when translation runs, and schema-aware mode. |
 | [Routing and clusters](routing-and-clusters.md) | Router chain, `routingFallback`, cluster groups, load-balancing strategies, and queueing. |
+| [Cluster variants, health & reconcile](cluster-variants-and-health.md) | Multi-warehouse expansion, ADBC introspection, custom health/reconcile SQL, distributed capacity. |
 | [Query tags](query-tags.md) | Attaching metadata to queries for routing, observability, and backend forwarding. |
 | [Query parameters](query-params.md) | Typed positional bindings — how `?` params flow from frontend to native engine APIs. |
 | [Observability](observability.md) | Prometheus metrics, Grafana dashboard, QueryFlux Studio, and the Admin REST API. |

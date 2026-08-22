@@ -318,17 +318,49 @@ async fn main() -> Result<()> {
                 }
             };
             let max_running = max_running_queries_u64_from_db(&r.name, r.max_running_queries)?;
-            clusters.insert(
-                r.name.clone(),
-                queryflux_core::engine_registry::cluster_config_from_persisted_json(
-                    engine,
-                    r.enabled,
-                    max_running,
-                    &r.config,
-                    auth,
-                    query_auth,
-                ),
+            let base_cfg = queryflux_core::engine_registry::cluster_config_from_persisted_json(
+                engine.clone(),
+                r.enabled,
+                max_running,
+                &r.config,
+                auth.clone(),
+                query_auth.clone(),
             );
+
+            // Expand variants: insert a ClusterConfig for each expanded name.
+            let variants = parse_cluster_variants(&r.variants);
+            if variants.is_empty() {
+                let mut base_cfg = base_cfg;
+                queryflux_core::config::apply_default_probe_queries(
+                    &mut base_cfg,
+                    &r.engine_key,
+                    &r.config,
+                );
+                clusters.insert(r.name.clone(), base_cfg);
+            } else {
+                match queryflux_core::config::expand_cluster_variants(
+                    &r.name,
+                    &r.config,
+                    &r.engine_key,
+                    &variants,
+                    base_cfg.health_check_query.as_deref(),
+                    base_cfg.reconcile_query.as_deref(),
+                ) {
+                    Ok(expanded) => {
+                        for exp in expanded {
+                            let mut variant_cfg = base_cfg.clone();
+                            variant_cfg.max_running_queries =
+                                exp.max_running_queries.or(max_running);
+                            variant_cfg.health_check_query = exp.health_check_query;
+                            variant_cfg.reconcile_query = exp.reconcile_query;
+                            clusters.insert(exp.expanded_name, variant_cfg);
+                        }
+                    }
+                    Err(err) => {
+                        tracing::error!(cluster = %r.name, error = %err, "Variant expansion failed — cluster omitted");
+                    }
+                }
+            }
         }
         config.clusters = clusters;
         startup_cluster_records = Some(db_cluster_records);
@@ -432,7 +464,7 @@ async fn main() -> Result<()> {
     type AdapterMap = HashMap<String, queryflux_engine_adapters::AdapterKind>;
     let mut adapters: AdapterMap = HashMap::new();
 
-    // Pass 1 — one adapter per cluster.
+    // Pass 1 — one adapter per cluster (expanding variants for DB path).
     // DB path: build from JSONB records directly; YAML path: build from ClusterConfig.
     if let Some(records) = &startup_cluster_records {
         for record in records {
@@ -440,25 +472,75 @@ async fn main() -> Result<()> {
                 tracing::info!(cluster = %record.name, "Cluster disabled — skipping");
                 continue;
             }
-            let cluster_name = ClusterName(record.name.clone());
-            let placeholder_group = ClusterGroupName("_".to_string());
-            match registered_engines::build_adapter_from_record(
-                cluster_name,
-                placeholder_group,
-                &record.engine_key,
-                &record.config,
-            )
-            .await
-            {
-                Ok(adapter) => {
-                    adapters.insert(record.name.clone(), adapter);
+
+            // Parse variants from the JSONB column.
+            let variants = parse_cluster_variants(&record.variants);
+            let (health_check_query, reconcile_query) = extract_base_probe_queries(&record.config);
+
+            if variants.is_empty() {
+                // No variants — build a single adapter as before.
+                let cluster_name = ClusterName(record.name.clone());
+                let placeholder_group = ClusterGroupName("_".to_string());
+                match registered_engines::build_adapter_from_record(
+                    cluster_name,
+                    placeholder_group,
+                    &record.engine_key,
+                    &record.config,
+                )
+                .await
+                {
+                    Ok(adapter) => {
+                        adapters.insert(record.name.clone(), adapter);
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            cluster = %record.name,
+                            error = %e,
+                            "Failed to build engine adapter — cluster omitted from routing until config or environment is fixed"
+                        );
+                    }
                 }
-                Err(e) => {
-                    tracing::error!(
-                        cluster = %record.name,
-                        error = %e,
-                        "Failed to build engine adapter — cluster omitted from routing until config or environment is fixed"
-                    );
+            } else {
+                // Expand variants into independent runtime clusters.
+                let expanded = match queryflux_core::config::expand_cluster_variants(
+                    &record.name,
+                    &record.config,
+                    &record.engine_key,
+                    &variants,
+                    health_check_query.as_deref(),
+                    reconcile_query.as_deref(),
+                ) {
+                    Ok(e) => e,
+                    Err(err) => {
+                        tracing::error!(cluster = %record.name, error = %err, "Variant expansion failed — cluster omitted");
+                        continue;
+                    }
+                };
+                for exp in &expanded {
+                    // Map expanded name back to parent DB ID.
+                    cluster_ids_by_name.insert(exp.expanded_name.clone(), record.id);
+
+                    let cluster_name = ClusterName(exp.expanded_name.clone());
+                    let placeholder_group = ClusterGroupName("_".to_string());
+                    match registered_engines::build_adapter_from_record(
+                        cluster_name,
+                        placeholder_group,
+                        &record.engine_key,
+                        &exp.merged_config,
+                    )
+                    .await
+                    {
+                        Ok(adapter) => {
+                            adapters.insert(exp.expanded_name.clone(), adapter);
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                cluster = %exp.expanded_name,
+                                error = %e,
+                                "Failed to build engine adapter for variant — omitted"
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -836,6 +918,18 @@ async fn main() -> Result<()> {
                 .map(|c| (name.clone(), c.clone()))
         })
         .collect();
+    // Build custom health/reconcile query maps from cluster configs.
+    let mut custom_health_queries: HashMap<String, String> = HashMap::new();
+    let mut custom_reconcile_queries: HashMap<String, String> = HashMap::new();
+    for (name, cfg) in &cluster_configs {
+        if let Some(q) = &cfg.health_check_query {
+            custom_health_queries.insert(name.clone(), q.clone());
+        }
+        if let Some(q) = &cfg.reconcile_query {
+            custom_reconcile_queries.insert(name.clone(), q.clone());
+        }
+    }
+
     let live_config = LiveConfig {
         router_chain,
         guard_chain,
@@ -843,6 +937,8 @@ async fn main() -> Result<()> {
         cluster_manager,
         adapters,
         health_check_targets,
+        custom_health_queries,
+        custom_reconcile_queries,
         cluster_configs,
         group_members,
         group_order,
@@ -860,15 +956,40 @@ async fn main() -> Result<()> {
     let initial_config_json: HashMap<String, String> = if let Some(records) =
         &startup_cluster_records
     {
-        records
-            .iter()
-            .map(|r| {
-                (
+        let mut m: HashMap<String, String> = HashMap::new();
+        for r in records {
+            let variants = parse_cluster_variants(&r.variants);
+            if variants.is_empty() {
+                m.insert(
                     r.name.clone(),
                     serde_json::to_string(&(r.engine_key.as_str(), &r.config)).unwrap_or_default(),
-                )
-            })
-            .collect()
+                );
+            } else {
+                let (health_check_query, reconcile_query) = extract_base_probe_queries(&r.config);
+                match queryflux_core::config::expand_cluster_variants(
+                    &r.name,
+                    &r.config,
+                    &r.engine_key,
+                    &variants,
+                    health_check_query.as_deref(),
+                    reconcile_query.as_deref(),
+                ) {
+                    Ok(expanded) => {
+                        for exp in expanded {
+                            m.insert(
+                                exp.expanded_name,
+                                serde_json::to_string(&(r.engine_key.as_str(), &exp.merged_config))
+                                    .unwrap_or_default(),
+                            );
+                        }
+                    }
+                    Err(err) => {
+                        tracing::error!(cluster = %r.name, error = %err, "Variant expansion failed — cluster omitted");
+                    }
+                }
+            }
+        }
+        m
     } else {
         live_config
             .cluster_configs
@@ -1128,7 +1249,8 @@ async fn main() -> Result<()> {
     }
 
     // Background task: push cluster utilization snapshots every 5s.
-    // In distributed mode, also queries CapacityStore for global running counts.
+    // In distributed mode, overlay the last published engine reconcile counts so
+    // every replica's metrics reflect the same backend ground truth.
     //
     // Every replica refreshes its *local* Prometheus gauges (each replica's
     // /metrics is scraped independently), but only the replica holding the
@@ -1153,10 +1275,10 @@ async fn main() -> Result<()> {
                 };
                 let mut records = Vec::with_capacity(snapshots.len());
                 for snap in snapshots {
-                    // In distributed mode, overlay global running count from CapacityStore
-                    // so metrics reflect the true cluster-wide utilization.
-                    let global_running = if let Some(cap) = &state.capacity_store {
-                        cap.active_count(&snap.cluster_name.0)
+                    let global_running = if let Some(db) = &distributed_backend {
+                        let store = db.clone() as Arc<dyn queryflux_persistence::CapacityStore>;
+                        store
+                            .active_count(&snap.cluster_name.0)
                             .await
                             .unwrap_or(snap.running_queries)
                     } else {
@@ -1648,6 +1770,8 @@ async fn main() -> Result<()> {
     });
 
     // Background task: health-check each cluster every 30s via its adapter.
+    // Clusters with a custom `healthCheckQuery` use that SQL instead of `SELECT 1`.
+    // ADBC SaaS backends without a custom query skip health checks (always healthy).
     tokio::spawn({
         let state = app_state.clone();
         let mut shutdown_rx = shutdown_rx.clone();
@@ -1657,26 +1781,34 @@ async fn main() -> Result<()> {
                 if !tick_or_shutdown(&mut interval, &mut shutdown_rx).await {
                     break;
                 }
-                let targets = {
+                let (targets, custom_health) = {
                     let live = state.live.read().await;
-                    live.health_check_targets.clone()
+                    (
+                        live.health_check_targets.clone(),
+                        live.custom_health_queries.clone(),
+                    )
                 };
-                for (adapter, state) in &targets {
-                    let healthy = adapter.health_check().await;
+                for (adapter, cstate) in &targets {
+                    let cluster_name = &cstate.cluster_name.0;
+                    let healthy = if let Some(custom_sql) = custom_health.get(cluster_name) {
+                        adapter.execute_custom_health_check(custom_sql).await
+                    } else {
+                        adapter.health_check().await
+                    };
                     if !healthy {
                         tracing::warn!(
-                            cluster = %state.cluster_name.0,
-                            group = %state.group_name.0,
+                            cluster = %cluster_name,
+                            group = %cstate.group_name.0,
                             "Health check failed — marking cluster unhealthy"
                         );
-                    } else if !state.is_healthy() {
+                    } else if !cstate.is_healthy() {
                         tracing::info!(
-                            cluster = %state.cluster_name.0,
-                            group = %state.group_name.0,
+                            cluster = %cluster_name,
+                            group = %cstate.group_name.0,
                             "Health check recovered — marking cluster healthy"
                         );
                     }
-                    state.set_healthy(healthy);
+                    cstate.set_healthy(healthy);
                 }
             }
         }
@@ -1685,9 +1817,11 @@ async fn main() -> Result<()> {
     // Background task: reconcile in-memory running_queries counters with ground truth
     // from each engine (engines that implement fetch_running_query_count). Runs every 30s.
     // Corrects drift caused by proxy crashes, client disconnects, or any other leak.
-    // In distributed mode, local counters are a cache; CapacityStore is authoritative.
+    // In distributed mode, only the replica holding the `engine-reconcile` sweep lock
+    // queries backends; it publishes counts to Postgres and other replicas sync locally.
     tokio::spawn({
         let state = app_state.clone();
+        let distributed_backend = distributed_backend.clone();
         let mut shutdown_rx = shutdown_rx.clone();
         async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
@@ -1695,45 +1829,78 @@ async fn main() -> Result<()> {
                 if !tick_or_shutdown(&mut interval, &mut shutdown_rx).await {
                     break;
                 }
-                let targets = {
+                let (targets, custom_reconcile) = {
                     let live = state.live.read().await;
-                    live.health_check_targets.clone()
+                    (
+                        live.health_check_targets.clone(),
+                        live.custom_reconcile_queries.clone(),
+                    )
                 };
-                for (adapter, cstate) in &targets {
-                    // In distributed mode, sync local counter from CapacityStore (global truth).
-                    if let Some(cap) = &state.capacity_store {
-                        if let Ok(global) = cap.active_count(&cstate.cluster_name.0).await {
-                            cstate.set_running_queries(global);
-                            continue;
-                        }
-                    }
 
-                    let tracked = cstate.running_queries();
-                    let max = cstate.max_running_queries();
-                    if tracked > max {
-                        let fix = adapter.fetch_running_query_count().await.unwrap_or(0);
-                        tracing::warn!(
-                            cluster = %cstate.cluster_name.0,
-                            group = %cstate.group_name.0,
-                            tracked,
-                            max,
-                            fix,
-                            "running_queries above group capacity; resetting from engine count"
-                        );
-                        cstate.set_running_queries(fix);
-                        continue;
-                    }
-                    if let Some(actual) = adapter.fetch_running_query_count().await {
-                        if actual != tracked {
-                            tracing::info!(
-                                cluster = %cstate.cluster_name.0,
-                                group = %cstate.group_name.0,
-                                tracked,
-                                actual,
-                                "Reconciling running_queries counter with engine ground truth"
-                            );
-                            cstate.set_running_queries(actual);
+                if let Some(ref db) = distributed_backend {
+                    let capacity_store =
+                        db.clone() as Arc<dyn queryflux_persistence::CapacityStore>;
+                    match db.try_sweep_lock("engine-reconcile").await {
+                        Ok(Some(lock)) => {
+                            for (adapter, cstate) in &targets {
+                                let cluster_name = &cstate.cluster_name.0;
+                                let actual = fetch_engine_running_count(
+                                    adapter,
+                                    cluster_name,
+                                    &custom_reconcile,
+                                )
+                                .await;
+                                if let Some(count) = actual {
+                                    if let Err(e) = capacity_store
+                                        .publish_running_count(cluster_name, count)
+                                        .await
+                                    {
+                                        state
+                                            .metrics
+                                            .on_coordination_failure("engine_reconcile_publish");
+                                        tracing::warn!(
+                                            cluster = %cluster_name,
+                                            "Failed to publish engine running count: {e}"
+                                        );
+                                    }
+                                }
+                                apply_reconcile_to_cluster_state(cstate, actual);
+                            }
+                            let _ = lock.release().await;
                         }
+                        Ok(None) => {
+                            for (_, cstate) in &targets {
+                                let cluster_name = &cstate.cluster_name.0;
+                                match capacity_store.active_count(cluster_name).await {
+                                    Ok(count) => {
+                                        apply_reconcile_to_cluster_state(cstate, Some(count));
+                                    }
+                                    Err(e) => {
+                                        state
+                                            .metrics
+                                            .on_coordination_failure("engine_reconcile_read");
+                                        tracing::warn!(
+                                            cluster = %cluster_name,
+                                            "Failed to read engine running count: {e}"
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            state
+                                .metrics
+                                .on_coordination_failure("engine_reconcile_sweep_lock");
+                            tracing::warn!("Engine reconcile sweep lock failed: {e}");
+                        }
+                    }
+                } else {
+                    for (adapter, cstate) in &targets {
+                        let cluster_name = &cstate.cluster_name.0;
+                        let actual =
+                            fetch_engine_running_count(adapter, cluster_name, &custom_reconcile)
+                                .await;
+                        apply_reconcile_to_cluster_state(cstate, actual);
                     }
                 }
             }
@@ -1982,6 +2149,33 @@ fn unauthenticated_passthrough_clusters(
         .collect()
 }
 
+/// Parses the `variants` JSONB column into `ClusterVariant`s. Shared by every
+/// startup/reload path that expands a persisted cluster record into runtime
+/// clusters, so the parsing behavior (and its `unwrap_or_default` on malformed
+/// JSON) stays identical everywhere instead of drifting across call sites.
+fn parse_cluster_variants(
+    variants_json: &serde_json::Value,
+) -> Vec<queryflux_core::config::ClusterVariant> {
+    serde_json::from_value(variants_json.clone()).unwrap_or_default()
+}
+
+/// Extracts the base `healthCheckQuery` / `reconcileQuery` overrides from a
+/// cluster's persisted `config` JSONB blob, ahead of variant expansion (which
+/// applies driver defaults and `{{sub_resource}}` substitution on top). Shared
+/// by every call site that needs these two fields before calling
+/// `expand_cluster_variants`.
+fn extract_base_probe_queries(config_json: &serde_json::Value) -> (Option<String>, Option<String>) {
+    let health_check_query = config_json
+        .get("healthCheckQuery")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let reconcile_query = config_json
+        .get("reconcileQuery")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    (health_check_query, reconcile_query)
+}
+
 /// Convert optional Postgres `BIGINT` (`max_running_queries`) to `Option<u64>`.
 /// Negative values fail fast (invalid row).
 fn max_running_queries_u64_from_db(cluster: &str, v: Option<i64>) -> Result<Option<u64>> {
@@ -2127,6 +2321,14 @@ fn validate_live_config_refs(
     issues
 }
 
+/// Per expanded variant: merged JSON config, optional max concurrency, optional probe SQL.
+type ExpandedVariantConfig = (
+    serde_json::Value,
+    Option<u64>,
+    Option<String>,
+    Option<String>,
+);
+
 /// Build a `LiveConfig` from DB cluster records, group maps, and router chain components.
 ///
 /// This is the DB load path: adapters are built directly from the JSONB config blob
@@ -2150,6 +2352,7 @@ async fn build_live_config(
         cluster_state::ClusterState, simple::SimpleClusterGroupManager,
         strategy::strategy_from_config,
     };
+    use queryflux_core::config::apply_default_probe_queries;
     use queryflux_core::engine_registry::{
         cluster_config_from_persisted_json, json_str, parse_auth_from_config_json,
         parse_engine_key, parse_query_auth_from_config_json,
@@ -2157,6 +2360,7 @@ async fn build_live_config(
     use queryflux_core::tags::QueryTags;
 
     // Build a lookup map from records for group member resolution.
+    // This includes both base record names and expanded variant names.
     let records_by_name: HashMap<
         &str,
         &queryflux_persistence::cluster_config::ClusterConfigRecord,
@@ -2165,10 +2369,62 @@ async fn build_live_config(
         .map(|r| (r.name.as_str(), r))
         .collect();
 
+    // Expand variants: build a map of all valid cluster names (base + expanded).
+    let mut all_cluster_names: HashSet<String> = HashSet::new();
+    // Track which expanded names map to which parent record (for records_by_name resolution).
+    let mut expanded_to_parent: HashMap<
+        String,
+        &queryflux_persistence::cluster_config::ClusterConfigRecord,
+    > = HashMap::new();
+    // Track expanded cluster configs for each variant.
+    let mut expanded_configs: HashMap<String, ExpandedVariantConfig> = HashMap::new();
+
+    for record in cluster_records {
+        let variants = parse_cluster_variants(&record.variants);
+
+        if variants.is_empty() {
+            all_cluster_names.insert(record.name.clone());
+        } else {
+            let (health_check_query, reconcile_query) = extract_base_probe_queries(&record.config);
+            match queryflux_core::config::expand_cluster_variants(
+                &record.name,
+                &record.config,
+                &record.engine_key,
+                &variants,
+                health_check_query.as_deref(),
+                reconcile_query.as_deref(),
+            ) {
+                Ok(expanded) => {
+                    for exp in expanded {
+                        all_cluster_names.insert(exp.expanded_name.clone());
+                        expanded_to_parent.insert(exp.expanded_name.clone(), record);
+                        expanded_configs.insert(
+                            exp.expanded_name,
+                            (
+                                exp.merged_config,
+                                exp.max_running_queries,
+                                exp.health_check_query,
+                                exp.reconcile_query,
+                            ),
+                        );
+                    }
+                }
+                Err(err) => {
+                    tracing::error!(cluster = %record.name, error = %err, "Reload: variant expansion failed — cluster omitted");
+                }
+            }
+        }
+    }
+
     let prev_config_json = cache.config_json.clone();
 
     // Build adapters — reuse when serialized cluster config is unchanged.
+    // First handle base (non-variant) records.
     for record in cluster_records {
+        if !parse_cluster_variants(&record.variants).is_empty() {
+            continue; // has variants — handled below
+        }
+
         let cluster_name_str = &record.name;
         if !record.enabled {
             cache.adapters.remove(cluster_name_str.as_str());
@@ -2211,12 +2467,61 @@ async fn build_live_config(
         cache.adapters.insert(cluster_name_str.clone(), adapter);
         cache.config_json.insert(cluster_name_str.clone(), cfg_json);
     }
+
+    // Build adapters for expanded variant clusters.
+    for (expanded_name, (merged_config, _, _, _)) in &expanded_configs {
+        let parent = match expanded_to_parent.get(expanded_name) {
+            Some(p) => p,
+            None => continue,
+        };
+        if !parent.enabled {
+            cache.adapters.remove(expanded_name.as_str());
+            cache.config_json.remove(expanded_name.as_str());
+            continue;
+        }
+        let cfg_json =
+            serde_json::to_string(&(parent.engine_key.as_str(), merged_config)).unwrap_or_default();
+        let reuse = cache.adapters.contains_key(expanded_name.as_str())
+            && prev_config_json
+                .get(expanded_name.as_str())
+                .map(String::as_str)
+                == Some(cfg_json.as_str());
+        if reuse {
+            continue;
+        }
+        cache.adapters.remove(expanded_name.as_str());
+        cache.config_json.remove(expanded_name.as_str());
+
+        let cluster_name = ClusterName(expanded_name.clone());
+        let placeholder_group = ClusterGroupName("_".to_string());
+        let adapter = match registered_engines::build_adapter_from_record(
+            cluster_name,
+            placeholder_group,
+            &parent.engine_key,
+            merged_config,
+        )
+        .await
+        {
+            Ok(a) => a,
+            Err(e) => {
+                tracing::error!(
+                    cluster = %expanded_name,
+                    error = %e,
+                    "Reload: failed to build engine adapter for variant — omitted"
+                );
+                continue;
+            }
+        };
+        cache.adapters.insert(expanded_name.clone(), adapter);
+        cache.config_json.insert(expanded_name.clone(), cfg_json);
+    }
+
     cache
         .adapters
-        .retain(|name, _| records_by_name.contains_key(name.as_str()));
+        .retain(|name, _| all_cluster_names.contains(name));
     cache
         .config_json
-        .retain(|name, _| records_by_name.contains_key(name.as_str()));
+        .retain(|name, _| all_cluster_names.contains(name));
 
     // Build group states.
     let mut group_states: GroupStatesMap = HashMap::new();
@@ -2240,12 +2545,16 @@ async fn build_live_config(
                 );
                 continue;
             }
+            // Resolve member: check base records first, then expanded variant names.
             let record = match records_by_name.get(member_name.as_str()) {
-                Some(r) => r,
-                None => {
-                    tracing::warn!(group = %group_name, cluster = %member_name, "Reload: group references unknown cluster");
-                    continue;
-                }
+                Some(r) => *r,
+                None => match expanded_to_parent.get(member_name.as_str()) {
+                    Some(r) => *r,
+                    None => {
+                        tracing::warn!(group = %group_name, cluster = %member_name, "Reload: group references unknown cluster");
+                        continue;
+                    }
+                },
             };
             if !cache.adapters.contains_key(member_name.as_str()) {
                 tracing::info!(group = %group_name, cluster = %member_name, "Reload: skipping disabled/missing cluster in group");
@@ -2256,16 +2565,35 @@ async fn build_live_config(
                 Err(_) => continue,
             };
             let engine_type = EngineType::from(&engine);
-            let max_q = max_running_queries_u64_from_db(member_name, record.max_running_queries)?
-                .unwrap_or(group_config.max_running_queries);
-            let endpoint = json_str(&record.config, "endpoint");
-            let cluster_cid = cluster_ids_by_name.get(member_name.as_str()).copied();
+            // For expanded variants, use the variant-specific max_running_queries if set.
+            // `?` (not `.unwrap_or_else` — a closure can't propagate `?` out of this
+            // function) so an invalid `max_running_queries` on the base record rejects
+            // the reload here exactly like the non-variant fallback, instead of
+            // silently falling back to the group default.
+            let variant_max_override = expanded_configs
+                .get(member_name.as_str())
+                .and_then(|(_, variant_max, _, _)| *variant_max);
+            let max_q = match variant_max_override {
+                Some(v) => v,
+                None => max_running_queries_u64_from_db(member_name, record.max_running_queries)?
+                    .unwrap_or(group_config.max_running_queries),
+            };
+            // For expanded variants, use merged config for endpoint resolution.
+            let effective_config = expanded_configs
+                .get(member_name.as_str())
+                .map(|(cfg, _, _, _)| cfg)
+                .unwrap_or(&record.config);
+            let endpoint = json_str(effective_config, "endpoint");
+            let cluster_cid = cluster_ids_by_name
+                .get(member_name.as_str())
+                .copied()
+                .or_else(|| expanded_to_parent.get(member_name.as_str()).map(|r| r.id));
             let group_cid = group_ids_by_name.get(group_name.as_str()).copied();
 
             // When the JSONB + engine_key fingerprint is unchanged, rebuild `ClusterState` from
             // the current record anyway (group membership, IDs, endpoint, max_q may still change)
             // but copy health and queue counters from the previous generation.
-            let cfg_json = serde_json::to_string(&(record.engine_key.as_str(), &record.config))
+            let cfg_json = serde_json::to_string(&(record.engine_key.as_str(), effective_config))
                 .unwrap_or_default();
             let config_unchanged = prev_config_json
                 .get(member_name.as_str())
@@ -2332,17 +2660,32 @@ async fn build_live_config(
             }
         };
         let max_running = max_running_queries_u64_from_db(&r.name, r.max_running_queries)?;
-        cluster_configs.insert(
-            r.name.clone(),
-            cluster_config_from_persisted_json(
-                engine,
-                r.enabled,
-                max_running,
-                &r.config,
-                auth,
-                query_auth,
-            ),
+        let base_cfg = cluster_config_from_persisted_json(
+            engine.clone(),
+            r.enabled,
+            max_running,
+            &r.config,
+            auth.clone(),
+            query_auth.clone(),
         );
+
+        let variants = parse_cluster_variants(&r.variants);
+        if variants.is_empty() {
+            let mut base_cfg = base_cfg;
+            apply_default_probe_queries(&mut base_cfg, &r.engine_key, &r.config);
+            cluster_configs.insert(r.name.clone(), base_cfg);
+        } else {
+            // Insert a ClusterConfig entry for each expanded variant name.
+            for (expanded_name, (_, variant_max, hcq, rq)) in &expanded_configs {
+                if expanded_name.starts_with(&format!("{}::", r.name)) {
+                    let mut variant_cfg = base_cfg.clone();
+                    variant_cfg.max_running_queries = variant_max.or(max_running);
+                    variant_cfg.health_check_query = hcq.clone();
+                    variant_cfg.reconcile_query = rq.clone();
+                    cluster_configs.insert(expanded_name.clone(), variant_cfg);
+                }
+            }
+        }
     }
 
     // Build router chain.
@@ -2499,6 +2842,18 @@ async fn build_live_config(
         ));
     }
 
+    // Build custom health/reconcile query maps from cluster configs.
+    let mut custom_health_queries: HashMap<String, String> = HashMap::new();
+    let mut custom_reconcile_queries: HashMap<String, String> = HashMap::new();
+    for (name, cfg) in &cluster_configs {
+        if let Some(q) = &cfg.health_check_query {
+            custom_health_queries.insert(name.clone(), q.clone());
+        }
+        if let Some(q) = &cfg.reconcile_query {
+            custom_reconcile_queries.insert(name.clone(), q.clone());
+        }
+    }
+
     Ok(LiveConfig {
         router_chain,
         guard_chain: None,
@@ -2506,6 +2861,8 @@ async fn build_live_config(
         cluster_manager,
         adapters: cache.adapters.clone(),
         health_check_targets,
+        custom_health_queries,
+        custom_reconcile_queries,
         cluster_configs,
         group_members,
         group_order,
@@ -2544,10 +2901,16 @@ async fn reload_live_config(
         .list_cluster_configs()
         .await
         .context("reload: list_cluster_configs")?;
-    let cluster_ids_by_name: HashMap<String, i64> = cluster_records
+    let mut cluster_ids_by_name: HashMap<String, i64> = cluster_records
         .iter()
         .map(|r| (r.name.clone(), r.id))
         .collect();
+    // Also map expanded variant names to their parent's DB ID.
+    for r in &cluster_records {
+        for v in &parse_cluster_variants(&r.variants) {
+            cluster_ids_by_name.insert(format!("{}::{}", r.name, v.name), r.id);
+        }
+    }
 
     let group_records = pg
         .list_group_configs()
@@ -3098,6 +3461,52 @@ fn build_guard_chains_from_db_value(
         .unwrap_or_default();
 
     (global, groups)
+}
+
+async fn fetch_engine_running_count(
+    adapter: &queryflux_engine_adapters::AdapterKind,
+    cluster_name: &str,
+    custom_reconcile: &HashMap<String, String>,
+) -> Option<u64> {
+    if let Some(custom_sql) = custom_reconcile.get(cluster_name) {
+        adapter.execute_custom_reconcile_query(custom_sql).await
+    } else {
+        adapter.fetch_running_query_count().await
+    }
+}
+
+fn apply_reconcile_to_cluster_state(
+    cstate: &queryflux_cluster_manager::cluster_state::ClusterState,
+    actual: Option<u64>,
+) {
+    let cluster_name = &cstate.cluster_name.0;
+    let tracked = cstate.running_queries();
+    let max = cstate.max_running_queries();
+    if tracked > max {
+        let fix = actual.unwrap_or(0);
+        tracing::warn!(
+            cluster = %cluster_name,
+            group = %cstate.group_name.0,
+            tracked,
+            max,
+            fix,
+            "running_queries above group capacity; resetting from engine count"
+        );
+        cstate.set_running_queries(fix);
+        return;
+    }
+    if let Some(actual) = actual {
+        if actual != tracked {
+            tracing::info!(
+                cluster = %cluster_name,
+                group = %cstate.group_name.0,
+                tracked,
+                actual,
+                "Reconciling running_queries counter with engine ground truth"
+            );
+            cstate.set_running_queries(actual);
+        }
+    }
 }
 
 /// Metrics chain for in-memory persistence: Prometheus plus the in-memory store

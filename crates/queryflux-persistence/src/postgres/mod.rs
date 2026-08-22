@@ -540,13 +540,14 @@ impl ClusterConfigStore for PostgresStore {
         cfg: &UpsertClusterConfig,
     ) -> Result<ClusterConfigRecord> {
         sqlx::query_as::<_, ClusterConfigRecord>(
-            r#"INSERT INTO cluster_configs (name, engine_key, enabled, max_running_queries, config)
-               VALUES ($1, $2, $3, $4, $5)
+            r#"INSERT INTO cluster_configs (name, engine_key, enabled, max_running_queries, config, variants)
+               VALUES ($1, $2, $3, $4, $5, $6)
                ON CONFLICT (name) DO UPDATE SET
                    engine_key          = EXCLUDED.engine_key,
                    enabled             = EXCLUDED.enabled,
                    max_running_queries = EXCLUDED.max_running_queries,
                    config              = EXCLUDED.config,
+                   variants            = EXCLUDED.variants,
                    updated_at          = now()
                RETURNING *"#,
         )
@@ -555,6 +556,7 @@ impl ClusterConfigStore for PostgresStore {
         .bind(cfg.enabled)
         .bind(cfg.max_running_queries)
         .bind(&cfg.config)
+        .bind(&cfg.variants)
         .fetch_one(&self.admin_pool)
         .await
         .map_err(|e| QueryFluxError::Persistence(format!("upsert_cluster_config: {e}")))
@@ -1925,26 +1927,34 @@ impl CapacityStore for PostgresStore {
     ) -> Result<bool> {
         let max_rq = max_running_queries.min(i64::MAX as u64) as i64;
 
-        // O(1) admission in a single statement: increment the per-cluster
-        // counter iff under the limit (the counter row's lock makes concurrent
-        // acquires for the same cluster serialize correctly; different clusters
-        // do not contend), and insert the lease only when granted.
+        // Admission: grant a lease iff the current lease count is below the limit.
+        // Leases live in cluster_capacity_leases; cluster_capacity_counters.running
+        // is updated only by reconcile sweeps.
         //
-        // The first CTE's INSERT path covers the cluster's very first acquire
-        // (`WHERE $4 >= 1` keeps a zero limit denying); ON CONFLICT covers all
-        // later ones. If the lease insert hits a duplicate query_id (not
-        // reachable from current call sites — leases are released before any
-        // re-dispatch of the same query), the counter drifts +1 until the
-        // sweep's reconcile in expire_stale corrects it.
+        // The count-then-insert is not atomic on its own — a plain `SELECT COUNT(*)`
+        // takes no row lock, so two concurrent transactions could both observe
+        // "under limit" before either commits its INSERT and over-admit past
+        // max_running_queries. `pg_advisory_xact_lock` serializes acquires for the
+        // *same* cluster_name (held only for this transaction, released on
+        // commit/rollback) while leaving other clusters uncontended, same pattern
+        // as the `engine-reconcile` sweep lock.
+        let mut tx = self
+            .coordination_pool
+            .begin()
+            .await
+            .map_err(|e| QueryFluxError::Persistence(format!("try_acquire begin: {e}")))?;
+
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtext('capacity:' || $1)::bigint)")
+            .bind(cluster_name)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| QueryFluxError::Persistence(format!("try_acquire lock: {e}")))?;
+
         let result = sqlx::query_scalar::<_, bool>(
             r#"
             WITH up AS (
-                INSERT INTO cluster_capacity_counters AS c (cluster_name, running)
-                SELECT $1, 1 WHERE $4 >= 1
-                ON CONFLICT (cluster_name) DO UPDATE
-                    SET running = c.running + 1
-                    WHERE c.running < $4
-                RETURNING 1
+                SELECT 1
+                WHERE (SELECT COUNT(*) FROM cluster_capacity_leases WHERE cluster_name = $1) < $4
             ),
             ins AS (
                 INSERT INTO cluster_capacity_leases (query_id, cluster_name, instance_id)
@@ -1960,34 +1970,23 @@ impl CapacityStore for PostgresStore {
         .bind(instance_id)
         .bind(query_id)
         .bind(max_rq)
-        .fetch_one(&self.coordination_pool)
+        .fetch_one(&mut *tx)
         .await
         .map_err(|e| QueryFluxError::Persistence(format!("try_acquire: {e}")))?;
+
+        tx.commit()
+            .await
+            .map_err(|e| QueryFluxError::Persistence(format!("try_acquire commit: {e}")))?;
 
         Ok(result)
     }
 
     async fn release(&self, _cluster_name: &str, query_id: &str) -> Result<()> {
-        // Delete the lease and decrement its cluster's counter in one
-        // statement. Idempotent: a second release deletes nothing, so the
-        // counter is not decremented twice.
-        sqlx::query(
-            r#"
-            WITH del AS (
-                DELETE FROM cluster_capacity_leases
-                WHERE query_id = $1
-                RETURNING cluster_name
-            )
-            UPDATE cluster_capacity_counters c
-            SET running = GREATEST(c.running - 1, 0)
-            FROM del
-            WHERE c.cluster_name = del.cluster_name
-            "#,
-        )
-        .bind(query_id)
-        .execute(&self.coordination_pool)
-        .await
-        .map_err(|e| QueryFluxError::Persistence(format!("release: {e}")))?;
+        sqlx::query("DELETE FROM cluster_capacity_leases WHERE query_id = $1")
+            .bind(query_id)
+            .execute(&self.coordination_pool)
+            .await
+            .map_err(|e| QueryFluxError::Persistence(format!("release: {e}")))?;
         Ok(())
     }
 
@@ -2003,56 +2002,15 @@ impl CapacityStore for PostgresStore {
     }
 
     async fn expire_stale(&self, cutoff: DateTime<Utc>) -> Result<u64> {
-        // Known non-atomicity: DELETE + reconcile UPDATE are two separate statements.
-        // A new acquire can commit its lease row between them, causing the counter to
-        // be written one lower than the true lease count. Under-admission is the safe
-        // direction (one query slot is wasted, not over-allocated), and the next sweep
-        // cycle (~120 s) corrects any drift. We accept this over a heavier serializable
-        // transaction because the sweep runs infrequently and correctness is recovered.
         let result = sqlx::query("DELETE FROM cluster_capacity_leases WHERE heartbeat_at < $1")
             .bind(cutoff)
             .execute(&self.coordination_pool)
             .await
             .map_err(|e| QueryFluxError::Persistence(format!("expire_stale: {e}")))?;
-
-        // Reconcile the admission counters from the leases (the ground truth):
-        // covers the rows just expired plus any drift from edge cases. An
-        // acquire committing between the two updates can be overwritten one
-        // low; the next cycle (120s) corrects it, and under-admission is the
-        // safe direction.
-        sqlx::query(
-            r#"
-            UPDATE cluster_capacity_counters c
-            SET running = sub.cnt
-            FROM (
-                SELECT cluster_name, COUNT(*) AS cnt
-                FROM cluster_capacity_leases
-                GROUP BY cluster_name
-            ) sub
-            WHERE c.cluster_name = sub.cluster_name AND c.running <> sub.cnt
-            "#,
-        )
-        .execute(&self.coordination_pool)
-        .await
-        .map_err(|e| QueryFluxError::Persistence(format!("expire_stale reconcile: {e}")))?;
-
-        sqlx::query(
-            r#"
-            UPDATE cluster_capacity_counters
-            SET running = 0
-            WHERE running <> 0
-              AND cluster_name NOT IN (SELECT cluster_name FROM cluster_capacity_leases)
-            "#,
-        )
-        .execute(&self.coordination_pool)
-        .await
-        .map_err(|e| QueryFluxError::Persistence(format!("expire_stale zero: {e}")))?;
-
         Ok(result.rows_affected())
     }
 
     async fn active_count(&self, cluster_name: &str) -> Result<u64> {
-        // O(1) counter read; reconciled from the leases table by the sweep.
         let count: i64 = sqlx::query_scalar(
             r#"
             SELECT COALESCE(
@@ -2068,35 +2026,42 @@ impl CapacityStore for PostgresStore {
         Ok(count.max(0) as u64)
     }
 
-    async fn release_all_for_instance(&self, instance_id: &str) -> Result<u64> {
-        // Return the number of leases deleted (not counter rows updated). Multiple
-        // leases on one cluster still update a single counter row.
-        let deleted: i64 = sqlx::query_scalar(
+    async fn publish_running_count(&self, cluster_name: &str, count: u64) -> Result<()> {
+        let running = count.min(i64::MAX as u64) as i64;
+        sqlx::query(
             r#"
-            WITH del AS (
-                DELETE FROM cluster_capacity_leases
-                WHERE instance_id = $1
-                RETURNING cluster_name
-            ),
-            counts AS (
-                SELECT cluster_name, COUNT(*)::bigint AS cnt
-                FROM del
-                GROUP BY cluster_name
-            ),
-            _upd AS (
-                UPDATE cluster_capacity_counters c
-                SET running = GREATEST(c.running - counts.cnt, 0)
-                FROM counts
-                WHERE c.cluster_name = counts.cluster_name
-            )
-            SELECT COALESCE((SELECT COUNT(*) FROM del), 0)
+            INSERT INTO cluster_capacity_counters (cluster_name, running)
+            VALUES ($1, $2)
+            ON CONFLICT (cluster_name) DO UPDATE
+                SET running = EXCLUDED.running
             "#,
         )
-        .bind(instance_id)
+        .bind(cluster_name)
+        .bind(running)
+        .execute(&self.coordination_pool)
+        .await
+        .map_err(|e| QueryFluxError::Persistence(format!("publish_running_count: {e}")))?;
+        Ok(())
+    }
+
+    async fn active_lease_count(&self, cluster_name: &str) -> Result<u64> {
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*)::bigint FROM cluster_capacity_leases WHERE cluster_name = $1",
+        )
+        .bind(cluster_name)
         .fetch_one(&self.coordination_pool)
         .await
-        .map_err(|e| QueryFluxError::Persistence(format!("release_all_for_instance: {e}")))?;
-        Ok(deleted.max(0) as u64)
+        .map_err(|e| QueryFluxError::Persistence(format!("active_lease_count: {e}")))?;
+        Ok(count.max(0) as u64)
+    }
+
+    async fn release_all_for_instance(&self, instance_id: &str) -> Result<u64> {
+        let result = sqlx::query("DELETE FROM cluster_capacity_leases WHERE instance_id = $1")
+            .bind(instance_id)
+            .execute(&self.coordination_pool)
+            .await
+            .map_err(|e| QueryFluxError::Persistence(format!("release_all_for_instance: {e}")))?;
+        Ok(result.rows_affected())
     }
 }
 
@@ -2410,10 +2375,12 @@ mod tests {
             .unwrap();
         assert!(acquired);
 
-        let count = store.active_count("test-cluster").await.unwrap();
+        let count = store.active_lease_count("test-cluster").await.unwrap();
         assert!(count >= 1);
 
         store.release("test-cluster", &qid).await.unwrap();
+
+        assert_eq!(store.active_lease_count("test-cluster").await.unwrap(), 0);
     }
 
     #[tokio::test]
@@ -2517,7 +2484,7 @@ mod tests {
             granted, LIMIT,
             "exactly the limit must be granted under contention"
         );
-        assert_eq!(store.active_count(&cluster).await.unwrap(), LIMIT);
+        assert_eq!(store.active_lease_count(&cluster).await.unwrap(), LIMIT);
 
         for i in 0..(LIMIT * 4) {
             let _ = store.release(&cluster, &format!("{cluster}-q{i}")).await;
@@ -2526,7 +2493,7 @@ mod tests {
 
     #[tokio::test]
     #[ignore]
-    async fn pg_capacity_counter_stays_consistent() {
+    async fn pg_capacity_leases_stay_consistent() {
         let _guard = CAPACITY_TEST_LOCK.lock().await;
         let store = test_store().await;
         let cluster = unique_id("cnt");
@@ -2537,25 +2504,41 @@ mod tests {
                 .await
                 .unwrap());
         }
-        assert_eq!(store.active_count(&cluster).await.unwrap(), 3);
+        assert_eq!(store.active_lease_count(&cluster).await.unwrap(), 3);
 
         store
             .release(&cluster, &format!("{cluster}-q2"))
             .await
             .unwrap();
-        assert_eq!(store.active_count(&cluster).await.unwrap(), 2);
+        assert_eq!(store.active_lease_count(&cluster).await.unwrap(), 2);
 
-        // Double release is a no-op on the counter.
+        // Double release is a no-op.
         store
             .release(&cluster, &format!("{cluster}-q2"))
             .await
             .unwrap();
-        assert_eq!(store.active_count(&cluster).await.unwrap(), 2);
+        assert_eq!(store.active_lease_count(&cluster).await.unwrap(), 2);
 
-        // Expiring every lease reconciles the counter back to zero.
+        // Expiring every lease clears admission slots.
         let far_future = chrono::Utc::now() + chrono::Duration::hours(1);
         store.expire_stale(far_future).await.unwrap();
+        assert_eq!(store.active_lease_count(&cluster).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn pg_capacity_publish_running_count() {
+        let _guard = CAPACITY_TEST_LOCK.lock().await;
+        let store = test_store().await;
+        let cluster = unique_id("reconcile");
+
         assert_eq!(store.active_count(&cluster).await.unwrap(), 0);
+
+        store.publish_running_count(&cluster, 42).await.unwrap();
+        assert_eq!(store.active_count(&cluster).await.unwrap(), 42);
+
+        store.publish_running_count(&cluster, 7).await.unwrap();
+        assert_eq!(store.active_count(&cluster).await.unwrap(), 7);
     }
 
     #[tokio::test]
@@ -2585,7 +2568,7 @@ mod tests {
         assert!(renewed >= 1, "heartbeat should renew the lease we hold");
 
         store.expire_stale(cutoff).await.unwrap();
-        let count = store.active_count("test-cluster-hb").await.unwrap();
+        let count = store.active_lease_count("test-cluster-hb").await.unwrap();
         assert!(count >= 1, "heartbeated lease must survive expiry");
 
         store.release("test-cluster-hb", &qid).await.unwrap();
@@ -2633,11 +2616,11 @@ mod tests {
                 .unwrap(),
             "replica-b must be denied once fleet is at limit"
         );
-        assert_eq!(store.active_count(&cluster).await.unwrap(), LIMIT);
+        assert_eq!(store.active_lease_count(&cluster).await.unwrap(), LIMIT);
 
         store.release(&cluster, &q1).await.unwrap();
         store.release(&cluster, &q2).await.unwrap();
-        assert_eq!(store.active_count(&cluster).await.unwrap(), 0);
+        assert_eq!(store.active_lease_count(&cluster).await.unwrap(), 0);
     }
 
     /// Crash path: holder never calls `release`. After `expire_stale`, a survivor
@@ -2671,7 +2654,7 @@ mod tests {
             expired >= 1,
             "expire_stale must reclaim the crashed instance lease"
         );
-        assert_eq!(store.active_count(&cluster).await.unwrap(), 0);
+        assert_eq!(store.active_lease_count(&cluster).await.unwrap(), 0);
 
         assert!(
             store
@@ -2680,7 +2663,7 @@ mod tests {
                 .unwrap(),
             "survivor must acquire after lease expiry reclaim"
         );
-        assert_eq!(store.active_count(&cluster).await.unwrap(), 1);
+        assert_eq!(store.active_lease_count(&cluster).await.unwrap(), 1);
 
         store.release(&cluster, &next).await.unwrap();
     }
@@ -2714,7 +2697,7 @@ mod tests {
 
         let freed = store.release_all_for_instance(&departing).await.unwrap();
         assert_eq!(freed, 2);
-        assert_eq!(store.active_count(&cluster).await.unwrap(), 0);
+        assert_eq!(store.active_lease_count(&cluster).await.unwrap(), 0);
 
         assert!(store
             .try_acquire(&cluster, LIMIT, "survivor", &q3)

@@ -290,6 +290,12 @@ pub trait SyncAdapter: Send + Sync {
     async fn fetch_running_query_count(&self) -> Option<u64> {
         None
     }
+    async fn execute_custom_health_check(&self, _sql: &str) -> bool {
+        self.health_check().await
+    }
+    async fn execute_custom_reconcile_query(&self, _sql: &str) -> Option<u64> {
+        None
+    }
     async fn list_catalogs(&self) -> Result<Vec<String>>;
     async fn list_databases(&self, catalog: &str) -> Result<Vec<String>>;
     async fn list_tables(&self, catalog: &str, database: &str) -> Result<Vec<String>>;
@@ -411,6 +417,28 @@ impl AdapterKind {
         match self {
             Self::Sync(a) => a.fetch_running_query_count().await,
             Self::Async(a) => a.fetch_running_query_count().await,
+        }
+    }
+
+    /// Execute a custom SQL query and return success/failure. Used for custom health checks.
+    pub async fn execute_custom_health_check(&self, sql: &str) -> bool {
+        match self {
+            Self::Sync(a) => a.execute_custom_health_check(sql).await,
+            Self::Async(a) => {
+                // Async adapters (Trino/Athena) don't have a simple SQL execution path
+                // for custom health checks. Fall back to the default health_check().
+                let _ = sql;
+                a.health_check().await
+            }
+        }
+    }
+
+    /// Execute a custom SQL query and read a single u64 from the first column of the first row.
+    /// Used for custom reconciliation queries.
+    pub async fn execute_custom_reconcile_query(&self, sql: &str) -> Option<u64> {
+        match self {
+            Self::Sync(a) => a.execute_custom_reconcile_query(sql).await,
+            Self::Async(_) => None,
         }
     }
 

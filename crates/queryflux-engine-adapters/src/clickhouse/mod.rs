@@ -860,6 +860,9 @@ mod tests {
             driver: None,
             auth: None,
             query_auth: None,
+            variants: vec![],
+            health_check_query: None,
+            reconcile_query: None,
         };
         assert!(ClickHouseConfig::from_cluster_config(&cfg, "ch-1").is_err());
 

@@ -99,6 +99,8 @@ mod tests {
             cluster_manager: Arc::new(SimpleClusterGroupManager::new(groups)),
             adapters: HashMap::new(),
             health_check_targets: vec![],
+            custom_health_queries: HashMap::new(),
+            custom_reconcile_queries: HashMap::new(),
             cluster_configs: HashMap::new(),
             group_members: HashMap::from([
                 ("analytics".into(), vec!["c1".into()]),

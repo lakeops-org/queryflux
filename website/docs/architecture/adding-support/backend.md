@@ -83,6 +83,14 @@ Adapters implement one of two traits depending on their execution model:
 
 Use **`QueryFluxError::Engine(format!(...))`** and include the **`cluster_name_str`** argument in messages so logs show which cluster failed.
 
+#### ADBC SaaS drivers — health check and reconcile
+
+If you add an **ADBC** driver for a cloud warehouse with auto-suspend, implement **`AdbcIntrospection`** in `crates/queryflux-engine-adapters/src/adbc/` rather than defaulting to `SELECT 1` health checks (which resume warehouses). Wire it in `AdbcAdapter::build_introspection()`.
+
+Operators can still override probes with optional `healthCheckQuery` / `reconcileQuery` on the cluster config. Multi-warehouse setups use **cluster variants** — see **[Cluster variants, health checks & reconciliation](../cluster-variants-and-health.md)**.
+
+In **distributed mode**, the reconcile loop runs on one replica per cycle and publishes your introspection result to `cluster_capacity_counters.running` via `CapacityStore::publish_running_count`.
+
 ### Step 4 — Register the factory (`queryflux` binary)
 
 In **`crates/queryflux/src/registered_engines.rs`**:

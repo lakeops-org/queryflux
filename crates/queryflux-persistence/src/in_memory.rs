@@ -62,6 +62,8 @@ pub struct InMemoryPersistence {
 
     // --- distributed-mode coordination (single-instance no-ops) ---
     config_revision: AtomicU64,
+    /// Published reconcile counts (single-process tests only).
+    published_running_counts: DashMap<String, u64>,
 
     // --- cache entry metadata ---
     cache_entries: DashMap<String, crate::cache_store::CacheEntryMeta>,
@@ -83,6 +85,7 @@ impl Default for InMemoryPersistence {
             next_script_id: AtomicI64::new(1),
             proxy_settings: std::sync::RwLock::new(std::collections::HashMap::new()),
             config_revision: AtomicU64::new(0),
+            published_running_counts: DashMap::default(),
             cache_entries: DashMap::default(),
         }
     }
@@ -460,6 +463,7 @@ impl ClusterConfigStore for InMemoryPersistence {
             enabled: cfg.enabled,
             max_running_queries: cfg.max_running_queries,
             config: cfg.config.clone(),
+            variants: cfg.variants.clone(),
             created_at: existing_created_at.unwrap_or(now),
             updated_at: now,
         };
@@ -485,6 +489,7 @@ impl ClusterConfigStore for InMemoryPersistence {
                     enabled: cfg.enabled,
                     max_running_queries: cfg.max_running_queries,
                     config: cfg.config.clone(),
+                    variants: cfg.variants.clone(),
                     created_at: now,
                     updated_at: now,
                 });
@@ -930,8 +935,21 @@ impl CapacityStore for InMemoryPersistence {
         Ok(0)
     }
 
-    async fn active_count(&self, _cluster_name: &str) -> Result<u64> {
-        // In-memory mode: local ClusterState is the source of truth.
+    async fn active_count(&self, cluster_name: &str) -> Result<u64> {
+        Ok(self
+            .published_running_counts
+            .get(cluster_name)
+            .map(|v| *v)
+            .unwrap_or(0))
+    }
+
+    async fn publish_running_count(&self, cluster_name: &str, count: u64) -> Result<()> {
+        self.published_running_counts
+            .insert(cluster_name.to_string(), count);
+        Ok(())
+    }
+
+    async fn active_lease_count(&self, _cluster_name: &str) -> Result<u64> {
         Ok(0)
     }
 
@@ -1150,6 +1168,7 @@ mod tests {
             enabled: true,
             max_running_queries: None,
             config: serde_json::json!({"endpoint": "http://localhost:8080"}),
+            variants: serde_json::Value::Array(Vec::new()),
         }
     }
 
