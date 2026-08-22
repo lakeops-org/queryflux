@@ -28,7 +28,10 @@ use queryflux_translation::TranslationService;
 /// that any handler can cheaply read a consistent snapshot, and a background
 /// task can atomically swap the whole bundle on each reload tick.
 pub struct LiveConfig {
-    pub router_chain: RouterChain,
+    /// `Arc`-wrapped (like `cluster_manager`/`authorization` below) so handlers that need to
+    /// call into it — e.g. the `/admin/route-explain` preview — can clone it out of the read
+    /// lock instead of holding the lock across the `await`.
+    pub router_chain: Arc<RouterChain>,
     /// Global guard chain — runs for every query regardless of cluster group.
     /// `None` means no global guardrails are configured.
     pub guard_chain: Option<Arc<GuardChain>>,
@@ -651,7 +654,7 @@ pub mod test_fixtures {
             ),
         );
         let live = LiveConfig {
-            router_chain: RouterChain::new(vec![], group_name.clone()),
+            router_chain: Arc::new(RouterChain::new(vec![], group_name.clone())),
             guard_chain: None,
             group_guard_chains: HashMap::new(),
             cluster_manager: Arc::new(SimpleClusterGroupManager::new(groups)),

@@ -658,7 +658,7 @@ async fn main() -> Result<()> {
         }
     }
 
-    let router_chain = RouterChain::new(routers, fallback);
+    let router_chain = Arc::new(RouterChain::new(routers, fallback));
 
     config
         .validate_startup_security()
@@ -2448,7 +2448,7 @@ async fn build_live_config(
             }
         }
     }
-    let router_chain = RouterChain::new(routers, fallback);
+    let router_chain = Arc::new(RouterChain::new(routers, fallback));
 
     let group_default_tags: HashMap<String, QueryTags> = cluster_groups
         .iter()

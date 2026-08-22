@@ -36,6 +36,26 @@ pub async fn resolve_routed_group(
     )))
 }
 
+/// The unconditional per-group authorization check every dispatch path runs on the
+/// resolved group, regardless of whether it was reached via an explicit router match or
+/// the fallback-reroute in [`resolve_routed_group`]. Returns `Some(message)` when denied,
+/// `None` when authorized — callers decide what to do with a denial (return an error,
+/// write it to a sink, or report it in a dry-run preview).
+pub async fn check_group_authorized(
+    authorization: &dyn AuthorizationChecker,
+    auth_ctx: &AuthContext,
+    group: &ClusterGroupName,
+) -> Option<String> {
+    if authorization.check(auth_ctx, &group.0).await {
+        None
+    } else {
+        Some(format!(
+            "user '{}' is not authorized to run queries on cluster group '{}'",
+            auth_ctx.user, group.0
+        ))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -93,7 +113,7 @@ mod tests {
             ),
         );
         LiveConfig {
-            router_chain: RouterChain::new(vec![], default.clone()),
+            router_chain: Arc::new(RouterChain::new(vec![], default.clone())),
             guard_chain: None,
             group_guard_chains: HashMap::new(),
             cluster_manager: Arc::new(SimpleClusterGroupManager::new(groups)),
@@ -247,5 +267,44 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(out.0, "analytics");
+    }
+
+    #[tokio::test]
+    async fn check_group_authorized_allows_when_policy_permits() {
+        let live = live_with_policies(HashMap::from([(
+            "analytics".into(),
+            ClusterGroupAuthorizationConfig {
+                allow_groups: vec!["team-a".into()],
+                allow_users: vec![],
+            },
+        )]));
+        let result = check_group_authorized(
+            live.authorization.as_ref(),
+            &auth("alice", &["team-a"]),
+            &ClusterGroupName("analytics".into()),
+        )
+        .await;
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn check_group_authorized_denies_with_standard_message() {
+        let live = live_with_policies(HashMap::from([(
+            "analytics".into(),
+            ClusterGroupAuthorizationConfig {
+                allow_groups: vec!["team-a".into()],
+                allow_users: vec![],
+            },
+        )]));
+        let result = check_group_authorized(
+            live.authorization.as_ref(),
+            &auth("bob", &[]),
+            &ClusterGroupName("analytics".into()),
+        )
+        .await;
+        assert_eq!(
+            result.as_deref(),
+            Some("user 'bob' is not authorized to run queries on cluster group 'analytics'")
+        );
     }
 }

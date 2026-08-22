@@ -1616,7 +1616,7 @@ mod cancel_executing_statement_tests {
             ),
         );
         let live = LiveConfig {
-            router_chain: RouterChain::new(vec![], group_name.clone()),
+            router_chain: Arc::new(RouterChain::new(vec![], group_name.clone())),
             guard_chain: None,
             group_guard_chains: HashMap::new(),
             cluster_manager: Arc::new(SimpleClusterGroupManager::new(groups)),

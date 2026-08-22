@@ -11,6 +11,8 @@ import type {
   GuardrailsConfig,
   QueryHistoryRecord,
   QueryListParams,
+  RouteExplainRequest,
+  RouteExplainResponse,
 } from "./api-types";
 import {
   SESSION_COOKIE_NAME,
@@ -428,6 +430,14 @@ export async function testClusterConfig(
 }
 
 // ---------------------------------------------------------------------------
+// Route explain — dry-run routing/guard/capacity preview
+// ---------------------------------------------------------------------------
+
+export async function explainRoute(body: RouteExplainRequest): Promise<RouteExplainResponse> {
+  return apiPost("/admin/route-explain", body);
+}
+
+// ---------------------------------------------------------------------------
 // Auth management
 // ---------------------------------------------------------------------------
 
@@ -469,10 +479,13 @@ export type {
   OpenFgaConfigDto,
   QueryHistoryRecord,
   QueryListParams,
+  RouteExplainRequest,
+  RouteExplainResponse,
   RouterConfigEntry,
   RoutingConfigDto,
   RoutingTrace,
   RoutingDecision,
+  GroupCapacityDto,
   SecurityConfigDto,
   UpsertClusterConfig,
   UpsertClusterGroupConfig,

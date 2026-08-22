@@ -127,7 +127,48 @@ def route(query: str, ctx: dict) -> str | None:
 
 ## Routing trace
 
-`route_with_trace` records each router’s decision (`matched`, optional `result`) and whether the **fallback** group was used. This supports debugging and future UI/metrics (see `RoutingTrace` in `queryflux_routing::chain`).
+`route_with_trace` records each router’s decision (`matched`, optional `result`, and — when a `queryRegex` deny rule fires — `deny_message`) and whether the **fallback** group was used (see `RoutingTrace` in `queryflux_routing::chain`). Every dispatched query's trace is persisted with its `QueryRecord` and rendered in Studio's Queries page. The same trace type also powers the **route-explain** preview below, so a historical trace and a dry-run trace render identically.
+
+## Route explain (dry run)
+
+`POST /admin/route-explain` answers "where would this query go, and what would happen to it" **without executing the query or consuming any capacity**. It mirrors the real dispatch order exactly — route → fallback-resolve → authorize → guard preview → capacity — so the answer matches what would actually happen if the query were submitted for real.
+
+**Request:**
+
+```json
+{
+  "sql": "SELECT * FROM prod.orders",
+  "protocol": "trinoHttp",
+  "user": "alice",
+  "groups": ["team-a"],
+  "database": null,
+  "tags": { "team": "eng" }
+}
+```
+
+`user`/`groups` are a **simulated identity** — they are not verified against any `AuthProvider`. This is what makes the endpoint useful for testing `allowGroups`/`allowUsers` rules before rolling them out: "if a query came in as this user, what would happen?" Because the endpoint sits behind the same admin Basic-auth gate as every other `/admin/*` route, an admin credential holder can already probe outcomes for any simulated user — that is the intended use, not a bypass of real authentication.
+
+**Response:**
+
+```json
+{
+  "routing_trace": { "decisions": [...], "final_group": "team-a-cluster", "used_fallback": false },
+  "denied": null,
+  "guard_actions": [{ "guard": "read_only", "action": "allow", "reason": null, "code": null }],
+  "would_be_guard_blocked": false,
+  "capacity": {
+    "group_name": "team-a-cluster",
+    "members": [{ "cluster_name": "trino-1", "running_queries": 2, "max_running_queries": 10, "is_healthy": true, "enabled": true }],
+    "would_queue": false
+  }
+}
+```
+
+- **`denied`** is set when a router (e.g. a `queryRegex` deny rule) or the per-group authorization check would reject the query. When set, `guard_actions` is empty and `capacity` is absent — nothing downstream of the deny was evaluated.
+- **`guard_actions`** / **`would_be_guard_blocked`** come from running the resolved group's guard chain (global chain, then the group's chain) against the translated SQL — the same way and same order the real pre-dispatch guard pass runs, using the resolved group's real engine type (from the first member) as the translation target. Groups with heterogeneous engine types across members are not modeled here — the first member stands in for the whole group.
+- **`capacity`** is a deliberately best-effort, moment-in-time signal — different in kind from `routing_trace`/`guard_actions`. Routing, authorization, and guardrail verdicts are config-driven: the same request gives the same answer regardless of when you ask, which is what makes them worth previewing. Capacity is live runtime state — it can change before you act on it no matter how accurately it's computed, so this endpoint doesn't try to make it authoritative. `would_queue: true` means "no member is currently enabled, healthy, and under `maxRunningQueries`" — i.e. would not dispatch immediately as of this snapshot — but it does **not** check the group's `maxQueuedQueries` admission limit, so it isn't a guarantee the query would successfully queue rather than being rejected outright with `QueueFull`. For authoritative live state, poll `GET /admin/clusters` (which this endpoint also reads from — it never calls `acquire_cluster`, so calling it has no side effects and consumes no capacity).
+
+Studio exposes this as the **Route Explain** page (left nav) — a form for SQL/protocol/simulated identity/tags that renders the same trace, guard, and capacity views used elsewhere in Studio.
 
 ## Cluster group configuration (actual shape)
 
