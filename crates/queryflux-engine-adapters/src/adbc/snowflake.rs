@@ -50,10 +50,12 @@ impl SnowflakeIntrospection {
         )
     }
 
-    /// `LIKE` can return multiple rows (see [`show_warehouses_sql`]); prefer
-    /// the row whose `name` exactly matches (case-insensitive — Snowflake
-    /// identifiers are case-insensitive unless quoted) over blindly taking
-    /// the first row.
+    /// `LIKE` can return multiple rows (see [`show_warehouses_sql`]) — e.g.
+    /// `LIKE 'ETL_WH'` matching only a decoy `ETLXWH` if the intended
+    /// warehouse doesn't exist. Require an exact `name` match (case-
+    /// insensitive — Snowflake identifiers are case-insensitive unless
+    /// quoted); a decoy row's health/running-count must never be reported as
+    /// the target warehouse's, so no match means `None`, not "guess row 0".
     fn find_named_row<'a>(
         batches: &'a [arrow::record_batch::RecordBatch],
         warehouse: &str,
@@ -67,7 +69,7 @@ impl SnowflakeIntrospection {
                 }
             }
         }
-        batches.iter().find(|b| b.num_rows() > 0).map(|b| (b, 0))
+        None
     }
 
     pub(crate) fn parse_show_warehouses_health(
@@ -240,6 +242,22 @@ mod tests {
             Some(3)
         );
         assert!(SnowflakeIntrospection::parse_show_warehouses_health(
+            &batches, "ETL_WH"
+        ));
+    }
+
+    #[test]
+    fn health_and_running_reject_decoy_when_no_exact_match_exists() {
+        // LIKE 'ETL_WH' returning only a decoy (e.g. "ETLXWH", fixture name
+        // "ANALYTICS_WH") must never be reported as ETL_WH's health/count —
+        // that would silently attribute one warehouse's state to another.
+        let decoy = snowflake_show_warehouses_batch("STARTED", 99);
+        let batches = vec![decoy];
+        assert_eq!(
+            SnowflakeIntrospection::parse_show_warehouses_running(&batches, "ETL_WH"),
+            None
+        );
+        assert!(!SnowflakeIntrospection::parse_show_warehouses_health(
             &batches, "ETL_WH"
         ));
     }
