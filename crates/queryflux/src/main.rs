@@ -3692,6 +3692,7 @@ mod tests {
                 user: Some("alice"),
                 agent_context: None,
                 query_tags: tags,
+                sql_parse: None,
             }
         }
 

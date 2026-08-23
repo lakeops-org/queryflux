@@ -78,6 +78,7 @@ async fn count_arrow_rows(adapter: &AdbcAdapter, sql: &str) -> usize {
             &creds,
             &tags,
             &vec![],
+            queryflux_core::sql_classify::ExecutionHints::default(),
             &queryflux_engine_adapters::BackendQueryIdSlot::new(),
         )
         .await
@@ -218,4 +219,179 @@ async fn trino_adbc_from_admin_json_config() {
 
     let n = count_arrow_rows(&adapter, "SELECT 1").await;
     assert!(n >= 1);
+}
+
+/// Regression for lakeops-org/queryflux#97: non-read SQL must use ADBC
+/// `execute_update`, returning an empty Arrow stream and `affected_rows`.
+#[tokio::test]
+#[ignore = "requires Trino + Trino ADBC driver — run with: make test-e2e"]
+async fn trino_adbc_ddl_uses_execute_update_empty_stream() {
+    let Some(adapter) = trino_adbc_adapter_ready().await else {
+        return;
+    };
+
+    let session = empty_trino_session();
+    let creds = QueryCredentials::ServiceAccount;
+    let tags = QueryTags::new();
+
+    // Force the update path explicitly (same path dispatch takes for classified DDL).
+    let hints = queryflux_core::sql_classify::ExecutionHints {
+        is_read_like: Some(false),
+    };
+
+    let table = format!(
+        "memory.default.qf_wire_ok_{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis()
+    );
+
+    let create_sql = format!("CREATE TABLE {table} (id BIGINT)");
+    let mut exec = adapter
+        .execute_as_arrow(
+            &create_sql,
+            &session,
+            &creds,
+            &tags,
+            &vec![],
+            hints,
+            &queryflux_engine_adapters::BackendQueryIdSlot::new(),
+        )
+        .await
+        .expect("CREATE via execute_update path");
+
+    assert!(
+        exec.affected_rows.is_some(),
+        "DDL must surface affected_rows from execute_update"
+    );
+
+    let mut batches = 0usize;
+    while let Some(batch_res) = exec.stream.next().await {
+        let batch = batch_res.expect("batch");
+        batches += 1;
+        assert_eq!(
+            batch.num_columns(),
+            0,
+            "DDL update path must not produce a result-set schema"
+        );
+    }
+    assert_eq!(
+        batches, 0,
+        "DDL execute_update path must yield an empty Arrow stream"
+    );
+
+    // Classification without an explicit hint should also route CREATE to update.
+    let drop_sql = format!("DROP TABLE IF EXISTS {table}");
+    let mut drop_exec = adapter
+        .execute_as_arrow(
+            &drop_sql,
+            &session,
+            &creds,
+            &tags,
+            &vec![],
+            queryflux_core::sql_classify::ExecutionHints::default(),
+            &queryflux_engine_adapters::BackendQueryIdSlot::new(),
+        )
+        .await
+        .expect("DROP via classified execute_update path");
+    assert!(
+        drop_exec.affected_rows.is_some(),
+        "classified DDL must set affected_rows"
+    );
+    assert!(
+        drop_exec.stream.next().await.is_none(),
+        "DROP must also produce an empty stream"
+    );
+}
+
+/// SELECT still uses the result-set path (execute), not execute_update.
+#[tokio::test]
+#[ignore = "requires Trino + Trino ADBC driver — run with: make test-e2e"]
+async fn trino_adbc_select_does_not_set_affected_rows() {
+    let Some(adapter) = trino_adbc_adapter_ready().await else {
+        return;
+    };
+
+    let session = empty_trino_session();
+    let creds = QueryCredentials::ServiceAccount;
+    let tags = QueryTags::new();
+    let hints = queryflux_core::sql_classify::ExecutionHints {
+        is_read_like: Some(true),
+    };
+
+    let mut exec = adapter
+        .execute_as_arrow(
+            "SELECT 1 AS n",
+            &session,
+            &creds,
+            &tags,
+            &vec![],
+            hints,
+            &queryflux_engine_adapters::BackendQueryIdSlot::new(),
+        )
+        .await
+        .expect("SELECT");
+
+    assert!(
+        exec.affected_rows.is_none(),
+        "SELECT must not set affected_rows"
+    );
+    let mut rows = 0usize;
+    while let Some(batch_res) = exec.stream.next().await {
+        rows += batch_res.expect("batch").num_rows();
+    }
+    assert!(rows >= 1);
+}
+
+/// Regression: a SELECT matching zero rows must still surface its real schema
+/// (not an empty stream that dispatch would misframe as a DDL/DML OK response).
+#[tokio::test]
+#[ignore = "requires Trino + Trino ADBC driver — run with: make test-e2e"]
+async fn trino_adbc_select_zero_rows_still_yields_schema() {
+    let Some(adapter) = trino_adbc_adapter_ready().await else {
+        return;
+    };
+
+    let session = empty_trino_session();
+    let creds = QueryCredentials::ServiceAccount;
+    let tags = QueryTags::new();
+    let hints = queryflux_core::sql_classify::ExecutionHints {
+        is_read_like: Some(true),
+    };
+
+    let mut exec = adapter
+        .execute_as_arrow(
+            "SELECT 1 AS n WHERE 1 = 0",
+            &session,
+            &creds,
+            &tags,
+            &vec![],
+            hints,
+            &queryflux_engine_adapters::BackendQueryIdSlot::new(),
+        )
+        .await
+        .expect("SELECT");
+
+    assert!(
+        exec.affected_rows.is_none(),
+        "SELECT must not set affected_rows"
+    );
+    let batch = exec
+        .stream
+        .next()
+        .await
+        .expect("empty SELECT must still yield one batch carrying the real schema")
+        .expect("batch");
+    assert_eq!(batch.num_rows(), 0);
+    assert_eq!(
+        batch.schema().fields().len(),
+        1,
+        "schema must have column n"
+    );
+    assert_eq!(batch.schema().field(0).name(), "n");
+    assert!(
+        exec.stream.next().await.is_none(),
+        "only one (empty) batch expected"
+    );
 }

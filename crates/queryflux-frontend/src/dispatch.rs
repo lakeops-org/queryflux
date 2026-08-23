@@ -62,6 +62,17 @@ pub trait ResultSink: Send {
             "on_native_chunk not implemented for this sink".to_string(),
         ))
     }
+
+    /// Called once, after translation, with the exact SQL sent to the adapter.
+    ///
+    /// Sinks that derive per-statement framing from the SQL text (e.g. Postgres
+    /// wire's CommandComplete tag) must classify from *this*, not the pre-translation
+    /// client SQL — translation can rewrite the leading verb (e.g. MySQL `REPLACE
+    /// INTO` → target-dialect `INSERT ... ON CONFLICT`). Default is a no-op for
+    /// sinks that don't need it.
+    async fn on_translated_sql(&mut self, _sql: &str) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// Protocol-agnostic result of dispatching a query to an async (Trino) backend.
@@ -339,6 +350,8 @@ pub async fn dispatch_query(
     // Global guards run first; per-group guards are appended after.
     let resolved_agent_ctx = session.resolved_agent_context();
     let mut all_guard_actions: Vec<queryflux_persistence::GuardAction> = Vec::new();
+    let sql_parse =
+        queryflux_core::sql_classify::SqlParseCache::new(sql.clone(), tgt_dialect.clone());
 
     let guard_ctx = GuardContext {
         sql: &original_sql,
@@ -348,6 +361,7 @@ pub async fn dispatch_query(
         user: session.user(),
         agent_context: resolved_agent_ctx.as_ref(),
         query_tags: &effective_tags,
+        sql_parse: Some(&sql_parse),
     };
 
     macro_rules! guard_deny {
@@ -1096,6 +1110,7 @@ enum DispatchAdapter {
 }
 
 impl DispatchAdapter {
+    #[allow(clippy::too_many_arguments)]
     async fn execute_as_arrow(
         &self,
         sql: &str,
@@ -1103,15 +1118,16 @@ impl DispatchAdapter {
         credentials: &QueryCredentials,
         tags: &queryflux_core::tags::QueryTags,
         params: &QueryParams,
+        hints: queryflux_core::sql_classify::ExecutionHints,
         id_slot: &BackendQueryIdSlot,
     ) -> Result<queryflux_engine_adapters::SyncExecution> {
         match self {
             Self::Sync(a) => {
-                a.execute_as_arrow(sql, session, credentials, tags, params, id_slot)
+                a.execute_as_arrow(sql, session, credentials, tags, params, hints, id_slot)
                     .await
             }
             Self::Async(a) => {
-                a.execute_as_arrow(sql, session, credentials, tags, params, id_slot)
+                a.execute_as_arrow(sql, session, credentials, tags, params, hints, id_slot)
                     .await
             }
         }
@@ -1174,6 +1190,8 @@ struct SyncQuerySetup {
     params: QueryParams,
     /// Guard actions collected by the guard chain (allow/warn). Merged into QueryOutcome.
     guard_actions: Vec<queryflux_persistence::GuardAction>,
+    /// Shared SQL parse cache — used by guardrails and execution hints.
+    sql_parse: queryflux_core::sql_classify::SqlParseCache,
     /// The wire auth resolved at submit time — reused by `SyncCancelGuard` so a client
     /// disconnect cancels with the same identity the query was submitted under.
     wire_auth: Option<StoredWireAuth>,
@@ -1455,7 +1473,7 @@ async fn setup_sync_query(
         cluster_config_id,
         engine_type,
         src_dialect,
-        tgt_dialect,
+        tgt_dialect: tgt_dialect.clone(),
         was_translated,
         translated_sql: if was_translated {
             Some(translated.clone())
@@ -1469,7 +1487,8 @@ async fn setup_sync_query(
 
     Ok(SyncQuerySetup {
         adapter,
-        translated,
+        translated: translated.clone(),
+        sql_parse: queryflux_core::sql_classify::SqlParseCache::new(translated, tgt_dialect),
         start,
         slot,
         ctx,
@@ -1503,6 +1522,9 @@ async fn execute_stream(
             &setup.credentials,
             &setup.ctx.query_tags,
             &setup.params,
+            queryflux_core::sql_classify::ExecutionHints {
+                is_read_like: Some(setup.sql_parse.is_read_like_async().await),
+            },
             id_slot,
         )
         .await
@@ -1533,6 +1555,7 @@ async fn execute_stream(
 
     let mut stream = execution.stream;
     let mut stats_rx = execution.stats;
+    let affected_rows = execution.affected_rows;
 
     let mut schema_sent = false;
     let mut rows_returned: u64 = 0;
@@ -1587,22 +1610,14 @@ async fn execute_stream(
     // before or during stream production, so try_recv() is always sufficient here.
     let engine_stats = stats_rx.try_recv().ok().flatten();
 
-    if !schema_sent {
-        if let Err(e) = sink.on_schema(&Schema::empty()).await {
-            let outcome = SyncOutcome {
-                status: QueryStatus::Failed,
-                rows: Some(0),
-                error: Some("client disconnected during empty schema send".to_string()),
-                elapsed_ms,
-                engine_stats,
-            };
-            return (outcome, Err(e));
-        }
-    }
+    // Do NOT synthesize on_schema(Schema::empty()) for empty streams: DDL/DML
+    // statements produce no batches and sinks treat the absence of on_schema as a
+    // signal to emit an OK/CommandComplete instead of a result-set sequence.
 
     let stats = QueryStats {
         execution_duration_ms: elapsed_ms,
         rows_returned,
+        affected_rows,
         ..Default::default()
     };
 
@@ -1744,6 +1759,10 @@ async fn run_plan_guards(
 ) -> std::result::Result<Vec<queryflux_persistence::GuardAction>, String> {
     let engine_type = queryflux_core::query::EngineType::Cache;
     let resolved_agent_ctx = session.resolved_agent_context();
+    let sql_parse = queryflux_core::sql_classify::SqlParseCache::new(
+        sql.to_string(),
+        queryflux_core::query::SqlDialect::Generic,
+    );
     let guard_ctx = GuardContext {
         sql,
         translated_sql: sql,
@@ -1752,6 +1771,7 @@ async fn run_plan_guards(
         user: session.user(),
         agent_context: resolved_agent_ctx.as_ref(),
         query_tags: effective_tags,
+        sql_parse: Some(&sql_parse),
     };
 
     let mut all_actions = Vec::new();
@@ -1896,6 +1916,7 @@ pub async fn execute_to_sink(
                     bytes_returned: Some(_stats.size_bytes),
                     queue_duration_ms: 0,
                     execution_duration_ms: 0,
+                    affected_rows: None,
                 };
                 return sink.on_complete(&stats).await;
             }
@@ -2026,6 +2047,7 @@ async fn execute_to_sink_inner(
             user: ctx.session.user(),
             agent_context: ctx.agent_context.as_ref(),
             query_tags: &ctx.query_tags,
+            sql_parse: Some(&setup.sql_parse),
         };
 
         let mut all_actions: Vec<queryflux_persistence::GuardAction> = Vec::new();
@@ -2066,6 +2088,10 @@ async fn execute_to_sink_inner(
         // Attach non-blocking guard actions (allow/warn) to the setup context so they
         // flow into record_query at the normal exit point below.
         setup.guard_actions = all_actions;
+    }
+
+    if let Err(e) = sink.on_translated_sql(&setup.translated).await {
+        return sink.on_error(&e.to_string()).await;
     }
 
     // Native path: skip Arrow when backend connection format matches frontend protocol.

@@ -926,6 +926,7 @@ impl SyncAdapter for AdbcAdapter {
         credentials: &queryflux_auth::QueryCredentials,
         _tags: &QueryTags,
         params: &queryflux_core::params::QueryParams,
+        hints: queryflux_core::sql_classify::ExecutionHints,
         _id_slot: &BackendQueryIdSlot,
     ) -> Result<SyncExecution> {
         // ADBC `Statement::cancel` requires the live statement (`&mut self`)
@@ -951,73 +952,142 @@ impl SyncAdapter for AdbcAdapter {
             _ => self.pool.clone(),
         };
         let sql = sql.to_string();
+        let is_query = hints.is_read_like.unwrap_or_else(|| {
+            queryflux_core::sql_classify::is_read_like_sql(&sql, &self.translation_dialect)
+        });
         let param_batch = if params.is_empty() {
             None
         } else {
             Some(params_to_record_batch(params)?)
         };
 
-        let (batch_tx, batch_rx) = mpsc::channel::<Result<RecordBatch>>(32);
-        let (stats_tx, stats_rx) = oneshot::channel();
+        if is_query {
+            let (batch_tx, batch_rx) = mpsc::channel::<Result<RecordBatch>>(32);
+            let (stats_tx, stats_rx) = oneshot::channel();
 
-        tokio::task::spawn_blocking(move || {
-            let mut conn = match pool.get() {
-                Ok(c) => c,
-                Err(e) => {
+            tokio::task::spawn_blocking(move || {
+                let mut conn = match pool.get() {
+                    Ok(c) => c,
+                    Err(e) => {
+                        let _ = batch_tx.blocking_send(Err(QueryFluxError::Engine(format!(
+                            "ADBC: failed to get connection from pool: {e}"
+                        ))));
+                        return;
+                    }
+                };
+                let mut stmt = match conn.new_statement() {
+                    Ok(s) => s,
+                    Err(e) => {
+                        let _ = batch_tx.blocking_send(Err(QueryFluxError::Engine(format!(
+                            "ADBC: failed to create statement: {e}"
+                        ))));
+                        return;
+                    }
+                };
+                if let Err(e) = stmt.set_sql_query(&sql) {
                     let _ = batch_tx.blocking_send(Err(QueryFluxError::Engine(format!(
-                        "ADBC: failed to get connection from pool: {e}"
+                        "ADBC: failed to set SQL query: {e}"
                     ))));
                     return;
                 }
-            };
-            let mut stmt = match conn.new_statement() {
-                Ok(s) => s,
-                Err(e) => {
-                    let _ = batch_tx.blocking_send(Err(QueryFluxError::Engine(format!(
-                        "ADBC: failed to create statement: {e}"
-                    ))));
-                    return;
+                if let Some(batch) = param_batch {
+                    if let Err(e) = stmt.bind(batch) {
+                        let _ = batch_tx.blocking_send(Err(QueryFluxError::Engine(format!(
+                            "ADBC: failed to bind parameters: {e}"
+                        ))));
+                        return;
+                    }
                 }
-            };
-            if let Err(e) = stmt.set_sql_query(&sql) {
-                let _ = batch_tx.blocking_send(Err(QueryFluxError::Engine(format!(
-                    "ADBC: failed to set SQL query: {e}"
-                ))));
-                return;
-            }
-            if let Some(batch) = param_batch {
-                if let Err(e) = stmt.bind(batch) {
-                    let _ = batch_tx.blocking_send(Err(QueryFluxError::Engine(format!(
-                        "ADBC: failed to bind parameters: {e}"
-                    ))));
-                    return;
+                let reader = match stmt.execute() {
+                    Ok(r) => r,
+                    Err(e) => {
+                        let _ = batch_tx.blocking_send(Err(QueryFluxError::Engine(format!(
+                            "ADBC: query execution failed: {e}"
+                        ))));
+                        return;
+                    }
+                };
+                // `RecordBatchReader::schema` reflects the query's real result-set
+                // schema even when the reader yields zero batches (e.g. a SELECT
+                // that matches no rows). Capture it before consuming the reader so
+                // dispatch can still send a correct RowDescription — never fall
+                // back to a fabricated Schema::empty(), which is indistinguishable
+                // from the DDL/DML no-result-set path (the root cause of #97).
+                let schema = reader.schema();
+                let mut produced_any = false;
+                for batch in reader {
+                    produced_any = true;
+                    let result = batch.map_err(|e| {
+                        QueryFluxError::Engine(format!("ADBC: failed to read results: {e}"))
+                    });
+                    if batch_tx.blocking_send(result).is_err() {
+                        return;
+                    }
                 }
-            }
-            let reader = match stmt.execute() {
-                Ok(r) => r,
-                Err(e) => {
-                    let _ = batch_tx.blocking_send(Err(QueryFluxError::Engine(format!(
-                        "ADBC: query execution failed: {e}"
-                    ))));
-                    return;
+                if !produced_any {
+                    let _ = batch_tx.blocking_send(Ok(RecordBatch::new_empty(schema)));
                 }
-            };
-            for batch in reader {
-                let result = batch.map_err(|e| {
-                    QueryFluxError::Engine(format!("ADBC: failed to read results: {e}"))
-                });
-                if batch_tx.blocking_send(result).is_err() {
-                    return; // consumer dropped, stop reading
-                }
-            }
-            // Send stats only after all batches have been produced.
-            let _ = stats_tx.send(None); // ADBC has no standard stats API
-        });
+                let _ = stats_tx.send(None);
+            });
 
-        Ok(SyncExecution {
-            stream: Box::pin(ReceiverStream::new(batch_rx)),
-            stats: stats_rx,
-        })
+            Ok(SyncExecution {
+                stream: Box::pin(ReceiverStream::new(batch_rx)),
+                stats: stats_rx,
+                affected_rows: None,
+            })
+        } else {
+            // DDL/DML path: use execute_update to get the affected row count
+            // without producing an Arrow stream.
+            let (affected_tx, affected_rx) = oneshot::channel::<Result<Option<u64>>>();
+            let (stats_tx, stats_rx) = oneshot::channel();
+
+            tokio::task::spawn_blocking(move || {
+                let result = (|| -> Result<Option<u64>> {
+                    let mut conn = pool.get().map_err(|e| {
+                        QueryFluxError::Engine(format!(
+                            "ADBC: failed to get connection from pool: {e}"
+                        ))
+                    })?;
+                    let mut stmt = conn.new_statement().map_err(|e| {
+                        QueryFluxError::Engine(format!("ADBC: failed to create statement: {e}"))
+                    })?;
+                    stmt.set_sql_query(&sql).map_err(|e| {
+                        QueryFluxError::Engine(format!("ADBC: failed to set SQL query: {e}"))
+                    })?;
+                    if let Some(batch) = param_batch {
+                        stmt.bind(batch).map_err(|e| {
+                            QueryFluxError::Engine(format!("ADBC: failed to bind parameters: {e}"))
+                        })?;
+                    }
+                    let rows = stmt.execute_update().map_err(|e| {
+                        QueryFluxError::Engine(format!("ADBC: DDL/DML execution failed: {e}"))
+                    })?;
+                    Ok(rows.and_then(|n| if n >= 0 { Some(n as u64) } else { None }))
+                })();
+                let _ = affected_tx.send(result);
+                let _ = stats_tx.send(None);
+            });
+
+            let affected = affected_rx.await.map_err(|_| {
+                QueryFluxError::Engine(
+                    "ADBC: execute_update channel closed unexpectedly".to_string(),
+                )
+            })??;
+
+            let empty: crate::ArrowStream = Box::pin(futures::stream::empty());
+            Ok(SyncExecution {
+                stream: empty,
+                stats: stats_rx,
+                // `affected` is `None` when the driver reports an unknown count
+                // (ADBC returns -1) — preserve that distinction here rather than
+                // coercing to 0. Query history, metrics, and audit records read
+                // `QueryStats.affected_rows` directly, not just the wire-protocol
+                // sinks (which already fall back to displaying 0 for `None`, since
+                // MySQL OK packets and Postgres CommandComplete tags always carry
+                // a definite row count on the wire).
+                affected_rows: affected,
+            })
+        }
     }
 
     fn engine_type(&self) -> EngineType {

@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use queryflux_core::{
     query::{ClusterGroupName, EngineType},
     session::AgentContext,
+    sql_classify::SqlParseCache,
     tags::QueryTags,
 };
 
@@ -26,6 +27,8 @@ pub struct GuardContext<'a> {
     pub user: Option<&'a str>,
     pub agent_context: Option<&'a AgentContext>,
     pub query_tags: &'a QueryTags,
+    /// Shared parse cache from dispatch. When set, guards must not re-parse SQL.
+    pub sql_parse: Option<&'a SqlParseCache>,
 }
 
 /// The verdict a guard returns after inspecting a query.

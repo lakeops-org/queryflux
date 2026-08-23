@@ -63,6 +63,10 @@ The dispatch layer chooses between two result-encoding paths based on the backen
 
 When backend and frontend formats match (`MysqlWire` ↔ `MySqlWire`), the entire Arrow columnar allocation is skipped. This also preserves type precision for `DECIMAL`, `DATETIME(6)`, and unsigned integers that would otherwise be approximated through the Arrow type system.
 
+### DDL/DML (non-SELECT) responses
+
+ADBC backends use the ADBC `execute_update` API for DDL/DML statements (`CREATE`, `INSERT`, `DROP`, etc.). These produce no Arrow result set, so the MySQL frontend returns a standard **OK packet** with the affected row count instead of a result-set sequence. This ensures MySQL clients see `Query OK, N rows affected` rather than a protocol error.
+
 ## Built-in query handling
 
 The MySQL frontend intercepts several common queries that clients and drivers send during connection setup:

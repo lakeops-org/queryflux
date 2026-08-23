@@ -517,6 +517,7 @@ impl AsyncAdapter for AthenaAdapter {
         _credentials: &queryflux_auth::QueryCredentials,
         _tags: &queryflux_core::tags::QueryTags,
         params: &queryflux_core::params::QueryParams,
+        _hints: queryflux_core::sql_classify::ExecutionHints,
         id_slot: &BackendQueryIdSlot,
     ) -> crate::Result<crate::SyncExecution> {
         use crate::SyncExecution;
@@ -568,6 +569,7 @@ impl AsyncAdapter for AthenaAdapter {
         Ok(SyncExecution {
             stream: Box::pin(ReceiverStream::new(batch_rx)),
             stats: stats_rx,
+            affected_rows: None,
         })
     }
 

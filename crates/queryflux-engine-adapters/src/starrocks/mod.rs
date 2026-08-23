@@ -533,6 +533,7 @@ impl SyncAdapter for StarRocksAdapter {
         credentials: &queryflux_auth::QueryCredentials,
         tags: &QueryTags,
         params: &queryflux_core::params::QueryParams,
+        _hints: queryflux_core::sql_classify::ExecutionHints,
         id_slot: &BackendQueryIdSlot,
     ) -> Result<SyncExecution> {
         let mut conn = match crate::mysql_native::open_passthrough_connection(
@@ -573,6 +574,7 @@ impl SyncAdapter for StarRocksAdapter {
         Ok(SyncExecution {
             stream: Box::pin(ReceiverStream::new(batch_rx)),
             stats: stats_rx,
+            affected_rows: None,
         })
     }
 

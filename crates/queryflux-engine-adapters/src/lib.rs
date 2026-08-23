@@ -77,6 +77,9 @@ pub struct SyncExecution {
     pub stream: ArrowStream,
     /// Engine-reported execution stats. Sent by the adapter once the stream ends.
     pub stats: tokio::sync::oneshot::Receiver<Option<queryflux_core::query::QueryEngineStats>>,
+    /// Number of rows affected by a DDL/DML statement (from `execute_update`).
+    /// `None` for queries that return a result set.
+    pub affected_rows: Option<u64>,
 }
 
 /// What wire format this adapter natively produces, determined by its connection type.
@@ -234,6 +237,7 @@ pub trait SyncAdapter: Send + Sync {
         credentials: &queryflux_auth::QueryCredentials,
         tags: &queryflux_core::tags::QueryTags,
         params: &queryflux_core::params::QueryParams,
+        hints: queryflux_core::sql_classify::ExecutionHints,
         id_slot: &BackendQueryIdSlot,
     ) -> Result<SyncExecution>;
     fn engine_type(&self) -> queryflux_core::query::EngineType;
@@ -349,6 +353,7 @@ pub trait AsyncAdapter: Send + Sync {
         _credentials: &queryflux_auth::QueryCredentials,
         _tags: &queryflux_core::tags::QueryTags,
         _params: &queryflux_core::params::QueryParams,
+        _hints: queryflux_core::sql_classify::ExecutionHints,
         _id_slot: &BackendQueryIdSlot,
     ) -> Result<SyncExecution> {
         Err(queryflux_core::error::QueryFluxError::SyncEngineRequired(
