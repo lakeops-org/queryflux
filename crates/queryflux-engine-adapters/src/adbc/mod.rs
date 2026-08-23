@@ -306,38 +306,117 @@ impl crate::EngineConfigParseable for AdbcConfig {
 
 pub(crate) type AdbcPool = r2d2::Pool<AdbcConnectionManager<ManagedDatabase>>;
 
-/// Small per-user pool, built on demand for `tokenExchange` clusters. Kept separate from
-/// the static `pool` (Type 1 / `serviceAccount`) because its `ManagedDatabase` bakes in a
-/// per-user OAuth token at connection-option time — there is no way to swap credentials on
-/// a checked-out connection from a shared pool, so a distinct user needs a distinct
-/// `ManagedDatabase`. Small size + idle eviction keep this from growing unbounded across a
-/// long-running process; see `identity_pool_for_token`.
-struct IdentityPoolEntry {
+/// Identifies a distinct connection scope: some combination of per-identity credentials
+/// (`token`) and/or a session-requested role/warehouse/schema override that differs from the
+/// cluster's own base config. Two queries with the same key are safe to share a sub-pool;
+/// two queries with different keys must never share one — see `AdbcAdapter::scoped_pool_for`.
+///
+/// A field is only ever populated when it actually differs from `base_db_kwargs`'s value —
+/// `AdbcAdapter::scoped_pool_key` enforces that, not this type — so the all-`None` key (no
+/// override at all) never appears here; `execute_as_arrow` uses `self.pool` directly for that
+/// case instead of going through this map at all.
+#[derive(Clone, PartialEq, Eq, Hash, Debug, Default)]
+struct PoolScopeKey {
+    /// Bearer token for `tokenExchange` clusters (`QueryCredentials::Bearer`).
+    token: Option<String>,
+    role: Option<String>,
+    warehouse: Option<String>,
+    schema: Option<String>,
+}
+
+impl PoolScopeKey {
+    fn is_empty(&self) -> bool {
+        self.token.is_none()
+            && self.role.is_none()
+            && self.warehouse.is_none()
+            && self.schema.is_none()
+    }
+}
+
+/// Pure core of `AdbcAdapter::scoped_pool_key` — split out so it's testable without a real,
+/// driver-backed `AdbcAdapter` instance (`AdbcAdapter::new` loads an actual ADBC shared
+/// library, which unit tests can't rely on being installed).
+///
+/// A `session.extra["snowflake.<field>"]` value only becomes part of the key when it actually
+/// differs from what `base_db_kwargs` already has mapped for that field via
+/// `variant_field_to_db_kwarg(driver, field)` — a `USE ROLE` naming the cluster's own
+/// configured role is a no-op, not a new scope. Not gated on `driver` directly: a driver with
+/// no field mapping just never produces an override, so this naturally extends to other
+/// drivers if `variant_field_to_db_kwarg` ever grows equivalent mappings for them.
+fn compute_scoped_pool_key(
+    driver: &str,
+    base_db_kwargs: &[(String, String)],
+    session: &SessionContext,
+    credentials: &queryflux_auth::QueryCredentials,
+) -> Option<PoolScopeKey> {
+    let token = match credentials {
+        queryflux_auth::QueryCredentials::Bearer { token } => Some(token.clone()),
+        _ => None,
+    };
+    let overridden = |field: &str| -> Option<String> {
+        let requested = session.extra.get(&format!("snowflake.{field}"))?;
+        let mapped_key = queryflux_core::config::variant_field_to_db_kwarg(driver, field)?;
+        let current = sql_helpers::db_kwarg(base_db_kwargs, mapped_key);
+        (current.as_deref() != Some(requested.as_str())).then(|| requested.clone())
+    };
+    let key = PoolScopeKey {
+        token,
+        role: overridden("role"),
+        warehouse: overridden("warehouse"),
+        schema: overridden("schema"),
+    };
+    (!key.is_empty()).then_some(key)
+}
+
+/// Pure core of `AdbcAdapter::scoped_pool_size` — see its doc comment for the rationale
+/// (token-keyed scopes are per-individual-identity and stay small; role/warehouse/schema-only
+/// scopes are shared across sessions and need the base pool's own concurrency).
+fn compute_scoped_pool_size(key: &PoolScopeKey, base_pool_size: u32) -> u32 {
+    if key.token.is_some() {
+        IDENTITY_POOL_MAX_SIZE
+    } else {
+        base_pool_size
+    }
+}
+
+/// Small dedicated pool, built on demand for a distinct [`PoolScopeKey`]. Kept separate from
+/// the static `pool` (Type 1 / `serviceAccount`) because its `ManagedDatabase` bakes in
+/// per-scope connection options — there is no way to swap credentials, role, warehouse, or
+/// schema on a checked-out connection from a shared pool, so a distinct scope needs a
+/// distinct `ManagedDatabase`. Idle eviction keeps this from growing unbounded across a
+/// long-running process; see `AdbcAdapter::scoped_pool_for`.
+struct ScopedPoolEntry {
     pool: AdbcPool,
     last_used: std::time::Instant,
 }
 
-/// Max connections per per-identity sub-pool. Deliberately small — this exists to amortize
-/// the OAuth-token-scoped connection setup cost across the handful of queries a user runs
-/// in quick succession, not to serve as a general-purpose pool.
+/// Max connections in a sub-pool keyed (at least partly) by `token` — i.e. genuinely
+/// per-individual-identity, not shared across sessions. Deliberately small — this exists to
+/// amortize the OAuth-token-scoped connection setup cost across the handful of queries a user
+/// runs in quick succession, not to serve as a general-purpose pool. A `role`/`warehouse`/
+/// `schema`-only key (no token) is a *shared* resource across every session requesting that
+/// combination — e.g. "every analyst" — so it uses the cluster's own `pool_size` instead; see
+/// `AdbcAdapter::scoped_pool_size`.
 const IDENTITY_POOL_MAX_SIZE: u32 = 2;
 
-/// Evict a per-identity sub-pool after this long without use. Roughly matches how often the
-/// resolver's own token cache refreshes (tokens are typically short-lived), so a pool rarely
-/// outlives the token it was built for by much.
+/// Evict a sub-pool after this long without use. Roughly matches how often the resolver's own
+/// token cache refreshes (tokens are typically short-lived), so a per-identity pool rarely
+/// outlives the token it was built for by much. Applied uniformly to role/warehouse/schema-only
+/// pools too — those are cheap to rebuild (no token validation), so evicting them on the same
+/// schedule costs little and keeps one eviction policy instead of two.
 const IDENTITY_POOL_IDLE_TTL: std::time::Duration = std::time::Duration::from_secs(15 * 60);
 
-/// Bound on building a per-identity `ManagedDatabase` (the driver FFI call that can involve
-/// real OAuth token validation) — see `AdbcAdapter::identity_pool_for_token`.
+/// Bound on building a scoped `ManagedDatabase` (the driver FFI call that can involve real
+/// OAuth token validation) — see `AdbcAdapter::scoped_pool_for`.
 const IDENTITY_POOL_BUILD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// Cap on concurrent per-identity pool builds (across all tokens) in flight at once.
+/// Cap on concurrent scoped-pool builds (across all keys) in flight at once.
 /// `tokio::time::timeout` gives up on *waiting* for a `spawn_blocking` task, but does not
 /// cancel it — the underlying OS thread keeps running the driver FFI call until it returns
-/// (or hangs) regardless. Without a cap, a burst of distinct identities hitting a slow or
+/// (or hangs) regardless. Without a cap, a burst of distinct scopes hitting a slow or
 /// unreachable OAuth endpoint at the same time could each leave a zombie build running,
 /// piling up on the shared tokio blocking thread pool. Combined with single-flighting
-/// same-token builds (below), this bounds worst-case blocking-thread usage from this path.
+/// same-key builds (below), this bounds worst-case blocking-thread usage from this path.
 const IDENTITY_POOL_MAX_CONCURRENT_BUILDS: usize = 8;
 
 /// Per-driver OAuth connection-option keys for `tokenExchange`. Only `snowflake` is wired in
@@ -383,15 +462,18 @@ pub struct AdbcAdapter {
     driver_name: String,
     base_uri: String,
     base_db_kwargs: Vec<(String, String)>,
-    identity_pools: Arc<DashMap<String, IdentityPoolEntry>>,
-    /// Per-token single-flight locks — serializes concurrent cache-miss builds for the same
-    /// token so a burst of queries from one identity builds exactly one pool instead of
-    /// racing to build (and discard all but the last of) several. See
-    /// `identity_pool_for_token`.
-    identity_pool_build_locks: Arc<DashMap<String, Arc<tokio::sync::Mutex<()>>>>,
-    /// Caps total concurrent per-identity pool builds across all tokens. See
+    /// Retained so `scoped_pool_size` can fall back to it for role/warehouse/schema-only
+    /// scopes, which are shared across sessions and need the same concurrency as the base
+    /// pool — not the small per-identity size used for token-keyed scopes.
+    base_pool_size: u32,
+    scoped_pools: Arc<DashMap<PoolScopeKey, ScopedPoolEntry>>,
+    /// Per-key single-flight locks — serializes concurrent cache-miss builds for the same
+    /// scope so a burst of queries builds exactly one pool instead of racing to build (and
+    /// discard all but the last of) several. See `scoped_pool_for`.
+    scoped_pool_build_locks: Arc<DashMap<PoolScopeKey, Arc<tokio::sync::Mutex<()>>>>,
+    /// Caps total concurrent scoped-pool builds across all keys. See
     /// `IDENTITY_POOL_MAX_CONCURRENT_BUILDS`.
-    identity_pool_build_semaphore: Arc<tokio::sync::Semaphore>,
+    scoped_pool_build_semaphore: Arc<tokio::sync::Semaphore>,
     engine_type: EngineType,
     translation_dialect: queryflux_core::query::SqlDialect,
     /// Optional driver-specific introspection (Databricks REST, SaaS reconcile SQL).
@@ -444,9 +526,10 @@ impl AdbcAdapter {
                 cluster_name.0
             ))
         })?;
-        // `driver` is kept (not dropped) on the adapter so per-identity `ManagedDatabase`s
-        // can be built later for `tokenExchange` — see `identity_pool_for_token`. Cloning it
-        // is cheap (Arc-backed), and the shared library stays loaded via that Arc either way.
+        // `driver` is kept (not dropped) on the adapter so scoped `ManagedDatabase`s can be
+        // built later for `tokenExchange` or a session-requested role/warehouse/schema — see
+        // `scoped_pool_for`. Cloning it is cheap (Arc-backed), and the shared library stays
+        // loaded via that Arc either way.
 
         let manager = AdbcConnectionManager::new(database);
         let pool = r2d2::Pool::builder()
@@ -475,9 +558,10 @@ impl AdbcAdapter {
             driver_name,
             base_uri,
             base_db_kwargs,
-            identity_pools: Arc::new(DashMap::new()),
-            identity_pool_build_locks: Arc::new(DashMap::new()),
-            identity_pool_build_semaphore: Arc::new(tokio::sync::Semaphore::new(
+            base_pool_size: config.pool_size,
+            scoped_pools: Arc::new(DashMap::new()),
+            scoped_pool_build_locks: Arc::new(DashMap::new()),
+            scoped_pool_build_semaphore: Arc::new(tokio::sync::Semaphore::new(
                 IDENTITY_POOL_MAX_CONCURRENT_BUILDS,
             )),
             engine_type,
@@ -486,64 +570,136 @@ impl AdbcAdapter {
         })
     }
 
-    /// Return the small per-identity pool for `token`, building (and caching) it on first
-    /// use.
+    /// Compute the [`PoolScopeKey`] for a query, or `None` when nothing overrides the
+    /// cluster's base config — the common case, and the fast path `execute_as_arrow` takes
+    /// straight to `self.pool` without touching this map at all.
+    ///
+    /// A `session.extra["snowflake.<field>"]` value only becomes part of the key when it
+    /// actually differs from what `base_db_kwargs` already has mapped for that field — a
+    /// `USE ROLE` naming the cluster's own configured role is a no-op, not a new scope.
+    fn scoped_pool_key(
+        &self,
+        session: &SessionContext,
+        credentials: &queryflux_auth::QueryCredentials,
+    ) -> Option<PoolScopeKey> {
+        compute_scoped_pool_key(
+            &self.driver_name,
+            &self.base_db_kwargs,
+            session,
+            credentials,
+        )
+    }
+
+    /// Connection-option overrides for a [`PoolScopeKey`] beyond `base_db_kwargs` — the OAuth
+    /// options for `key.token` (when present) plus whichever of role/warehouse/schema this
+    /// driver has a `dbKwargs` mapping for (`variant_field_to_db_kwarg`; today only Snowflake).
+    /// Not gated on `driver_name` directly — a driver with no field mapping just contributes
+    /// nothing here, so this naturally extends to other drivers if `variant_field_to_db_kwarg`
+    /// ever grows equivalent mappings for them, with no code change needed in this function.
+    fn scoped_pool_options(
+        driver: &str,
+        key: &PoolScopeKey,
+    ) -> Result<Vec<(OptionDatabase, adbc_core::options::OptionValue)>> {
+        let mut opts = Vec::new();
+        if let Some(token) = &key.token {
+            opts.extend(oauth_token_options(driver, token)?);
+        }
+        for (field, value) in [
+            ("role", &key.role),
+            ("warehouse", &key.warehouse),
+            ("schema", &key.schema),
+        ] {
+            if let Some(value) = value {
+                if let Some(mapped) =
+                    queryflux_core::config::variant_field_to_db_kwarg(driver, field)
+                {
+                    opts.push((
+                        OptionDatabase::Other(mapped.to_string()),
+                        value.clone().into(),
+                    ));
+                }
+            }
+        }
+        Ok(opts)
+    }
+
+    /// Max connections for a scoped sub-pool. A `token`-keyed scope is per-individual-identity
+    /// (small, per [`IDENTITY_POOL_MAX_SIZE`]); a role/warehouse/schema-only scope is *shared*
+    /// across every session requesting that combination, so it needs the same concurrency as
+    /// the base pool, not the small per-identity size.
+    fn scoped_pool_size(&self, key: &PoolScopeKey) -> u32 {
+        compute_scoped_pool_size(key, self.base_pool_size)
+    }
+
+    /// Return the dedicated pool for `key`, building (and caching) it on first use.
     ///
     /// The cache-hit path is a cheap `DashMap` lookup, safe to call directly from async
     /// context. The cache-miss path calls the driver FFI (`new_database_with_opts`) — a
-    /// genuinely blocking call (Snowflake's driver validates the OAuth token, which can
-    /// mean real network I/O), so it runs inside `spawn_blocking` rather than directly on
-    /// the async executor — an earlier version of this comment claimed it "rides along" on
-    /// `execute_as_arrow`'s own `spawn_blocking`, which was wrong: this is called *before*
-    /// that, so without its own `spawn_blocking` it would have blocked whatever tokio
-    /// worker thread happened to be running the query. Also bounded by
-    /// [`IDENTITY_POOL_BUILD_TIMEOUT`] — left unbounded, a slow or unreachable Snowflake
-    /// OAuth endpoint would hang the query indefinitely instead of failing it.
+    /// genuinely blocking call (Snowflake's driver validates an OAuth token or resolves a
+    /// role/warehouse, either of which can mean real network I/O), so it runs inside
+    /// `spawn_blocking` rather than directly on the async executor — an earlier version of
+    /// this comment claimed it "rides along" on `execute_as_arrow`'s own `spawn_blocking`,
+    /// which was wrong: this is called *before* that, so without its own `spawn_blocking` it
+    /// would have blocked whatever tokio worker thread happened to be running the query. Also
+    /// bounded by [`IDENTITY_POOL_BUILD_TIMEOUT`] — left unbounded, a slow or unreachable
+    /// backend would hang the query indefinitely instead of failing it.
     ///
-    /// Concurrent cache misses for the *same* token are single-flighted through
-    /// `identity_pool_build_locks`: only the first caller actually builds; the rest wait on
-    /// the per-token lock and then hit the now-populated cache. Without this, a burst of
-    /// queries from one identity would each build (and all but one immediately discard) a
-    /// real Snowflake connection — wasted OAuth validation calls, not just wasted CPU.
-    /// `identity_pool_build_semaphore` additionally caps concurrent builds *across* distinct
-    /// tokens, since a timed-out build's `spawn_blocking` task keeps running rather than
-    /// being cancelled (see `IDENTITY_POOL_MAX_CONCURRENT_BUILDS`).
+    /// Concurrent cache misses for the *same* key are single-flighted through
+    /// `scoped_pool_build_locks`: only the first caller actually builds; the rest wait on the
+    /// per-key lock and then hit the now-populated cache. Without this, a burst of queries for
+    /// one scope would each build (and all but one immediately discard) a real connection —
+    /// wasted validation calls, not just wasted CPU. `scoped_pool_build_semaphore` additionally
+    /// caps concurrent builds *across* distinct keys, since a timed-out build's
+    /// `spawn_blocking` task keeps running rather than being cancelled (see
+    /// `IDENTITY_POOL_MAX_CONCURRENT_BUILDS`).
     ///
     /// Sweeps idle entries at the *start* of every call, before the cache-hit check —
     /// sweeping only on the (rarer, in steady state) miss path would let an expired pool
     /// stay reachable indefinitely as long as it kept getting cache hits.
-    async fn identity_pool_for_token(&self, token: &str) -> Result<AdbcPool> {
+    async fn scoped_pool_for(&self, key: PoolScopeKey) -> Result<AdbcPool> {
         let now = std::time::Instant::now();
-        self.identity_pools
-            .retain(|_, e| now.duration_since(e.last_used) < IDENTITY_POOL_IDLE_TTL);
+        let evicted = {
+            let before = self.scoped_pools.len();
+            self.scoped_pools
+                .retain(|_, e| now.duration_since(e.last_used) < IDENTITY_POOL_IDLE_TTL);
+            before - self.scoped_pools.len()
+        };
+        if evicted > 0 {
+            tracing::debug!(
+                cluster = %self.cluster_name,
+                evicted,
+                remaining = self.scoped_pools.len(),
+                "evicted idle ADBC scoped sub-pools"
+            );
+        }
 
-        if let Some(mut entry) = self.identity_pools.get_mut(token) {
+        if let Some(mut entry) = self.scoped_pools.get_mut(&key) {
             entry.last_used = now;
             return Ok(entry.pool.clone());
         }
 
         let lock = self
-            .identity_pool_build_locks
-            .entry(token.to_string())
+            .scoped_pool_build_locks
+            .entry(key.clone())
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
             .clone();
         let _build_guard = lock.lock().await;
 
-        // Re-check: another waiter may have just finished building this token's pool while
+        // Re-check: another waiter may have just finished building this key's pool while
         // we were waiting for the lock.
-        if let Some(mut entry) = self.identity_pools.get_mut(token) {
+        if let Some(mut entry) = self.scoped_pools.get_mut(&key) {
             entry.last_used = std::time::Instant::now();
-            self.identity_pool_build_locks.remove(token);
+            self.scoped_pool_build_locks.remove(&key);
             return Ok(entry.pool.clone());
         }
 
         let permit = self
-            .identity_pool_build_semaphore
+            .scoped_pool_build_semaphore
             .clone()
             .acquire_owned()
             .await
             .map_err(|e| {
-                QueryFluxError::Engine(format!("identity pool build semaphore closed: {e}"))
+                QueryFluxError::Engine(format!("scoped pool build semaphore closed: {e}"))
             })?;
 
         let driver_name = self.driver_name.clone();
@@ -551,11 +707,12 @@ impl AdbcAdapter {
         let base_uri = self.base_uri.clone();
         let base_db_kwargs = self.base_db_kwargs.clone();
         let cluster_name = self.cluster_name.0.clone();
-        let token_owned = token.to_string();
+        let max_size = self.scoped_pool_size(&key);
+        let key_for_build = key.clone();
 
         let build = tokio::task::spawn_blocking(move || -> Result<AdbcPool> {
             let _permit = permit;
-            let opts = oauth_token_options(&driver_name, &token_owned)?;
+            let opts = Self::scoped_pool_options(&driver_name, &key_for_build)?;
             let mut opts_with_uri = vec![(OptionDatabase::Uri, base_uri.into())];
             for (k, v) in &base_db_kwargs {
                 opts_with_uri.push((OptionDatabase::Other(k.clone()), v.clone().into()));
@@ -564,17 +721,17 @@ impl AdbcAdapter {
 
             let database = driver.new_database_with_opts(opts_with_uri).map_err(|e| {
                 QueryFluxError::Engine(format!(
-                    "cluster '{cluster_name}': failed to create per-identity ADBC database: {e}"
+                    "cluster '{cluster_name}': failed to create scoped ADBC database: {e}"
                 ))
             })?;
             let manager = AdbcConnectionManager::new(database);
             r2d2::Pool::builder()
-                .max_size(IDENTITY_POOL_MAX_SIZE)
+                .max_size(max_size)
                 .build(manager)
                 .map_err(|e| {
                     QueryFluxError::Engine(format!(
-                        "cluster '{cluster_name}': failed to create per-identity ADBC \
-                         connection pool: {e}"
+                        "cluster '{cluster_name}': failed to create scoped ADBC connection \
+                         pool: {e}"
                     ))
                 })
         });
@@ -583,9 +740,9 @@ impl AdbcAdapter {
             .await
             .map_err(|_| {
                 QueryFluxError::Engine(format!(
-                    "cluster '{}': building a per-identity ADBC connection timed out after \
-                     {}s (the OAuth token validation may be slow or the identity backend \
-                     unreachable)",
+                    "cluster '{}': building a scoped ADBC connection timed out after {}s (an \
+                     OAuth token validation or role/warehouse resolution may be slow, or the \
+                     backend is unreachable)",
                     self.cluster_name.0,
                     IDENTITY_POOL_BUILD_TIMEOUT.as_secs()
                 ))
@@ -593,7 +750,7 @@ impl AdbcAdapter {
             .and_then(|joined| {
                 joined.map_err(|e| {
                     QueryFluxError::Engine(format!(
-                        "cluster '{}': per-identity ADBC connection task panicked: {e}",
+                        "cluster '{}': scoped ADBC connection task panicked: {e}",
                         self.cluster_name.0
                     ))
                 })
@@ -604,19 +761,36 @@ impl AdbcAdapter {
         // brand-new caller that arrives right after the lock is released is guaranteed to
         // see the cache hit rather than racing to start a redundant build. Release the lock
         // regardless of outcome — a build failure must not wedge every subsequent attempt
-        // for this token behind a lock nobody will ever release again (the `Arc<Mutex>`
+        // for this key behind a lock nobody will ever release again (the `Arc<Mutex>`
         // itself is dropped along with the map entry once every clone — including whichever
         // waiters are still parked on `.lock().await` — has released it).
-        if let Ok(pool) = &result {
-            self.identity_pools.insert(
-                token.to_string(),
-                IdentityPoolEntry {
-                    pool: pool.clone(),
-                    last_used: std::time::Instant::now(),
-                },
-            );
+        match &result {
+            Ok(pool) => {
+                self.scoped_pools.insert(
+                    key.clone(),
+                    ScopedPoolEntry {
+                        pool: pool.clone(),
+                        last_used: std::time::Instant::now(),
+                    },
+                );
+                tracing::info!(
+                    cluster = %self.cluster_name,
+                    has_token = key.token.is_some(),
+                    role = ?key.role,
+                    warehouse = ?key.warehouse,
+                    schema = ?key.schema,
+                    "built ADBC scoped sub-pool"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    cluster = %self.cluster_name,
+                    error = %e,
+                    "failed to build ADBC scoped sub-pool"
+                );
+            }
         }
-        self.identity_pool_build_locks.remove(token);
+        self.scoped_pool_build_locks.remove(&key);
 
         result
     }
@@ -762,7 +936,7 @@ impl SyncAdapter for AdbcAdapter {
     async fn execute_as_arrow(
         &self,
         sql: &str,
-        _session: &SessionContext,
+        session: &SessionContext,
         credentials: &queryflux_auth::QueryCredentials,
         _tags: &QueryTags,
         params: &queryflux_core::params::QueryParams,
@@ -778,17 +952,18 @@ impl SyncAdapter for AdbcAdapter {
             attempt_id = %uuid::Uuid::new_v4(),
             "Executing ADBC query"
         );
-        // `Bearer` is the only non-serviceAccount `QueryCredentials` that can reach an ADBC
-        // adapter — startup validation (`query_auth_supported`) rejects `passthrough`/
-        // `impersonate` for every ADBC driver, so `tokenExchange` (resolved to `Bearer`) is
-        // the only other case to handle here. `identity_pool_for_token` is a cheap DashMap
-        // lookup on cache hits; the miss path runs the blocking driver FFI call inside its
-        // own `spawn_blocking` with a timeout, not inline here.
-        let pool = match credentials {
-            queryflux_auth::QueryCredentials::Bearer { token } => {
-                self.identity_pool_for_token(token).await?
-            }
-            _ => self.pool.clone(),
+        // `Bearer` is the only non-serviceAccount `QueryCredentials` that reaches an ADBC
+        // adapter today — startup validation (`query_auth_supported`) rejects `passthrough`/
+        // `impersonate` for every ADBC driver. A session-requested role/warehouse/schema
+        // override (from a `USE ROLE`/`USE WAREHOUSE`/`USE SCHEMA` the Snowflake frontend
+        // tracked) is the other source of a non-trivial key. `scoped_pool_key` returns `None`
+        // for the common case (no token, no override), so the fast path below never touches
+        // the scoped-pool map at all. `scoped_pool_for` is a cheap `DashMap` lookup on cache
+        // hits; the miss path runs the blocking driver FFI call inside its own
+        // `spawn_blocking` with a timeout, not inline here.
+        let pool = match self.scoped_pool_key(session, credentials) {
+            Some(key) => self.scoped_pool_for(key).await?,
+            None => self.pool.clone(),
         };
         let sql = sql.to_string();
         let param_batch = if params.is_empty() {
@@ -1131,9 +1306,162 @@ impl EngineAdapterFactory for AdbcFactory {
 
 #[cfg(test)]
 mod tests {
-    use super::{oauth_token_options, AdbcConfig};
+    use super::{
+        compute_scoped_pool_key, compute_scoped_pool_size, oauth_token_options, AdbcConfig,
+        PoolScopeKey, IDENTITY_POOL_MAX_SIZE,
+    };
     use crate::EngineConfigParseable;
+    use queryflux_auth::QueryCredentials;
     use queryflux_core::query::{EngineType, SqlDialect};
+    use queryflux_core::session::SessionContext;
+
+    fn session_with(pairs: &[(&str, &str)]) -> SessionContext {
+        SessionContext {
+            extra: pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn scoped_pool_key_is_none_with_no_override_and_service_account() {
+        let session = SessionContext::default();
+        let key = compute_scoped_pool_key(
+            "snowflake",
+            &[],
+            &session,
+            &QueryCredentials::ServiceAccount,
+        );
+        assert!(key.is_none());
+    }
+
+    #[test]
+    fn scoped_pool_key_carries_bearer_token() {
+        let session = SessionContext::default();
+        let key = compute_scoped_pool_key(
+            "snowflake",
+            &[],
+            &session,
+            &QueryCredentials::Bearer {
+                token: "tok".to_string(),
+            },
+        )
+        .expect("token alone makes a non-empty key");
+        assert_eq!(key.token.as_deref(), Some("tok"));
+        assert_eq!(key.role, None);
+    }
+
+    #[test]
+    fn scoped_pool_key_picks_up_role_override() {
+        let session = session_with(&[("snowflake.role", "ANALYST")]);
+        let key = compute_scoped_pool_key(
+            "snowflake",
+            &[],
+            &session,
+            &QueryCredentials::ServiceAccount,
+        )
+        .expect("role differs from unset base config");
+        assert_eq!(key.role.as_deref(), Some("ANALYST"));
+        assert_eq!(key.token, None);
+    }
+
+    #[test]
+    fn scoped_pool_key_is_none_when_override_matches_base_config() {
+        let session = session_with(&[("snowflake.role", "ANALYST")]);
+        let base_db_kwargs = vec![("adbc.snowflake.sql.role".to_string(), "ANALYST".to_string())];
+        let key = compute_scoped_pool_key(
+            "snowflake",
+            &base_db_kwargs,
+            &session,
+            &QueryCredentials::ServiceAccount,
+        );
+        assert!(
+            key.is_none(),
+            "requesting the already-configured role is a no-op"
+        );
+    }
+
+    #[test]
+    fn scoped_pool_key_non_none_when_override_differs_from_base_config() {
+        let session = session_with(&[("snowflake.role", "SYSADMIN")]);
+        let base_db_kwargs = vec![("adbc.snowflake.sql.role".to_string(), "ANALYST".to_string())];
+        let key = compute_scoped_pool_key(
+            "snowflake",
+            &base_db_kwargs,
+            &session,
+            &QueryCredentials::ServiceAccount,
+        )
+        .expect("SYSADMIN differs from the configured ANALYST");
+        assert_eq!(key.role.as_deref(), Some("SYSADMIN"));
+    }
+
+    #[test]
+    fn scoped_pool_key_ignores_unmapped_driver() {
+        // `variant_field_to_db_kwarg` has no mapping for postgresql's "role" — the override
+        // must be silently ignored, not accidentally applied via some fallback.
+        let session = session_with(&[("snowflake.role", "ANALYST")]);
+        let key = compute_scoped_pool_key(
+            "postgresql",
+            &[],
+            &session,
+            &QueryCredentials::ServiceAccount,
+        );
+        assert!(key.is_none());
+    }
+
+    #[test]
+    fn scoped_pool_key_combines_token_and_role() {
+        let session = session_with(&[("snowflake.role", "ANALYST")]);
+        let key = compute_scoped_pool_key(
+            "snowflake",
+            &[],
+            &session,
+            &QueryCredentials::Bearer {
+                token: "tok".to_string(),
+            },
+        )
+        .expect("token + role both present");
+        assert_eq!(key.token.as_deref(), Some("tok"));
+        assert_eq!(key.role.as_deref(), Some("ANALYST"));
+    }
+
+    #[test]
+    fn scoped_pool_key_cross_protocol_bare_key_never_collides() {
+        // A Postgres- or MySQL-fronted session could plausibly have an unrelated, unprefixed
+        // "role" key in `extra` (e.g. a real libpq `role` connection parameter) if ever routed
+        // to a Snowflake ADBC cluster — the namespaced `snowflake.role` key must never read it.
+        let session = session_with(&[("role", "unrelated-postgres-value")]);
+        let key = compute_scoped_pool_key(
+            "snowflake",
+            &[],
+            &session,
+            &QueryCredentials::ServiceAccount,
+        );
+        assert!(
+            key.is_none(),
+            "bare 'role' key must not be read as a Snowflake override"
+        );
+    }
+
+    #[test]
+    fn scoped_pool_size_is_small_for_token_scopes() {
+        let key = PoolScopeKey {
+            token: Some("tok".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(compute_scoped_pool_size(&key, 20), IDENTITY_POOL_MAX_SIZE);
+    }
+
+    #[test]
+    fn scoped_pool_size_uses_base_pool_size_for_role_only_scopes() {
+        let key = PoolScopeKey {
+            role: Some("ANALYST".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(compute_scoped_pool_size(&key, 20), 20);
+    }
 
     #[test]
     fn oauth_token_options_snowflake_sets_auth_type_and_token() {

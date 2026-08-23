@@ -4,7 +4,9 @@
 //! DELETE /session                 — logout / invalidate session
 //! GET  /session/heartbeat         — validate session and bump idle timer
 
-use axum::extract::State;
+use std::collections::HashMap;
+
+use axum::extract::{Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
@@ -28,6 +30,7 @@ use queryflux_routing::ChainRouteResult;
 
 pub async fn login_request(
     State(state): State<SnowflakeWireState>,
+    Query(query_params): Query<HashMap<String, String>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
@@ -44,6 +47,17 @@ pub async fn login_request(
     let password = data["PASSWORD"].as_str().unwrap_or("").to_string();
     let database = data["DATABASE_NAME"].as_str().map(|s| s.to_string());
     let schema = data["SCHEMA_NAME"].as_str().map(|s| s.to_string());
+    // Unlike database/schema, real Snowflake drivers send role/warehouse as query-string
+    // parameters on the login-request URL itself (`?roleName=X&warehouse=Y`), not JSON body
+    // fields — confirmed against the actual login URL the Go driver constructs.
+    let role = query_params
+        .get("roleName")
+        .filter(|s| !s.is_empty())
+        .cloned();
+    let warehouse = query_params
+        .get("warehouse")
+        .filter(|s| !s.is_empty())
+        .cloned();
 
     let auth_provider = state.app.live.read().await.auth_provider.clone();
     let auth_ctx = match auth_provider
@@ -126,7 +140,9 @@ pub async fn login_request(
         auth_ctx,
         group,
         database.clone(),
-        schema,
+        schema.clone(),
+        role.clone(),
+        warehouse.clone(),
     );
 
     let master_token = Uuid::new_v4().to_string();
@@ -154,9 +170,9 @@ pub async fn login_request(
                 ],
                 "sessionInfo": {
                     "databaseName": database.unwrap_or_default(),
-                    "schemaName": "",
-                    "warehouseName": "",
-                    "roleName": "PUBLIC"
+                    "schemaName": schema.unwrap_or_default(),
+                    "warehouseName": warehouse.unwrap_or_default(),
+                    "roleName": role.unwrap_or_else(|| "PUBLIC".to_string())
                 },
                 "idToken": null,
                 "idTokenValidityInSeconds": 0,
