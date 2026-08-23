@@ -153,7 +153,7 @@ pub async fn query_request(
     };
 
     // Validate session and extract stored context.
-    let (auth_ctx, group, mut database, mut schema_name, role, warehouse) = {
+    let (auth_ctx, group, mut database, mut schema_name, role, warehouse, password) = {
         match state.sessions.validate_session(&token) {
             Some((_, session)) => (
                 session.auth_ctx.clone(),
@@ -162,6 +162,7 @@ pub async fn query_request(
                 session.schema.clone().unwrap_or_default(),
                 session.role.clone(),
                 session.warehouse.clone(),
+                session.password.clone(),
             ),
             None => return unauthorized(),
         }
@@ -222,6 +223,19 @@ pub async fn query_request(
     }
     if !schema_name.is_empty() {
         extra.insert("snowflake.schema".to_string(), schema_name.clone());
+    }
+    // Only meaningful for `queryAuth: passthrough` clusters — `AdbcAdapter` fails closed if
+    // these are absent and the resolved credentials are `Passthrough`; harmless to include
+    // otherwise (any other credential mode just ignores them).
+    if let Some(password) = &password {
+        extra.insert(
+            "snowflake.passthrough_username".to_string(),
+            auth_ctx.user.clone(),
+        );
+        extra.insert(
+            "snowflake.passthrough_password".to_string(),
+            password.clone(),
+        );
     }
 
     let session_ctx = SessionContext {
