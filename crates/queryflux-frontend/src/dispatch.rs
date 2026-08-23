@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use arrow::datatypes::Schema;
 use arrow::record_batch::RecordBatch;
@@ -16,11 +16,14 @@ use queryflux_core::{
     error::{QueryFluxError, Result},
     query::{
         ClusterGroupName, ClusterName, ExecutingQuery, FrontendProtocol, ProxyQueryId,
-        QueryEngineStats, QueryExecution, QueryStats, QueryStatus, QueuedQuery,
+        QueryEngineStats, QueryExecution, QueryStats, QueryStatus, QueuedQuery, StoredWireAuth,
     },
     session::SessionContext,
 };
-use queryflux_engine_adapters::{AdapterKind, AsyncAdapter, ConnectionFormat, SyncAdapter};
+use queryflux_engine_adapters::{
+    wire_auth::{enrich_session_for_passthrough, resolve_stored_wire_auth},
+    AdapterKind, AsyncAdapter, BackendQueryIdSlot, ConnectionFormat, SyncAdapter,
+};
 use queryflux_guardrails::{GuardChain, GuardContext, GuardLayer};
 use queryflux_metrics::MetricsStore;
 use queryflux_translation::SchemaContext;
@@ -110,7 +113,7 @@ pub async fn dispatch_query(
     query_id: ProxyQueryId,
     sql: String,
     params: QueryParams,
-    session: SessionContext,
+    mut session: SessionContext,
     protocol: FrontendProtocol,
     group: ClusterGroupName,
     already_queued: bool,
@@ -130,9 +133,7 @@ pub async fn dispatch_query(
         guard_chain,
         group_guard_chain,
         cluster_cfg,
-        // TODO: plumb max_queued_queries through LiveConfig. Add a field like
-        // `group_max_queued_queries: HashMap<String, Option<u64>>` to LiveConfig,
-        // populated from ClusterGroupConfig.max_queued_queries during reload.
+        adapters,
         max_queued_queries,
     ) = {
         let live = state.live.read().await;
@@ -152,7 +153,17 @@ pub async fn dispatch_query(
             // cluster_cfg resolved after cluster selection below; captured here
             // so credential resolution uses the same config generation.
             live.cluster_configs.clone(),
-            None::<u64>,
+            // adapters snapshotted from the same read guard as cluster_cfg — a config
+            // update landing between credential resolution and adapter selection could
+            // otherwise resolve credentials against one config generation and submit
+            // through an adapter built from a newer one (e.g. HTTP auth removed between
+            // the two reads would make credential resolution and the Trino adapter's own
+            // internal derivation disagree on whether to forward client Authorization).
+            live.adapters.clone(),
+            live.group_max_queued_queries
+                .get(&group.0)
+                .copied()
+                .flatten(),
         )
     };
 
@@ -179,6 +190,7 @@ pub async fn dispatch_query(
             already_queued,
             sequence,
             max_queued_queries,
+            auth_ctx,
         )
         .await?;
         return Ok(DispatchOutcome::Queued {
@@ -202,6 +214,7 @@ pub async fn dispatch_query(
                         already_queued,
                         sequence,
                         max_queued_queries,
+                        auth_ctx,
                     )
                     .await?;
                     return Ok(DispatchOutcome::Queued {
@@ -222,6 +235,7 @@ pub async fn dispatch_query(
                 already_queued,
                 sequence,
                 max_queued_queries,
+                auth_ctx,
             )
             .await?;
             return Ok(DispatchOutcome::Queued {
@@ -261,7 +275,23 @@ pub async fn dispatch_query(
         }
     };
 
-    let adapter_kind = match state.adapter(&cluster_name.0).await {
+    // Passthrough: forward the client's own Authorization if the frontend already
+    // captured one; otherwise inject a Bearer built from the OIDC raw_token so the
+    // backend still receives a per-user credential. The adapter fails closed if
+    // neither is available — this is best-effort enrichment, not the fail-closed check.
+    enrich_session_for_passthrough(&mut session, &credentials, auth_ctx);
+
+    // Resolved once here (mirroring what the Trino adapter derives internally for the
+    // POST itself) so the exact same wire auth can be persisted on `ExecutingQuery` and
+    // reused by poll/cancel, which never see the original `SessionContext` again.
+    let cluster_sets_http_auth = this_cluster_cfg
+        .as_ref()
+        .and_then(|c| c.auth.as_ref())
+        .is_some_and(|a| a.sets_http_authorization());
+    let wire_auth: Option<StoredWireAuth> =
+        resolve_stored_wire_auth(&credentials, &session, cluster_sets_http_auth);
+
+    let adapter_kind = match adapters.get(&cluster_name.0).cloned() {
         Some(a) => a,
         None => {
             slot.release().await;
@@ -464,6 +494,8 @@ pub async fn dispatch_query(
                 agent_context: resolved_agent_ctx,
                 submitted_guard_actions,
                 was_guard_blocked: false,
+                submitted_by: auth_ctx.user.clone(),
+                wire_auth: wire_auth.clone(),
             };
 
             match execution {
@@ -480,8 +512,12 @@ pub async fn dispatch_query(
                         warn!(id = %query_id, "Failed to persist executing query: {e}");
                         let cancel_adapter = adapter.clone();
                         let cancel_id = backend_query_id.clone();
+                        let cancel_wire_auth = wire_auth.clone();
                         tokio::spawn(async move {
-                            if let Err(ce) = cancel_adapter.cancel_query(&cancel_id).await {
+                            if let Err(ce) = cancel_adapter
+                                .cancel_query(&cancel_id, cancel_wire_auth.as_ref())
+                                .await
+                            {
                                 warn!(backend = %cancel_id, "Best-effort cancel after persistence failure: {ce}");
                             }
                         });
@@ -754,26 +790,31 @@ async fn persist_queued_query(
     session: SessionContext,
     protocol: FrontendProtocol,
     group: ClusterGroupName,
-    _already_stored: bool,
+    already_stored: bool,
     sequence: u64,
     max_queued_queries: Option<u64>,
+    auth_ctx: &AuthContext,
 ) -> Result<String> {
     // Enforce queue depth limit before admitting to the queue.
-    if let Some(limit) = max_queued_queries {
-        if limit > 0 {
-            let active_after = Utc::now() - chrono::Duration::seconds(QUEUE_ACTIVE_WINDOW_SECS);
-            let count = state
-                .persistence
-                .count_active_queued_before(&group.0, None, active_after)
-                .await
-                .unwrap_or(0);
-            if count >= limit {
-                return Err(QueryFluxError::Other(anyhow::anyhow!(
-                    "Queue full for group '{}': {}/{} queued queries",
-                    group.0,
-                    count,
-                    limit
-                )));
+    // Skip when re-persisting an already-queued query so a waiter cannot
+    // self-reject by counting itself against the limit.
+    if !already_stored {
+        if let Some(limit) = max_queued_queries {
+            if limit > 0 {
+                let active_after = Utc::now() - chrono::Duration::seconds(QUEUE_ACTIVE_WINDOW_SECS);
+                let count = state
+                    .persistence
+                    .count_active_queued_before(&group.0, None, active_after)
+                    .await
+                    .unwrap_or(0);
+                if count >= limit {
+                    state.metrics.on_queue_full(&group.0);
+                    return Err(QueryFluxError::QueueFull {
+                        group: group.0.clone(),
+                        count,
+                        limit,
+                    });
+                }
             }
         }
     }
@@ -782,12 +823,13 @@ async fn persist_queued_query(
     let queued = QueuedQuery {
         id: query_id.clone(),
         sql,
-        session,
+        session: session.without_auth_headers(),
         frontend_protocol: protocol,
         cluster_group: group,
         creation_time: now,
         last_accessed: now,
         sequence,
+        submitted_by: auth_ctx.user.clone(),
     };
     state.persistence.upsert_queued(queued).await?;
     let next_seq = sequence + 1;
@@ -908,6 +950,140 @@ impl Drop for ClusterSlotGuard {
 }
 
 // ---------------------------------------------------------------------------
+// SyncCancelGuard — kill the engine query if the client drops mid-flight
+// ---------------------------------------------------------------------------
+
+/// Issues `adapter.cancel_query` when dropped without [`SyncCancelGuard::disarm`].
+///
+/// Adapters publish the engine-side id into `id_slot` before the blocking wait.
+/// On HTTP handler cancellation the future is dropped, this guard fires, and
+/// the backend query is stopped (ClickHouse `KILL QUERY`, StarRocks `KILL QUERY`,
+/// DuckDB interrupt, Athena `StopQueryExecution`, Trino `DELETE /v1/query`).
+struct SyncCancelGuard {
+    adapter: DispatchAdapter,
+    id_slot: BackendQueryIdSlot,
+    /// The wire auth resolved at submit time — reused so cancellation on disconnect uses
+    /// the same identity the query was submitted under, not cluster auth.
+    wire_auth: Option<StoredWireAuth>,
+    state: Option<Arc<AppState>>,
+    ctx: Option<QueryContext>,
+    start: Instant,
+    disarmed: bool,
+}
+
+impl SyncCancelGuard {
+    fn new(
+        adapter: DispatchAdapter,
+        id_slot: BackendQueryIdSlot,
+        wire_auth: Option<StoredWireAuth>,
+        state: Arc<AppState>,
+        ctx: QueryContext,
+        start: Instant,
+    ) -> Self {
+        Self {
+            adapter,
+            id_slot,
+            wire_auth,
+            state: Some(state),
+            ctx: Some(ctx),
+            start,
+            disarmed: false,
+        }
+    }
+
+    /// Do not cancel — the query finished (success or engine error).
+    fn disarm(&mut self) {
+        self.disarmed = true;
+        self.state = None;
+        self.ctx = None;
+    }
+
+    /// Spawn a best-effort cancel now. Idempotent with [`Drop`].
+    fn fire(&mut self) {
+        if self.disarmed {
+            return;
+        }
+        self.disarmed = true;
+        self.state = None;
+        self.ctx = None;
+        spawn_sync_cancel(
+            self.adapter.clone(),
+            self.id_slot.clone(),
+            self.wire_auth.clone(),
+        );
+    }
+}
+
+impl Drop for SyncCancelGuard {
+    fn drop(&mut self) {
+        if self.disarmed {
+            return;
+        }
+        self.disarmed = true;
+        spawn_sync_cancel(
+            self.adapter.clone(),
+            self.id_slot.clone(),
+            self.wire_auth.clone(),
+        );
+        if let (Some(state), Some(ctx)) = (self.state.take(), self.ctx.take()) {
+            let backend_query_id = self.id_slot.get().map(|id| id.0);
+            state.record_query(
+                &ctx,
+                QueryOutcome {
+                    backend_query_id,
+                    status: QueryStatus::Cancelled,
+                    execution_ms: self.start.elapsed().as_millis() as u64,
+                    rows: None,
+                    error: Some("client disconnected".to_string()),
+                    routing_trace: None,
+                    engine_stats: None,
+                    guard_actions: vec![],
+                    was_guard_blocked: false,
+                    queue_duration_ms: 0,
+                    cache_hit: false,
+                },
+            );
+        }
+    }
+}
+
+/// Outer deadline for detached `cancel_query` tasks. Matches adapter control-plane
+/// timeouts (ClickHouse / StarRocks pool checkout) so a hung backend cannot leak tasks.
+const SYNC_CANCEL_TIMEOUT: Duration = Duration::from_secs(10);
+
+fn spawn_sync_cancel(
+    adapter: DispatchAdapter,
+    id_slot: BackendQueryIdSlot,
+    wire_auth: Option<StoredWireAuth>,
+) {
+    let Some(id) = id_slot.get() else {
+        return;
+    };
+    tokio::spawn(async move {
+        match tokio::time::timeout(
+            SYNC_CANCEL_TIMEOUT,
+            adapter.cancel_query(&id, wire_auth.as_ref()),
+        )
+        .await
+        {
+            Err(_) => {
+                warn!(
+                    backend = %id,
+                    timeout_secs = SYNC_CANCEL_TIMEOUT.as_secs(),
+                    "Sync cancel timed out"
+                );
+            }
+            Ok(Err(e)) => {
+                warn!(backend = %id, "Best-effort sync cancel on client disconnect: {e}");
+            }
+            Ok(Ok(())) => {
+                debug!(backend = %id, "Issued backend cancel after client disconnect");
+            }
+        }
+    });
+}
+
+// ---------------------------------------------------------------------------
 // Sync execution path — shared by MySQL wire, Postgres wire, Flight SQL
 // ---------------------------------------------------------------------------
 
@@ -916,6 +1092,7 @@ impl Drop for ClusterSlotGuard {
 /// Async engines (Trino) implement `execute_as_arrow` internally by driving their own
 /// submit+poll loop — allowing MySQL/Postgres clients to query them without needing a
 /// separate execution path in dispatch.
+#[derive(Clone)]
 enum DispatchAdapter {
     Sync(Arc<dyn SyncAdapter>),
     Async(Arc<dyn AsyncAdapter>),
@@ -930,16 +1107,28 @@ impl DispatchAdapter {
         tags: &queryflux_core::tags::QueryTags,
         params: &QueryParams,
         hints: queryflux_core::sql_classify::ExecutionHints,
+        id_slot: &BackendQueryIdSlot,
     ) -> Result<queryflux_engine_adapters::SyncExecution> {
         match self {
             Self::Sync(a) => {
-                a.execute_as_arrow(sql, session, credentials, tags, params, hints)
+                a.execute_as_arrow(sql, session, credentials, tags, params, hints, id_slot)
                     .await
             }
             Self::Async(a) => {
-                a.execute_as_arrow(sql, session, credentials, tags, params, hints)
+                a.execute_as_arrow(sql, session, credentials, tags, params, hints, id_slot)
                     .await
             }
+        }
+    }
+
+    async fn cancel_query(
+        &self,
+        backend_id: &queryflux_core::query::BackendQueryId,
+        wire_auth: Option<&StoredWireAuth>,
+    ) -> Result<()> {
+        match self {
+            Self::Sync(a) => a.cancel_query(backend_id).await,
+            Self::Async(a) => a.cancel_query(backend_id, wire_auth).await,
         }
     }
 
@@ -991,6 +1180,9 @@ struct SyncQuerySetup {
     guard_actions: Vec<queryflux_persistence::GuardAction>,
     /// Shared SQL parse cache — used by guardrails and execution hints.
     sql_parse: queryflux_core::sql_classify::SqlParseCache,
+    /// The wire auth resolved at submit time — reused by `SyncCancelGuard` so a client
+    /// disconnect cancels with the same identity the query was submitted under.
+    wire_auth: Option<StoredWireAuth>,
 }
 
 /// The outcome of executing a sync query — everything record_query needs.
@@ -1035,15 +1227,20 @@ async fn setup_sync_query(
     state: &Arc<AppState>,
     sql: String,
     params: QueryParams,
-    session: SessionContext,
+    mut session: SessionContext,
     protocol: FrontendProtocol,
     group: ClusterGroupName,
     auth_ctx: &AuthContext,
 ) -> Result<SyncQuerySetup> {
     let query_id = ProxyQueryId::new();
 
-    let (cluster_manager, group_fixups, group_default_tags, cluster_configs) = {
+    let (cluster_manager, group_fixups, group_default_tags, wait_timeout_secs) = {
         let live = state.live.read().await;
+        let wait_timeout_secs = live
+            .group_capacity_wait_timeout_secs
+            .get(&group.0)
+            .copied()
+            .unwrap_or(queryflux_core::config::DEFAULT_CAPACITY_WAIT_TIMEOUT_SECS);
         (
             live.cluster_manager.clone(),
             live.group_translation_scripts
@@ -1054,7 +1251,7 @@ async fn setup_sync_query(
                 .get(&group.0)
                 .cloned()
                 .unwrap_or_default(),
-            live.cluster_configs.clone(),
+            wait_timeout_secs,
         )
     };
     let effective_tags: QueryTags = merge_tags(&group_default_tags, &session.tags().clone());
@@ -1062,9 +1259,17 @@ async fn setup_sync_query(
     // Queue loop: spin until a cluster slot is available (both local and global).
     // `wait_start` is this query's place in line for the fairness gate: queued
     // queries enqueued before it (and still polling) get freed slots first.
+    // Bound by `capacityWaitTimeoutSecs` so clients cannot wait forever.
     let wait_start = Utc::now();
+    let deadline = wait_start + chrono::Duration::seconds(wait_timeout_secs as i64);
     let mut seq: u64 = 0;
-    let (cluster_name, adapter) = loop {
+    let (cluster_name, adapter, this_cluster_cfg) = loop {
+        if Utc::now() >= deadline {
+            return Err(QueryFluxError::CapacityWaitTimeout {
+                group: group.0.clone(),
+                timeout_secs: wait_timeout_secs,
+            });
+        }
         if should_yield_to_older_queued(state, &cluster_manager, &group, Some(wait_start)).await {
             queued_backoff_delay(seq).await;
             seq += 1;
@@ -1085,9 +1290,24 @@ async fn setup_sync_query(
                     }
                     CapacityGrant::Granted => {}
                 }
-                match state.adapter(&name.0).await {
-                    Some(AdapterKind::Sync(a)) => break (name, DispatchAdapter::Sync(a)),
-                    Some(AdapterKind::Async(a)) => break (name, DispatchAdapter::Async(a)),
+                // Read the adapter and its cluster config from the same lock acquisition —
+                // this loop can spin for a while waiting on capacity, so a config update
+                // landing mid-wait must not let a fresh adapter get paired with a stale
+                // (or vice versa) cluster config for credential resolution below.
+                let (adapter_for_cluster, cluster_cfg_for_cluster) = {
+                    let live = state.live.read().await;
+                    (
+                        live.adapters.get(&name.0).cloned(),
+                        live.cluster_configs.get(&name.0).cloned(),
+                    )
+                };
+                match adapter_for_cluster {
+                    Some(AdapterKind::Sync(a)) => {
+                        break (name, DispatchAdapter::Sync(a), cluster_cfg_for_cluster)
+                    }
+                    Some(AdapterKind::Async(a)) => {
+                        break (name, DispatchAdapter::Async(a), cluster_cfg_for_cluster)
+                    }
                     None => {
                         let _ = cluster_manager.release_cluster(&group, &name).await;
                         if let Some(cap) = &state.capacity_store {
@@ -1185,7 +1405,6 @@ async fn setup_sync_query(
 
     let was_translated = translated != sql;
 
-    let this_cluster_cfg = cluster_configs.get(&cluster_name.0).cloned();
     let credentials = match state
         .identity_resolver
         .resolve(auth_ctx, this_cluster_cfg.as_ref())
@@ -1197,6 +1416,25 @@ async fn setup_sync_query(
             return Err(e);
         }
     };
+
+    // Same enrichment as the async dispatch path: Flight SQL already forwards a client
+    // `Authorization` gRPC metadata header into `session.extra` verbatim, so this is only
+    // a no-op fallback for `passthrough` clusters when that header is missing but the
+    // caller authenticated via OIDC. `execute_as_arrow` (Trino reached via this sync
+    // bridge) resolves its own wire auth internally from this same session.
+    enrich_session_for_passthrough(&mut session, &credentials, auth_ctx);
+
+    // Resolved the same way as the async dispatch path (after enrichment, so passthrough
+    // benefits from it too), so a disconnect mid-query cancels with the identity the query
+    // actually submitted under — not cluster auth — for passthrough/impersonate/
+    // tokenExchange queries reached via the sync bridge (Postgres/MySQL/Flight wire, or
+    // Trino's own `execute_as_arrow`).
+    let cluster_sets_http_auth = this_cluster_cfg
+        .as_ref()
+        .and_then(|c| c.auth.as_ref())
+        .is_some_and(|a| a.sets_http_authorization());
+    let wire_auth: Option<StoredWireAuth> =
+        resolve_stored_wire_auth(&credentials, &session, cluster_sets_http_auth);
 
     // Fallback interpolation: when the adapter does not support native params,
     // substitute `?` placeholders with typed literals now so the adapter receives
@@ -1245,6 +1483,7 @@ async fn setup_sync_query(
         credentials,
         params: effective_params,
         guard_actions: vec![],
+        wire_auth,
     })
 }
 
@@ -1259,6 +1498,7 @@ async fn setup_sync_query(
 async fn execute_stream(
     setup: &SyncQuerySetup,
     sink: &mut impl ResultSink,
+    id_slot: &BackendQueryIdSlot,
 ) -> (SyncOutcome, Result<()>) {
     let elapsed = || setup.start.elapsed().as_millis() as u64;
 
@@ -1273,6 +1513,7 @@ async fn execute_stream(
             queryflux_core::sql_classify::ExecutionHints {
                 is_read_like: Some(setup.sql_parse.is_read_like()),
             },
+            id_slot,
         )
         .await
     {
@@ -1387,6 +1628,7 @@ async fn execute_native_to_sink(
     setup: &SyncQuerySetup,
     protocol: &FrontendProtocol,
     sink: &mut impl ResultSink,
+    id_slot: &BackendQueryIdSlot,
 ) -> (SyncOutcome, Result<()>) {
     let elapsed = || setup.start.elapsed().as_millis() as u64;
 
@@ -1418,6 +1660,7 @@ async fn execute_native_to_sink(
             &setup.credentials,
             &setup.ctx.query_tags,
             &setup.params,
+            id_slot,
         )
         .await
     {
@@ -1838,20 +2081,44 @@ async fn execute_to_sink_inner(
     // Native path: skip Arrow when backend connection format matches frontend protocol.
     // All other guarantees (slot release, record_query) are upheld by this function's
     // outer structure — only the inner execution subroutine is swapped.
-    let (outcome, sink_result) = if setup
+    let id_slot = BackendQueryIdSlot::new();
+    let mut cancel = SyncCancelGuard::new(
+        setup.adapter.clone(),
+        id_slot.clone(),
+        setup.wire_auth.clone(),
+        state.clone(),
+        setup.ctx.clone(),
+        setup.start,
+    );
+    let (mut outcome, sink_result) = if setup
         .adapter
         .connection_format()
         .matches_frontend(&protocol)
     {
-        execute_native_to_sink(&setup, &protocol, sink).await
+        execute_native_to_sink(&setup, &protocol, sink, &id_slot).await
     } else {
-        execute_stream(&setup, sink).await
+        execute_stream(&setup, sink, &id_slot).await
     };
+    if sink_result.is_err() {
+        // Client gone mid-stream (or during schema send): stop the engine query.
+        cancel.fire();
+        // Only reclassify when the engine itself did not already fail — otherwise
+        // an engine error delivered to a departed client is logged as a cancel.
+        if outcome.status == QueryStatus::Success {
+            outcome.status = QueryStatus::Cancelled;
+        }
+        if outcome.error.is_none() {
+            outcome.error = Some("client disconnected".to_string());
+        }
+    }
+    // Successful completion and engine errors: the query is already finished.
+    cancel.disarm();
 
     // Guaranteed single exit: release slot, then record.
     // slot.release() is idempotent and sets released=true so Drop is a no-op.
     setup.slot.release().await;
     let mut final_outcome: QueryOutcome = outcome.into();
+    final_outcome.backend_query_id = id_slot.get().map(|id| id.0);
     // Prepend guard actions (allow/warn) collected before execution.
     if !setup.guard_actions.is_empty() {
         setup.guard_actions.extend(final_outcome.guard_actions);
@@ -1860,4 +2127,286 @@ async fn execute_to_sink_inner(
     state.record_query(&setup.ctx, final_outcome);
 
     sink_result
+}
+
+#[cfg(test)]
+mod queue_limit_tests {
+    use super::persist_queued_query;
+    use crate::state::test_fixtures::app_state;
+    use queryflux_auth::AuthContext;
+    use queryflux_core::error::QueryFluxError;
+    use queryflux_core::query::{ClusterGroupName, FrontendProtocol, ProxyQueryId};
+    use queryflux_core::session::SessionContext;
+    use std::collections::HashMap;
+
+    #[tokio::test]
+    async fn persist_queued_rejects_when_at_limit() {
+        let state = app_state(false);
+        let auth = AuthContext {
+            user: "alice".into(),
+            groups: vec![],
+            roles: vec![],
+            raw_token: None,
+            ..Default::default()
+        };
+        let group = ClusterGroupName("default".into());
+
+        persist_queued_query(
+            &state,
+            ProxyQueryId::new(),
+            "SELECT 1".into(),
+            SessionContext::default(),
+            FrontendProtocol::TrinoHttp,
+            group.clone(),
+            false,
+            0,
+            Some(1),
+            &auth,
+        )
+        .await
+        .expect("first enqueue");
+
+        let err = persist_queued_query(
+            &state,
+            ProxyQueryId::new(),
+            "SELECT 2".into(),
+            SessionContext::default(),
+            FrontendProtocol::TrinoHttp,
+            group.clone(),
+            false,
+            0,
+            Some(1),
+            &auth,
+        )
+        .await
+        .expect_err("second enqueue must fail");
+        match err {
+            QueryFluxError::QueueFull {
+                group: g,
+                count,
+                limit,
+            } => {
+                assert_eq!(g, "default");
+                assert_eq!(count, 1);
+                assert_eq!(limit, 1);
+            }
+            other => panic!("expected QueueFull, got {other}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn already_stored_skips_limit_check() {
+        let state = app_state(false);
+        let auth = AuthContext {
+            user: "alice".into(),
+            groups: vec![],
+            roles: vec![],
+            raw_token: None,
+            ..Default::default()
+        };
+        let group = ClusterGroupName("default".into());
+        let id = ProxyQueryId::new();
+
+        persist_queued_query(
+            &state,
+            id.clone(),
+            "SELECT 1".into(),
+            SessionContext::default(),
+            FrontendProtocol::TrinoHttp,
+            group.clone(),
+            false,
+            0,
+            Some(1),
+            &auth,
+        )
+        .await
+        .expect("first enqueue");
+
+        persist_queued_query(
+            &state,
+            id,
+            "SELECT 1".into(),
+            SessionContext::default(),
+            FrontendProtocol::TrinoHttp,
+            group,
+            true,
+            1,
+            Some(1),
+            &auth,
+        )
+        .await
+        .expect("already_stored must bypass limit");
+    }
+
+    #[tokio::test]
+    async fn dispatch_reads_limit_from_live_config() {
+        use super::dispatch_query;
+        use queryflux_cluster_manager::cluster_state::ClusterState;
+        use queryflux_cluster_manager::simple::SimpleClusterGroupManager;
+        use queryflux_core::query::{ClusterName, EngineType};
+        use std::sync::Arc;
+
+        let state = app_state(false);
+        {
+            let mut live = state.live.write().await;
+            live.group_max_queued_queries
+                .insert("default".into(), Some(1));
+            let group = ClusterGroupName("default".into());
+            let cluster = ClusterName("trino".into());
+            let cluster_state = Arc::new(ClusterState::new(
+                cluster.clone(),
+                group.clone(),
+                None,
+                None,
+                EngineType::Trino,
+                Some("http://trino.test:8080".into()),
+                0,
+                true,
+            ));
+            let mut groups = HashMap::new();
+            groups.insert(
+                group.clone(),
+                (
+                    vec![cluster_state],
+                    Arc::new(queryflux_cluster_manager::strategy::RoundRobinStrategy::new())
+                        as Arc<dyn queryflux_cluster_manager::strategy::ClusterSelectionStrategy>,
+                ),
+            );
+            live.cluster_manager = Arc::new(SimpleClusterGroupManager::new(groups));
+        }
+
+        let auth = AuthContext {
+            user: "alice".into(),
+            groups: vec![],
+            roles: vec![],
+            raw_token: None,
+            ..Default::default()
+        };
+        let group = ClusterGroupName("default".into());
+
+        dispatch_query(
+            &state,
+            ProxyQueryId::new(),
+            "SELECT 1".into(),
+            vec![],
+            SessionContext::default(),
+            FrontendProtocol::TrinoHttp,
+            group.clone(),
+            false,
+            None,
+            0,
+            &auth,
+        )
+        .await
+        .expect("first should queue");
+
+        let err = match dispatch_query(
+            &state,
+            ProxyQueryId::new(),
+            "SELECT 2".into(),
+            vec![],
+            SessionContext::default(),
+            FrontendProtocol::TrinoHttp,
+            group,
+            false,
+            None,
+            0,
+            &auth,
+        )
+        .await
+        {
+            Ok(_) => panic!("second should hit QueueFull"),
+            Err(e) => e,
+        };
+        assert!(
+            matches!(err, QueryFluxError::QueueFull { limit: 1, .. }),
+            "got {err}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod capacity_wait_tests {
+    use super::setup_sync_query;
+    use crate::state::test_fixtures::app_state;
+    use queryflux_auth::AuthContext;
+    use queryflux_cluster_manager::cluster_state::ClusterState;
+    use queryflux_cluster_manager::simple::SimpleClusterGroupManager;
+    use queryflux_core::error::QueryFluxError;
+    use queryflux_core::query::{ClusterGroupName, ClusterName, EngineType, FrontendProtocol};
+    use queryflux_core::session::SessionContext;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    #[tokio::test]
+    async fn sync_setup_times_out_when_no_capacity() {
+        let state = app_state(false);
+        {
+            let mut live = state.live.write().await;
+            live.group_capacity_wait_timeout_secs
+                .insert("default".into(), 1);
+            let group = ClusterGroupName("default".into());
+            let cluster = ClusterName("trino".into());
+            // max_running_queries = 0 → acquire_cluster always returns None.
+            let cluster_state = Arc::new(ClusterState::new(
+                cluster.clone(),
+                group.clone(),
+                None,
+                None,
+                EngineType::Trino,
+                Some("http://trino.test:8080".into()),
+                0,
+                true,
+            ));
+            let mut groups = HashMap::new();
+            groups.insert(
+                group.clone(),
+                (
+                    vec![cluster_state],
+                    Arc::new(queryflux_cluster_manager::strategy::RoundRobinStrategy::new())
+                        as Arc<dyn queryflux_cluster_manager::strategy::ClusterSelectionStrategy>,
+                ),
+            );
+            live.cluster_manager = Arc::new(SimpleClusterGroupManager::new(groups));
+        }
+
+        let auth = AuthContext {
+            user: "alice".into(),
+            groups: vec![],
+            roles: vec![],
+            raw_token: None,
+            ..Default::default()
+        };
+        let started = Instant::now();
+        let result = setup_sync_query(
+            &state,
+            "SELECT 1".into(),
+            vec![],
+            SessionContext::default(),
+            FrontendProtocol::TrinoHttp,
+            ClusterGroupName("default".into()),
+            &auth,
+        )
+        .await;
+        assert!(
+            started.elapsed().as_secs() < 10,
+            "timeout should fire near 1s, got {:?}",
+            started.elapsed()
+        );
+        let err = match result {
+            Ok(_) => panic!("must time out waiting for capacity"),
+            Err(e) => e,
+        };
+        match err {
+            QueryFluxError::CapacityWaitTimeout {
+                group,
+                timeout_secs,
+            } => {
+                assert_eq!(group, "default");
+                assert_eq!(timeout_secs, 1);
+            }
+            other => panic!("expected CapacityWaitTimeout, got {other}"),
+        }
+    }
 }

@@ -40,63 +40,42 @@ html[data-theme='dark'] .heroGlow {
   margin-right: auto;
 }
 
+/* Artwork has its own dark background baked in — frame it as a card rather than
+   letting it float as a bare rectangle against the (light-mode) page background.
+   Sized to fill the content column (--qf-content-max), not float small inside it. */
 .heroImage {
   display: block;
-  width: min(100%, 920px);
+  width: min(100%, 880px);
   height: auto;
-  margin: 0 auto 1.5rem;
+  margin: 0 auto 1.75rem;
+  border-radius: 1.25rem;
+  box-shadow:
+    0 20px 50px -12px rgba(124, 58, 237, 0.28),
+    0 0 0 1px rgba(124, 58, 237, 0.12);
+}
+
+html[data-theme='dark'] .heroImage {
+  box-shadow:
+    0 20px 50px -12px rgba(0, 0, 0, 0.6),
+    0 0 0 1px rgba(255, 255, 255, 0.06),
+    0 0 60px rgba(124, 58, 237, 0.12);
 }
 
 .heroTitle {
-  font-size: clamp(2.05rem, 4.4vw, 2.75rem);
+  font-size: clamp(1.5rem, 2.6vw, 1.9rem);
   font-weight: 700;
-  letter-spacing: -0.03em;
-  line-height: 1.15;
-  margin: 0 0 0.5rem;
-  display: inline-flex;
-  flex-wrap: wrap;
-  justify-content: center;
-  align-items: baseline;
-  gap: 0;
-}
-
-.heroTitleQuery {
-  color: #0f172a;
-  transition: color 0.22s cubic-bezier(0.4, 0, 0.2, 1);
-}
-
-.heroTitleFlux {
-  color: var(--brand-flux, #ff7619);
-}
-
-html[data-theme='dark'] .heroTitleQuery {
-  color: #fafafa;
-  text-shadow: 0 0 42px rgba(167, 139, 250, 0.12);
-}
-
-.heroTitle:hover .heroTitleQuery {
-  color: #5b21b6;
-}
-
-html[data-theme='dark'] .heroTitle:hover .heroTitleQuery {
-  color: #e9d5ff;
-}
-
-html[data-theme='dark'] .heroTitleFlux {
-  text-shadow: 0 0 32px rgba(255, 118, 25, 0.2);
-}
-
-.heroTagline {
-  font-size: clamp(1.28rem, 2.5vw, 1.52rem);
-  font-weight: 650;
-  color: #334155;
+  letter-spacing: -0.02em;
+  line-height: 1.35;
   margin: 0 0 1rem;
-  line-height: 1.5;
+  color: #1e1b3a;
+  max-width: var(--qf-section-heading-max);
+  margin-left: auto;
+  margin-right: auto;
 }
 
-html[data-theme='dark'] .heroTagline {
-  color: #e2e8f0;
-  text-shadow: 0 0 24px rgba(124, 58, 237, 0.15);
+html[data-theme='dark'] .heroTitle {
+  color: #f4f4f5;
+  text-shadow: 0 0 32px rgba(167, 139, 250, 0.12);
 }
 
 .heroLeadin {

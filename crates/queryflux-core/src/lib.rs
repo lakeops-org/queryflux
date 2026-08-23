@@ -7,6 +7,7 @@ pub mod native_result;
 pub mod params;
 pub mod polyglot_pool;
 pub mod query;
+pub mod security_setting;
 pub mod session;
 pub mod sql_classify;
 pub mod tags;

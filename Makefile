@@ -59,7 +59,7 @@ build:
 ## Run clippy lints (no external services needed).
 lint: clippy
 clippy:
-	$(CARGO) clippy --all-targets --all-features -- -D warnings
+	$(CARGO) clippy --workspace --all-targets --all-features --exclude queryflux-bench -- -D warnings
 
 ## Validate the Helm chart structure and run helm lint/template.
 helm-check:
@@ -104,12 +104,13 @@ test-e2e:
 	trap '$(COMPOSE_TEST) down' EXIT; \
 	PYO3_PYTHON=$(shell pwd)/.venv/bin/python3 \
 	PYTHONPATH=$(PYTHONPATH_VENV) \
-	$(COMPOSE_TEST) up -d --wait trino starrocks sentinel; \
+	$(COMPOSE_TEST) up -d --wait trino starrocks clickhouse sentinel; \
 	PYO3_PYTHON=$(shell pwd)/.venv/bin/python3 \
 	PYTHONPATH=$(PYTHONPATH_VENV) \
 	TRINO_URL=http://localhost:18081 \
 	TRINO_ADBC_URI=http://localhost:18081 \
 	STARROCKS_URL=mysql://root@localhost:9030 \
+	CLICKHOUSE_URL=http://localhost:18123 \
 	LAKEKEEPER_URL=http://localhost:18181 \
 	MINIO_ENDPOINT=localhost:19000 \
 	$(CARGO) test -p queryflux-e2e-tests --manifest-path Cargo.toml -- --test-threads=1 --include-ignored --nocapture

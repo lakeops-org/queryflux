@@ -77,6 +77,7 @@ async fn count_arrow_rows(adapter: &AdbcAdapter, sql: &str) -> usize {
             &tags,
             &vec![],
             queryflux_core::sql_classify::ExecutionHints::default(),
+            &queryflux_engine_adapters::BackendQueryIdSlot::new(),
         )
         .await
         .expect("execute_as_arrow");
@@ -246,7 +247,15 @@ async fn trino_adbc_ddl_uses_execute_update_empty_stream() {
 
     let create_sql = format!("CREATE TABLE {table} (id BIGINT)");
     let mut exec = adapter
-        .execute_as_arrow(&create_sql, &session, &creds, &tags, &vec![], hints)
+        .execute_as_arrow(
+            &create_sql,
+            &session,
+            &creds,
+            &tags,
+            &vec![],
+            hints,
+            &queryflux_engine_adapters::BackendQueryIdSlot::new(),
+        )
         .await
         .expect("CREATE via execute_update path");
 
@@ -280,6 +289,7 @@ async fn trino_adbc_ddl_uses_execute_update_empty_stream() {
             &tags,
             &vec![],
             queryflux_core::sql_classify::ExecutionHints::default(),
+            &queryflux_engine_adapters::BackendQueryIdSlot::new(),
         )
         .await
         .expect("DROP via classified execute_update path");
@@ -309,7 +319,15 @@ async fn trino_adbc_select_does_not_set_affected_rows() {
     };
 
     let mut exec = adapter
-        .execute_as_arrow("SELECT 1 AS n", &session, &creds, &tags, &vec![], hints)
+        .execute_as_arrow(
+            "SELECT 1 AS n",
+            &session,
+            &creds,
+            &tags,
+            &vec![],
+            hints,
+            &queryflux_engine_adapters::BackendQueryIdSlot::new(),
+        )
         .await
         .expect("SELECT");
 

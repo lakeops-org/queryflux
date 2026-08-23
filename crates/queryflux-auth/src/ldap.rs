@@ -161,6 +161,7 @@ impl AuthProvider for LdapAuthProvider {
                     groups: vec![],
                     roles: vec![],
                     raw_token: None,
+                    raw_password: None,
                 });
             }
         };
@@ -189,11 +190,15 @@ impl AuthProvider for LdapAuthProvider {
 
         let _ = ldap.unbind().await;
 
+        // This password was just verified by a real LDAP bind above — safe to carry as
+        // `raw_password` for `queryAuth: passthrough` on a MySQL-wire cluster configured
+        // against the same LDAP directory (StarRocks `authentication_ldap_simple`).
         Ok(AuthContext {
             user: username,
             groups,
             roles: vec![],
             raw_token: None,
+            raw_password: Some(password.to_string()),
         })
     }
 }

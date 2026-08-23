@@ -57,7 +57,7 @@ services:
       trino:
         condition: service_healthy
     restart: unless-stopped
-    # Admin listens only after Postgres sqlx migrations + startup succeed. `docker compose up --wait`
+    # Admin listens only after Postgres Refinery migrations + startup succeed. `docker compose up --wait`
     # then blocks until QueryFlux is actually ready (not only Postgres/Trino).
     healthcheck:
       test:

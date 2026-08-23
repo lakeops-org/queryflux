@@ -31,9 +31,11 @@ use queryflux_core::{
     tags::parse_query_tags,
 };
 
+use crate::abort::{wait_client_gone, AbortOnDrop};
 use crate::dispatch::{execute_to_sink, ResultSink};
 use crate::state::AppState;
-use crate::{FrontendListenerTrait, ShutdownRx};
+use crate::{FrontendListenerTrait, ShutdownRx, MAX_FRONTEND_MESSAGE_BYTES};
+use queryflux_routing::ChainRouteResult;
 
 // ── Postgres type OIDs (text-format only in V1) ───────────────────────────────
 
@@ -126,12 +128,12 @@ async fn handle_connection(
     connection_id: u32,
 ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
     stream.set_nodelay(true)?;
-    let (mut reader, mut writer) = tokio::io::split(stream);
+    let (mut reader, mut writer) = stream.into_split();
 
     // ── Startup phase ────────────────────────────────────────────────────────
 
     // Read the startup message: 4-byte length + 4-byte protocol version + params.
-    let startup_len = read_i32(&mut reader).await? as usize;
+    let startup_len = checked_frontend_len(read_i32(&mut reader).await?)?;
     if startup_len < 8 {
         return Ok(());
     }
@@ -150,7 +152,7 @@ async fn handle_connection(
         writer.write_all(b"N").await?; // 'N' = no SSL
         writer.flush().await?;
         // Re-read the real startup message.
-        let real_len = read_i32(&mut reader).await? as usize;
+        let real_len = checked_frontend_len(read_i32(&mut reader).await?)?;
         if real_len < 8 {
             return Ok(());
         }
@@ -223,7 +225,7 @@ async fn handle_connection(
             Err(_) => break,
         };
 
-        let msg_len = read_i32(&mut reader).await? as usize;
+        let msg_len = checked_frontend_len(read_i32(&mut reader).await?)?;
         if msg_len < 4 {
             break;
         }
@@ -243,7 +245,7 @@ async fn handle_connection(
                     .trim()
                     .to_string();
                 debug!(conn_id = connection_id, sql = %sql, "Postgres wire: query");
-                handle_simple_query(&mut writer, &state, &session, &sql).await?;
+                handle_simple_query(&mut reader, &mut writer, &state, &session, &sql).await?;
             }
 
             b'P' => {
@@ -284,8 +286,9 @@ async fn handle_connection(
 
 // ── Query execution ───────────────────────────────────────────────────────────
 
-async fn handle_simple_query<W: AsyncWriteExt + Unpin>(
-    writer: &mut W,
+async fn handle_simple_query(
+    reader: &mut tokio::net::tcp::OwnedReadHalf,
+    writer: &mut tokio::net::tcp::OwnedWriteHalf,
     state: &Arc<AppState>,
     session: &SessionContext,
     sql: &str,
@@ -299,15 +302,15 @@ async fn handle_simple_query<W: AsyncWriteExt + Unpin>(
 
     let sql_lower = sql.trim().to_lowercase();
 
-    // Fast-path: SET statements.
-    if sql_lower.starts_with("set ") || sql_lower.starts_with("set\t") {
-        write_msg(writer, b'C', b"SET\0").await?;
-        write_msg(writer, b'Z', b"I").await?;
-        return Ok(());
-    }
-
     let protocol = FrontendProtocol::PostgresWire;
 
+    // No `bearer_token` captured here — the Postgres wire startup message carries only a
+    // username (password auth, if any, happens in a separate AuthenticationMD5Password/
+    // cleartext exchange this handler doesn't thread through to `Credentials`). That means
+    // `AuthContext.raw_token` is always `None` for this frontend, so `queryAuth: passthrough`
+    // / `tokenExchange` on a backend cluster can never resolve a per-user credential when
+    // reached this way — only `serviceAccount` (and `impersonate`, backend-side) work.
+    // Use the Trino HTTP or Flight SQL frontend when per-user backend identity is required.
     let creds = Credentials {
         username: session.user().map(|s| s.to_string()),
         ..Default::default()
@@ -316,11 +319,22 @@ async fn handle_simple_query<W: AsyncWriteExt + Unpin>(
     let auth_ctx = match auth_provider.authenticate(&creds).await {
         Ok(ctx) => ctx,
         Err(e) => {
+            state
+                .metrics
+                .on_auth_failure(&format!("{:?}", FrontendProtocol::PostgresWire));
             write_error_response(writer, "28000", &e.to_string()).await?;
             write_msg(writer, b'Z', b"I").await?;
             return Ok(());
         }
     };
+
+    // Auth-complete fast path: `SET` statements are handled locally by the proxy,
+    // but must still go through authentication when `auth.required=true`.
+    if sql_lower.starts_with("set ") || sql_lower.starts_with("set\t") {
+        write_msg(writer, b'C', b"SET\0").await?;
+        write_msg(writer, b'Z', b"I").await?;
+        return Ok(());
+    }
 
     let routing_result = {
         let live = state.live.read().await;
@@ -328,8 +342,34 @@ async fn handle_simple_query<W: AsyncWriteExt + Unpin>(
             .route_with_trace(sql, session, &protocol, Some(&auth_ctx))
             .await
     };
-    let (group, _trace) = match routing_result {
+    let (chain_result, mut routing_trace) = match routing_result {
         Ok(r) => r,
+        Err(e) => {
+            write_error_response(writer, "42000", &e.to_string()).await?;
+            write_msg(writer, b'Z', b"I").await?;
+            return Ok(());
+        }
+    };
+    let mut group = match chain_result {
+        ChainRouteResult::Routed(g) => g,
+        ChainRouteResult::Denied { message } => {
+            state.record_routing_deny(sql, session, protocol, &message, Some(routing_trace));
+            // 42501 = insufficient_privilege
+            write_error_response(writer, "42501", &message).await?;
+            write_msg(writer, b'Z', b"I").await?;
+            return Ok(());
+        }
+    };
+    group = match state
+        .resolve_routed_group(group, &mut routing_trace, &auth_ctx)
+        .await
+    {
+        Ok(g) => g,
+        Err(QueryFluxError::Unauthorized(msg)) => {
+            write_error_response(writer, "42501", &msg).await?;
+            write_msg(writer, b'Z', b"I").await?;
+            return Ok(());
+        }
         Err(e) => {
             write_error_response(writer, "42000", &e.to_string()).await?;
             write_msg(writer, b'Z', b"I").await?;
@@ -344,7 +384,7 @@ async fn handle_simple_query<W: AsyncWriteExt + Unpin>(
     let session2 = session.clone();
     let sql2 = sql.to_string();
 
-    let exec_task = tokio::spawn(async move {
+    let exec_task = AbortOnDrop::new(tokio::spawn(async move {
         execute_to_sink(
             &state2,
             sql2,
@@ -357,15 +397,29 @@ async fn handle_simple_query<W: AsyncWriteExt + Unpin>(
         )
         .await
         // sink drops here, closing tx
-    });
+    }));
 
-    // Forward encoded Postgres messages to the client as they arrive.
-    while let Some(msg) = rx.recv().await {
-        writer.write_all(&msg).await?;
-        writer.flush().await?;
+    // Forward encoded Postgres messages. Abort the engine query if the client
+    // closes (or sends another message) while we are still waiting for results.
+    loop {
+        tokio::select! {
+            msg = rx.recv() => {
+                match msg {
+                    Some(msg) => {
+                        writer.write_all(&msg).await?;
+                        writer.flush().await?;
+                    }
+                    None => break,
+                }
+            }
+            _ = wait_client_gone(reader) => {
+                debug!("Postgres wire: client disconnected during query — aborting");
+                return Ok(());
+            }
+        }
     }
 
-    if let Err(e) = exec_task.await {
+    if let Err(e) = exec_task.join().await {
         warn!("Postgres query task panicked: {e}");
     }
 
@@ -563,6 +617,23 @@ async fn read_i32<R: AsyncReadExt + Unpin>(
     let mut buf = [0u8; 4];
     reader.read_exact(&mut buf).await?;
     Ok(i32::from_be_bytes(buf))
+}
+
+/// Validate a Postgres length-prefixed message size before allocating.
+fn checked_frontend_len(
+    len: i32,
+) -> std::result::Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+    if len <= 0 {
+        return Err(format!("invalid Postgres message length {len}").into());
+    }
+    let len = len as usize;
+    if len > MAX_FRONTEND_MESSAGE_BYTES {
+        return Err(format!(
+            "Postgres message length {len} exceeds max allowed {MAX_FRONTEND_MESSAGE_BYTES} bytes"
+        )
+        .into());
+    }
+    Ok(len)
 }
 
 // ── Startup message parsing ───────────────────────────────────────────────────
@@ -791,5 +862,50 @@ mod tests {
             "DDL/DML must not use SELECT tag"
         );
         assert!(rx.try_recv().is_err(), "only one CommandComplete expected");
+    }
+
+    #[tokio::test]
+    async fn set_fast_path_rejects_unauthenticated_when_required() {
+        use tokio::io::AsyncReadExt;
+        use tokio::net::{TcpListener, TcpStream};
+
+        use crate::state::test_fixtures;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let state = test_fixtures::app_state(true);
+        let session = SessionContext::default();
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let (mut reader, mut writer) = stream.into_split();
+            super::handle_simple_query(
+                &mut reader,
+                &mut writer,
+                &state,
+                &session,
+                "SET search_path = public",
+            )
+            .await
+            .expect("handle_simple_query");
+        });
+
+        let mut stream = TcpStream::connect(addr).await.expect("connect");
+        let mut msg_type = [0u8; 1];
+        stream.read_exact(&mut msg_type).await.expect("read type");
+        server.await.expect("server");
+
+        assert_eq!(
+            msg_type[0], b'E',
+            "expected Postgres ErrorResponse when auth is required"
+        );
+    }
+
+    #[test]
+    fn checked_frontend_len_rejects_negative_and_oversized() {
+        assert!(checked_frontend_len(0).is_err());
+        assert!(checked_frontend_len(-1).is_err());
+        assert!(checked_frontend_len((MAX_FRONTEND_MESSAGE_BYTES + 1) as i32).is_err());
+        assert_eq!(checked_frontend_len(8).unwrap(), 8);
     }
 }

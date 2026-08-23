@@ -142,6 +142,18 @@ pub fn expand_router_for_persistence(
                         .and_then(|x| x.as_str())
                         .unwrap_or("")
                         .to_string();
+                    let action = r.get("action").and_then(|x| x.as_str()).unwrap_or("route");
+                    if action.eq_ignore_ascii_case("deny") {
+                        let mut def = Map::new();
+                        def.insert("type".into(), json!("_qfRegexLeg"));
+                        def.insert("regex".into(), json!(regex));
+                        def.insert("action".into(), json!("deny"));
+                        if let Some(err) = r.get("error").and_then(|e| e.as_str()) {
+                            def.insert("error".into(), json!(err));
+                        }
+                        out.push((Value::Object(def), None));
+                        continue;
+                    }
                     let tg = field(r, "targetGroup", "target_group")
                         .and_then(|x| x.as_str())
                         .unwrap_or("");
@@ -393,6 +405,21 @@ fn merge_regex_chunk(
             .and_then(|x| x.as_str())
             .unwrap_or("")
             .to_string();
+        let action = leg
+            .definition
+            .get("action")
+            .and_then(|x| x.as_str())
+            .unwrap_or("route");
+        if action.eq_ignore_ascii_case("deny") {
+            let mut rule = Map::new();
+            rule.insert("regex".into(), json!(regex));
+            rule.insert("action".into(), json!("deny"));
+            if let Some(err) = leg.definition.get("error").and_then(|e| e.as_str()) {
+                rule.insert("error".into(), json!(err));
+            }
+            rules.push(Value::Object(rule));
+            continue;
+        }
         let gid = leg.target_group_id.ok_or_else(|| {
             QueryFluxError::Persistence("_qfRegexLeg missing target_group_id".into())
         })?;
@@ -621,5 +648,36 @@ mod tests {
         assert_eq!(out.len(), 1);
         assert_eq!(out[0]["type"], json!("pythonScript"));
         assert_eq!(out[0]["script"], router["script"]);
+    }
+
+    #[test]
+    fn roundtrip_query_regex_deny_without_group() {
+        let router = json!({
+            "type": "queryRegex",
+            "rules": [{
+                "regex": "(?i)^\\\\s*DROP",
+                "action": "deny",
+                "error": "DDL blocked"
+            }]
+        });
+        let slices = expand_router_for_persistence(&router, &HashMap::new()).unwrap();
+        assert_eq!(slices.len(), 1);
+        assert!(slices[0].1.is_none());
+        assert_eq!(slices[0].0["type"], json!("_qfRegexLeg"));
+        assert_eq!(slices[0].0["action"], json!("deny"));
+
+        let row = RoutingRulePersistRow {
+            sort_order: 0,
+            router_logical_index: 0,
+            slice_index: 0,
+            target_group_id: None,
+            definition: slices[0].0.clone(),
+        };
+        let out = collapse_rows_to_routers(&[row], &HashMap::new()).unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0]["type"], json!("queryRegex"));
+        assert_eq!(out[0]["rules"][0]["action"], json!("deny"));
+        assert_eq!(out[0]["rules"][0]["error"], json!("DDL blocked"));
+        assert!(out[0]["rules"][0].get("targetGroup").is_none());
     }
 }

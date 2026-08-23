@@ -8,7 +8,11 @@ config.yaml
 
 # Local-only tooling (never commit or push)
 .idea/
-.cursor/
+.cursor/*
+!.cursor/skills/
+!.cursor/skills/**
+!.cursor/rules/
+!.cursor/rules/**
 .claude/
 snowflake-client/
 examples/node-starrocks-via-queryflux/

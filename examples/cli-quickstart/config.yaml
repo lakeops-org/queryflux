@@ -1,0 +1,23 @@
+# A minimal QueryFlux configuration using the embedded DuckDB engine.
+# This config requires NO external databases or containers.
+
+queryflux:
+  frontends:
+    trino_http:
+      enabled: true
+      bind_address: "0.0.0.0:8080"
+  metrics:
+    bind_address: "0.0.0.0:9000"
+
+clusters:
+  local_duckdb:
+    engine: duckDb
+    max_connections: 10
+
+cluster_groups:
+  default_group:
+    members:
+      - local_duckdb
+
+routing_fallback: default_group
+routers: []

@@ -37,3 +37,10 @@ config.data.queryflux.enforceSnowflakeHttpSessionAffinity: true to make
 QueryFlux refuse to start until the affinity requirement is acknowledged in
 config.
 {{- end }}
+{{- if .Values.networkPolicy.enabled }}
+
+NOTE: NetworkPolicy is enabled. Confirm ingress allows clients (and metrics
+scrape on the admin port) and egress allows DNS, Postgres, and your engines.
+Empty rule lists are rejected by the chart; see
+charts/queryflux/examples/networkpolicy-values.yaml.
+{{- end }}

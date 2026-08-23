@@ -39,9 +39,11 @@ use queryflux_core::{
     tags::{parse_query_tags, QueryTags},
 };
 
+use crate::abort::{wait_client_gone, AbortOnDrop};
 use crate::dispatch::{execute_to_sink, ResultSink};
 use crate::state::AppState;
-use crate::{FrontendListenerTrait, ShutdownRx};
+use crate::{FrontendListenerTrait, ShutdownRx, MAX_FRONTEND_MESSAGE_BYTES};
+use queryflux_routing::ChainRouteResult;
 
 // ── MySQL command bytes ───────────────────────────────────────────────────────
 
@@ -159,7 +161,7 @@ async fn handle_connection(
     connection_id: u32,
 ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
     stream.set_nodelay(true)?;
-    let (mut reader, mut writer) = tokio::io::split(stream);
+    let (mut reader, mut writer) = stream.into_split();
 
     // Send server handshake.
     write_packet(&mut writer, 0, &build_handshake(connection_id)).await?;
@@ -238,8 +240,15 @@ async fn handle_connection(
                     .trim_end_matches('\0')
                     .to_string();
                 debug!(conn_id = connection_id, sql = %sql, "MySQL wire: query");
-                handle_com_query(&mut writer, &state, &mut session, &sql, seq.wrapping_add(1))
-                    .await?;
+                handle_com_query(
+                    &mut reader,
+                    &mut writer,
+                    &state,
+                    &mut session,
+                    &sql,
+                    seq.wrapping_add(1),
+                )
+                .await?;
             }
 
             COM_FIELD_LIST => {
@@ -267,8 +276,9 @@ async fn handle_connection(
 
 // ── Query execution ───────────────────────────────────────────────────────────
 
-async fn handle_com_query<W: AsyncWriteExt + Unpin>(
-    writer: &mut W,
+async fn handle_com_query(
+    reader: &mut tokio::net::tcp::OwnedReadHalf,
+    writer: &mut tokio::net::tcp::OwnedWriteHalf,
     state: &Arc<AppState>,
     session: &mut SessionContext,
     sql: &str,
@@ -277,6 +287,31 @@ async fn handle_com_query<W: AsyncWriteExt + Unpin>(
     // Unwrap MySQL conditional comments: /*!40101 SET ... */ → SET ...
     let logical = strip_mysql_conditional_comment(sql);
     let sql_lower = logical.trim().to_lowercase();
+
+    // Auth-complete early gate: all statement/metadata fast paths must still
+    // be subject to authentication when `auth.required=true`.
+    let protocol = FrontendProtocol::MySqlWire;
+    // No `bearer_token` captured here — the MySQL wire handshake password is not threaded
+    // through to `Credentials`, so `AuthContext.raw_token` is always `None` for this
+    // frontend. `queryAuth: passthrough` / `tokenExchange` on a backend cluster can never
+    // resolve a per-user credential when reached this way — only `serviceAccount` (and
+    // `impersonate`, backend-side) work. Use the Trino HTTP or Flight SQL frontend when
+    // per-user backend identity is required.
+    let creds = Credentials {
+        username: session.user().map(|s| s.to_string()),
+        ..Default::default()
+    };
+    let auth_provider = state.live.read().await.auth_provider.clone();
+    let auth_ctx = match auth_provider.authenticate(&creds).await {
+        Ok(ctx) => ctx,
+        Err(e) => {
+            state
+                .metrics
+                .on_auth_failure(&format!("{:?}", FrontendProtocol::MySqlWire));
+            write_packet(writer, start_seq, &build_err(1045, &e.to_string())).await?;
+            return Ok(());
+        }
+    };
 
     // Fast-path: SET query_tags / SET SESSION query_tags — update session tags and ACK.
     if let Some(new_tags) = try_parse_set_query_tags(logical) {
@@ -346,29 +381,37 @@ async fn handle_com_query<W: AsyncWriteExt + Unpin>(
         return write_synthetic_multi_column_row(writer, &col_vals, start_seq).await;
     }
 
-    let protocol = FrontendProtocol::MySqlWire;
-
-    let creds = Credentials {
-        username: session.user().map(|s| s.to_string()),
-        ..Default::default()
-    };
-    let auth_provider = state.live.read().await.auth_provider.clone();
-    let auth_ctx = match auth_provider.authenticate(&creds).await {
-        Ok(ctx) => ctx,
-        Err(e) => {
-            write_packet(writer, start_seq, &build_err(1045, &e.to_string())).await?;
-            return Ok(());
-        }
-    };
-
     let routing_result = {
         let live = state.live.read().await;
         live.router_chain
             .route_with_trace(sql, session, &protocol, Some(&auth_ctx))
             .await
     };
-    let (group, _trace) = match routing_result {
+    let (chain_result, mut routing_trace) = match routing_result {
         Ok(r) => r,
+        Err(e) => {
+            write_packet(writer, start_seq, &build_err(1105, &e.to_string())).await?;
+            return Ok(());
+        }
+    };
+    let mut group = match chain_result {
+        ChainRouteResult::Routed(g) => g,
+        ChainRouteResult::Denied { message } => {
+            state.record_routing_deny(sql, session, protocol, &message, Some(routing_trace));
+            // 1227 = ER_SPECIFIC_ACCESS_DENIED_ERROR
+            write_packet(writer, start_seq, &build_err(1227, &message)).await?;
+            return Ok(());
+        }
+    };
+    group = match state
+        .resolve_routed_group(group, &mut routing_trace, &auth_ctx)
+        .await
+    {
+        Ok(g) => g,
+        Err(QueryFluxError::Unauthorized(msg)) => {
+            write_packet(writer, start_seq, &build_err(1227, &msg)).await?;
+            return Ok(());
+        }
         Err(e) => {
             write_packet(writer, start_seq, &build_err(1105, &e.to_string())).await?;
             return Ok(());
@@ -383,7 +426,7 @@ async fn handle_com_query<W: AsyncWriteExt + Unpin>(
     let session2 = session.clone();
     let sql2 = sql.to_string();
 
-    let exec_task = tokio::spawn(async move {
+    let exec_task = AbortOnDrop::new(tokio::spawn(async move {
         execute_to_sink(
             &state2,
             sql2,
@@ -396,16 +439,30 @@ async fn handle_com_query<W: AsyncWriteExt + Unpin>(
         )
         .await
         // `sink` drops here — closes tx — rx.recv() will return None after last packet
-    });
+    }));
 
-    // Forward encoded MySQL packets to the client as they arrive.
-    while let Some(pkt) = rx.recv().await {
-        writer.write_all(&pkt).await?;
-        writer.flush().await?;
+    // Forward encoded MySQL packets. Abort the engine query if the client
+    // closes (or sends another command) while we are still waiting for results.
+    loop {
+        tokio::select! {
+            pkt = rx.recv() => {
+                match pkt {
+                    Some(pkt) => {
+                        writer.write_all(&pkt).await?;
+                        writer.flush().await?;
+                    }
+                    None => break,
+                }
+            }
+            _ = wait_client_gone(reader) => {
+                debug!("MySQL wire: client disconnected during query — aborting");
+                return Ok(());
+            }
+        }
     }
 
     // Log any panic in the execution task; result errors go through on_error → ERR packet.
-    if let Err(e) = exec_task.await {
+    if let Err(e) = exec_task.join().await {
         warn!("MySQL query task panicked: {e}");
     }
 
@@ -864,6 +921,12 @@ async fn read_packet<R: AsyncReadExt + Unpin>(
     reader.read_exact(&mut header).await?;
     let len = u32::from_le_bytes([header[0], header[1], header[2], 0]) as usize;
     let seq = header[3];
+    if len > MAX_FRONTEND_MESSAGE_BYTES {
+        return Err(format!(
+            "MySQL packet length {len} exceeds max allowed {MAX_FRONTEND_MESSAGE_BYTES} bytes"
+        )
+        .into());
+    }
     let mut payload = vec![0u8; len];
     if len > 0 {
         reader.read_exact(&mut payload).await?;
@@ -1923,5 +1986,59 @@ mod tests {
         let pkt = rx.try_recv().expect("OK packet");
         assert_eq!(pkt[4], 0x00);
         assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn set_fast_path_rejects_unauthenticated_when_required() {
+        use tokio::io::AsyncReadExt;
+        use tokio::net::{TcpListener, TcpStream};
+
+        use crate::state::test_fixtures;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let state = test_fixtures::app_state(true);
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let (mut reader, mut writer) = stream.into_split();
+            let mut session = SessionContext::default();
+            super::handle_com_query(
+                &mut reader,
+                &mut writer,
+                &state,
+                &mut session,
+                "SET query_tags='team:eng'",
+                0,
+            )
+            .await
+            .expect("handle_com_query");
+        });
+
+        let mut stream = TcpStream::connect(addr).await.expect("connect");
+        let mut buf = [0u8; 512];
+        let n = stream.read(&mut buf).await.expect("read");
+        server.await.expect("server");
+
+        assert!(n >= 5, "expected MySQL packet, got {n} bytes");
+        assert_eq!(
+            buf[4], 0xff,
+            "expected MySQL ERR packet when auth is required"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_packet_rejects_oversized_length() {
+        // 24-bit length = MAX_FRONTEND_MESSAGE_BYTES + 1, seq 0.
+        let over = (MAX_FRONTEND_MESSAGE_BYTES + 1) as u32;
+        let header = [
+            (over & 0xff) as u8,
+            ((over >> 8) & 0xff) as u8,
+            ((over >> 16) & 0xff) as u8,
+            0,
+        ];
+        let mut cursor = std::io::Cursor::new(header.to_vec());
+        let err = read_packet(&mut cursor).await.expect_err("must reject");
+        assert!(err.to_string().contains("exceeds max allowed"), "got {err}");
     }
 }

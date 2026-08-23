@@ -111,6 +111,41 @@ curl -u admin:admin -X POST http://localhost:9000/admin/auth/change-password \
 
 The full OpenAPI spec is available at `http://localhost:9000/openapi.json` and a Swagger UI at `http://localhost:9000/docs`.
 
+## Managing clusters
+
+The **Clusters** page lists runtime cluster state (health, running queries, capacity) and lets you add or edit persisted cluster configs when Postgres persistence is enabled.
+
+In **distributed mode**, the **running** count shown reflects backend ground truth from the reconcile sweep (for example Snowflake warehouse `running`, BigQuery in-flight jobs). **Capacity** / admission limits use QueryFlux fleet-wide leases separately — a warehouse can report many running queries while QueryFlux only holds a few admission slots.
+
+### Add cluster
+
+1. Click **Add cluster** and choose an engine (ADBC drivers are listed individually — Snowflake, Databricks, BigQuery, etc.).
+2. Step 2: set cluster name, routing limits, and connection fields.
+3. For **SaaS ADBC** drivers (Snowflake, Databricks, BigQuery, Redshift), configure **Warehouses & health**:
+   - Add one or more warehouse rows (each expands to `cluster-name::variant-name` at runtime).
+   - Optionally override **Health check query** and **Reconcile query** (leave empty for built-in driver introspection).
+4. For **other ADBC** drivers, the same optional health/reconcile fields appear under **Health & reconcile** (no structured warehouse editor on create).
+5. **Save cluster** persists to Postgres; the proxy hot-reloads adapters without restart.
+
+### Edit cluster
+
+Expand a cluster row to edit connection settings, enable/disable, max concurrent queries, warehouses (SaaS ADBC), variants JSON (other ADBC), and optional health/reconcile SQL overrides.
+
+Password and bearer token fields can be left blank to keep values already stored in Postgres.
+
+### Health and reconcile fields (ADBC)
+
+| Field | Config key | When to set |
+|---|---|---|
+| Health check query | `healthCheckQuery` | Override built-in probe (for example custom `SHOW WAREHOUSES` with `{{sub_resource}}`) |
+| Reconcile query | `reconcileQuery` | Override running-query ground truth; must return a single integer |
+
+Empty fields mean **use built-in behavior** — Databricks REST, Snowflake `SHOW WAREHOUSES`, BigQuery `JOBS_BY_PROJECT`, etc. See **[Cluster variants, health checks & reconciliation](./architecture/cluster-variants-and-health)**.
+
+### Cluster groups and variants
+
+When a cluster has warehouse variants, add **expanded** member names to groups (for example `my-snowflake::analytics`), not just the base cluster name.
+
 ## Studio in production
 
 For production deployments:

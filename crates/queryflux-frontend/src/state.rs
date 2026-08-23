@@ -8,8 +8,8 @@ use queryflux_core::{
     config::ClusterConfig,
     params::QueryParams,
     query::{
-        ClusterGroupName, ClusterName, EngineType, FrontendProtocol, ProxyQueryId,
-        QueryEngineStats, QueryStatus, SqlDialect,
+        ClusterGroupName, ClusterName, EngineType, ExecutingQuery, FrontendProtocol, ProxyQueryId,
+        QueryEngineStats, QueryStatus, QueuedQuery, SqlDialect,
     },
     session::{AgentContext, SessionContext},
     tags::QueryTags,
@@ -41,6 +41,10 @@ pub struct LiveConfig {
     /// One `(adapter, ClusterState)` per physical cluster (first group membership wins).
     /// Used by background health / reconcile tasks so they track the **current** reload generation.
     pub health_check_targets: Vec<(AdapterKind, Arc<ClusterState>)>,
+    /// cluster_name → custom SQL for health checks. If absent, use the adapter's default.
+    pub custom_health_queries: HashMap<String, String>,
+    /// cluster_name → custom SQL for reconciliation. If absent, use the adapter's default.
+    pub custom_reconcile_queries: HashMap<String, String>,
     /// Cluster configs keyed by cluster name — used by `BackendIdentityResolver` to
     /// look up `queryAuth` after a cluster is selected.
     pub cluster_configs: HashMap<String, ClusterConfig>,
@@ -54,6 +58,12 @@ pub struct LiveConfig {
     /// group_name → default tags configured on the group.
     /// Merged with session tags at dispatch time; session tags win on key conflicts.
     pub group_default_tags: HashMap<String, QueryTags>,
+    /// group_name → optional `maxQueuedQueries` from ClusterGroupConfig.
+    /// `None` / missing entry means unlimited. `Some(0)` is treated as unlimited
+    /// (same as the enforce check requiring `limit > 0`).
+    pub group_max_queued_queries: HashMap<String, Option<u64>>,
+    /// group_name → resolved capacity wait timeout in seconds (default 300).
+    pub group_capacity_wait_timeout_secs: HashMap<String, u64>,
     /// group_name → cache settings for groups that have caching enabled.
     pub group_cache_settings: HashMap<String, queryflux_core::config::GroupCacheConfig>,
     /// Verifies client identity — hot-reloaded when security config changes via admin API.
@@ -95,6 +105,7 @@ pub struct AppState {
 /// Stable per-query metadata that does not change across the query's lifecycle.
 /// Built once (after cluster selection and SQL translation) and passed to every
 /// `record_query` call within the same dispatch function.
+#[derive(Clone)]
 pub struct QueryContext {
     pub query_id: ProxyQueryId,
     pub sql: String,
@@ -145,6 +156,20 @@ impl AppState {
 
     pub async fn cluster_config_cloned(&self, cluster: &str) -> Option<ClusterConfig> {
         self.live.read().await.cluster_configs.get(cluster).cloned()
+    }
+
+    /// Resolve engine metadata from a live adapter or stored cluster config.
+    pub async fn engine_type_for_cluster(&self, cluster: &str) -> (EngineType, SqlDialect) {
+        if let Some(adapter) = self.adapter(cluster).await {
+            return (adapter.engine_type(), adapter.translation_target_dialect());
+        }
+        if let Some(cfg) = self.cluster_config_cloned(cluster).await {
+            if let Some(engine) = &cfg.engine {
+                let engine_type = EngineType::from(engine);
+                return (engine_type.clone(), engine_type.dialect());
+            }
+        }
+        (EngineType::Undispatched, SqlDialect::Generic)
     }
 
     /// Returns true if any cluster in the group supports async execution (e.g. Trino).
@@ -268,5 +293,400 @@ impl AppState {
             }
             let _ = metrics.record_query(record).await;
         });
+    }
+
+    /// Persist a `Cancelled` audit row for an executing query (client cancel, admin
+    /// cancel, or zombie eviction). Prefer calling this before deleting the
+    /// executing record so a raced poll completion still wins if it recorded first.
+    pub fn record_executing_cancelled(
+        &self,
+        executing: &ExecutingQuery,
+        protocol: FrontendProtocol,
+        engine_type: EngineType,
+        tgt_dialect: SqlDialect,
+        reason: &str,
+    ) {
+        let was_translated = executing.translated_sql.is_some();
+        let execution_ms = (Utc::now() - executing.creation_time)
+            .num_milliseconds()
+            .max(0) as u64;
+        let guard_actions: Vec<GuardAction> = serde_json::from_value(serde_json::Value::Array(
+            executing.submitted_guard_actions.clone(),
+        ))
+        .unwrap_or_default();
+        let session = SessionContext {
+            user: (!executing.submitted_by.is_empty()).then(|| executing.submitted_by.clone()),
+            ..Default::default()
+        };
+        let src_dialect = protocol.default_dialect();
+        let ctx = QueryContext {
+            query_id: executing.id.clone(),
+            sql: executing
+                .translated_sql
+                .as_deref()
+                .unwrap_or(&executing.sql)
+                .to_string(),
+            session,
+            protocol,
+            group: executing.cluster_group.clone(),
+            cluster: executing.cluster_name.clone(),
+            cluster_group_config_id: executing.cluster_group_config_id,
+            cluster_config_id: executing.cluster_config_id,
+            engine_type,
+            src_dialect,
+            tgt_dialect,
+            was_translated,
+            translated_sql: if was_translated {
+                Some(executing.sql.clone())
+            } else {
+                None
+            },
+            query_tags: executing.query_tags.clone(),
+            query_params: vec![],
+            agent_context: executing.agent_context.clone(),
+        };
+        self.record_query(
+            &ctx,
+            QueryOutcome {
+                backend_query_id: Some(executing.backend_query_id.0.clone()),
+                status: QueryStatus::Cancelled,
+                execution_ms,
+                rows: None,
+                error: Some(reason.to_string()),
+                routing_trace: None,
+                engine_stats: None,
+                guard_actions,
+                was_guard_blocked: executing.was_guard_blocked,
+                queue_duration_ms: 0,
+                cache_hit: false,
+            },
+        );
+    }
+
+    /// Persist a `Denied` history row for a query rejected by a routing deny rule
+    /// before cluster selection / dispatch.
+    pub fn record_routing_deny(
+        &self,
+        sql: &str,
+        session: &SessionContext,
+        protocol: FrontendProtocol,
+        message: &str,
+        routing_trace: Option<RoutingTrace>,
+    ) -> ProxyQueryId {
+        let query_id = ProxyQueryId::new();
+        let dialect = protocol.default_dialect();
+        let ctx = QueryContext {
+            query_id: query_id.clone(),
+            sql: sql.to_string(),
+            session: session.clone(),
+            protocol,
+            group: ClusterGroupName(String::new()),
+            cluster: ClusterName(String::new()),
+            cluster_group_config_id: None,
+            cluster_config_id: None,
+            engine_type: EngineType::Undispatched,
+            src_dialect: dialect.clone(),
+            tgt_dialect: dialect,
+            was_translated: false,
+            translated_sql: None,
+            query_tags: session.tags.clone(),
+            query_params: vec![],
+            agent_context: session.resolved_agent_context(),
+        };
+        self.record_query(
+            &ctx,
+            QueryOutcome {
+                backend_query_id: None,
+                status: QueryStatus::Denied,
+                execution_ms: 0,
+                rows: None,
+                error: Some(message.to_string()),
+                routing_trace,
+                engine_stats: None,
+                guard_actions: vec![],
+                was_guard_blocked: false,
+                queue_duration_ms: 0,
+                cache_hit: false,
+            },
+        );
+        query_id
+    }
+
+    /// Apply authorization-aware first-fit when the router chain used fallback.
+    pub async fn resolve_routed_group(
+        &self,
+        routed: ClusterGroupName,
+        trace: &mut queryflux_routing::chain::RoutingTrace,
+        auth_ctx: &queryflux_auth::AuthContext,
+    ) -> queryflux_core::error::Result<ClusterGroupName> {
+        let (group_order, authorization) = {
+            let live = self.live.read().await;
+            if !trace.used_fallback {
+                return Ok(routed);
+            }
+            (live.group_order.clone(), live.authorization.clone())
+        };
+        crate::routing_resolve::resolve_routed_group(
+            &group_order,
+            authorization.as_ref(),
+            routed,
+            trace,
+            auth_ctx,
+        )
+        .await
+    }
+
+    /// Persist a terminal audit row for a queued query that never reached an engine
+    /// (capacity wait timeout, stale client disconnect).
+    pub fn record_queued_terminal(&self, queued: &QueuedQuery, status: QueryStatus, reason: &str) {
+        let queue_duration_ms = (Utc::now() - queued.creation_time)
+            .num_milliseconds()
+            .max(0) as u64;
+        let mut session = queued.session.clone();
+        if session.user.is_none() && !queued.submitted_by.is_empty() {
+            session.user = Some(queued.submitted_by.clone());
+        }
+        let query_tags = session.tags().clone();
+        let agent_context = session.resolved_agent_context();
+        let dialect = queued.frontend_protocol.default_dialect();
+        let ctx = QueryContext {
+            query_id: queued.id.clone(),
+            sql: queued.sql.clone(),
+            session,
+            protocol: queued.frontend_protocol.clone(),
+            group: queued.cluster_group.clone(),
+            cluster: ClusterName("(not-dispatched)".into()),
+            cluster_group_config_id: None,
+            cluster_config_id: None,
+            engine_type: EngineType::Undispatched,
+            src_dialect: dialect.clone(),
+            tgt_dialect: SqlDialect::Generic,
+            was_translated: false,
+            translated_sql: None,
+            query_tags,
+            query_params: vec![],
+            agent_context,
+        };
+        self.record_query(
+            &ctx,
+            QueryOutcome {
+                backend_query_id: None,
+                status,
+                execution_ms: 0,
+                rows: None,
+                error: Some(reason.to_string()),
+                routing_trace: None,
+                engine_stats: None,
+                guard_actions: vec![],
+                was_guard_blocked: false,
+                queue_duration_ms,
+                cache_hit: false,
+            },
+        );
+    }
+}
+
+#[cfg(test)]
+mod record_terminal_tests {
+    use std::sync::Arc;
+
+    use queryflux_core::{
+        query::{
+            ClusterGroupName, EngineType, FrontendProtocol, ProxyQueryId, QueryStatus, QueuedQuery,
+        },
+        session::SessionContext,
+        tags::QueryTags,
+    };
+    use queryflux_persistence::{
+        in_memory::InMemoryPersistence, query_history::QueryFilters, QueryHistoryStore,
+    };
+
+    use super::test_fixtures;
+
+    fn queued_with_tags() -> QueuedQuery {
+        let mut session = SessionContext {
+            tags: [("team".to_string(), Some("eng".to_string()))].into(),
+            ..Default::default()
+        };
+        session.extra.insert("agent_id".into(), "agent-1".into());
+        session
+            .extra
+            .insert("conversation_id".into(), "conv-1".into());
+        QueuedQuery {
+            id: ProxyQueryId("q-queued-terminal".into()),
+            sql: "SELECT 1".into(),
+            session,
+            frontend_protocol: FrontendProtocol::TrinoHttp,
+            cluster_group: ClusterGroupName("default".into()),
+            creation_time: chrono::Utc::now(),
+            last_accessed: chrono::Utc::now(),
+            sequence: 0,
+            submitted_by: "alice".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn record_queued_terminal_preserves_tags_and_agent_context() {
+        let mem = Arc::new(InMemoryPersistence::new());
+        let state = test_fixtures::app_state_with_metrics(mem.clone(), false);
+
+        state.record_queued_terminal(
+            &queued_with_tags(),
+            QueryStatus::Failed,
+            "capacity wait timeout",
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let rows = mem
+            .list_queries(&QueryFilters {
+                limit: 50,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].engine_type, "Undispatched");
+        assert_eq!(rows[0].username.as_deref(), Some("alice"));
+        assert_eq!(rows[0].agent_id.as_deref(), Some("agent-1"));
+        assert_eq!(rows[0].conversation_id.as_deref(), Some("conv-1"));
+        let tags = rows[0].query_tags.as_ref().expect("tags");
+        assert_eq!(tags.get("team"), Some(&serde_json::json!("eng")));
+    }
+
+    #[tokio::test]
+    async fn record_executing_cancelled_writes_cancelled_history_row() {
+        use chrono::Utc;
+        use queryflux_core::query::{BackendQueryId, ClusterName, ExecutingQuery, SqlDialect};
+
+        let mem = Arc::new(InMemoryPersistence::new());
+        let state = test_fixtures::app_state_with_metrics(mem.clone(), false);
+
+        let executing = ExecutingQuery {
+            id: ProxyQueryId("q-exec-cancel".into()),
+            sql: "SELECT 1".into(),
+            translated_sql: None,
+            cluster_group: ClusterGroupName("default".into()),
+            cluster_name: ClusterName("trino".into()),
+            cluster_group_config_id: None,
+            cluster_config_id: None,
+            backend_query_id: BackendQueryId("backend-1".into()),
+            poll_base_url: None,
+            creation_time: Utc::now(),
+            last_accessed: Utc::now(),
+            query_tags: QueryTags::default(),
+            agent_context: None,
+            submitted_guard_actions: vec![],
+            was_guard_blocked: false,
+            submitted_by: "bob".into(),
+            wire_auth: None,
+        };
+        state.record_executing_cancelled(
+            &executing,
+            FrontendProtocol::TrinoHttp,
+            EngineType::Trino,
+            SqlDialect::Trino,
+            "client cancelled",
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let rows = mem
+            .list_queries(&QueryFilters {
+                limit: 50,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].status.contains("Cancelled"));
+        assert_eq!(rows[0].error_message.as_deref(), Some("client cancelled"));
+    }
+}
+
+#[cfg(test)]
+pub mod test_fixtures {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use queryflux_auth::{
+        AllowAllAuthorization, AuthProvider, AuthorizationChecker, BackendIdentityResolver,
+        NoneAuthProvider,
+    };
+    use queryflux_cluster_manager::{
+        cluster_state::ClusterState, simple::SimpleClusterGroupManager,
+    };
+    use queryflux_core::query::{ClusterGroupName, ClusterName, EngineType};
+    use queryflux_metrics::{MetricsStore, NoopMetricsStore};
+    use queryflux_persistence::in_memory::InMemoryPersistence;
+    use queryflux_routing::chain::RouterChain;
+    use queryflux_translation::TranslationService;
+    use tokio::sync::RwLock;
+
+    use super::{AppState, LiveConfig};
+
+    pub fn app_state(auth_required: bool) -> Arc<AppState> {
+        app_state_with_metrics(Arc::new(NoopMetricsStore), auth_required)
+    }
+
+    pub fn app_state_with_metrics(
+        metrics: Arc<dyn MetricsStore>,
+        auth_required: bool,
+    ) -> Arc<AppState> {
+        let group_name = ClusterGroupName("default".into());
+        let cluster_name = ClusterName("trino".into());
+        let cluster_state = Arc::new(ClusterState::new(
+            cluster_name.clone(),
+            group_name.clone(),
+            None,
+            None,
+            EngineType::Trino,
+            Some("http://trino.test:8080".into()),
+            10,
+            true,
+        ));
+        let mut group_members = HashMap::new();
+        group_members.insert(group_name.0.clone(), vec![cluster_name.0.clone()]);
+        let mut groups = HashMap::new();
+        groups.insert(
+            group_name.clone(),
+            (
+                vec![cluster_state],
+                Arc::new(queryflux_cluster_manager::strategy::RoundRobinStrategy::new())
+                    as Arc<dyn queryflux_cluster_manager::strategy::ClusterSelectionStrategy>,
+            ),
+        );
+        let live = LiveConfig {
+            router_chain: RouterChain::new(vec![], group_name.clone()),
+            guard_chain: None,
+            group_guard_chains: HashMap::new(),
+            cluster_manager: Arc::new(SimpleClusterGroupManager::new(groups)),
+            adapters: HashMap::new(),
+            health_check_targets: vec![],
+            custom_health_queries: HashMap::new(),
+            custom_reconcile_queries: HashMap::new(),
+            cluster_configs: HashMap::new(),
+            group_members,
+            group_order: vec![group_name.0.clone()],
+            group_translation_scripts: HashMap::new(),
+            group_default_tags: HashMap::new(),
+            group_max_queued_queries: HashMap::new(),
+            group_capacity_wait_timeout_secs: HashMap::new(),
+            group_cache_settings: HashMap::new(),
+            auth_provider: Arc::new(NoneAuthProvider::new(auth_required)) as Arc<dyn AuthProvider>,
+            authorization: Arc::new(AllowAllAuthorization::default())
+                as Arc<dyn AuthorizationChecker>,
+        };
+        Arc::new(AppState {
+            external_address: "http://127.0.0.1:8080".into(),
+            live: Arc::new(RwLock::new(live)),
+            persistence: Arc::new(InMemoryPersistence::new()),
+            translation: Arc::new(TranslationService::disabled()),
+            metrics,
+            identity_resolver: Arc::new(BackendIdentityResolver::new()),
+            capacity_store: None,
+            queue_coordinator: None,
+            instance_id: "test".into(),
+            http_client: reqwest::Client::new(),
+            result_cache: Arc::new(queryflux_cache::noop::NoopResultCache),
+        })
     }
 }

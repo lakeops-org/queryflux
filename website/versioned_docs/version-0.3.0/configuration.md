@@ -1,0 +1,135 @@
+---
+sidebar_position: 1
+sidebar_label: YAML reference
+title: YAML Configuration Reference
+description: Complete config.yaml reference — frontends, cluster groups, routing rules, persistence, translation, and admin API settings.
+image: img/queryflux-hero-banner.png
+---
+# Configuration
+
+Copy `config.example.yaml` in the repository root and adjust for your environment.
+
+```yaml
+queryflux:
+  externalAddress: http://localhost:8080
+  frontends:
+    trinoHttp:
+      enabled: true
+      port: 8080
+    snowflakeHttp:
+      enabled: true
+      port: 8445
+  persistence:
+    type: inMemory  # or: postgres
+
+clusters:
+  trino-1:
+    engine: trino
+    endpoint: http://trino-host:8080
+    enabled: true
+    auth:
+      type: basic
+      username: user
+      password: pass
+  duckdb-1:
+    engine: duckDb
+    enabled: true
+    databasePath: /tmp/queryflux.duckdb
+
+clusterGroups:
+  trino-default:
+    maxRunningQueries: 100
+    members: [trino-1]
+  duckdb-local:
+    maxRunningQueries: 4
+    members: [duckdb-1]
+
+routers:
+  - type: protocolBased
+    trinoHttp: trino-default
+    snowflakeHttp: trino-default
+    snowflakeSqlApi: trino-default
+
+  - type: header
+    headerName: x-target-engine
+    headerValueToGroup:
+      duckdb: duckdb-local
+
+routingFallback: trino-default
+```
+
+## Authentication, authorization & backend identity
+
+```yaml
+auth:
+  provider: oidc              # none | static | oidc | ldap
+  required: true
+  oidc:
+    issuer: https://keycloak.internal/realms/my-realm
+    jwksUri: https://keycloak.internal/realms/my-realm/protocol/openid-connect/certs
+    audience: queryflux
+
+authorization:
+  provider: none               # none | openfga
+
+clusters:
+  trino-1:
+    engine: trino
+    endpoint: https://trino.internal:8443
+    auth:                      # Type 1 — QueryFlux's own service credential
+      type: basic
+      username: qf_svc
+      password: "..."
+    queryAuth:
+      type: impersonate         # serviceAccount | passthrough | impersonate | tokenExchange
+```
+
+`auth` controls who can authenticate to QueryFlux; `authorization` controls which cluster groups they can route to; `clusters[].queryAuth` controls which identity the query runs as on the backend engine — independent of the client's own credential. See **[Authentication & identity](./authentication)** for the full picture, a decision guide for `queryAuth` modes, and per-engine setup requirements.
+
+## Admin API
+
+```yaml
+queryflux:
+  adminApi:
+    port: 9000            # Admin REST API + Studio proxy port (default: 9000)
+    username: admin       # Bootstrap admin username — see note below (default: admin)
+    password: admin       # Bootstrap admin password — see note below (default: admin)
+```
+
+`username` and `password` are the **bootstrap** credentials used on first boot. After you change the password through Studio's Security page, the new bcrypt hash is stored in Postgres and the YAML values are ignored.
+
+Environment variables `QUERYFLUX_ADMIN_USER` and `QUERYFLUX_ADMIN_PASSWORD` override the YAML fields and follow the same bootstrap semantics.
+
+See **[Studio & Admin Auth](./studio)** for the full credential priority rules and password-change instructions.
+
+## Query Cache
+
+QueryFlux can cache deterministic query results to avoid repeated backend roundtrips. See the dedicated **[Caching](./architecture/caching)** page for full documentation.
+
+Quick example:
+
+```yaml
+queryflux:
+  cacheBackend:
+    scheme: s3
+    compression: lz4
+    options:
+      bucket: queryflux-cache
+      endpoint: http://localhost:19000
+      region: us-east-1
+      access_key_id: minio-root-user
+      secret_access_key: minio-root-password
+
+clusterGroups:
+  analytics:
+    members: [trino-1]
+    maxRunningQueries: 50
+    cache:
+      enabled: true
+      ttlSecs: 300
+      maxEntrySizeMb: 64
+```
+
+---
+
+`config.example.yaml`, `config.local.yaml`, and the serde types in `queryflux-core` (`config.rs`) are the authoritative reference. For routing semantics and `clusterGroups`, see **[Routing and clusters](/docs/architecture/routing-and-clusters)**.

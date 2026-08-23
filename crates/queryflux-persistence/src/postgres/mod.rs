@@ -62,9 +62,13 @@ FROM cluster_group_configs g
 /// Postgres backend — implements both `Persistence` (in-flight query state)
 /// and `MetricsStore` (historical query records + cluster snapshots).
 ///
-/// A single shared pool covers all tables. Run `migrate()` once at startup.
+/// Uses isolated connection pools so the dispatch hot path, distributed
+/// coordination, and admin/reload workloads cannot exhaust each other.
 pub struct PostgresStore {
-    pool: PgPool,
+    query_pool: PgPool,
+    coordination_pool: PgPool,
+    admin_pool: PgPool,
+    database_url: String,
 }
 
 impl PostgresStore {
@@ -74,8 +78,7 @@ impl PostgresStore {
     }
 
     /// Connect with explicit pool tuning. `None` values keep sqlx defaults.
-    /// The pool serves the dispatch hot path (capacity acquire/release per
-    /// query) plus persistence, admin, LISTEN/NOTIFY, and sweep connections.
+    /// Splits the legacy single `max_connections` budget across query/coordination/admin pools.
     pub async fn connect_with_pool_size(
         database_url: &str,
         max_connections: Option<u32>,
@@ -89,63 +92,112 @@ impl PostgresStore {
         acquire_timeout_secs: Option<u64>,
         statement_timeout_secs: Option<u64>,
     ) -> Result<Self> {
-        let mut opts = sqlx::postgres::PgPoolOptions::new();
-        if let Some(n) = max_connections {
-            opts = opts.max_connections(n);
-        }
-        let timeout = std::time::Duration::from_secs(acquire_timeout_secs.unwrap_or(30));
-        opts = opts.acquire_timeout(timeout);
-
-        let stmt_ms = statement_timeout_secs.unwrap_or(60).saturating_mul(1000);
-        opts = opts.after_connect(move |conn, _meta| {
-            Box::pin(async move {
-                use sqlx::Executor;
-                conn.execute(format!("SET statement_timeout = {stmt_ms}").as_str())
-                    .await?;
-                Ok(())
-            })
-        });
-        let pool = opts.connect(database_url).await.map_err(|e| {
-            QueryFluxError::Persistence(format!("Failed to connect to Postgres: {e}"))
-        })?;
-        Ok(Self { pool })
+        let conn = queryflux_core::config::PostgresPersistenceConfig {
+            pool_size: max_connections,
+            acquire_timeout_secs,
+            statement_timeout_secs,
+            ..Default::default()
+        };
+        Self::connect_from_config(database_url, &conn).await
     }
 
-    /// Run all migrations (persistence + metrics). Tracks applied migrations in `_sqlx_migrations`.
+    /// Connect using full Postgres persistence config (isolated pools + timeouts).
+    pub async fn connect_from_config(
+        database_url: &str,
+        conn: &queryflux_core::config::PostgresPersistenceConfig,
+    ) -> Result<Self> {
+        let (query_max, coordination_max, admin_max) = conn
+            .resolve_pool_sizes()
+            .map_err(QueryFluxError::Persistence)?;
+        let query_pool = build_pg_pool(
+            database_url,
+            query_max,
+            conn.acquire_timeout_secs,
+            conn.statement_timeout_secs,
+        )
+        .await?;
+        let coordination_pool = build_pg_pool(
+            database_url,
+            coordination_max,
+            conn.acquire_timeout_secs,
+            conn.statement_timeout_secs,
+        )
+        .await?;
+        let admin_pool = build_pg_pool(
+            database_url,
+            admin_max,
+            conn.acquire_timeout_secs,
+            conn.statement_timeout_secs,
+        )
+        .await?;
+        Ok(Self {
+            query_pool,
+            coordination_pool,
+            admin_pool,
+            database_url: database_url.to_string(),
+        })
+    }
+
+    /// Run all migrations via Refinery. Tracks applied migrations in `refinery_schema_history`.
+    ///
+    /// Prefer [`crate::SchemaMigrator`] / [`crate::run_persistence_migrations`] from CLI and
+    /// other callers so non-Postgres backends can plug in the same interface later.
     pub async fn migrate(&self) -> Result<()> {
-        sqlx::migrate!("src/postgres/migrations")
-            .run(&self.pool)
-            .await
-            .map_err(|e| QueryFluxError::Persistence(format!("Migration failed: {e}")))?;
-        Ok(())
+        crate::migrate::run_postgres_refinery_migrations(&self.database_url).await
     }
 }
 
+async fn build_pg_pool(
+    database_url: &str,
+    max_connections: u32,
+    acquire_timeout_secs: Option<u64>,
+    statement_timeout_secs: Option<u64>,
+) -> Result<PgPool> {
+    let mut opts = sqlx::postgres::PgPoolOptions::new().max_connections(max_connections);
+    let timeout = std::time::Duration::from_secs(acquire_timeout_secs.unwrap_or(30));
+    opts = opts.acquire_timeout(timeout);
+
+    let stmt_ms = statement_timeout_secs.unwrap_or(60).saturating_mul(1000);
+    opts = opts.after_connect(move |conn, _meta| {
+        Box::pin(async move {
+            use sqlx::Executor;
+            conn.execute(format!("SET statement_timeout = {stmt_ms}").as_str())
+                .await?;
+            Ok(())
+        })
+    });
+    opts.connect(database_url)
+        .await
+        .map_err(|e| QueryFluxError::Persistence(format!("Failed to connect to Postgres: {e}")))
+}
+
 /// The Postgres sweep lock is a session-scoped advisory lock held on a
-/// dedicated pooled connection inside the returned guard, so if the owning
-/// process crashes mid-sweep, Postgres releases the lock when the connection
-/// drops and another replica takes over on its next tick.
+/// dedicated direct connection (outside the coordination pool), so sweeps
+/// never pin pool slots and concurrent try-lock attempts can each open a
+/// connection to call `pg_try_advisory_lock`.
 #[async_trait]
 impl SweepCoordinator for PostgresStore {
     async fn try_sweep_lock(&self, name: &str) -> Result<Option<Box<dyn SweepGuard>>> {
-        let mut conn =
-            self.pool.acquire().await.map_err(|e| {
-                QueryFluxError::Persistence(format!("sweep lock acquire conn: {e}"))
-            })?;
+        use sqlx::Connection;
+        let mut conn = sqlx::PgConnection::connect(&self.database_url)
+            .await
+            .map_err(|e| QueryFluxError::Persistence(format!("sweep lock connect: {e}")))?;
 
         let got: bool =
             sqlx::query_scalar("SELECT pg_try_advisory_lock(hashtext('sweep:' || $1)::bigint)")
                 .bind(name)
-                .fetch_one(&mut *conn)
+                .fetch_one(&mut conn)
                 .await
                 .map_err(|e| QueryFluxError::Persistence(format!("sweep lock try: {e}")))?;
 
-        Ok(got.then(|| {
-            Box::new(SweepLock {
+        if got {
+            Ok(Some(Box::new(SweepLock {
                 conn: Some(conn),
                 name: name.to_string(),
-            }) as Box<dyn SweepGuard>
-        }))
+            }) as Box<dyn SweepGuard>))
+        } else {
+            Ok(None)
+        }
     }
 }
 
@@ -158,25 +210,24 @@ impl BackendCapabilities for PostgresStore {
 /// Guard for a single-owner background sweep (see [`PostgresStore::try_sweep_lock`]).
 ///
 /// Releases the advisory lock on [`Self::release`] or on drop. Session advisory
-/// locks are per-connection, so the unlock must run on the same connection the
-/// lock was taken on; if unlocking fails, the connection is closed rather than
-/// returned to the pool, so the lock can never leak onto a recycled connection.
+/// locks are per-connection; if unlocking fails, the connection is closed so the
+/// lock can never leak onto a recycled connection.
 pub struct SweepLock {
-    conn: Option<sqlx::pool::PoolConnection<sqlx::Postgres>>,
+    conn: Option<sqlx::PgConnection>,
     name: String,
 }
 
 impl SweepLock {
-    async fn unlock(mut conn: sqlx::pool::PoolConnection<sqlx::Postgres>, name: &str) {
+    async fn unlock(mut conn: sqlx::PgConnection, name: &str) {
         let res = sqlx::query("SELECT pg_advisory_unlock(hashtext('sweep:' || $1)::bigint)")
             .bind(name)
-            .execute(&mut *conn)
+            .execute(&mut conn)
             .await;
         if let Err(e) = res {
             tracing::warn!("Failed to release sweep lock '{name}': {e}; closing connection");
-            use sqlx::Connection;
-            let _ = conn.detach().close().await;
         }
+        use sqlx::Connection;
+        let _ = conn.close().await;
     }
 
     /// Release the lock now (deterministic, preferred at the end of a sweep).
@@ -197,10 +248,7 @@ impl SweepGuard for SweepLock {
 impl Drop for SweepLock {
     fn drop(&mut self) {
         // Fallback for early exits (`continue`, `?`): spawn the unlock so the
-        // connection never returns to the pool still holding the session lock.
-        // `tokio::spawn` panics outside a runtime (e.g. process teardown), so
-        // check first; without a runtime, dropping the connection closes it,
-        // which releases the session-scoped lock server-side.
+        // connection is closed rather than dropped while still holding the lock.
         if let Some(conn) = self.conn.take() {
             if let Ok(handle) = tokio::runtime::Handle::try_current() {
                 let name = std::mem::take(&mut self.name);
@@ -249,7 +297,7 @@ impl QueryHistoryStore for PostgresStore {
         .bind(&filters.engine)
         .bind(filters.limit)
         .bind(filters.offset)
-        .fetch_all(&self.pool)
+        .fetch_all(&self.admin_pool)
         .await
         .map_err(|e| QueryFluxError::Persistence(format!("list_queries: {e}")))
     }
@@ -264,7 +312,7 @@ impl QueryHistoryStore for PostgresStore {
                FROM query_records
                WHERE created_at > NOW() - INTERVAL '1 hour'"#,
         )
-        .fetch_one(&self.pool)
+        .fetch_one(&self.admin_pool)
         .await
         .map_err(|e| QueryFluxError::Persistence(format!("get_dashboard_stats: {e}")))?;
 
@@ -305,7 +353,7 @@ impl QueryHistoryStore for PostgresStore {
                ORDER BY total_queries DESC"#,
         )
         .bind(hours)
-        .fetch_all(&self.pool)
+        .fetch_all(&self.admin_pool)
         .await
         .map_err(|e| QueryFluxError::Persistence(format!("get_engine_stats: {e}")))
     }
@@ -340,7 +388,7 @@ impl QueryHistoryStore for PostgresStore {
                ORDER BY total_queries DESC"#,
         )
         .bind(hours)
-        .fetch_all(&self.pool)
+        .fetch_all(&self.admin_pool)
         .await
         .map_err(|e| QueryFluxError::Persistence(format!("get_group_stats: {e}")))
     }
@@ -348,7 +396,7 @@ impl QueryHistoryStore for PostgresStore {
     async fn list_engines(&self) -> Result<Vec<String>> {
         let rows: Vec<(String,)> =
             sqlx::query_as("SELECT DISTINCT engine_type FROM query_records ORDER BY engine_type")
-                .fetch_all(&self.pool)
+                .fetch_all(&self.admin_pool)
                 .await
                 .map_err(|e| QueryFluxError::Persistence(format!("list_engines: {e}")))?;
         Ok(rows.into_iter().map(|(e,)| e).collect())
@@ -370,7 +418,7 @@ impl QueryHistoryStore for PostgresStore {
         )
         .bind(limit)
         .bind(offset)
-        .fetch_all(&self.pool)
+        .fetch_all(&self.admin_pool)
         .await
         .map_err(|e| QueryFluxError::Persistence(format!("list_agents: {e}")))
     }
@@ -399,7 +447,7 @@ impl QueryHistoryStore for PostgresStore {
         .bind(agent_id)
         .bind(limit)
         .bind(offset)
-        .fetch_all(&self.pool)
+        .fetch_all(&self.admin_pool)
         .await
         .map_err(|e| QueryFluxError::Persistence(format!("list_conversations: {e}")))
     }
@@ -426,7 +474,7 @@ impl QueryHistoryStore for PostgresStore {
                ORDER BY qr.step_index ASC NULLS LAST, qr.created_at ASC"#,
         )
         .bind(conversation_id)
-        .fetch_all(&self.pool)
+        .fetch_all(&self.admin_pool)
         .await
         .map_err(|e| QueryFluxError::Persistence(format!("get_conversation: {e}")))
     }
@@ -435,12 +483,33 @@ impl QueryHistoryStore for PostgresStore {
         &self,
         older_than: chrono::DateTime<chrono::Utc>,
     ) -> Result<u64> {
-        let r = sqlx::query("DELETE FROM query_records WHERE created_at < $1")
+        let mut tx = self.admin_pool.begin().await.map_err(|e| {
+            QueryFluxError::Persistence(format!("purge_old_query_records begin: {e}"))
+        })?;
+
+        let records = sqlx::query("DELETE FROM query_records WHERE created_at < $1")
             .bind(older_than)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await
-            .map_err(|e| QueryFluxError::Persistence(format!("purge_old_query_records: {e}")))?;
-        Ok(r.rows_affected())
+            .map_err(|e| QueryFluxError::Persistence(format!("purge query_records: {e}")))?;
+
+        let digests = sqlx::query("DELETE FROM query_digest_stats WHERE last_seen < $1")
+            .bind(older_than)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| QueryFluxError::Persistence(format!("purge query_digest_stats: {e}")))?;
+
+        let snapshots = sqlx::query("DELETE FROM cluster_snapshots WHERE recorded_at < $1")
+            .bind(older_than)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| QueryFluxError::Persistence(format!("purge cluster_snapshots: {e}")))?;
+
+        tx.commit().await.map_err(|e| {
+            QueryFluxError::Persistence(format!("purge_old_query_records commit: {e}"))
+        })?;
+
+        Ok(records.rows_affected() + digests.rows_affected() + snapshots.rows_affected())
     }
 }
 
@@ -452,7 +521,7 @@ impl QueryHistoryStore for PostgresStore {
 impl ClusterConfigStore for PostgresStore {
     async fn list_cluster_configs(&self) -> Result<Vec<ClusterConfigRecord>> {
         sqlx::query_as::<_, ClusterConfigRecord>("SELECT * FROM cluster_configs ORDER BY name")
-            .fetch_all(&self.pool)
+            .fetch_all(&self.admin_pool)
             .await
             .map_err(|e| QueryFluxError::Persistence(format!("list_cluster_configs: {e}")))
     }
@@ -460,7 +529,7 @@ impl ClusterConfigStore for PostgresStore {
     async fn get_cluster_config(&self, name: &str) -> Result<Option<ClusterConfigRecord>> {
         sqlx::query_as::<_, ClusterConfigRecord>("SELECT * FROM cluster_configs WHERE name = $1")
             .bind(name)
-            .fetch_optional(&self.pool)
+            .fetch_optional(&self.admin_pool)
             .await
             .map_err(|e| QueryFluxError::Persistence(format!("get_cluster_config: {e}")))
     }
@@ -471,13 +540,14 @@ impl ClusterConfigStore for PostgresStore {
         cfg: &UpsertClusterConfig,
     ) -> Result<ClusterConfigRecord> {
         sqlx::query_as::<_, ClusterConfigRecord>(
-            r#"INSERT INTO cluster_configs (name, engine_key, enabled, max_running_queries, config)
-               VALUES ($1, $2, $3, $4, $5)
+            r#"INSERT INTO cluster_configs (name, engine_key, enabled, max_running_queries, config, variants)
+               VALUES ($1, $2, $3, $4, $5, $6)
                ON CONFLICT (name) DO UPDATE SET
                    engine_key          = EXCLUDED.engine_key,
                    enabled             = EXCLUDED.enabled,
                    max_running_queries = EXCLUDED.max_running_queries,
                    config              = EXCLUDED.config,
+                   variants            = EXCLUDED.variants,
                    updated_at          = now()
                RETURNING *"#,
         )
@@ -486,13 +556,38 @@ impl ClusterConfigStore for PostgresStore {
         .bind(cfg.enabled)
         .bind(cfg.max_running_queries)
         .bind(&cfg.config)
-        .fetch_one(&self.pool)
+        .bind(&cfg.variants)
+        .fetch_one(&self.admin_pool)
         .await
         .map_err(|e| QueryFluxError::Persistence(format!("upsert_cluster_config: {e}")))
     }
 
+    async fn insert_cluster_config_if_missing(
+        &self,
+        name: &str,
+        cfg: &UpsertClusterConfig,
+    ) -> Result<bool> {
+        let inserted = sqlx::query_as::<_, ClusterConfigRecord>(
+            r#"INSERT INTO cluster_configs (name, engine_key, enabled, max_running_queries, config)
+               VALUES ($1, $2, $3, $4, $5)
+               ON CONFLICT (name) DO NOTHING
+               RETURNING *"#,
+        )
+        .bind(name)
+        .bind(&cfg.engine_key)
+        .bind(cfg.enabled)
+        .bind(cfg.max_running_queries)
+        .bind(&cfg.config)
+        .fetch_optional(&self.admin_pool)
+        .await
+        .map_err(|e| {
+            QueryFluxError::Persistence(format!("insert_cluster_config_if_missing: {e}"))
+        })?;
+        Ok(inserted.is_some())
+    }
+
     async fn delete_cluster_config(&self, name: &str) -> Result<bool> {
-        let mut tx = self.pool.begin().await.map_err(|e| {
+        let mut tx = self.admin_pool.begin().await.map_err(|e| {
             QueryFluxError::Persistence(format!("delete_cluster_config begin: {e}"))
         })?;
 
@@ -541,7 +636,7 @@ impl ClusterConfigStore for PostgresStore {
 
     async fn cluster_configs_count(&self) -> Result<i64> {
         let (n,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM cluster_configs")
-            .fetch_one(&self.pool)
+            .fetch_one(&self.admin_pool)
             .await
             .map_err(|e| QueryFluxError::Persistence(format!("cluster_configs_count: {e}")))?;
         Ok(n)
@@ -565,7 +660,7 @@ impl ClusterConfigStore for PostgresStore {
             });
         }
 
-        let mut tx = self.pool.begin().await.map_err(|e| {
+        let mut tx = self.admin_pool.begin().await.map_err(|e| {
             QueryFluxError::Persistence(format!("rename_cluster_config begin: {e}"))
         })?;
 
@@ -618,7 +713,7 @@ impl ClusterConfigStore for PostgresStore {
     async fn list_group_configs(&self) -> Result<Vec<ClusterGroupConfigRecord>> {
         let q = format!("{CLUSTER_GROUP_CONFIG_SELECT} ORDER BY g.name");
         sqlx::query_as::<_, ClusterGroupConfigRecord>(&q)
-            .fetch_all(&self.pool)
+            .fetch_all(&self.admin_pool)
             .await
             .map_err(|e| QueryFluxError::Persistence(format!("list_group_configs: {e}")))
     }
@@ -627,7 +722,7 @@ impl ClusterConfigStore for PostgresStore {
         let q = format!("{CLUSTER_GROUP_CONFIG_SELECT} WHERE g.name = $1");
         sqlx::query_as::<_, ClusterGroupConfigRecord>(&q)
             .bind(name)
-            .fetch_optional(&self.pool)
+            .fetch_optional(&self.admin_pool)
             .await
             .map_err(|e| QueryFluxError::Persistence(format!("get_group_config: {e}")))
     }
@@ -638,7 +733,7 @@ impl ClusterConfigStore for PostgresStore {
         cfg: &UpsertClusterGroupConfig,
     ) -> Result<ClusterGroupConfigRecord> {
         let mut tx =
-            self.pool.begin().await.map_err(|e| {
+            self.admin_pool.begin().await.map_err(|e| {
                 QueryFluxError::Persistence(format!("upsert_group_config begin: {e}"))
             })?;
 
@@ -730,10 +825,109 @@ impl ClusterConfigStore for PostgresStore {
         Ok(record)
     }
 
+    async fn insert_group_config_if_missing(
+        &self,
+        name: &str,
+        cfg: &UpsertClusterGroupConfig,
+    ) -> Result<bool> {
+        let mut tx = self.admin_pool.begin().await.map_err(|e| {
+            QueryFluxError::Persistence(format!("insert_group_config_if_missing begin: {e}"))
+        })?;
+
+        let existing: Option<(i64,)> =
+            sqlx::query_as("SELECT id FROM cluster_group_configs WHERE name = $1")
+                .bind(name)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|e| {
+                    QueryFluxError::Persistence(format!(
+                        "insert_group_config_if_missing lookup: {e}"
+                    ))
+                })?;
+        if existing.is_some() {
+            tx.commit().await.map_err(|e| {
+                QueryFluxError::Persistence(format!("insert_group_config_if_missing commit: {e}"))
+            })?;
+            return Ok(false);
+        }
+
+        let mut member_ids: Vec<i64> = Vec::with_capacity(cfg.members.len());
+        for m in &cfg.members {
+            let row: Option<(i64,)> =
+                sqlx::query_as("SELECT id FROM cluster_configs WHERE name = $1")
+                    .bind(m)
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .map_err(|e| {
+                        QueryFluxError::Persistence(format!(
+                            "insert_group_config_if_missing member lookup: {e}"
+                        ))
+                    })?;
+            let Some((cid,)) = row else {
+                return Err(QueryFluxError::Persistence(format!(
+                    "Unknown cluster '{m}' in group members (clusters must exist first)"
+                )));
+            };
+            member_ids.push(cid);
+        }
+
+        for sid in &cfg.translation_script_ids {
+            let row: Option<(String,)> =
+                sqlx::query_as("SELECT kind FROM user_scripts WHERE id = $1")
+                    .bind(sid)
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .map_err(|e| {
+                        QueryFluxError::Persistence(format!(
+                            "insert_group_config_if_missing script lookup: {e}"
+                        ))
+                    })?;
+            let Some((kind,)) = row else {
+                return Err(QueryFluxError::Persistence(format!(
+                    "Unknown translation script id {sid}"
+                )));
+            };
+            if kind != KIND_TRANSLATION_FIXUP {
+                return Err(QueryFluxError::Persistence(format!(
+                    "Script id {sid} has kind '{kind}', expected '{KIND_TRANSLATION_FIXUP}' for group translation"
+                )));
+            }
+        }
+
+        let inserted: Option<(i64,)> = sqlx::query_as(
+            r#"INSERT INTO cluster_group_configs
+                   (name, enabled, members, max_running_queries, max_queued_queries, strategy, allow_groups, allow_users, translation_script_ids, default_tags, cache)
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+               ON CONFLICT (name) DO NOTHING
+               RETURNING id"#,
+        )
+        .bind(name)
+        .bind(cfg.enabled)
+        .bind(&member_ids)
+        .bind(cfg.max_running_queries)
+        .bind(cfg.max_queued_queries)
+        .bind(&cfg.strategy)
+        .bind(&cfg.allow_groups)
+        .bind(&cfg.allow_users)
+        .bind(&cfg.translation_script_ids)
+        .bind(&cfg.default_tags)
+        .bind(&cfg.cache)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| {
+            QueryFluxError::Persistence(format!("insert_group_config_if_missing: {e}"))
+        })?;
+
+        tx.commit().await.map_err(|e| {
+            QueryFluxError::Persistence(format!("insert_group_config_if_missing commit: {e}"))
+        })?;
+        Ok(inserted.is_some())
+    }
+
     async fn delete_group_config(&self, name: &str) -> Result<bool> {
         let r = sqlx::query("DELETE FROM cluster_group_configs WHERE name = $1")
             .bind(name)
-            .execute(&self.pool)
+            .execute(&self.admin_pool)
             .await
             .map_err(|e| {
                 if let Some(db) = e.as_database_error() {
@@ -750,7 +944,7 @@ impl ClusterConfigStore for PostgresStore {
 
     async fn group_configs_count(&self) -> Result<i64> {
         let (n,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM cluster_group_configs")
-            .fetch_one(&self.pool)
+            .fetch_one(&self.admin_pool)
             .await
             .map_err(|e| QueryFluxError::Persistence(format!("group_configs_count: {e}")))?;
         Ok(n)
@@ -772,7 +966,7 @@ impl ClusterConfigStore for PostgresStore {
             let q = format!("{CLUSTER_GROUP_CONFIG_SELECT} WHERE g.name = $1");
             return sqlx::query_as::<_, ClusterGroupConfigRecord>(&q)
                 .bind(old_name)
-                .fetch_optional(&self.pool)
+                .fetch_optional(&self.admin_pool)
                 .await
                 .map_err(|e| QueryFluxError::Persistence(format!("rename_group_config: {e}")))?
                 .ok_or_else(|| {
@@ -781,7 +975,7 @@ impl ClusterConfigStore for PostgresStore {
         }
 
         let mut tx =
-            self.pool.begin().await.map_err(|e| {
+            self.admin_pool.begin().await.map_err(|e| {
                 QueryFluxError::Persistence(format!("rename_group_config begin: {e}"))
             })?;
 
@@ -860,11 +1054,11 @@ impl ScriptLibraryStore for PostgresStore {
                 "SELECT * FROM user_scripts WHERE kind = $1 ORDER BY name",
             )
             .bind(k)
-            .fetch_all(&self.pool)
+            .fetch_all(&self.admin_pool)
             .await
         } else {
             sqlx::query_as::<_, UserScriptRecord>("SELECT * FROM user_scripts ORDER BY name")
-                .fetch_all(&self.pool)
+                .fetch_all(&self.admin_pool)
                 .await
         }
         .map_err(|e| QueryFluxError::Persistence(format!("list_user_scripts: {e}")))?;
@@ -874,7 +1068,7 @@ impl ScriptLibraryStore for PostgresStore {
     async fn get_user_script(&self, id: i64) -> Result<Option<UserScriptRecord>> {
         sqlx::query_as::<_, UserScriptRecord>("SELECT * FROM user_scripts WHERE id = $1")
             .bind(id)
-            .fetch_optional(&self.pool)
+            .fetch_optional(&self.admin_pool)
             .await
             .map_err(|e| QueryFluxError::Persistence(format!("get_user_script: {e}")))
     }
@@ -895,7 +1089,7 @@ impl ScriptLibraryStore for PostgresStore {
         .bind(&body.description)
         .bind(&body.kind)
         .bind(&body.body)
-        .fetch_one(&self.pool)
+        .fetch_one(&self.admin_pool)
         .await
         .map_err(|e| QueryFluxError::Persistence(format!("create_user_script: {e}")))
     }
@@ -926,7 +1120,7 @@ impl ScriptLibraryStore for PostgresStore {
         .bind(&body.description)
         .bind(&body.kind)
         .bind(&body.body)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&self.admin_pool)
         .await
         .map_err(|e| QueryFluxError::Persistence(format!("update_user_script: {e}")))?
         .ok_or_else(|| QueryFluxError::Persistence(format!("user script id {id} not found")))
@@ -935,7 +1129,7 @@ impl ScriptLibraryStore for PostgresStore {
     async fn delete_user_script(&self, id: i64) -> Result<bool> {
         let r = sqlx::query("DELETE FROM user_scripts WHERE id = $1")
             .bind(id)
-            .execute(&self.pool)
+            .execute(&self.admin_pool)
             .await
             .map_err(|e| QueryFluxError::Persistence(format!("delete_user_script: {e}")))?;
         Ok(r.rows_affected() > 0)
@@ -949,7 +1143,7 @@ impl ScriptLibraryStore for PostgresStore {
                JOIN user_scripts s ON s.id = u.sid AND s.kind = 'translation_fixup'
                ORDER BY g.name, u.ord"#,
         )
-        .fetch_all(&self.pool)
+        .fetch_all(&self.admin_pool)
         .await
         .map_err(|e| QueryFluxError::Persistence(format!("load_group_translation_bodies: {e}")))?;
 
@@ -973,7 +1167,7 @@ impl ProxySettingsStore for PostgresStore {
                 let row: Option<(serde_json::Value,)> = sqlx::query_as(
                     r#"SELECT config FROM security_settings WHERE singleton = TRUE"#,
                 )
-                .fetch_optional(&self.pool)
+                .fetch_optional(&self.admin_pool)
                 .await
                 .map_err(|e| QueryFluxError::Persistence(format!("get_proxy_setting: {e}")))?;
                 Ok(row.map(|(v,)| v))
@@ -981,7 +1175,7 @@ impl ProxySettingsStore for PostgresStore {
             "guardrails_config" => {
                 let rows: Vec<(String, serde_json::Value)> =
                     sqlx::query_as(r#"SELECT kind, guards FROM guardrails ORDER BY kind"#)
-                        .fetch_all(&self.pool)
+                        .fetch_all(&self.admin_pool)
                         .await
                         .map_err(|e| QueryFluxError::Persistence(format!("get guardrails: {e}")))?;
                 if rows.is_empty() {
@@ -1000,7 +1194,17 @@ impl ProxySettingsStore for PostgresStore {
                     serde_json::json!({ "global": global, "groups": groups }),
                 ))
             }
-            _ => Ok(None),
+            other => {
+                let row: Option<(serde_json::Value,)> =
+                    sqlx::query_as(r#"SELECT value FROM proxy_settings WHERE key = $1"#)
+                        .bind(other)
+                        .fetch_optional(&self.admin_pool)
+                        .await
+                        .map_err(|e| {
+                            QueryFluxError::Persistence(format!("get_proxy_setting: {e}"))
+                        })?;
+                Ok(row.map(|(v,)| v))
+            }
         }
     }
 
@@ -1012,7 +1216,7 @@ impl ProxySettingsStore for PostgresStore {
                        ON CONFLICT (singleton) DO UPDATE SET config = EXCLUDED.config, updated_at = now()"#,
                 )
                 .bind(&value)
-                .execute(&self.pool)
+                .execute(&self.admin_pool)
                 .await
                 .map_err(|e| QueryFluxError::Persistence(format!("set_proxy_setting: {e}")))?;
             }
@@ -1028,7 +1232,7 @@ impl ProxySettingsStore for PostgresStore {
                     .unwrap_or_default();
 
                 let mut tx = self
-                    .pool
+                    .admin_pool
                     .begin()
                     .await
                     .map_err(|e| QueryFluxError::Persistence(format!("guardrails tx: {e}")))?;
@@ -1072,7 +1276,17 @@ impl ProxySettingsStore for PostgresStore {
                     QueryFluxError::Persistence(format!("guardrails tx commit: {e}"))
                 })?;
             }
-            _ => {}
+            other => {
+                sqlx::query(
+                    r#"INSERT INTO proxy_settings (key, value) VALUES ($1, $2)
+                       ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()"#,
+                )
+                .bind(other)
+                .bind(&value)
+                .execute(&self.admin_pool)
+                .await
+                .map_err(|e| QueryFluxError::Persistence(format!("set_proxy_setting: {e}")))?;
+            }
         }
         Ok(())
     }
@@ -1083,17 +1297,25 @@ impl ProxySettingsStore for PostgresStore {
                 sqlx::query(
                     r#"UPDATE security_settings SET config = '{}'::jsonb, updated_at = now() WHERE singleton = TRUE"#,
                 )
-                .execute(&self.pool)
+                .execute(&self.admin_pool)
                 .await
                 .map_err(|e| QueryFluxError::Persistence(format!("delete_proxy_setting: {e}")))?;
             }
             "guardrails_config" => {
                 sqlx::query(r#"DELETE FROM guardrails"#)
-                    .execute(&self.pool)
+                    .execute(&self.admin_pool)
                     .await
                     .map_err(|e| QueryFluxError::Persistence(format!("delete guardrails: {e}")))?;
             }
-            _ => {}
+            other => {
+                sqlx::query(r#"DELETE FROM proxy_settings WHERE key = $1"#)
+                    .bind(other)
+                    .execute(&self.admin_pool)
+                    .await
+                    .map_err(|e| {
+                        QueryFluxError::Persistence(format!("delete_proxy_setting: {e}"))
+                    })?;
+            }
         }
         Ok(())
     }
@@ -1111,7 +1333,7 @@ impl RoutingConfigStore for PostgresStore {
                  FROM routing_settings
                 WHERE singleton = true"#,
         )
-        .fetch_optional(&self.pool)
+        .fetch_optional(&self.admin_pool)
         .await
         .map_err(|e| QueryFluxError::Persistence(format!("load_routing_config settings: {e}")))?;
 
@@ -1124,7 +1346,7 @@ impl RoutingConfigStore for PostgresStore {
 
         let id_rows: Vec<(i64, String)> =
             sqlx::query_as(r#"SELECT id, name FROM cluster_group_configs"#)
-                .fetch_all(&self.pool)
+                .fetch_all(&self.admin_pool)
                 .await
                 .map_err(|e| {
                     QueryFluxError::Persistence(format!("load_routing_config groups: {e}"))
@@ -1142,7 +1364,7 @@ impl RoutingConfigStore for PostgresStore {
                      FROM routing_rules
                     ORDER BY sort_order ASC, id ASC"#,
         )
-        .fetch_all(&self.pool)
+        .fetch_all(&self.admin_pool)
         .await
         .map_err(|e| QueryFluxError::Persistence(format!("load_routing_config rules: {e}")))?;
 
@@ -1176,7 +1398,7 @@ impl RoutingConfigStore for PostgresStore {
         routing_fallback_group_id: Option<i64>,
         routers: &[serde_json::Value],
     ) -> Result<()> {
-        let mut tx = self.pool.begin().await.map_err(|e| {
+        let mut tx = self.admin_pool.begin().await.map_err(|e| {
             QueryFluxError::Persistence(format!("replace_routing_config begin: {e}"))
         })?;
 
@@ -1264,7 +1486,7 @@ impl Persistence for PostgresStore {
         )
         .bind(&id)
         .bind(data)
-        .execute(&self.pool)
+        .execute(&self.query_pool)
         .await
         .map_err(|e| QueryFluxError::Persistence(format!("Upsert executing_queries: {e}")))?;
         Ok(())
@@ -1274,7 +1496,7 @@ impl Persistence for PostgresStore {
         let row: Option<(serde_json::Value,)> =
             sqlx::query_as("SELECT data FROM executing_queries WHERE id = $1")
                 .bind(&id.0)
-                .fetch_optional(&self.pool)
+                .fetch_optional(&self.query_pool)
                 .await
                 .map_err(|e| QueryFluxError::Persistence(format!("Get executing_queries: {e}")))?;
         match row {
@@ -1290,7 +1512,7 @@ impl Persistence for PostgresStore {
     async fn delete(&self, id: &BackendQueryId) -> Result<()> {
         sqlx::query("DELETE FROM executing_queries WHERE id = $1")
             .bind(&id.0)
-            .execute(&self.pool)
+            .execute(&self.query_pool)
             .await
             .map_err(|e| QueryFluxError::Persistence(format!("Delete executing_queries: {e}")))?;
         Ok(())
@@ -1299,7 +1521,7 @@ impl Persistence for PostgresStore {
     async fn list_all(&self) -> Result<Vec<ExecutingQuery>> {
         let rows: Vec<(serde_json::Value,)> =
             sqlx::query_as("SELECT data FROM executing_queries ORDER BY created_at")
-                .fetch_all(&self.pool)
+                .fetch_all(&self.query_pool)
                 .await
                 .map_err(|e| QueryFluxError::Persistence(format!("List executing_queries: {e}")))?;
         rows.into_iter()
@@ -1340,7 +1562,7 @@ impl Persistence for PostgresStore {
         .bind(data)
         .bind(&group)
         .bind(last_accessed)
-        .execute(&self.pool)
+        .execute(&self.query_pool)
         .await
         .map_err(|e| QueryFluxError::Persistence(format!("Upsert queued_queries: {e}")))?;
         Ok(())
@@ -1350,7 +1572,7 @@ impl Persistence for PostgresStore {
         let row: Option<(serde_json::Value,)> =
             sqlx::query_as("SELECT data FROM queued_queries WHERE id = $1")
                 .bind(&id.0)
-                .fetch_optional(&self.pool)
+                .fetch_optional(&self.query_pool)
                 .await
                 .map_err(|e| QueryFluxError::Persistence(format!("Get queued_queries: {e}")))?;
         match row {
@@ -1366,16 +1588,33 @@ impl Persistence for PostgresStore {
     async fn delete_queued(&self, id: &ProxyQueryId) -> Result<()> {
         sqlx::query("DELETE FROM queued_queries WHERE id = $1")
             .bind(&id.0)
-            .execute(&self.pool)
+            .execute(&self.query_pool)
             .await
             .map_err(|e| QueryFluxError::Persistence(format!("Delete queued_queries: {e}")))?;
         Ok(())
     }
 
+    async fn take_queued(&self, id: &ProxyQueryId) -> Result<Option<QueuedQuery>> {
+        let row: Option<(serde_json::Value,)> =
+            sqlx::query_as("DELETE FROM queued_queries WHERE id = $1 RETURNING data")
+                .bind(&id.0)
+                .fetch_optional(&self.query_pool)
+                .await
+                .map_err(|e| QueryFluxError::Persistence(format!("take_queued: {e}")))?;
+        match row {
+            None => Ok(None),
+            Some((data,)) => {
+                let q = serde_json::from_value(data)
+                    .map_err(|e| QueryFluxError::Persistence(format!("Deserialize error: {e}")))?;
+                Ok(Some(q))
+            }
+        }
+    }
+
     async fn list_queued(&self) -> Result<Vec<QueuedQuery>> {
         let rows: Vec<(serde_json::Value,)> =
             sqlx::query_as("SELECT data FROM queued_queries ORDER BY created_at")
-                .fetch_all(&self.pool)
+                .fetch_all(&self.query_pool)
                 .await
                 .map_err(|e| QueryFluxError::Persistence(format!("List queued_queries: {e}")))?;
         rows.into_iter()
@@ -1389,7 +1628,7 @@ impl Persistence for PostgresStore {
     async fn touch_queued_last_accessed(&self, id: &ProxyQueryId) -> Result<()> {
         sqlx::query("UPDATE queued_queries SET last_accessed = now() WHERE id = $1")
             .bind(&id.0)
-            .execute(&self.pool)
+            .execute(&self.query_pool)
             .await
             .map_err(|e| QueryFluxError::Persistence(format!("touch_queued_last_accessed: {e}")))?;
         Ok(())
@@ -1401,7 +1640,7 @@ impl Persistence for PostgresStore {
     ) -> Result<u64> {
         let result = sqlx::query("DELETE FROM queued_queries WHERE last_accessed < $1")
             .bind(cutoff)
-            .execute(&self.pool)
+            .execute(&self.query_pool)
             .await
             .map_err(|e| {
                 QueryFluxError::Persistence(format!("delete_queued_not_accessed_since: {e}"))
@@ -1430,7 +1669,7 @@ impl Persistence for PostgresStore {
         .bind(cluster_group)
         .bind(active_after)
         .bind(enqueued_before)
-        .fetch_one(&self.pool)
+        .fetch_one(&self.query_pool)
         .await
         .map_err(|e| QueryFluxError::Persistence(format!("count_active_queued_before: {e}")))?;
         Ok(count.max(0) as u64)
@@ -1470,7 +1709,7 @@ impl MetricsStore for PostgresStore {
         let query_tags_json = tags_to_json(&r.query_tags);
         let guard_actions_json =
             serde_json::to_value(&r.guard_actions).unwrap_or(serde_json::Value::Array(vec![]));
-        sqlx::query(
+        let insert_result = sqlx::query(
             r#"INSERT INTO query_records
                 (proxy_query_id, backend_query_id, cluster_group, cluster_name, engine_type,
                  frontend_protocol, source_dialect, target_dialect, was_translated, username,
@@ -1484,7 +1723,8 @@ impl MetricsStore for PostgresStore {
                  guard_actions, was_guard_blocked, cache_hit)
                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,
                        $21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,
-                       $36,$37,$38,$39,$40,$41,$42,$43)"#,
+                       $36,$37,$38,$39,$40,$41,$42,$43)
+               ON CONFLICT (proxy_query_id) DO NOTHING"#,
         )
         .bind(&r.proxy_query_id)
         .bind(&r.backend_query_id)
@@ -1529,9 +1769,12 @@ impl MetricsStore for PostgresStore {
         .bind(guard_actions_json)
         .bind(r.was_guard_blocked)
         .bind(r.cache_hit)
-        .execute(&self.pool)
+        .execute(&self.admin_pool)
         .await
         .map_err(|e| QueryFluxError::Persistence(format!("Insert query_records: {e}")))?;
+        if insert_result.rows_affected() == 0 {
+            return Ok(());
+        }
 
         // Upsert into query_digest_stats.
         if let Some(phash) = r.query_parameterized_hash {
@@ -1561,7 +1804,7 @@ impl MetricsStore for PostgresStore {
             .bind(exec_ms)
             .bind(rows)
             .bind(&r.cluster_group.0)
-            .execute(&self.pool)
+            .execute(&self.admin_pool)
             .await
             .map_err(|e| QueryFluxError::Persistence(format!("Upsert query_digest_stats: {e}")))?;
         }
@@ -1583,7 +1826,7 @@ impl MetricsStore for PostgresStore {
         .bind(s.queued_queries as i32)
         .bind(s.max_running_queries as i32)
         .bind(s.recorded_at)
-        .execute(&self.pool)
+        .execute(&self.admin_pool)
         .await
         .map_err(|e| QueryFluxError::Persistence(format!("Insert cluster_snapshots: {e}")))?;
         Ok(())
@@ -1598,7 +1841,7 @@ impl MetricsStore for PostgresStore {
 impl ConfigRevisionStore for PostgresStore {
     async fn current_revision(&self) -> Result<u64> {
         let row: (i64,) = sqlx::query_as("SELECT revision FROM config_revision WHERE id = TRUE")
-            .fetch_one(&self.pool)
+            .fetch_one(&self.admin_pool)
             .await
             .map_err(|e| QueryFluxError::Persistence(format!("Read config_revision: {e}")))?;
         Ok(row.0 as u64)
@@ -1608,7 +1851,7 @@ impl ConfigRevisionStore for PostgresStore {
         let row: (i64,) = sqlx::query_as(
             "UPDATE config_revision SET revision = revision + 1, updated_at = now() WHERE id = TRUE RETURNING revision",
         )
-        .fetch_one(&self.pool)
+        .fetch_one(&self.admin_pool)
         .await
         .map_err(|e| {
             QueryFluxError::Persistence(format!("Bump config_revision: {e}"))
@@ -1617,7 +1860,7 @@ impl ConfigRevisionStore for PostgresStore {
     }
 
     async fn subscribe_revisions(&self) -> Result<Option<tokio::sync::mpsc::Receiver<u64>>> {
-        let pool = self.pool.clone();
+        let database_url = self.database_url.clone();
         let (tx, rx) = tokio::sync::mpsc::channel::<u64>(16);
 
         tokio::spawn(async move {
@@ -1625,7 +1868,7 @@ impl ConfigRevisionStore for PostgresStore {
             let mut backoff = std::time::Duration::from_secs(1);
 
             'reconnect: loop {
-                let mut listener = match sqlx::postgres::PgListener::connect_with(&pool).await {
+                let mut listener = match sqlx::postgres::PgListener::connect(&database_url).await {
                     Ok(l) => l,
                     Err(e) => {
                         tracing::warn!("PgListener connect failed, retrying in {backoff:?}: {e}");
@@ -1684,26 +1927,34 @@ impl CapacityStore for PostgresStore {
     ) -> Result<bool> {
         let max_rq = max_running_queries.min(i64::MAX as u64) as i64;
 
-        // O(1) admission in a single statement: increment the per-cluster
-        // counter iff under the limit (the counter row's lock makes concurrent
-        // acquires for the same cluster serialize correctly; different clusters
-        // do not contend), and insert the lease only when granted.
+        // Admission: grant a lease iff the current lease count is below the limit.
+        // Leases live in cluster_capacity_leases; cluster_capacity_counters.running
+        // is updated only by reconcile sweeps.
         //
-        // The first CTE's INSERT path covers the cluster's very first acquire
-        // (`WHERE $4 >= 1` keeps a zero limit denying); ON CONFLICT covers all
-        // later ones. If the lease insert hits a duplicate query_id (not
-        // reachable from current call sites — leases are released before any
-        // re-dispatch of the same query), the counter drifts +1 until the
-        // sweep's reconcile in expire_stale corrects it.
+        // The count-then-insert is not atomic on its own — a plain `SELECT COUNT(*)`
+        // takes no row lock, so two concurrent transactions could both observe
+        // "under limit" before either commits its INSERT and over-admit past
+        // max_running_queries. `pg_advisory_xact_lock` serializes acquires for the
+        // *same* cluster_name (held only for this transaction, released on
+        // commit/rollback) while leaving other clusters uncontended, same pattern
+        // as the `engine-reconcile` sweep lock.
+        let mut tx = self
+            .coordination_pool
+            .begin()
+            .await
+            .map_err(|e| QueryFluxError::Persistence(format!("try_acquire begin: {e}")))?;
+
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtext('capacity:' || $1)::bigint)")
+            .bind(cluster_name)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| QueryFluxError::Persistence(format!("try_acquire lock: {e}")))?;
+
         let result = sqlx::query_scalar::<_, bool>(
             r#"
             WITH up AS (
-                INSERT INTO cluster_capacity_counters AS c (cluster_name, running)
-                SELECT $1, 1 WHERE $4 >= 1
-                ON CONFLICT (cluster_name) DO UPDATE
-                    SET running = c.running + 1
-                    WHERE c.running < $4
-                RETURNING 1
+                SELECT 1
+                WHERE (SELECT COUNT(*) FROM cluster_capacity_leases WHERE cluster_name = $1) < $4
             ),
             ins AS (
                 INSERT INTO cluster_capacity_leases (query_id, cluster_name, instance_id)
@@ -1719,34 +1970,23 @@ impl CapacityStore for PostgresStore {
         .bind(instance_id)
         .bind(query_id)
         .bind(max_rq)
-        .fetch_one(&self.pool)
+        .fetch_one(&mut *tx)
         .await
         .map_err(|e| QueryFluxError::Persistence(format!("try_acquire: {e}")))?;
+
+        tx.commit()
+            .await
+            .map_err(|e| QueryFluxError::Persistence(format!("try_acquire commit: {e}")))?;
 
         Ok(result)
     }
 
     async fn release(&self, _cluster_name: &str, query_id: &str) -> Result<()> {
-        // Delete the lease and decrement its cluster's counter in one
-        // statement. Idempotent: a second release deletes nothing, so the
-        // counter is not decremented twice.
-        sqlx::query(
-            r#"
-            WITH del AS (
-                DELETE FROM cluster_capacity_leases
-                WHERE query_id = $1
-                RETURNING cluster_name
-            )
-            UPDATE cluster_capacity_counters c
-            SET running = GREATEST(c.running - 1, 0)
-            FROM del
-            WHERE c.cluster_name = del.cluster_name
-            "#,
-        )
-        .bind(query_id)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| QueryFluxError::Persistence(format!("release: {e}")))?;
+        sqlx::query("DELETE FROM cluster_capacity_leases WHERE query_id = $1")
+            .bind(query_id)
+            .execute(&self.coordination_pool)
+            .await
+            .map_err(|e| QueryFluxError::Persistence(format!("release: {e}")))?;
         Ok(())
     }
 
@@ -1755,63 +1995,22 @@ impl CapacityStore for PostgresStore {
             "UPDATE cluster_capacity_leases SET heartbeat_at = now() WHERE instance_id = $1",
         )
         .bind(instance_id)
-        .execute(&self.pool)
+        .execute(&self.coordination_pool)
         .await
         .map_err(|e| QueryFluxError::Persistence(format!("heartbeat: {e}")))?;
         Ok(result.rows_affected())
     }
 
     async fn expire_stale(&self, cutoff: DateTime<Utc>) -> Result<u64> {
-        // Known non-atomicity: DELETE + reconcile UPDATE are two separate statements.
-        // A new acquire can commit its lease row between them, causing the counter to
-        // be written one lower than the true lease count. Under-admission is the safe
-        // direction (one query slot is wasted, not over-allocated), and the next sweep
-        // cycle (~120 s) corrects any drift. We accept this over a heavier serializable
-        // transaction because the sweep runs infrequently and correctness is recovered.
         let result = sqlx::query("DELETE FROM cluster_capacity_leases WHERE heartbeat_at < $1")
             .bind(cutoff)
-            .execute(&self.pool)
+            .execute(&self.coordination_pool)
             .await
             .map_err(|e| QueryFluxError::Persistence(format!("expire_stale: {e}")))?;
-
-        // Reconcile the admission counters from the leases (the ground truth):
-        // covers the rows just expired plus any drift from edge cases. An
-        // acquire committing between the two updates can be overwritten one
-        // low; the next cycle (120s) corrects it, and under-admission is the
-        // safe direction.
-        sqlx::query(
-            r#"
-            UPDATE cluster_capacity_counters c
-            SET running = sub.cnt
-            FROM (
-                SELECT cluster_name, COUNT(*) AS cnt
-                FROM cluster_capacity_leases
-                GROUP BY cluster_name
-            ) sub
-            WHERE c.cluster_name = sub.cluster_name AND c.running <> sub.cnt
-            "#,
-        )
-        .execute(&self.pool)
-        .await
-        .map_err(|e| QueryFluxError::Persistence(format!("expire_stale reconcile: {e}")))?;
-
-        sqlx::query(
-            r#"
-            UPDATE cluster_capacity_counters
-            SET running = 0
-            WHERE running <> 0
-              AND cluster_name NOT IN (SELECT cluster_name FROM cluster_capacity_leases)
-            "#,
-        )
-        .execute(&self.pool)
-        .await
-        .map_err(|e| QueryFluxError::Persistence(format!("expire_stale zero: {e}")))?;
-
         Ok(result.rows_affected())
     }
 
     async fn active_count(&self, cluster_name: &str) -> Result<u64> {
-        // O(1) counter read; reconciled from the leases table by the sweep.
         let count: i64 = sqlx::query_scalar(
             r#"
             SELECT COALESCE(
@@ -1821,35 +2020,47 @@ impl CapacityStore for PostgresStore {
             "#,
         )
         .bind(cluster_name)
-        .fetch_one(&self.pool)
+        .fetch_one(&self.coordination_pool)
         .await
         .map_err(|e| QueryFluxError::Persistence(format!("active_count: {e}")))?;
         Ok(count.max(0) as u64)
     }
 
-    async fn release_all_for_instance(&self, instance_id: &str) -> Result<u64> {
-        let result = sqlx::query(
+    async fn publish_running_count(&self, cluster_name: &str, count: u64) -> Result<()> {
+        let running = count.min(i64::MAX as u64) as i64;
+        sqlx::query(
             r#"
-            WITH del AS (
-                DELETE FROM cluster_capacity_leases
-                WHERE instance_id = $1
-                RETURNING cluster_name
-            ),
-            counts AS (
-                SELECT cluster_name, COUNT(*) AS cnt
-                FROM del
-                GROUP BY cluster_name
-            )
-            UPDATE cluster_capacity_counters c
-            SET running = GREATEST(c.running - counts.cnt, 0)
-            FROM counts
-            WHERE c.cluster_name = counts.cluster_name
+            INSERT INTO cluster_capacity_counters (cluster_name, running)
+            VALUES ($1, $2)
+            ON CONFLICT (cluster_name) DO UPDATE
+                SET running = EXCLUDED.running
             "#,
         )
-        .bind(instance_id)
-        .execute(&self.pool)
+        .bind(cluster_name)
+        .bind(running)
+        .execute(&self.coordination_pool)
         .await
-        .map_err(|e| QueryFluxError::Persistence(format!("release_all_for_instance: {e}")))?;
+        .map_err(|e| QueryFluxError::Persistence(format!("publish_running_count: {e}")))?;
+        Ok(())
+    }
+
+    async fn active_lease_count(&self, cluster_name: &str) -> Result<u64> {
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*)::bigint FROM cluster_capacity_leases WHERE cluster_name = $1",
+        )
+        .bind(cluster_name)
+        .fetch_one(&self.coordination_pool)
+        .await
+        .map_err(|e| QueryFluxError::Persistence(format!("active_lease_count: {e}")))?;
+        Ok(count.max(0) as u64)
+    }
+
+    async fn release_all_for_instance(&self, instance_id: &str) -> Result<u64> {
+        let result = sqlx::query("DELETE FROM cluster_capacity_leases WHERE instance_id = $1")
+            .bind(instance_id)
+            .execute(&self.coordination_pool)
+            .await
+            .map_err(|e| QueryFluxError::Persistence(format!("release_all_for_instance: {e}")))?;
         Ok(result.rows_affected())
     }
 }
@@ -1880,7 +2091,7 @@ impl QueueCoordinator for PostgresStore {
         .bind(query_id)
         .bind(instance_id)
         .bind(stale_before)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&self.coordination_pool)
         .await
         .map_err(|e| QueryFluxError::Persistence(format!("try_claim: {e}")))?;
 
@@ -1898,10 +2109,27 @@ impl QueueCoordinator for PostgresStore {
     async fn release_claim(&self, query_id: &str) -> Result<()> {
         sqlx::query("UPDATE queued_queries SET claimed_by = NULL, claimed_at = NULL WHERE id = $1")
             .bind(query_id)
-            .execute(&self.pool)
+            .execute(&self.coordination_pool)
             .await
             .map_err(|e| QueryFluxError::Persistence(format!("release_claim: {e}")))?;
         Ok(())
+    }
+
+    async fn refresh_claim(&self, query_id: &str, instance_id: &str) -> Result<bool> {
+        let row: Option<(String,)> = sqlx::query_as(
+            r#"
+            UPDATE queued_queries
+            SET claimed_at = now()
+            WHERE id = $1 AND claimed_by = $2
+            RETURNING id
+            "#,
+        )
+        .bind(query_id)
+        .bind(instance_id)
+        .fetch_optional(&self.coordination_pool)
+        .await
+        .map_err(|e| QueryFluxError::Persistence(format!("refresh_claim: {e}")))?;
+        Ok(row.is_some())
     }
 
     async fn list_unclaimed(&self, stale_before: DateTime<Utc>) -> Result<Vec<QueuedQuery>> {
@@ -1913,7 +2141,7 @@ impl QueueCoordinator for PostgresStore {
             "#,
         )
         .bind(stale_before)
-        .fetch_all(&self.pool)
+        .fetch_all(&self.coordination_pool)
         .await
         .map_err(|e| QueryFluxError::Persistence(format!("list_unclaimed: {e}")))?;
 
@@ -1948,7 +2176,7 @@ impl CacheStore for PostgresStore {
                    WHERE cache_key = $1 AND expires_at > NOW()"#,
         )
         .bind(cache_key)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&self.admin_pool)
         .await
         .map_err(|e| QueryFluxError::Persistence(format!("cache_get_valid: {e}")))?;
 
@@ -1983,7 +2211,7 @@ impl CacheStore for PostgresStore {
         .bind(entry.expires_at)
         .bind(entry.row_count)
         .bind(entry.size_bytes)
-        .execute(&self.pool)
+        .execute(&self.admin_pool)
         .await
         .map_err(|e| QueryFluxError::Persistence(format!("cache_upsert: {e}")))?;
         Ok(())
@@ -1993,7 +2221,7 @@ impl CacheStore for PostgresStore {
         let rows: Vec<(String, String)> = sqlx::query_as(
             "DELETE FROM cache_entries WHERE expires_at < NOW() RETURNING cache_key, group_name",
         )
-        .fetch_all(&self.pool)
+        .fetch_all(&self.admin_pool)
         .await
         .map_err(|e| QueryFluxError::Persistence(format!("cache_delete_expired: {e}")))?;
 
@@ -2011,7 +2239,7 @@ impl CacheStore for PostgresStore {
             "DELETE FROM cache_entries WHERE group_name = $1 RETURNING cache_key, group_name",
         )
         .bind(group)
-        .fetch_all(&self.pool)
+        .fetch_all(&self.admin_pool)
         .await
         .map_err(|e| QueryFluxError::Persistence(format!("cache_delete_by_group: {e}")))?;
 
@@ -2027,7 +2255,7 @@ impl CacheStore for PostgresStore {
     async fn cache_delete_all(&self) -> Result<Vec<CacheEntryRef>> {
         let rows: Vec<(String, String)> =
             sqlx::query_as("DELETE FROM cache_entries RETURNING cache_key, group_name")
-                .fetch_all(&self.pool)
+                .fetch_all(&self.admin_pool)
                 .await
                 .map_err(|e| QueryFluxError::Persistence(format!("cache_delete_all: {e}")))?;
 
@@ -2049,9 +2277,21 @@ impl CacheStore for PostgresStore {
 mod tests {
     use super::*;
     use crate::{CapacityStore, ConfigRevisionStore, Persistence, QueueCoordinator};
+    use queryflux_core::config::PostgresPersistenceConfig;
     use queryflux_core::query::{ClusterGroupName, FrontendProtocol, ProxyQueryId, QueuedQuery};
     use queryflux_core::session::SessionContext;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn isolated_pool_sizes_from_config() {
+        let cfg = PostgresPersistenceConfig {
+            query_pool_size: Some(12),
+            coordination_pool_size: Some(3),
+            admin_pool_size: Some(5),
+            ..Default::default()
+        };
+        assert_eq!(cfg.resolve_pool_sizes().unwrap(), (12, 3, 5));
+    }
 
     async fn test_store() -> PostgresStore {
         let url = std::env::var("DATABASE_URL")
@@ -2079,6 +2319,7 @@ mod tests {
             creation_time: chrono::Utc::now(),
             last_accessed: chrono::Utc::now(),
             sequence: 0,
+            submitted_by: String::new(),
         }
     }
 
@@ -2134,10 +2375,12 @@ mod tests {
             .unwrap();
         assert!(acquired);
 
-        let count = store.active_count("test-cluster").await.unwrap();
+        let count = store.active_lease_count("test-cluster").await.unwrap();
         assert!(count >= 1);
 
         store.release("test-cluster", &qid).await.unwrap();
+
+        assert_eq!(store.active_lease_count("test-cluster").await.unwrap(), 0);
     }
 
     #[tokio::test]
@@ -2241,7 +2484,7 @@ mod tests {
             granted, LIMIT,
             "exactly the limit must be granted under contention"
         );
-        assert_eq!(store.active_count(&cluster).await.unwrap(), LIMIT);
+        assert_eq!(store.active_lease_count(&cluster).await.unwrap(), LIMIT);
 
         for i in 0..(LIMIT * 4) {
             let _ = store.release(&cluster, &format!("{cluster}-q{i}")).await;
@@ -2250,7 +2493,7 @@ mod tests {
 
     #[tokio::test]
     #[ignore]
-    async fn pg_capacity_counter_stays_consistent() {
+    async fn pg_capacity_leases_stay_consistent() {
         let _guard = CAPACITY_TEST_LOCK.lock().await;
         let store = test_store().await;
         let cluster = unique_id("cnt");
@@ -2261,25 +2504,41 @@ mod tests {
                 .await
                 .unwrap());
         }
-        assert_eq!(store.active_count(&cluster).await.unwrap(), 3);
+        assert_eq!(store.active_lease_count(&cluster).await.unwrap(), 3);
 
         store
             .release(&cluster, &format!("{cluster}-q2"))
             .await
             .unwrap();
-        assert_eq!(store.active_count(&cluster).await.unwrap(), 2);
+        assert_eq!(store.active_lease_count(&cluster).await.unwrap(), 2);
 
-        // Double release is a no-op on the counter.
+        // Double release is a no-op.
         store
             .release(&cluster, &format!("{cluster}-q2"))
             .await
             .unwrap();
-        assert_eq!(store.active_count(&cluster).await.unwrap(), 2);
+        assert_eq!(store.active_lease_count(&cluster).await.unwrap(), 2);
 
-        // Expiring every lease reconciles the counter back to zero.
+        // Expiring every lease clears admission slots.
         let far_future = chrono::Utc::now() + chrono::Duration::hours(1);
         store.expire_stale(far_future).await.unwrap();
+        assert_eq!(store.active_lease_count(&cluster).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn pg_capacity_publish_running_count() {
+        let _guard = CAPACITY_TEST_LOCK.lock().await;
+        let store = test_store().await;
+        let cluster = unique_id("reconcile");
+
         assert_eq!(store.active_count(&cluster).await.unwrap(), 0);
+
+        store.publish_running_count(&cluster, 42).await.unwrap();
+        assert_eq!(store.active_count(&cluster).await.unwrap(), 42);
+
+        store.publish_running_count(&cluster, 7).await.unwrap();
+        assert_eq!(store.active_count(&cluster).await.unwrap(), 7);
     }
 
     #[tokio::test]
@@ -2302,17 +2561,149 @@ mod tests {
         // makes a client-side cutoff flaky. (Production is insensitive: the expiry
         // cutoff there has a 300s margin against a 60s heartbeat interval.)
         let cutoff: chrono::DateTime<chrono::Utc> = sqlx::query_scalar("SELECT now()")
-            .fetch_one(&store.pool)
+            .fetch_one(&store.admin_pool)
             .await
             .unwrap();
         let renewed = store.heartbeat(&inst).await.unwrap();
         assert!(renewed >= 1, "heartbeat should renew the lease we hold");
 
         store.expire_stale(cutoff).await.unwrap();
-        let count = store.active_count("test-cluster-hb").await.unwrap();
+        let count = store.active_lease_count("test-cluster-hb").await.unwrap();
         assert!(count >= 1, "heartbeated lease must survive expiry");
 
         store.release("test-cluster-hb", &qid).await.unwrap();
+    }
+
+    /// Two logical replicas (distinct `instance_id`s) must not exceed the fleet
+    /// `maxRunningQueries` limit — the epic distributed-admission guarantee.
+    #[tokio::test]
+    #[ignore]
+    async fn pg_capacity_two_replicas_cannot_exceed_max_running() {
+        let _guard = CAPACITY_TEST_LOCK.lock().await;
+        let store = test_store().await;
+        let cluster = unique_id("fleet");
+        const LIMIT: u64 = 2;
+        let q1 = format!("{cluster}-a1");
+        let q2 = format!("{cluster}-b1");
+        let q3 = format!("{cluster}-a2");
+        let q4 = format!("{cluster}-b2");
+
+        assert!(
+            store
+                .try_acquire(&cluster, LIMIT, "replica-a", &q1)
+                .await
+                .unwrap(),
+            "replica-a should acquire first slot"
+        );
+        assert!(
+            store
+                .try_acquire(&cluster, LIMIT, "replica-b", &q2)
+                .await
+                .unwrap(),
+            "replica-b should acquire second slot"
+        );
+        assert!(
+            !store
+                .try_acquire(&cluster, LIMIT, "replica-a", &q3)
+                .await
+                .unwrap(),
+            "replica-a must be denied once fleet is at limit"
+        );
+        assert!(
+            !store
+                .try_acquire(&cluster, LIMIT, "replica-b", &q4)
+                .await
+                .unwrap(),
+            "replica-b must be denied once fleet is at limit"
+        );
+        assert_eq!(store.active_lease_count(&cluster).await.unwrap(), LIMIT);
+
+        store.release(&cluster, &q1).await.unwrap();
+        store.release(&cluster, &q2).await.unwrap();
+        assert_eq!(store.active_lease_count(&cluster).await.unwrap(), 0);
+    }
+
+    /// Crash path: holder never calls `release`. After `expire_stale`, a survivor
+    /// replica can acquire the slot again.
+    #[tokio::test]
+    #[ignore]
+    async fn pg_capacity_crash_without_release_recovered_by_expire_stale() {
+        let _guard = CAPACITY_TEST_LOCK.lock().await;
+        let store = test_store().await;
+        let cluster = unique_id("crash");
+        const LIMIT: u64 = 1;
+        let held = format!("{cluster}-held");
+        let next = format!("{cluster}-next");
+
+        assert!(store
+            .try_acquire(&cluster, LIMIT, "crashed-inst", &held)
+            .await
+            .unwrap());
+        assert!(
+            !store
+                .try_acquire(&cluster, LIMIT, "survivor", &next)
+                .await
+                .unwrap(),
+            "survivor must wait while crashed lease still counts"
+        );
+
+        // Treat every lease as stale (same approach as expire_stale_cleans_old_leases).
+        let far_future = chrono::Utc::now() + chrono::Duration::hours(1);
+        let expired = store.expire_stale(far_future).await.unwrap();
+        assert!(
+            expired >= 1,
+            "expire_stale must reclaim the crashed instance lease"
+        );
+        assert_eq!(store.active_lease_count(&cluster).await.unwrap(), 0);
+
+        assert!(
+            store
+                .try_acquire(&cluster, LIMIT, "survivor", &next)
+                .await
+                .unwrap(),
+            "survivor must acquire after lease expiry reclaim"
+        );
+        assert_eq!(store.active_lease_count(&cluster).await.unwrap(), 1);
+
+        store.release(&cluster, &next).await.unwrap();
+    }
+
+    /// Graceful shutdown path: `release_all_for_instance` frees every lease owned
+    /// by the departing replica so other replicas can admit.
+    #[tokio::test]
+    #[ignore]
+    async fn pg_capacity_release_all_for_instance_frees_slots() {
+        let _guard = CAPACITY_TEST_LOCK.lock().await;
+        let store = test_store().await;
+        let cluster = unique_id("drain");
+        const LIMIT: u64 = 2;
+        let departing = unique_id("departing");
+        let q1 = format!("{cluster}-d1");
+        let q2 = format!("{cluster}-d2");
+        let q3 = format!("{cluster}-s1");
+
+        assert!(store
+            .try_acquire(&cluster, LIMIT, &departing, &q1)
+            .await
+            .unwrap());
+        assert!(store
+            .try_acquire(&cluster, LIMIT, &departing, &q2)
+            .await
+            .unwrap());
+        assert!(!store
+            .try_acquire(&cluster, LIMIT, "survivor", &q3)
+            .await
+            .unwrap());
+
+        let freed = store.release_all_for_instance(&departing).await.unwrap();
+        assert_eq!(freed, 2);
+        assert_eq!(store.active_lease_count(&cluster).await.unwrap(), 0);
+
+        assert!(store
+            .try_acquire(&cluster, LIMIT, "survivor", &q3)
+            .await
+            .unwrap());
+        store.release(&cluster, &q3).await.unwrap();
     }
 
     // -- Admission fairness ---------------------------------------------------
@@ -2332,6 +2723,7 @@ mod tests {
             creation_time,
             last_accessed,
             sequence: 0,
+            submitted_by: String::new(),
         }
     }
 
@@ -2509,6 +2901,25 @@ mod tests {
 
     #[tokio::test]
     #[ignore]
+    async fn pg_queue_refresh_claim_only_for_owner() {
+        let store = test_store().await;
+        let qid = unique_id("hb");
+        store.upsert_queued(make_queued(&qid)).await.unwrap();
+        assert!(store
+            .try_claim(&qid, "inst-A", no_stale())
+            .await
+            .unwrap()
+            .is_some());
+        assert!(store.refresh_claim(&qid, "inst-A").await.unwrap());
+        assert!(
+            !store.refresh_claim(&qid, "inst-B").await.unwrap(),
+            "other instance must not refresh the claim"
+        );
+        store.delete_queued(&ProxyQueryId(qid)).await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore]
     async fn pg_queue_stale_claim_can_be_taken_over() {
         let store = test_store().await;
         let qid = unique_id("st");
@@ -2573,5 +2984,100 @@ mod tests {
 
         store.delete_queued(&ProxyQueryId(qid1)).await.unwrap();
         store.delete_queued(&ProxyQueryId(qid2)).await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn pg_take_queued_returns_row_once() {
+        let store = test_store().await;
+        let qid = unique_id("take");
+
+        store.upsert_queued(make_queued(&qid)).await.unwrap();
+        assert!(store
+            .take_queued(&ProxyQueryId(qid.clone()))
+            .await
+            .unwrap()
+            .is_some());
+        assert!(store
+            .take_queued(&ProxyQueryId(qid))
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn pg_record_query_keeps_first_terminal_row_per_proxy_id() {
+        use crate::{MetricsStore, QueryHistoryStore, QueryRecord};
+        use queryflux_core::query::{
+            ClusterGroupName, ClusterName, EngineType, FrontendProtocol, QueryStatus, SqlDialect,
+        };
+
+        let store = test_store().await;
+        let proxy_id = unique_id("dedup");
+        let mut first = QueryRecord {
+            proxy_query_id: proxy_id.clone(),
+            backend_query_id: None,
+            cluster_group: ClusterGroupName("g".into()),
+            cluster_name: ClusterName("c".into()),
+            cluster_group_config_id: None,
+            cluster_config_id: None,
+            engine_type: EngineType::Undispatched,
+            frontend_protocol: FrontendProtocol::TrinoHttp,
+            source_dialect: SqlDialect::Trino,
+            target_dialect: SqlDialect::Generic,
+            was_translated: false,
+            translated_sql: None,
+            user: None,
+            catalog: None,
+            database: None,
+            sql_preview: "SELECT 1".into(),
+            status: QueryStatus::Failed,
+            routing_trace: None,
+            queue_duration_ms: 100,
+            execution_duration_ms: 0,
+            rows_returned: None,
+            error_message: Some("capacity wait timeout".into()),
+            created_at: chrono::Utc::now(),
+            engine_stats: None,
+            query_tags: Default::default(),
+            query_hash: None,
+            query_parameterized_hash: Some(42),
+            translated_query_hash: None,
+            digest_text: Some("select 1".into()),
+            translated_digest_text: None,
+            agent_id: None,
+            conversation_id: None,
+            step_index: None,
+            tool_call_id: None,
+            query_intent: None,
+            guard_actions: vec![],
+            was_guard_blocked: false,
+            cache_hit: false,
+        };
+        store.record_query(first.clone()).await.unwrap();
+        first.status = QueryStatus::Cancelled;
+        first.error_message = Some("client cancelled".into());
+        store.record_query(first).await.unwrap();
+
+        let rows = store
+            .list_queries(&QueryFilters {
+                limit: 50,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].proxy_query_id, proxy_id);
+        assert!(rows[0].status.contains("Failed"));
+
+        let digest_count: (i64,) = sqlx::query_as(
+            "SELECT call_count FROM query_digest_stats WHERE query_parameterized_hash = $1",
+        )
+        .bind(42_i64)
+        .fetch_one(&store.admin_pool)
+        .await
+        .unwrap();
+        assert_eq!(digest_count.0, 1);
     }
 }

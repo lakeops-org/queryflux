@@ -68,6 +68,7 @@ impl AuthProvider for NoneAuthProvider {
             groups: vec![],
             roles: vec![],
             raw_token: creds.bearer_token.clone(),
+            raw_password: None,
         })
     }
 }
@@ -116,6 +117,7 @@ impl AuthProvider for StaticAuthProvider {
                     groups: vec![],
                     roles: vec![],
                     raw_token: None,
+                    raw_password: None,
                 });
             }
         };
@@ -137,11 +139,15 @@ impl AuthProvider for StaticAuthProvider {
             )));
         }
 
+        // `raw_password` deliberately stays None: this password only proves the caller
+        // knows QueryFlux's own local static-user entry, not any credential a backend
+        // would recognize. See the field doc on `AuthContext::raw_password`.
         Ok(AuthContext {
             user: username.to_string(),
             groups: entry.groups.clone(),
             roles: entry.roles.clone(),
             raw_token: None,
+            raw_password: None,
         })
     }
 }
@@ -229,9 +235,20 @@ impl AuthProvider for OidcAuthProvider {
                     groups: vec![],
                     roles: vec![],
                     raw_token: None,
+                    raw_password: None,
                 });
             }
         };
+
+        // Audience validation is security-critical for production deployments.
+        // If the operator marked auth as required but did not configure `audience`,
+        // fail closed instead of skipping audience checks.
+        if self.required && self.config.audience.is_none() {
+            return Err(QueryFluxError::Auth(
+                "OIDC audience validation required: configure auth.oidc.audience when auth.required=true"
+                    .into(),
+            ));
+        }
 
         // Decode the header to get kid + algorithm.
         let header = decode_header(token)
@@ -292,6 +309,7 @@ impl AuthProvider for OidcAuthProvider {
             groups,
             roles,
             raw_token: Some(token.to_string()),
+            raw_password: None,
         })
     }
 }
@@ -321,4 +339,37 @@ fn resolve_dot_path<'a>(value: &'a Value, path: &str) -> Option<&'a Value> {
         current = current.get(segment)?;
     }
     Some(current)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use queryflux_core::config::OidcConfig;
+
+    #[tokio::test]
+    async fn oidc_audience_required_fails_fast_when_missing() {
+        let provider = OidcAuthProvider::new(
+            OidcConfig {
+                issuer: "https://idp".to_string(),
+                jwks_uri: "https://idp/jwks".to_string(),
+                audience: None,
+                groups_claim: "groups".to_string(),
+                roles_claim: None,
+            },
+            true,
+        );
+
+        let creds = Credentials {
+            username: None,
+            password: None,
+            bearer_token: Some("not-a-real-jwt".to_string()),
+        };
+
+        let err = provider.authenticate(&creds).await.unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("OIDC audience validation required"),
+            "unexpected error: {err}"
+        );
+    }
 }

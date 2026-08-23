@@ -33,6 +33,10 @@ pub struct ClusterConfigRecord {
     /// All engine-specific connection details (endpoint, auth, TLS, region, …).
     #[schema(value_type = Object)]
     pub config: serde_json::Value,
+    /// Sub-resource variants that expand this config into multiple runtime clusters.
+    #[serde(default = "default_variants")]
+    #[schema(value_type = Object)]
+    pub variants: serde_json::Value,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -50,6 +54,10 @@ pub struct UpsertClusterConfig {
     /// Engine-specific connection details. Schema depends on `engineKey`.
     #[schema(value_type = Object)]
     pub config: serde_json::Value,
+    /// Sub-resource variants. Each variant expands into an independent runtime cluster.
+    #[serde(default = "default_variants")]
+    #[schema(value_type = Object)]
+    pub variants: serde_json::Value,
 }
 
 /// Request body for PATCH rename (`/admin/config/clusters/{name}`, `/admin/config/groups/{name}`).
@@ -173,6 +181,9 @@ impl UpsertClusterConfig {
         if let Some(n) = cfg.pool_size {
             config.insert("poolSize".into(), serde_json::json!(n));
         }
+        if let Some(n) = cfg.max_result_buffer_bytes {
+            config.insert("maxResultBufferBytes".into(), serde_json::json!(n));
+        }
 
         match &cfg.auth {
             Some(ClusterAuth::Basic { username, password }) => {
@@ -218,11 +229,26 @@ impl UpsertClusterConfig {
             config.insert("queryAuth".into(), serde_json::to_value(qa)?);
         }
 
+        if let Some(v) = &cfg.health_check_query {
+            config.insert("healthCheckQuery".into(), v.clone().into());
+        }
+        if let Some(v) = &cfg.reconcile_query {
+            config.insert("reconcileQuery".into(), v.clone().into());
+        }
+
+        let variants = if cfg.variants.is_empty() {
+            serde_json::Value::Array(Vec::new())
+        } else {
+            serde_json::to_value(&cfg.variants)
+                .unwrap_or_else(|_| serde_json::Value::Array(Vec::new()))
+        };
+
         Ok(Some(Self {
             engine_key: engine_key.to_owned(),
             enabled: cfg.enabled,
             max_running_queries: cfg.max_running_queries.map(|v| v as i64),
             config: serde_json::Value::Object(config),
+            variants,
         }))
     }
 }
@@ -298,6 +324,8 @@ impl ClusterGroupConfigRecord {
             strategy,
             max_running_queries: self.max_running_queries as u64,
             max_queued_queries: self.max_queued_queries.map(|v| v as u64),
+            // Not persisted in Postgres yet; YAML LiveConfig path supplies the value.
+            capacity_wait_timeout_secs: None,
             authorization: queryflux_core::config::ClusterGroupAuthorizationConfig {
                 allow_groups: self.allow_groups.clone(),
                 allow_users: self.allow_users.clone(),
@@ -310,6 +338,10 @@ impl ClusterGroupConfigRecord {
 
 fn default_true() -> bool {
     true
+}
+
+fn default_variants() -> serde_json::Value {
+    serde_json::Value::Array(Vec::new())
 }
 
 fn default_tags_value() -> serde_json::Value {
@@ -348,6 +380,7 @@ mod tests {
             strategy: None,
             max_running_queries: 10,
             max_queued_queries: None,
+            capacity_wait_timeout_secs: None,
             authorization: queryflux_core::config::ClusterGroupAuthorizationConfig {
                 allow_groups: vec![],
                 allow_users: vec![],
@@ -448,5 +481,49 @@ mod tests {
         );
         assert_eq!(core_out.default_tags.get("batch"), Some(&None));
         assert_eq!(core_out.default_tags.len(), 2);
+    }
+
+    /// The YAML→Postgres seed runs on every startup with a full-replace of the
+    /// config JSONB — any ClusterConfig field it drops silently vanishes in
+    /// Postgres mode (and wipes a Studio-set value on restart).
+    #[test]
+    fn cluster_from_core_preserves_pool_size_and_result_buffer_cap() {
+        let cfg: ClusterConfig = serde_json::from_value(serde_json::json!({
+            "engine": "clickHouse",
+            "endpoint": "http://ch:8123",
+            "poolSize": 4,
+            "maxResultBufferBytes": 65536,
+        }))
+        .unwrap();
+        let upsert = UpsertClusterConfig::from_core(&cfg).unwrap().unwrap();
+        assert_eq!(upsert.config.get("poolSize"), Some(&serde_json::json!(4)));
+        assert_eq!(
+            upsert.config.get("maxResultBufferBytes"),
+            Some(&serde_json::json!(65536))
+        );
+    }
+
+    /// YAML-seeded clusters with custom probe SQL must keep it across the
+    /// first Postgres write — otherwise they silently reload with driver
+    /// defaults instead of the operator's `healthCheckQuery`/`reconcileQuery`.
+    #[test]
+    fn cluster_from_core_preserves_probe_queries() {
+        let cfg: ClusterConfig = serde_json::from_value(serde_json::json!({
+            "engine": "adbc",
+            "healthCheckQuery": "SHOW WAREHOUSES LIKE 'WH1'",
+            "reconcileQuery": "SELECT COUNT(*) FROM stv_recents WHERE status = 'Running'",
+        }))
+        .unwrap();
+        let upsert = UpsertClusterConfig::from_core(&cfg).unwrap().unwrap();
+        assert_eq!(
+            upsert.config.get("healthCheckQuery"),
+            Some(&serde_json::json!("SHOW WAREHOUSES LIKE 'WH1'"))
+        );
+        assert_eq!(
+            upsert.config.get("reconcileQuery"),
+            Some(&serde_json::json!(
+                "SELECT COUNT(*) FROM stv_recents WHERE status = 'Running'"
+            ))
+        );
     }
 }

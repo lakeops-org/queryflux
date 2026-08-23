@@ -1,19 +1,17 @@
 //! Snowflake SQL REST API v2 frontend (Form 2) — Design B: protocol bridge.
 //!
-//! Exposes `routes()` — a stateless `Router<Arc<AppState>>`.
-
-use std::sync::Arc;
+//! Exposes `routes()` — a stateless `Router<SnowflakeWireState>`.
 
 use axum::{
     routing::{get, post},
     Router,
 };
 
-use crate::state::AppState;
+use crate::snowflake::http::SnowflakeWireState;
 
 pub mod handlers;
 
-pub fn routes() -> Router<Arc<AppState>> {
+pub fn routes() -> Router<SnowflakeWireState> {
     Router::new()
         .route("/api/v2/statements", post(handlers::submit_statement))
         .route(

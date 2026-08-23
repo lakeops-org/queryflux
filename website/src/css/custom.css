@@ -1,8 +1,28 @@
 /**
  * QueryFlux — brand: violet / purple primary, orange “Flux”, black dark canvas.
+ *
+ * Typography: Manrope (headings — geometric, distinctive character) + Inter
+ * (body/UI — proven at small sizes for long-form docs) + JetBrains Mono (code).
+ * Self-hosted via @fontsource — no external requests, no FOUC from a CDN round trip.
  */
+@import '@fontsource-variable/manrope/wght.css';
+@import '@fontsource-variable/inter/standard.css';
+@import '@fontsource-variable/inter/standard-italic.css';
+@import '@fontsource/jetbrains-mono/400.css';
+@import '@fontsource/jetbrains-mono/500.css';
+@import '@fontsource/jetbrains-mono/600.css';
 
 :root {
+  --qf-font-heading: 'Manrope Variable', 'Manrope', system-ui, sans-serif;
+  --qf-font-body: 'Inter Variable', 'Inter', system-ui, sans-serif;
+  --qf-font-mono: 'JetBrains Mono', 'SFMono-Regular', Consolas, 'Liberation Mono', monospace;
+
+  --ifm-font-family-base: var(--qf-font-body);
+  --ifm-heading-font-family: var(--qf-font-heading);
+  --ifm-font-family-monospace: var(--qf-font-mono);
+  --ifm-heading-font-weight: 700;
+  --ifm-heading-letter-spacing: -0.02em;
+
   --brand-flux: #ff7619;
   --brand-flux-soft: #fb923c;
   --brand-query: #0f172a;
@@ -224,6 +244,65 @@ main .pagination-nav__sublabel {
 .navbar-sidebar .navbar-sidebar__brand .wordmark {
   font-size: 1.42rem;
   letter-spacing: -0.02em;
+}
+
+/* ——— Code blocks — violet-tinted chrome around a nightOwl/nightOwlLight base ——— */
+.theme-code-block {
+  --qf-code-radius: 0.75rem;
+  border-radius: var(--qf-code-radius);
+  border: 1px solid rgba(124, 58, 237, 0.14);
+  box-shadow: 0 1px 2px rgba(15, 23, 42, 0.04);
+  overflow: hidden;
+}
+
+html[data-theme='dark'] .theme-code-block {
+  border-color: rgba(167, 139, 250, 0.16);
+  box-shadow:
+    0 1px 2px rgba(0, 0, 0, 0.4),
+    0 0 0 1px rgba(255, 255, 255, 0.02) inset;
+}
+
+.theme-code-block div[class^='codeBlockContainer'] {
+  background: linear-gradient(180deg, rgba(124, 58, 237, 0.035) 0%, transparent 12%), #fbfafe !important;
+}
+
+html[data-theme='dark'] .theme-code-block div[class^='codeBlockContainer'] {
+  background:
+    linear-gradient(180deg, rgba(139, 92, 246, 0.06) 0%, transparent 16%),
+    #0d0a17 !important;
+}
+
+.theme-code-block div[class^='codeBlockTitle'] {
+  background: rgba(124, 58, 237, 0.06);
+  border-bottom: 1px solid rgba(124, 58, 237, 0.14);
+  font-family: var(--qf-font-mono);
+  font-size: 0.85em;
+}
+
+html[data-theme='dark'] .theme-code-block div[class^='codeBlockTitle'] {
+  background: rgba(139, 92, 246, 0.1);
+  border-bottom-color: rgba(167, 139, 250, 0.16);
+}
+
+.theme-code-block pre {
+  background: transparent !important;
+}
+
+/* Inline `code` — distinct from fenced blocks, still on-brand */
+:not(pre) > code {
+  background: var(--ifm-code-background);
+  border: 1px solid rgba(124, 58, 237, 0.12);
+  border-radius: 0.375rem;
+  padding: 0.15em 0.4em;
+  font-weight: 500;
+}
+
+html[data-theme='dark'] :not(pre) > code {
+  border-color: rgba(167, 139, 250, 0.16);
+}
+
+.theme-code-block button[class*='copyButton'] {
+  border-radius: 0.4rem;
 }
 
 /* ——— Navbar ——— */
@@ -951,10 +1030,76 @@ html[data-theme='dark'] .pagination-nav__link:hover {
   }
 }
 
-/* Admonitions — clearer border on black canvas */
+/* Admonitions — softer, integrated callouts instead of Infima's flat colored-border box */
+.admonition {
+  border-radius: 0.75rem;
+  border: 1px solid var(--ifm-color-emphasis-200);
+  border-left-width: 1px;
+  box-shadow: 0 1px 2px rgba(15, 23, 42, 0.04);
+}
+
+.admonition-heading {
+  font-family: var(--qf-font-heading);
+  letter-spacing: -0.01em;
+}
+
+.admonition-icon svg {
+  border-radius: 0.4rem;
+}
+
 html[data-theme='dark'] .admonition {
   border-color: rgba(255, 255, 255, 0.1);
   background: var(--ifm-background-surface-color);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.4);
+}
+
+/* Tables — rounded container + brand-tinted header instead of a bare Infima grid */
+.markdown table {
+  display: table;
+  width: 100%;
+  border-radius: 0.65rem;
+  overflow: hidden;
+  border: 1px solid var(--ifm-color-emphasis-200);
+  box-shadow: 0 1px 2px rgba(15, 23, 42, 0.04);
+}
+
+.markdown table thead tr {
+  background: rgba(124, 58, 237, 0.06);
+}
+
+.markdown table th {
+  font-family: var(--qf-font-heading);
+  font-weight: 700;
+  letter-spacing: -0.01em;
+}
+
+.markdown table tr:nth-child(2n) {
+  background: rgba(124, 58, 237, 0.02);
+}
+
+html[data-theme='dark'] .markdown table {
+  border-color: rgba(255, 255, 255, 0.1);
+}
+
+html[data-theme='dark'] .markdown table thead tr {
+  background: rgba(167, 139, 250, 0.08);
+}
+
+html[data-theme='dark'] .markdown table tr:nth-child(2n) {
+  background: rgba(255, 255, 255, 0.015);
+}
+
+/* Blockquotes — brand gradient accent instead of Infima's flat gray bar */
+.markdown blockquote {
+  border-left: 3px solid transparent;
+  border-image: linear-gradient(180deg, #7c3aed, #ff7619) 1;
+  background: rgba(124, 58, 237, 0.04);
+  border-radius: 0 0.5rem 0.5rem 0;
+  padding: 0.75rem 1.25rem;
+}
+
+html[data-theme='dark'] .markdown blockquote {
+  background: rgba(167, 139, 250, 0.06);
 }
 
 /* Footer link row + icons */

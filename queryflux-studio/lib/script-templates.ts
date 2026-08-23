@@ -1,8 +1,9 @@
 /**
  * Starter bodies for user_scripts rows. Must match runtime contracts:
  * - translation_fixup: sqlglot AST transform
- * - routing: PythonScriptRouter `route(query, ctx)` (see docs/routing-and-clusters.md)
+ * - routing: PythonScriptRouter `route(query, ctx)` (see website/docs/architecture/routing-and-clusters.md)
  * - guard: GuardChain `check(ctx)` returns {"action": "allow"|"warn"|"deny", ...}
+ * - clusterStrategy: PythonScriptStrategy `select_cluster(candidates)` (see website/docs/architecture/routing-and-clusters.md)
  */
 
 export const TRANSLATION_FIXUP_TEMPLATE = `# Do not remove the imports below — they are required by the proxy.
@@ -64,5 +65,22 @@ export const ROUTING_SCRIPT_TEMPLATE = `def route(query: str, ctx: dict) -> str 
     #     user = (ctx.get("headers") or {}).get("x-trino-user")
     #     if user == "batch":
     #         return "my-heavy-group"
+    return None
+`;
+
+export const CLUSTER_STRATEGY_SCRIPT_TEMPLATE = `def select_cluster(candidates: list[dict]) -> str | None:
+    """Pick a member cluster from this group, or None to fall back to the first candidate.
+
+    Called only with eligible candidates: already enabled, healthy, and under
+    max_running_queries. Each candidate dict has:
+      - name: cluster name (str)
+      - engineType: e.g. "trino", "duckDb", "starRocks"
+      - runningQueries: current in-flight query count (int)
+      - maxRunningQueries: per-cluster capacity limit (int)
+    """
+    # Example: prefer the least-loaded Trino cluster, otherwise fall back.
+    # trino = [c for c in candidates if c["engineType"] == "trino"]
+    # if trino:
+    #     return min(trino, key=lambda c: c["runningQueries"])["name"]
     return None
 `;

@@ -8,7 +8,6 @@ use arrow::array::{
 use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
-use futures::stream;
 use mysql_async::{
     consts::ColumnType, prelude::Queryable, Conn, Opts, OptsBuilder, Pool, PoolConstraints,
     PoolOpts, Row, Value,
@@ -17,12 +16,13 @@ use queryflux_core::{
     catalog::TableSchema,
     config::{ClusterAuth, ClusterConfig},
     error::{QueryFluxError, Result},
-    query::{ClusterGroupName, ClusterName, EngineType},
+    query::{BackendQueryId, ClusterGroupName, ClusterName, EngineType},
     session::SessionContext,
     tags::{tags_to_json, QueryTags},
 };
+use tokio_stream::wrappers::ReceiverStream;
 
-use crate::{AdapterKind, SyncAdapter, SyncExecution};
+use crate::{AdapterKind, BackendQueryIdSlot, SyncAdapter, SyncExecution};
 use queryflux_core::engine_registry::{
     AuthType, ConfigField, ConnectionType, EngineDescriptor, FieldType,
 };
@@ -65,11 +65,18 @@ pub struct StarRocksConfig {
     pub endpoint: String,
     pub auth: Option<ClusterAuth>,
     pub pool_size: usize,
+    /// `passthrough` (dedicated per-query LDAP connection — see
+    /// `mysql_native::open_passthrough_connection`) or `None`/`serviceAccount` —
+    /// `impersonate`/`tokenExchange` are already rejected by `query_auth_supported` before
+    /// construction.
+    pub query_auth: Option<queryflux_core::config::QueryAuthConfig>,
 }
 
 impl crate::EngineConfigParseable for StarRocksConfig {
     fn from_json(json: &serde_json::Value, cluster_name: &str) -> crate::Result<Self> {
-        use queryflux_core::engine_registry::{json_str, parse_auth_from_config_json};
+        use queryflux_core::engine_registry::{
+            json_str, parse_auth_from_config_json, parse_query_auth_from_config_json,
+        };
         let endpoint = json_str(json, "endpoint").ok_or_else(|| {
             queryflux_core::error::QueryFluxError::Engine(format!(
                 "cluster '{cluster_name}': missing endpoint"
@@ -87,11 +94,17 @@ impl crate::EngineConfigParseable for StarRocksConfig {
                 )));
             }
         }
+        let query_auth = parse_query_auth_from_config_json(json).map_err(|e| {
+            queryflux_core::error::QueryFluxError::Engine(format!(
+                "cluster '{cluster_name}': invalid queryAuth ({e})"
+            ))
+        })?;
         let pool_size = parse_pool_size_from_json(json, cluster_name)?;
         Ok(Self {
             endpoint,
             auth,
             pool_size,
+            query_auth,
         })
     }
 
@@ -112,6 +125,7 @@ impl crate::EngineConfigParseable for StarRocksConfig {
             endpoint,
             auth: cfg.auth.clone(),
             pool_size: cfg.pool_size.unwrap_or(DEFAULT_STARROCKS_POOL_SIZE).max(1),
+            query_auth: cfg.query_auth.clone(),
         })
     }
 }
@@ -134,6 +148,13 @@ pub struct StarRocksAdapter {
     pool: Pool,
     /// Dedicated 1×1 pool for `health_check` so probes do not compete with query traffic.
     control_pool: Pool,
+    /// Base connection options (endpoint, TLS, `enable_cleartext_plugin`) with no user/pass
+    /// override — cloned and given a per-user `user`/`pass` by
+    /// `mysql_native::open_passthrough_connection` for `queryAuth: passthrough` queries.
+    base_opts: Opts,
+    /// Connection ids that currently own an in-flight query. `cancel_query`
+    /// skips `KILL QUERY` once the id is released (connection back in the pool).
+    inflight: crate::mysql_native::InflightConnIds,
 }
 
 impl StarRocksAdapter {
@@ -142,6 +163,19 @@ impl StarRocksAdapter {
         group_name: ClusterGroupName,
         config: StarRocksConfig,
     ) -> Result<Self> {
+        // `passthrough` opens a dedicated connection per query authenticated directly as
+        // the target user, using a real StarRocks/LDAP password (see
+        // `mysql_native::open_passthrough_connection`). That requires the
+        // `mysql_clear_password` plugin (StarRocks LDAP auth negotiates it), which sends
+        // the password with no hashing or encryption at the MySQL protocol layer — safe
+        // only over TLS. `enable_cleartext_plugin` is therefore gated on the endpoint
+        // already requesting TLS (`?require_ssl=true`), checked once below against the
+        // built `Opts`, not assumed.
+        let requires_passthrough = matches!(
+            config.query_auth,
+            Some(queryflux_core::config::QueryAuthConfig::Passthrough)
+        );
+
         let make_builder = || -> Result<OptsBuilder> {
             // Always disable Unix socket preference — StarRocks doesn't support the
             // `@@socket` system variable that mysql_async queries when prefer_socket=true.
@@ -154,6 +188,9 @@ impl StarRocksAdapter {
             let mut b = OptsBuilder::from_opts(base_opts).prefer_socket(false);
             if let Some(ClusterAuth::Basic { username, password }) = &config.auth {
                 b = b.user(Some(username.clone())).pass(Some(password.clone()));
+            }
+            if requires_passthrough {
+                b = b.enable_cleartext_plugin(true);
             }
             Ok(b)
         };
@@ -177,6 +214,16 @@ impl StarRocksAdapter {
                 .clone()
                 .pool_opts(pool_opts_for(config.pool_size)?),
         );
+        if requires_passthrough && main_opts.ssl_opts().is_none() {
+            return Err(QueryFluxError::Engine(format!(
+                "cluster '{}': queryAuth: passthrough requires TLS on the StarRocks endpoint \
+                 (add ?require_ssl=true to the connection URL) — LDAP passthrough sends the \
+                 password in cleartext at the MySQL protocol layer and must not run \
+                 unencrypted",
+                cluster_name.0
+            )));
+        }
+        let base_opts = main_opts.clone();
         let pool = Pool::new(main_opts);
 
         let control_opts = Opts::from(make_builder()?.pool_opts(pool_opts_for(1)?));
@@ -187,6 +234,8 @@ impl StarRocksAdapter {
             group_name,
             pool,
             control_pool,
+            base_opts,
+            inflight: crate::mysql_native::InflightConnIds::default(),
         })
     }
 
@@ -239,6 +288,108 @@ impl StarRocksAdapter {
                     .or_else(|| row.take::<u64, usize>(0).map(|u| u.to_string()))
             })
             .collect())
+    }
+
+    async fn stream_arrow_on_conn(
+        conn: &mut Conn,
+        sql: &str,
+        session: &SessionContext,
+        tags: &QueryTags,
+        params: &queryflux_core::params::QueryParams,
+        batch_tx: &tokio::sync::mpsc::Sender<Result<RecordBatch>>,
+    ) -> Result<()> {
+        if let Some(db) = session.database() {
+            let use_sql = format!("USE `{}`", db.replace('`', "``"));
+            conn.query_drop(&use_sql)
+                .await
+                .map_err(|e| QueryFluxError::Engine(format!("StarRocks USE failed: {e}")))?;
+        }
+
+        if !tags.is_empty() {
+            let tag_json = tags_to_json(tags).to_string();
+            let escaped = Value::from(tag_json).as_sql(false);
+            let set_sql = format!("SET @query_tag = {escaped}");
+            conn.query_drop(&set_sql).await.map_err(|e| {
+                QueryFluxError::Engine(format!("StarRocks SET @query_tag failed: {e}"))
+            })?;
+        }
+
+        if params.is_empty() {
+            // Text protocol — required for SHOW/DDL that StarRocks rejects via prepared statements.
+            let query_result = conn
+                .query_iter(sql)
+                .await
+                .map_err(|e| QueryFluxError::Engine(format!("StarRocks query failed: {e}")))?;
+            Self::stream_arrow_from_query_result(query_result, batch_tx).await
+        } else {
+            let mysql_params = mysql_async::Params::Positional(
+                params.iter().map(query_param_to_mysql_value).collect(),
+            );
+            let query_result = conn
+                .exec_iter(sql, mysql_params)
+                .await
+                .map_err(|e| QueryFluxError::Engine(format!("StarRocks exec failed: {e}")))?;
+            Self::stream_arrow_from_query_result(query_result, batch_tx).await
+        }
+    }
+
+    async fn stream_arrow_from_query_result<P: mysql_async::prelude::Protocol>(
+        mut query_result: mysql_async::QueryResult<'_, '_, P>,
+        batch_tx: &tokio::sync::mpsc::Sender<Result<RecordBatch>>,
+    ) -> Result<()> {
+        const BATCH_SIZE: usize = 1_000;
+
+        let fields: Vec<Field> = query_result
+            .columns_ref()
+            .iter()
+            .map(|c| {
+                Field::new(
+                    c.name_str().to_string(),
+                    mysql_column_type_to_arrow(c.column_type()),
+                    true,
+                )
+            })
+            .collect();
+
+        if fields.is_empty() {
+            return Ok(());
+        }
+
+        let schema = Arc::new(ArrowSchema::new(fields));
+        let num_cols = schema.fields().len();
+        let mut batch_rows: Vec<Row> = Vec::with_capacity(BATCH_SIZE);
+        let mut sent_any = false;
+
+        while let Some(row) = query_result
+            .next()
+            .await
+            .map_err(|e| QueryFluxError::Engine(format!("StarRocks read row failed: {e}")))?
+        {
+            batch_rows.push(row);
+            if batch_rows.len() >= BATCH_SIZE {
+                let batch = starrocks_rows_to_batch(&schema, &mut batch_rows, num_cols)?;
+                batch_rows.clear();
+                sent_any = true;
+                if batch_tx.send(Ok(batch)).await.is_err() {
+                    query_result.drop_result().await.ok();
+                    return Ok(());
+                }
+            }
+        }
+
+        if !batch_rows.is_empty() {
+            let batch = starrocks_rows_to_batch(&schema, &mut batch_rows, num_cols)?;
+            let _ = batch_tx.send(Ok(batch)).await;
+        } else if !sent_any {
+            let batch = RecordBatch::new_empty(Arc::clone(&schema));
+            let _ = batch_tx.send(Ok(batch)).await;
+        }
+
+        query_result
+            .drop_result()
+            .await
+            .map_err(|e| QueryFluxError::Engine(format!("StarRocks drop_result failed: {e}")))?;
+        Ok(())
     }
 }
 
@@ -304,97 +455,125 @@ impl SyncAdapter for StarRocksAdapter {
         credentials: &queryflux_auth::QueryCredentials,
         tags: &QueryTags,
         params: &queryflux_core::params::QueryParams,
+        id_slot: &BackendQueryIdSlot,
     ) -> crate::Result<crate::NativeExecution> {
-        crate::mysql_native::execute(&self.pool, sql, session, credentials, tags, params).await
+        crate::mysql_native::execute(
+            &self.pool,
+            &self.base_opts,
+            sql,
+            session,
+            credentials,
+            tags,
+            params,
+            id_slot,
+            &self.inflight,
+        )
+        .await
     }
 
+    async fn cancel_query(&self, backend_id: &BackendQueryId) -> Result<()> {
+        let Some(sql) = kill_query_sql(&backend_id.0) else {
+            tracing::debug!(
+                cluster = %self.cluster_name,
+                query_id = %backend_id,
+                "StarRocks cancel skipped: connection id is not a safe integer"
+            );
+            return Ok(());
+        };
+        if !self.inflight.contains_published(&backend_id.0) {
+            tracing::debug!(
+                cluster = %self.cluster_name,
+                query_id = %backend_id,
+                "StarRocks cancel skipped: connection no longer owns an in-flight query"
+            );
+            return Ok(());
+        }
+        let mut conn = match self.acquire_control_conn().await {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::debug!(
+                    cluster = %self.cluster_name,
+                    query_id = %backend_id,
+                    error = %e,
+                    "StarRocks KILL QUERY: control pool checkout failed (ignored)"
+                );
+                return Ok(());
+            }
+        };
+        match conn.query_drop(&sql).await {
+            Ok(()) => {
+                tracing::debug!(
+                    cluster = %self.cluster_name,
+                    query_id = %backend_id,
+                    "StarRocks KILL QUERY issued"
+                );
+            }
+            Err(e) => {
+                tracing::debug!(
+                    cluster = %self.cluster_name,
+                    query_id = %backend_id,
+                    error = %e,
+                    "StarRocks KILL QUERY failed (ignored)"
+                );
+            }
+        }
+        self.inflight.release_published(&backend_id.0);
+        Ok(())
+    }
+
+    // `credentials` is `ServiceAccount` or `Passthrough` here — `query_auth_supported`
+    // rejects `impersonate`/`tokenExchange` for StarRocks at startup (StarRocks' JWT MySQL
+    // auth plugin is a separate, confirmed-infeasible path for `mysql_async` — see
+    // auth-authz-design.md "StarRocks"). `Passthrough` here means a dedicated per-query
+    // LDAP connection, opened by `open_passthrough_connection` below.
     async fn execute_as_arrow(
         &self,
         sql: &str,
         session: &SessionContext,
-        _credentials: &queryflux_auth::QueryCredentials,
+        credentials: &queryflux_auth::QueryCredentials,
         tags: &QueryTags,
         params: &queryflux_core::params::QueryParams,
         _hints: queryflux_core::sql_classify::ExecutionHints,
+        id_slot: &BackendQueryIdSlot,
     ) -> Result<SyncExecution> {
-        let mut conn = self.acquire_conn().await?;
-
-        if let Some(db) = session.database() {
-            let use_sql = format!("USE `{}`", db.replace('`', "``"));
-            conn.query_drop(&use_sql)
-                .await
-                .map_err(|e| QueryFluxError::Engine(format!("StarRocks USE failed: {e}")))?;
-        }
-
-        // Set query tag as a session variable so StarRocks surfaces it in audit logs.
-        if !tags.is_empty() {
-            let tag_json = tags_to_json(tags).to_string();
-            // Use the driver's Value escaping so all MySQL string-literal special
-            // characters (\0, \n, \r, \\, ', ") are handled correctly.
-            let escaped = Value::from(tag_json).as_sql(false);
-            let set_sql = format!("SET @query_tag = {escaped}");
-            conn.query_drop(&set_sql).await.map_err(|e| {
-                QueryFluxError::Engine(format!("StarRocks SET @query_tag failed: {e}"))
-            })?;
-        }
-
-        let mut rows: Vec<Row> = if params.is_empty() {
-            conn.query::<Row, _>(sql)
-                .await
-                .map_err(|e| QueryFluxError::Engine(format!("StarRocks query failed: {e}")))?
-        } else {
-            let mysql_params = mysql_async::Params::Positional(
-                params.iter().map(query_param_to_mysql_value).collect(),
-            );
-            conn.exec::<Row, _, _>(sql, mysql_params)
-                .await
-                .map_err(|e| QueryFluxError::Engine(format!("StarRocks exec failed: {e}")))?
+        let mut conn = match crate::mysql_native::open_passthrough_connection(
+            &self.base_opts,
+            credentials,
+            session,
+        )
+        .await?
+        {
+            Some(conn) => conn,
+            None => self.acquire_conn().await?,
         };
+        let conn_id = conn.id();
+        id_slot.publish(conn_id.to_string());
 
-        let (tx, rx) = tokio::sync::oneshot::channel();
+        let (batch_tx, batch_rx) = tokio::sync::mpsc::channel::<Result<RecordBatch>>(32);
+        let (stats_tx, stats_rx) = tokio::sync::oneshot::channel();
+        let inflight = self.inflight.clone();
+        let sql = sql.to_string();
+        let session = session.clone();
+        let tags = tags.clone();
+        let params = params.to_vec();
 
-        if rows.is_empty() {
-            // StarRocks does not expose structured execution stats (CPU, bytes, etc.)
-            // via the MySQL protocol — send None and establish the pattern for future use.
-            let _ = tx.send(None);
-            return Ok(SyncExecution {
-                stream: Box::pin(stream::empty()),
-                stats: rx,
-                affected_rows: None,
-            });
-        }
+        tokio::spawn(async move {
+            let mut claim = inflight.claim(conn_id);
+            if let Err(e) = StarRocksAdapter::stream_arrow_on_conn(
+                &mut conn, &sql, &session, &tags, &params, &batch_tx,
+            )
+            .await
+            {
+                let _ = batch_tx.send(Err(e)).await;
+            }
+            claim.finish();
+            drop(conn);
+            let _ = stats_tx.send(None);
+        });
 
-        // Build Arrow schema from first row's column metadata.
-        let fields: Vec<Field> = rows[0]
-            .columns_ref()
-            .iter()
-            .map(|c| {
-                Field::new(
-                    c.name_str().to_string(),
-                    mysql_column_type_to_arrow(c.column_type()),
-                    true,
-                )
-            })
-            .collect();
-        let schema = Arc::new(ArrowSchema::new(fields));
-
-        // Build columns from rows.
-        let num_cols = schema.fields().len();
-        let mut columns: Vec<ArrayRef> = Vec::with_capacity(num_cols);
-
-        for col_idx in 0..num_cols {
-            let dt = schema.field(col_idx).data_type();
-            let col = starrocks_build_column(dt, &mut rows, col_idx)?;
-            columns.push(col);
-        }
-
-        let batch = RecordBatch::try_new(schema, columns)
-            .map_err(|e| QueryFluxError::Engine(format!("StarRocks RecordBatch failed: {e}")))?;
-
-        let _ = tx.send(None);
         Ok(SyncExecution {
-            stream: Box::pin(stream::iter(std::iter::once(Ok(batch)))),
-            stats: rx,
+            stream: Box::pin(ReceiverStream::new(batch_rx)),
+            stats: stats_rx,
             affected_rows: None,
         })
     }
@@ -479,6 +658,15 @@ impl SyncAdapter for StarRocksAdapter {
     }
 }
 
+/// `KILL QUERY <connection_id>` — `connection_id` must be a decimal integer.
+fn kill_query_sql(id: &str) -> Option<String> {
+    let trimmed = id.trim();
+    if trimmed.is_empty() || trimmed.len() > 20 || !trimmed.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    Some(format!("KILL QUERY {trimmed}"))
+}
+
 // ---------------------------------------------------------------------------
 // Parameter binding
 // ---------------------------------------------------------------------------
@@ -524,6 +712,20 @@ fn mysql_column_type_to_arrow(ct: ColumnType) -> DataType {
         ColumnType::MYSQL_TYPE_BIT => DataType::Boolean,
         _ => DataType::Utf8,
     }
+}
+
+fn starrocks_rows_to_batch(
+    schema: &Arc<ArrowSchema>,
+    rows: &mut [Row],
+    num_cols: usize,
+) -> Result<RecordBatch> {
+    let mut columns: Vec<ArrayRef> = Vec::with_capacity(num_cols);
+    for col_idx in 0..num_cols {
+        let dt = schema.field(col_idx).data_type();
+        columns.push(starrocks_build_column(dt, rows, col_idx)?);
+    }
+    RecordBatch::try_new(Arc::clone(schema), columns)
+        .map_err(|e| QueryFluxError::Engine(format!("StarRocks RecordBatch failed: {e}")))
 }
 
 fn starrocks_build_column(dt: &DataType, rows: &mut [Row], col_idx: usize) -> Result<ArrayRef> {
@@ -866,5 +1068,73 @@ mod tests {
     #[test]
     fn null_maps_to_null() {
         assert_eq!(query_param_to_mysql_value(&QueryParam::Null), Value::NULL);
+    }
+
+    #[test]
+    fn kill_query_sql_accepts_decimal_ids() {
+        assert_eq!(kill_query_sql("42").as_deref(), Some("KILL QUERY 42"));
+        assert_eq!(kill_query_sql(" 7 ").as_deref(), Some("KILL QUERY 7"));
+    }
+
+    #[test]
+    fn kill_query_sql_rejects_non_integers() {
+        assert!(kill_query_sql("").is_none());
+        assert!(kill_query_sql("12; DROP").is_none());
+        assert!(kill_query_sql("-1").is_none());
+        assert!(kill_query_sql("1e2").is_none());
+    }
+
+    // ── passthrough requires TLS ──────────────────────────────────────────────
+    // `mysql_async::Pool::new` doesn't eagerly connect, so these construct a real
+    // `StarRocksAdapter` against an unreachable host without needing a live server.
+
+    fn config(
+        endpoint: &str,
+        query_auth: Option<queryflux_core::config::QueryAuthConfig>,
+    ) -> StarRocksConfig {
+        StarRocksConfig {
+            endpoint: endpoint.to_string(),
+            auth: None,
+            pool_size: 1,
+            query_auth,
+        }
+    }
+
+    #[test]
+    fn passthrough_without_tls_is_rejected_at_construction() {
+        let cfg = config(
+            "mysql://svc@127.0.0.1:1/db",
+            Some(queryflux_core::config::QueryAuthConfig::Passthrough),
+        );
+        let result =
+            StarRocksAdapter::new(ClusterName("sr".into()), ClusterGroupName("g".into()), cfg);
+        match result {
+            Ok(_) => panic!("passthrough without require_ssl must fail construction"),
+            Err(e) => assert!(
+                e.to_string().contains("TLS"),
+                "expected a TLS-requirement error, got: {e}"
+            ),
+        }
+    }
+
+    #[test]
+    fn passthrough_with_require_ssl_is_accepted_at_construction() {
+        let cfg = config(
+            "mysql://svc@127.0.0.1:1/db?require_ssl=true",
+            Some(queryflux_core::config::QueryAuthConfig::Passthrough),
+        );
+        assert!(
+            StarRocksAdapter::new(ClusterName("sr".into()), ClusterGroupName("g".into()), cfg)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn service_account_does_not_require_tls() {
+        let cfg = config("mysql://svc@127.0.0.1:1/db", None);
+        assert!(
+            StarRocksAdapter::new(ClusterName("sr".into()), ClusterGroupName("g".into()), cfg)
+                .is_ok()
+        );
     }
 }

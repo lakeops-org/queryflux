@@ -14,7 +14,13 @@ const sidebars: SidebarsConfig = {
       type: 'category',
       label: 'Guides',
       collapsed: false,
-      items: ['getting-started', 'studio'],
+      items: ['getting-started', 'studio', 'authentication'],
+    },
+    {
+      type: 'category',
+      label: 'Operations',
+      collapsed: false,
+      items: ['operations/multi-replica'],
     },
     {
       type: 'category',
@@ -40,6 +46,7 @@ const sidebars: SidebarsConfig = {
         'architecture/system-map',
         'architecture/query-translation',
         'architecture/routing-and-clusters',
+        'architecture/cluster-variants-and-health',
         'architecture/caching',
         'architecture/query-tags',
         'architecture/query-params',

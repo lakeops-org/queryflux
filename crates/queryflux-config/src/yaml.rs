@@ -38,14 +38,67 @@ impl ConfigProvider for YamlFileConfigProvider {
         })?;
 
         if let Some(guardrails) = &config.guardrails {
-            if let Err(e) = guardrails.validate() {
-                tracing::warn!(
-                    "Invalid guardrails in {}: {e} — will be ignored if Postgres config overrides YAML",
+            guardrails.validate().map_err(|e| {
+                QueryFluxError::Config(format!(
+                    "Invalid guardrails in {}: {e}",
                     self.path.display()
-                );
-            }
+                ))
+            })?;
         }
 
         Ok(config)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn load_rejects_invalid_guardrails() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.yaml");
+        tokio::fs::write(
+            &path,
+            r#"
+queryflux: {}
+guardrails:
+  global:
+    - kind: python_script
+"#,
+        )
+        .await
+        .expect("write config");
+
+        let provider = YamlFileConfigProvider::new(&path);
+        let err = provider
+            .load()
+            .await
+            .expect_err("invalid guardrails must fail");
+        let msg = err.to_string();
+        assert!(msg.contains("script"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn load_accepts_valid_guardrails() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.yaml");
+        tokio::fs::write(
+            &path,
+            r#"
+queryflux: {}
+guardrails:
+  global:
+    - kind: python_script
+      script: |
+        def check(ctx):
+            return {"action": "allow"}
+"#,
+        )
+        .await
+        .expect("write config");
+
+        let provider = YamlFileConfigProvider::new(&path);
+        provider.load().await.expect("valid guardrails should load");
     }
 }

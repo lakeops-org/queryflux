@@ -1,0 +1,75 @@
+queryflux:
+  externalAddress: http://localhost:8080
+  frontends:
+    trinoHttp:
+      enabled: true
+      port: 8080
+  persistence:
+    type: postgres
+    url: postgres://queryflux:queryflux@postgres:5432/queryflux
+  adminApi:
+    port: 9000
+
+auth:
+  provider: oidc
+  required: true
+  oidc:
+    issuer: http://keycloak:8080/realms/queryflux
+    jwksUri: http://keycloak:8080/realms/queryflux/protocol/openid-connect/certs
+    audience: queryflux
+    groupsClaim: groups
+    rolesClaim: roles
+
+authorization:
+  provider: none
+
+clusters:
+  trino-1:
+    engine: trino
+    enabled: true
+    endpoint: http://trino:8080
+    # Type 1 — the service account QueryFlux authenticates to Trino with. Requires Trino
+    # to have a password authenticator configured (this example's plain trinodb/trino
+    # image does not ship one) — see the NOTE below before trying this against the
+    # example's docker-compose.yml as-is.
+    auth:
+      type: basic
+      username: qf_svc
+      password: qf_svc_change_me
+    # Type 2 — service account authenticates; QueryFlux injects the real user via
+    # X-Trino-User after auth. The client's own Authorization header is stripped.
+    queryAuth:
+      type: impersonate
+
+clusterGroups:
+  trino:
+    enabled: true
+    maxRunningQueries: 100
+    members: [trino-1]
+    strategy:
+      type: roundRobin
+    authorization:
+      allowGroups: [data-team, analytics-team]
+
+routers:
+  - type: protocolBased
+    trinoHttp: trino
+
+routingFallback: trino
+
+translation:
+  errorOnUnsupported: false
+
+# NOTE — this config is a reference for the `impersonate` shape, not a turnkey demo:
+# Trino's built-in access control prohibits impersonation by default, and the base
+# trinodb/trino image in docker-compose.yml has no password authenticator (so `auth:
+# basic` above has nothing to authenticate against). To actually exercise this mode you
+# need, on the Trino side:
+#   1. A password authenticator (e.g. file-based) with a `qf_svc` user matching the
+#      password above.
+#   2. File-based system access control granting the impersonation:
+#        { "impersonation": [{ "original_user": "qf_svc", "new_user": ".*", "allow": true }] }
+#      wired via `http-server.access-control.config-files=/etc/trino/rules.json`.
+# See website/docs/architecture/auth-authz-design.md → "Mode: impersonate" for the full
+# requirement and why `passthrough` (config.yaml) is usually the lower-friction choice
+# when Trino and QueryFlux share the same IdP.

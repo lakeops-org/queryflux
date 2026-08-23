@@ -1,5 +1,66 @@
 # Changelog
 
+## [0.3.0](https://github.com/lakeops-org/queryflux/compare/queryflux-v0.2.0...queryflux-v0.3.0) (2026-08-19)
+
+
+### Features
+
+* ADBC tokenExchange for Snowflake via per-identity sub-pool ([#166](https://github.com/lakeops-org/queryflux/issues/166)) ([db88f95](https://github.com/lakeops-org/queryflux/commit/db88f95fae6ff5a050490cf0af02d2bb09556651))
+* add deny routing rules with Denied query history ([#160](https://github.com/lakeops-org/queryflux/issues/160)) ([30c77b8](https://github.com/lakeops-org/queryflux/commit/30c77b854b60361e0fed051cf53a0bd62b5501f5))
+* Add helm chart for QueryFlux ([#75](https://github.com/lakeops-org/queryflux/issues/75)) ([3c3acd4](https://github.com/lakeops-org/queryflux/commit/3c3acd4e8f5a3a4e9d46ad873ff8a88413c26d0a))
+* add native CLI flow and duckdb quickstart example ([#98](https://github.com/lakeops-org/queryflux/issues/98)) ([2b04b83](https://github.com/lakeops-org/queryflux/commit/2b04b838824a8e832f24fa4919d5b15f8b9d632c))
+* Add Python and webhook guardrail execution ([#81](https://github.com/lakeops-org/queryflux/issues/81)) ([0af87cd](https://github.com/lakeops-org/queryflux/commit/0af87cdb8f94e67da2408e8dec46728488c9b944))
+* add query result cache with OpenDAL storage backend ([#90](https://github.com/lakeops-org/queryflux/issues/90)) ([5109d49](https://github.com/lakeops-org/queryflux/commit/5109d495b4c7e4971ce58cc7795657093bcdbce0))
+* authorization-aware first-fit when routing uses fallback ([#161](https://github.com/lakeops-org/queryflux/issues/161)) ([703ae4a](https://github.com/lakeops-org/queryflux/commit/703ae4a012725710b7ddb3d4931ca2a05516225e))
+* cancel in-flight sync queries on client disconnect ([#120](https://github.com/lakeops-org/queryflux/issues/120)) ([e1c1794](https://github.com/lakeops-org/queryflux/commit/e1c17942675d68ac2eb085ee25299320364a8739))
+* ClickHouse backend adapter (HTTP, Arrow result path) ([#105](https://github.com/lakeops-org/queryflux/issues/105)) ([60986c1](https://github.com/lakeops-org/queryflux/commit/60986c1571c20982d4789c920a3c55171fc6a7bc))
+* ClickHouse impersonate via EXECUTE AS ([#167](https://github.com/lakeops-org/queryflux/issues/167)) ([7d564d7](https://github.com/lakeops-org/queryflux/commit/7d564d73295c0c257a6440f1a6ffb593ec2bc04a))
+* distributed multi replica ([#84](https://github.com/lakeops-org/queryflux/issues/84)) ([1b55ced](https://github.com/lakeops-org/queryflux/commit/1b55cedba3c27a61e673b77ce2e7e50c4eaf19a4))
+* extend passthrough enrichment to the sync-bridge dispatch path ([#165](https://github.com/lakeops-org/queryflux/issues/165)) ([85f1170](https://github.com/lakeops-org/queryflux/commit/85f117066ae0203f346505f50b42493310e560d0))
+* group default tags, admin OpenAPI spec, and Studio Swagger UI ([#78](https://github.com/lakeops-org/queryflux/issues/78)) ([4a97a25](https://github.com/lakeops-org/queryflux/commit/4a97a254de880958479098290a907aa51a5ddb6b))
+* **security:** persist query owner and allow operator/admin cancel ([#121](https://github.com/lakeops-org/queryflux/issues/121)) ([7118e70](https://github.com/lakeops-org/queryflux/commit/7118e70567288ca70716d4ef69f0c24acf17156c))
+* StarRocks passthrough via LDAP COM_CHANGE_USER ([#168](https://github.com/lakeops-org/queryflux/issues/168)) ([9c054ad](https://github.com/lakeops-org/queryflux/commit/9c054ad82b314657d340af8d45110ca5e4b82c70))
+* switch schema migrations to Refinery and add migrate CLI ([#163](https://github.com/lakeops-org/queryflux/issues/163)) ([44ddd03](https://github.com/lakeops-org/queryflux/commit/44ddd0333aa79355a86512b96c89f603a558d7f8))
+* wire backend identity into Trino adapter ([#164](https://github.com/lakeops-org/queryflux/issues/164)) ([a70cf1a](https://github.com/lakeops-org/queryflux/commit/a70cf1ad832e77ccdebc8b358f71510b322f8098))
+
+
+### Bug Fixes
+
+* **athena:** bound wait_for_completion and refresh RoleArn credentials ([#133](https://github.com/lakeops-org/queryflux/issues/133)) ([c2b6c78](https://github.com/lakeops-org/queryflux/commit/c2b6c78fd8d28d6dc2a13e05b985b73fa63168ff))
+* **auth:** enforce auth for frontend SET and metadata fast paths ([#127](https://github.com/lakeops-org/queryflux/issues/127)) ([af63da2](https://github.com/lakeops-org/queryflux/commit/af63da2cf3d8ff796eca841f4ad195b43eca0507))
+* **auth:** require OIDC audience when auth.required=true ([#124](https://github.com/lakeops-org/queryflux/issues/124)) ([e0773e9](https://github.com/lakeops-org/queryflux/commit/e0773e961fe963360c2a78b6193fd82d0da74e6c))
+* bound capacity wait with capacityWaitTimeoutSecs ([#140](https://github.com/lakeops-org/queryflux/issues/140)) ([b6335c2](https://github.com/lakeops-org/queryflux/commit/b6335c270a387815075dbe7c293489c7829bb8ce))
+* cancel in-flight Snowflake HTTP and SQL API queries (P2-39) ([#156](https://github.com/lakeops-org/queryflux/issues/156)) ([3b0c656](https://github.com/lakeops-org/queryflux/commit/3b0c6561e0595a2d26fbc0c2b7b65b8d428b35d1))
+* cancel Trino queries with cluster credentials before releasing slots ([#131](https://github.com/lakeops-org/queryflux/issues/131)) ([a517b3c](https://github.com/lakeops-org/queryflux/commit/a517b3c129d10f0e64f2542b1d572cbe9941c3f6))
+* cancel zombie/admin queries through adapters with cluster credentials ([#134](https://github.com/lakeops-org/queryflux/issues/134)) ([e35b709](https://github.com/lakeops-org/queryflux/commit/e35b70937aacd9b192717d67c2ff817a4747addf))
+* cap MySQL and Postgres wire message sizes before allocate ([#143](https://github.com/lakeops-org/queryflux/issues/143)) ([0f03017](https://github.com/lakeops-org/queryflux/commit/0f03017df27f2d31abab01a4aa173a7515f2de6c))
+* count config reload and auth rebuild failures ([#138](https://github.com/lakeops-org/queryflux/issues/138)) ([1f86894](https://github.com/lakeops-org/queryflux/commit/1f86894fa6b66b08de84a9262be54e76e37a0596))
+* do not apply a 30s timeout to Trino poll GETs ([#129](https://github.com/lakeops-org/queryflux/issues/129)) ([802fe73](https://github.com/lakeops-org/queryflux/commit/802fe736a07fa89d6094fe8c592a164ce84d29ae))
+* enforce maxQueuedQueries from LiveConfig ([#135](https://github.com/lakeops-org/queryflux/issues/135)) ([7276e16](https://github.com/lakeops-org/queryflux/commit/7276e168bd9c2a72d8db4a0b66b1c49aa3d07a37))
+* fail-closed guard kinds (script + webhook) ([#162](https://github.com/lakeops-org/queryflux/issues/162)) ([e725b17](https://github.com/lakeops-org/queryflux/commit/e725b17136db3c7ed8c326855f200bdee3561475))
+* heartbeat queue claims so slow dispatch cannot double-run ([#130](https://github.com/lakeops-org/queryflux/issues/130)) ([7055e6d](https://github.com/lakeops-org/queryflux/commit/7055e6d0ca71e82b8deec377a7f1dc96c727ba47))
+* **helm:** reject empty NetworkPolicy that would lock out traffic ([#142](https://github.com/lakeops-org/queryflux/issues/142)) ([71a06c8](https://github.com/lakeops-org/queryflux/commit/71a06c8a8e629f4468ed2ddfcd06c64d2652fd5c))
+* **helm:** startupProbe, terminationGracePeriod, and appVersion 0.2.0 ([#137](https://github.com/lakeops-org/queryflux/issues/137)) ([b589b2d](https://github.com/lakeops-org/queryflux/commit/b589b2d0657e99bc3004845dcbc5abeba00148b6))
+* honor frontends.trinoHttp.enabled when spawning the listener ([#144](https://github.com/lakeops-org/queryflux/issues/144)) ([c63be4e](https://github.com/lakeops-org/queryflux/commit/c63be4e16a50e6ae5caceb5404746c6e47e7ed7a))
+* increment auth_failures_total on frontend auth errors ([#136](https://github.com/lakeops-org/queryflux/issues/136)) ([45bd962](https://github.com/lakeops-org/queryflux/commit/45bd96242ef11fc56b1805e0fd6521ef7047a9dd))
+* install UserGroup router from config ([#146](https://github.com/lakeops-org/queryflux/issues/146)) ([457cca8](https://github.com/lakeops-org/queryflux/commit/457cca81bd3b931978742f20183ed6c701faaa68))
+* isolate Postgres pools for query, coordination, and admin (P1-23) ([#155](https://github.com/lakeops-org/queryflux/issues/155)) ([893bd89](https://github.com/lakeops-org/queryflux/commit/893bd89c5c7d29bf4ce6dfcdf0c272efd8d973e4))
+* persist admin password changes in Postgres ([#123](https://github.com/lakeops-org/queryflux/issues/123)) ([9b332ee](https://github.com/lakeops-org/queryflux/commit/9b332eebfde8da208fc8a978c2cf42c5fc037d2e))
+* persist Studio security settings ([#99](https://github.com/lakeops-org/queryflux/issues/99)) ([#122](https://github.com/lakeops-org/queryflux/issues/122)) ([ce5bb18](https://github.com/lakeops-org/queryflux/commit/ce5bb187643b8b9dbae8a0819c67a5a0288ad432))
+* purge digests and cluster snapshots with query history retention ([#145](https://github.com/lakeops-org/queryflux/issues/145)) ([2124a16](https://github.com/lakeops-org/queryflux/commit/2124a163383fb49b93ef9633ec040f9302fe036e))
+* record query history and dashboard stats with in-memory persistence ([#94](https://github.com/lakeops-org/queryflux/issues/94)) ([bd0490a](https://github.com/lakeops-org/queryflux/commit/bd0490a6d23e253a56e760e1a496fac2be5cc240))
+* record query history on cancel and queue terminal paths ([#150](https://github.com/lakeops-org/queryflux/issues/150)) ([e105824](https://github.com/lakeops-org/queryflux/commit/e10582488bea1c4316c2f1beedfda641b9e56b0a))
+* reject unimplemented Redis persistence at startup ([#147](https://github.com/lakeops-org/queryflux/issues/147)) ([5f61fd8](https://github.com/lakeops-org/queryflux/commit/5f61fd87999a321ac46f0f10a701a9b7c64b3d40))
+* seed YAML clusters into Postgres only when missing ([#151](https://github.com/lakeops-org/queryflux/issues/151)) ([02c31b1](https://github.com/lakeops-org/queryflux/commit/02c31b11d31e6125418819583c647412f21385bd))
+* stop background tasks when shutdown is signaled ([#148](https://github.com/lakeops-org/queryflux/issues/148)) ([c571ef6](https://github.com/lakeops-org/queryflux/commit/c571ef6a05f63d918f3d82fe236b4aa0f18dbf3b))
+* stream DuckDB results with pool and buffer cap (P1-18) ([#154](https://github.com/lakeops-org/queryflux/issues/154)) ([5dfce7c](https://github.com/lakeops-org/queryflux/commit/5dfce7cee4241dd508d866837d2292e7e8a0a8c0))
+* stream StarRocks/MySQL-native results (P1-17) ([#153](https://github.com/lakeops-org/queryflux/issues/153)) ([aca2219](https://github.com/lakeops-org/queryflux/commit/aca2219dc5c93006801ed69f1c5298449a753f78))
+* **trino:** cancel or drain catalog helper queries so executions do not leak ([#132](https://github.com/lakeops-org/queryflux/issues/132)) ([7c0f61d](https://github.com/lakeops-org/queryflux/commit/7c0f61d618114171722962981e0793335cf8ce95))
+* **trino:** escape identifiers in discovery queries ([#125](https://github.com/lakeops-org/queryflux/issues/125)) ([08cdfc8](https://github.com/lakeops-org/queryflux/commit/08cdfc8c6b7141c3d6698397c1a9c72aa2bf0458))
+* **trino:** prevent client Authorization from overriding cluster auth ([#126](https://github.com/lakeops-org/queryflux/issues/126)) ([e994ade](https://github.com/lakeops-org/queryflux/commit/e994ade5974eee61dd3fc88f239c1a2a91ef266e))
+* validate auth and OpenFGA config at startup when required ([#149](https://github.com/lakeops-org/queryflux/issues/149)) ([bb473d9](https://github.com/lakeops-org/queryflux/commit/bb473d930044d11baf8c723d0b4302c411bb6d93))
+* website/package.json & website/package-lock.json to reduce vulnerabilities ([#110](https://github.com/lakeops-org/queryflux/issues/110)) ([bfce084](https://github.com/lakeops-org/queryflux/commit/bfce084c7dd9a2dd34c46203822d27c10352bd6d))
+
 ## [0.2.0](https://github.com/lakeops-org/queryflux/compare/queryflux-v0.1.2...queryflux-v0.2.0) (2026-06-02)
 
 

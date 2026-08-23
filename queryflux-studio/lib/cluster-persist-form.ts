@@ -5,7 +5,7 @@
  * Engine-specific flat-form validation lives in `lib/studio-engines/validate-flat.ts` (per-engine modules).
  */
 
-import type { ClusterConfigRecord, UpsertClusterConfig } from "@/lib/api-types";
+import type { ClusterConfigRecord, ClusterVariant, UpsertClusterConfig } from "@/lib/api-types";
 
 export { validateEngineSpecific } from "@/lib/studio-engines/validate-flat";
 
@@ -35,6 +35,7 @@ export const MANAGED_CONFIG_JSON_KEYS = new Set([
   "role",
   "schema",
   "poolSize",
+  "maxResultBufferBytes",
 ]);
 
 function jsonScalarToString(v: unknown): string {
@@ -134,6 +135,10 @@ export function persistedClusterConfigToFlat(
     config.tlsInsecureSkipVerify === true ? "true" : "false";
 
   flat.poolSize = jsonScalarToString(config.poolSize);
+  flat.maxResultBufferBytes = jsonScalarToString(config.maxResultBufferBytes);
+
+  flat.healthCheckQuery = jsonScalarToString(config.healthCheckQuery);
+  flat.reconcileQuery = jsonScalarToString(config.reconcileQuery);
 
   if (descriptor) {
     for (const f of descriptor.configFields) {
@@ -178,6 +183,8 @@ export function flatToPersistedConfig(flat: Record<string, string>): Record<stri
   if (flat.schema?.trim()) cfg.schema = flat.schema.trim();
   const poolN = parsePositiveIntString(flat.poolSize);
   if (poolN !== undefined) cfg.poolSize = poolN;
+  const bufN = parsePositiveIntString(flat.maxResultBufferBytes);
+  if (bufN !== undefined) cfg.maxResultBufferBytes = bufN;
   return cfg;
 }
 
@@ -265,13 +272,29 @@ export function mergeClusterConfigFromFlat(
     } else delete out.poolSize;
   }
 
+  if (flat.maxResultBufferBytes !== undefined) {
+    const t = flat.maxResultBufferBytes.trim();
+    if (t) {
+      const n = parsePositiveIntString(flat.maxResultBufferBytes);
+      if (n !== undefined) out.maxResultBufferBytes = n;
+      else delete out.maxResultBufferBytes;
+    } else delete out.maxResultBufferBytes;
+  }
+
+  setOrDel("healthCheckQuery", flat.healthCheckQuery, "healthCheckQuery");
+  setOrDel("reconcileQuery", flat.reconcileQuery, "reconcileQuery");
+
   return out;
 }
 
 export function buildClusterUpsertFromForm(
   record: ClusterConfigRecord,
   flat: Record<string, string>,
-  opts: { enabled: boolean; maxRunningQueriesInput: string },
+  opts: {
+    enabled: boolean;
+    maxRunningQueriesInput: string;
+    variants?: ClusterVariant[];
+  },
 ): UpsertClusterConfig {
   const prev = record.config as Record<string, unknown>;
   const config = mergeClusterConfigFromFlat(prev, flat);
@@ -283,6 +306,8 @@ export function buildClusterUpsertFromForm(
   };
   const maxTrim = opts.maxRunningQueriesInput.trim();
   body.maxRunningQueries = maxTrim === "" ? null : Number.parseInt(maxTrim, 10);
+  if (opts.variants !== undefined) body.variants = opts.variants;
+  else if (record.variants) body.variants = record.variants;
   return body;
 }
 
@@ -312,6 +337,8 @@ export function buildValidateShape(flat: Record<string, string>): Record<string,
   if (flat.schema) o.schema = flat.schema;
   const poolN = parsePositiveIntString(flat.poolSize);
   if (poolN !== undefined) o.poolSize = poolN;
+  const bufN = parsePositiveIntString(flat.maxResultBufferBytes);
+  if (bufN !== undefined) o.maxResultBufferBytes = bufN;
   const auth: Record<string, string> = {};
   if (flat["auth.type"]) auth.type = flat["auth.type"];
   if (flat["auth.username"]) auth.username = flat["auth.username"];
@@ -327,13 +354,26 @@ export function buildValidateShape(flat: Record<string, string>): Record<string,
 export function toUpsertBody(
   engineKey: string,
   flat: Record<string, string>,
-  runtime: { enabled: boolean; maxRunningQueriesInput: string },
+  runtime: {
+    enabled: boolean;
+    maxRunningQueriesInput: string;
+    variants?: ClusterVariant[];
+    healthCheckQuery?: string;
+    reconcileQuery?: string;
+  },
 ): UpsertClusterConfig {
   const config = flatToPersistedConfig(flat);
+  const hcq = runtime.healthCheckQuery?.trim();
+  if (hcq) config.healthCheckQuery = hcq;
+  const rq = runtime.reconcileQuery?.trim();
+  if (rq) config.reconcileQuery = rq;
   const body: UpsertClusterConfig = { engineKey, enabled: runtime.enabled, config };
   const maxTrim = runtime.maxRunningQueriesInput.trim();
   if (maxTrim !== "") {
     body.maxRunningQueries = Number.parseInt(maxTrim, 10);
+  }
+  if (runtime.variants !== undefined) {
+    body.variants = runtime.variants;
   }
   return body;
 }

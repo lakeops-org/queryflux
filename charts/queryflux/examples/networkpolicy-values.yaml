@@ -1,0 +1,59 @@
+# Example NetworkPolicy body for QueryFlux.
+# Defaults keep networkPolicy.enabled: false. Enabling with empty ingress/egress
+# and policyTypes Ingress+Egress denies all traffic — the chart fails install in
+# that case. Copy and tighten selectors for your cluster.
+#
+# helm upgrade --install queryflux ./charts/queryflux \
+#   --values charts/queryflux/examples/networkpolicy-values.yaml \
+#   --values <your-other-values.yaml>
+
+networkPolicy:
+  enabled: true
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    # Clients / ingress controller / Studio / Admin API.
+    # Tighten: replace namespaceSelector: {} with matchLabels for ingress-nginx, etc.
+    - from:
+        - namespaceSelector: {}
+      ports:
+        - protocol: TCP
+          port: 8080 # Trino HTTP
+        - protocol: TCP
+          port: 9000 # Admin (/metrics, /readyz)
+        - protocol: TCP
+          port: 3000 # Studio
+    # Optional: Prometheus scrape from a monitoring namespace only.
+    # - from:
+    #     - namespaceSelector:
+    #         matchLabels:
+    #           kubernetes.io/metadata.name: monitoring
+    #   ports:
+    #     - protocol: TCP
+    #       port: 9000
+  egress:
+    # Cluster DNS
+    - to:
+        - namespaceSelector: {}
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # Postgres persistence (same or peer namespace — tighten selectors)
+    - to:
+        - namespaceSelector: {}
+      ports:
+        - protocol: TCP
+          port: 5432
+    # Query engines (e.g. Trino). Add more ports/namespaces as needed.
+    - to:
+        - namespaceSelector: {}
+      ports:
+        - protocol: TCP
+          port: 8080
+    # Optional: OIDC / external HTTPS
+    # - ports:
+    #     - protocol: TCP
+    #       port: 443

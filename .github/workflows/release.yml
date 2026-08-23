@@ -52,6 +52,59 @@ jobs:
           raw="${{ needs.release_please.outputs.tag_name }}"
           echo "base=${raw#queryflux-}" >> "$GITHUB_OUTPUT"
 
+  # Snapshot website/docs into a new Docusaurus version so the published site tracks
+  # releases instead of drifting (docs stayed pinned at 0.1.2 while the crate moved past
+  # 0.2.0 — nothing cut a new version automatically). Pushing with RELEASE_PLEASE_TOKEN
+  # (not GITHUB_TOKEN) is required so this commit actually triggers deploy-website.yml —
+  # GitHub does not cascade workflow runs from a GITHUB_TOKEN-authored push.
+  docs_version:
+    name: Cut docs version snapshot
+    needs: [release_please, docker_tag_base]
+    if: ${{ needs.release_please.outputs.releases_created == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@44c2b7a8a4ea60a981eaca3cf939b5f4305c123b # v4.1.5
+        with:
+          ref: main
+          token: ${{ secrets.RELEASE_PLEASE_TOKEN }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: website/package-lock.json
+
+      - name: Install website dependencies
+        working-directory: website
+        run: npm ci
+
+      - name: Cut Docusaurus version
+        working-directory: website
+        run: |
+          set -eu
+          version="${{ needs.docker_tag_base.outputs.base }}"
+          version="${version#v}"
+          npx docusaurus docs:version "$version"
+
+      - name: Verify the new version builds
+        working-directory: website
+        run: npm run build
+
+      - name: Commit and push
+        run: |
+          set -eu
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add website/versioned_docs website/versioned_sidebars website/versions.json
+          if git diff --cached --quiet; then
+            echo "No docs version changes to commit"
+            exit 0
+          fi
+          version="${{ needs.docker_tag_base.outputs.base }}"
+          version="${version#v}"
+          git commit -m "docs: cut versioned docs snapshot for ${version}"
+          git push origin HEAD:main
+
   build-slim:
     name: Build server-only (${{ matrix.suffix }})
     needs: [release_please]

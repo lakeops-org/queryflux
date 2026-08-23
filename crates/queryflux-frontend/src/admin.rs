@@ -16,8 +16,8 @@ use queryflux_core::{
         ClusterGroupConfig, FrontendConfig, FrontendsConfig, OpenFgaCredentials, RouterConfig,
     },
     engine_registry::EngineRegistry,
-    error::Result,
-    query::{ClusterGroupName, ClusterName},
+    error::{QueryFluxError, Result},
+    query::{BackendQueryId, ClusterGroupName, ClusterName, ExecutingQuery, ProxyQueryId},
 };
 use queryflux_metrics::prometheus_store::PrometheusMetrics;
 use queryflux_persistence::{
@@ -42,7 +42,10 @@ use utoipa::{OpenApi, ToSchema};
 use std::future::Future;
 use std::pin::Pin;
 
-use crate::{state::LiveConfig, FrontendListenerTrait, ShutdownRx};
+use crate::{
+    state::{AppState, LiveConfig},
+    FrontendListenerTrait, ShutdownRx,
+};
 
 /// Callback type for testing a cluster config without persisting it.
 /// Receives `(engine_key, config_json)` → returns `Ok(true)` if healthy, `Ok(false)` if
@@ -87,6 +90,8 @@ pub struct ClusterStateDto {
         update_cluster_handler,
         engine_registry_handler,
         list_queries_handler,
+        list_running_queries_handler,
+        cancel_query_handler,
         get_stats_handler,
         list_engines_handler,
         get_engine_stats_handler,
@@ -127,6 +132,7 @@ pub struct ClusterStateDto {
         ClusterStateDto,
         ClusterUpdateRequest,
         QuerySummary,
+        RunningQueryDto,
         DashboardStats,
         EngineStatRow,
         GroupStatRow,
@@ -162,10 +168,20 @@ pub struct SecurityConfigDto {
     pub ldap: Option<LdapConfigDto>,
     /// Number of users defined when provider = "static". Passwords are never exposed.
     pub static_user_count: Option<usize>,
+    /// Usernames + groups/roles so Studio can re-save without wiping the user list.
+    /// Passwords are never included.
+    #[serde(default)]
+    pub static_user_summaries: Vec<StaticUserSummaryDto>,
     pub authorization_provider: String,
     pub openfga: Option<OpenFgaConfigDto>,
     /// Per-cluster-group simple allow-lists (used when authorization_provider = "none").
     pub group_authorization: HashMap<String, GroupAuthzDto>,
+    /// IdP roles that may cancel any query.
+    #[serde(default)]
+    pub operator_roles: Vec<String>,
+    /// IdP groups that may cancel any query.
+    #[serde(default)]
+    pub operator_groups: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -202,6 +218,13 @@ pub struct GroupAuthzDto {
     pub allow_users: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct StaticUserSummaryDto {
+    pub username: String,
+    pub groups: Vec<String>,
+    pub roles: Vec<String>,
+}
+
 impl Default for SecurityConfigDto {
     fn default() -> Self {
         Self {
@@ -210,9 +233,12 @@ impl Default for SecurityConfigDto {
             oidc: None,
             ldap: None,
             static_user_count: None,
+            static_user_summaries: Vec::new(),
             authorization_provider: "none".to_string(),
             openfga: None,
             group_authorization: HashMap::new(),
+            operator_roles: Vec::new(),
+            operator_groups: Vec::new(),
         }
     }
 }
@@ -366,7 +392,25 @@ impl SecurityConfigDto {
             group_name_attribute: l.group_name_attribute.clone(),
         });
 
-        let static_user_count = auth.static_users.as_ref().map(|s| s.users.len());
+        let static_user_summaries: Vec<StaticUserSummaryDto> = auth
+            .static_users
+            .as_ref()
+            .map(|s| {
+                s.users
+                    .iter()
+                    .map(|(username, entry)| StaticUserSummaryDto {
+                        username: username.clone(),
+                        groups: entry.groups.clone(),
+                        roles: entry.roles.clone(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let static_user_count = if static_user_summaries.is_empty() {
+            None
+        } else {
+            Some(static_user_summaries.len())
+        };
 
         let authorization_provider = match authz.provider {
             AuthorizationProviderConfig::None => "none",
@@ -408,9 +452,12 @@ impl SecurityConfigDto {
             oidc,
             ldap,
             static_user_count,
+            static_user_summaries,
             authorization_provider,
             openfga,
             group_authorization,
+            operator_roles: auth.operator_roles.clone(),
+            operator_groups: auth.operator_groups.clone(),
         }
     }
 }
@@ -452,6 +499,10 @@ pub struct UpsertSecurityConfig {
     pub static_users: Option<serde_json::Value>,
     pub authorization_provider: String,
     pub openfga: Option<serde_json::Value>,
+    #[serde(default)]
+    pub operator_roles: Option<Vec<String>>,
+    #[serde(default)]
+    pub operator_groups: Option<Vec<String>>,
 }
 
 /// Request body for PUT /admin/config/routing
@@ -492,6 +543,8 @@ struct AdminState {
     test_cluster_fn: TestClusterFn,
     /// Query result cache for invalidation endpoints.
     result_cache: Arc<dyn queryflux_cache::QueryResultCache>,
+    /// Shared proxy state — in-flight queries, adapters, slot release.
+    app: Arc<AppState>,
 }
 
 // ---------------------------------------------------------------------------
@@ -512,6 +565,7 @@ pub struct AdminFrontend {
     test_cluster_fn: TestClusterFn,
     cors_allowed_origins: Vec<String>,
     result_cache: Arc<dyn queryflux_cache::QueryResultCache>,
+    app: Arc<AppState>,
 }
 
 impl AdminFrontend {
@@ -530,6 +584,7 @@ impl AdminFrontend {
         test_cluster_fn: TestClusterFn,
         cors_allowed_origins: Vec<String>,
         result_cache: Arc<dyn queryflux_cache::QueryResultCache>,
+        app: Arc<AppState>,
     ) -> Self {
         Self {
             prometheus,
@@ -545,6 +600,7 @@ impl AdminFrontend {
             test_cluster_fn,
             cors_allowed_origins,
             result_cache,
+            app,
         }
     }
 
@@ -561,6 +617,7 @@ impl AdminFrontend {
             admin_creds: self.admin_creds.clone(),
             test_cluster_fn: self.test_cluster_fn.clone(),
             result_cache: self.result_cache.clone(),
+            app: self.app.clone(),
         });
 
         let spec_json =
@@ -590,6 +647,8 @@ impl AdminFrontend {
         let protected = Router::new()
             .route("/admin/clusters", get(clusters_handler))
             .route("/admin/queries", get(list_queries_handler))
+            .route("/admin/queries/running", get(list_running_queries_handler))
+            .route("/admin/queries/{id}", delete(cancel_query_handler))
             .route("/admin/agents", get(list_agents_handler))
             .route("/admin/conversations", get(list_conversations_handler))
             .route("/admin/conversations/{id}", get(get_conversation_handler))
@@ -799,11 +858,17 @@ struct AuthStatusResponse {
     /// `true` once the operator has changed the password via the web UI.
     /// `false` means bootstrap (YAML/env) credentials are still in use.
     db_override: bool,
+    /// `true` when settings are backed by Postgres (survive restart).
+    durable_store: bool,
 }
 
 async fn auth_status_handler(State(state): State<Arc<AdminState>>) -> impl IntoResponse {
     let db_override = state.admin_creds.has_db_override().await;
-    Json(AuthStatusResponse { db_override })
+    let durable_store = state.admin_creds.settings_are_durable();
+    Json(AuthStatusResponse {
+        db_override,
+        durable_store,
+    })
 }
 
 #[derive(Deserialize)]
@@ -822,14 +887,26 @@ async fn change_password_handler(
         .await
     {
         Ok(()) => (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response(),
+        Err(QueryFluxError::Auth(msg)) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": msg})),
+        )
+            .into_response(),
+        Err(QueryFluxError::Persistence(e)) => {
+            tracing::error!(error = %e, "failed to persist admin password change");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "failed to persist password change"})),
+            )
+                .into_response()
+        }
         Err(e) => {
-            let msg = e.to_string();
-            let status = if msg.contains("incorrect") {
-                StatusCode::UNAUTHORIZED
-            } else {
-                StatusCode::BAD_REQUEST
-            };
-            (status, Json(serde_json::json!({"error": msg}))).into_response()
+            tracing::error!(error = %e, "unexpected error changing admin password");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "failed to change password"})),
+            )
+                .into_response()
         }
     }
 }
@@ -953,6 +1030,220 @@ async fn list_queries_handler(
         Ok(rows) => Json::<Vec<QuerySummary>>(rows).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct RunningQueryDto {
+    pub id: String,
+    pub backend_query_id: Option<String>,
+    pub submitted_by: String,
+    pub group: String,
+    pub cluster: Option<String>,
+    pub sql_preview: String,
+    /// `executing` or `queued`
+    pub state: String,
+}
+
+fn sql_preview(sql: &str) -> String {
+    let t = sql.split_whitespace().collect::<Vec<_>>().join(" ");
+    if t.chars().count() > 160 {
+        format!("{}…", t.chars().take(159).collect::<String>())
+    } else {
+        t
+    }
+}
+
+/// Build the admin "running queries" response from persistence.
+async fn collect_running_queries(
+    persistence: &dyn queryflux_persistence::Persistence,
+) -> queryflux_core::error::Result<Vec<RunningQueryDto>> {
+    let mut out = Vec::new();
+    for q in persistence.list_all().await? {
+        out.push(RunningQueryDto {
+            id: q.id.0,
+            backend_query_id: Some(q.backend_query_id.0),
+            submitted_by: q.submitted_by,
+            group: q.cluster_group.0,
+            cluster: Some(q.cluster_name.0),
+            sql_preview: sql_preview(&q.sql),
+            state: "executing".to_string(),
+        });
+    }
+    for q in persistence.list_queued().await? {
+        out.push(RunningQueryDto {
+            id: q.id.0,
+            backend_query_id: None,
+            submitted_by: q.submitted_by,
+            group: q.cluster_group.0,
+            cluster: None,
+            sql_preview: sql_preview(&q.sql),
+            state: "queued".to_string(),
+        });
+    }
+    Ok(out)
+}
+
+/// Admin cancel path for a queued query (claim release handled by caller).
+async fn delete_queued_if_exists(
+    persistence: &dyn queryflux_persistence::Persistence,
+    id: &str,
+) -> queryflux_core::error::Result<Option<queryflux_core::query::QueuedQuery>> {
+    persistence.take_queued(&ProxyQueryId(id.to_string())).await
+}
+
+async fn find_executing_query(
+    persistence: &dyn queryflux_persistence::Persistence,
+    id: &str,
+) -> queryflux_core::error::Result<Option<ExecutingQuery>> {
+    if let Some(q) = persistence.get(&BackendQueryId(id.to_string())).await? {
+        return Ok(Some(q));
+    }
+    Ok(persistence
+        .list_all()
+        .await?
+        .into_iter()
+        .find(|q| q.id.0 == id))
+}
+
+/// In-flight executing + queued queries (not history).
+#[utoipa::path(
+    get,
+    path = "/admin/queries/running",
+    tag = "admin",
+    responses(
+        (status = 200, description = "In-flight queries", body = Vec<RunningQueryDto>),
+        (status = 500, description = "Internal error", body = str),
+    )
+)]
+async fn list_running_queries_handler(State(state): State<Arc<AdminState>>) -> impl IntoResponse {
+    match collect_running_queries(state.app.persistence.as_ref()).await {
+        Ok(out) => Json(out).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+/// Cancel any in-flight or queued query. Admin Basic auth is the privilege.
+#[utoipa::path(
+    delete,
+    path = "/admin/queries/{id}",
+    tag = "admin",
+    params(("id" = String, Path, description = "Proxy query id or backend query id")),
+    responses(
+        (status = 204, description = "Cancelled"),
+        (status = 404, description = "Query not found", body = str),
+        (status = 500, description = "Internal error", body = str),
+    )
+)]
+async fn cancel_query_handler(
+    State(state): State<Arc<AdminState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let persistence = &state.app.persistence;
+
+    match find_executing_query(persistence.as_ref(), &id).await {
+        Ok(Some(executing)) => return cancel_executing(&state, executing).await,
+        Ok(None) => {}
+        Err(e) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+        }
+    }
+
+    let qid = ProxyQueryId(id.clone());
+    match delete_queued_if_exists(persistence.as_ref(), &id).await {
+        Ok(Some(queued)) => {
+            state.app.record_queued_terminal(
+                &queued,
+                queryflux_core::query::QueryStatus::Cancelled,
+                "admin cancelled",
+            );
+            // A worker may have claimed and started executing between the first
+            // lookup and this delete. Cancel that path too.
+            match find_executing_query(persistence.as_ref(), &id).await {
+                Ok(Some(executing)) => return cancel_executing(&state, executing).await,
+                Ok(None) => {}
+                Err(e) => {
+                    return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+                }
+            }
+            if let Some(qc) = &state.app.queue_coordinator {
+                let _ = qc.release_claim(&qid.0).await;
+            }
+            info!(id = %qid, "Admin cancelled queued query");
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Ok(None) => {
+            // Claimed and moved to executing after the first lookup.
+            match find_executing_query(persistence.as_ref(), &id).await {
+                Ok(Some(executing)) => cancel_executing(&state, executing).await,
+                Ok(None) => (StatusCode::NOT_FOUND, "query not found").into_response(),
+                Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+            }
+        }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+async fn cancel_executing(
+    state: &AdminState,
+    executing: queryflux_core::query::ExecutingQuery,
+) -> Response {
+    let Some(adapter) = state.app.adapter(&executing.cluster_name.0).await else {
+        warn!(
+            id = %executing.id,
+            cluster = %executing.cluster_name,
+            "Admin cancel: no adapter for cluster"
+        );
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "failed to cancel query on backend",
+        )
+            .into_response();
+    };
+    if let Err(e) = adapter
+        .cancel_query(&executing.backend_query_id, executing.wire_auth.as_ref())
+        .await
+    {
+        warn!(
+            id = %executing.id,
+            backend = %executing.backend_query_id,
+            "Admin adapter cancel failed: {e}"
+        );
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "failed to cancel query on backend",
+        )
+            .into_response();
+    }
+    state.app.record_executing_cancelled(
+        &executing,
+        queryflux_core::query::FrontendProtocol::TrinoHttp,
+        adapter.engine_type(),
+        adapter.translation_target_dialect(),
+        "admin cancelled",
+    );
+    state
+        .app
+        .release_query_slot(
+            &executing.cluster_group,
+            &executing.cluster_name,
+            &executing.id.0,
+        )
+        .await;
+    if let Err(e) = state
+        .app
+        .persistence
+        .delete(&executing.backend_query_id)
+        .await
+    {
+        return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+    }
+    info!(
+        id = %executing.id,
+        backend = %executing.backend_query_id,
+        owner = %executing.submitted_by,
+        "Admin cancelled executing query"
+    );
+    StatusCode::NO_CONTENT.into_response()
 }
 
 /// Distinct agents that have run queries, with aggregate stats.
@@ -1384,6 +1675,25 @@ async fn get_cluster_config_handler(
     }
 }
 
+/// Mirrors the startup validation in `main.rs` for clusters loaded from YAML — the
+/// engine × `queryAuth` matrix must reject the same combinations here, at the moment an
+/// operator saves them through Studio, not only at the next process restart.
+fn validate_query_auth_for_upsert(body: &UpsertClusterConfig) -> std::result::Result<(), String> {
+    let engine = queryflux_core::engine_registry::parse_engine_key(&body.engine_key)
+        .map_err(|e| e.to_string())?;
+    let query_auth =
+        queryflux_core::engine_registry::parse_query_auth_from_config_json(&body.config)
+            .map_err(|e| e.to_string())?;
+    if let Some(mode) = &query_auth {
+        // ADBC's `driver` key lives in the raw config JSON, not on `EngineConfig` itself —
+        // `query_auth_supported` needs it to tell an OAuth-capable driver (e.g. snowflake)
+        // apart from one that isn't.
+        let driver = body.config.get("driver").and_then(|v| v.as_str());
+        queryflux_core::config::query_auth_supported(Some(&engine), driver, mode)?;
+    }
+    Ok(())
+}
+
 /// Create or fully replace a cluster configuration.
 #[utoipa::path(
     put,
@@ -1403,6 +1713,9 @@ async fn upsert_cluster_config_handler(
     Json(body): Json<UpsertClusterConfig>,
 ) -> impl IntoResponse {
     let pg = require_store!(state);
+    if let Err(e) = validate_query_auth_for_upsert(&body) {
+        return (StatusCode::BAD_REQUEST, e).into_response();
+    }
     match pg.upsert_cluster_config(&name, &body).await {
         Ok(r) => {
             notify_live_config_reload(&state);
@@ -1816,10 +2129,37 @@ async fn delete_user_script_handler(
 async fn get_security_config_handler(State(state): State<Arc<AdminState>>) -> impl IntoResponse {
     if let Some(store) = &state.admin_store {
         if let Ok(Some(v)) = store.get_proxy_setting("security_config").await {
-            return Json(v).into_response();
+            if !queryflux_core::security_setting::is_blank_security_setting(&v) {
+                return Json(security_dto_from_stored(&v, &state.security_config)).into_response();
+            }
         }
     }
     Json(state.security_config.as_ref()).into_response()
+}
+
+/// Sanitized view of a stored security blob. Never returns raw passwords.
+fn security_dto_from_stored(
+    v: &serde_json::Value,
+    fallback: &SecurityConfigDto,
+) -> SecurityConfigDto {
+    let (auth, authz) = queryflux_core::security_setting::parse_security_setting(v);
+    let mut dto = fallback.clone();
+    if let Some(auth) = auth.as_ref() {
+        let tmp =
+            SecurityConfigDto::from_config(auth, &AuthorizationConfig::default(), &HashMap::new());
+        dto.auth_provider = tmp.auth_provider;
+        dto.auth_required = tmp.auth_required;
+        dto.oidc = tmp.oidc;
+        dto.ldap = tmp.ldap;
+        dto.static_user_count = tmp.static_user_count;
+        dto.static_user_summaries = tmp.static_user_summaries;
+    }
+    if let Some(authz) = authz.as_ref() {
+        let tmp = SecurityConfigDto::from_config(&AuthConfig::default(), authz, &HashMap::new());
+        dto.authorization_provider = tmp.authorization_provider;
+        dto.openfga = tmp.openfga;
+    }
+    dto
 }
 
 fn group_id_maps(
@@ -1898,7 +2238,58 @@ async fn put_security_config_handler(
         )
             .into_response();
     };
-    let value = serde_json::to_value(&body).unwrap_or(serde_json::Value::Null);
+    let incoming = serde_json::to_value(&body).unwrap_or(serde_json::Value::Null);
+    let existing = store
+        .get_proxy_setting("security_config")
+        .await
+        .ok()
+        .flatten();
+    let value =
+        queryflux_core::security_setting::merge_security_setting(existing.as_ref(), incoming);
+
+    let (auth, _) = queryflux_core::security_setting::parse_security_setting(&value);
+    match auth {
+        None if body.auth_provider != "none" => {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "could not parse auth.provider = {} (check static users / OIDC / LDAP fields)",
+                    body.auth_provider
+                ),
+            )
+                .into_response();
+        }
+        Some(cfg)
+            if matches!(cfg.provider, AuthProviderConfig::Static)
+                && cfg
+                    .static_users
+                    .as_ref()
+                    .map(|s| s.users.is_empty())
+                    .unwrap_or(true) =>
+        {
+            return (
+                StatusCode::BAD_REQUEST,
+                "auth.provider = static requires at least one user",
+            )
+                .into_response();
+        }
+        Some(cfg) if matches!(cfg.provider, AuthProviderConfig::Oidc) && cfg.oidc.is_none() => {
+            return (
+                StatusCode::BAD_REQUEST,
+                "auth.provider = oidc requires oidc issuer and jwks_uri",
+            )
+                .into_response();
+        }
+        Some(cfg) if matches!(cfg.provider, AuthProviderConfig::Ldap) && cfg.ldap.is_none() => {
+            return (
+                StatusCode::BAD_REQUEST,
+                "auth.provider = ldap requires ldap url and user_search_base",
+            )
+                .into_response();
+        }
+        _ => {}
+    }
+
     match store.set_proxy_setting("security_config", value).await {
         Ok(()) => {
             notify_live_config_reload(&state);
@@ -1906,6 +2297,28 @@ async fn put_security_config_handler(
         }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
+}
+
+/// Reject invalid query-regex patterns before persisting routing config.
+fn validate_query_regex_patterns(routers: &[serde_json::Value]) -> std::result::Result<(), String> {
+    use queryflux_routing::implementations::query_regex::QueryRegexRouter;
+
+    for router in routers {
+        if router.get("type").and_then(|t| t.as_str()) != Some("queryRegex") {
+            continue;
+        }
+        let Some(rules) = router.get("rules").and_then(|r| r.as_array()) else {
+            continue;
+        };
+        for rule in rules {
+            if let Some(regex) = rule.get("regex").and_then(|r| r.as_str()) {
+                if !regex.is_empty() {
+                    QueryRegexRouter::validate_pattern(regex)?;
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Replace the routing configuration.
@@ -1961,6 +2374,10 @@ async fn put_routing_config_handler(
             format!("routingFallback '{fallback_name}' is not a known cluster group"),
         )
             .into_response();
+    }
+
+    if let Err(msg) = validate_query_regex_patterns(&body.routers) {
+        return (StatusCode::BAD_REQUEST, msg).into_response();
     }
 
     let fallback_gid = body.routing_fallback_group_id.or_else(|| {
@@ -2276,8 +2693,149 @@ async fn invalidate_group_cache_handler(
 
 #[cfg(test)]
 mod tests {
-    use super::GuardrailsConfigDto;
+    use super::{
+        collect_running_queries, delete_queued_if_exists, sql_preview, GuardrailsConfigDto,
+        SecurityConfigDto,
+    };
+    use chrono::Utc;
+    use queryflux_core::config::{
+        AuthConfig, AuthProviderConfig, AuthorizationConfig, StaticUserEntry, StaticUsersConfig,
+    };
+    use queryflux_core::query::{
+        BackendQueryId, ClusterGroupName, ClusterName, ExecutingQuery, FrontendProtocol,
+        ProxyQueryId, QueuedQuery,
+    };
+    use queryflux_core::session::SessionContext;
+    use queryflux_persistence::{in_memory::InMemoryPersistence, Persistence};
     use serde_json::json;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    #[test]
+    fn security_config_dto_omits_static_user_passwords() {
+        let mut users = HashMap::new();
+        users.insert(
+            "alice".into(),
+            StaticUserEntry {
+                password: "s3cret".into(),
+                groups: vec!["analytics".into()],
+                roles: vec!["reader".into()],
+            },
+        );
+        let auth = AuthConfig {
+            provider: AuthProviderConfig::Static,
+            required: true,
+            static_users: Some(StaticUsersConfig { users }),
+            ..AuthConfig::default()
+        };
+        let dto =
+            SecurityConfigDto::from_config(&auth, &AuthorizationConfig::default(), &HashMap::new());
+        let serialized = serde_json::to_value(&dto).unwrap().to_string();
+        assert!(!serialized.contains("s3cret"));
+        assert!(!serialized.contains("\"password\""));
+        assert_eq!(dto.static_user_summaries.len(), 1);
+        assert_eq!(dto.static_user_summaries[0].username, "alice");
+        assert_eq!(dto.static_user_summaries[0].groups, vec!["analytics"]);
+    }
+
+    #[test]
+    fn sql_preview_truncates_to_160_chars() {
+        let long = "word ".repeat(50);
+        let preview = sql_preview(&long);
+        assert!(preview.chars().count() <= 160);
+        assert!(preview.ends_with('…'));
+    }
+
+    #[test]
+    fn sql_preview_collapses_whitespace() {
+        assert_eq!(sql_preview("SELECT   1\nFROM  t"), "SELECT 1 FROM t");
+    }
+
+    #[tokio::test]
+    async fn collect_running_queries_includes_executing_and_queued() {
+        let store = Arc::new(InMemoryPersistence::new());
+        let now = Utc::now();
+        store
+            .upsert(ExecutingQuery {
+                id: ProxyQueryId("exec-1".into()),
+                sql: "SELECT 1".into(),
+                translated_sql: None,
+                cluster_group: ClusterGroupName("analytics".into()),
+                cluster_name: ClusterName("trino".into()),
+                cluster_group_config_id: None,
+                cluster_config_id: None,
+                backend_query_id: BackendQueryId("backend-1".into()),
+                poll_base_url: None,
+                creation_time: now,
+                last_accessed: now,
+                query_tags: Default::default(),
+                agent_context: None,
+                submitted_guard_actions: vec![],
+                was_guard_blocked: false,
+                submitted_by: "alice".into(),
+                wire_auth: None,
+            })
+            .await
+            .unwrap();
+        store
+            .upsert_queued(QueuedQuery {
+                id: ProxyQueryId("queued-1".into()),
+                sql: "SELECT 2".into(),
+                session: SessionContext::default(),
+                frontend_protocol: FrontendProtocol::TrinoHttp,
+                cluster_group: ClusterGroupName("analytics".into()),
+                creation_time: now,
+                last_accessed: now,
+                sequence: 0,
+                submitted_by: "bob".into(),
+            })
+            .await
+            .unwrap();
+
+        let rows = collect_running_queries(store.as_ref()).await.unwrap();
+        assert_eq!(rows.len(), 2);
+        let exec = rows.iter().find(|r| r.id == "exec-1").unwrap();
+        assert_eq!(exec.state, "executing");
+        assert_eq!(exec.submitted_by, "alice");
+        assert_eq!(exec.backend_query_id.as_deref(), Some("backend-1"));
+        let queued = rows.iter().find(|r| r.id == "queued-1").unwrap();
+        assert_eq!(queued.state, "queued");
+        assert_eq!(queued.submitted_by, "bob");
+        assert!(queued.backend_query_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn delete_queued_if_exists_removes_row() {
+        let store = Arc::new(InMemoryPersistence::new());
+        store
+            .upsert_queued(QueuedQuery {
+                id: ProxyQueryId("q-cancel".into()),
+                sql: "SELECT 1".into(),
+                session: SessionContext::default(),
+                frontend_protocol: FrontendProtocol::TrinoHttp,
+                cluster_group: ClusterGroupName("g".into()),
+                creation_time: Utc::now(),
+                last_accessed: Utc::now(),
+                sequence: 0,
+                submitted_by: "alice".into(),
+            })
+            .await
+            .unwrap();
+
+        assert!(delete_queued_if_exists(store.as_ref(), "q-cancel")
+            .await
+            .unwrap()
+            .is_some());
+        assert!(store
+            .get_queued(&ProxyQueryId("q-cancel".into()))
+            .await
+            .unwrap()
+            .is_none());
+        assert!(delete_queued_if_exists(store.as_ref(), "missing")
+            .await
+            .unwrap()
+            .is_none());
+    }
 
     #[test]
     fn guardrails_dto_allows_supported_built_in_guards() {

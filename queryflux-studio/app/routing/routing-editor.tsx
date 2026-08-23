@@ -91,6 +91,10 @@ interface FlatRule {
   tagValue: string;
   // regex
   regex: string;
+  /** SQL regex action: route (default) or deny. */
+  regexAction: "route" | "deny";
+  /** Client-visible message when regexAction is deny. */
+  denyError: string;
   // protocol
   protocol: string;
   // shared — cluster_group_configs.id
@@ -133,6 +137,8 @@ function blankRule(ruleType: FlatRuleType): FlatRule {
     tagKey: "",
     tagValue: "",
     regex: "",
+    regexAction: "route",
+    denyError: "",
     protocol: "trinoHttp",
     targetGroupId: null,
   };
@@ -235,7 +241,14 @@ function flatRuleToChainItem(rule: FlatRule): ChainItem {
     case "tag":
       return { id, kind: "tag", tagKey: rule.tagKey, tagValue: rule.tagValue, targetGroupId: rule.targetGroupId };
     case "regex":
-      return { id, kind: "regex", regex: rule.regex, targetGroupId: rule.targetGroupId };
+      return {
+        id,
+        kind: "regex",
+        regex: rule.regex,
+        action: rule.regexAction,
+        error: rule.denyError,
+        targetGroupId: rule.regexAction === "deny" ? null : rule.targetGroupId,
+      };
     case "protocol":
       return {
         id,
@@ -774,19 +787,29 @@ function NewRuleForm({
   const [form, setForm] = useState<FlatRule>(blankRule("header"));
 
   const isValid =
-    form.targetGroupId != null &&
     (() => {
       switch (form.ruleType) {
         case "header":
-          return form.headerName.trim() !== "" && form.headerValue.trim() !== "";
+          return (
+            form.targetGroupId != null &&
+            form.headerName.trim() !== "" &&
+            form.headerValue.trim() !== ""
+          );
         case "user":
-          return form.username.trim() !== "";
+          return form.targetGroupId != null && form.username.trim() !== "";
         case "tag":
-          return form.tagKey.trim() !== "";
+          return form.targetGroupId != null && form.tagKey.trim() !== "";
         case "regex":
-          return form.regex.trim() !== "";
+          if (form.regex.trim() === "") return false;
+          try {
+            new RegExp(form.regex);
+          } catch {
+            return false;
+          }
+          if (form.regexAction === "deny") return true;
+          return form.targetGroupId != null;
         case "protocol":
-          return form.protocol !== "";
+          return form.targetGroupId != null && form.protocol !== "";
       }
     })();
 
@@ -795,11 +818,13 @@ function NewRuleForm({
     value: string,
     onChange: (v: string) => void,
     extraClass = "",
+    ariaLabel?: string,
   ) => (
     <input
       className={`px-2.5 py-1.5 text-xs rounded-lg border border-slate-200 bg-white text-slate-900 font-mono focus:outline-none focus:ring-2 focus:ring-indigo-300 ${extraClass}`}
       placeholder={placeholder}
       value={value}
+      aria-label={ariaLabel}
       onChange={(e) => onChange(e.target.value)}
     />
   );
@@ -879,11 +904,48 @@ function NewRuleForm({
         )}
 
         {form.ruleType === "regex" && (
-          <div className="flex-1 min-w-[220px]">
-            <label className="block text-[10px] font-semibold text-slate-400 uppercase tracking-widest mb-1">
-              Regex pattern
-            </label>
-            {input("^SELECT.*fact_", form.regex, (v) => setForm((f) => ({ ...f, regex: v })), "w-full")}
+          <div className="flex-1 min-w-[220px] space-y-3">
+            <div>
+              <label className="block text-[10px] font-semibold text-slate-400 uppercase tracking-widest mb-1">
+                Regex pattern
+              </label>
+              {input("^SELECT.*fact_", form.regex, (v) => setForm((f) => ({ ...f, regex: v })), "w-full")}
+            </div>
+            <div className="flex flex-wrap gap-3 items-end">
+              <div>
+                <label className="block text-[10px] font-semibold text-slate-400 uppercase tracking-widest mb-1">
+                  Action
+                </label>
+                <select
+                  className="px-2.5 py-1.5 text-xs rounded-lg border border-slate-200 bg-white text-slate-900 focus:outline-none focus:ring-2 focus:ring-indigo-300"
+                  value={form.regexAction}
+                  onChange={(e) =>
+                    setForm((f) => ({
+                      ...f,
+                      regexAction: e.target.value as "route" | "deny",
+                      targetGroupId: e.target.value === "deny" ? null : f.targetGroupId,
+                    }))
+                  }
+                >
+                  <option value="route">Route</option>
+                  <option value="deny">Deny</option>
+                </select>
+              </div>
+              {form.regexAction === "deny" && (
+                <div className="flex-1 min-w-[180px]">
+                  <label className="block text-[10px] font-semibold text-slate-400 uppercase tracking-widest mb-1">
+                    Error message
+                  </label>
+                  {input(
+                    "Query denied by routing rule",
+                    form.denyError,
+                    (v) => setForm((f) => ({ ...f, denyError: v })),
+                    "w-full",
+                    "Denial message",
+                  )}
+                </div>
+              )}
+            </div>
           </div>
         )}
 
@@ -911,16 +973,22 @@ function NewRuleForm({
           <ArrowRight size={14} />
         </div>
 
-        {/* Target group */}
+        {/* Target group / deny */}
         <div>
           <label className="block text-[10px] font-semibold text-slate-400 uppercase tracking-widest mb-1">
-            Route to group
+            {form.ruleType === "regex" && form.regexAction === "deny" ? "Outcome" : "Route to group"}
           </label>
-          <GroupSelectById
-            valueId={form.targetGroupId}
-            onChangeId={(id) => setForm((f) => ({ ...f, targetGroupId: id }))}
-            groups={groups}
-          />
+          {form.ruleType === "regex" && form.regexAction === "deny" ? (
+            <span className="inline-flex items-center px-2.5 py-1.5 text-xs font-semibold rounded-lg bg-amber-50 text-amber-800 ring-1 ring-amber-200">
+              Deny query
+            </span>
+          ) : (
+            <GroupSelectById
+              valueId={form.targetGroupId}
+              onChangeId={(id) => setForm((f) => ({ ...f, targetGroupId: id }))}
+              groups={groups}
+            />
+          )}
         </div>
       </div>
 
@@ -962,6 +1030,7 @@ function SortableChainRow({
   onEditCompound,
   onEditPython,
   onSetTargetGroup,
+  onSetDenyError,
 }: {
   item: ChainItem;
   index: number;
@@ -973,6 +1042,7 @@ function SortableChainRow({
   onEditCompound: () => void;
   onEditPython: () => void;
   onSetTargetGroup: (id: number | null) => void;
+  onSetDenyError: (error: string) => void;
 }) {
   const {
     attributes,
@@ -1063,6 +1133,19 @@ function SortableChainRow({
           <span className="text-slate-400 text-[11px]">
             {item.kind === "pythonScript" ? "— (group from script)" : "— (see raw config)"}
           </span>
+        ) : item.kind === "regex" && item.action === "deny" ? (
+          <div className="space-y-1">
+            <span className="inline-flex items-center px-2 py-0.5 text-[11px] font-semibold rounded-md bg-amber-50 text-amber-800 ring-1 ring-amber-200">
+              Deny
+            </span>
+            <input
+              aria-label="Denial message"
+              className="w-full max-w-[220px] px-2 py-1 text-[11px] rounded-md border border-slate-200 bg-white text-slate-700 font-mono focus:outline-none focus:ring-2 focus:ring-indigo-300"
+              placeholder="Query denied by routing rule"
+              value={item.error}
+              onChange={(e) => onSetDenyError(e.target.value)}
+            />
+          </div>
         ) : (
           <GroupSelectById
             valueId={item.targetGroupId}
@@ -1234,10 +1317,25 @@ export function RoutingEditor({ initialRouting, groups }: RoutingEditorProps) {
     );
   }
 
+  function setChainItemDenyError(id: string, error: string) {
+    setChainItems((items) =>
+      items.map((x) => (x.id === id && x.kind === "regex" ? { ...x, error } : x)),
+    );
+  }
+
   const saveRoutingConfig = async () => {
     setRoutingSaving(true);
     setRoutingMsg(null);
     try {
+      for (const item of chainItems) {
+        if (item.kind === "regex" && item.regex.trim() !== "") {
+          try {
+            new RegExp(item.regex);
+          } catch {
+            throw new Error(`Invalid regex pattern: ${item.regex}`);
+          }
+        }
+      }
       await putRoutingConfig({
         routingFallbackGroupId: routingFallbackId,
         routingFallback: "",
@@ -1259,7 +1357,7 @@ export function RoutingEditor({ initialRouting, groups }: RoutingEditorProps) {
         <h1 className="text-2xl font-bold text-slate-900 tracking-tight">Routing</h1>
         <p className="text-sm text-slate-500 mt-1">
           Request routing rules and fallback group. Rules are evaluated <strong>top to bottom</strong>; the{" "}
-          <strong>first</strong> rule that selects a group wins. Reorder by dragging the grip in the first
+          <strong>first</strong> rule that selects a group or denies the query wins. Reorder by dragging the grip in the first
           column (or use ↑ ↓).{" "}
           <Link href="/security" className="text-indigo-600 hover:text-indigo-700 font-medium">
             Security &amp; auth
@@ -1356,6 +1454,7 @@ export function RoutingEditor({ initialRouting, groups }: RoutingEditorProps) {
                               openPythonDialogEdit(item.id, item.script);
                             }}
                             onSetTargetGroup={(id) => setChainItemTargetGroup(item.id, id)}
+                            onSetDenyError={(error) => setChainItemDenyError(item.id, error)}
                           />
                         ))}
                       </SortableContext>

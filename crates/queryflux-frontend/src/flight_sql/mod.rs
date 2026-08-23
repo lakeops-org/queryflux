@@ -15,6 +15,7 @@
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 
 use arrow::datatypes::Schema;
 use arrow::record_batch::RecordBatch;
@@ -41,9 +42,11 @@ use queryflux_core::{
     session::SessionContext,
 };
 
+use crate::abort::AbortOnDrop;
 use crate::dispatch::{execute_to_sink, ResultSink};
 use crate::state::AppState;
 use crate::{FrontendListenerTrait, ShutdownRx};
+use queryflux_routing::ChainRouteResult;
 
 // ── Frontend listener ─────────────────────────────────────────────────────────
 
@@ -195,10 +198,15 @@ impl FlightSqlService for QueryFluxFlightSql {
             ..Default::default()
         };
         let auth_provider = self.state.live.read().await.auth_provider.clone();
-        let auth_ctx = auth_provider
-            .authenticate(&creds)
-            .await
-            .map_err(|e| Status::unauthenticated(e.to_string()))?;
+        let auth_ctx = match auth_provider.authenticate(&creds).await {
+            Ok(ctx) => ctx,
+            Err(e) => {
+                self.state
+                    .metrics
+                    .on_auth_failure(&format!("{:?}", FrontendProtocol::FlightSql));
+                return Err(Status::unauthenticated(e.to_string()));
+            }
+        };
 
         let routing_result = {
             let live = self.state.live.read().await;
@@ -206,7 +214,29 @@ impl FlightSqlService for QueryFluxFlightSql {
                 .route_with_trace(&sql, &session, &protocol, Some(&auth_ctx))
                 .await
         };
-        let (group, _trace) = routing_result.map_err(|e| Status::internal(e.to_string()))?;
+        let (chain_result, mut routing_trace) =
+            routing_result.map_err(|e| Status::internal(e.to_string()))?;
+        let mut group = match chain_result {
+            ChainRouteResult::Routed(g) => g,
+            ChainRouteResult::Denied { message } => {
+                self.state.record_routing_deny(
+                    &sql,
+                    &session,
+                    protocol,
+                    &message,
+                    Some(routing_trace),
+                );
+                return Err(Status::permission_denied(message));
+            }
+        };
+        group = self
+            .state
+            .resolve_routed_group(group, &mut routing_trace, &auth_ctx)
+            .await
+            .map_err(|e| match e {
+                QueryFluxError::Unauthorized(msg) => Status::permission_denied(msg),
+                other => Status::internal(other.to_string()),
+            })?;
 
         // Channel: sink sends RecordBatches; FlightDataEncoderBuilder encodes them.
         let (tx, rx) =
@@ -216,7 +246,7 @@ impl FlightSqlService for QueryFluxFlightSql {
         let state2 = self.state.clone();
         let sql2 = sql.clone();
 
-        tokio::spawn(async move {
+        let exec_task = AbortOnDrop::new(tokio::spawn(async move {
             let _ = execute_to_sink(
                 &state2,
                 sql2,
@@ -229,9 +259,12 @@ impl FlightSqlService for QueryFluxFlightSql {
             )
             .await;
             // sink drops here → tx closes → rx stream ends
-        });
+        }));
 
-        let batch_stream = tokio_stream::wrappers::UnboundedReceiverStream::new(rx);
+        let batch_stream = AbortOnDropStream {
+            inner: tokio_stream::wrappers::UnboundedReceiverStream::new(rx),
+            _abort: exec_task,
+        };
 
         let flight_data_stream = FlightDataEncoderBuilder::new()
             .build(batch_stream)
@@ -278,6 +311,20 @@ impl ResultSink for FlightSqlResultSink {
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+/// Forwards an inner stream and aborts the execute task when the Flight client drops.
+struct AbortOnDropStream<S> {
+    inner: S,
+    _abort: AbortOnDrop<()>,
+}
+
+impl<S: Stream + Unpin> Stream for AbortOnDropStream<S> {
+    type Item = S::Item;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        Pin::new(&mut self.inner).poll_next(cx)
+    }
+}
 
 /// Encode an empty Arrow schema as IPC bytes for FlightInfo.schema.
 fn encode_empty_schema() -> bytes::Bytes {

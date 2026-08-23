@@ -6,7 +6,6 @@ use arrow::{
     record_batch::RecordBatch,
 };
 use async_trait::async_trait;
-use futures::stream;
 use queryflux_auth::QueryCredentials;
 use queryflux_core::{
     catalog::TableSchema,
@@ -17,9 +16,10 @@ use queryflux_core::{
     tags::QueryTags,
 };
 use reqwest::Client;
+use tokio_stream::wrappers::ReceiverStream;
 use tracing::debug;
 
-use crate::{AdapterKind, SyncAdapter, SyncExecution};
+use crate::{AdapterKind, BackendQueryIdSlot, SyncAdapter, SyncExecution};
 use queryflux_core::engine_registry::{
     AuthType, ConfigField, ConnectionType, EngineDescriptor, FieldType,
 };
@@ -29,6 +29,7 @@ pub struct DuckDbHttpConfig {
     pub endpoint: String,
     pub tls_skip_verify: bool,
     pub auth: Option<queryflux_core::config::ClusterAuth>,
+    pub max_result_buffer_bytes: usize,
 }
 
 impl crate::EngineConfigParseable for DuckDbHttpConfig {
@@ -59,6 +60,10 @@ impl crate::EngineConfigParseable for DuckDbHttpConfig {
             endpoint,
             tls_skip_verify,
             auth,
+            max_result_buffer_bytes: crate::duckdb::parse_max_result_buffer_from_json(
+                json,
+                cluster_name,
+            )?,
         })
     }
 
@@ -86,6 +91,10 @@ impl crate::EngineConfigParseable for DuckDbHttpConfig {
             endpoint,
             tls_skip_verify,
             auth,
+            max_result_buffer_bytes: crate::duckdb::parse_max_result_buffer_bytes(
+                cfg.max_result_buffer_bytes,
+                cluster_name,
+            )?,
         })
     }
 }
@@ -107,6 +116,7 @@ pub struct DuckDbHttpAdapter {
     pub group_name: ClusterGroupName,
     endpoint: String,
     client: Client,
+    max_result_buffer_bytes: usize,
 }
 
 /// Parsed NDJSON response from the DuckDB HTTP server.
@@ -199,13 +209,13 @@ impl DuckDbHttpAdapter {
             group_name,
             endpoint,
             client,
+            max_result_buffer_bytes: config.max_result_buffer_bytes,
         })
     }
 
-    async fn run_query(&self, sql: &str) -> Result<HttpQueryResponse> {
+    async fn read_body_capped(&self, sql: &str, cap: usize) -> Result<Vec<u8>> {
         let url = format!("{}/", self.endpoint);
-
-        let resp = self
+        let mut resp = self
             .client
             .post(&url)
             .body(sql.to_string())
@@ -213,16 +223,97 @@ impl DuckDbHttpAdapter {
             .await
             .map_err(|e| QueryFluxError::Engine(format!("DuckDB HTTP request failed: {e}")))?;
 
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-
-        if !status.is_success() {
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
             return Err(QueryFluxError::Engine(format!(
                 "DuckDB HTTP server returned {status}: {body}"
             )));
         }
 
-        HttpQueryResponse::parse(&body)
+        let mut body: Vec<u8> = Vec::new();
+        while let Some(chunk) = resp
+            .chunk()
+            .await
+            .map_err(|e| QueryFluxError::Engine(format!("DuckDB HTTP read failed: {e}")))?
+        {
+            if body.len() + chunk.len() > cap {
+                return Err(QueryFluxError::Engine(format!(
+                    "DuckDB HTTP result exceeded the {cap}-byte buffered-result cap; \
+                     add a LIMIT, narrow the query, or raise maxResultBufferBytes"
+                )));
+            }
+            body.extend_from_slice(&chunk);
+        }
+        Ok(body)
+    }
+
+    fn clone_for_task(&self) -> Self {
+        Self {
+            cluster_name: self.cluster_name.clone(),
+            group_name: self.group_name.clone(),
+            endpoint: self.endpoint.clone(),
+            client: self.client.clone(),
+            max_result_buffer_bytes: self.max_result_buffer_bytes,
+        }
+    }
+
+    async fn run_query(&self, sql: &str) -> Result<HttpQueryResponse> {
+        let body = self
+            .read_body_capped(sql, self.max_result_buffer_bytes)
+            .await?;
+        let text = std::str::from_utf8(&body).map_err(|e| {
+            QueryFluxError::Engine(format!("DuckDB HTTP response is not valid UTF-8: {e}"))
+        })?;
+        HttpQueryResponse::parse(text)
+    }
+
+    async fn stream_ndjson_to_batches(
+        body: &[u8],
+        batch_tx: &tokio::sync::mpsc::Sender<Result<RecordBatch>>,
+    ) -> Result<()> {
+        const BATCH_SIZE: usize = 8_192;
+        let text = std::str::from_utf8(body).map_err(|e| {
+            QueryFluxError::Engine(format!("DuckDB HTTP response is not valid UTF-8: {e}"))
+        })?;
+        let mut column_names: Vec<String> = Vec::new();
+        let mut rows: Vec<Vec<serde_json::Value>> = Vec::new();
+
+        for line in text.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let obj: serde_json::Map<String, serde_json::Value> = serde_json::from_str(line)
+                .map_err(|e| {
+                    QueryFluxError::Engine(format!("Failed to parse DuckDB HTTP NDJSON line: {e}"))
+                })?;
+            if column_names.is_empty() {
+                column_names = obj.keys().cloned().collect();
+            }
+            let row: Vec<serde_json::Value> = column_names
+                .iter()
+                .map(|k| obj.get(k).cloned().unwrap_or(serde_json::Value::Null))
+                .collect();
+            rows.push(row);
+            if rows.len() >= BATCH_SIZE {
+                let response = HttpQueryResponse {
+                    column_names: column_names.clone(),
+                    rows: std::mem::take(&mut rows),
+                };
+                let batch = response_to_record_batch(response)?;
+                if batch_tx.send(Ok(batch)).await.is_err() {
+                    return Ok(());
+                }
+            }
+        }
+
+        if !rows.is_empty() || !column_names.is_empty() {
+            let response = HttpQueryResponse { column_names, rows };
+            let batch = response_to_record_batch(response)?;
+            let _ = batch_tx.send(Ok(batch)).await;
+        }
+        Ok(())
     }
 }
 
@@ -244,16 +335,39 @@ impl SyncAdapter for DuckDbHttpAdapter {
         _tags: &QueryTags,
         _params: &queryflux_core::params::QueryParams,
         _hints: queryflux_core::sql_classify::ExecutionHints,
+        _id_slot: &BackendQueryIdSlot,
     ) -> Result<SyncExecution> {
-        debug!(cluster = %self.cluster_name, "Executing DuckDB HTTP query");
-        let response = self.run_query(sql).await?;
-        let batch = response_to_record_batch(response)?;
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        let _ = tx.send(None);
-        let stream = Box::pin(stream::iter(vec![Ok(batch)]));
+        // Community httpserver has no cancel API — leave the slot unset so
+        // dispatch does not record a fake backend id or spawn a no-op cancel.
+        // Dropping this future aborts the HTTP request (best-effort).
+        debug!(
+            cluster = %self.cluster_name,
+            attempt_id = %uuid::Uuid::new_v4(),
+            "Executing DuckDB HTTP query"
+        );
+
+        let (batch_tx, batch_rx) = tokio::sync::mpsc::channel(32);
+        let (stats_tx, stats_rx) = tokio::sync::oneshot::channel();
+        let adapter = self.clone_for_task();
+        let sql = sql.to_string();
+
+        tokio::spawn(async move {
+            let result = async {
+                let body = adapter
+                    .read_body_capped(&sql, adapter.max_result_buffer_bytes)
+                    .await?;
+                DuckDbHttpAdapter::stream_ndjson_to_batches(&body, &batch_tx).await
+            }
+            .await;
+            if let Err(e) = result {
+                let _ = batch_tx.send(Err(e)).await;
+            }
+            let _ = stats_tx.send(None);
+        });
+
         Ok(SyncExecution {
-            stream,
-            stats: rx,
+            stream: Box::pin(ReceiverStream::new(batch_rx)),
+            stats: stats_rx,
             affected_rows: None,
         })
     }
@@ -549,6 +663,14 @@ impl DuckDbHttpAdapter {
                     field_type: FieldType::Boolean,
                     required: false,
                     example: Some("false"),
+                },
+                ConfigField {
+                    key: "maxResultBufferBytes",
+                    label: "Max result buffer (bytes)",
+                    description: "Per-query cap on buffered HTTP response / Arrow bytes. Defaults to 1 GiB.",
+                    field_type: FieldType::Number,
+                    required: false,
+                    example: Some("1073741824"),
                 },
             ],
         }

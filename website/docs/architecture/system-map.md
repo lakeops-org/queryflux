@@ -7,49 +7,110 @@ image: img/queryflux-hero-banner.png
 
 QueryFlux is a universal SQL query proxy and router. It accepts queries from clients over multiple protocols (Trino HTTP, PostgreSQL wire, MySQL wire, Arrow Flight SQL, and others), routes them to the appropriate backend engine, optionally translates the SQL dialect, and streams results back in the client's native format.
 
-**More documentation:** the [architecture documentation overview](./overview.md) indexes deeper topics — [motivation-and-goals.md](motivation-and-goals.md) (why the project exists), [query-translation.md](query-translation.md) (sqlglot and dialects), [routing-and-clusters.md](routing-and-clusters.md) (routers, groups, load balancing), [observability.md](observability.md) (Prometheus, Grafana, Studio, Admin API), [adding-support/overview.md](adding-support/overview.md) (Extending QueryFlux — backend, frontend).
+**More documentation:** the [architecture documentation overview](./overview.md) indexes deeper topics — [motivation-and-goals.md](motivation-and-goals.md) (why the project exists), [query-translation.md](query-translation.md) (sqlglot and dialects), [routing-and-clusters.md](routing-and-clusters.md) (routers, groups, load balancing), [cluster-variants-and-health.md](cluster-variants-and-health.md) (multi-warehouse variants, health/reconcile, distributed capacity), [observability.md](observability.md) (Prometheus, Grafana, Studio, Admin API), [adding-support/overview.md](adding-support/overview.md) (Extending QueryFlux — backend, frontend).
 
 ---
 
-## High-Level Flow
+## High-level flow
 
-```
-Client (Trino CLI / psql / mysql / DBI)
-        │  native protocol
-        ▼
-┌───────────────────┐
-│  Frontend Listener │  ← speaks the client's wire protocol
-└────────┬──────────┘
-         │ SQL + SessionContext
-         ▼
-┌───────────────────┐
-│   Router Chain    │  ← selects target cluster group
-└────────┬──────────┘
-         │ ClusterGroupName
-         ▼
-┌───────────────────┐
-│ ClusterGroupManager│ ← load-balances across clusters; queues if at capacity
-└────────┬──────────┘
-         │ ClusterName
-         ▼
-┌───────────────────┐
-│ Translation Service│ ← sqlglot via PyO3; skipped when dialects match
-└────────┬──────────┘
-         │ translated SQL
-         ▼
-┌───────────────────┐
-│  Engine Adapter   │  ← speaks the backend engine's native protocol
-└────────┬──────────┘
-         │ QueryExecution (Async | Sync)
-         ▼
-┌───────────────────┐
-│   Persistence     │  ← stores in-flight state for async engines
-└───────────────────┘
+```mermaid
+%%{init: {'theme': 'base', 'themeVariables': {
+  'primaryColor': '#f5f3ff',
+  'primaryTextColor': '#3b0764',
+  'primaryBorderColor': '#7c3aed',
+  'lineColor': '#8b5cf6',
+  'fontFamily': 'Manrope Variable, Manrope, system-ui, sans-serif'
+}}}%%
+flowchart TD
+    Client(["Client<br/>Trino CLI / psql / mysql / DBI"])
+    Frontend["Frontend Listener<br/><i>speaks the client's wire protocol</i>"]
+    Router["Router Chain<br/><i>selects target cluster group</i>"]
+    ClusterMgr["ClusterGroupManager<br/><i>load-balances across clusters; queues if at capacity</i>"]
+    Translation["Translation Service<br/><i>sqlglot via PyO3; skipped when dialects match</i>"]
+    Adapter["Engine Adapter<br/><i>speaks the backend engine's native protocol</i>"]
+    Persistence[("Persistence<br/><i>stores in-flight state for async engines</i>")]
+
+    Client -->|native protocol| Frontend
+    Frontend -->|SQL + SessionContext| Router
+    Router -->|ClusterGroupName| ClusterMgr
+    ClusterMgr -->|ClusterName| Translation
+    Translation -->|translated SQL| Adapter
+    Adapter -->|"QueryExecution (Async \| Sync)"| Persistence
+
+    classDef stage fill:#faf5ff,stroke:#7c3aed,stroke-width:1.5px,color:#3b0764,rx:8,ry:8
+    class Frontend,Router,ClusterMgr,Translation,Adapter stage
+    classDef endpoint fill:#7c3aed,stroke:#5b21b6,stroke-width:1.5px,color:#fff
+    class Client,Persistence endpoint
 ```
 
-The frontend never knows which engine it's talking to. The engine adapter never knows which client protocol was used. The dispatch layer in the middle is the only place that bridges them.
+| Step | Component | What happens |
+|---|---|---|
+| **① Client** | Any supported driver or CLI | Sends SQL over Trino HTTP, PostgreSQL wire, MySQL wire, Flight SQL, Snowflake, etc. |
+| **② Frontend** | `queryflux-frontend` | Parses the wire protocol, builds `SessionContext`, hands SQL to dispatch. |
+| **③ Router** | `queryflux-routing` | Evaluates the router chain; picks a **cluster group** (or falls back to `routingFallback`). |
+| **④ Cluster manager** | `queryflux-cluster-manager` | Picks a healthy member cluster, enforces capacity (local counters or shared leases in distributed mode), may queue if the group is full. |
+| **⑤ Translation** | `queryflux-translation` | Rewrites SQL when client dialect ≠ engine dialect; skipped when they already match. |
+| **⑥ Engine** | `queryflux-engine-adapters` | Runs the query on Trino, DuckDB, StarRocks, Athena, or an ADBC SaaS warehouse. |
 
-When the backend's connection format matches the frontend protocol (e.g. `mysql_async` backend → MySQL wire client), dispatch takes a **native path** that skips Arrow entirely — driver values are text-encoded directly into the client's wire format with no columnar allocation in between.
+**After dispatch**, async engines (Trino, Athena) store an in-flight handle in the **persistence layer** so the client can poll until completion. Sync engines return results in one round trip.
+
+**Result paths back to the client:**
+
+| Path | When | Behavior |
+|---|---|---|
+| **Async poll** | Trino-style groups | Submit → persist handle → client polls proxy `nextUri` until done |
+| **Sync Arrow** | Most frontend/backend pairs | Stream `RecordBatch`es, re-encode to the client protocol |
+| **Sync native** | Matching wire formats (e.g. MySQL → StarRocks) | Stream driver-native chunks — no Arrow allocation |
+
+The frontend never knows which engine ran the query. The adapter never knows which client protocol was used.
+
+---
+
+## Operations and persistence
+
+QueryFlux separates **query traffic** (frontends, routing, engines) from **operational state** (config, in-flight queries, metrics history). Studio and Prometheus reach the **Admin API** on port `9000`; the query proxy uses the same process but different listeners.
+
+```mermaid
+flowchart LR
+    ST[Studio] --> ADM[Admin API]
+    PR[Prometheus] --> ADM
+
+    subgraph QF[QueryFlux replica]
+        ADM
+        PX[Query proxy]
+    end
+
+    ADM --> STORE
+    PX --> STORE
+
+    subgraph STORE[Persistence backend]
+        direction TB
+        CFG[Config]
+        STATE[In-flight state]
+        HIST[History]
+        COORD[Coordination]
+    end
+```
+
+**Persistence backends today:**
+
+| Backend | Config | In-flight / queued queries | Query history | Multi-replica coordination |
+|---|---|---|---|---|
+| **In-memory** | YAML only (no Studio CRUD) | Per-process | Not persisted | Not available |
+| **Postgres** | Hot-reload from DB + Studio | Shared across restarts | Studio dashboards | Optional (`distributed: true`) |
+
+The **coordination** bucket (capacity leases, reconcile running counts, queue claims) is only used when a durable backend implements `DistributedBackendStore` — Postgres today. Single-replica Postgres deployments use config, state, and history only.
+
+**Background tasks** (every replica, timers in `main.rs`):
+
+| Task | Interval | Does |
+|---|---|---|
+| Config reload | 30s (configurable) | Re-read routing config when using a durable backend |
+| Health check | 30s | Probe backends; mark clusters unhealthy |
+| Reconcile | 30s | Sync running counts with engine ground truth; in distributed mode one leader publishes, others read |
+| Metrics snapshot | 5s | Publish cluster utilization to Prometheus |
+
+Distributed multi-replica details: **[Cluster variants, health checks & reconciliation](./cluster-variants-and-health.md#distributed-mode-and-capacitystore)**.
 
 ---
 
@@ -122,25 +183,21 @@ QueryExecution::Sync { result: QueryPollResult }
 | Trino | Async | Submit → poll `nextUri` until done |
 | DuckDB | Sync | Runs on `spawn_blocking`, result available immediately |
 | StarRocks | Sync | MySQL protocol, single round-trip |
-| ClickHouse | — | Planned |
+| ClickHouse | Sync | HTTP interface, `ArrowStream` response decoded to Arrow record batches |
 
-### EngineAdapterTrait (`queryflux-engine-adapters`)
+### Engine adapters (`queryflux-engine-adapters`)
+
+There is no single `EngineAdapterTrait`. Engines implement **`SyncAdapter`** (DuckDB, StarRocks, ClickHouse, ADBC) or **`AsyncAdapter`** (Trino, Athena).
 
 ```rust
-pub trait EngineAdapterTrait: Send + Sync {
-    async fn submit_query(&self, sql: &str, session: &SessionContext) -> Result<QueryExecution>;
-    async fn poll_query(&self, backend_id: &BackendQueryId, next_uri: Option<&str>) -> Result<QueryPollResult>;
-    async fn cancel_query(&self, backend_id: &BackendQueryId) -> Result<()>;
-    async fn health_check(&self) -> bool;
-    fn engine_type(&self) -> EngineType;
+// SyncAdapter — execute_as_arrow / optional execute_native
+async fn cancel_query(&self, backend_id: &BackendQueryId) -> Result<()>; // default no-op
 
-    // Catalog discovery — feeds schema context for translation
-    async fn list_catalogs(&self) -> Result<Vec<String>>;
-    async fn list_databases(&self, catalog: &str) -> Result<Vec<String>>;
-    async fn list_tables(&self, catalog: &str, db: &str) -> Result<Vec<String>>;
-    async fn describe_table(&self, catalog: &str, db: &str, table: &str) -> Result<Option<TableSchema>>;
-}
+// AsyncAdapter — submit_query + poll_query
+async fn cancel_query(&self, backend_id: &BackendQueryId) -> Result<()>; // required
 ```
+
+On the sync path, dispatch holds a `SyncCancelGuard`. Adapters publish a `BackendQueryId` into a shared slot as soon as the engine id is known (before the blocking wait). If the client disconnects, the guard calls `cancel_query` (ClickHouse `KILL QUERY WHERE query_id = …`, StarRocks `KILL QUERY <connection_id>`, DuckDB `interrupt()`, Athena `StopQueryExecution`, Trino `DELETE /v1/query/{id}`). DuckDB HTTP and ADBC have no cross-thread kill API — cancel is a documented no-op; dropping the HTTP request is best-effort.
 
 ### RouterTrait (`queryflux-routing`)
 
@@ -189,10 +246,11 @@ pub trait RouterTrait: Send + Sync {
 |---|---|---|---|
 | Trino (HTTP) | **Done** | `TrinoHttp` | Async — transparent `nextUri` proxying; raw bytes, zero copy |
 | Trino (ADBC) | **Done** | `Arrow` | Sync — ADBC driver, Arrow result set |
+| ADBC (Snowflake, Databricks, BigQuery, Redshift, …) | **Done** | `Arrow` | Sync — ADBC driver; built-in health/reconcile introspection for SaaS warehouses |
 | DuckDB | **Done** | `Arrow` | Sync embedded — `spawn_blocking` + Arrow result set |
 | StarRocks | **Done** | `MysqlWire` | Sync — `mysql_async` pool; native path (zero Arrow) for MySQL wire clients |
 | Athena | **Done** | `Arrow` | Async AWS SDK — `StartQueryExecution` → poll → `GetQueryResults` |
-| ClickHouse | Planned | `MysqlWire` / `Arrow` / `ClickHouseHttp` | Depends on configured connection type |
+| ClickHouse | **Done** | `Arrow` | Sync — HTTP interface (`default_format=ArrowStream`), Arrow result set |
 
 ### Routers
 
@@ -207,11 +265,15 @@ pub trait RouterTrait: Send + Sync {
 
 ### Persistence
 
-| Store | Status | Use case |
+Persistence is pluggable behind traits in `queryflux-persistence` (`Persistence`, `MetricsStore`, `ClusterConfigStore`, `CapacityStore`, …). The binary wires an **in-memory** or **Postgres** implementation today.
+
+| Backend | Status | Use case |
 |---|---|---|
-| In-memory (`DashMap`) | **Done** | Single-instance dev |
-| PostgreSQL (JSONB) | **Done** | Production / HA |
-| Redis | Planned | Distributed |
+| In-memory (`DashMap`) | **Done** | Single-instance dev; config from YAML |
+| PostgreSQL (JSONB) | **Done** | Durable config, query history, in-flight state, optional distributed coordination |
+| Redis | Planned | Faster shared state; routing config would stay on the durable store |
+
+**Distributed coordination** (`queryflux.distributed: true` + a backend that implements `DistributedBackendStore`, Postgres today): fleet-wide capacity leases, reconcile-published running counts, and queue claims. See **[Cluster variants, health checks & reconciliation](./cluster-variants-and-health.md#distributed-mode-and-capacitystore)**.
 
 ### Metrics
 
@@ -229,8 +291,8 @@ pub trait RouterTrait: Send + Sync {
 | `queryflux_queries_total` | Counter | `engine_type`, `cluster_group`, `status`, `protocol` |
 | `queryflux_query_duration_seconds` | Histogram | `engine_type`, `cluster_group` |
 | `queryflux_translated_queries_total` | Counter | `src_dialect`, `tgt_dialect` |
-| `queryflux_running_queries` | Gauge | `cluster_group`, `cluster_name` |
-| `queryflux_queued_queries` | Gauge | `cluster_group` |
+| `queryflux_running_queries` | Gauge | `cluster_group`, `cluster_name` | Running queries per cluster; in distributed mode reflects reconcile-published engine ground truth |
+| `queryflux_queued_queries` | Gauge | `cluster_group` | Queries waiting for a free cluster slot |
 
 ---
 
@@ -375,4 +437,5 @@ curl -s -X POST http://localhost:8080/v1/statement \
 | P1 | Athena backend | **Done** |
 | P1 | Authentication / authorization (`queryflux-auth`) | **Done** |
 | P2 | Wire `SchemaContext` from catalog into dispatch | Planned |
-| P3 | ClickHouse HTTP backend + frontend | Planned |
+| P3 | ClickHouse backend (HTTP, Arrow) | **Done** |
+| P3 | ClickHouse HTTP frontend | Planned |

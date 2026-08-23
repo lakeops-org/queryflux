@@ -58,6 +58,34 @@ routers:
 routingFallback: trino-default
 ```
 
+## Authentication, authorization & backend identity
+
+```yaml
+auth:
+  provider: oidc              # none | static | oidc | ldap
+  required: true
+  oidc:
+    issuer: https://keycloak.internal/realms/my-realm
+    jwksUri: https://keycloak.internal/realms/my-realm/protocol/openid-connect/certs
+    audience: queryflux
+
+authorization:
+  provider: none               # none | openfga
+
+clusters:
+  trino-1:
+    engine: trino
+    endpoint: https://trino.internal:8443
+    auth:                      # Type 1 — QueryFlux's own service credential
+      type: basic
+      username: qf_svc
+      password: "..."
+    queryAuth:
+      type: impersonate         # serviceAccount | passthrough | impersonate | tokenExchange
+```
+
+`auth` controls who can authenticate to QueryFlux; `authorization` controls which cluster groups they can route to; `clusters[].queryAuth` controls which identity the query runs as on the backend engine — independent of the client's own credential. See **[Authentication & identity](./authentication)** for the full picture, a decision guide for `queryAuth` modes, and per-engine setup requirements.
+
 ## Admin API
 
 ```yaml
@@ -73,6 +101,32 @@ queryflux:
 Environment variables `QUERYFLUX_ADMIN_USER` and `QUERYFLUX_ADMIN_PASSWORD` override the YAML fields and follow the same bootstrap semantics.
 
 See **[Studio & Admin Auth](./studio)** for the full credential priority rules and password-change instructions.
+
+## Persistence and distributed mode
+
+```yaml
+queryflux:
+  persistence:
+    type: postgres
+    postgres:
+      url: postgres://queryflux:queryflux@localhost:5433/queryflux
+  # Optional — defaults to true when postgres persistence is configured
+  distributed: true
+  configReloadIntervalSecs: 30
+```
+
+With **Postgres persistence** and **`distributed: true`** (the default when Postgres is configured), multiple QueryFlux replicas coordinate through Postgres:
+
+| Concern | Mechanism |
+|---|---|
+| Config hot-reload | `configReloadIntervalSecs` + immediate reload on Admin API writes |
+| Fleet-wide `maxRunningQueries` | Capacity leases in `cluster_capacity_leases` (`try_acquire` / `release`) |
+| Engine running counts | Reconcile sweep publishes to `cluster_capacity_counters.running` |
+| Queued query dispatch | Claim columns on `queued_queries` — one replica per query |
+
+Set `distributed: false` to run Postgres-backed persistence without cross-replica coordination (single replica or explicit opt-out).
+
+Helm / Kubernetes: see **[charts/queryflux/README.md](https://github.com/lakeops-org/queryflux/blob/main/charts/queryflux/README.md#persistence-and-replicas)**. Full behavior: **[Cluster variants, health checks & reconciliation](./architecture/cluster-variants-and-health#distributed-mode-and-capacitystore)**.
 
 ## Query Cache
 
@@ -105,3 +159,44 @@ clusterGroups:
 ---
 
 `config.example.yaml`, `config.local.yaml`, and the serde types in `queryflux-core` (`config.rs`) are the authoritative reference. For routing semantics and `clusterGroups`, see **[Routing and clusters](/docs/architecture/routing-and-clusters)**.
+
+## Cluster variants (multi-warehouse)
+
+A single cluster config can define **`variants`**: named overrides that expand into separate runtime clusters at load time. Use this when one credential set targets multiple Snowflake warehouses, Databricks SQL warehouses, BigQuery projects, or similar.
+
+```yaml
+clusters:
+  my-snowflake:
+    engine: adbc
+    driver: snowflake
+    uri: svc_user@myaccount/mydb/myschema
+    auth:
+      type: keyPair
+      username: SVC_ACCOUNT
+      privateKeyPem: "..."
+    # Optional — leave empty to use built-in Snowflake introspection
+    healthCheckQuery: "SHOW WAREHOUSES LIKE '{{sub_resource}}'"
+    variants:
+      - name: analytics
+        overrides:
+          warehouse: ANALYTICS_WH
+      - name: etl
+        overrides:
+          warehouse: ETL_WH
+          maxRunningQueries: 5
+
+clusterGroups:
+  snowflake-pool:
+    maxRunningQueries: 20
+    members:
+      - my-snowflake::analytics
+      - my-snowflake::etl
+```
+
+**Rules:**
+
+- Runtime names are `{base}::{variant_name}` (for example `my-snowflake::analytics`).
+- A cluster **with** variants does not create a runtime cluster for the base name alone.
+- `healthCheckQuery` and `reconcileQuery` are set on the **base** config; `{{sub_resource}}` is substituted per variant.
+
+Full details: **[Cluster variants, health checks & reconciliation](./architecture/cluster-variants-and-health)**.

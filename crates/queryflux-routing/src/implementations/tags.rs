@@ -7,7 +7,7 @@ use queryflux_core::{
     tags::QueryTags,
 };
 
-use crate::RouterTrait;
+use crate::{RouterTrait, RoutingDecision};
 
 /// Routes queries based on tag key+value matching.
 ///
@@ -41,19 +41,21 @@ impl RouterTrait for TagsRouter {
         session: &SessionContext,
         _frontend_protocol: &FrontendProtocol,
         _auth_ctx: Option<&queryflux_auth::AuthContext>,
-    ) -> Result<Option<ClusterGroupName>> {
+    ) -> Result<RoutingDecision> {
         let session_tags = session.tags();
         if session_tags.is_empty() {
-            return Ok(None);
+            return Ok(RoutingDecision::NoMatch);
         }
 
         for rule in &self.rules {
             if rule_matches(&rule.tags, session_tags) {
-                return Ok(Some(ClusterGroupName(rule.target_group.clone())));
+                return Ok(RoutingDecision::Route(ClusterGroupName(
+                    rule.target_group.clone(),
+                )));
             }
         }
 
-        Ok(None)
+        Ok(RoutingDecision::NoMatch)
     }
 }
 
@@ -82,7 +84,7 @@ mod tests {
     };
 
     use super::TagsRouter;
-    use crate::RouterTrait;
+    use crate::{RouterTrait, RoutingDecision};
 
     fn group(name: &str) -> queryflux_core::query::ClusterGroupName {
         queryflux_core::query::ClusterGroupName(name.to_string())
@@ -121,7 +123,7 @@ mod tests {
             .route("SELECT 1", &session, &FrontendProtocol::MySqlWire, None)
             .await
             .unwrap();
-        assert_eq!(result, Some(group("engineering")));
+        assert_eq!(result, Some(group("engineering")).into());
     }
 
     #[tokio::test]
@@ -135,7 +137,7 @@ mod tests {
             .route("SELECT 1", &session, &FrontendProtocol::MySqlWire, None)
             .await
             .unwrap();
-        assert_eq!(result, None);
+        assert_eq!(result, RoutingDecision::NoMatch);
     }
 
     #[tokio::test]
@@ -149,7 +151,7 @@ mod tests {
             .route("SELECT 1", &session, &FrontendProtocol::MySqlWire, None)
             .await
             .unwrap();
-        assert_eq!(result, Some(group("batch-cluster")));
+        assert_eq!(result, Some(group("batch-cluster")).into());
     }
 
     #[tokio::test]
@@ -163,7 +165,7 @@ mod tests {
             .route("SELECT 1", &session, &FrontendProtocol::MySqlWire, None)
             .await
             .unwrap();
-        assert_eq!(result, Some(group("batch-cluster")));
+        assert_eq!(result, Some(group("batch-cluster")).into());
     }
 
     #[tokio::test]
@@ -181,7 +183,7 @@ mod tests {
             .route("SELECT 1", &session, &FrontendProtocol::MySqlWire, None)
             .await
             .unwrap();
-        assert_eq!(result, None);
+        assert_eq!(result, RoutingDecision::NoMatch);
     }
 
     #[tokio::test]
@@ -201,7 +203,7 @@ mod tests {
             .route("SELECT 1", &session, &FrontendProtocol::MySqlWire, None)
             .await
             .unwrap();
-        assert_eq!(result, Some(group("first")));
+        assert_eq!(result, Some(group("first")).into());
     }
 
     #[tokio::test]
@@ -215,7 +217,7 @@ mod tests {
             .route("SELECT 1", &session, &FrontendProtocol::TrinoHttp, None)
             .await
             .unwrap();
-        assert_eq!(result, Some(group("analytics")));
+        assert_eq!(result, Some(group("analytics")).into());
     }
 
     #[tokio::test]
@@ -229,7 +231,7 @@ mod tests {
             .route("SELECT 1", &session, &FrontendProtocol::MySqlWire, None)
             .await
             .unwrap();
-        assert_eq!(result, None);
+        assert_eq!(result, RoutingDecision::NoMatch);
     }
 
     #[tokio::test]
@@ -243,6 +245,6 @@ mod tests {
             .route("SELECT 1", &session, &FrontendProtocol::MySqlWire, None)
             .await
             .unwrap();
-        assert_eq!(result, Some(group("engineering")));
+        assert_eq!(result, Some(group("engineering")).into());
     }
 }

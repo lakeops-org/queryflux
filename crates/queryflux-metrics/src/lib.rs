@@ -58,6 +58,12 @@ impl MetricsStore for MultiMetricsStore {
         }
     }
 
+    fn on_config_reload_failure(&self, stage: &str) {
+        for s in &self.stores {
+            s.on_config_reload_failure(stage);
+        }
+    }
+
     fn on_queue_full(&self, cluster_group: &str) {
         for s in &self.stores {
             s.on_queue_full(cluster_group);

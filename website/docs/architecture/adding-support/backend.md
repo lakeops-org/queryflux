@@ -61,7 +61,8 @@ Adapters implement one of two traits depending on their execution model:
 
 1. Add `src/your_engine/mod.rs` (or similar).
 2. Implement **`SyncAdapter`** or **`AsyncAdapter`** — pick the one that matches your engine's execution model. Copy the shape from StarRocks (`SyncAdapter`) or Trino (`AsyncAdapter`).
-   - Required methods: `execute_as_arrow` / `submit_query` + `poll_query` + `cancel_query`, `health_check`, `engine_type`, catalog helpers (`list_catalogs`, `list_databases`, `list_tables`, `describe_table`).
+   - **SyncAdapter** required methods: `execute_as_arrow`, `health_check`, `engine_type`, catalog helpers. Optional: `cancel_query` (default no-op) — override so a client disconnect can stop the engine query. Publish a **real** engine-side id into the `id_slot` argument *before* the blocking wait (ClickHouse `query_id`, StarRocks `CONNECTION_ID()`, Athena execution id, …). Leave the slot unset when the engine has no cancel API — do not publish a synthetic UUID.
+   - **AsyncAdapter** required methods: `submit_query` + `poll_query` + `cancel_query`, `health_check`, `engine_type`, catalog helpers.
 3. **Declare `connection_format()`** — this is how dispatch knows which result-encoding path to use:
 
    ```rust
@@ -81,6 +82,14 @@ Adapters implement one of two traits depending on their execution model:
 8. Export the module from `crates/queryflux-engine-adapters/src/lib.rs` and add **Cargo.toml** dependencies for any new client libraries.
 
 Use **`QueryFluxError::Engine(format!(...))`** and include the **`cluster_name_str`** argument in messages so logs show which cluster failed.
+
+#### ADBC SaaS drivers — health check and reconcile
+
+If you add an **ADBC** driver for a cloud warehouse with auto-suspend, implement **`AdbcIntrospection`** in `crates/queryflux-engine-adapters/src/adbc/` rather than defaulting to `SELECT 1` health checks (which resume warehouses). Wire it in `AdbcAdapter::build_introspection()`.
+
+Operators can still override probes with optional `healthCheckQuery` / `reconcileQuery` on the cluster config. Multi-warehouse setups use **cluster variants** — see **[Cluster variants, health checks & reconciliation](../cluster-variants-and-health.md)**.
+
+In **distributed mode**, the reconcile loop runs on one replica per cycle and publishes your introspection result to `cluster_capacity_counters.running` via `CapacityStore::publish_running_count`.
 
 ### Step 4 — Register the factory (`queryflux` binary)
 
@@ -103,7 +112,7 @@ You normally **do not** edit `queryflux-persistence` for engine-specific JSON ke
 
 ### Unimplemented placeholder
 
-Until the adapter exists, **`EngineConfig::ClickHouse`** (or similar) may **`bail!`** inside **`build_adapter`**. Replace that with a real arm when you implement the adapter.
+Until the adapter exists, your `EngineConfig` variant may **`bail!("Engine <name> not yet implemented")`** inside **`build_adapter`** (ClickHouse used this pattern before its adapter landed). Replace that with a real arm when you implement the adapter.
 
 ---
 

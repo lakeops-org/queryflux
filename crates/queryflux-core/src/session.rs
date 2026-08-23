@@ -195,6 +195,16 @@ impl SessionContext {
             .or_else(|| self.extra.get("client_name"))
             .map(|s| s.as_str())
     }
+
+    /// Drop hop-by-hop credentials so they are not persisted on queued/executing rows.
+    ///
+    /// Client `Authorization` must not be stored in Postgres JSON or replayed onto
+    /// a later poller's backend request.
+    pub fn without_auth_headers(mut self) -> Self {
+        self.extra.remove("authorization");
+        self.extra.remove("proxy-authorization");
+        self
+    }
 }
 
 #[cfg(test)]
@@ -273,6 +283,27 @@ mod tests {
         // SessionContext itself does no case folding.
         let s = session(None, None, &[("X-Trino-Source", "app")]);
         assert_eq!(s.client_source(), None); // uppercase key is not matched
+    }
+
+    #[test]
+    fn without_auth_headers_strips_credentials_keeps_session() {
+        let s = session(
+            Some("alice"),
+            Some("tpch"),
+            &[
+                ("authorization", "Bearer stolen"),
+                ("proxy-authorization", "Basic abc"),
+                ("x-trino-catalog", "hive"),
+            ],
+        )
+        .without_auth_headers();
+        assert!(!s.extra.contains_key("authorization"));
+        assert!(!s.extra.contains_key("proxy-authorization"));
+        assert_eq!(
+            s.extra.get("x-trino-catalog").map(String::as_str),
+            Some("hive")
+        );
+        assert_eq!(s.user(), Some("alice"));
     }
 
     #[test]

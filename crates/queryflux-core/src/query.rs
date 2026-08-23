@@ -122,6 +122,8 @@ pub enum EngineType {
     Exasol,
     /// ADBC adapter backed by a SingleStore driver (MySQL-compatible dialect).
     SingleStore,
+    /// Query never reached a backend engine (still queued or evicted before dispatch).
+    Undispatched,
     /// Result served from cache — no backend engine involved.
     Cache,
 }
@@ -145,6 +147,7 @@ impl EngineType {
             EngineType::Redshift => SqlDialect::Redshift,
             EngineType::Exasol => SqlDialect::Exasol,
             EngineType::SingleStore => SqlDialect::MySql,
+            EngineType::Undispatched => SqlDialect::Generic,
             EngineType::Cache => SqlDialect::Generic,
         }
     }
@@ -281,6 +284,51 @@ pub struct ExecutingQuery {
     /// True when a guard blocked this query at submit time.
     #[serde(default)]
     pub was_guard_blocked: bool,
+    /// Authenticated user who submitted the query. Used to reject poll/cancel
+    /// from a different subject (IDOR). Empty on rows written before this field
+    /// existed — those are treated as legacy and not ownership-checked.
+    #[serde(default)]
+    pub submitted_by: String,
+    /// Wire-level credential resolved at submit time, so poll/cancel requests — which
+    /// don't repeat the client's original headers — can re-apply the same auth the
+    /// backend accepted for the initial submit. `None` means `serviceAccount`: the
+    /// adapter's static cluster auth is sufficient and there's nothing extra to persist.
+    /// Absent on rows written before this field existed (`serviceAccount`-equivalent).
+    #[serde(default)]
+    pub wire_auth: Option<StoredWireAuth>,
+}
+
+/// Wire-level auth material persisted alongside an [`ExecutingQuery`] so poll/cancel can
+/// re-apply the exact credential used at submit time. Deliberately smaller than
+/// `QueryCredentials` (queryflux-auth) — it holds only what must survive a process
+/// restart / different-replica poll, not the resolution logic that produced it.
+///
+/// `Authorization` holds a live, reusable bearer/basic credential and is persisted as
+/// part of `ExecutingQuery` in the `executing_queries.data` JSONB column (plaintext at
+/// rest — see the "Persisted wire credentials" note in `auth-authz-design.md` for the
+/// accepted residual risk and the encryption-at-rest follow-up). `Debug` is implemented
+/// by hand below to redact it, so it never leaks through `{:?}` logging even though it's
+/// not encrypted at rest.
+#[derive(Clone, Serialize, Deserialize)]
+pub enum StoredWireAuth {
+    /// Exact `Authorization` header value to send (passthrough forward, or a
+    /// tokenExchange-resolved Bearer token already formatted as `"Bearer {token}"`).
+    Authorization(String),
+    /// Trino-only: `X-Trino-User` value to re-inject on every poll/cancel (impersonate).
+    ImpersonateUser(String),
+}
+
+impl std::fmt::Debug for StoredWireAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            StoredWireAuth::Authorization(_) => {
+                f.debug_tuple("Authorization").field(&"<redacted>").finish()
+            }
+            StoredWireAuth::ImpersonateUser(user) => {
+                f.debug_tuple("ImpersonateUser").field(user).finish()
+            }
+        }
+    }
 }
 
 // --- Query execution result model ---
@@ -297,6 +345,10 @@ pub struct QueuedQuery {
     pub last_accessed: DateTime<Utc>,
     /// How many times the client has polled. Used for exponential backoff.
     pub sequence: u64,
+    /// Authenticated user who enqueued the query. Dequeue/poll must match.
+    /// Empty on legacy rows — not ownership-checked.
+    #[serde(default)]
+    pub submitted_by: String,
 }
 
 /// Returned by `AsyncAdapter::submit_query`.
@@ -391,4 +443,59 @@ pub enum QueryStatus {
     Success,
     Failed,
     Cancelled,
+    /// Rejected by a routing deny rule before dispatch.
+    Denied,
+}
+
+#[cfg(test)]
+mod submitted_by_serde_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn stored_wire_auth_debug_redacts_the_authorization_value() {
+        let auth = StoredWireAuth::Authorization("Bearer super-secret-token".to_string());
+        let rendered = format!("{auth:?}");
+        assert!(!rendered.contains("super-secret-token"));
+        assert!(rendered.contains("redacted"));
+    }
+
+    #[test]
+    fn stored_wire_auth_debug_does_not_redact_the_impersonate_username() {
+        // Not a secret — matches what's already visible on the wire as X-Trino-User.
+        let auth = StoredWireAuth::ImpersonateUser("alice".to_string());
+        let rendered = format!("{auth:?}");
+        assert!(rendered.contains("alice"));
+    }
+
+    #[test]
+    fn executing_query_missing_submitted_by_defaults_empty() {
+        let v = json!({
+            "id": "p1",
+            "sql": "SELECT 1",
+            "cluster_group": "g",
+            "cluster_name": "c",
+            "backend_query_id": "b1",
+            "creation_time": "2026-01-01T00:00:00Z",
+            "last_accessed": "2026-01-01T00:00:00Z"
+        });
+        let q: ExecutingQuery = serde_json::from_value(v).expect("legacy executing row");
+        assert!(q.submitted_by.is_empty());
+    }
+
+    #[test]
+    fn queued_query_missing_submitted_by_defaults_empty() {
+        let mut v = json!({
+            "id": "p1",
+            "sql": "SELECT 1",
+            "frontend_protocol": "trinoHttp",
+            "cluster_group": "g",
+            "creation_time": "2026-01-01T00:00:00Z",
+            "last_accessed": "2026-01-01T00:00:00Z",
+            "sequence": 0
+        });
+        v["session"] = serde_json::to_value(SessionContext::default()).unwrap();
+        let q: QueuedQuery = serde_json::from_value(v).expect("legacy queued row");
+        assert!(q.submitted_by.is_empty());
+    }
 }

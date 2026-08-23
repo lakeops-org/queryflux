@@ -200,6 +200,13 @@ export interface ClusterUpdateRequest {
 // Persisted cluster / group config (requires Postgres persistence)
 // ---------------------------------------------------------------------------
 
+/** One variant that expands a base cluster into an independent runtime cluster. */
+export interface ClusterVariant {
+  name: string;
+  overrides?: Record<string, unknown>;
+  maxRunningQueries?: number | null;
+}
+
 /** Matches QueryFlux Admin API JSON (`#[serde(rename_all = "camelCase")]` on the Rust structs). */
 export interface ClusterConfigRecord {
   /** Stable surrogate key; group members reference these ids in Postgres. */
@@ -211,6 +218,8 @@ export interface ClusterConfigRecord {
   maxRunningQueries?: number | null;
   /** All engine-specific connection details (endpoint, auth, TLS, region, …). */
   config: Record<string, unknown>;
+  /** Sub-resource variants that expand this config into multiple runtime clusters. */
+  variants?: ClusterVariant[];
   createdAt: string;
   updatedAt: string;
 }
@@ -222,6 +231,8 @@ export interface UpsertClusterConfig {
   maxRunningQueries?: number | null;
   /** Engine-specific connection details. Schema depends on engineKey. */
   config: Record<string, unknown>;
+  /** Sub-resource variants. Each variant expands into an independent runtime cluster. */
+  variants?: ClusterVariant[];
 }
 
 /** Body for PATCH `/admin/config/clusters/{name}` and `/admin/config/groups/{name}`. */
@@ -343,11 +354,21 @@ export interface SecurityConfigDto {
   ldap: LdapConfigDto | null;
   /** Count of users when provider = "static". Passwords are never exposed. */
   static_user_count: number | null;
+  /** Usernames + groups/roles so a re-save does not wipe users. No passwords. */
+  static_user_summaries?: Array<{
+    username: string;
+    groups: string[];
+    roles: string[];
+  }>;
   /** "none" | "openfga" */
   authorization_provider: string;
   openfga: OpenFgaConfigDto | null;
   /** Per-cluster-group allow-lists (used when authorization_provider = "none"). */
   group_authorization: Record<string, GroupAuthzDto>;
+  /** IdP roles that may cancel any query. */
+  operator_roles?: string[];
+  /** IdP groups that may cancel any query. */
+  operator_groups?: string[];
 }
 
 export interface RoutingConfigDto {
@@ -403,6 +424,8 @@ export interface RouterConfigEntry {
         target_group?: string;
         targetGroup?: string;
         targetGroupId?: number;
+        action?: "route" | "deny";
+        error?: string;
       }
     | TagRoutingRule
   >;
@@ -443,6 +466,8 @@ export interface UpsertSecurityConfig {
   } | null;
   static_users?: Record<string, { password: string; groups?: string[]; roles?: string[] }> | null;
   authorization_provider: string;
+  operator_roles?: string[];
+  operator_groups?: string[];
   openfga?: {
     url: string;
     store_id: string;

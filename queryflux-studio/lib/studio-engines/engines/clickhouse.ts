@@ -1,4 +1,16 @@
+import type { FlatClusterForm } from "@/lib/cluster-form/types";
 import type { StudioEngineModule } from "@/lib/studio-engines/types";
+
+function validateClickHouseClusterFlat(flat: FlatClusterForm): string[] {
+  const raw = flat.maxResultBufferBytes?.trim();
+  if (raw) {
+    const n = Number(raw);
+    if (!Number.isInteger(n) || n < 1) {
+      return ["ClickHouse: max result buffer must be a positive integer (bytes)."];
+    }
+  }
+  return [];
+}
 
 export const clickHouseStudioEngine: StudioEngineModule = {
   descriptor: {
@@ -11,7 +23,7 @@ export const clickHouseStudioEngine: StudioEngineModule = {
     defaultPort: 8123,
     endpointExample: "http://clickhouse:8123",
     supportedAuth: ["basic"],
-    implemented: false,
+    implemented: true,
     configFields: [
       {
         key: "endpoint",
@@ -45,6 +57,15 @@ export const clickHouseStudioEngine: StudioEngineModule = {
         required: false,
       },
       {
+        key: "maxResultBufferBytes",
+        label: "Max result buffer (bytes)",
+        description:
+          "Per-query cap on the result bytes QueryFlux buffers in memory. Defaults to 1 GiB when omitted.",
+        fieldType: "number",
+        required: false,
+        example: "1073741824",
+      },
+      {
         key: "tls.insecureSkipVerify",
         label: "Skip TLS verification",
         description:
@@ -60,4 +81,5 @@ export const clickHouseStudioEngine: StudioEngineModule = {
     simpleIconSlug: "siClickhouse",
     catalogDescription: "Real-time OLAP database management system",
   },
+  validateFlat: validateClickHouseClusterFlat,
 };
