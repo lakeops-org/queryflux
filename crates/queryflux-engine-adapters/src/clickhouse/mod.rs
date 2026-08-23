@@ -468,7 +468,14 @@ fn find_last(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 }
 
 /// Decode a complete ArrowStream response body into record batches.
-/// An empty body (DDL, INSERT) decodes to no batches.
+///
+/// An empty body (DDL, INSERT) decodes to no batches — ClickHouse sends nothing at
+/// all for those. A `SELECT` matching zero rows is different: the HTTP body is
+/// non-empty (it still carries the Arrow IPC schema message), but `StreamReader`
+/// yields zero data batches. `StreamReader::schema()` reflects the real result
+/// schema regardless of row count, so when the reader produces nothing we forward
+/// one empty batch carrying it — otherwise dispatch never calls `on_schema` and the
+/// wire sinks misframe the empty result set as a DDL/DML OK response (#97-style).
 fn decode_arrow_stream(body: &[u8]) -> Result<Vec<RecordBatch>> {
     if body.is_empty() {
         return Ok(Vec::new());
@@ -476,9 +483,14 @@ fn decode_arrow_stream(body: &[u8]) -> Result<Vec<RecordBatch>> {
     let reader = StreamReader::try_new(Cursor::new(body), None).map_err(|e| {
         QueryFluxError::Engine(format!("ClickHouse Arrow stream schema read failed: {e}"))
     })?;
-    reader
+    let schema = reader.schema();
+    let mut batches = reader
         .collect::<std::result::Result<Vec<_>, _>>()
-        .map_err(|e| QueryFluxError::Engine(format!("ClickHouse Arrow decode failed: {e}")))
+        .map_err(|e| QueryFluxError::Engine(format!("ClickHouse Arrow decode failed: {e}")))?;
+    if batches.is_empty() {
+        batches.push(RecordBatch::new_empty(schema));
+    }
+    Ok(batches)
 }
 
 /// Split a `DESCRIBE TABLE` TSV line into a column definition.
@@ -1046,6 +1058,29 @@ mod tests {
     #[test]
     fn decode_empty_body_is_no_batches() {
         assert!(decode_arrow_stream(&[]).unwrap().is_empty());
+    }
+
+    /// Regression: a `SELECT` matching zero rows sends a non-empty HTTP body (the
+    /// Arrow IPC schema message) but zero data batches. Decoding that must not
+    /// collapse to "no batches" — dispatch relies on at least one `on_schema` call
+    /// to frame an empty result set instead of a DDL/DML-style OK response (#97).
+    #[test]
+    fn decode_schema_only_stream_yields_one_empty_batch_with_real_schema() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, true),
+        ]));
+        let empty_batch = RecordBatch::new_empty(Arc::clone(&schema));
+        let body = ipc_stream(std::slice::from_ref(&empty_batch));
+        assert!(
+            !body.is_empty(),
+            "a schema-only IPC stream must not be an empty HTTP body"
+        );
+
+        let decoded = decode_arrow_stream(&body).unwrap();
+        assert_eq!(decoded.len(), 1, "expected exactly one (empty) batch");
+        assert_eq!(decoded[0].num_rows(), 0);
+        assert_eq!(decoded[0].schema(), schema);
     }
 
     #[test]

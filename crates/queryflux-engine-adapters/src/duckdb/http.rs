@@ -102,8 +102,13 @@ impl crate::EngineConfigParseable for DuckDbHttpConfig {
 /// DuckDB remote HTTP server adapter.
 ///
 /// Targets the DuckDB community `httpserver` extension API:
-/// - POST `{endpoint}/query` with JSON body `{"query": "..."}`
-/// - Response: JSON with `columns` metadata and `rows` data
+/// - POST `{endpoint}/?default_format=JSONCompact` with the raw SQL as the request body.
+/// - Response: a single JSON object `{"meta": [{"name","type"}, ...], "data": [[...], ...],
+///   "rows": N, "statistics": {...}}` (see `result_serializer_compact_json.hpp` in
+///   quackscience/duckdb-extension-httpserver). Unlike the default `JSONEachRow`
+///   (NDJSON-per-row) format, `meta` always reflects the query's real result schema —
+///   even when `data` is empty — so a zero-row `SELECT` can still be framed as a proper
+///   empty result set instead of falling back to a DDL/DML-style OK response.
 ///
 /// Start a DuckDB HTTP server with:
 /// ```sql
@@ -119,42 +124,80 @@ pub struct DuckDbHttpAdapter {
     max_result_buffer_bytes: usize,
 }
 
-/// Parsed NDJSON response from the DuckDB HTTP server.
-/// Each row is a JSON object `{"col": value, ...}`.
+/// Parsed JSONCompact response from the DuckDB HTTP server.
+#[derive(Debug)]
 struct HttpQueryResponse {
-    /// Column names in order (derived from the first row's keys).
-    column_names: Vec<String>,
-    /// Row data: outer vec = rows, inner vec = column values in column_names order.
+    /// Column name + Arrow type, in positional order — always present (even for a
+    /// zero-row result) since it comes from `meta`, not inferred from row data.
+    columns: Vec<(String, DataType)>,
+    /// Row data: outer vec = rows, inner vec = column values in `columns` order.
     rows: Vec<Vec<serde_json::Value>>,
 }
 
 impl HttpQueryResponse {
     fn parse(body: &str) -> Result<Self> {
-        let mut column_names: Vec<String> = Vec::new();
-        let mut rows: Vec<Vec<serde_json::Value>> = Vec::new();
+        let root: serde_json::Value = serde_json::from_str(body).map_err(|e| {
+            QueryFluxError::Engine(format!(
+                "Failed to parse DuckDB HTTP JSONCompact response: {e}"
+            ))
+        })?;
 
-        for line in body.lines() {
-            let line = line.trim();
-            if line.is_empty() {
-                continue;
-            }
-            let obj: serde_json::Map<String, serde_json::Value> = serde_json::from_str(line)
-                .map_err(|e| {
-                    QueryFluxError::Engine(format!("Failed to parse DuckDB HTTP NDJSON line: {e}"))
-                })?;
+        let meta = root.get("meta").and_then(|m| m.as_array()).ok_or_else(|| {
+            QueryFluxError::Engine(
+                "DuckDB HTTP JSONCompact response missing 'meta' — expected \
+                 ?default_format=JSONCompact"
+                    .to_string(),
+            )
+        })?;
+        let columns: Vec<(String, DataType)> = meta
+            .iter()
+            .map(|col| {
+                let name = col
+                    .get("name")
+                    .and_then(|n| n.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let ty = col.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                (name, duckdb_type_to_arrow(ty))
+            })
+            .collect();
 
-            if column_names.is_empty() {
-                column_names = obj.keys().cloned().collect();
-            }
+        let rows: Vec<Vec<serde_json::Value>> = root
+            .get("data")
+            .and_then(|d| d.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|row| row.as_array().cloned())
+                    .collect()
+            })
+            .unwrap_or_default();
 
-            let row: Vec<serde_json::Value> = column_names
-                .iter()
-                .map(|k| obj.get(k).cloned().unwrap_or(serde_json::Value::Null))
-                .collect();
-            rows.push(row);
-        }
+        Ok(Self { columns, rows })
+    }
+}
 
-        Ok(Self { column_names, rows })
+/// Map a DuckDB `LogicalType::ToString()` name (as emitted in JSONCompact `meta[].type`,
+/// e.g. `"INTEGER"`, `"DECIMAL(10,2)"`, `"STRUCT(a INTEGER)"`) to an Arrow `DataType`.
+/// Only maps the types `build_array` below actually specializes for (Boolean, the
+/// integer family, the float family) — everything else DuckDB's serializer already
+/// emits as a JSON string (dates, timestamps, UUIDs, blobs, lists, structs, ...), so
+/// falling back to `Utf8` matches what's actually on the wire.
+fn duckdb_type_to_arrow(ty: &str) -> DataType {
+    if ty.contains('[') {
+        // LIST/ARRAY element type, e.g. "INTEGER[]". DuckDB's serializer emits
+        // these as nested JSON arrays, not scalars — mapping the element type
+        // here (e.g. to Int64) would feed a JSON array into `build_array`'s
+        // scalar-only Int64 parser, silently turning every value into NULL.
+        // Stringify via the Utf8 fallback instead.
+        return DataType::Utf8;
+    }
+    let base = ty.split('(').next().unwrap_or(ty).trim().to_uppercase();
+    match base.as_str() {
+        "BOOLEAN" => DataType::Boolean,
+        "TINYINT" | "SMALLINT" | "INTEGER" | "BIGINT" | "HUGEINT" | "UTINYINT" | "USMALLINT"
+        | "UINTEGER" | "UBIGINT" | "UHUGEINT" => DataType::Int64,
+        "FLOAT" | "DOUBLE" | "DECIMAL" => DataType::Float64,
+        _ => DataType::Utf8,
     }
 }
 
@@ -214,7 +257,7 @@ impl DuckDbHttpAdapter {
     }
 
     async fn read_body_capped(&self, sql: &str, cap: usize) -> Result<Vec<u8>> {
-        let url = format!("{}/", self.endpoint);
+        let url = format!("{}/?default_format=JSONCompact", self.endpoint);
         let mut resp = self
             .client
             .post(&url)
@@ -268,7 +311,17 @@ impl DuckDbHttpAdapter {
         HttpQueryResponse::parse(text)
     }
 
-    async fn stream_ndjson_to_batches(
+    /// Chunk a parsed JSONCompact response into `RecordBatch`es of at most
+    /// `BATCH_SIZE` rows. The whole body is already fully buffered by
+    /// `read_body_capped` (bounded by `max_result_buffer_bytes`) before this runs —
+    /// unlike the old NDJSON parser, JSONCompact is one JSON object, not an
+    /// incrementally-parseable line stream — so chunking here only bounds how much
+    /// gets copied into a single Arrow batch, not how much memory the response uses.
+    ///
+    /// Always sends at least one batch (possibly zero rows) carrying the real
+    /// schema from `meta`, so a genuinely empty `SELECT` is still framed as an
+    /// empty result set by dispatch, not misread as a DDL/DML OK response.
+    async fn stream_json_to_batches(
         body: &[u8],
         batch_tx: &tokio::sync::mpsc::Sender<Result<RecordBatch>>,
     ) -> Result<()> {
@@ -276,42 +329,27 @@ impl DuckDbHttpAdapter {
         let text = std::str::from_utf8(body).map_err(|e| {
             QueryFluxError::Engine(format!("DuckDB HTTP response is not valid UTF-8: {e}"))
         })?;
-        let mut column_names: Vec<String> = Vec::new();
-        let mut rows: Vec<Vec<serde_json::Value>> = Vec::new();
+        let HttpQueryResponse { columns, mut rows } = HttpQueryResponse::parse(text)?;
 
-        for line in text.lines() {
-            let line = line.trim();
-            if line.is_empty() {
-                continue;
-            }
-            let obj: serde_json::Map<String, serde_json::Value> = serde_json::from_str(line)
-                .map_err(|e| {
-                    QueryFluxError::Engine(format!("Failed to parse DuckDB HTTP NDJSON line: {e}"))
-                })?;
-            if column_names.is_empty() {
-                column_names = obj.keys().cloned().collect();
-            }
-            let row: Vec<serde_json::Value> = column_names
-                .iter()
-                .map(|k| obj.get(k).cloned().unwrap_or(serde_json::Value::Null))
-                .collect();
-            rows.push(row);
-            if rows.len() >= BATCH_SIZE {
-                let response = HttpQueryResponse {
-                    column_names: column_names.clone(),
-                    rows: std::mem::take(&mut rows),
-                };
-                let batch = response_to_record_batch(response)?;
-                if batch_tx.send(Ok(batch)).await.is_err() {
-                    return Ok(());
-                }
-            }
+        if rows.is_empty() {
+            let batch = response_to_record_batch(HttpQueryResponse { columns, rows })?;
+            let _ = batch_tx.send(Ok(batch)).await;
+            return Ok(());
         }
 
-        if !rows.is_empty() || !column_names.is_empty() {
-            let response = HttpQueryResponse { column_names, rows };
-            let batch = response_to_record_batch(response)?;
-            let _ = batch_tx.send(Ok(batch)).await;
+        while !rows.is_empty() {
+            let chunk: Vec<_> = if rows.len() > BATCH_SIZE {
+                rows.drain(..BATCH_SIZE).collect()
+            } else {
+                std::mem::take(&mut rows)
+            };
+            let batch = response_to_record_batch(HttpQueryResponse {
+                columns: columns.clone(),
+                rows: chunk,
+            })?;
+            if batch_tx.send(Ok(batch)).await.is_err() {
+                return Ok(());
+            }
         }
         Ok(())
     }
@@ -356,7 +394,7 @@ impl SyncAdapter for DuckDbHttpAdapter {
                 let body = adapter
                     .read_body_capped(&sql, adapter.max_result_buffer_bytes)
                     .await?;
-                DuckDbHttpAdapter::stream_ndjson_to_batches(&body, &batch_tx).await
+                DuckDbHttpAdapter::stream_json_to_batches(&body, &batch_tx).await
             }
             .await;
             if let Err(e) = result {
@@ -441,9 +479,12 @@ impl SyncAdapter for DuckDbHttpAdapter {
 // JSON → Arrow conversion
 // ---------------------------------------------------------------------------
 
-/// Convert a DuckDB HTTP NDJSON response into a single Arrow RecordBatch.
+/// Convert a parsed DuckDB HTTP JSONCompact response into a single Arrow RecordBatch.
+/// `response.columns` (from `meta`) is always populated with the real schema, even
+/// when `response.rows` is empty, so this builds a correctly-typed zero-row batch
+/// for an empty `SELECT` rather than an untyped, columnless one.
 fn response_to_record_batch(response: HttpQueryResponse) -> Result<RecordBatch> {
-    let n_cols = response.column_names.len();
+    let n_cols = response.columns.len();
     let n_rows = response.rows.len();
 
     if n_cols == 0 {
@@ -456,39 +497,18 @@ fn response_to_record_batch(response: HttpQueryResponse) -> Result<RecordBatch> 
     let mut fields: Vec<Field> = Vec::with_capacity(n_cols);
     let mut arrays: Vec<ArrayRef> = Vec::with_capacity(n_cols);
 
-    for (col_idx, col_name) in response.column_names.iter().enumerate() {
+    for (col_idx, (col_name, arrow_type)) in response.columns.iter().enumerate() {
         let col_values: Vec<Option<&serde_json::Value>> =
             response.rows.iter().map(|row| row.get(col_idx)).collect();
 
-        // Infer Arrow type from the first non-null value in the column.
-        let arrow_type = infer_arrow_type(&col_values);
         fields.push(Field::new(col_name, arrow_type.clone(), true));
-
-        let array = build_array(&arrow_type, &col_values, n_rows)?;
+        let array = build_array(arrow_type, &col_values, n_rows)?;
         arrays.push(array);
     }
 
     let schema = Arc::new(Schema::new(fields));
     RecordBatch::try_new(schema, arrays)
         .map_err(|e| QueryFluxError::Engine(format!("Failed to build RecordBatch: {e}")))
-}
-
-/// Infer an Arrow DataType from the first non-null JSON value in a column.
-fn infer_arrow_type(values: &[Option<&serde_json::Value>]) -> DataType {
-    let Some(v) = values.iter().flatten().next() else {
-        return DataType::Utf8;
-    };
-    match v {
-        serde_json::Value::Bool(_) => DataType::Boolean,
-        serde_json::Value::Number(n) => {
-            if n.is_f64() && n.as_i64().is_none() {
-                DataType::Float64
-            } else {
-                DataType::Int64
-            }
-        }
-        _ => DataType::Utf8,
-    }
 }
 
 /// Build an Arrow array from a column of JSON values.
@@ -703,5 +723,136 @@ impl crate::EngineAdapterFactory for DuckDbHttpFactory {
             group,
             config,
         )?)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Shape produced by `ResultSerializerCompactJson` in
+    /// quackscience/duckdb-extension-httpserver for a query matching zero rows —
+    /// `meta` still lists the real columns, `data` is an empty array.
+    const EMPTY_SELECT_RESPONSE: &str = r#"{
+        "meta": [
+            {"name": "id", "type": "INTEGER"},
+            {"name": "name", "type": "VARCHAR"}
+        ],
+        "data": [],
+        "rows": 0,
+        "statistics": {"elapsed": 0.001, "rows_read": 0, "bytes_read": 0}
+    }"#;
+
+    const TWO_ROW_RESPONSE: &str = r#"{
+        "meta": [
+            {"name": "id", "type": "BIGINT"},
+            {"name": "score", "type": "DOUBLE"},
+            {"name": "active", "type": "BOOLEAN"},
+            {"name": "label", "type": "VARCHAR"}
+        ],
+        "data": [
+            [1, 1.5, true, "a"],
+            [2, null, false, null]
+        ],
+        "rows": 2,
+        "statistics": {"elapsed": 0.001, "rows_read": 2, "bytes_read": 0}
+    }"#;
+
+    #[test]
+    fn duckdb_type_mapping_covers_the_common_families() {
+        assert_eq!(duckdb_type_to_arrow("BOOLEAN"), DataType::Boolean);
+        assert_eq!(duckdb_type_to_arrow("INTEGER"), DataType::Int64);
+        assert_eq!(duckdb_type_to_arrow("BIGINT"), DataType::Int64);
+        assert_eq!(duckdb_type_to_arrow("UBIGINT"), DataType::Int64);
+        assert_eq!(duckdb_type_to_arrow("DOUBLE"), DataType::Float64);
+        assert_eq!(duckdb_type_to_arrow("FLOAT"), DataType::Float64);
+        assert_eq!(duckdb_type_to_arrow("DECIMAL(10,2)"), DataType::Float64);
+        assert_eq!(duckdb_type_to_arrow("VARCHAR"), DataType::Utf8);
+        assert_eq!(duckdb_type_to_arrow("DATE"), DataType::Utf8);
+        assert_eq!(duckdb_type_to_arrow("TIMESTAMP"), DataType::Utf8);
+        assert_eq!(duckdb_type_to_arrow("STRUCT(a INTEGER)"), DataType::Utf8);
+        assert_eq!(duckdb_type_to_arrow("INTEGER[]"), DataType::Utf8);
+    }
+
+    /// Regression: a zero-row SELECT must still carry its real column schema —
+    /// this is the whole reason for switching from JSONEachRow (NDJSON, columns
+    /// only derivable from row data) to JSONCompact (`meta` always present).
+    #[test]
+    fn parse_empty_select_keeps_real_schema() {
+        let resp = HttpQueryResponse::parse(EMPTY_SELECT_RESPONSE).expect("parse");
+        assert_eq!(
+            resp.columns,
+            vec![
+                ("id".to_string(), DataType::Int64),
+                ("name".to_string(), DataType::Utf8),
+            ]
+        );
+        assert!(resp.rows.is_empty());
+
+        let batch = response_to_record_batch(resp).expect("build batch");
+        assert_eq!(batch.num_rows(), 0);
+        assert_eq!(batch.schema().fields().len(), 2);
+        assert_eq!(batch.schema().field(0).name(), "id");
+        assert_eq!(batch.schema().field(1).name(), "name");
+    }
+
+    #[test]
+    fn parse_populates_rows_and_types() {
+        let resp = HttpQueryResponse::parse(TWO_ROW_RESPONSE).expect("parse");
+        assert_eq!(resp.rows.len(), 2);
+        let batch = response_to_record_batch(resp).expect("build batch");
+        assert_eq!(batch.num_rows(), 2);
+        assert_eq!(batch.num_columns(), 4);
+    }
+
+    #[test]
+    fn parse_rejects_ndjson_missing_meta() {
+        // The old NDJSON-per-row format has no top-level `meta` — must fail loudly
+        // rather than silently misinterpreting the response.
+        let err = HttpQueryResponse::parse(r#"{"id": 1, "name": "a"}"#).unwrap_err();
+        assert!(err.to_string().contains("meta"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn stream_json_to_batches_empty_select_sends_one_zero_row_batch_with_schema() {
+        use futures::StreamExt;
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        DuckDbHttpAdapter::stream_json_to_batches(EMPTY_SELECT_RESPONSE.as_bytes(), &tx)
+            .await
+            .expect("stream");
+        drop(tx);
+        let batches: Vec<_> = tokio_stream::wrappers::ReceiverStream::new(rx)
+            .collect()
+            .await;
+        assert_eq!(batches.len(), 1, "expected exactly one batch");
+        let batch = batches[0].as_ref().expect("batch ok");
+        assert_eq!(batch.num_rows(), 0);
+        assert_eq!(batch.schema().fields().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn stream_json_to_batches_chunks_large_results() {
+        use futures::StreamExt;
+        let meta = r#"[{"name": "n", "type": "INTEGER"}]"#;
+        let data: Vec<String> = (0..20_000).map(|i| format!("[{i}]")).collect();
+        let body = format!(
+            r#"{{"meta": {meta}, "data": [{}], "rows": 20000}}"#,
+            data.join(",")
+        );
+
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        DuckDbHttpAdapter::stream_json_to_batches(body.as_bytes(), &tx)
+            .await
+            .expect("stream");
+        drop(tx);
+        let batches: Vec<_> = tokio_stream::wrappers::ReceiverStream::new(rx)
+            .collect()
+            .await;
+        assert!(batches.len() > 1, "20000 rows must span multiple batches");
+        let total: usize = batches
+            .iter()
+            .map(|b| b.as_ref().expect("batch ok").num_rows())
+            .sum();
+        assert_eq!(total, 20_000);
     }
 }

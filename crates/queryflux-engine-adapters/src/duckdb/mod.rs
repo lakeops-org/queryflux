@@ -314,8 +314,17 @@ impl SyncAdapter for DuckDbAdapter {
                 let arrow = stmt
                     .query_arrow(duckdb::params_from_iter(duckdb_params))
                     .map_err(|e| QueryFluxError::Engine(format!("DuckDB query failed: {e}")))?;
+                // `Arrow::get_schema` reads the prepared statement's schema directly —
+                // it reflects the query's real result schema even when the iterator
+                // yields zero batches (e.g. a SELECT matching no rows). Capture it
+                // before consuming so an empty result still carries its real columns:
+                // otherwise dispatch never calls `on_schema` and the wire sinks
+                // misframe the empty result set as a DDL/DML OK response (#97-style).
+                let schema = arrow.get_schema();
                 let mut buffered_bytes = 0usize;
+                let mut produced_any = false;
                 for batch in arrow {
+                    produced_any = true;
                     buffered_bytes = buffered_bytes.saturating_add(batch.get_array_memory_size());
                     if buffered_bytes > max_bytes {
                         return Err(QueryFluxError::Engine(format!(
@@ -326,6 +335,11 @@ impl SyncAdapter for DuckDbAdapter {
                     if batch_tx.blocking_send(Ok(batch)).is_err() {
                         return Ok(());
                     }
+                }
+                if !produced_any {
+                    let _ = batch_tx.blocking_send(Ok(
+                        duckdb::arrow::record_batch::RecordBatch::new_empty(schema),
+                    ));
                 }
                 Ok(())
             })();
@@ -921,6 +935,58 @@ mod tests {
             "expected multiple Arrow batches, got {batches}"
         );
         assert_eq!(rows, 2500);
+    }
+
+    /// Regression: a SELECT matching zero rows must still surface its real schema
+    /// as one empty batch — otherwise dispatch never calls `on_schema` and the
+    /// wire sinks misframe the empty result set as a DDL/DML OK response (#97-style).
+    #[tokio::test]
+    async fn execute_as_arrow_select_zero_rows_still_yields_schema() {
+        use futures::StreamExt;
+        use queryflux_auth::QueryCredentials;
+        use queryflux_core::query::{ClusterGroupName, ClusterName};
+
+        let adapter = DuckDbAdapter::new(
+            ClusterName("duck".into()),
+            ClusterGroupName("g".into()),
+            DuckDbConfig {
+                database_path: None,
+                motherduck_token: None,
+                pool_size: 1,
+                max_result_buffer_bytes: DEFAULT_MAX_RESULT_BUFFER_BYTES,
+            },
+        )
+        .expect("open in-memory duckdb");
+
+        let params: QueryParams = vec![];
+
+        let exec = adapter
+            .execute_as_arrow(
+                "SELECT * FROM (SELECT 1 AS id, 'x' AS name) t WHERE 1 = 0",
+                &SessionContext::default(),
+                &QueryCredentials::ServiceAccount,
+                &QueryTags::new(),
+                &params,
+                queryflux_core::sql_classify::ExecutionHints::default(),
+                &BackendQueryIdSlot::new(),
+            )
+            .await
+            .expect("execute");
+
+        let mut stream = exec.stream;
+        let batch = stream
+            .next()
+            .await
+            .expect("empty SELECT must still yield one batch carrying the real schema")
+            .expect("batch ok");
+        assert_eq!(batch.num_rows(), 0);
+        assert_eq!(batch.schema().fields().len(), 2);
+        assert_eq!(batch.schema().field(0).name(), "id");
+        assert_eq!(batch.schema().field(1).name(), "name");
+        assert!(
+            stream.next().await.is_none(),
+            "only one (empty) batch expected"
+        );
     }
 
     #[tokio::test]
