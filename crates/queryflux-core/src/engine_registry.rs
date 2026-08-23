@@ -252,7 +252,7 @@ pub fn validate_cluster_config(
             {
                 let driver_name = config.driver.as_deref().unwrap_or("<unknown>");
                 errors.push(format!(
-                    "cluster '{cluster_name}': queryAuth type 'keyPair' is not supported for \
+                    "cluster '{cluster_name}': auth type 'keyPair' is not supported for \
                      ADBC driver '{driver_name}' (only {:?})",
                     crate::config::ADBC_KEYPAIR_AUTH_DRIVERS
                 ));

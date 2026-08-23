@@ -311,15 +311,23 @@ impl crate::EngineConfigParseable for AdbcConfig {
             _ => Vec::new(),
         };
 
-        // `jwt_auth_options` owns these keys — an operator setting them directly in `dbKwargs`
-        // alongside `authType: keyPair` can only be a mistake or a stale copy-paste, and would
-        // otherwise silently override the JWT auth options (`AdbcAdapter::new` appends
-        // `dbKwargs` after the explicit auth options, so the last write wins).
+        // `jwt_auth_options` owns exactly these keys — an operator setting one directly in
+        // `dbKwargs` alongside `authType: keyPair` can only be a mistake or a stale copy-paste,
+        // and would otherwise silently override the JWT auth options (`AdbcAdapter::new`
+        // appends `dbKwargs` after the explicit auth options, so the last write wins). Matched
+        // by exact key, not by a `jwt_`-prefix scan — a prefix match would also reject
+        // unrelated, legitimate options `jwt_auth_options` never touches, e.g.
+        // `adbc.snowflake.sql.client_option.jwt_expire_timeout`.
+        const JWT_AUTH_OPTION_KEYS: [&str; 3] = [
+            "adbc.snowflake.sql.auth_type",
+            "adbc.snowflake.sql.client_option.jwt_private_key_pkcs8_password",
+            "adbc.snowflake.sql.client_option.jwt_private_key_pkcs8_value",
+        ];
         if private_key_pem.is_some() {
-            if let Some((bad_key, _)) = db_kwargs.iter().find(|(k, _)| {
-                k == "adbc.snowflake.sql.auth_type"
-                    || k.starts_with("adbc.snowflake.sql.client_option.jwt_")
-            }) {
+            if let Some((bad_key, _)) = db_kwargs
+                .iter()
+                .find(|(k, _)| JWT_AUTH_OPTION_KEYS.contains(&k.as_str()))
+            {
                 return Err(QueryFluxError::Engine(format!(
                     "cluster '{cluster_name}': dbKwargs['{bad_key}'] conflicts with authType \
                      'keyPair' — this key is set automatically from the key-pair credential, \
@@ -1474,7 +1482,50 @@ mod tests {
     }
 
     #[test]
-    fn from_json_rejects_db_kwargs_jwt_client_option_conflict() {
+    fn from_json_rejects_db_kwargs_jwt_pkcs8_value_conflict() {
+        let pem = test_pkcs8_pem();
+        let json = serde_json::json!({
+            "driver": "snowflake",
+            "uri": "snowflake://acct",
+            "authType": "keyPair",
+            "authUsername": "svc_user",
+            "authPassword": pem,
+            "dbKwargs": { "adbc.snowflake.sql.client_option.jwt_private_key_pkcs8_value": "x" },
+        });
+        match AdbcConfig::from_json(&json, "c") {
+            Err(e) => assert!(
+                e.to_string().contains("conflicts with authType 'keyPair'"),
+                "unexpected: {e}"
+            ),
+            Ok(_) => panic!("expected conflict error"),
+        }
+    }
+
+    #[test]
+    fn from_json_rejects_db_kwargs_jwt_pkcs8_password_conflict() {
+        let pem = test_pkcs8_pem();
+        let json = serde_json::json!({
+            "driver": "snowflake",
+            "uri": "snowflake://acct",
+            "authType": "keyPair",
+            "authUsername": "svc_user",
+            "authPassword": pem,
+            "dbKwargs": { "adbc.snowflake.sql.client_option.jwt_private_key_pkcs8_password": "x" },
+        });
+        match AdbcConfig::from_json(&json, "c") {
+            Err(e) => assert!(
+                e.to_string().contains("conflicts with authType 'keyPair'"),
+                "unexpected: {e}"
+            ),
+            Ok(_) => panic!("expected conflict error"),
+        }
+    }
+
+    #[test]
+    fn from_json_allows_unrelated_jwt_prefixed_db_kwargs() {
+        // A prefix scan would wrongly reject this — `jwt_expire_timeout` is a real, unrelated
+        // Snowflake driver option `jwt_auth_options` never sets, so it must be allowed
+        // alongside `authType: keyPair`.
         let pem = test_pkcs8_pem();
         let json = serde_json::json!({
             "driver": "snowflake",
@@ -1484,13 +1535,8 @@ mod tests {
             "authPassword": pem,
             "dbKwargs": { "adbc.snowflake.sql.client_option.jwt_expire_timeout": "5m" },
         });
-        match AdbcConfig::from_json(&json, "c") {
-            Err(e) => assert!(
-                e.to_string().contains("conflicts with authType 'keyPair'"),
-                "unexpected: {e}"
-            ),
-            Ok(_) => panic!("expected conflict error"),
-        }
+        let cfg = AdbcConfig::from_json(&json, "c").expect("jwt_expire_timeout is not a conflict");
+        assert_eq!(cfg.db_kwargs.len(), 1);
     }
 
     #[test]

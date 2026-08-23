@@ -4130,8 +4130,6 @@ dependencies = [
  "duckdb",
  "futures",
  "mysql_async",
- "pkcs1",
- "pkcs8",
  "queryflux-auth",
  "queryflux-core",
  "r2d2",
