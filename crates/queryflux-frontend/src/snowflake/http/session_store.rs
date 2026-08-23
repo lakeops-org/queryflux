@@ -49,6 +49,13 @@ pub struct SnowflakeSession {
     pub group: ClusterGroupName,
     pub database: Option<String>,
     pub schema: Option<String>,
+    /// Captured at login (`roleName` login-request query param) or updated mid-session by
+    /// `USE ROLE`. `None` means "whatever role the backend connection defaults to" — never
+    /// forwarded as a session-scoped override in that case.
+    pub role: Option<String>,
+    /// Captured at login (`warehouse` login-request query param) or updated mid-session by
+    /// `USE WAREHOUSE`.
+    pub warehouse: Option<String>,
     created_at: Instant,
     last_seen: Instant,
 }
@@ -92,6 +99,7 @@ impl SnowflakeSessionStore {
     }
 
     /// Insert a new session and return the opaque token.
+    #[allow(clippy::too_many_arguments)]
     pub fn create_session(
         &self,
         user: String,
@@ -99,6 +107,8 @@ impl SnowflakeSessionStore {
         group: ClusterGroupName,
         database: Option<String>,
         schema: Option<String>,
+        role: Option<String>,
+        warehouse: Option<String>,
     ) -> String {
         let token = Uuid::new_v4().to_string();
         let now = Instant::now();
@@ -110,11 +120,42 @@ impl SnowflakeSessionStore {
                 group,
                 database,
                 schema,
+                role,
+                warehouse,
                 created_at: now,
                 last_seen: now,
             },
         );
         token
+    }
+
+    /// Update the tracked database for `token` (e.g. from a `USE DATABASE` statement).
+    /// No-op if the token is unknown (session expired/removed concurrently).
+    pub fn set_database(&self, token: &str, database: Option<String>) {
+        if let Some(mut entry) = self.sessions.get_mut(token) {
+            entry.database = database;
+        }
+    }
+
+    /// Update the tracked schema for `token` (e.g. from a `USE SCHEMA` statement).
+    pub fn set_schema(&self, token: &str, schema: Option<String>) {
+        if let Some(mut entry) = self.sessions.get_mut(token) {
+            entry.schema = schema;
+        }
+    }
+
+    /// Update the tracked role for `token` (e.g. from a `USE ROLE` statement).
+    pub fn set_role(&self, token: &str, role: Option<String>) {
+        if let Some(mut entry) = self.sessions.get_mut(token) {
+            entry.role = role;
+        }
+    }
+
+    /// Update the tracked warehouse for `token` (e.g. from a `USE WAREHOUSE` statement).
+    pub fn set_warehouse(&self, token: &str, warehouse: Option<String>) {
+        if let Some(mut entry) = self.sessions.get_mut(token) {
+            entry.warehouse = warehouse;
+        }
     }
 
     /// Validate a session token. On success bumps `last_seen` and returns remaining
@@ -242,6 +283,8 @@ mod tests {
             ClusterGroupName("prod".into()),
             Some("mydb".into()),
             None,
+            None,
+            None,
         );
         let result = store.validate_session(&token);
         assert!(result.is_some());
@@ -266,6 +309,8 @@ mod tests {
             ClusterGroupName("g".into()),
             None,
             None,
+            None,
+            None,
         );
         store.remove_session(&token);
         assert!(store.validate_session(&token).is_none());
@@ -281,6 +326,8 @@ mod tests {
             "charlie".into(),
             make_auth(),
             ClusterGroupName("g".into()),
+            None,
+            None,
             None,
             None,
         );
@@ -301,6 +348,8 @@ mod tests {
             ClusterGroupName("g".into()),
             None,
             None,
+            None,
+            None,
         );
         std::thread::sleep(Duration::from_millis(10));
         assert!(store.validate_session(&token).is_none());
@@ -316,6 +365,8 @@ mod tests {
             "eve".into(),
             make_auth(),
             ClusterGroupName("g".into()),
+            None,
+            None,
             None,
             None,
         );
@@ -339,8 +390,58 @@ mod tests {
             ClusterGroupName("g".into()),
             None,
             None,
+            None,
+            None,
         );
         let (remaining, _) = store.validate_session(&token).unwrap();
         assert_eq!(remaining, u64::MAX);
+    }
+
+    #[test]
+    fn create_session_captures_role_and_warehouse() {
+        let store = store_with_policy(3600, 900);
+        let token = store.create_session(
+            "grace".into(),
+            make_auth(),
+            ClusterGroupName("g".into()),
+            None,
+            None,
+            Some("ANALYST".into()),
+            Some("ANALYTICS_WH".into()),
+        );
+        let (_, session) = store.validate_session(&token).unwrap();
+        assert_eq!(session.role.as_deref(), Some("ANALYST"));
+        assert_eq!(session.warehouse.as_deref(), Some("ANALYTICS_WH"));
+    }
+
+    #[test]
+    fn setters_update_tracked_fields() {
+        let store = store_with_policy(3600, 900);
+        let token = store.create_session(
+            "heidi".into(),
+            make_auth(),
+            ClusterGroupName("g".into()),
+            None,
+            None,
+            None,
+            None,
+        );
+        store.set_role(&token, Some("SYSADMIN".into()));
+        store.set_warehouse(&token, Some("ETL_WH".into()));
+        store.set_schema(&token, Some("PUBLIC".into()));
+        store.set_database(&token, Some("PROD".into()));
+        let (_, session) = store.validate_session(&token).unwrap();
+        assert_eq!(session.role.as_deref(), Some("SYSADMIN"));
+        assert_eq!(session.warehouse.as_deref(), Some("ETL_WH"));
+        assert_eq!(session.schema.as_deref(), Some("PUBLIC"));
+        assert_eq!(session.database.as_deref(), Some("PROD"));
+    }
+
+    #[test]
+    fn setters_are_a_no_op_for_unknown_tokens() {
+        let store = store_with_policy(3600, 900);
+        // Must not panic when the session was already removed/expired concurrently.
+        store.set_role("no-such-token", Some("X".into()));
+        store.set_warehouse("no-such-token", Some("X".into()));
     }
 }

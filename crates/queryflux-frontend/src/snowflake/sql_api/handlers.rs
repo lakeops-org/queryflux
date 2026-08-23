@@ -161,6 +161,35 @@ impl CastColumn {
 }
 
 // ---------------------------------------------------------------------------
+// Per-statement database/role/warehouse/schema — SQL API v2 is stateless, so real
+// Snowflake accepts these as top-level request-body fields instead of a session `USE`.
+// ---------------------------------------------------------------------------
+
+fn statement_database(body_json: &Value) -> Option<String> {
+    body_json["database"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+/// Namespaced (`snowflake.*`) so these never collide with an unrelated `extra` key some other
+/// frontend might have set if ever routed to a Snowflake ADBC cluster — see the identical
+/// concern for wire v1's `USE ROLE`/`USE WAREHOUSE` handling in `handlers::query`.
+fn statement_session_overrides(body_json: &Value) -> HashMap<String, String> {
+    let mut overrides = HashMap::new();
+    for (field, extra_key) in [
+        ("role", "snowflake.role"),
+        ("warehouse", "snowflake.warehouse"),
+        ("schema", "snowflake.schema"),
+    ] {
+        if let Some(value) = body_json[field].as_str().filter(|s| !s.is_empty()) {
+            overrides.insert(extra_key.to_string(), value.to_string());
+        }
+    }
+    overrides
+}
+
+// ---------------------------------------------------------------------------
 // SQL API v2 error helper — preserves the real HTTP status code
 // ---------------------------------------------------------------------------
 
@@ -213,7 +242,7 @@ pub async fn submit_statement(
 
     // Collect request headers into `extra` (lowercase keys) so that agent headers
     // (x-agent-id, x-conversation-id, etc.) are resolved lazily in dispatch.
-    let extra: HashMap<String, String> = headers
+    let mut extra: HashMap<String, String> = headers
         .iter()
         .filter_map(|(k, v)| {
             v.to_str()
@@ -221,9 +250,16 @@ pub async fn submit_statement(
                 .map(|s| (k.as_str().to_lowercase(), s.to_string()))
         })
         .collect();
+
+    // SQL API v2 is stateless — there is no session to intercept a mid-stream `USE ROLE`/
+    // `USE WAREHOUSE` into (unlike wire v1's session-based login), so real Snowflake accepts
+    // these as per-statement fields on the request body instead. Read them the same way.
+    let database = statement_database(&body_json);
+    extra.extend(statement_session_overrides(&body_json));
+
     let session_ctx = SessionContext {
         user: Some(auth_ctx.user.clone()),
-        database: None,
+        database,
         tags: QueryTags::default(),
         extra,
         agent_context: None,
@@ -387,4 +423,63 @@ async fn authenticate(
                 .on_auth_failure(&format!("{:?}", FrontendProtocol::SnowflakeSqlApi));
             e.to_string()
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{statement_database, statement_session_overrides};
+    use serde_json::json;
+
+    #[test]
+    fn statement_database_reads_top_level_field() {
+        let body = json!({"statement": "SELECT 1", "database": "PROD"});
+        assert_eq!(statement_database(&body).as_deref(), Some("PROD"));
+    }
+
+    #[test]
+    fn statement_database_absent_when_missing_or_empty() {
+        assert_eq!(statement_database(&json!({"statement": "SELECT 1"})), None);
+        assert_eq!(
+            statement_database(&json!({"statement": "SELECT 1", "database": ""})),
+            None
+        );
+    }
+
+    #[test]
+    fn statement_session_overrides_reads_role_warehouse_schema_namespaced() {
+        let body = json!({
+            "statement": "SELECT 1",
+            "role": "ANALYST",
+            "warehouse": "ANALYTICS_WH",
+            "schema": "PUBLIC",
+        });
+        let overrides = statement_session_overrides(&body);
+        assert_eq!(
+            overrides.get("snowflake.role").map(String::as_str),
+            Some("ANALYST")
+        );
+        assert_eq!(
+            overrides.get("snowflake.warehouse").map(String::as_str),
+            Some("ANALYTICS_WH")
+        );
+        assert_eq!(
+            overrides.get("snowflake.schema").map(String::as_str),
+            Some("PUBLIC")
+        );
+        // Bare (unnamespaced) keys must never appear — that's what avoids the cross-protocol
+        // collision risk if this ever shared an `extra` map convention with another frontend.
+        assert!(!overrides.contains_key("role"));
+    }
+
+    #[test]
+    fn statement_session_overrides_empty_when_no_fields_present() {
+        let body = json!({"statement": "SELECT 1"});
+        assert!(statement_session_overrides(&body).is_empty());
+    }
+
+    #[test]
+    fn statement_session_overrides_skips_empty_strings() {
+        let body = json!({"statement": "SELECT 1", "role": ""});
+        assert!(statement_session_overrides(&body).is_empty());
+    }
 }
