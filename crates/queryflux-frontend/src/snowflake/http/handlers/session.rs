@@ -45,6 +45,12 @@ pub async fn login_request(
         _ => return sf_error("390000", "Missing LOGIN_NAME"),
     };
     let password = data["PASSWORD"].as_str().unwrap_or("").to_string();
+    // Retained for `passthrough` mode (see `SnowflakeSession::password`) — unconditionally,
+    // since a login handler has no way to know yet whether the query group it's about to
+    // resolve will route to a `queryAuth: passthrough` cluster. Not verified by queryflux
+    // itself; the actual verification is the real Snowflake connection attempt this later
+    // enables (`AdbcAdapter`'s passthrough sub-pool), same as connecting to Snowflake directly.
+    let passthrough_password = (!password.is_empty()).then(|| password.clone());
     let database = data["DATABASE_NAME"].as_str().map(|s| s.to_string());
     let schema = data["SCHEMA_NAME"].as_str().map(|s| s.to_string());
     // Unlike database/schema, real Snowflake drivers send role/warehouse as query-string
@@ -143,6 +149,7 @@ pub async fn login_request(
         schema.clone(),
         role.clone(),
         warehouse.clone(),
+        passthrough_password,
     );
 
     let master_token = Uuid::new_v4().to_string();

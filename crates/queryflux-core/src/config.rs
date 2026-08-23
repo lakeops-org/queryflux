@@ -1598,6 +1598,12 @@ pub enum QueryAuthConfig {
 /// list is what actually gates `tokenExchange` for ADBC clusters.
 const ADBC_TOKEN_EXCHANGE_DRIVERS: &[&str] = &["snowflake"];
 
+/// ADBC drivers whose adapter code knows how to route a query to a per-caller-credential
+/// sub-pool for `passthrough` (see `AdbcAdapter::execute_as_arrow`'s `PoolScopeKey`
+/// passthrough dimension). Every other ADBC driver is `serviceAccount`-only — same shape as
+/// [`ADBC_TOKEN_EXCHANGE_DRIVERS`], just for `passthrough` instead of `tokenExchange`.
+const ADBC_PASSTHROUGH_AUTH_DRIVERS: &[&str] = &["snowflake"];
+
 /// Centralizes the engine × `queryAuth` support matrix so YAML load, Studio PUT, and
 /// startup validation can't drift apart. Returns `Err` with an operator-facing message
 /// when `mode` is not implemented for `engine` (and, for ADBC, `driver`) yet.
@@ -1647,11 +1653,24 @@ pub fn query_auth_supported(
         {
             Ok(())
         }
+        // Passthrough here means a real per-caller Snowflake username/password, captured at
+        // Snowflake wire v1 login and routed to a dedicated sub-pool — see
+        // `AdbcAdapter::execute_as_arrow`. SQL API v2 (stateless, Bearer-only) has no password
+        // to capture, so a passthrough-configured cluster reached that way fails closed at
+        // dispatch time with a clear error instead of silently falling back to the service
+        // account — no separate check needed here for that case.
+        Some(EngineConfig::Adbc)
+            if matches!(mode, QueryAuthConfig::Passthrough)
+                && driver.is_some_and(|d| ADBC_PASSTHROUGH_AUTH_DRIVERS.contains(&d)) =>
+        {
+            Ok(())
+        }
         Some(EngineConfig::Adbc) => {
             let driver_name = driver.unwrap_or("<unknown>");
             Err(format!(
                 "queryAuth.type = {mode_name} is not supported for ADBC driver '{driver_name}' \
-                 in this release (only tokenExchange for {ADBC_TOKEN_EXCHANGE_DRIVERS:?})"
+                 in this release (only tokenExchange for {ADBC_TOKEN_EXCHANGE_DRIVERS:?}, or \
+                 passthrough for {ADBC_PASSTHROUGH_AUTH_DRIVERS:?})"
             ))
         }
         other => {
@@ -1661,7 +1680,7 @@ pub fn query_auth_supported(
             Err(format!(
                 "queryAuth.type = {mode_name} is only supported for Trino, ClickHouse \
                  (impersonate only), StarRocks (passthrough only), and ADBC/snowflake \
-                 (tokenExchange only) in this release, got {engine_name}"
+                 (tokenExchange or passthrough) in this release, got {engine_name}"
             ))
         }
     }
@@ -2098,19 +2117,34 @@ mod tests {
     }
 
     #[test]
-    fn adbc_passthrough_and_impersonate_rejected_even_for_snowflake_driver() {
-        // Only tokenExchange is wired for ADBC in this release — passthrough/impersonate
-        // are rejected regardless of driver.
+    fn adbc_impersonate_rejected_even_for_snowflake_driver() {
+        // No ADBC driver has an `impersonate` mechanism in this release.
+        assert!(query_auth_supported(
+            Some(&EngineConfig::Adbc),
+            Some("snowflake"),
+            &QueryAuthConfig::Impersonate
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn adbc_passthrough_allowed_only_for_snowflake_driver() {
         assert!(query_auth_supported(
             Some(&EngineConfig::Adbc),
             Some("snowflake"),
             &QueryAuthConfig::Passthrough
         )
+        .is_ok());
+        assert!(query_auth_supported(
+            Some(&EngineConfig::Adbc),
+            Some("postgresql"),
+            &QueryAuthConfig::Passthrough
+        )
         .is_err());
         assert!(query_auth_supported(
             Some(&EngineConfig::Adbc),
-            Some("snowflake"),
-            &QueryAuthConfig::Impersonate
+            None,
+            &QueryAuthConfig::Passthrough
         )
         .is_err());
     }
