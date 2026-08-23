@@ -1598,6 +1598,14 @@ pub enum QueryAuthConfig {
 /// list is what actually gates `tokenExchange` for ADBC clusters.
 const ADBC_TOKEN_EXCHANGE_DRIVERS: &[&str] = &["snowflake"];
 
+/// ADBC drivers whose adapter code knows how to turn a `ClusterAuth::KeyPair` (Type 1,
+/// baseline cluster auth) into driver-specific JWT connection options — see
+/// `AdbcAdapter::new`/`jwt_auth_options`. Every other ADBC driver is `basic`-only.
+/// `EngineConfig::Adbc` alone can't tell drivers apart, so `engine_registry`'s startup
+/// validation checks this list before accepting `authType: keyPair` on an ADBC cluster —
+/// the same shape as [`ADBC_TOKEN_EXCHANGE_DRIVERS`], just for Type 1 auth instead of Type 2.
+pub const ADBC_KEYPAIR_AUTH_DRIVERS: &[&str] = &["snowflake"];
+
 /// Centralizes the engine × `queryAuth` support matrix so YAML load, Studio PUT, and
 /// startup validation can't drift apart. Returns `Err` with an operator-facing message
 /// when `mode` is not implemented for `engine` (and, for ADBC, `driver`) yet.
