@@ -445,7 +445,15 @@ impl PostgresCommandTag {
     fn classify(sql: &str) -> Self {
         let s = queryflux_core::sql_classify::strip_leading_sql_comments(sql);
         let mut words = s.split_whitespace();
-        let first = words.next().unwrap_or("").to_uppercase();
+        // Trim trailing punctuation (e.g. a semicolon on a single-statement,
+        // single-word command like `COMMIT;`) — real Postgres never includes it
+        // in the tag, and some drivers match the tag text to track transaction
+        // state, so a stray `;` can change client behavior.
+        let first = words
+            .next()
+            .unwrap_or("")
+            .trim_end_matches(|c: char| !c.is_ascii_alphanumeric())
+            .to_uppercase();
         match first.as_str() {
             "INSERT" => Self {
                 verb: "INSERT 0".to_string(),
@@ -995,6 +1003,11 @@ mod tests {
                 "CREATE FUNCTION",
                 false,
             ),
+            // Trailing punctuation on a single-token statement must not leak into
+            // the tag — real Postgres sends "COMMIT"/"VACUUM", never "COMMIT;".
+            ("COMMIT;", "COMMIT", false),
+            ("VACUUM;", "VACUUM", false),
+            ("BEGIN;", "BEGIN", false),
         ];
         for (sql, expected_verb, has_row_count) in cases {
             let tag = super::PostgresCommandTag::classify(sql);

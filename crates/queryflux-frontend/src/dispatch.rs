@@ -1523,7 +1523,7 @@ async fn execute_stream(
             &setup.ctx.query_tags,
             &setup.params,
             queryflux_core::sql_classify::ExecutionHints {
-                is_read_like: Some(setup.sql_parse.is_read_like()),
+                is_read_like: Some(setup.sql_parse.is_read_like_async().await),
             },
             id_slot,
         )

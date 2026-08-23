@@ -194,8 +194,15 @@ fn duckdb_type_to_arrow(ty: &str) -> DataType {
     let base = ty.split('(').next().unwrap_or(ty).trim().to_uppercase();
     match base.as_str() {
         "BOOLEAN" => DataType::Boolean,
-        "TINYINT" | "SMALLINT" | "INTEGER" | "BIGINT" | "HUGEINT" | "UTINYINT" | "USMALLINT"
-        | "UINTEGER" | "UBIGINT" | "UHUGEINT" => DataType::Int64,
+        // TINYINT..BIGINT and the unsigned types up to UINTEGER all fit in i64
+        // (BIGINT's max is exactly i64::MAX). HUGEINT/UHUGEINT are 128-bit and
+        // UBIGINT's max (~1.8e19) exceeds i64::MAX (~9.2e18) — DuckDB's own
+        // serializer already emits those three as JSON strings to avoid losing
+        // precision, so map them to Utf8 rather than feeding out-of-range values
+        // into `build_array`'s Int64 parser, which would silently turn them NULL.
+        "TINYINT" | "SMALLINT" | "INTEGER" | "BIGINT" | "UTINYINT" | "USMALLINT" | "UINTEGER" => {
+            DataType::Int64
+        }
         "FLOAT" | "DOUBLE" | "DECIMAL" => DataType::Float64,
         _ => DataType::Utf8,
     }
@@ -763,7 +770,7 @@ mod tests {
         assert_eq!(duckdb_type_to_arrow("BOOLEAN"), DataType::Boolean);
         assert_eq!(duckdb_type_to_arrow("INTEGER"), DataType::Int64);
         assert_eq!(duckdb_type_to_arrow("BIGINT"), DataType::Int64);
-        assert_eq!(duckdb_type_to_arrow("UBIGINT"), DataType::Int64);
+        assert_eq!(duckdb_type_to_arrow("UINTEGER"), DataType::Int64);
         assert_eq!(duckdb_type_to_arrow("DOUBLE"), DataType::Float64);
         assert_eq!(duckdb_type_to_arrow("FLOAT"), DataType::Float64);
         assert_eq!(duckdb_type_to_arrow("DECIMAL(10,2)"), DataType::Float64);
@@ -772,6 +779,36 @@ mod tests {
         assert_eq!(duckdb_type_to_arrow("TIMESTAMP"), DataType::Utf8);
         assert_eq!(duckdb_type_to_arrow("STRUCT(a INTEGER)"), DataType::Utf8);
         assert_eq!(duckdb_type_to_arrow("INTEGER[]"), DataType::Utf8);
+    }
+
+    /// Regression: UBIGINT/HUGEINT/UHUGEINT can exceed i64::MAX. DuckDB's own
+    /// serializer already emits them as JSON strings for this reason — mapping
+    /// them to Int64 would feed an out-of-range value into `build_array`'s
+    /// `as_i64()`/`parse::<i64>()` parsing, silently turning it into NULL.
+    #[test]
+    fn wide_integer_types_map_to_utf8_not_int64() {
+        assert_eq!(duckdb_type_to_arrow("UBIGINT"), DataType::Utf8);
+        assert_eq!(duckdb_type_to_arrow("HUGEINT"), DataType::Utf8);
+        assert_eq!(duckdb_type_to_arrow("UHUGEINT"), DataType::Utf8);
+    }
+
+    /// A UBIGINT value beyond i64::MAX must round-trip as text, not silently
+    /// become NULL.
+    #[test]
+    fn out_of_i64_range_ubigint_value_is_preserved_as_text() {
+        let body = r#"{
+            "meta": [{"name": "n", "type": "UBIGINT"}],
+            "data": [["18446744073709551615"]],
+            "rows": 1
+        }"#;
+        let resp = HttpQueryResponse::parse(body).expect("parse");
+        let batch = response_to_record_batch(resp).expect("build batch");
+        let col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .expect("UBIGINT column must be Utf8");
+        assert_eq!(col.value(0), "18446744073709551615");
     }
 
     /// Regression: a zero-row SELECT must still carry its real column schema —

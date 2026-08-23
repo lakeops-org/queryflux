@@ -12,19 +12,28 @@ fn engine_dialect(engine: &EngineType) -> DialectType {
     to_polyglot_dialect(&engine.dialect())
 }
 
-fn guard_statements<'a>(
+/// Async so parsing (and any wait for a `polyglot_pool` worker) never blocks the
+/// calling task's Tokio worker thread — `check` is on the live request path for
+/// every guarded query, not just an occasional background call.
+async fn guard_statements<'a>(
     ctx: &'a GuardContext<'a>,
 ) -> Result<std::borrow::Cow<'a, [Expression]>, ()> {
     if let Some(cache) = ctx.sql_parse {
+        cache.ensure_parsed().await;
         return cache.statements().map(std::borrow::Cow::Borrowed).ok_or(());
     }
 
     let sql = ctx.translated_sql.to_string();
     let dialect = engine_dialect(ctx.engine_type);
-    queryflux_core::polyglot_pool::run(move || polyglot_sql::parse(&sql, dialect))
-        .and_then(|r| r.ok())
-        .map(std::borrow::Cow::Owned)
-        .ok_or(())
+    tokio::task::spawn_blocking(move || {
+        queryflux_core::polyglot_pool::run(move || polyglot_sql::parse(&sql, dialect))
+    })
+    .await
+    .ok()
+    .flatten()
+    .and_then(|r| r.ok())
+    .map(std::borrow::Cow::Owned)
+    .ok_or(())
 }
 
 /// The extension trait every guard implements.
@@ -50,7 +59,7 @@ impl Guard for ReadOnlyGuard {
         GuardLayer::Plan
     }
     async fn check(&self, ctx: &GuardContext<'_>) -> GuardResult {
-        match guard_statements(ctx) {
+        match guard_statements(ctx).await {
             Ok(stmts) => {
                 for stmt in stmts.iter() {
                     if !is_read_stmt(stmt) {
@@ -90,7 +99,7 @@ impl Guard for RowLimitGuard {
         GuardLayer::Plan
     }
     async fn check(&self, ctx: &GuardContext<'_>) -> GuardResult {
-        match guard_statements(ctx) {
+        match guard_statements(ctx).await {
             Ok(stmts) => {
                 for stmt in stmts.iter() {
                     if !is_read_stmt(stmt) {
@@ -185,7 +194,7 @@ impl Guard for RequirePredicateGuard {
         GuardLayer::Plan
     }
     async fn check(&self, ctx: &GuardContext<'_>) -> GuardResult {
-        match guard_statements(ctx) {
+        match guard_statements(ctx).await {
             Ok(stmts) => {
                 for stmt in stmts.iter() {
                     if select_lacks_where(stmt, &self.applies_to) {

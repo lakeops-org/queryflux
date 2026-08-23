@@ -55,12 +55,55 @@ impl SqlParseCache {
         })
     }
 
+    /// Populate the cache without blocking the calling task's worker thread.
+    ///
+    /// `parsed()` (and everything built on it — `statements()`, `is_read_like()`)
+    /// blocks synchronously on `polyglot_pool::run`: queueing the job and waiting
+    /// for a pool worker. Calling that directly from an async fn parks a Tokio
+    /// worker thread for the duration, which — now that dispatch and every guard
+    /// check share one cache per query on the live request path, not just the
+    /// original fingerprinting use — can starve unrelated requests under load if
+    /// the pool's queue is full or a parse is slow. This runs the same work on a
+    /// blocking-pool thread instead and awaits it.
+    ///
+    /// A no-op once the cache is warm — the common case, since dispatch and
+    /// guardrails share one `SqlParseCache` per query and only the first caller
+    /// actually parses.
+    pub async fn ensure_parsed(&self) {
+        if self.cache.get().is_some() {
+            return;
+        }
+        let sql = self.sql.clone();
+        let dialect = self.dialect.clone();
+        let parsed = tokio::task::spawn_blocking(move || {
+            let dialect = to_polyglot_dialect(&dialect);
+            crate::polyglot_pool::run(move || {
+                polyglot_sql::parse(&sql, dialect)
+                    .map(ParsedStatements::Ok)
+                    .unwrap_or(ParsedStatements::Err)
+            })
+            .unwrap_or(ParsedStatements::Err)
+        })
+        .await
+        .unwrap_or(ParsedStatements::Err);
+        // Ignore "already set": a concurrent caller raced us and won. Same
+        // result either way — at worst we duplicated the parse once.
+        let _ = self.cache.set(parsed);
+    }
+
     /// Parsed statements when `polyglot_sql` succeeds.
     pub fn statements(&self) -> Option<&[Expression]> {
         match self.parsed() {
             ParsedStatements::Ok(stmts) => Some(stmts.as_slice()),
             ParsedStatements::Err => None,
         }
+    }
+
+    /// Async equivalent of [`Self::statements`] — never blocks the calling
+    /// task's worker thread. Prefer this on any async request path.
+    pub async fn statements_async(&self) -> Option<&[Expression]> {
+        self.ensure_parsed().await;
+        self.statements()
     }
 
     /// Whether the statement should use a result-set execution path (`execute`) vs
@@ -84,6 +127,13 @@ impl SqlParseCache {
             }
             None => is_read_like_fallback(&self.sql),
         }
+    }
+
+    /// Async equivalent of [`Self::is_read_like`] — never blocks the calling
+    /// task's worker thread. Prefer this on any async request path.
+    pub async fn is_read_like_async(&self) -> bool {
+        self.ensure_parsed().await;
+        self.is_read_like()
     }
 }
 
@@ -171,6 +221,53 @@ pub fn strip_leading_sql_comments(mut s: &str) -> &str {
 mod tests {
     use super::*;
     use crate::query::SqlDialect;
+
+    /// `is_read_like_async`/`statements_async` route the actual parse through
+    /// `tokio::task::spawn_blocking` instead of blocking the calling task's
+    /// worker thread directly — must still agree with the sync accessors.
+    #[tokio::test]
+    async fn async_accessors_match_sync_results() {
+        for (sql, expect_read_like) in [
+            ("SELECT 1", true),
+            ("CREATE TABLE t (id INT)", false),
+            ("INSERT INTO t VALUES (1)", false),
+        ] {
+            let cache = SqlParseCache::new(sql, SqlDialect::Generic);
+            let async_result = cache.is_read_like_async().await;
+            assert_eq!(async_result, cache.is_read_like(), "sql: {sql}");
+            assert_eq!(async_result, expect_read_like, "sql: {sql}");
+            assert_eq!(
+                cache.statements_async().await.map(<[_]>::len),
+                cache.statements().map(<[_]>::len),
+                "sql: {sql}"
+            );
+        }
+    }
+
+    /// `ensure_parsed` populates a `OnceLock` from inside `spawn_blocking`; many
+    /// concurrent callers on the same cache must not race into inconsistent
+    /// state or panic — only one parse should "win", and every caller must
+    /// still observe the correct, fully-parsed result.
+    #[tokio::test]
+    async fn ensure_parsed_is_race_safe_under_concurrent_callers() {
+        let cache = std::sync::Arc::new(SqlParseCache::new(
+            "CREATE TABLE t (id INT)",
+            SqlDialect::Generic,
+        ));
+        let mut handles = Vec::new();
+        for _ in 0..16 {
+            let cache = std::sync::Arc::clone(&cache);
+            handles.push(tokio::spawn(
+                async move { cache.is_read_like_async().await },
+            ));
+        }
+        for handle in handles {
+            assert!(
+                !handle.await.expect("task panicked"),
+                "CREATE TABLE must not be read-like"
+            );
+        }
+    }
 
     #[test]
     fn cache_parses_only_once() {
