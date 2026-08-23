@@ -27,6 +27,8 @@ fn maybe_trino_adbc_adapter() -> Option<AdbcAdapter> {
         uri,
         username: None,
         password: None,
+        private_key_pem: None,
+        private_key_passphrase: None,
         db_kwargs: Vec::new(),
         flight_sql_cluster_dialect: None,
         pool_size: 2,

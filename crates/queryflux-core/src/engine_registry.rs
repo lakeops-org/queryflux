@@ -225,7 +225,17 @@ pub fn validate_cluster_config(
         let has_auth_type = match auth {
             ClusterAuth::Basic { .. } => desc.supported_auth.contains(&AuthType::Basic),
             ClusterAuth::Bearer { .. } => desc.supported_auth.contains(&AuthType::Bearer),
-            ClusterAuth::KeyPair { .. } => desc.supported_auth.contains(&AuthType::KeyPair),
+            // `EngineConfig::Adbc` alone can't tell drivers apart — `supported_auth` on the
+            // generic ADBC descriptor advertises KeyPair for every driver, so this needs the
+            // same driver-aware narrowing `query_auth_supported` already does for Type 2 auth.
+            ClusterAuth::KeyPair { .. } => {
+                desc.supported_auth.contains(&AuthType::KeyPair)
+                    && (!matches!(engine, crate::config::EngineConfig::Adbc)
+                        || config
+                            .driver
+                            .as_deref()
+                            .is_some_and(|d| crate::config::ADBC_KEYPAIR_AUTH_DRIVERS.contains(&d)))
+            }
             ClusterAuth::AccessKey { .. } => desc.supported_auth.contains(&AuthType::AccessKey),
             ClusterAuth::RoleArn { .. } => desc.supported_auth.contains(&AuthType::RoleArn),
         };
@@ -237,10 +247,21 @@ pub fn validate_cluster_config(
                 ClusterAuth::AccessKey { .. } => "accessKey",
                 ClusterAuth::RoleArn { .. } => "roleArn",
             };
-            errors.push(format!(
-                "cluster '{cluster_name}': engine '{}' does not support '{auth_label}' authentication",
-                desc.display_name
-            ));
+            if matches!(auth, ClusterAuth::KeyPair { .. })
+                && matches!(engine, crate::config::EngineConfig::Adbc)
+            {
+                let driver_name = config.driver.as_deref().unwrap_or("<unknown>");
+                errors.push(format!(
+                    "cluster '{cluster_name}': auth type 'keyPair' is not supported for \
+                     ADBC driver '{driver_name}' (only {:?})",
+                    crate::config::ADBC_KEYPAIR_AUTH_DRIVERS
+                ));
+            } else {
+                errors.push(format!(
+                    "cluster '{cluster_name}': engine '{}' does not support '{auth_label}' authentication",
+                    desc.display_name
+                ));
+            }
         }
     }
 
@@ -295,5 +316,100 @@ impl From<&EngineConfig> for EngineType {
             EngineConfig::Athena => EngineType::Athena,
             EngineConfig::Adbc => EngineType::Adbc,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::EngineConfig;
+
+    fn adbc_descriptor() -> EngineDescriptor {
+        EngineDescriptor {
+            engine_key: "adbc",
+            display_name: "ADBC",
+            description: "test",
+            hex: "000000",
+            connection_type: ConnectionType::Driver,
+            default_port: None,
+            endpoint_example: None,
+            supported_auth: vec![AuthType::Basic, AuthType::KeyPair],
+            implemented: true,
+            config_fields: vec![],
+        }
+    }
+
+    fn key_pair_auth() -> ClusterAuth {
+        ClusterAuth::KeyPair {
+            username: "svc".to_string(),
+            private_key_pem: "pem".to_string(),
+            private_key_passphrase: None,
+        }
+    }
+
+    #[test]
+    fn adbc_key_pair_accepted_for_snowflake_driver() {
+        let registry = EngineRegistry::new(vec![adbc_descriptor()]);
+        let config = ClusterConfig {
+            engine: Some(EngineConfig::Adbc),
+            driver: Some("snowflake".to_string()),
+            auth: Some(key_pair_auth()),
+            ..Default::default()
+        };
+        let errors = validate_cluster_config(&registry, "c", &config);
+        assert!(errors.is_empty(), "unexpected errors: {errors:?}");
+    }
+
+    #[test]
+    fn adbc_key_pair_rejected_for_non_snowflake_driver() {
+        let registry = EngineRegistry::new(vec![adbc_descriptor()]);
+        let config = ClusterConfig {
+            engine: Some(EngineConfig::Adbc),
+            driver: Some("postgresql".to_string()),
+            auth: Some(key_pair_auth()),
+            ..Default::default()
+        };
+        let errors = validate_cluster_config(&registry, "c", &config);
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("keyPair"), "unexpected: {errors:?}");
+        assert!(errors[0].contains("postgresql"), "unexpected: {errors:?}");
+    }
+
+    #[test]
+    fn adbc_key_pair_rejected_when_descriptor_does_not_advertise_it() {
+        let mut desc = adbc_descriptor();
+        desc.supported_auth = vec![AuthType::Basic];
+        let registry = EngineRegistry::new(vec![desc]);
+        let config = ClusterConfig {
+            engine: Some(EngineConfig::Adbc),
+            driver: Some("snowflake".to_string()),
+            auth: Some(key_pair_auth()),
+            ..Default::default()
+        };
+        let errors = validate_cluster_config(&registry, "c", &config);
+        assert_eq!(errors.len(), 1, "unexpected errors: {errors:?}");
+    }
+
+    #[test]
+    fn non_adbc_engine_key_pair_ignores_driver() {
+        // KeyPair on a non-ADBC engine (e.g. a hypothetical future Databricks-native
+        // adapter) should only check `supported_auth`, never `driver` — the driver-aware
+        // narrowing exists specifically because `EngineConfig::Adbc` alone can't tell
+        // drivers apart. Use a Trino-keyed descriptor (driver: None) with KeyPair advertised,
+        // to exercise the `!matches!(engine, EngineConfig::Adbc)` short-circuit directly.
+        let desc = EngineDescriptor {
+            engine_key: "trino",
+            supported_auth: vec![AuthType::KeyPair],
+            ..adbc_descriptor()
+        };
+        let registry = EngineRegistry::new(vec![desc]);
+        let config = ClusterConfig {
+            engine: Some(EngineConfig::Trino),
+            driver: None,
+            auth: Some(key_pair_auth()),
+            ..Default::default()
+        };
+        let errors = validate_cluster_config(&registry, "c", &config);
+        assert!(errors.is_empty(), "unexpected errors: {errors:?}");
     }
 }

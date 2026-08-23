@@ -30,3 +30,7 @@ adbc_driver_manager = "0.23"
 r2d2 = "0.8"
 r2d2_adbc = { git = "https://github.com/amitgilad3/r2d2-adbc.git" }
 dashmap = { workspace = true }
+rsa = "0.9"
+
+[dev-dependencies]
+rand = "0.8"

@@ -162,6 +162,11 @@ pub struct AdbcConfig {
     pub uri: String,
     pub username: Option<String>,
     pub password: Option<String>,
+    /// RSA private key PEM (PKCS#1 or PKCS#8, optionally PKCS#8-encrypted) for `authType:
+    /// keyPair`. Mutually exclusive with `password` — see `AdbcAdapter::new`, which sends
+    /// JWT connection options instead of a plain password when this is set.
+    pub private_key_pem: Option<String>,
+    pub private_key_passphrase: Option<String>,
     pub db_kwargs: Vec<(String, String)>,
     /// When `driver` is `flightsql`, sqlglot `write` dialect for translation (any supported name).
     /// JSON key `flightSqlClusterDialect`; legacy `flightSqlEngine` is still accepted when parsing.
@@ -246,14 +251,53 @@ impl crate::EngineConfigParseable for AdbcConfig {
             })?
             .to_string();
 
-        let username = json
-            .get("username")
-            .and_then(|v| v.as_str())
-            .map(str::to_string);
-        let password = json
-            .get("password")
-            .and_then(|v| v.as_str())
-            .map(str::to_string);
+        // `authType`-tagged auth (`basic`/`keyPair`) is the same convention every other engine
+        // adapter reads via `parse_auth_from_config_json` on this same JSON document. Fall back
+        // to the legacy flat `username`/`password` fields when `authType` is absent — ADBC
+        // clusters created before `keyPair` support existed never set it.
+        let auth = queryflux_core::engine_registry::parse_auth_from_config_json(json)
+            .map_err(|e| QueryFluxError::Engine(format!("cluster '{cluster_name}': {e}")))?;
+        let (username, password, private_key_pem, private_key_passphrase) = match auth {
+            Some(queryflux_core::config::ClusterAuth::KeyPair {
+                username,
+                private_key_pem,
+                private_key_passphrase,
+            }) => (
+                Some(username),
+                None,
+                Some(private_key_pem),
+                private_key_passphrase,
+            ),
+            Some(queryflux_core::config::ClusterAuth::Basic { username, password }) => {
+                (Some(username), Some(password), None, None)
+            }
+            Some(other) => {
+                let label = match other {
+                    queryflux_core::config::ClusterAuth::Bearer { .. } => "bearer",
+                    queryflux_core::config::ClusterAuth::AccessKey { .. } => "accessKey",
+                    queryflux_core::config::ClusterAuth::RoleArn { .. } => "roleArn",
+                    queryflux_core::config::ClusterAuth::Basic { .. }
+                    | queryflux_core::config::ClusterAuth::KeyPair { .. } => {
+                        unreachable!("Basic/KeyPair handled above")
+                    }
+                };
+                return Err(QueryFluxError::Engine(format!(
+                    "cluster '{cluster_name}': authType '{label}' is not supported for ADBC \
+                     clusters (only basic/keyPair)"
+                )));
+            }
+            None => {
+                let username = json
+                    .get("username")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+                let password = json
+                    .get("password")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+                (username, password, None, None)
+            }
+        };
 
         let db_kwargs = match json.get("dbKwargs") {
             Some(serde_json::Value::Object(map)) => {
@@ -266,6 +310,31 @@ impl crate::EngineConfigParseable for AdbcConfig {
             }
             _ => Vec::new(),
         };
+
+        // `jwt_auth_options` owns exactly these keys — an operator setting one directly in
+        // `dbKwargs` alongside `authType: keyPair` can only be a mistake or a stale copy-paste,
+        // and would otherwise silently override the JWT auth options (`AdbcAdapter::new`
+        // appends `dbKwargs` after the explicit auth options, so the last write wins). Matched
+        // by exact key, not by a `jwt_`-prefix scan — a prefix match would also reject
+        // unrelated, legitimate options `jwt_auth_options` never touches, e.g.
+        // `adbc.snowflake.sql.client_option.jwt_expire_timeout`.
+        const JWT_AUTH_OPTION_KEYS: [&str; 3] = [
+            "adbc.snowflake.sql.auth_type",
+            "adbc.snowflake.sql.client_option.jwt_private_key_pkcs8_password",
+            "adbc.snowflake.sql.client_option.jwt_private_key_pkcs8_value",
+        ];
+        if private_key_pem.is_some() {
+            if let Some((bad_key, _)) = db_kwargs
+                .iter()
+                .find(|(k, _)| JWT_AUTH_OPTION_KEYS.contains(&k.as_str()))
+            {
+                return Err(QueryFluxError::Engine(format!(
+                    "cluster '{cluster_name}': dbKwargs['{bad_key}'] conflicts with authType \
+                     'keyPair' — this key is set automatically from the key-pair credential, \
+                     remove it from dbKwargs"
+                )));
+            }
+        }
 
         let flight_sql_cluster_dialect = json
             .get("flightSqlClusterDialect")
@@ -291,6 +360,8 @@ impl crate::EngineConfigParseable for AdbcConfig {
             uri,
             username,
             password,
+            private_key_pem,
+            private_key_passphrase,
             db_kwargs,
             flight_sql_cluster_dialect,
             pool_size,
@@ -365,6 +436,85 @@ fn oauth_token_options(
     }
 }
 
+/// Normalize a Snowflake key-pair private key PEM to PKCS#8 — the only format the ADBC
+/// driver's `jwt_private_key_pkcs8_value` option accepts (`PRIVATE KEY` or `ENCRYPTED
+/// PRIVATE KEY` PEM blocks; it PEM-decodes the option value directly and rejects any other
+/// block type, including PKCS#1's `RSA PRIVATE KEY`). `ClusterAuth::KeyPair` accepts PKCS#1
+/// or PKCS#8 PEM, so PKCS#1 keys are re-encoded here. An already-PKCS#8 PEM (encrypted or
+/// not) passes through unchanged — the driver decrypts an encrypted PKCS#8 key itself, given
+/// the passphrase option, so no decryption happens on the queryflux side either way.
+fn normalize_to_pkcs8_pem(pem: &str, cluster_name: &str) -> Result<String> {
+    let trimmed = pem.trim();
+    if trimmed.contains("BEGIN PRIVATE KEY") || trimmed.contains("BEGIN ENCRYPTED PRIVATE KEY") {
+        return Ok(pem.to_string());
+    }
+    if trimmed.contains("BEGIN RSA PRIVATE KEY") {
+        use rsa::pkcs1::DecodeRsaPrivateKey;
+        use rsa::pkcs8::EncodePrivateKey;
+        let key = rsa::RsaPrivateKey::from_pkcs1_pem(trimmed).map_err(|e| {
+            QueryFluxError::Engine(format!(
+                "cluster '{cluster_name}': failed to parse PKCS#1 private key: {e}"
+            ))
+        })?;
+        let pkcs8 = key.to_pkcs8_pem(rsa::pkcs8::LineEnding::LF).map_err(|e| {
+            QueryFluxError::Engine(format!(
+                "cluster '{cluster_name}': failed to convert private key to PKCS#8: {e}"
+            ))
+        })?;
+        return Ok(pkcs8.to_string());
+    }
+    Err(QueryFluxError::Engine(format!(
+        "cluster '{cluster_name}': private key PEM must be PKCS#1 (\"RSA PRIVATE KEY\") or \
+         PKCS#8 (\"PRIVATE KEY\"/\"ENCRYPTED PRIVATE KEY\") — unrecognized PEM header"
+    )))
+}
+
+/// Per-driver JWT (key-pair) connection-option keys for `authType: keyPair`. Only `snowflake`
+/// is wired in this release — must stay in sync with `ADBC_KEYPAIR_AUTH_DRIVERS` in
+/// `queryflux_core::config`, which is what actually gates which clusters can reach this code
+/// path (startup validation rejects `keyPair` for any other ADBC driver).
+///
+/// **Order matters**: when `passphrase` is `Some`, it is pushed *before* the key-value option.
+/// The Go driver looks up the passphrase in a shared options map at the exact moment it parses
+/// the key value, and `new_database_with_opts` applies every option in vec order (one
+/// `DatabaseSetOption` FFI call per entry) — swapping this order makes the driver report the
+/// passphrase as unconfigured even though it was supplied.
+fn jwt_auth_options(
+    driver: &str,
+    private_key_pem: &str,
+    passphrase: Option<&str>,
+    cluster_name: &str,
+) -> Result<Vec<(OptionDatabase, adbc_core::options::OptionValue)>> {
+    match driver {
+        "snowflake" => {
+            let pem = normalize_to_pkcs8_pem(private_key_pem, cluster_name)?;
+            let mut opts = vec![(
+                OptionDatabase::Other("adbc.snowflake.sql.auth_type".to_string()),
+                "auth_jwt".into(),
+            )];
+            if let Some(pass) = passphrase {
+                opts.push((
+                    OptionDatabase::Other(
+                        "adbc.snowflake.sql.client_option.jwt_private_key_pkcs8_password"
+                            .to_string(),
+                    ),
+                    pass.to_string().into(),
+                ));
+            }
+            opts.push((
+                OptionDatabase::Other(
+                    "adbc.snowflake.sql.client_option.jwt_private_key_pkcs8_value".to_string(),
+                ),
+                pem.into(),
+            ));
+            Ok(opts)
+        }
+        other => Err(QueryFluxError::Engine(format!(
+            "ADBC driver '{other}' has no keyPair connection-option wiring in this release"
+        ))),
+    }
+}
+
 /// ADBC adapter — wraps any ADBC-compatible shared library driver.
 ///
 /// The driver is loaded once at construction via `load_from_name` (manifest-based, searches
@@ -428,11 +578,18 @@ impl AdbcAdapter {
         let mut opts: Vec<(OptionDatabase, adbc_core::options::OptionValue)> =
             vec![(OptionDatabase::Uri, base_uri.clone().into())];
 
-        if let Some(username) = config.username {
-            opts.push((OptionDatabase::Username, username.into()));
+        if let Some(username) = &config.username {
+            opts.push((OptionDatabase::Username, username.clone().into()));
         }
-        if let Some(password) = config.password {
-            opts.push((OptionDatabase::Password, password.into()));
+        if let Some(private_key_pem) = &config.private_key_pem {
+            opts.extend(jwt_auth_options(
+                &driver_name,
+                private_key_pem,
+                config.private_key_passphrase.as_deref(),
+                &cluster_name.0,
+            )?);
+        } else if let Some(password) = &config.password {
+            opts.push((OptionDatabase::Password, password.clone().into()));
         }
         for (k, v) in &base_db_kwargs {
             opts.push((OptionDatabase::Other(k.clone()), v.clone().into()));
@@ -630,7 +787,10 @@ impl AdbcAdapter {
             connection_type: ConnectionType::Driver,
             default_port: None,
             endpoint_example: None,
-            supported_auth: vec![AuthType::Basic],
+            // `KeyPair` is only actually usable for drivers in `ADBC_KEYPAIR_AUTH_DRIVERS`
+            // (snowflake) — this descriptor is shared across all ADBC drivers, so the
+            // driver-aware narrowing happens in `engine_registry::validate_cluster_config`.
+            supported_auth: vec![AuthType::Basic, AuthType::KeyPair],
             implemented: true,
             config_fields: vec![
                 ConfigField {
@@ -1131,9 +1291,253 @@ impl EngineAdapterFactory for AdbcFactory {
 
 #[cfg(test)]
 mod tests {
-    use super::{oauth_token_options, AdbcConfig};
+    use super::{jwt_auth_options, normalize_to_pkcs8_pem, oauth_token_options, AdbcConfig};
     use crate::EngineConfigParseable;
     use queryflux_core::query::{EngineType, SqlDialect};
+
+    /// Small (test-speed-only, not security-relevant) RSA key pair encoded as PKCS#1 PEM.
+    fn test_pkcs1_pem() -> String {
+        use rsa::pkcs1::EncodeRsaPrivateKey;
+        let mut rng = rand::thread_rng();
+        let key = rsa::RsaPrivateKey::new(&mut rng, 512).expect("generate test key");
+        key.to_pkcs1_pem(rsa::pkcs8::LineEnding::LF)
+            .expect("encode pkcs1")
+            .to_string()
+    }
+
+    /// Small (test-speed-only) RSA key pair encoded as unencrypted PKCS#8 PEM.
+    fn test_pkcs8_pem() -> String {
+        use rsa::pkcs8::EncodePrivateKey;
+        let mut rng = rand::thread_rng();
+        let key = rsa::RsaPrivateKey::new(&mut rng, 512).expect("generate test key");
+        key.to_pkcs8_pem(rsa::pkcs8::LineEnding::LF)
+            .expect("encode pkcs8")
+            .to_string()
+    }
+
+    #[test]
+    fn jwt_auth_options_order_is_auth_type_then_password_then_value() {
+        let pem = test_pkcs8_pem();
+        let opts = jwt_auth_options("snowflake", &pem, Some("s3cr3t"), "c").expect("wired");
+        let keys: Vec<String> = opts.iter().map(|(k, _)| format!("{k:?}")).collect();
+        assert_eq!(
+            keys.len(),
+            3,
+            "expected auth_type + password + value, got {keys:?}"
+        );
+        assert!(keys[0].contains("adbc.snowflake.sql.auth_type"), "{keys:?}");
+        assert!(
+            keys[1].contains("jwt_private_key_pkcs8_password"),
+            "passphrase must precede the key value: {keys:?}"
+        );
+        assert!(keys[2].contains("jwt_private_key_pkcs8_value"), "{keys:?}");
+    }
+
+    #[test]
+    fn jwt_auth_options_no_passphrase_omits_password_option() {
+        let pem = test_pkcs8_pem();
+        let opts = jwt_auth_options("snowflake", &pem, None, "c").expect("wired");
+        let keys: Vec<String> = opts.iter().map(|(k, _)| format!("{k:?}")).collect();
+        assert_eq!(
+            keys.len(),
+            2,
+            "expected auth_type + value only, got {keys:?}"
+        );
+        assert!(keys[0].contains("adbc.snowflake.sql.auth_type"), "{keys:?}");
+        assert!(keys[1].contains("jwt_private_key_pkcs8_value"), "{keys:?}");
+    }
+
+    #[test]
+    fn jwt_auth_options_rejects_unwired_drivers() {
+        let pem = test_pkcs8_pem();
+        for driver in ["postgresql", "mysql", "flightsql", "databricks", "unknown"] {
+            assert!(
+                jwt_auth_options(driver, &pem, None, "c").is_err(),
+                "driver '{driver}' should not be wired for keyPair yet"
+            );
+        }
+    }
+
+    #[test]
+    fn normalize_to_pkcs8_pem_passes_pkcs8_through_unchanged() {
+        let pem = test_pkcs8_pem();
+        let out = normalize_to_pkcs8_pem(&pem, "c").expect("no-op for pkcs8");
+        assert_eq!(out, pem);
+    }
+
+    #[test]
+    fn normalize_to_pkcs8_pem_converts_pkcs1() {
+        let pem = test_pkcs1_pem();
+        assert!(pem.contains("BEGIN RSA PRIVATE KEY"));
+        let out = normalize_to_pkcs8_pem(&pem, "c").expect("convert pkcs1");
+        assert!(
+            out.contains("BEGIN PRIVATE KEY"),
+            "expected PKCS#8, got: {out}"
+        );
+        assert!(!out.contains("BEGIN RSA PRIVATE KEY"));
+    }
+
+    #[test]
+    fn normalize_to_pkcs8_pem_rejects_garbage() {
+        let err = normalize_to_pkcs8_pem("not a pem at all", "c").unwrap_err();
+        assert!(err.to_string().contains("unrecognized PEM header"), "{err}");
+    }
+
+    #[test]
+    fn from_json_key_pair_auth_type_parses_private_key() {
+        let pem = test_pkcs8_pem();
+        let json = serde_json::json!({
+            "driver": "snowflake",
+            "uri": "snowflake://acct",
+            "authType": "keyPair",
+            "authUsername": "svc_user",
+            "authPassword": pem,
+            "authToken": "the-passphrase",
+        });
+        let cfg = AdbcConfig::from_json(&json, "c").expect("parse");
+        assert_eq!(cfg.username.as_deref(), Some("svc_user"));
+        assert_eq!(cfg.password, None);
+        assert_eq!(cfg.private_key_pem.as_deref(), Some(pem.as_str()));
+        assert_eq!(
+            cfg.private_key_passphrase.as_deref(),
+            Some("the-passphrase")
+        );
+    }
+
+    #[test]
+    fn from_json_key_pair_auth_type_without_passphrase() {
+        let pem = test_pkcs8_pem();
+        let json = serde_json::json!({
+            "driver": "snowflake",
+            "uri": "snowflake://acct",
+            "authType": "keyPair",
+            "authUsername": "svc_user",
+            "authPassword": pem,
+        });
+        let cfg = AdbcConfig::from_json(&json, "c").expect("parse");
+        assert_eq!(cfg.private_key_passphrase, None);
+    }
+
+    #[test]
+    fn from_json_basic_auth_type_parses_username_password() {
+        let json = serde_json::json!({
+            "driver": "trino",
+            "uri": "http://localhost:8080",
+            "authType": "basic",
+            "authUsername": "u",
+            "authPassword": "p",
+        });
+        let cfg = AdbcConfig::from_json(&json, "c").expect("parse");
+        assert_eq!(cfg.username.as_deref(), Some("u"));
+        assert_eq!(cfg.password.as_deref(), Some("p"));
+        assert_eq!(cfg.private_key_pem, None);
+    }
+
+    #[test]
+    fn from_json_legacy_flat_fields_without_auth_type_still_work() {
+        // Backward compat: ADBC clusters created before `authType` existed for ADBC.
+        let json = serde_json::json!({
+            "driver": "trino",
+            "uri": "http://localhost:8080",
+            "username": "u",
+            "password": "p",
+        });
+        let cfg = AdbcConfig::from_json(&json, "c").expect("parse");
+        assert_eq!(cfg.username.as_deref(), Some("u"));
+        assert_eq!(cfg.password.as_deref(), Some("p"));
+    }
+
+    #[test]
+    fn from_json_rejects_bearer_auth_type_for_adbc() {
+        let json = serde_json::json!({
+            "driver": "trino",
+            "uri": "http://localhost:8080",
+            "authType": "bearer",
+            "authToken": "t",
+        });
+        match AdbcConfig::from_json(&json, "c") {
+            Err(e) => assert!(e.to_string().contains("bearer"), "unexpected: {e}"),
+            Ok(_) => panic!("expected parse error for authType 'bearer' on ADBC"),
+        }
+    }
+
+    #[test]
+    fn from_json_rejects_db_kwargs_conflicting_with_key_pair() {
+        let pem = test_pkcs8_pem();
+        let json = serde_json::json!({
+            "driver": "snowflake",
+            "uri": "snowflake://acct",
+            "authType": "keyPair",
+            "authUsername": "svc_user",
+            "authPassword": pem,
+            "dbKwargs": { "adbc.snowflake.sql.auth_type": "auth_snowflake" },
+        });
+        match AdbcConfig::from_json(&json, "c") {
+            Err(e) => assert!(
+                e.to_string().contains("conflicts with authType 'keyPair'"),
+                "unexpected: {e}"
+            ),
+            Ok(_) => panic!("expected conflict error"),
+        }
+    }
+
+    #[test]
+    fn from_json_rejects_db_kwargs_jwt_pkcs8_value_conflict() {
+        let pem = test_pkcs8_pem();
+        let json = serde_json::json!({
+            "driver": "snowflake",
+            "uri": "snowflake://acct",
+            "authType": "keyPair",
+            "authUsername": "svc_user",
+            "authPassword": pem,
+            "dbKwargs": { "adbc.snowflake.sql.client_option.jwt_private_key_pkcs8_value": "x" },
+        });
+        match AdbcConfig::from_json(&json, "c") {
+            Err(e) => assert!(
+                e.to_string().contains("conflicts with authType 'keyPair'"),
+                "unexpected: {e}"
+            ),
+            Ok(_) => panic!("expected conflict error"),
+        }
+    }
+
+    #[test]
+    fn from_json_rejects_db_kwargs_jwt_pkcs8_password_conflict() {
+        let pem = test_pkcs8_pem();
+        let json = serde_json::json!({
+            "driver": "snowflake",
+            "uri": "snowflake://acct",
+            "authType": "keyPair",
+            "authUsername": "svc_user",
+            "authPassword": pem,
+            "dbKwargs": { "adbc.snowflake.sql.client_option.jwt_private_key_pkcs8_password": "x" },
+        });
+        match AdbcConfig::from_json(&json, "c") {
+            Err(e) => assert!(
+                e.to_string().contains("conflicts with authType 'keyPair'"),
+                "unexpected: {e}"
+            ),
+            Ok(_) => panic!("expected conflict error"),
+        }
+    }
+
+    #[test]
+    fn from_json_allows_unrelated_jwt_prefixed_db_kwargs() {
+        // A prefix scan would wrongly reject this — `jwt_expire_timeout` is a real, unrelated
+        // Snowflake driver option `jwt_auth_options` never sets, so it must be allowed
+        // alongside `authType: keyPair`.
+        let pem = test_pkcs8_pem();
+        let json = serde_json::json!({
+            "driver": "snowflake",
+            "uri": "snowflake://acct",
+            "authType": "keyPair",
+            "authUsername": "svc_user",
+            "authPassword": pem,
+            "dbKwargs": { "adbc.snowflake.sql.client_option.jwt_expire_timeout": "5m" },
+        });
+        let cfg = AdbcConfig::from_json(&json, "c").expect("jwt_expire_timeout is not a conflict");
+        assert_eq!(cfg.db_kwargs.len(), 1);
+    }
 
     #[test]
     fn oauth_token_options_snowflake_sets_auth_type_and_token() {
