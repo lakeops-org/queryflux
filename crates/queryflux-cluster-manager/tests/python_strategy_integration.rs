@@ -55,12 +55,23 @@ def select_cluster(candidates):
     assert_eq!(picked, Some(ClusterName("cluster-b".to_string())));
 }
 
-/// A blocking-dispatch strategy that always picks the first candidate, but signals
-/// `started` before it "runs" (simulated with a short sleep) so a concurrent task can
-/// change cluster state mid-pick — exercising the check-to-use window between building
-/// `eligible` and re-validating the chosen cluster after the `spawn_blocking` await.
+/// A blocking-dispatch strategy that always picks the first candidate, and holds
+/// `pick` open until the test releases it — exercising the check-to-use window between
+/// building `eligible` and re-validating the chosen cluster after the `spawn_blocking`
+/// await.
+///
+/// Two rendezvous points make the interleaving deterministic rather than timing-based:
+/// `started` signals that `pick` has begun (so the snapshot is already taken), and
+/// `resume` blocks `pick` from returning until the test has mutated cluster state. A
+/// plain sleep here would only make the race *likely*, not guaranteed — a delayed test
+/// task on a loaded runner could let `pick` return first and fail a correct
+/// implementation.
 struct SlowFirstCandidateStrategy {
     started: Arc<tokio::sync::Notify>,
+    /// `Receiver` is `Send` but not `Sync`; the `Mutex` supplies the `Sync` half of the
+    /// trait's `Send + Sync` bound. Blocking `recv()` is safe here because `pick` runs
+    /// on a `spawn_blocking` thread, not a Tokio worker.
+    resume: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
 }
 
 impl ClusterSelectionStrategy for SlowFirstCandidateStrategy {
@@ -73,7 +84,8 @@ impl ClusterSelectionStrategy for SlowFirstCandidateStrategy {
         _candidates: &[queryflux_cluster_manager::strategy::ClusterCandidate<'_>],
     ) -> Option<usize> {
         self.started.notify_one();
-        std::thread::sleep(std::time::Duration::from_millis(150));
+        // Park until the test has disabled cluster-a — no sleep, no timing assumption.
+        let _ = self.resume.lock().expect("resume mutex").recv();
         Some(0)
     }
 }
@@ -107,8 +119,10 @@ async fn acquire_cluster_revalidates_pick_after_blocking_dispatch() {
     ));
 
     let started = Arc::new(tokio::sync::Notify::new());
+    let (resume_tx, resume_rx) = std::sync::mpsc::channel();
     let strategy: Arc<dyn ClusterSelectionStrategy> = Arc::new(SlowFirstCandidateStrategy {
         started: started.clone(),
+        resume: std::sync::Mutex::new(resume_rx),
     });
 
     let mut groups = HashMap::new();
@@ -122,9 +136,10 @@ async fn acquire_cluster_revalidates_pick_after_blocking_dispatch() {
     };
 
     // Wait until pick() has started (candidates already snapshotted), then disable
-    // cluster-a — the strategy's chosen candidate — while pick() is still "running".
+    // cluster-a — the strategy's chosen candidate — before letting pick() return.
     started.notified().await;
     a.set_enabled(false);
+    resume_tx.send(()).expect("release pick()");
 
     let picked = acquire_task.await.unwrap().unwrap();
     assert_eq!(
