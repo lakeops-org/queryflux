@@ -847,13 +847,25 @@ impl SyncAdapter for AdbcAdapter {
                         return;
                     }
                 };
+                // `RecordBatchReader::schema` reflects the query's real result-set
+                // schema even when the reader yields zero batches (e.g. a SELECT
+                // that matches no rows). Capture it before consuming the reader so
+                // dispatch can still send a correct RowDescription — never fall
+                // back to a fabricated Schema::empty(), which is indistinguishable
+                // from the DDL/DML no-result-set path (the root cause of #97).
+                let schema = reader.schema();
+                let mut produced_any = false;
                 for batch in reader {
+                    produced_any = true;
                     let result = batch.map_err(|e| {
                         QueryFluxError::Engine(format!("ADBC: failed to read results: {e}"))
                     });
                     if batch_tx.blocking_send(result).is_err() {
                         return;
                     }
+                }
+                if !produced_any {
+                    let _ = batch_tx.blocking_send(Ok(RecordBatch::new_empty(schema)));
                 }
                 let _ = stats_tx.send(None);
             });
@@ -906,7 +918,14 @@ impl SyncAdapter for AdbcAdapter {
             Ok(SyncExecution {
                 stream: empty,
                 stats: stats_rx,
-                affected_rows: Some(affected.unwrap_or(0)),
+                // `affected` is `None` when the driver reports an unknown count
+                // (ADBC returns -1) — preserve that distinction here rather than
+                // coercing to 0. Query history, metrics, and audit records read
+                // `QueryStats.affected_rows` directly, not just the wire-protocol
+                // sinks (which already fall back to displaying 0 for `None`, since
+                // MySQL OK packets and Postgres CommandComplete tags always carry
+                // a definite row count on the wire).
+                affected_rows: affected,
             })
         }
     }

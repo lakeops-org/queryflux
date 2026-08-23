@@ -341,3 +341,48 @@ async fn trino_adbc_select_does_not_set_affected_rows() {
     }
     assert!(rows >= 1);
 }
+
+/// Regression: a SELECT matching zero rows must still surface its real schema
+/// (not an empty stream that dispatch would misframe as a DDL/DML OK response).
+#[tokio::test]
+#[ignore = "requires Trino + Trino ADBC driver — run with: make test-e2e"]
+async fn trino_adbc_select_zero_rows_still_yields_schema() {
+    let Some(adapter) = trino_adbc_adapter_ready().await else {
+        return;
+    };
+
+    let session = empty_trino_session();
+    let creds = QueryCredentials::ServiceAccount;
+    let tags = QueryTags::new();
+    let hints = queryflux_core::sql_classify::ExecutionHints {
+        is_read_like: Some(true),
+    };
+
+    let mut exec = adapter
+        .execute_as_arrow(
+            "SELECT 1 AS n WHERE 1 = 0",
+            &session,
+            &creds,
+            &tags,
+            &vec![],
+            hints,
+            &queryflux_engine_adapters::BackendQueryIdSlot::new(),
+        )
+        .await
+        .expect("SELECT");
+
+    assert!(
+        exec.affected_rows.is_none(),
+        "SELECT must not set affected_rows"
+    );
+    let batch = exec
+        .stream
+        .next()
+        .await
+        .expect("empty SELECT must still yield one batch carrying the real schema")
+        .expect("batch");
+    assert_eq!(batch.num_rows(), 0);
+    assert_eq!(batch.schema().fields().len(), 1, "schema must have column n");
+    assert_eq!(batch.schema().field(0).name(), "n");
+    assert!(exec.stream.next().await.is_none(), "only one (empty) batch expected");
+}

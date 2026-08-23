@@ -378,7 +378,7 @@ async fn handle_simple_query(
     };
 
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
-    let mut sink = PostgresResultSink::new(tx);
+    let mut sink = PostgresResultSink::new(tx, sql);
 
     let state2 = state.clone();
     let session2 = session.clone();
@@ -430,6 +430,59 @@ async fn handle_simple_query(
 
 // ── PostgresResultSink ────────────────────────────────────────────────────────
 
+/// The `CommandComplete` tag for a non-result-set statement: a verb (or
+/// verb + object, e.g. "CREATE TABLE") and whether Postgres appends a row count.
+///
+/// Real Postgres tags: `INSERT 0 <rows>`, `UPDATE <rows>`, `DELETE <rows>`,
+/// `MERGE <rows>` carry a count; DDL tags (`CREATE TABLE`, `DROP INDEX`, …) and
+/// everything else do not.
+struct PostgresCommandTag {
+    verb: String,
+    has_row_count: bool,
+}
+
+impl PostgresCommandTag {
+    fn classify(sql: &str) -> Self {
+        let s = queryflux_core::sql_classify::strip_leading_sql_comments(sql);
+        let mut words = s.split_whitespace();
+        let first = words.next().unwrap_or("").to_uppercase();
+        match first.as_str() {
+            "INSERT" => Self {
+                verb: "INSERT 0".to_string(),
+                has_row_count: true,
+            },
+            "UPDATE" | "DELETE" | "MERGE" => Self {
+                verb: first,
+                has_row_count: true,
+            },
+            "CREATE" | "DROP" | "ALTER" => {
+                let second = words.next().unwrap_or("").to_uppercase();
+                let verb = if second.is_empty() {
+                    first
+                } else {
+                    format!("{first} {second}")
+                };
+                Self {
+                    verb,
+                    has_row_count: false,
+                }
+            }
+            "TRUNCATE" => Self {
+                verb: "TRUNCATE TABLE".to_string(),
+                has_row_count: false,
+            },
+            "" => Self {
+                verb: "OK".to_string(),
+                has_row_count: false,
+            },
+            other => Self {
+                verb: other.to_string(),
+                has_row_count: false,
+            },
+        }
+    }
+}
+
 /// Streams Arrow RecordBatches as Postgres wire protocol messages over a channel.
 ///
 /// Sends pre-encoded Postgres messages (type byte + length + body) via channel.
@@ -438,14 +491,18 @@ struct PostgresResultSink {
     tx: UnboundedSender<Vec<u8>>,
     row_count: u64,
     schema_sent: bool,
+    /// Command tag verb (e.g. "CREATE TABLE", "INSERT 0", "UPDATE") for the
+    /// non-result-set path, derived from the original SQL at construction.
+    command_tag: PostgresCommandTag,
 }
 
 impl PostgresResultSink {
-    fn new(tx: UnboundedSender<Vec<u8>>) -> Self {
+    fn new(tx: UnboundedSender<Vec<u8>>, sql: &str) -> Self {
         Self {
             tx,
             row_count: 0,
             schema_sent: false,
+            command_tag: PostgresCommandTag::classify(sql),
         }
     }
 
@@ -513,10 +570,10 @@ impl ResultSink for PostgresResultSink {
     async fn on_complete(&mut self, stats: &QueryStats) -> Result<()> {
         let tag = if self.schema_sent {
             format!("SELECT {}\0", self.row_count)
-        } else if let Some(n) = stats.affected_rows {
-            format!("OK {n}\0")
+        } else if self.command_tag.has_row_count {
+            format!("{} {}\0", self.command_tag.verb, stats.affected_rows.unwrap_or(0))
         } else {
-            "OK\0".to_string()
+            format!("{}\0", self.command_tag.verb)
         };
         self.send_msg(b'C', tag.into_bytes());
         Ok(())
@@ -748,9 +805,9 @@ mod tests {
     use tokio::sync::mpsc::unbounded_channel;
 
     #[tokio::test]
-    async fn no_schema_complete_emits_ok_command_complete() {
+    async fn no_schema_complete_emits_insert_command_complete() {
         let (tx, mut rx) = unbounded_channel::<Vec<u8>>();
-        let mut sink = PostgresResultSink::new(tx);
+        let mut sink = PostgresResultSink::new(tx, "INSERT INTO t VALUES (1)");
 
         let stats = QueryStats {
             affected_rows: Some(1),
@@ -762,13 +819,16 @@ mod tests {
         assert_eq!(msg[0], b'C', "CommandComplete message type");
         let body = &msg[5..]; // skip type + i32 length
         let tag = String::from_utf8_lossy(body);
-        assert!(tag.starts_with("OK 1"), "tag should be 'OK 1', got: {tag}");
+        assert!(
+            tag.starts_with("INSERT 0 1"),
+            "tag should be 'INSERT 0 1', got: {tag}"
+        );
     }
 
     #[tokio::test]
-    async fn no_schema_no_affected_rows_emits_ok() {
+    async fn ddl_with_no_affected_rows_emits_bare_command_tag() {
         let (tx, mut rx) = unbounded_channel::<Vec<u8>>();
-        let mut sink = PostgresResultSink::new(tx);
+        let mut sink = PostgresResultSink::new(tx, "CREATE TABLE t (id INT)");
 
         let stats = QueryStats::default();
         sink.on_complete(&stats).await.unwrap();
@@ -776,13 +836,16 @@ mod tests {
         let msg = rx.try_recv().expect("CommandComplete");
         let body = &msg[5..];
         let tag = String::from_utf8_lossy(body);
-        assert!(tag.starts_with("OK\0"), "tag should be 'OK', got: {tag}");
+        assert!(
+            tag.starts_with("CREATE TABLE\0"),
+            "tag should be 'CREATE TABLE', got: {tag}"
+        );
     }
 
     #[tokio::test]
     async fn empty_schema_skips_row_description() {
         let (tx, mut rx) = unbounded_channel::<Vec<u8>>();
-        let mut sink = PostgresResultSink::new(tx);
+        let mut sink = PostgresResultSink::new(tx, "CREATE TABLE t (id INT)");
 
         sink.on_schema(&Schema::empty()).await.unwrap();
         assert!(
@@ -795,7 +858,7 @@ mod tests {
     async fn non_empty_schema_sends_row_description_and_select_tag() {
         use arrow::datatypes::{DataType, Field};
         let (tx, mut rx) = unbounded_channel::<Vec<u8>>();
-        let mut sink = PostgresResultSink::new(tx);
+        let mut sink = PostgresResultSink::new(tx, "SELECT * FROM t");
 
         let schema = Schema::new(vec![Field::new("id", DataType::Int32, false)]);
         sink.on_schema(&schema).await.unwrap();
@@ -822,7 +885,7 @@ mod tests {
         use std::sync::Arc;
 
         let (tx, mut rx) = unbounded_channel::<Vec<u8>>();
-        let mut sink = PostgresResultSink::new(tx);
+        let mut sink = PostgresResultSink::new(tx, "CREATE TABLE t (id INT)");
 
         sink.on_schema(&Schema::empty()).await.unwrap();
 
@@ -837,12 +900,12 @@ mod tests {
     }
 
     /// Regression for lakeops-org/queryflux#97 (Postgres wire).
-    /// DDL/DML with no result set must emit CommandComplete OK, not SELECT 0
-    /// after a zero-field RowDescription.
+    /// DDL/DML with no result set must emit a CommandComplete with the real
+    /// Postgres command tag, not SELECT 0 after a zero-field RowDescription.
     #[tokio::test]
-    async fn issue97_ddl_path_emits_ok_command_complete_without_row_description() {
+    async fn issue97_ddl_path_emits_command_complete_without_row_description() {
         let (tx, mut rx) = unbounded_channel::<Vec<u8>>();
-        let mut sink = PostgresResultSink::new(tx);
+        let mut sink = PostgresResultSink::new(tx, "UPDATE t SET x = 1");
 
         let stats = QueryStats {
             affected_rows: Some(2),
@@ -854,14 +917,34 @@ mod tests {
         assert_eq!(msg[0], b'C');
         let tag = String::from_utf8_lossy(&msg[5..]);
         assert!(
-            tag.starts_with("OK 2"),
-            "expected OK with affected_rows, got: {tag}"
+            tag.starts_with("UPDATE 2"),
+            "expected UPDATE tag with affected_rows, got: {tag}"
         );
         assert!(
             !tag.starts_with("SELECT"),
             "DDL/DML must not use SELECT tag"
         );
         assert!(rx.try_recv().is_err(), "only one CommandComplete expected");
+    }
+
+    #[tokio::test]
+    async fn command_tag_classifies_ddl_dml_verbs() {
+        let cases: &[(&str, &str, bool)] = &[
+            ("CREATE TABLE t (id INT)", "CREATE TABLE", false),
+            ("create table t (id int)", "CREATE TABLE", false),
+            ("DROP TABLE t", "DROP TABLE", false),
+            ("ALTER TABLE t ADD COLUMN y INT", "ALTER TABLE", false),
+            ("TRUNCATE t", "TRUNCATE TABLE", false),
+            ("INSERT INTO t VALUES (1)", "INSERT 0", true),
+            ("UPDATE t SET x = 1", "UPDATE", true),
+            ("DELETE FROM t WHERE id = 1", "DELETE", true),
+            ("  -- comment\nDROP TABLE t", "DROP TABLE", false),
+        ];
+        for (sql, expected_verb, has_row_count) in cases {
+            let tag = super::PostgresCommandTag::classify(sql);
+            assert_eq!(tag.verb, *expected_verb, "sql: {sql}");
+            assert_eq!(tag.has_row_count, *has_row_count, "sql: {sql}");
+        }
     }
 
     #[tokio::test]

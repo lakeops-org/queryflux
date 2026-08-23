@@ -1099,6 +1099,7 @@ enum DispatchAdapter {
 }
 
 impl DispatchAdapter {
+    #[allow(clippy::too_many_arguments)]
     async fn execute_as_arrow(
         &self,
         sql: &str,

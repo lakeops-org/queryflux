@@ -65,9 +65,23 @@ impl SqlParseCache {
 
     /// Whether the statement should use a result-set execution path (`execute`) vs
     /// an update path (`execute_update`).
+    ///
+    /// Deliberately stricter than [`is_read_stmt`]: `Expression::Command` (`BEGIN`,
+    /// `COMMIT`, `ROLLBACK`, and any future catch-all the parser recognizes but
+    /// doesn't model precisely) is treated as "read" by `is_read_stmt` so guardrails
+    /// don't block it, but that's a permissive default for a different question
+    /// ("is this safe to allow?"). Here we're deciding which ADBC API to call, and a
+    /// `Command` produces no result set — routing it through `execute()` risks the
+    /// same empty-stream misframing this cache exists to avoid (#97). Route it
+    /// through `execute_update()` like DDL/DML instead.
     pub fn is_read_like(&self) -> bool {
         match self.statements() {
-            Some(stmts) => !stmts.is_empty() && stmts.iter().all(is_read_stmt),
+            Some(stmts) => {
+                !stmts.is_empty()
+                    && stmts
+                        .iter()
+                        .all(|s| is_read_stmt(s) && !matches!(s, Expression::Command(_)))
+            }
             None => is_read_like_fallback(&self.sql),
         }
     }
@@ -201,6 +215,33 @@ mod tests {
                 "expected non-read for: {sql}"
             );
         }
+    }
+
+    /// `Command` (e.g. bare `END` in a non-Postgres dialect) is "read" for
+    /// `is_read_stmt` (guardrails' permissive default) but must NOT be read-like
+    /// for ADBC routing — it produces no result set, so it belongs on the
+    /// execute_update path like DDL/DML.
+    #[test]
+    fn command_statements_are_read_for_guardrails_but_not_for_execution_routing() {
+        let sql = "END";
+        let cache = SqlParseCache::new(sql, SqlDialect::Generic);
+        let stmts = cache
+            .statements()
+            .unwrap_or_else(|| panic!("expected polyglot_sql to parse {sql:?} as a statement"));
+        assert_eq!(stmts.len(), 1);
+        assert!(
+            matches!(stmts[0], Expression::Command(_)),
+            "expected {sql:?} to parse as Expression::Command, got: {:?}",
+            stmts[0]
+        );
+        assert!(
+            is_read_stmt(&stmts[0]),
+            "is_read_stmt should still treat Command as read (guardrails default): {sql}"
+        );
+        assert!(
+            !cache.is_read_like(),
+            "is_read_like must route Command through execute_update, not execute: {sql}"
+        );
     }
 
     #[test]
