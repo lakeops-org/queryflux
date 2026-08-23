@@ -382,7 +382,14 @@ async fn trino_adbc_select_zero_rows_still_yields_schema() {
         .expect("empty SELECT must still yield one batch carrying the real schema")
         .expect("batch");
     assert_eq!(batch.num_rows(), 0);
-    assert_eq!(batch.schema().fields().len(), 1, "schema must have column n");
+    assert_eq!(
+        batch.schema().fields().len(),
+        1,
+        "schema must have column n"
+    );
     assert_eq!(batch.schema().field(0).name(), "n");
-    assert!(exec.stream.next().await.is_none(), "only one (empty) batch expected");
+    assert!(
+        exec.stream.next().await.is_none(),
+        "only one (empty) batch expected"
+    );
 }

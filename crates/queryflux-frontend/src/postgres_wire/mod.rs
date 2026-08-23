@@ -456,14 +456,38 @@ impl PostgresCommandTag {
                 has_row_count: true,
             },
             "CREATE" | "DROP" | "ALTER" => {
-                let second = words.next().unwrap_or("").to_uppercase();
-                let verb = if second.is_empty() {
-                    first
-                } else {
-                    format!("{first} {second}")
-                };
+                // Modifiers between the verb and the object type that Postgres
+                // drops from the tag entirely (e.g. `CREATE OR REPLACE VIEW` →
+                // "CREATE VIEW", `CREATE UNIQUE INDEX` → "CREATE INDEX").
+                const SKIPPED_QUALIFIERS: &[&str] = &[
+                    "OR",
+                    "REPLACE",
+                    "TEMP",
+                    "TEMPORARY",
+                    "UNLOGGED",
+                    "UNIQUE",
+                    "GLOBAL",
+                    "LOCAL",
+                ];
+                // Object-type words that are themselves a prefix of a two-word
+                // type (`CREATE MATERIALIZED VIEW`, `CREATE FOREIGN TABLE`) —
+                // keep scanning for the next word instead of stopping here.
+                const COMPOUND_TYPE_PREFIXES: &[&str] = &["MATERIALIZED", "FOREIGN"];
+
+                let mut parts = vec![first];
+                for word in words {
+                    let upper = word.to_uppercase();
+                    if SKIPPED_QUALIFIERS.contains(&upper.as_str()) {
+                        continue;
+                    }
+                    let is_prefix = COMPOUND_TYPE_PREFIXES.contains(&upper.as_str());
+                    parts.push(upper);
+                    if !is_prefix {
+                        break;
+                    }
+                }
                 Self {
-                    verb,
+                    verb: parts.join(" "),
                     has_row_count: false,
                 }
             }
@@ -571,7 +595,11 @@ impl ResultSink for PostgresResultSink {
         let tag = if self.schema_sent {
             format!("SELECT {}\0", self.row_count)
         } else if self.command_tag.has_row_count {
-            format!("{} {}\0", self.command_tag.verb, stats.affected_rows.unwrap_or(0))
+            format!(
+                "{} {}\0",
+                self.command_tag.verb,
+                stats.affected_rows.unwrap_or(0)
+            )
         } else {
             format!("{}\0", self.command_tag.verb)
         };
@@ -591,6 +619,14 @@ impl ResultSink for PostgresResultSink {
         body.push(0);
         body.push(0); // terminator
         self.send_msg(b'E', body);
+        Ok(())
+    }
+
+    async fn on_translated_sql(&mut self, sql: &str) -> Result<()> {
+        // Translation can rewrite the leading verb (e.g. MySQL `REPLACE INTO` →
+        // target-dialect `INSERT ... ON CONFLICT`) — reclassify from what's
+        // actually executed, not the pre-translation SQL used at construction.
+        self.command_tag = PostgresCommandTag::classify(sql);
         Ok(())
     }
 }
@@ -939,12 +975,58 @@ mod tests {
             ("UPDATE t SET x = 1", "UPDATE", true),
             ("DELETE FROM t WHERE id = 1", "DELETE", true),
             ("  -- comment\nDROP TABLE t", "DROP TABLE", false),
+            ("CREATE OR REPLACE VIEW v AS SELECT 1", "CREATE VIEW", false),
+            ("CREATE TEMP TABLE t (id INT)", "CREATE TABLE", false),
+            ("CREATE TEMPORARY TABLE t (id INT)", "CREATE TABLE", false),
+            ("CREATE UNLOGGED TABLE t (id INT)", "CREATE TABLE", false),
+            ("CREATE UNIQUE INDEX idx ON t (id)", "CREATE INDEX", false),
+            (
+                "CREATE MATERIALIZED VIEW v AS SELECT 1",
+                "CREATE MATERIALIZED VIEW",
+                false,
+            ),
+            (
+                "CREATE FOREIGN TABLE t (id INT) SERVER s",
+                "CREATE FOREIGN TABLE",
+                false,
+            ),
+            (
+                "CREATE OR REPLACE FUNCTION f() RETURNS INT AS $$ SELECT 1 $$ LANGUAGE sql",
+                "CREATE FUNCTION",
+                false,
+            ),
         ];
         for (sql, expected_verb, has_row_count) in cases {
             let tag = super::PostgresCommandTag::classify(sql);
             assert_eq!(tag.verb, *expected_verb, "sql: {sql}");
             assert_eq!(tag.has_row_count, *has_row_count, "sql: {sql}");
         }
+    }
+
+    /// `on_translated_sql` must override the construction-time classification —
+    /// dispatch calls it once the SQL is fully translated, and translation can
+    /// rewrite the leading verb (e.g. MySQL `REPLACE INTO` on the client side
+    /// becomes a target-dialect `INSERT ... ON CONFLICT`).
+    #[tokio::test]
+    async fn on_translated_sql_reclassifies_the_command_tag() {
+        let (tx, mut rx) = unbounded_channel::<Vec<u8>>();
+        let mut sink = PostgresResultSink::new(tx, "REPLACE INTO t VALUES (1)");
+        sink.on_translated_sql("INSERT INTO t VALUES (1) ON CONFLICT DO UPDATE SET x = 1")
+            .await
+            .unwrap();
+
+        let stats = QueryStats {
+            affected_rows: Some(1),
+            ..Default::default()
+        };
+        sink.on_complete(&stats).await.unwrap();
+
+        let msg = rx.try_recv().expect("CommandComplete");
+        let tag = String::from_utf8_lossy(&msg[5..]);
+        assert!(
+            tag.starts_with("INSERT 0 1"),
+            "expected reclassified INSERT tag, got: {tag}"
+        );
     }
 
     #[tokio::test]

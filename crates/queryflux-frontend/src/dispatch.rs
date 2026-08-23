@@ -62,6 +62,17 @@ pub trait ResultSink: Send {
             "on_native_chunk not implemented for this sink".to_string(),
         ))
     }
+
+    /// Called once, after translation, with the exact SQL sent to the adapter.
+    ///
+    /// Sinks that derive per-statement framing from the SQL text (e.g. Postgres
+    /// wire's CommandComplete tag) must classify from *this*, not the pre-translation
+    /// client SQL — translation can rewrite the leading verb (e.g. MySQL `REPLACE
+    /// INTO` → target-dialect `INSERT ... ON CONFLICT`). Default is a no-op for
+    /// sinks that don't need it.
+    async fn on_translated_sql(&mut self, _sql: &str) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// Protocol-agnostic result of dispatching a query to an async (Trino) backend.
@@ -2077,6 +2088,10 @@ async fn execute_to_sink_inner(
         // Attach non-blocking guard actions (allow/warn) to the setup context so they
         // flow into record_query at the normal exit point below.
         setup.guard_actions = all_actions;
+    }
+
+    if let Err(e) = sink.on_translated_sql(&setup.translated).await {
+        return sink.on_error(&e.to_string()).await;
     }
 
     // Native path: skip Arrow when backend connection format matches frontend protocol.
