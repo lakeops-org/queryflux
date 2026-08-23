@@ -55,8 +55,55 @@ impl ClusterGroupManager for SimpleClusterGroupManager {
             })
             .collect();
 
-        let picked_local_idx = strategy.pick(&candidates).unwrap_or(0);
+        let picked_local_idx = if strategy.requires_blocking_dispatch() {
+            // Strategies like the Python script one may block the thread (e.g. holding
+            // the GIL) — run them off the async runtime rather than calling inline.
+            let owned: Vec<(String, queryflux_core::query::EngineType, u64, u64)> = candidates
+                .iter()
+                .map(|c| {
+                    (
+                        c.name.to_string(),
+                        c.engine_type.clone(),
+                        c.running_queries,
+                        c.max_running_queries,
+                    )
+                })
+                .collect();
+            let strategy = Arc::clone(strategy);
+            tokio::task::spawn_blocking(move || {
+                let candidates: Vec<ClusterCandidate<'_>> = owned
+                    .iter()
+                    .map(|(name, engine_type, running, max)| ClusterCandidate {
+                        name: name.as_str(),
+                        engine_type: engine_type.clone(),
+                        running_queries: *running,
+                        max_running_queries: *max,
+                    })
+                    .collect();
+                strategy.pick(&candidates)
+            })
+            .await
+            .map_err(|e| QueryFluxError::Routing(format!("spawn_blocking error: {e}")))?
+            .unwrap_or(0)
+        } else {
+            strategy.pick(&candidates).unwrap_or(0)
+        };
         let (_, chosen) = eligible[picked_local_idx];
+        // A blocking-dispatch strategy yields at the `.await` above; another task can
+        // fill `chosen` to capacity or a health check can mark it unhealthy in that
+        // window. Re-validate before admitting the query, falling back to any other
+        // still-eligible member rather than trusting a snapshot that may be stale.
+        let chosen = if chosen.is_enabled() && chosen.is_healthy() && !chosen.is_at_capacity() {
+            chosen
+        } else {
+            match eligible
+                .iter()
+                .find(|(_, c)| c.is_enabled() && c.is_healthy() && !c.is_at_capacity())
+            {
+                Some((_, c)) => *c,
+                None => return Ok(None),
+            }
+        };
         chosen.increment_running();
         Ok(Some(chosen.cluster_name.clone()))
     }

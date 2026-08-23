@@ -18,6 +18,7 @@ import {
   STRATEGY_OPTIONS,
   type StrategyKind,
 } from "@/lib/cluster-group-strategy";
+import { CLUSTER_STRATEGY_SCRIPT_TEMPLATE } from "@/lib/script-templates";
 
 type Props = {
   open: boolean;
@@ -49,6 +50,8 @@ export function GroupFormDialog({
   const [strategyKind, setStrategyKind] = useState<StrategyKind>("default");
   const [enginePreferenceCsv, setEnginePreferenceCsv] = useState("");
   const [weightedJson, setWeightedJson] = useState("{}");
+  const [clusterStrategyScript, setClusterStrategyScript] = useState("");
+  const [clusterStrategyScriptFile, setClusterStrategyScriptFile] = useState("");
   const [translationScriptIds, setTranslationScriptIds] = useState<number[]>([]);
   const [scriptLibrary, setScriptLibrary] = useState<UserScriptRecord[]>([]);
   const [addScriptId, setAddScriptId] = useState<string>("");
@@ -74,6 +77,8 @@ export function GroupFormDialog({
     setStrategyKind("default");
     setEnginePreferenceCsv("");
     setWeightedJson("{}");
+    setClusterStrategyScript("");
+    setClusterStrategyScriptFile("");
     setTranslationScriptIds([]);
     setAddScriptId("");
     setTagRows([]);
@@ -108,6 +113,8 @@ export function GroupFormDialog({
         setStrategyKind(p.kind);
         setEnginePreferenceCsv(p.enginePreferenceCsv);
         setWeightedJson(p.weightedJson.trim() ? p.weightedJson : "{}");
+        setClusterStrategyScript(p.script);
+        setClusterStrategyScriptFile(p.scriptFile);
       }
       if (initial.cache) {
         setCacheEnabled(initial.cache.enabled);
@@ -226,6 +233,8 @@ export function GroupFormDialog({
         strategyKind,
         enginePreferenceCsv,
         weightedJson,
+        clusterStrategyScript,
+        clusterStrategyScriptFile,
       );
     } catch (e) {
       setError(e instanceof Error ? e.message : "Invalid strategy");
@@ -728,6 +737,64 @@ export function GroupFormDialog({
                   Keys must match cluster <strong>names</strong> in this group. Missing clusters
                   default to weight 1 at runtime.
                 </p>
+              </div>
+            ) : null}
+
+            {strategyKind === "pythonScript" ? (
+              <div>
+                <div className="flex items-center justify-between mb-1.5">
+                  <label
+                    htmlFor="group-python-script"
+                    className="block text-[11px] font-semibold text-slate-500 uppercase tracking-wide"
+                  >
+                    Python body
+                  </label>
+                  <button
+                    type="button"
+                    onClick={() => setClusterStrategyScript(CLUSTER_STRATEGY_SCRIPT_TEMPLATE)}
+                    className="text-[10px] font-semibold uppercase tracking-wide text-indigo-600 hover:text-indigo-800 px-2 py-1 rounded-md hover:bg-indigo-50"
+                  >
+                    Insert template
+                  </button>
+                </div>
+                <textarea
+                  id="group-python-script"
+                  value={clusterStrategyScript}
+                  onChange={(e) => setClusterStrategyScript(e.target.value)}
+                  placeholder={CLUSTER_STRATEGY_SCRIPT_TEMPLATE}
+                  rows={10}
+                  className="w-full text-xs font-mono border border-slate-200 rounded-lg px-3 py-2 bg-white focus:outline-none focus:ring-2 focus:ring-indigo-300"
+                />
+                <p className="text-[10px] text-slate-400 mt-1.5">
+                  Define{" "}
+                  <code className="bg-white px-1 rounded border border-slate-200">
+                    def select_cluster(candidates: list[dict]) -&gt; str | None
+                  </code>
+                  . Return a member cluster <strong>name</strong> from this group, or{" "}
+                  <code className="bg-white px-1 rounded border border-slate-200">None</code>{" "}
+                  to fall back to the first eligible candidate.
+                </p>
+
+                <div className="mt-3">
+                  <label
+                    htmlFor="group-python-script-file"
+                    className="block text-[11px] font-semibold text-slate-500 uppercase tracking-wide mb-1.5"
+                  >
+                    Script file path (optional)
+                  </label>
+                  <input
+                    id="group-python-script-file"
+                    value={clusterStrategyScriptFile}
+                    onChange={(e) => setClusterStrategyScriptFile(e.target.value)}
+                    placeholder="/etc/queryflux/select-cluster.py"
+                    className="w-full text-sm font-mono border border-slate-200 rounded-lg px-3 py-2 focus:outline-none focus:ring-2 focus:ring-indigo-300"
+                  />
+                  <p className="text-[10px] text-slate-400 mt-1.5">
+                    If set, this <strong>file on the proxy host</strong> is used instead of the
+                    Python body above — the file wins when both are set. Leave empty to use the
+                    inline script.
+                  </p>
+                </div>
               </div>
             ) : null}
           </div>

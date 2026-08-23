@@ -641,7 +641,8 @@ async fn main() -> Result<()> {
             states.push(state);
         }
 
-        let strategy = strategy_from_config(group_config.strategy.as_ref());
+        let strategy = strategy_from_config(group_config.strategy.as_ref())
+            .context(format!("group '{group_name}' cluster-selection strategy"))?;
         group_members.insert(group_name.clone(), group_config.members.clone());
         group_order.push(group_name.clone());
         group_states.insert(group_key, (states, strategy));
@@ -649,6 +650,13 @@ async fn main() -> Result<()> {
     group_order.sort();
 
     let health_check_targets = health_targets_from_groups(&group_states, &adapters);
+    let initial_strategies: HashMap<
+        String,
+        Arc<dyn queryflux_cluster_manager::strategy::ClusterSelectionStrategy>,
+    > = group_states
+        .iter()
+        .map(|(name, (_, strategy))| (name.0.clone(), strategy.clone()))
+        .collect();
     let cluster_manager = Arc::new(SimpleClusterGroupManager::new(group_states));
 
     // --- Build translation service ---
@@ -1018,6 +1026,7 @@ async fn main() -> Result<()> {
             .collect(),
         routing_fallback: config.routing_fallback.clone(),
         routers_cfg: config.routers.clone(),
+        strategies: initial_strategies,
     }));
     let live = Arc::new(tokio::sync::RwLock::new(live_config));
 
@@ -2203,6 +2212,14 @@ struct AdapterReloadCache {
     /// `Ok(None)` so periodic reload does not wipe routing.
     routing_fallback: String,
     routers_cfg: Vec<queryflux_core::config::RouterConfig>,
+    /// Last-successfully-built cluster-selection strategy per group, keyed by group name.
+    /// Consulted when a reload's `strategy_from_config` fails (e.g. a `pythonScript` group's
+    /// `scriptFile` becomes transiently unreadable) so that group keeps its real strategy
+    /// (weighting, engine affinity, …) instead of silently degrading to round robin. Only
+    /// updated on a successful build, so it always reflects the last *good* strategy, not
+    /// whatever fallback got substituted on a prior failed reload.
+    strategies:
+        HashMap<String, Arc<dyn queryflux_cluster_manager::strategy::ClusterSelectionStrategy>>,
 }
 
 fn health_targets_from_groups(
@@ -2349,8 +2366,9 @@ async fn build_live_config(
     cache: &mut AdapterReloadCache,
 ) -> Result<LiveConfig> {
     use queryflux_cluster_manager::{
-        cluster_state::ClusterState, simple::SimpleClusterGroupManager,
-        strategy::strategy_from_config,
+        cluster_state::ClusterState,
+        simple::SimpleClusterGroupManager,
+        strategy::{strategy_from_config, RoundRobinStrategy},
     };
     use queryflux_core::config::apply_default_probe_queries;
     use queryflux_core::engine_registry::{
@@ -2621,12 +2639,39 @@ async fn build_live_config(
             states.push(state);
         }
 
-        let strategy = strategy_from_config(group_config.strategy.as_ref());
+        let strategy = match strategy_from_config(group_config.strategy.as_ref()) {
+            Ok(s) => {
+                cache.strategies.insert(group_name.clone(), s.clone());
+                s
+            }
+            Err(e) => {
+                if let Some(prev) = cache.strategies.get(group_name.as_str()) {
+                    tracing::warn!(
+                        group = %group_name,
+                        error = %e,
+                        "Reload: failed to build cluster-selection strategy; keeping this group's previous strategy"
+                    );
+                    prev.clone()
+                } else {
+                    tracing::warn!(
+                        group = %group_name,
+                        error = %e,
+                        "Reload: failed to build cluster-selection strategy; no previous strategy cached, falling back to round robin"
+                    );
+                    Arc::new(RoundRobinStrategy::new())
+                }
+            }
+        };
         group_members.insert(group_name.clone(), group_config.members.clone());
         group_order.push(group_name.clone());
         group_states.insert(group_key, (states, strategy));
     }
     group_order.sort();
+    // Drop cached strategies for groups that no longer exist, so a deleted-then-recreated
+    // group name can't inherit the old group's strategy if the new one's build ever fails.
+    cache
+        .strategies
+        .retain(|name, _| cluster_groups.contains_key(name.as_str()));
 
     let health_check_targets = health_targets_from_groups(&group_states, &cache.adapters);
     cache.cluster_states = health_check_targets

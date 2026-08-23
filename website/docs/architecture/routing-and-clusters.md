@@ -172,8 +172,52 @@ Configured as `strategy: { type: ... }` on a group. Implemented in `strategy.rs`
 | `failover` | First eligible member in **member list order** (priority ordering in YAML). |
 | `engineAffinity` | Ordered engine preference; within each engine, least loaded. |
 | `weighted` | Distributes by configured weights (deterministic pseudo-random from load). |
+| `pythonScript` | Embedded or file-backed Python `select_cluster(candidates)` returning a member cluster name or `None`. See [Python script strategy](#python-script-strategy-pythonscript) below. |
 
 Eligible candidates are always **healthy**, **enabled**, and **not at capacity** before the strategy runs.
+
+## Python script strategy (`pythonScript`)
+
+For groups where none of the built-in strategies fit — custom cost/tiering rules, time-of-day shaping, or any placement logic specific to your deployment — a group's `strategy` can run operator-supplied Python instead. This is the same pattern as the [Python script router](#python-script-router-pythonscript) above, one stage down: that picks a cluster **group**, this picks a member **cluster** within a group already chosen by routing.
+
+```yaml
+clusterGroups:
+  trino-default:
+    enabled: true
+    maxRunningQueries: 100
+    members: [trino-a, trino-b, duckdb-1]
+    strategy:
+      type: pythonScript
+      script: |
+        def select_cluster(candidates: list[dict]) -> str | None:
+            trino = [c for c in candidates if c["engineType"] == "trino"]
+            if trino:
+                return min(trino, key=lambda c: c["runningQueries"])["name"]
+            return None
+```
+
+The script must define:
+
+```python
+def select_cluster(candidates: list[dict]) -> str | None:
+    ...
+```
+
+- **`candidates`**: the same **eligible** (healthy, enabled, under capacity) member list every strategy receives, as a list of dicts:
+
+| Key | Type | Meaning |
+|-----|------|---------|
+| `name` | `str` | Cluster name (matches `clusterGroups.<group>.members`). |
+| `engineType` | `str` | e.g. `trino`, `duckDb`, `starRocks` (camelCase, matches `EngineType`). |
+| `runningQueries` | `int` | Current in-flight query count on this cluster. |
+| `maxRunningQueries` | `int` | Per-cluster capacity limit. |
+
+- **`candidates` preserves `clusterGroups.<group>.members` order** — `acquire_cluster` filters that list down to eligible members without reordering it. Return a `name` from `candidates` to pick that cluster, or `None` to fall back to the **first eligible candidate in that member order**. Returning an unrecognized name also falls back and logs a warning naming the bad value; an in-script exception falls back the same way (also logged) — a broken script degrades to `failover`-like behavior rather than dropping the query.
+- Load from a file instead of inline with `scriptFile: /path/to/select.py`. If **both** `script` and `scriptFile` are set, `scriptFile` wins (same precedence as the router-level `pythonScript` config).
+- Unlike `script`/`scriptFile` at the **router** level, a missing/unreadable `scriptFile` (or a `pythonScript` strategy with neither field set) is a **hard failure at startup** — the process won't boot with a misconfigured strategy. On a config **reload**, the same failure is non-fatal: that group keeps its **last-known-good strategy** (the last one that built successfully) and a warning is logged; only a group whose strategy has never successfully built falls back to `roundRobin`. Either way, one bad script edit can't take down an already-running proxy.
+- Unlike the router-level script, `select_cluster` does **not** receive the query text or session context — `ClusterGroupManager::acquire_cluster` only knows the group name at this stage. Placement logic here is necessarily load/topology-based, not query-content-based.
+- Runs off the async runtime (`spawn_blocking`) so a slow or GIL-bound script can't block a Tokio **worker thread**. This doesn't make it free: `spawn_blocking` uses a shared, bounded thread pool, and the Python GIL serializes concurrent Python calls process-wide (shared with guard scripts and translation fixups) — a script that hangs or loops forever still ties up a blocking-pool thread and contends for the GIL indefinitely. There is currently no execution timeout on `select_cluster`, unlike `python_script` guards (`GuardSpecConfig.timeoutMs`); treat a runaway script as a process-level operational risk, not just a per-group one.
+- The script is compiled and `select_cluster` looked up **once**, on the first pick, then reused for the lifetime of that strategy instance (module-level state persists across calls, same as a normal Python module). A config reload rebuilds a fresh instance, so a script edit is always picked up on the next reload.
 
 ## Health and runtime updates
 

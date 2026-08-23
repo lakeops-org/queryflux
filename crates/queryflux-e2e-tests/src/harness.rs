@@ -131,7 +131,10 @@ impl TestHarness {
                 },
             ));
 
-            group_states.insert(group.clone(), (vec![state], strategy_from_config(None)));
+            group_states.insert(
+                group.clone(),
+                (vec![state], strategy_from_config(None).unwrap()),
+            );
             group_members.insert(GROUP_TRINO.to_string(), vec![cluster.0.clone()]);
             group_order.push(GROUP_TRINO.to_string());
             adapters.insert(cluster.0.clone(), AdapterKind::Async(adapter));
@@ -170,7 +173,10 @@ impl TestHarness {
                 .map_err(|e| anyhow!("StarRocks adapter: {e}"))?,
             );
 
-            group_states.insert(group.clone(), (vec![state], strategy_from_config(None)));
+            group_states.insert(
+                group.clone(),
+                (vec![state], strategy_from_config(None).unwrap()),
+            );
             group_members.insert(GROUP_STARROCKS.to_string(), vec![cluster.0.clone()]);
             group_order.push(GROUP_STARROCKS.to_string());
             available_groups.push(GROUP_STARROCKS.to_string());
@@ -236,7 +242,10 @@ impl TestHarness {
                 )
                 .map_err(|e| anyhow!("ClickHouse adapter: {e}"))?,
             );
-            group_states.insert(group.clone(), (vec![state], strategy_from_config(None)));
+            group_states.insert(
+                group.clone(),
+                (vec![state], strategy_from_config(None).unwrap()),
+            );
             group_members.insert(GROUP_CLICKHOUSE.to_string(), vec![cluster.0.clone()]);
             group_order.push(GROUP_CLICKHOUSE.to_string());
             adapters.insert(cluster.0.clone(), AdapterKind::Sync(adapter));
@@ -271,7 +280,10 @@ impl TestHarness {
                 )
                 .map_err(|e| anyhow!("DuckDB adapter: {e}"))?,
             );
-            group_states.insert(group.clone(), (vec![state], strategy_from_config(None)));
+            group_states.insert(
+                group.clone(),
+                (vec![state], strategy_from_config(None).unwrap()),
+            );
             group_members.insert(GROUP_DUCKDB.to_string(), vec![cluster.0.clone()]);
             group_order.push(GROUP_DUCKDB.to_string());
             adapters.insert(cluster.0.clone(), AdapterKind::Sync(adapter));
@@ -545,7 +557,10 @@ impl WireTestHarness {
         );
 
         let mut group_states: HashMap<ClusterGroupName, _> = HashMap::new();
-        group_states.insert(group.clone(), (vec![cs], strategy_from_config(None)));
+        group_states.insert(
+            group.clone(),
+            (vec![cs], strategy_from_config(None).unwrap()),
+        );
         let mut adapters: HashMap<String, AdapterKind> = HashMap::new();
         adapters.insert(cluster.0.clone(), AdapterKind::Sync(adapter));
 
@@ -684,7 +699,10 @@ impl WireTestHarness {
         );
 
         let mut group_states: HashMap<ClusterGroupName, _> = HashMap::new();
-        group_states.insert(group.clone(), (vec![cs], strategy_from_config(None)));
+        group_states.insert(
+            group.clone(),
+            (vec![cs], strategy_from_config(None).unwrap()),
+        );
         let mut adapters: HashMap<String, AdapterKind> = HashMap::new();
         adapters.insert(cluster.0.clone(), AdapterKind::Sync(adapter));
 
@@ -843,7 +861,10 @@ impl ProtocolWireHarness {
         );
 
         let mut group_states: HashMap<ClusterGroupName, _> = HashMap::new();
-        group_states.insert(group.clone(), (vec![cs], strategy_from_config(None)));
+        group_states.insert(
+            group.clone(),
+            (vec![cs], strategy_from_config(None).unwrap()),
+        );
         let mut adapters: HashMap<String, AdapterKind> = HashMap::new();
         adapters.insert(cluster.0.clone(), AdapterKind::Sync(adapter));
 

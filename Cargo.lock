@@ -4043,8 +4043,12 @@ name = "queryflux-cluster-manager"
 version = "0.3.0"
 dependencies = [
  "async-trait",
+ "pyo3",
  "queryflux-core",
  "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
