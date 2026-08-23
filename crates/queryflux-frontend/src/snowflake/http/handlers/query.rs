@@ -435,11 +435,27 @@ fn try_parse_snowflake_use(sql: &str) -> Option<(SnowflakeUseTarget, String)> {
         return None;
     };
 
-    let value = strip_snowflake_quotes(rest.trim());
-    if value.is_empty() {
+    let raw_value = rest.trim();
+    if raw_value.is_empty() || !looks_like_identifier(raw_value) {
+        // Rejects e.g. `USE SECONDARY ROLES ALL` — a real, different Snowflake statement
+        // that also starts with `USE` and would otherwise be misparsed as a bare `USE
+        // <database>` naming the literal (unquoted, multi-word) database "SECONDARY ROLES
+        // ALL". An unquoted identifier can never legitimately contain whitespace, so
+        // anything that does isn't a simple single-target USE statement at all — fall
+        // through to normal dispatch instead of guessing wrong.
         return None;
     }
-    Some((target, value))
+    Some((target, strip_snowflake_quotes(raw_value)))
+}
+
+/// True if every dot-separated segment of `value` is either quoted (`"..."`, where internal
+/// whitespace is fine — e.g. `"My Db"`) or a bare token with no whitespace. Used to reject
+/// non-identifier content (like `SECONDARY ROLES ALL`) that happens to appear after `USE`.
+fn looks_like_identifier(value: &str) -> bool {
+    value.split('.').all(|part| {
+        let part = part.trim();
+        part.starts_with('"') || !part.contains(char::is_whitespace)
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -556,5 +572,33 @@ mod tests {
     fn rejects_use_role_with_no_target() {
         assert!(try_parse_snowflake_use("USE ROLE").is_none());
         assert!(try_parse_snowflake_use("USE ROLE ").is_none());
+    }
+
+    #[test]
+    fn rejects_use_secondary_roles_as_a_bare_database_name() {
+        // A real, different Snowflake statement (activates secondary roles) that also starts
+        // with `USE` — must fall through to normal dispatch, not be misparsed as `USE
+        // <database>` naming the literal unquoted, multi-word "SECONDARY ROLES ALL".
+        assert!(try_parse_snowflake_use("USE SECONDARY ROLES ALL").is_none());
+        assert!(try_parse_snowflake_use("USE SECONDARY ROLES NONE").is_none());
+        assert!(try_parse_snowflake_use("USE SECONDARY ROLES analyst, auditor").is_none());
+    }
+
+    #[test]
+    fn bare_use_still_accepts_a_quoted_database_identifier_with_spaces() {
+        let (target, value) = try_parse_snowflake_use(r#"USE "My Db""#).unwrap();
+        assert_eq!(target, SnowflakeUseTarget::Database);
+        assert_eq!(value, "My Db");
+    }
+
+    #[test]
+    fn rejects_unquoted_multi_word_value_for_every_keyword_form() {
+        // An unquoted identifier can never legitimately contain whitespace — this applies
+        // uniformly, not just to the bare-USE fallback that collides with `USE SECONDARY
+        // ROLES`.
+        assert!(try_parse_snowflake_use("USE ROLE MY ROLE").is_none());
+        assert!(try_parse_snowflake_use("USE WAREHOUSE MY WH").is_none());
+        assert!(try_parse_snowflake_use("USE DATABASE MY DB").is_none());
+        assert!(try_parse_snowflake_use("USE SCHEMA MY SCHEMA").is_none());
     }
 }

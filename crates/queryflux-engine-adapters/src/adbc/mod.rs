@@ -419,6 +419,15 @@ const IDENTITY_POOL_BUILD_TIMEOUT: std::time::Duration = std::time::Duration::fr
 /// same-key builds (below), this bounds worst-case blocking-thread usage from this path.
 const IDENTITY_POOL_MAX_CONCURRENT_BUILDS: usize = 8;
 
+/// Hard ceiling on the number of distinct scoped sub-pools a cluster keeps at once, evicting
+/// the least-recently-used entry once it's reached. `IDENTITY_POOL_IDLE_TTL` alone only bounds
+/// growth *over time* (15 minutes), not *in the moment* — role/warehouse/schema values come
+/// straight from client `USE ROLE`/`USE WAREHOUSE`/`USE SCHEMA` statements with no check that
+/// they exist on the backend, so a client cycling through many distinct values in a loop could
+/// otherwise force an unbounded number of real backend connections and driver-FFI build calls
+/// before the idle sweep ever catches up.
+const SCOPED_POOL_MAX_ENTRIES: usize = 500;
+
 /// Per-driver OAuth connection-option keys for `tokenExchange`. Only `snowflake` is wired in
 /// this release — must stay in sync with `ADBC_TOKEN_EXCHANGE_DRIVERS` in
 /// `queryflux_core::config`, which is what actually gates which clusters can reach this code
@@ -658,12 +667,19 @@ impl AdbcAdapter {
     /// stay reachable indefinitely as long as it kept getting cache hits.
     async fn scoped_pool_for(&self, key: PoolScopeKey) -> Result<AdbcPool> {
         let now = std::time::Instant::now();
-        let evicted = {
-            let before = self.scoped_pools.len();
-            self.scoped_pools
-                .retain(|_, e| now.duration_since(e.last_used) < IDENTITY_POOL_IDLE_TTL);
-            before - self.scoped_pools.len()
-        };
+        // Count evictions inside the `retain` closure, not via a before/after `len()` diff —
+        // `scoped_pool_for` runs concurrently for different keys, so another task can insert
+        // between the `len()` read and `retain()` finishing, making `before < after` and
+        // underflowing an unsigned subtraction (panics in debug, wraps to a meaningless value
+        // in release).
+        let mut evicted = 0usize;
+        self.scoped_pools.retain(|_, e| {
+            let keep = now.duration_since(e.last_used) < IDENTITY_POOL_IDLE_TTL;
+            if !keep {
+                evicted += 1;
+            }
+            keep
+        });
         if evicted > 0 {
             tracing::debug!(
                 cluster = %self.cluster_name,
@@ -766,6 +782,25 @@ impl AdbcAdapter {
         // waiters are still parked on `.lock().await` — has released it).
         match &result {
             Ok(pool) => {
+                // Enforce the hard cap *before* inserting the new entry, not instead of
+                // inserting it — a newly-built pool that was just paid for (a real driver FFI
+                // call) is always kept; if the cache is already at capacity, the
+                // least-recently-used *other* entry is evicted to make room instead.
+                if self.scoped_pools.len() >= SCOPED_POOL_MAX_ENTRIES {
+                    if let Some(lru_key) = self
+                        .scoped_pools
+                        .iter()
+                        .min_by_key(|e| e.last_used)
+                        .map(|e| e.key().clone())
+                    {
+                        self.scoped_pools.remove(&lru_key);
+                        tracing::warn!(
+                            cluster = %self.cluster_name,
+                            cap = SCOPED_POOL_MAX_ENTRIES,
+                            "ADBC scoped sub-pool cache at capacity — evicted least-recently-used entry"
+                        );
+                    }
+                }
                 self.scoped_pools.insert(
                     key.clone(),
                     ScopedPoolEntry {
