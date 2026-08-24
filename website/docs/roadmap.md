@@ -43,7 +43,8 @@ Everything below is implemented and available on the `main` branch.
 | **Auth** | Authentication providers: none, static, OIDC, LDAP |
 | | Authorization: allow-all, simple policy, OpenFGA |
 | | Backend identity (`queryAuth`): `serviceAccount`, `passthrough`, `impersonate`, `tokenExchange` — see **[Authentication & identity](./authentication)** |
-| | Trino: all four modes. ClickHouse: `impersonate` (`EXECUTE AS`, self-hosted 25.11+). StarRocks: `passthrough` (LDAP, TLS-required). Snowflake (ADBC): `tokenExchange` (per-identity connection pool) |
+| | Trino: all four modes. ClickHouse: `impersonate` (`EXECUTE AS`, self-hosted 25.11+). StarRocks: `passthrough` (LDAP, TLS-required). Snowflake (ADBC): `tokenExchange` and `passthrough` (both per-identity connection pools) |
+| | Snowflake (ADBC): session-scoped connection pooling for `USE ROLE`/`USE WAREHOUSE`/`USE SCHEMA`, intercepted client-side and applied per-session without leaking state across a shared pooled connection |
 | **Observability** | Prometheus metrics: queries, duration, translation, running, queued |
 | | Grafana dashboard (auto-provisioned) |
 | | QueryFlux Studio — Next.js UI: clusters, query history, engine registry |
@@ -85,12 +86,6 @@ The motivation doc describes the gap: without a routing layer that understands w
 - **Time-based routing** — route to cheaper scan-priced backends (Athena) during off-peak hours; reserve compute-priced clusters (StarRocks) for peak interactive traffic.
 - **Cost annotations on groups** — tag groups with a cost tier (`interactive`, `batch`, `serverless`) so routing rules can reference intent rather than engine names.
 
-### Snowflake backend
-
-Snowflake is one of the most common analytical systems in enterprise data stacks. Adding a Snowflake adapter would let organizations route overflow or exploratory traffic to Snowflake from the same QueryFlux proxy that serves Trino and StarRocks — without clients changing connection strings.
-
-Protocol: Snowflake's HTTP API or JDBC-compatible interface. Auth: key-pair or OAuth.
-
 ### BigQuery backend
 
 BigQuery on-demand pricing (bytes scanned) maps cleanly to the scan-priced routing tier described in the cost-aware routing section. A BigQuery adapter enables the pattern: route selective, cold-data exploration queries to BigQuery; route pre-aggregated, hot-data dashboard queries to StarRocks.
@@ -127,6 +122,6 @@ The roadmap reflects:
 
 1. **What unblocks the most deployments** — schema-aware translation and ClickHouse cover the most common next integration requests.
 2. **What delivers the cost/performance story end-to-end** — cost-aware routing closes the loop between the motivation (wrong engine for the workload) and the solution (QueryFlux routes it correctly).
-3. **What the open table format ecosystem needs** — Snowflake and BigQuery backends, federated planning, and cache complete the "compute interoperability" layer above Iceberg/Delta/Hudi.
+3. **What the open table format ecosystem needs** — a BigQuery backend, federated planning, and cache complete the "compute interoperability" layer above Iceberg/Delta/Hudi (Snowflake is already covered — see "What is done").
 
 Contributions are welcome — see [Contributing](/docs/contribute). If a feature here is blocking your use case, open an issue on [GitHub](https://github.com/lakeops-org/queryflux/issues) to help prioritize.

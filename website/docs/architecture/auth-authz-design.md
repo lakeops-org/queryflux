@@ -89,7 +89,7 @@ clusters:
 | ClickHouse | ✅ | ❌ not yet wired | ✅ `EXECUTE AS` (self-hosted 25.11+ only, see below) | ❌ not yet wired |
 | StarRocks (MySQL wire) | ✅ | ✅ dedicated per-query LDAP connection (requires TLS; see below) | ❌ no wire mechanism | ❌ no wire mechanism |
 | StarRocks (HTTP, future) | ✅ | — | — | — |
-| Snowflake (ADBC) | ✅ | ❌ not yet wired | ❌ | ✅ per-identity connection pool |
+| Snowflake (ADBC) | ✅ | ✅ per-caller connection, fails closed if unverified (see below) | ❌ | ✅ per-identity connection pool |
 | Databricks (ADBC, future) | ✅ | ❌ not yet wired | ❌ | ❌ not yet wired |
 | DuckDB | ✅ (no-op) | — | — | — |
 
@@ -653,7 +653,25 @@ Poll and cancel requests don't repeat the client's original headers, so the reso
 - `tokenExchange` is wired: the resolved OAuth token is set via the driver's own connection options (`adbc.snowflake.sql.auth_type=auth_oauth`, `adbc.snowflake.sql.client_option.auth_token`), each user's token requiring its own `ManagedDatabase` (see the per-identity sub-pool design in the backend-identity plan's Phase 3a) since ADBC bakes connection options in at open time, not per-checkout
 - Service account (`serviceAccount` mode, Type 1) should use key-pair auth (RSA JWT), not password — Snowflake's recommended pattern for automated connections
 - Private keys must not be stored in config files in production; use `secretRef` to Secrets Manager
-- `passthrough` is not wired for ADBC in this release (only `tokenExchange`, only for the `snowflake` driver)
+- **`passthrough` is wired**, for deployments where a Snowflake-fronted caller already holds a real Snowflake identity and per-caller connections (not a shared service account) are what's wanted:
+  - The Snowflake **HTTP wire v1** login handler (`POST /session/v1/login-request`) captures the submitted username/password into session state, **unverified** — QueryFlux itself never checks this password against anything. The ADBC connection attempt the sub-pool builds *is* the verification: exactly what would happen connecting to Snowflake directly, and consistent with how `USE ROLE`/`USE WAREHOUSE` failures are already left to surface naturally rather than pre-validated.
+  - **Fails closed:** if a cluster is configured `queryAuth: passthrough` and no verified-at-connection-time username/password was captured for the session, the query is rejected outright rather than silently falling back to the service account.
+  - **SQL API v2** (stateless, Bearer-only) has no password to capture for this mode — a passthrough-configured cluster reached that way hits the same fail-closed path automatically.
+  - The captured credential is deliberately *not* routed through the `raw_password`/`enrich_session_for_passthrough` mechanism MySQL-wire/StarRocks passthrough use — that mechanism's contract requires the password to already be verified against the same backend the target authenticates against (LDAP-verified passwords, which StarRocks also trusts). Snowflake has no equivalent shared identity system QueryFlux can check at login time, so it uses its own namespaced `snowflake.passthrough_username`/`snowflake.passthrough_password` session keys instead of claiming a pre-verification guarantee it can't back up.
+
+#### Session-scoped pooling (`USE ROLE` / `USE WAREHOUSE` / `USE SCHEMA`, and per-identity tokens)
+
+An ADBC `ManagedDatabase` bakes its connection options in at open time — there's no way to swap credentials, role, warehouse, or schema on a connection already checked out of the shared pool. Two mechanisms build on the same scoped sub-pool machinery to work around that:
+
+- **`USE ROLE` / `USE WAREHOUSE` / `USE DATABASE` / `USE SCHEMA`** on the Snowflake HTTP wire v1 frontend are intercepted client-side and never forwarded as literal SQL — doing so against a connection shared across unrelated sessions would leak state between them. Instead they update the frontend's own session state and ack locally (mirroring the MySQL-wire frontend's `USE <db>` handling); the *next* real query on that session carries the requested role/warehouse/schema and dispatches through the scoped pool below.
+- **Token-scoped pools** (`tokenExchange`) work the same way, keyed by the resolved OAuth token instead of a role/warehouse/schema value.
+
+A distinct scope (`PoolScopeKey`: some combination of token, passthrough credential, role, warehouse, schema) only exists when it actually differs from the cluster's own base config — a `USE ROLE` naming the cluster's already-configured role is a no-op, not a new pool. Two important asymmetries:
+
+- **Per-identity scopes** (keyed by a token or a passthrough credential) are capped at 2 connections each — they exist to amortize connection-setup cost across the handful of queries one caller runs in quick succession, not to serve as a general-purpose pool.
+- **Role/warehouse/schema-only scopes** (no token or passthrough credential) are a *shared* resource across every session requesting that same combination — e.g. "every analyst using the `ANALYST` role" — so they get the cluster's own full configured pool size instead.
+
+Idle sub-pools are evicted after 15 minutes, and a hard ceiling of 500 distinct scoped sub-pools per cluster evicts the least-recently-used entry once reached — role/warehouse/schema values come straight from client `USE` statements with no check that they exist on the backend, so this bounds a client that cycles through many distinct (nonexistent or real) values in a loop from forcing unbounded backend connections before the idle sweep catches up.
 
 ### Trino
 - Implicit header forwarding works for same-IdP deployments

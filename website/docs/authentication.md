@@ -85,7 +85,7 @@ clusters:
 | Mode | The backend sees | Engines |
 | --- | --- | --- |
 | `serviceAccount` *(default)* | QueryFlux's own service credential only — the user is known to QueryFlux for audit/routing, not proven to the backend | All |
-| `passthrough` | The client's own credential, forwarded unchanged | Trino, StarRocks (MySQL wire, LDAP-backed) |
+| `passthrough` | The client's own credential, forwarded unchanged | Trino, StarRocks (MySQL wire, LDAP-backed), Snowflake (ADBC, per-caller connection) |
 | `impersonate` | The service account authenticates; the real user is injected via an engine-specific mechanism (`X-Trino-User`, ClickHouse `EXECUTE AS`) | Trino, ClickHouse |
 | `tokenExchange` | A backend-scoped OAuth token, exchanged (RFC 8693) from the client's own token | Trino, Snowflake (ADBC) |
 
@@ -106,6 +106,7 @@ Backend identity needs a small amount of setup on the engine side — QueryFlux 
 - **ClickHouse `impersonate`** — requires ClickHouse **25.11+, self-hosted** (not supported on ClickHouse Cloud), `access_control_improvements.allow_impersonate_user = 1`, and `GRANT IMPERSONATE ON {user} TO {service_account}`. Cancelling an impersonated query additionally needs `GRANT KILL QUERY ON *.*` on the service account.
 - **StarRocks `passthrough`** — authenticates each query on a dedicated connection as the target user via `authentication_ldap_simple`. Requires the cluster endpoint to use TLS (`?require_ssl=true`) and the passthrough user to hold `OPERATE` for `cancel_query` to work.
 - **Snowflake `tokenExchange`** — the exchanged token is sent as `adbc.snowflake.sql.client_option.auth_token` with `auth_type=auth_oauth`; register QueryFlux as an OAuth client in the same IdP as the target Snowflake OAuth integration.
+- **Snowflake `passthrough`** — the caller's own Snowflake username/password (captured at HTTP wire v1 login) opens a dedicated per-caller connection; QueryFlux does not verify the password itself, the connection attempt is the verification. Not available over SQL API v2 (stateless, Bearer-only) — a passthrough cluster reached that way fails closed.
 
 Full per-engine wiring, the resolver's fail-closed contract, and the `queryAuth` × engine compatibility matrix: **[Auth & authorization design](/docs/architecture/auth-authz-design)**.
 
