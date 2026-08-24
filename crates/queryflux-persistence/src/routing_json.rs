@@ -491,6 +491,103 @@ mod tests {
         assert_eq!(out["targetGroup"], json!("analytics"));
     }
 
+    /// `PROTO_CAMEL_SNAKE` is a hand-maintained mirror of the field names on
+    /// [`queryflux_core::config::RouterConfig::ProtocolBased`]. A field added there without a
+    /// matching entry here is silently dropped by every persistence write/collect/enrich path
+    /// (see https://github.com/lakeops-org/queryflux/issues/86, fixed for Snowflake in #84).
+    /// Serializing a fully-populated variant and diffing its keys against `PROTO_CAMEL_SNAKE`
+    /// catches that drift without needing the struct to derive `EnumIter`/similar.
+    #[test]
+    fn proto_camel_snake_matches_protocol_based_fields() {
+        use queryflux_core::config::RouterConfig;
+
+        let all_set = RouterConfig::ProtocolBased {
+            trino_http: Some("g".into()),
+            postgres_wire: Some("g".into()),
+            mysql_wire: Some("g".into()),
+            clickhouse_http: Some("g".into()),
+            flight_sql: Some("g".into()),
+            snowflake_http: Some("g".into()),
+            snowflake_sql_api: Some("g".into()),
+        };
+        let serialized = serde_json::to_value(&all_set).unwrap();
+        let obj = serialized.as_object().unwrap();
+
+        let struct_fields: std::collections::HashSet<&str> = obj
+            .keys()
+            .map(|k| k.as_str())
+            .filter(|k| *k != "type")
+            .collect();
+        let const_fields: std::collections::HashSet<&str> =
+            PROTO_CAMEL_SNAKE.iter().map(|(camel, _)| *camel).collect();
+
+        assert_eq!(
+            struct_fields, const_fields,
+            "PROTO_CAMEL_SNAKE has drifted from RouterConfig::ProtocolBased's fields; a \
+             mismatch here means protocol-based routing rules are silently dropped on write, \
+             read, or Studio enrichment for the missing protocol"
+        );
+
+        // The camel-case check above only proves PROTO_CAMEL_SNAKE's *keys* line up with the
+        // struct's fields. It says nothing about the paired snake_case value — a typo there
+        // (e.g. "snowflake_sqlapi" instead of "snowflake_sql_api") would still pass it, yet
+        // would make `field()` fail to recognize Studio's snake_case JSON.stringify input and
+        // silently drop that protocol's routing rule. Pin the exact pairs against the known
+        // Rust field names (mysql_wire, snowflake_sql_api, ...) to catch that too.
+        let expected_mappings: std::collections::HashSet<(&str, &str)> = [
+            ("trinoHttp", "trino_http"),
+            ("postgresWire", "postgres_wire"),
+            ("mysqlWire", "mysql_wire"),
+            ("clickhouseHttp", "clickhouse_http"),
+            ("flightSql", "flight_sql"),
+            ("snowflakeHttp", "snowflake_http"),
+            ("snowflakeSqlApi", "snowflake_sql_api"),
+        ]
+        .into_iter()
+        .collect();
+        let const_mappings: std::collections::HashSet<(&str, &str)> =
+            PROTO_CAMEL_SNAKE.iter().copied().collect();
+        assert_eq!(
+            const_mappings, expected_mappings,
+            "PROTO_CAMEL_SNAKE's snake_case half doesn't match RouterConfig::ProtocolBased's \
+             actual field names; Studio's snake_case JSON.stringify input would silently fail \
+             to resolve for the mismatched protocol"
+        );
+    }
+
+    #[test]
+    fn resolve_and_collect_protocol_based_snowflake() {
+        let v = json!({
+            "type": "protocolBased",
+            "snowflakeHttp": 3,
+            "snowflakeSqlApi": 4,
+        });
+        let mut m = HashMap::new();
+        m.insert(3, "snowflake-group".to_string());
+        m.insert(4, "snowflake-sql-api-group".to_string());
+
+        let stored = resolve_one_router_for_storage(&v, &m).unwrap();
+        assert_eq!(stored["snowflakeHttp"], json!("snowflake-group"));
+        assert_eq!(stored["snowflakeSqlApi"], json!("snowflake-sql-api-group"));
+
+        let mut names = collect_group_names_from_router_json(&stored);
+        names.sort();
+        assert_eq!(
+            names,
+            vec![
+                "snowflake-group".to_string(),
+                "snowflake-sql-api-group".to_string(),
+            ]
+        );
+
+        let mut name_to_id = HashMap::new();
+        name_to_id.insert("snowflake-group".to_string(), 3i64);
+        name_to_id.insert("snowflake-sql-api-group".to_string(), 4i64);
+        let enriched = enrich_one_router_for_api(&stored, &name_to_id);
+        assert_eq!(enriched["snowflakeHttpGroupId"], json!(3));
+        assert_eq!(enriched["snowflakeSqlApiGroupId"], json!(4));
+    }
+
     #[test]
     fn resolve_tags_tag_rules_and_target_group_id() {
         let v = json!({
