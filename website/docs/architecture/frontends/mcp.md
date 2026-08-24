@@ -40,7 +40,7 @@ Requests carry `Authorization: Bearer <token>`, checked against the same `AuthPr
 
 Every tool that accepts `engine_hint` uses it as an exact cluster-group name when it matches a configured group; otherwise the query is routed normally through the configured `RouterChain` — the same routing behavior as every other frontend, just with an optional override.
 
-Every tool except `get_query_status` / `cancel_query` also accepts the optional agent-context fields — `agent_id`, `conversation_id`, `step_index`, `tool_call_id`, `query_intent` — directly as tool parameters, in addition to the `X-Agent-Id` / `X-Conversation-Id` / etc. headers every other HTTP frontend already supports. See [Agentic context](../../agentic/agent-context#setting-context-via-mcp-tool-parameters) for why MCP gets both paths and which one wins when both are supplied.
+Every tool except `get_query_status` / `cancel_query` also accepts the optional agent-context fields — `agent_id`, `conversation_id`, `step_index`, `tool_call_id`, `query_intent` — directly as tool parameters, in addition to the `X-Agent-Id` / `X-Conversation-Id` / etc. headers every other HTTP frontend already supports. Both are optional: when neither is supplied, `agent_id`/`conversation_id` default rather than being left unset (see [Agent context defaults on MCP](../../agentic/agent-context#agent-context-defaults-on-mcp)). See [Agentic context](../../agentic/agent-context#setting-context-via-mcp-tool-parameters) for why MCP gets both paths and which one wins when both are supplied.
 
 ## Guardrails
 
@@ -50,7 +50,7 @@ Column/PII masking is not currently available for any frontend, MCP included —
 
 ## Query history and session replay
 
-Every MCP query is recorded the same way as every other frontend's queries, with the agent-context fields populated when present. This means MCP-originated queries show up in QueryFlux Studio's **Queries**, **Agents**, and **Conversations** pages exactly like agent traffic through Trino HTTP or PostgreSQL wire — no separate MCP-specific tooling needed to audit or replay what an agent did. See [Session replay and guardrails](../../agentic/session-replay) for the full persistence and replay model.
+Every MCP query is recorded the same way as every other frontend's queries. Unlike every other frontend, MCP always has agent context — even a tool call with no `agent_id`/`conversation_id` header or parameter still gets one, defaulted from the authenticated identity and the MCP session id (see [Agent context defaults on MCP](../../agentic/agent-context#agent-context-defaults-on-mcp)), so MCP traffic never goes missing from the **Agents** page the way an unlabeled query on another frontend would. MCP-originated queries show up in QueryFlux Studio's **Queries**, **Agents**, and **Conversations** pages exactly like agent traffic through Trino HTTP or PostgreSQL wire — no separate MCP-specific tooling needed to audit or replay what an agent did. See [Session replay and guardrails](../../agentic/session-replay) for the full persistence and replay model.
 
 ## Connecting a client
 

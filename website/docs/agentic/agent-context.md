@@ -17,7 +17,7 @@ All three approaches use the same underlying fields and produce identical record
 
 ## Setting context via HTTP headers
 
-HTTP frontends accept agentic context as request headers. Both `X-Agent-Id` and `X-Conversation-Id` must be present to activate agentic context — if either is missing the query is treated as a non-agentic request.
+HTTP frontends accept agentic context as request headers. Both `X-Agent-Id` and `X-Conversation-Id` must be present to activate agentic context — if either is missing the query is treated as a non-agentic request. **MCP is the one exception** — see [Agent context defaults on MCP](#agent-context-defaults-on-mcp) below.
 
 | Header | Required | Description |
 |--------|----------|-------------|
@@ -102,6 +102,19 @@ To cover that case, every MCP tool (`execute_query`, `list_schemas`, `describe_t
 When a value is supplied both ways — an `X-Agent-Id` header on the connection *and* an `agent_id` tool argument on the call — the **header wins**, matching the existing precedence between HTTP-header-style and SQL-session-param-style values used by every other frontend.
 
 This mirrors how the wider MCP ecosystem is moving away from relying on transport-level session state for anything that needs to persist across tool calls, in favor of explicit, model-visible arguments — the tool parameters are the reliable path for any MCP client, headers are a free bonus for integrators who control their own HTTP client.
+
+### Agent context defaults on MCP
+
+Every other frontend requires **both** `agent_id` and `conversation_id` to activate agentic context — if a client supplies neither, the query is just a normal, non-agentic query. MCP does not follow that rule: since MCP traffic is agent traffic by definition, a tool call that supplies neither field still gets agent context, so it isn't silently invisible on the **Agents** page.
+
+When `agent_id` / `conversation_id` aren't supplied via header or tool parameter, MCP fills them in:
+
+| Field | Default |
+|-------|---------|
+| `agent_id` | The authenticated identity (`auth.user` — e.g. `"anonymous"` under `auth.provider: none`). |
+| `conversation_id` | The transport's `Mcp-Session-Id`, so every tool call within one MCP session groups together. Falls back to a fresh UUID per call if no session id is available (e.g. a stateless client). |
+
+Explicit headers and tool parameters still override both defaults — this only fills gaps, it never replaces a value you actually sent. Because `conversation_id` defaults to the session id, a client that never sets it explicitly still gets meaningful session-level grouping on the **Conversations** page for free, for as long as its MCP session lives; a client that wants grouping across multiple MCP sessions (or a stable identity independent of transport reconnects) should still set `conversation_id` explicitly.
 
 ---
 
