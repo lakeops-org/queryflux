@@ -180,6 +180,11 @@ fn resolve_agent_context(
     AgentContext::from_headers(&merged)
 }
 
+/// `agent_context` must already be the fully-resolved value from `resolve_agent_context`
+/// (headers-vs-params precedence already applied) — setting it here makes
+/// `SessionContext::resolved_agent_context()` return it verbatim, since that method
+/// prefers an explicit `agent_context` over re-parsing `extra`. MCP never populates
+/// `extra`, so that fallback path is unused; do not rely on it for MCP.
 fn session_for(auth: &AuthContext, agent_context: Option<AgentContext>) -> SessionContext {
     SessionContext {
         user: Some(auth.user.clone()),
@@ -263,13 +268,21 @@ async fn run_query(
     )]))
 }
 
-/// Best-effort identifier quoting shared by `describe_table` / `list_schemas`. QueryFlux's
-/// translation layer (sqlglot) normalizes the final SQL per target engine, so this only
-/// needs to produce something every dialect's parser accepts going in.
+/// Quote a single identifier ANSI-style (double quotes, embedded `"` doubled). Used by
+/// `qualify_table` so a `table`/`schema` argument containing a space, reserved word, or
+/// `;` stays a single identifier rather than producing unintended SQL — the caller can
+/// already run arbitrary SQL via `execute_query`, so this isn't a privilege boundary,
+/// just correctness. QueryFlux's translation layer (sqlglot) re-quotes per target engine
+/// dialect (backticks for MySQL-family, etc.), so ANSI double-quoting on the way in is
+/// the right canonical form regardless of the final backend.
+fn quote_ident(ident: &str) -> String {
+    format!("\"{}\"", ident.replace('"', "\"\""))
+}
+
 fn qualify_table(schema: Option<&str>, table: &str) -> String {
     match schema {
-        Some(s) if !s.is_empty() => format!("{s}.{table}"),
-        _ => table.to_string(),
+        Some(s) if !s.is_empty() => format!("{}.{}", quote_ident(s), quote_ident(table)),
+        _ => quote_ident(table),
     }
 }
 

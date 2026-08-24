@@ -54,12 +54,14 @@ Every MCP query is recorded the same way as every other frontend's queries, with
 
 ## Connecting a client
 
-Point any streamable-HTTP MCP client at `http://<host>:<port>/mcp` with a bearer token. For example, with the [MCP Inspector](https://github.com/modelcontextprotocol/inspector):
+Point any streamable-HTTP MCP client at `http://<host>:<port>/mcp` with a bearer token. The `http://localhost:8811/mcp` example below is for local development only — QueryFlux does not terminate TLS itself (same as every other frontend), so a bearer token sent to a **remote** host must go through HTTPS or a TLS-terminating reverse proxy in front of QueryFlux; otherwise the token travels in cleartext.
+
+For example, with the [MCP Inspector](https://github.com/modelcontextprotocol/inspector):
 
 ```bash
 npx @modelcontextprotocol/inspector
 # Transport: Streamable HTTP
-# URL: http://localhost:8811/mcp
+# URL: http://localhost:8811/mcp   (local dev — use https:// through a TLS terminator remotely)
 # Header: Authorization: Bearer <token>
 ```
 
@@ -72,6 +74,7 @@ npx @modelcontextprotocol/inspector
 | Natural-language-to-SQL, semantic routing, result caching, query rewriting | Explicitly out of scope for this frontend — QueryFlux routes and executes the SQL it's given. |
 | Async submit/poll execution model | `execute_query` is synchronous — it blocks until the query completes. `get_query_status` / `cancel_query` are best-effort against the existing in-flight query registry (useful from a concurrent tool call), not a full async job API. |
 | Column/PII masking | Not implemented for any frontend yet. |
+| TLS | Not terminated by QueryFlux. Use an external TLS terminator in front of QueryFlux for any deployment where the bearer token crosses an untrusted network. |
 
 ## Related
 

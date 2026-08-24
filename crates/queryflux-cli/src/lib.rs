@@ -288,6 +288,11 @@ fn config_requires_translation(config: &ProxyConfig) -> bool {
             enabled_frontends.push((FrontendProtocol::SnowflakeHttp, SqlDialect::Snowflake));
         }
     }
+    if let Some(ref f) = config.queryflux.frontends.mcp {
+        if f.enabled {
+            enabled_frontends.push((FrontendProtocol::Mcp, SqlDialect::Generic));
+        }
+    }
 
     if enabled_frontends.is_empty() {
         return false;

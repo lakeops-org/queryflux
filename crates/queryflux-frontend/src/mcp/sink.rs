@@ -1,6 +1,6 @@
 use arrow::array::{
     Array, BooleanArray, Float32Array, Float64Array, Int16Array, Int32Array, Int64Array, Int8Array,
-    StringArray, UInt16Array, UInt32Array, UInt64Array, UInt8Array,
+    LargeStringArray, StringArray, UInt16Array, UInt32Array, UInt64Array, UInt8Array,
 };
 use arrow::datatypes::{DataType, Schema};
 use arrow::record_batch::RecordBatch;
@@ -138,15 +138,23 @@ fn arrow_value(array: &dyn Array, idx: usize) -> Value {
         DataType::Float32 => {
             let a = array.as_any().downcast_ref::<Float32Array>().unwrap();
             let v = a.value(idx) as f64;
-            Value::Number(serde_json::Number::from_f64(v).unwrap_or(serde_json::Number::from(0)))
+            // NaN / +-infinity have no JSON representation; from_f64 returns None for
+            // them. Emit null rather than silently coercing to a misleading 0.
+            serde_json::Number::from_f64(v).map_or(Value::Null, Value::Number)
         }
         DataType::Float64 => {
             let a = array.as_any().downcast_ref::<Float64Array>().unwrap();
             let v = a.value(idx);
-            Value::Number(serde_json::Number::from_f64(v).unwrap_or(serde_json::Number::from(0)))
+            serde_json::Number::from_f64(v).map_or(Value::Null, Value::Number)
         }
-        DataType::Utf8 | DataType::LargeUtf8 => {
+        DataType::Utf8 => {
             let a = array.as_any().downcast_ref::<StringArray>().unwrap();
+            Value::String(a.value(idx).to_string())
+        }
+        DataType::LargeUtf8 => {
+            // Arrow backs LargeUtf8 with LargeStringArray, not StringArray — downcasting
+            // to StringArray here returns None and unwrap() panics on any LargeUtf8 column.
+            let a = array.as_any().downcast_ref::<LargeStringArray>().unwrap();
             Value::String(a.value(idx).to_string())
         }
         _ => {
@@ -218,5 +226,45 @@ mod tests {
         let mut sink = JsonResultSink::new(10);
         sink.on_error("boom").await.unwrap();
         assert_eq!(sink.error.as_deref(), Some("boom"));
+    }
+
+    #[tokio::test]
+    async fn nan_and_infinity_become_null_not_zero() {
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DT::Float64, false)]));
+        let mut sink = JsonResultSink::new(10);
+        sink.on_schema(&schema).await.unwrap();
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Float64Array::from(vec![
+                f64::NAN,
+                f64::INFINITY,
+                f64::NEG_INFINITY,
+                1.5,
+            ]))],
+        )
+        .unwrap();
+        sink.on_batch(&batch).await.unwrap();
+
+        let result = sink.into_result(5, "duckdb");
+        assert_eq!(result["rows"][0]["v"], Value::Null, "NaN should be null");
+        assert_eq!(result["rows"][1]["v"], Value::Null, "+inf should be null");
+        assert_eq!(result["rows"][2]["v"], Value::Null, "-inf should be null");
+        assert_eq!(result["rows"][3]["v"], json!(1.5));
+    }
+
+    #[tokio::test]
+    async fn large_utf8_column_does_not_panic() {
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DT::LargeUtf8, false)]));
+        let mut sink = JsonResultSink::new(10);
+        sink.on_schema(&schema).await.unwrap();
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(LargeStringArray::from(vec!["hello"]))],
+        )
+        .unwrap();
+        sink.on_batch(&batch).await.unwrap();
+
+        let result = sink.into_result(5, "duckdb");
+        assert_eq!(result["rows"][0]["v"], json!("hello"));
     }
 }

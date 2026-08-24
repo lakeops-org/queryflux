@@ -64,18 +64,17 @@ impl FrontendListenerTrait for McpFrontend {
             router = router.layer(tower::limit::ConcurrencyLimitLayer::new(limit));
         }
 
-        info!("MCP frontend listening on {addr}");
         let listener = tokio::net::TcpListener::bind(addr)
             .await
             .map_err(|e| QueryFluxError::Other(e.into()))?;
+        info!("MCP frontend listening on {addr}");
 
-        let result = axum::serve(listener, router)
+        axum::serve(listener, router)
             .with_graceful_shutdown(async move {
                 let _ = shutdown.changed().await;
                 ct.cancel();
             })
             .await
-            .map_err(|e| QueryFluxError::Other(e.into()));
-        result
+            .map_err(|e| QueryFluxError::Other(e.into()))
     }
 }

@@ -331,6 +331,30 @@ async fn protocol_router_snowflake_sql_api() {
     assert_eq!(result, RoutingDecision::Route(group("sf-rest")));
 }
 
+#[tokio::test]
+async fn protocol_router_mcp() {
+    let router = ProtocolBasedRouter {
+        trino_http: None,
+        postgres_wire: None,
+        mysql_wire: None,
+        clickhouse_http: None,
+        flight_sql: None,
+        snowflake_http: None,
+        snowflake_sql_api: None,
+        mcp: Some(group("agent-queries")),
+    };
+    let result = router
+        .route(
+            "SELECT 1",
+            &mysql_session(Some("u")),
+            &FrontendProtocol::Mcp,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(result, RoutingDecision::Route(group("agent-queries")));
+}
+
 // ---------------------------------------------------------------------------
 // TagsRouter
 // ---------------------------------------------------------------------------
