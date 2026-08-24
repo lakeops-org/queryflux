@@ -56,6 +56,14 @@ pub struct SnowflakeSession {
     /// Captured at login (`warehouse` login-request query param) or updated mid-session by
     /// `USE WAREHOUSE`.
     pub warehouse: Option<String>,
+    /// The plaintext password submitted at login, retained for the session's lifetime —
+    /// **not verified by queryflux itself** — used only to build a `passthrough`-mode ADBC
+    /// sub-pool (`AdbcAdapter`'s `PoolScopeKey::passthrough`), where the real Snowflake
+    /// connection attempt is the actual verification. Harmless to capture unconditionally:
+    /// unused unless the session's queries route to a `queryAuth: passthrough` cluster.
+    /// Deliberately distinct from `AuthContext::raw_password`, which carries an implicit
+    /// "verified by a provider that checked the same backend" guarantee this does not have.
+    pub password: Option<String>,
     created_at: Instant,
     last_seen: Instant,
 }
@@ -109,6 +117,7 @@ impl SnowflakeSessionStore {
         schema: Option<String>,
         role: Option<String>,
         warehouse: Option<String>,
+        password: Option<String>,
     ) -> String {
         let token = Uuid::new_v4().to_string();
         let now = Instant::now();
@@ -122,6 +131,7 @@ impl SnowflakeSessionStore {
                 schema,
                 role,
                 warehouse,
+                password,
                 created_at: now,
                 last_seen: now,
             },
@@ -285,6 +295,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         let result = store.validate_session(&token);
         assert!(result.is_some());
@@ -311,6 +322,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         store.remove_session(&token);
         assert!(store.validate_session(&token).is_none());
@@ -326,6 +338,7 @@ mod tests {
             "charlie".into(),
             make_auth(),
             ClusterGroupName("g".into()),
+            None,
             None,
             None,
             None,
@@ -350,6 +363,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         std::thread::sleep(Duration::from_millis(10));
         assert!(store.validate_session(&token).is_none());
@@ -365,6 +379,7 @@ mod tests {
             "eve".into(),
             make_auth(),
             ClusterGroupName("g".into()),
+            None,
             None,
             None,
             None,
@@ -392,6 +407,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         let (remaining, _) = store.validate_session(&token).unwrap();
         assert_eq!(remaining, u64::MAX);
@@ -408,6 +424,7 @@ mod tests {
             None,
             Some("ANALYST".into()),
             Some("ANALYTICS_WH".into()),
+            None,
         );
         let (_, session) = store.validate_session(&token).unwrap();
         assert_eq!(session.role.as_deref(), Some("ANALYST"));
@@ -421,6 +438,7 @@ mod tests {
             "heidi".into(),
             make_auth(),
             ClusterGroupName("g".into()),
+            None,
             None,
             None,
             None,

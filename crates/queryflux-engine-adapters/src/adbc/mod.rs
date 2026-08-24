@@ -386,10 +386,20 @@ pub(crate) type AdbcPool = r2d2::Pool<AdbcConnectionManager<ManagedDatabase>>;
 /// `AdbcAdapter::scoped_pool_key` enforces that, not this type — so the all-`None` key (no
 /// override at all) never appears here; `execute_as_arrow` uses `self.pool` directly for that
 /// case instead of going through this map at all.
-#[derive(Clone, PartialEq, Eq, Hash, Debug, Default)]
+/// No `Debug` derive: `passthrough` carries a real caller-supplied Snowflake password, and
+/// `token` carries an OAuth bearer token — neither should ever be printable via a stray
+/// `{:?}` (e.g. in a log line or panic message). Individual non-secret fields (`role`,
+/// `warehouse`, `schema`) are logged directly where needed instead of via this type's Debug.
+#[derive(Clone, PartialEq, Eq, Hash, Default)]
 struct PoolScopeKey {
     /// Bearer token for `tokenExchange` clusters (`QueryCredentials::Bearer`).
     token: Option<String>,
+    /// `(username, password)` for `passthrough` clusters (`QueryCredentials::Passthrough`) —
+    /// a real, caller-supplied Snowflake credential, captured at Snowflake wire v1 login and
+    /// **not verified by queryflux itself**; the ADBC connection attempt this key builds is
+    /// the actual verification, exactly as it would be if the caller connected to Snowflake
+    /// directly. See `compute_scoped_pool_key`.
+    passthrough: Option<(String, String)>,
     role: Option<String>,
     warehouse: Option<String>,
     schema: Option<String>,
@@ -398,6 +408,7 @@ struct PoolScopeKey {
 impl PoolScopeKey {
     fn is_empty(&self) -> bool {
         self.token.is_none()
+            && self.passthrough.is_none()
             && self.role.is_none()
             && self.warehouse.is_none()
             && self.schema.is_none()
@@ -424,6 +435,22 @@ fn compute_scoped_pool_key(
         queryflux_auth::QueryCredentials::Bearer { token } => Some(token.clone()),
         _ => None,
     };
+    // Captured at Snowflake wire v1 login (`snowflake.passthrough_username`/`_password` in
+    // `SessionContext.extra`), namespaced like the role/warehouse/schema keys below and for
+    // the same reason: unlike `passthrough_username`/`passthrough_password` (no `snowflake.`
+    // prefix), which the MySQL-wire/StarRocks passthrough path already owns and which carry
+    // an implicit "verified by a provider that checked the same backend" guarantee (see
+    // `AuthContext::raw_password`), a Snowflake password captured at login is *not*
+    // pre-verified by queryflux — the ADBC connection attempt this key builds is the actual
+    // verification. Using a distinct, honestly-named key avoids ever conflating the two.
+    let passthrough = match credentials {
+        queryflux_auth::QueryCredentials::Passthrough => session
+            .extra
+            .get("snowflake.passthrough_username")
+            .zip(session.extra.get("snowflake.passthrough_password"))
+            .map(|(u, p)| (u.clone(), p.clone())),
+        _ => None,
+    };
     let overridden = |field: &str| -> Option<String> {
         let requested = session.extra.get(&format!("snowflake.{field}"))?;
         let mapped_key = queryflux_core::config::variant_field_to_db_kwarg(driver, field)?;
@@ -432,6 +459,7 @@ fn compute_scoped_pool_key(
     };
     let key = PoolScopeKey {
         token,
+        passthrough,
         role: overridden("role"),
         warehouse: overridden("warehouse"),
         schema: overridden("schema"),
@@ -440,10 +468,11 @@ fn compute_scoped_pool_key(
 }
 
 /// Pure core of `AdbcAdapter::scoped_pool_size` — see its doc comment for the rationale
-/// (token-keyed scopes are per-individual-identity and stay small; role/warehouse/schema-only
-/// scopes are shared across sessions and need the base pool's own concurrency).
+/// (token- and passthrough-keyed scopes are per-individual-identity and stay small;
+/// role/warehouse/schema-only scopes are shared across sessions and need the base pool's own
+/// concurrency).
 fn compute_scoped_pool_size(key: &PoolScopeKey, base_pool_size: u32) -> u32 {
-    if key.token.is_some() {
+    if key.token.is_some() || key.passthrough.is_some() {
         IDENTITY_POOL_MAX_SIZE
     } else {
         base_pool_size
@@ -757,11 +786,15 @@ impl AdbcAdapter {
     }
 
     /// Connection-option overrides for a [`PoolScopeKey`] beyond `base_db_kwargs` — the OAuth
-    /// options for `key.token` (when present) plus whichever of role/warehouse/schema this
-    /// driver has a `dbKwargs` mapping for (`variant_field_to_db_kwarg`; today only Snowflake).
-    /// Not gated on `driver_name` directly — a driver with no field mapping just contributes
-    /// nothing here, so this naturally extends to other drivers if `variant_field_to_db_kwarg`
-    /// ever grows equivalent mappings for them, with no code change needed in this function.
+    /// options for `key.token` (when present), `Username`/`Password` set to the caller's own
+    /// credential for `key.passthrough` (when present — this *replaces* the cluster's own
+    /// service-account username/password for this sub-pool, it does not layer on top of it),
+    /// plus whichever of role/warehouse/schema this driver has a `dbKwargs` mapping for
+    /// (`variant_field_to_db_kwarg`; today only Snowflake). The role/warehouse/schema lookup
+    /// is not gated on `driver_name` directly — a driver with no field mapping just
+    /// contributes nothing here, so this naturally extends to other drivers if
+    /// `variant_field_to_db_kwarg` ever grows equivalent mappings for them, with no code
+    /// change needed in this function.
     fn scoped_pool_options(
         driver: &str,
         key: &PoolScopeKey,
@@ -769,6 +802,23 @@ impl AdbcAdapter {
         let mut opts = Vec::new();
         if let Some(token) = &key.token {
             opts.extend(oauth_token_options(driver, token)?);
+        }
+        if let Some((username, password)) = &key.passthrough {
+            // Force standard username/password auth for this scoped pool. `Username`/
+            // `Password` and `adbc.snowflake.sql.auth_type` are independent fields on the
+            // driver's internal config — setting the former does not reset the latter. If
+            // the cluster's base `dbKwargs` sets `auth_type=auth_oauth` (a plausible base
+            // config for a cluster that also supports `tokenExchange`), this vec's entries
+            // still apply after `base_db_kwargs` (see `scoped_pool_for`), but without this
+            // explicit override the driver would keep authenticating as the cluster's base
+            // OAuth identity — silently ignoring the caller's own passthrough credential
+            // entirely, exactly the identity leak passthrough exists to prevent.
+            opts.push((
+                OptionDatabase::Other("adbc.snowflake.sql.auth_type".to_string()),
+                "auth_snowflake".into(),
+            ));
+            opts.push((OptionDatabase::Username, username.clone().into()));
+            opts.push((OptionDatabase::Password, password.clone().into()));
         }
         for (field, value) in [
             ("role", &key.role),
@@ -789,10 +839,11 @@ impl AdbcAdapter {
         Ok(opts)
     }
 
-    /// Max connections for a scoped sub-pool. A `token`-keyed scope is per-individual-identity
-    /// (small, per [`IDENTITY_POOL_MAX_SIZE`]); a role/warehouse/schema-only scope is *shared*
-    /// across every session requesting that combination, so it needs the same concurrency as
-    /// the base pool, not the small per-identity size.
+    /// Max connections for a scoped sub-pool. A `token`- or `passthrough`-keyed scope is
+    /// per-individual-identity (small, per [`IDENTITY_POOL_MAX_SIZE`]); a
+    /// role/warehouse/schema-only scope is *shared* across every session requesting that
+    /// combination, so it needs the same concurrency as the base pool, not the small
+    /// per-identity size.
     fn scoped_pool_size(&self, key: &PoolScopeKey) -> u32 {
         compute_scoped_pool_size(key, self.base_pool_size)
     }
@@ -1148,18 +1199,38 @@ impl SyncAdapter for AdbcAdapter {
             attempt_id = %uuid::Uuid::new_v4(),
             "Executing ADBC query"
         );
-        // `Bearer` is the only non-serviceAccount `QueryCredentials` that reaches an ADBC
-        // adapter today — startup validation (`query_auth_supported`) rejects `passthrough`/
-        // `impersonate` for every ADBC driver. A session-requested role/warehouse/schema
-        // override (from a `USE ROLE`/`USE WAREHOUSE`/`USE SCHEMA` the Snowflake frontend
-        // tracked) is the other source of a non-trivial key. `scoped_pool_key` returns `None`
-        // for the common case (no token, no override), so the fast path below never touches
-        // the scoped-pool map at all. `scoped_pool_for` is a cheap `DashMap` lookup on cache
-        // hits; the miss path runs the blocking driver FFI call inside its own
-        // `spawn_blocking` with a timeout, not inline here.
-        let pool = match self.scoped_pool_key(session, credentials) {
-            Some(key) => self.scoped_pool_for(key).await?,
-            None => self.pool.clone(),
+        // `Bearer` (`tokenExchange`) and `Passthrough` are the only non-`ServiceAccount`
+        // `QueryCredentials` that reach an ADBC adapter today — startup validation
+        // (`query_auth_supported`) rejects `impersonate` for every ADBC driver, and
+        // `passthrough` for every ADBC driver except `snowflake`. A session-requested
+        // role/warehouse/schema override (from a `USE ROLE`/`USE WAREHOUSE`/`USE SCHEMA` the
+        // Snowflake frontend tracked) is the other source of a non-trivial key, and composes
+        // with either credential mode. `scoped_pool_key` returns `None` for the common case
+        // (no token, no passthrough, no override), so the fast path below never touches the
+        // scoped-pool map at all. `scoped_pool_for` is a cheap `DashMap` lookup on cache hits;
+        // the miss path runs the blocking driver FFI call inside its own `spawn_blocking` with
+        // a timeout, not inline here.
+        //
+        // `Passthrough` fails closed explicitly rather than falling through to `self.pool`:
+        // `scoped_pool_key` returning `None` here means no verified credential was found in
+        // the session (`QueryCredentials::Passthrough`'s own doc comment requires this — it
+        // must never silently degrade to the service account).
+        let pool = if matches!(credentials, queryflux_auth::QueryCredentials::Passthrough) {
+            match self.scoped_pool_key(session, credentials) {
+                Some(key) if key.passthrough.is_some() => self.scoped_pool_for(key).await?,
+                _ => {
+                    return Err(QueryFluxError::Auth(
+                        "ADBC passthrough requires a verified username/password captured at \
+                         Snowflake login — none was available for this session"
+                            .to_string(),
+                    ));
+                }
+            }
+        } else {
+            match self.scoped_pool_key(session, credentials) {
+                Some(key) => self.scoped_pool_for(key).await?,
+                None => self.pool.clone(),
+            }
         };
         let sql = sql.to_string();
         let is_query = hints.is_read_like.unwrap_or_else(|| {
@@ -1573,7 +1644,7 @@ impl EngineAdapterFactory for AdbcFactory {
 mod tests {
     use super::{
         compute_scoped_pool_key, compute_scoped_pool_size, jwt_auth_options,
-        normalize_to_pkcs8_pem, oauth_token_options, AdbcConfig, PoolScopeKey,
+        normalize_to_pkcs8_pem, oauth_token_options, AdbcAdapter, AdbcConfig, PoolScopeKey,
         IDENTITY_POOL_MAX_SIZE,
     };
     use crate::EngineConfigParseable;
@@ -1691,6 +1762,122 @@ mod tests {
         .expect("token + role both present");
         assert_eq!(key.token.as_deref(), Some("tok"));
         assert_eq!(key.role.as_deref(), Some("ANALYST"));
+    }
+
+    #[test]
+    fn scoped_pool_key_picks_up_passthrough_credentials() {
+        let session = session_with(&[
+            ("snowflake.passthrough_username", "alice"),
+            ("snowflake.passthrough_password", "s3cr3t"),
+        ]);
+        let key =
+            compute_scoped_pool_key("snowflake", &[], &session, &QueryCredentials::Passthrough)
+                .expect("passthrough credentials present");
+        assert_eq!(
+            key.passthrough,
+            Some(("alice".to_string(), "s3cr3t".to_string()))
+        );
+        assert_eq!(key.token, None);
+    }
+
+    #[test]
+    fn scoped_pool_key_is_none_for_passthrough_without_captured_credentials() {
+        // Fail-closed check lives in `execute_as_arrow` (this returning `None` is what
+        // triggers it) — confirm the key computation itself doesn't silently invent a
+        // passthrough dimension from nothing.
+        let session = SessionContext::default();
+        let key =
+            compute_scoped_pool_key("snowflake", &[], &session, &QueryCredentials::Passthrough);
+        assert!(key.is_none());
+    }
+
+    #[test]
+    fn scoped_pool_key_ignores_passthrough_extra_for_non_passthrough_credentials() {
+        // If a session somehow retains passthrough_username/password (e.g. a cluster that
+        // used to be configured for passthrough) but the resolved credentials for this query
+        // are ServiceAccount, the passthrough dimension must not leak in — only `credentials`
+        // decides which dimensions apply, not whatever happens to be sitting in `extra`.
+        let session = session_with(&[
+            ("snowflake.passthrough_username", "alice"),
+            ("snowflake.passthrough_password", "s3cr3t"),
+        ]);
+        let key = compute_scoped_pool_key(
+            "snowflake",
+            &[],
+            &session,
+            &QueryCredentials::ServiceAccount,
+        );
+        assert!(key.is_none());
+    }
+
+    #[test]
+    fn scoped_pool_key_never_reads_unnamespaced_passthrough_keys() {
+        // The generic MySQL-wire/StarRocks passthrough mechanism (`enrich_session_for_passthrough`)
+        // uses unprefixed `passthrough_username`/`passthrough_password` keys and carries an
+        // implicit "verified against the same backend" guarantee that does not hold for a
+        // Snowflake password captured at login — the namespaced `snowflake.*` keys must be
+        // read instead, never the bare ones, so the two mechanisms can never be conflated.
+        let session = session_with(&[
+            ("passthrough_username", "alice"),
+            ("passthrough_password", "s3cr3t"),
+        ]);
+        let key =
+            compute_scoped_pool_key("snowflake", &[], &session, &QueryCredentials::Passthrough);
+        assert!(key.is_none());
+    }
+
+    #[test]
+    fn scoped_pool_size_is_small_for_passthrough_scopes() {
+        let key = PoolScopeKey {
+            passthrough: Some(("alice".to_string(), "pw".to_string())),
+            ..Default::default()
+        };
+        assert_eq!(compute_scoped_pool_size(&key, 20), IDENTITY_POOL_MAX_SIZE);
+    }
+
+    #[test]
+    fn scoped_pool_options_passthrough_forces_standard_auth_type() {
+        // `Username`/`Password` alone do not reset `adbc.snowflake.sql.auth_type` — it's an
+        // independent field on the driver's config. If the cluster's base `dbKwargs` sets
+        // `auth_type=auth_oauth` (plausible for a cluster that also supports
+        // `tokenExchange`), a passthrough connection must still explicitly force
+        // `auth_snowflake`, or it would silently authenticate as the cluster's base OAuth
+        // identity instead of the caller's own passthrough credential.
+        let key = PoolScopeKey {
+            passthrough: Some(("alice".to_string(), "s3cr3t".to_string())),
+            ..Default::default()
+        };
+        let opts = AdbcAdapter::scoped_pool_options("snowflake", &key).expect("snowflake wired");
+        let rendered: Vec<String> = opts.iter().map(|(k, _)| format!("{k:?}")).collect();
+        let auth_type_idx = rendered
+            .iter()
+            .position(|k| k.contains("adbc.snowflake.sql.auth_type"))
+            .expect("auth_type option must be present for a passthrough key");
+        let username_idx = rendered
+            .iter()
+            .position(|k| k == "Username")
+            .expect("Username option must be present for a passthrough key");
+        assert!(
+            auth_type_idx < username_idx,
+            "auth_type must be forced before Username/Password: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn scoped_pool_options_no_auth_type_forced_without_passthrough() {
+        // A bare role/warehouse/schema-only key (no passthrough, no token) has no reason to
+        // touch auth_type at all — it should inherit whatever the cluster's base config sets.
+        let key = PoolScopeKey {
+            role: Some("ANALYST".to_string()),
+            ..Default::default()
+        };
+        let opts = AdbcAdapter::scoped_pool_options("snowflake", &key).expect("snowflake wired");
+        assert!(
+            !opts
+                .iter()
+                .any(|(k, _)| format!("{k:?}").contains("auth_type")),
+            "unexpected auth_type option: {opts:?}"
+        );
     }
 
     #[test]
