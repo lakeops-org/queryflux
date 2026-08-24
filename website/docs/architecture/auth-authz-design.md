@@ -27,7 +27,7 @@ Every backend cluster has **two distinct credential relationships**, both config
 
 **Anonymous requests fail closed for explicit per-user modes.** An unauthenticated (`AuthContext.user == "anonymous"`) request only ever resolves to `serviceAccount` — there is no per-user credential to forward, impersonate, or exchange. If a cluster is explicitly configured with `passthrough`, `impersonate`, or `tokenExchange`, an anonymous request is rejected with an auth error rather than silently executing under the service account.
 
-`passthrough` forwards the client's own credential (Bearer/Basic) to the backend unchanged — the backend authenticates the user's own token, not a QueryFlux-vouched identity. It is **Trino-only in this release**; startup validation rejects it for engines whose adapters don't yet consume `QueryCredentials` (see the compatibility table below).
+`passthrough` forwards the client's own credential to the backend — a Bearer/Basic header unchanged for Trino, a dedicated per-query LDAP connection for StarRocks, a per-caller ADBC connection for Snowflake — so the backend authenticates the user's own credential, not a QueryFlux-vouched identity. Support is per-engine and per-adapter, not universal; startup validation rejects it for engines/drivers whose adapters don't yet consume `QueryCredentials` for this mode (see the compatibility table below).
 
 Before `passthrough` existed as an explicit type, the Trino adapter forwarded all headers stored in `SessionContext.extra` verbatim whenever a cluster had no HTTP-setting `auth` of its own — including the client's `Authorization` header — regardless of `queryAuth`. That implicit behavior is **deprecated but still supported** for `serviceAccount`/omitted `queryAuth` on Trino clusters, for backward compatibility (a startup warning is emitted). New configs should set `queryAuth.type: passthrough` explicitly instead of relying on the implicit fallback.
 
@@ -56,9 +56,10 @@ clusters:
     queryAuth:
       type: serviceAccount          # only viable option for ClickHouse
 
-  snowflake-prod:                   # future adapter
-    engine: snowflake
-    endpoint: https://myaccount.snowflakecomputing.com
+  snowflake-prod:                   # ADBC driver — see configuration.md for the full shape
+    engine: adbc
+    driver: snowflake
+    uri: qf_svc@myaccount/mydb/myschema
     auth:
       type: keyPair                 # RSA key-pair, Snowflake standard
       username: QF_SVC
@@ -567,7 +568,7 @@ QueryFlux cannot verify any of these remotely at startup — an unsupported vers
 
 **Only Trino and ClickHouse support `impersonate`.** StarRocks has no equivalent over MySQL wire (no trusted-proxy mechanism). Startup validation rejects `impersonate` for any other engine type.
 
-### Mode: `tokenExchange` (Trino only in this release)
+### Mode: `tokenExchange` (Trino, Snowflake in this release)
 
 QueryFlux exchanges the user's OIDC JWT (`auth_ctx.raw_token`) for a backend-specific OAuth access token via RFC 8693 token exchange. Requires `OidcAuthProvider` on the frontend (so `raw_token` is populated). **Fails closed:** if `raw_token` is absent or the exchange fails, the query is rejected with an auth error — it never silently falls back to `serviceAccount`, since that would submit the query under the wrong principal.
 
@@ -596,14 +597,14 @@ clusters:
       targetAudience: trino-client   # Keycloak target client ID
 ```
 
-#### Future: Snowflake, Databricks
+#### Snowflake (shipped), Databricks (future)
 
-Non-Trino OAuth-based engines are natural `tokenExchange` targets once their adapters consume `QueryCredentials::Bearer`:
+Non-Trino OAuth-based engines are natural `tokenExchange` targets once their adapters consume `QueryCredentials::Bearer`. Snowflake's ADBC adapter does today — see "Session-scoped pooling" under Engine-Specific Notes below for how the exchanged token is applied per-identity. Databricks has no ADBC adapter yet, so `tokenExchange` remains rejected at startup for it.
 
 | Provider | Grant type | Subject token type | Audience / scope |
 |----------|-----------|-------------------|-----------------|
 | Snowflake external OAuth | `urn:ietf:params:oauth:grant-type:token-exchange` | `urn:ietf:params:oauth:token-type:access_token` | `scope: session:role:&lt;ROLE&gt;` |
-| Databricks OAuth U2M | `urn:ietf:params:oauth:grant-type:token-exchange` | `urn:ietf:params:oauth:token-type:access_token` | `scope: all-apis` |
+| Databricks OAuth U2M *(future)* | `urn:ietf:params:oauth:grant-type:token-exchange` | `urn:ietf:params:oauth:token-type:access_token` | `scope: all-apis` |
 
 The same `queryAuth: tokenExchange` config shape applies — only the `targetAudience`/`scope` and the engine's own OAuth registration differ.
 
