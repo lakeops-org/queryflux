@@ -338,3 +338,53 @@ async fn agent_context_via_headers_wins_over_params() {
 
     let _ = client.cancel().await;
 }
+
+/// When the caller supplies no agent params/headers at all, MCP must not drop agent
+/// context entirely (that would make the call invisible on the Agents page) — it
+/// defaults `agent_id` from the authenticated identity and `conversation_id` from the
+/// transport's `Mcp-Session-Id`, which the `rmcp` client transparently attaches after
+/// `initialize`. Two calls on the same client/session should therefore share one
+/// `conversation_id`, proving the session-based grouping actually works.
+#[tokio::test]
+async fn agent_context_defaults_when_absent() {
+    let h = ProtocolWireHarness::new().await.expect("harness");
+    h.clear_records();
+    let client = connect(h.mcp_port).await;
+
+    let result = client
+        .call_tool(call("execute_query", serde_json::json!({ "sql": "SELECT 1" })))
+        .await
+        .expect("call_tool execute_query");
+    assert!(!is_error(&result), "unexpected tool error: {result:?}");
+
+    let record = h
+        .wait_for_record(|r| r.agent_id.is_some())
+        .await
+        .expect("expected a QueryRecord with a defaulted agent_id");
+    // The harness wires a `NoneAuthProvider(required = false)`, and MCP's `authenticate`
+    // never supplies a username, so the authenticated identity is deterministically
+    // "anonymous" here.
+    assert_eq!(record.agent_id.as_deref(), Some("anonymous"));
+    let conversation_id = record
+        .conversation_id
+        .clone()
+        .expect("conversation_id should default to the Mcp-Session-Id");
+
+    let result2 = client
+        .call_tool(call("execute_query", serde_json::json!({ "sql": "SELECT 2" })))
+        .await
+        .expect("call_tool execute_query");
+    assert!(!is_error(&result2), "unexpected tool error: {result2:?}");
+
+    let record2 = h
+        .wait_for_record(|r| r.sql_preview.contains("SELECT 2"))
+        .await
+        .expect("expected a QueryRecord for the second call");
+    assert_eq!(
+        record2.conversation_id.as_deref(),
+        Some(conversation_id.as_str()),
+        "calls on the same MCP session should share the session-derived conversation_id"
+    );
+
+    let _ = client.cancel().await;
+}

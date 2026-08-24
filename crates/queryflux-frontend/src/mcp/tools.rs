@@ -18,6 +18,7 @@ use rmcp::{
 use serde::Deserialize;
 use serde_json::json;
 use tracing::debug;
+use uuid::Uuid;
 
 use crate::{
     admin::{cancel_executing_query, delete_queued_if_exists, find_executing_query},
@@ -154,10 +155,22 @@ async fn authenticate(
 /// Merge explicit tool-parameter agent fields with any threaded HTTP headers into an
 /// `AgentContext`. Headers win on conflict — reuses `AgentContext::from_headers` exactly
 /// as every other frontend does, fed from a map with both sources' keys present.
+///
+/// MCP is inherently agent-facing traffic, but LLM callers inconsistently fill in the
+/// free-text `agent_id`/`conversation_id` tool params (or omit them), which would
+/// otherwise make the call invisible on the Agents page (it's keyed off
+/// `conversation_id`, and `AgentContext::from_headers` requires both fields or neither).
+/// So unlike every other frontend, MCP never leaves these unset: `agent_id` defaults to
+/// the authenticated identity (`auth.user`, never empty — see `AuthContext::user` docs),
+/// and `conversation_id` defaults to the transport's `Mcp-Session-Id` header when present
+/// (groups every call within one MCP session together), falling back to a fresh UUID per
+/// call when no session id is available (e.g. a stateless transport). Explicit
+/// params/headers still win over both defaults.
 fn resolve_agent_context(
     headers: &HashMap<String, String>,
     params: &AgentContextParams,
-) -> Option<AgentContext> {
+    auth: &AuthContext,
+) -> AgentContext {
     let mut merged = HashMap::new();
     if let Some(v) = &params.agent_id {
         merged.insert("agent_id".to_string(), v.clone());
@@ -177,18 +190,30 @@ fn resolve_agent_context(
     // Headers override same-named tool params (x-agent-id beats agent_id, etc.) because
     // AgentContext::from_headers checks the x-prefixed key first.
     merged.extend(headers.iter().map(|(k, v)| (k.clone(), v.clone())));
+
+    merged
+        .entry("agent_id".to_string())
+        .or_insert_with(|| auth.user.clone());
+    merged.entry("conversation_id".to_string()).or_insert_with(|| {
+        headers
+            .get("mcp-session-id")
+            .cloned()
+            .unwrap_or_else(|| format!("mcp-{}", Uuid::new_v4()))
+    });
+
     AgentContext::from_headers(&merged)
+        .expect("agent_id and conversation_id are populated by the defaults above")
 }
 
 /// `agent_context` must already be the fully-resolved value from `resolve_agent_context`
-/// (headers-vs-params precedence already applied) — setting it here makes
+/// (headers-vs-params precedence and defaults already applied) — setting it here makes
 /// `SessionContext::resolved_agent_context()` return it verbatim, since that method
 /// prefers an explicit `agent_context` over re-parsing `extra`. MCP never populates
 /// `extra`, so that fallback path is unused; do not rely on it for MCP.
-fn session_for(auth: &AuthContext, agent_context: Option<AgentContext>) -> SessionContext {
+fn session_for(auth: &AuthContext, agent_context: AgentContext) -> SessionContext {
     SessionContext {
         user: Some(auth.user.clone()),
-        agent_context,
+        agent_context: Some(agent_context),
         ..Default::default()
     }
 }
@@ -318,7 +343,7 @@ impl QueryFluxMcpServer {
     ) -> Result<CallToolResult, McpError> {
         let headers = extract_headers(&ctx);
         let auth = authenticate(&self.state, &headers).await?;
-        let agent_context = resolve_agent_context(&headers, &agent);
+        let agent_context = resolve_agent_context(&headers, &agent, &auth);
         let session = session_for(&auth, agent_context);
         let group =
             resolve_group(&self.state, &sql, &session, engine_hint.as_deref(), &auth).await?;
@@ -345,7 +370,7 @@ impl QueryFluxMcpServer {
     ) -> Result<CallToolResult, McpError> {
         let headers = extract_headers(&ctx);
         let auth = authenticate(&self.state, &headers).await?;
-        let agent_context = resolve_agent_context(&headers, &agent);
+        let agent_context = resolve_agent_context(&headers, &agent, &auth);
         let session = session_for(&auth, agent_context);
         let sql = "SELECT schema_name FROM information_schema.schemata".to_string();
         let group =
@@ -370,7 +395,7 @@ impl QueryFluxMcpServer {
     ) -> Result<CallToolResult, McpError> {
         let headers = extract_headers(&ctx);
         let auth = authenticate(&self.state, &headers).await?;
-        let agent_context = resolve_agent_context(&headers, &agent);
+        let agent_context = resolve_agent_context(&headers, &agent, &auth);
         let qualified = qualify_table(schema.as_deref(), &table);
 
         let describe_session = session_for(&auth, agent_context.clone());
@@ -460,7 +485,7 @@ impl QueryFluxMcpServer {
     ) -> Result<CallToolResult, McpError> {
         let headers = extract_headers(&ctx);
         let auth = authenticate(&self.state, &headers).await?;
-        let agent_context = resolve_agent_context(&headers, &agent);
+        let agent_context = resolve_agent_context(&headers, &agent, &auth);
         let session = session_for(&auth, agent_context);
         let explain_sql = format!("EXPLAIN {sql}");
         let group = resolve_group(
