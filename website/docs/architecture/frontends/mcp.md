@@ -25,7 +25,7 @@ The MCP frontend speaks **streamable HTTP** only (`rmcp`'s `transport-streamable
 
 ## Authentication
 
-Requests carry `Authorization: Bearer <token>`, checked against the same `AuthProvider` every other HTTP frontend uses (`none`, `static`, `oidc`, `ldap` — see [Authentication](/docs/authentication)). There is no MCP-specific auth mechanism.
+Requests carry `Authorization: Bearer <token>`, checked against the same `AuthProvider` every other HTTP frontend uses (`none`, `static`, `oidc`, `ldap` — see [Authentication](../../authentication)). There is no MCP-specific auth mechanism.
 
 ## Tools
 
@@ -40,7 +40,7 @@ Requests carry `Authorization: Bearer <token>`, checked against the same `AuthPr
 
 Every tool that accepts `engine_hint` uses it as an exact cluster-group name when it matches a configured group; otherwise the query is routed normally through the configured `RouterChain` — the same routing behavior as every other frontend, just with an optional override.
 
-Every tool except `get_query_status` / `cancel_query` also accepts the optional agent-context fields — `agent_id`, `conversation_id`, `step_index`, `tool_call_id`, `query_intent` — directly as tool parameters, in addition to the `X-Agent-Id` / `X-Conversation-Id` / etc. headers every other HTTP frontend already supports. See [Agentic context](/docs/agentic/agent-context#setting-context-via-mcp-tool-parameters) for why MCP gets both paths and which one wins when both are supplied.
+Every tool except `get_query_status` / `cancel_query` also accepts the optional agent-context fields — `agent_id`, `conversation_id`, `step_index`, `tool_call_id`, `query_intent` — directly as tool parameters, in addition to the `X-Agent-Id` / `X-Conversation-Id` / etc. headers every other HTTP frontend already supports. See [Agentic context](../../agentic/agent-context#setting-context-via-mcp-tool-parameters) for why MCP gets both paths and which one wins when both are supplied.
 
 ## Guardrails
 
@@ -50,7 +50,7 @@ Column/PII masking is not currently available for any frontend, MCP included —
 
 ## Query history and session replay
 
-Every MCP query is recorded the same way as every other frontend's queries, with the agent-context fields populated when present. This means MCP-originated queries show up in QueryFlux Studio's **Queries**, **Agents**, and **Conversations** pages exactly like agent traffic through Trino HTTP or PostgreSQL wire — no separate MCP-specific tooling needed to audit or replay what an agent did. See [Session replay and guardrails](/docs/agentic/session-replay) for the full persistence and replay model.
+Every MCP query is recorded the same way as every other frontend's queries, with the agent-context fields populated when present. This means MCP-originated queries show up in QueryFlux Studio's **Queries**, **Agents**, and **Conversations** pages exactly like agent traffic through Trino HTTP or PostgreSQL wire — no separate MCP-specific tooling needed to audit or replay what an agent did. See [Session replay and guardrails](../../agentic/session-replay) for the full persistence and replay model.
 
 ## Connecting a client
 
@@ -79,6 +79,6 @@ npx @modelcontextprotocol/inspector
 ## Related
 
 - [Frontends overview](overview.md) — shared dispatch and session model
-- [Setting agent context](/docs/agentic/agent-context) — how MCP populates agent identity, via headers and tool parameters
-- [Session replay and guardrails](/docs/agentic/session-replay) — what gets persisted and how to reconstruct an agent's session
+- [Setting agent context](../../agentic/agent-context) — how MCP populates agent identity, via headers and tool parameters
+- [Session replay and guardrails](../../agentic/session-replay) — what gets persisted and how to reconstruct an agent's session
 - [Guardrails](../guardrails) — configuring `read_only`, `row_limit`, and other guards

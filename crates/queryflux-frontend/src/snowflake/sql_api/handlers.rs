@@ -406,7 +406,7 @@ async fn authenticate(
     let bearer = headers
         .get("authorization")
         .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.strip_prefix("Bearer "))
+        .and_then(crate::strip_bearer_prefix)
         .map(|s| s.to_string());
 
     let auth_provider = state.live.read().await.auth_provider.clone();

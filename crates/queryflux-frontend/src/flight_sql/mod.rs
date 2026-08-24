@@ -190,7 +190,7 @@ impl FlightSqlService for QueryFluxFlightSql {
             .metadata()
             .get("authorization")
             .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.strip_prefix("Bearer "))
+            .and_then(crate::strip_bearer_prefix)
             .map(|t| t.to_string());
         let creds = Credentials {
             username: session.user().map(|s| s.to_string()),

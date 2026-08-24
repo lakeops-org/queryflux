@@ -137,7 +137,7 @@ async fn authenticate(
 ) -> Result<AuthContext, McpError> {
     let token = headers
         .get("authorization")
-        .and_then(|v| v.strip_prefix("Bearer "))
+        .and_then(|v| crate::strip_bearer_prefix(v))
         .map(|t| t.to_string());
     let creds = Credentials {
         username: None,

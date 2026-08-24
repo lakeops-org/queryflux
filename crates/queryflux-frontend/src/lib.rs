@@ -24,6 +24,18 @@ pub type ShutdownRx = tokio::sync::watch::Receiver<bool>;
 /// multi‑MiB DoS buffers. Kept below MySQL's 24-bit packet max (16 MiB − 1).
 pub const MAX_FRONTEND_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
 
+/// Extract the token from an `Authorization: Bearer <token>` header value. Matches the
+/// `Bearer` scheme name case-insensitively per RFC 6750 §2.1 (e.g. `bearer <token>` is a
+/// valid header), unlike a plain `str::strip_prefix("Bearer ")`.
+pub fn strip_bearer_prefix(value: &str) -> Option<&str> {
+    let bytes = value.as_bytes();
+    if bytes.len() >= 7 && bytes[..7].eq_ignore_ascii_case(b"bearer ") {
+        Some(&value[7..])
+    } else {
+        None
+    }
+}
+
 /// Implemented by each frontend protocol server (Trino HTTP, PG wire, MySQL wire, etc.).
 ///
 /// Each listener binds to a port, accepts connections in its native protocol,
@@ -34,4 +46,40 @@ pub trait FrontendListenerTrait: Send + Sync {
     /// Start the listener. Returns when the shutdown signal fires and in-flight
     /// work has drained (or the server framework finishes its own drain).
     async fn listen(&self, shutdown: ShutdownRx) -> Result<()>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn strip_bearer_prefix_matches_canonical_case() {
+        assert_eq!(strip_bearer_prefix("Bearer abc123"), Some("abc123"));
+    }
+
+    #[test]
+    fn strip_bearer_prefix_matches_lowercase_scheme() {
+        assert_eq!(strip_bearer_prefix("bearer abc123"), Some("abc123"));
+    }
+
+    #[test]
+    fn strip_bearer_prefix_matches_mixed_case_scheme() {
+        assert_eq!(strip_bearer_prefix("BeArEr abc123"), Some("abc123"));
+    }
+
+    #[test]
+    fn strip_bearer_prefix_rejects_other_schemes() {
+        assert_eq!(strip_bearer_prefix("Basic abc123"), None);
+    }
+
+    #[test]
+    fn strip_bearer_prefix_rejects_short_input() {
+        assert_eq!(strip_bearer_prefix("Bear"), None);
+        assert_eq!(strip_bearer_prefix(""), None);
+    }
+
+    #[test]
+    fn strip_bearer_prefix_allows_empty_token() {
+        assert_eq!(strip_bearer_prefix("Bearer "), Some(""));
+    }
 }
