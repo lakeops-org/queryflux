@@ -17,6 +17,7 @@ A **frontend** is the entry point for client traffic into QueryFlux. Each fronte
 | [MySQL wire](mysql-wire.md) | `mysqlWire` | 3306 | MySQL wire | MySQL | **Done** |
 | [Arrow Flight SQL](flight-sql.md) | `flightSql` | 50051 | gRPC (Arrow Flight) | Generic | **Done** |
 | [Snowflake](snowflake.md) | `snowflakeHttp` | 8443* | Snowflake HTTP wire + SQL API v2 | Snowflake | **Done** |
+| [MCP](mcp.md) | `mcp` | — | Streamable HTTP (MCP tool calls) | Generic | **Done** |
 | ClickHouse HTTP | `clickhouseHttp` | 8123 | HTTP | ClickHouse | Planned |
 
 \*Snowflake is optional: you must set `snowflakeHttp.port` in YAML (no implicit default). `8443` is typical; some repo examples use `8445`. Wire and SQL API v2 share this listener; routing uses `snowflakeHttp` vs `snowflakeSqlApi` — see [Snowflake](snowflake.md).
@@ -103,6 +104,7 @@ routers:
     flightSql: flight-analytics
     snowflakeHttp: trino-default
     snowflakeSqlApi: trino-default
+    mcp: agent-queries
 ```
 
 ### SQL dialect and translation
@@ -132,8 +134,11 @@ queryflux:
       enabled: true
       port: 8443
       sessionAffinityAcknowledged: false
+    mcp:
+      enabled: true
+      port: 8811
 ```
 
-Omitting `postgresWire`, `mysqlWire`, `flightSql`, or `snowflakeHttp` disables that listener. For any frontend block, `enabled: false` turns the listener off while keeping other settings. When `trinoHttp` is omitted from YAML, serde defaults apply (`enabled: true`, port `8080`).
+Omitting `postgresWire`, `mysqlWire`, `flightSql`, `snowflakeHttp`, or `mcp` disables that listener. For any frontend block, `enabled: false` turns the listener off while keeping other settings. When `trinoHttp` is omitted from YAML, serde defaults apply (`enabled: true`, port `8080`).
 
 See **[Snowflake](snowflake.md)** for session affinity, TTL fields, and SQL API v2 behavior.

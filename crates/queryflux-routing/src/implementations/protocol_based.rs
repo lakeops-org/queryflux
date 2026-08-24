@@ -18,6 +18,7 @@ pub struct ProtocolBasedRouter {
     pub flight_sql: Option<ClusterGroupName>,
     pub snowflake_http: Option<ClusterGroupName>,
     pub snowflake_sql_api: Option<ClusterGroupName>,
+    pub mcp: Option<ClusterGroupName>,
 }
 
 #[async_trait]
@@ -41,6 +42,7 @@ impl RouterTrait for ProtocolBasedRouter {
             FrontendProtocol::FlightSql => self.flight_sql.clone(),
             FrontendProtocol::SnowflakeHttp => self.snowflake_http.clone(),
             FrontendProtocol::SnowflakeSqlApi => self.snowflake_sql_api.clone(),
+            FrontendProtocol::Mcp => self.mcp.clone(),
         };
         Ok(group.into())
     }

@@ -20,6 +20,7 @@ queryflux-translation = { workspace = true }
 queryflux-metrics = { workspace = true }
 queryflux-routing = { workspace = true }
 queryflux-auth = { workspace = true }
+queryflux-guardrails = { workspace = true }
 
 # Async runtime
 tokio = { workspace = true }
@@ -57,4 +58,9 @@ futures = { workspace = true }
 # Query params e2e tests — decode Snowflake rowsetBase64 (Arrow IPC + base64)
 arrow = { workspace = true }
 base64 = "0.22"
+
+[dev-dependencies]
+# Real MCP client (streamable HTTP) for mcp_tests.rs — drives the McpFrontend with the
+# actual protocol instead of hand-rolled JSON-RPC.
+rmcp = { version = "3", features = ["client", "transport-streamable-http-client", "transport-streamable-http-client-reqwest"] }
 

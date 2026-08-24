@@ -737,6 +737,9 @@ pub struct FrontendsConfig {
     pub flight_sql: Option<FrontendConfig>,
     #[serde(default)]
     pub snowflake_http: Option<SnowflakeHttpFrontendConfig>,
+    /// MCP (Model Context Protocol) streamable-HTTP frontend for AI agent tool calls.
+    #[serde(default)]
+    pub mcp: Option<FrontendConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1739,6 +1742,8 @@ pub enum RouterConfig {
         snowflake_http: Option<String>,
         #[serde(default)]
         snowflake_sql_api: Option<String>,
+        #[serde(default)]
+        mcp: Option<String>,
     },
     #[serde(rename_all = "camelCase")]
     Header {

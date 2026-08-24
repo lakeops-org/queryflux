@@ -17,6 +17,7 @@ use queryflux_frontend::{
         SecurityConfigDto as AdminSecurityConfigDto, TestClusterFn,
     },
     flight_sql::FlightSqlFrontend,
+    mcp::McpFrontend,
     mysql_wire::MysqlWireFrontend,
     postgres_wire::PostgresWireFrontend,
     snowflake::SnowflakeFrontend,
@@ -684,6 +685,7 @@ async fn main() -> Result<()> {
                 flight_sql,
                 snowflake_http,
                 snowflake_sql_api,
+                mcp,
             } => {
                 routers.push(Box::new(ProtocolBasedRouter {
                     trino_http: trino_http.as_ref().map(|s| ClusterGroupName(s.clone())),
@@ -697,6 +699,7 @@ async fn main() -> Result<()> {
                     snowflake_sql_api: snowflake_sql_api
                         .as_ref()
                         .map(|s| ClusterGroupName(s.clone())),
+                    mcp: mcp.as_ref().map(|s| ClusterGroupName(s.clone())),
                 }));
             }
             RouterConfig::Header {
@@ -1994,6 +1997,21 @@ async fn main() -> Result<()> {
             }
         }
     });
+    let mut mcp_handle = tokio::spawn({
+        let state = app_state.clone();
+        let rx = shutdown_rx.clone();
+        let cfg = config.queryflux.frontends.mcp.clone();
+        async move {
+            match cfg {
+                Some(c) if c.enabled => {
+                    McpFrontend::new(state, c.port, c.max_connections)
+                        .listen(rx)
+                        .await
+                }
+                _ => std::future::pending::<queryflux_core::error::Result<()>>().await,
+            }
+        }
+    });
 
     // Wait for either a shutdown signal or an unexpected frontend exit.
     let shutdown_signal = async {
@@ -2023,6 +2041,7 @@ async fn main() -> Result<()> {
         r = &mut postgres_handle => { if let Ok(Err(e)) = r { tracing::error!("Postgres wire exited unexpectedly: {e}"); } },
         r = &mut flight_sql_handle => { if let Ok(Err(e)) = r { tracing::error!("Flight SQL exited unexpectedly: {e}"); } },
         r = &mut snowflake_handle => { if let Ok(Err(e)) = r { tracing::error!("Snowflake exited unexpectedly: {e}"); } },
+        r = &mut mcp_handle => { if let Ok(Err(e)) = r { tracing::error!("MCP exited unexpectedly: {e}"); } },
     }
 
     // --- Phase 1: signal all frontends to stop accepting new connections ---
@@ -2045,6 +2064,7 @@ async fn main() -> Result<()> {
             postgres_handle,
             flight_sql_handle,
             snowflake_handle,
+            mcp_handle,
         );
 
         // Poll persistence until no executing or queued queries remain (or until
@@ -2278,8 +2298,9 @@ fn validate_live_config_refs(
                 flight_sql,
                 snowflake_http,
                 snowflake_sql_api,
+                mcp,
             } => {
-                let opts: [Option<&str>; 7] = [
+                let opts: [Option<&str>; 8] = [
                     trino_http.as_deref(),
                     postgres_wire.as_deref(),
                     mysql_wire.as_deref(),
@@ -2287,6 +2308,7 @@ fn validate_live_config_refs(
                     flight_sql.as_deref(),
                     snowflake_http.as_deref(),
                     snowflake_sql_api.as_deref(),
+                    mcp.as_deref(),
                 ];
                 refs.extend(opts.into_iter().flatten());
             }
@@ -2747,6 +2769,7 @@ async fn build_live_config(
                 flight_sql,
                 snowflake_http,
                 snowflake_sql_api,
+                mcp,
             } => {
                 routers.push(Box::new(
                     queryflux_routing::implementations::protocol_based::ProtocolBasedRouter {
@@ -2763,6 +2786,7 @@ async fn build_live_config(
                         snowflake_sql_api: snowflake_sql_api
                             .as_ref()
                             .map(|s| ClusterGroupName(s.clone())),
+                        mcp: mcp.as_ref().map(|s| ClusterGroupName(s.clone())),
                     },
                 ));
             }

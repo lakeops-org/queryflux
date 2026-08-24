@@ -21,6 +21,7 @@ Everything below is implemented and available on the `main` branch.
 | | MySQL wire protocol (port 3306) |
 | | Arrow Flight SQL (gRPC) |
 | | Snowflake HTTP wire + SQL API v2 (configurable port) |
+| | MCP (Model Context Protocol) — streamable HTTP, six tools for AI agents, see **[MCP Frontend](./architecture/frontends/mcp)** |
 | | Admin REST API + OpenAPI / Swagger UI (port 9000) |
 | **Backends** | Trino — async HTTP polling, transparent `nextUri` proxying |
 | | DuckDB — embedded, in-process, Arrow result sets |

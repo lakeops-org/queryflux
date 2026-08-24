@@ -12,6 +12,14 @@ queryflux:
     #   enabled: false
     #   port: 8445
     #   sessionAffinityAcknowledged: false
+    # MCP (Model Context Protocol) streamable-HTTP frontend for AI agent tool calls.
+    # Authenticates via `Authorization: Bearer <token>` like other HTTP frontends — see
+    # the `auth` section below. Guardrails (read-only, row limits, etc.) are configured
+    # the same way as for every other frontend, via the top-level `guardrails` /
+    # per-group guard config — nothing MCP-specific is enforced by default.
+    # mcp:
+    #   enabled: false
+    #   port: 8811
   persistence:
     type: inMemory
   # --- Postgres persistence examples (pick one style) ---

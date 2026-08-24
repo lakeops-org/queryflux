@@ -71,6 +71,8 @@ pub enum FrontendProtocol {
     SnowflakeHttp,
     /// Snowflake SQL REST API v2 (`/api/v2/statements`).
     SnowflakeSqlApi,
+    /// Model Context Protocol (streamable HTTP) — MCP tool calls from AI agents.
+    Mcp,
 }
 
 impl FrontendProtocol {
@@ -81,7 +83,7 @@ impl FrontendProtocol {
             FrontendProtocol::PostgresWire => SqlDialect::Postgres,
             FrontendProtocol::MySqlWire => SqlDialect::MySql,
             FrontendProtocol::ClickHouseHttp => SqlDialect::ClickHouse,
-            FrontendProtocol::FlightSql => SqlDialect::Generic,
+            FrontendProtocol::FlightSql | FrontendProtocol::Mcp => SqlDialect::Generic,
             FrontendProtocol::SnowflakeHttp | FrontendProtocol::SnowflakeSqlApi => {
                 SqlDialect::Snowflake
             }

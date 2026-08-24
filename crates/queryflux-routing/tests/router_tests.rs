@@ -152,6 +152,7 @@ async fn protocol_router_trino_http() {
         flight_sql: None,
         snowflake_http: None,
         snowflake_sql_api: None,
+        mcp: None,
     };
     let session = trino_session(&[]);
     let result = router
@@ -171,6 +172,7 @@ async fn protocol_router_postgres_wire() {
         flight_sql: None,
         snowflake_http: None,
         snowflake_sql_api: None,
+        mcp: None,
     };
     let result = router
         .route(
@@ -194,6 +196,7 @@ async fn protocol_router_unconfigured() {
         flight_sql: None,
         snowflake_http: None,
         snowflake_sql_api: None,
+        mcp: None,
     };
     let result = router
         .route(
@@ -217,6 +220,7 @@ async fn protocol_router_mysql_wire() {
         flight_sql: None,
         snowflake_http: None,
         snowflake_sql_api: None,
+        mcp: None,
     };
     let result = router
         .route(
@@ -240,6 +244,7 @@ async fn protocol_router_clickhouse_http() {
         flight_sql: None,
         snowflake_http: None,
         snowflake_sql_api: None,
+        mcp: None,
     };
     let result = router
         .route(
@@ -263,6 +268,7 @@ async fn protocol_router_flight_sql() {
         flight_sql: Some(group("sf-analytics")),
         snowflake_http: None,
         snowflake_sql_api: None,
+        mcp: None,
     };
     // `ProtocolBasedRouter` routes on frontend protocol only (session is ignored).
     let result = router
@@ -287,6 +293,7 @@ async fn protocol_router_snowflake_http() {
         flight_sql: None,
         snowflake_http: Some(group("sf-wire")),
         snowflake_sql_api: None,
+        mcp: None,
     };
     let result = router
         .route(
@@ -310,6 +317,7 @@ async fn protocol_router_snowflake_sql_api() {
         flight_sql: None,
         snowflake_http: None,
         snowflake_sql_api: Some(group("sf-rest")),
+        mcp: None,
     };
     let result = router
         .route(
@@ -1111,6 +1119,7 @@ async fn chain_protocol_based_then_header_fallback() {
                 flight_sql: None,
                 snowflake_http: None,
                 snowflake_sql_api: None,
+                mcp: None,
             }),
             Box::new(HeaderRouter::new(
                 "x-tenant".to_string(),
