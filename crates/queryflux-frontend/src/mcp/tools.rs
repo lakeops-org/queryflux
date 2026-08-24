@@ -194,12 +194,14 @@ fn resolve_agent_context(
     merged
         .entry("agent_id".to_string())
         .or_insert_with(|| auth.user.clone());
-    merged.entry("conversation_id".to_string()).or_insert_with(|| {
-        headers
-            .get("mcp-session-id")
-            .cloned()
-            .unwrap_or_else(|| format!("mcp-{}", Uuid::new_v4()))
-    });
+    merged
+        .entry("conversation_id".to_string())
+        .or_insert_with(|| {
+            headers
+                .get("mcp-session-id")
+                .cloned()
+                .unwrap_or_else(|| format!("mcp-{}", Uuid::new_v4()))
+        });
 
     AgentContext::from_headers(&merged)
         .expect("agent_id and conversation_id are populated by the defaults above")

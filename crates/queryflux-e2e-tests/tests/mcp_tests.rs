@@ -352,7 +352,10 @@ async fn agent_context_defaults_when_absent() {
     let client = connect(h.mcp_port).await;
 
     let result = client
-        .call_tool(call("execute_query", serde_json::json!({ "sql": "SELECT 1" })))
+        .call_tool(call(
+            "execute_query",
+            serde_json::json!({ "sql": "SELECT 1" }),
+        ))
         .await
         .expect("call_tool execute_query");
     assert!(!is_error(&result), "unexpected tool error: {result:?}");
@@ -371,7 +374,10 @@ async fn agent_context_defaults_when_absent() {
         .expect("conversation_id should default to the Mcp-Session-Id");
 
     let result2 = client
-        .call_tool(call("execute_query", serde_json::json!({ "sql": "SELECT 2" })))
+        .call_tool(call(
+            "execute_query",
+            serde_json::json!({ "sql": "SELECT 2" }),
+        ))
         .await
         .expect("call_tool execute_query");
     assert!(!is_error(&result2), "unexpected tool error: {result2:?}");
