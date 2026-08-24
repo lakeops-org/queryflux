@@ -4,11 +4,11 @@
     "color": "EEEEEE"
   },
   "CHECKS": {
-    "regexp": "^(feat|fix|docs|chore|ui)!?(\\(.*\\))?!?:.*|^\\[Snyk\\].*|^Bump .+"
+    "regexp": "^(feat|fix|docs|chore|ui|test)!?(\\(.*\\))?!?:.*|^\\[Snyk\\].*|^Bump .+"
   },
   "MESSAGES": {
     "success": "PR title is valid",
     "failure": "PR title is invalid",
-    "notice": "PR title must match Conventional Commits (feat|fix|docs|chore|ui), or be a Snyk/Dependabot title ([Snyk]... / Bump ...)"
+    "notice": "PR title must match Conventional Commits (feat|fix|docs|chore|ui|test), or be a Snyk/Dependabot title ([Snyk]... / Bump ...)"
   }
 }
