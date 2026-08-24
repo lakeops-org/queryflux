@@ -527,6 +527,32 @@ mod tests {
              mismatch here means protocol-based routing rules are silently dropped on write, \
              read, or Studio enrichment for the missing protocol"
         );
+
+        // The camel-case check above only proves PROTO_CAMEL_SNAKE's *keys* line up with the
+        // struct's fields. It says nothing about the paired snake_case value — a typo there
+        // (e.g. "snowflake_sqlapi" instead of "snowflake_sql_api") would still pass it, yet
+        // would make `field()` fail to recognize Studio's snake_case JSON.stringify input and
+        // silently drop that protocol's routing rule. Pin the exact pairs against the known
+        // Rust field names (mysql_wire, snowflake_sql_api, ...) to catch that too.
+        let expected_mappings: std::collections::HashSet<(&str, &str)> = [
+            ("trinoHttp", "trino_http"),
+            ("postgresWire", "postgres_wire"),
+            ("mysqlWire", "mysql_wire"),
+            ("clickhouseHttp", "clickhouse_http"),
+            ("flightSql", "flight_sql"),
+            ("snowflakeHttp", "snowflake_http"),
+            ("snowflakeSqlApi", "snowflake_sql_api"),
+        ]
+        .into_iter()
+        .collect();
+        let const_mappings: std::collections::HashSet<(&str, &str)> =
+            PROTO_CAMEL_SNAKE.iter().copied().collect();
+        assert_eq!(
+            const_mappings, expected_mappings,
+            "PROTO_CAMEL_SNAKE's snake_case half doesn't match RouterConfig::ProtocolBased's \
+             actual field names; Studio's snake_case JSON.stringify input would silently fail \
+             to resolve for the mismatched protocol"
+        );
     }
 
     #[test]
