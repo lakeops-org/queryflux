@@ -804,6 +804,19 @@ impl AdbcAdapter {
             opts.extend(oauth_token_options(driver, token)?);
         }
         if let Some((username, password)) = &key.passthrough {
+            // Force standard username/password auth for this scoped pool. `Username`/
+            // `Password` and `adbc.snowflake.sql.auth_type` are independent fields on the
+            // driver's internal config — setting the former does not reset the latter. If
+            // the cluster's base `dbKwargs` sets `auth_type=auth_oauth` (a plausible base
+            // config for a cluster that also supports `tokenExchange`), this vec's entries
+            // still apply after `base_db_kwargs` (see `scoped_pool_for`), but without this
+            // explicit override the driver would keep authenticating as the cluster's base
+            // OAuth identity — silently ignoring the caller's own passthrough credential
+            // entirely, exactly the identity leak passthrough exists to prevent.
+            opts.push((
+                OptionDatabase::Other("adbc.snowflake.sql.auth_type".to_string()),
+                "auth_snowflake".into(),
+            ));
             opts.push((OptionDatabase::Username, username.clone().into()));
             opts.push((OptionDatabase::Password, password.clone().into()));
         }
@@ -1631,7 +1644,7 @@ impl EngineAdapterFactory for AdbcFactory {
 mod tests {
     use super::{
         compute_scoped_pool_key, compute_scoped_pool_size, jwt_auth_options,
-        normalize_to_pkcs8_pem, oauth_token_options, AdbcConfig, PoolScopeKey,
+        normalize_to_pkcs8_pem, oauth_token_options, AdbcAdapter, AdbcConfig, PoolScopeKey,
         IDENTITY_POOL_MAX_SIZE,
     };
     use crate::EngineConfigParseable;
@@ -1820,6 +1833,51 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(compute_scoped_pool_size(&key, 20), IDENTITY_POOL_MAX_SIZE);
+    }
+
+    #[test]
+    fn scoped_pool_options_passthrough_forces_standard_auth_type() {
+        // `Username`/`Password` alone do not reset `adbc.snowflake.sql.auth_type` — it's an
+        // independent field on the driver's config. If the cluster's base `dbKwargs` sets
+        // `auth_type=auth_oauth` (plausible for a cluster that also supports
+        // `tokenExchange`), a passthrough connection must still explicitly force
+        // `auth_snowflake`, or it would silently authenticate as the cluster's base OAuth
+        // identity instead of the caller's own passthrough credential.
+        let key = PoolScopeKey {
+            passthrough: Some(("alice".to_string(), "s3cr3t".to_string())),
+            ..Default::default()
+        };
+        let opts = AdbcAdapter::scoped_pool_options("snowflake", &key).expect("snowflake wired");
+        let rendered: Vec<String> = opts.iter().map(|(k, _)| format!("{k:?}")).collect();
+        let auth_type_idx = rendered
+            .iter()
+            .position(|k| k.contains("adbc.snowflake.sql.auth_type"))
+            .expect("auth_type option must be present for a passthrough key");
+        let username_idx = rendered
+            .iter()
+            .position(|k| k == "Username")
+            .expect("Username option must be present for a passthrough key");
+        assert!(
+            auth_type_idx < username_idx,
+            "auth_type must be forced before Username/Password: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn scoped_pool_options_no_auth_type_forced_without_passthrough() {
+        // A bare role/warehouse/schema-only key (no passthrough, no token) has no reason to
+        // touch auth_type at all — it should inherit whatever the cluster's base config sets.
+        let key = PoolScopeKey {
+            role: Some("ANALYST".to_string()),
+            ..Default::default()
+        };
+        let opts = AdbcAdapter::scoped_pool_options("snowflake", &key).expect("snowflake wired");
+        assert!(
+            !opts
+                .iter()
+                .any(|(k, _)| format!("{k:?}").contains("auth_type")),
+            "unexpected auth_type option: {opts:?}"
+        );
     }
 
     #[test]
