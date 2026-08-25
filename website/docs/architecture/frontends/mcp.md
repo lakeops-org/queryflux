@@ -64,16 +64,72 @@ Every MCP query is recorded the same way as every other frontend's queries. Unli
 
 ## Connecting a client
 
-Point any streamable-HTTP MCP client at `http://<host>:<port>/mcp` with a bearer token. The `http://localhost:8811/mcp` example below is for local development only — QueryFlux does not terminate TLS itself (same as every other frontend), so a bearer token sent to a **remote** host must go through HTTPS or a TLS-terminating reverse proxy in front of QueryFlux; otherwise the token travels in cleartext.
+Point any streamable-HTTP MCP client at `http://<host>:<port>/mcp` with a bearer token. Every example below uses `http://localhost:8811/mcp` for local development — QueryFlux does not terminate TLS itself (same as every other frontend), so a bearer token sent to a **remote** host must go through HTTPS or a TLS-terminating reverse proxy in front of QueryFlux; otherwise the token travels in cleartext. Don't hardcode the token in a committed config file — every client below supports pulling it from an environment variable instead.
 
-For example, with the [MCP Inspector](https://github.com/modelcontextprotocol/inspector):
+### MCP Inspector (quick sanity check)
 
 ```bash
 npx @modelcontextprotocol/inspector
 # Transport: Streamable HTTP
-# URL: http://localhost:8811/mcp   (local dev — use https:// through a TLS terminator remotely)
+# URL: http://localhost:8811/mcp
 # Header: Authorization: Bearer <token>
 ```
+
+### Cursor
+
+Cursor supports streamable HTTP natively — no bridge needed. Add to `.cursor/mcp.json` (project-scoped) or Cursor's global MCP settings:
+
+```json
+{
+  "mcpServers": {
+    "queryflux": {
+      "url": "http://localhost:8811/mcp",
+      "headers": {
+        "Authorization": "Bearer ${env:QUERYFLUX_MCP_TOKEN}"
+      }
+    }
+  }
+}
+```
+
+### Claude Code
+
+```bash
+claude mcp add --transport http queryflux http://localhost:8811/mcp \
+  --header "Authorization: Bearer $QUERYFLUX_MCP_TOKEN"
+```
+
+Add `--scope user` to make it available across every project instead of just the current one. Run `/mcp` inside Claude Code afterward to confirm it shows as connected — a bad token shows as failed with the HTTP status QueryFlux returned (e.g. 401).
+
+### Claude Desktop
+
+Claude Desktop's `claude_desktop_config.json` only validates stdio server entries — pasting a streamable-HTTP URL directly into it is silently ignored. Two options:
+
+- **Custom Connector (recommended)**: Settings → Connectors → Add custom connector, and enter the URL and bearer token there. No JSON file editing.
+- **[`mcp-remote`](https://www.npmjs.com/package/mcp-remote) bridge**, if you need it in the config file itself:
+
+```json
+{
+  "mcpServers": {
+    "queryflux": {
+      "command": "npx",
+      "args": [
+        "mcp-remote@latest",
+        "http://localhost:8811/mcp",
+        "--header",
+        "Authorization:${AUTH_HEADER}"
+      ],
+      "env": {
+        "AUTH_HEADER": "Bearer YOUR_TOKEN_HERE"
+      }
+    }
+  }
+}
+```
+
+### Other clients
+
+Most other MCP-capable tools (Windsurf, VS Code's MCP support, etc.) follow the same `mcpServers: { "<name>": { "url": ..., "headers": {...} } }` convention Cursor uses above — check that client's own docs for where the file lives, but the `url`/`headers` shape is usually a direct copy-paste.
 
 ## Not supported / Known limitations
 
