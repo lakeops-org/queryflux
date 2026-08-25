@@ -31,16 +31,26 @@ Requests carry `Authorization: Bearer <token>`, checked against the same `AuthPr
 
 | Tool | Description |
 |------|-------------|
-| `execute_query(sql, engine_hint?, max_rows?, ...agent context)` | Execute SQL and return rows as JSON, keyed by column name. Truncates at `max_rows` (default 1000) — a result-size bound, not a safety mechanism. |
+| `execute_query(sql, engine_hint?, max_rows?, dialect?, ...agent context)` | Execute SQL and return rows as JSON, keyed by column name. Truncates at `max_rows` (default 1000) — a result-size bound, not a safety mechanism. |
 | `list_schemas(engine_hint?, ...agent context)` | List schemas by querying `information_schema.schemata` — the SQL-standard view every supported engine implements. |
 | `describe_table(schema?, table, sample_rows?, engine_hint?, ...agent context)` | Column metadata via `DESCRIBE`, plus a bounded sample (`SELECT * ... LIMIT sample_rows`) in the same call when `sample_rows > 0` — reduces agent round-trips. |
-| `explain_query(sql, engine_hint?, ...agent context)` | Query plan via `EXPLAIN`, without executing the query. |
+| `explain_query(sql, engine_hint?, dialect?, ...agent context)` | Query plan via `EXPLAIN`, without executing the query. |
 | `get_query_status(query_id)` | Status of a query submitted via `execute_query` — `running`, `queued`, or `not_found_or_completed`. QueryFlux does not currently retain a lookup-by-id history of completed queries, so this only covers in-flight queries. |
 | `cancel_query(query_id)` | Cancel a running or queued query. Only the agent/user that submitted it may cancel it (ownership-checked, same as every other owner-scoped operation in QueryFlux). |
 
 Every tool that accepts `engine_hint` uses it as an exact cluster-group name when it matches a configured group; otherwise the query is routed normally through the configured `RouterChain` — the same routing behavior as every other frontend, just with an optional override.
 
 Every tool except `get_query_status` / `cancel_query` also accepts the optional agent-context fields — `agent_id`, `conversation_id`, `step_index`, `tool_call_id`, `query_intent` — directly as tool parameters, in addition to the `X-Agent-Id` / `X-Conversation-Id` / etc. headers every other HTTP frontend already supports. Both are optional: when neither is supplied, `agent_id`/`conversation_id` default rather than being left unset (see [Agent context defaults on MCP](../../agentic/agent-context#agent-context-defaults-on-mcp)). See [Agentic context](../../agentic/agent-context#setting-context-via-mcp-tool-parameters) for why MCP gets both paths and which one wins when both are supplied.
+
+### The `dialect` parameter
+
+Every other frontend implies a SQL dialect from its wire protocol — a PostgreSQL wire client is assumed to write Postgres-flavored SQL, for example. MCP has no such signal: an LLM agent can write SQL in any dialect, or (more commonly) in whatever dialect the target engine itself uses. Guessing wrong is worse than not translating at all — a wrong dialect assumption can cause sqlglot to parse the SQL under the wrong syntax rules and silently rewrite it incorrectly.
+
+So `execute_query` and `explain_query` default to applying **no translation** — the SQL is assumed to already match the target engine's dialect, which is the common case. Set `dialect` only when the SQL was written for a *different* engine and should be translated before being routed. Accepted values (case-insensitive):
+
+`trino`, `athena`, `duckdb`, `starrocks`, `clickhouse`, `mysql`, `postgres` (or `postgresql`), `sqlite`, `snowflake`, `bigquery`, `databricks`, `tsql` (or `mssql`), `redshift`, `exasol`, `generic`.
+
+An unrecognized value is rejected with an `invalid_params` error listing the accepted set, rather than being passed through to sqlglot unvalidated.
 
 ## Guardrails
 

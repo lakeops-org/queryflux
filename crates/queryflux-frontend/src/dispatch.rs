@@ -16,7 +16,8 @@ use queryflux_core::{
     error::{QueryFluxError, Result},
     query::{
         ClusterGroupName, ClusterName, ExecutingQuery, FrontendProtocol, ProxyQueryId,
-        QueryEngineStats, QueryExecution, QueryStats, QueryStatus, QueuedQuery, StoredWireAuth,
+        QueryEngineStats, QueryExecution, QueryStats, QueryStatus, QueuedQuery, SqlDialect,
+        StoredWireAuth,
     },
     session::SessionContext,
 };
@@ -31,6 +32,31 @@ use queryflux_translation::SchemaContext;
 use tracing::{debug, info, warn};
 
 use crate::state::{AppState, QueryContext, QueryOutcome};
+
+/// Resolve the source dialect used for translation.
+///
+/// An explicit `session.extra["dialect"]` override — set by the MCP frontend when the
+/// caller declares a dialect via the `dialect` tool parameter or an `X-Sql-Dialect`
+/// header — always wins. Otherwise falls back to the protocol's wire-implied default,
+/// *except* for MCP: unlike every other frontend, MCP has no wire protocol that implies
+/// a dialect (an LLM agent can write SQL in anything), so guessing `SqlDialect::Generic`
+/// risks sqlglot parsing/rewriting under its own opinionated base dialect when the SQL
+/// was actually already correct for the target engine. Defaulting to the *target*
+/// dialect instead makes translation a no-op by default (the common case), rather than
+/// a guess that can silently produce wrong SQL.
+fn resolve_src_dialect(
+    session: &SessionContext,
+    protocol: &FrontendProtocol,
+    tgt_dialect: &SqlDialect,
+) -> SqlDialect {
+    if let Some(name) = session.extra.get("dialect") {
+        return SqlDialect::Sqlglot(name.clone());
+    }
+    if matches!(protocol, FrontendProtocol::Mcp) {
+        return tgt_dialect.clone();
+    }
+    protocol.default_dialect()
+}
 
 // ---------------------------------------------------------------------------
 // ResultSink — universal streaming output interface
@@ -312,8 +338,8 @@ pub async fn dispatch_query(
         }
     };
 
-    let src_dialect = protocol.default_dialect();
     let tgt_dialect = adapter_kind.translation_target_dialect();
+    let src_dialect = resolve_src_dialect(&session, &protocol, &tgt_dialect);
     let engine_type = adapter_kind.engine_type();
     let original_sql = sql.clone();
     let sql = match state
@@ -563,7 +589,11 @@ pub async fn dispatch_query(
                     slot.disarm();
                     info!(id = %query_id, backend = %backend_query_id, cluster = %cluster_name, "Query completed on submit");
                     let was_translated = executing.translated_sql.is_some();
-                    let src_dialect = protocol.default_dialect();
+                    let src_dialect = resolve_src_dialect(
+                        &session,
+                        &protocol,
+                        &adapter.translation_target_dialect(),
+                    );
                     let ctx = QueryContext {
                         query_id: executing.id.clone(),
                         sql: executing
@@ -1354,8 +1384,8 @@ async fn setup_sync_query(
         query_id.0.clone(),
     );
 
-    let src_dialect = protocol.default_dialect();
     let tgt_dialect = adapter.translation_target_dialect();
+    let src_dialect = resolve_src_dialect(&session, &protocol, &tgt_dialect);
     let engine_type = adapter.engine_type();
     let start = Instant::now();
 
@@ -2424,5 +2454,51 @@ mod capacity_wait_tests {
             }
             other => panic!("expected CapacityWaitTimeout, got {other}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod resolve_src_dialect_tests {
+    use super::resolve_src_dialect;
+    use queryflux_core::query::{FrontendProtocol, SqlDialect};
+    use queryflux_core::session::SessionContext;
+
+    #[test]
+    fn mcp_defaults_to_target_dialect_not_generic() {
+        let session = SessionContext::default();
+        let resolved = resolve_src_dialect(&session, &FrontendProtocol::Mcp, &SqlDialect::Trino);
+        assert_eq!(resolved, SqlDialect::Trino);
+    }
+
+    #[test]
+    fn non_mcp_protocol_uses_its_own_wire_implied_default() {
+        let session = SessionContext::default();
+        let resolved = resolve_src_dialect(
+            &session,
+            &FrontendProtocol::PostgresWire,
+            &SqlDialect::DuckDb,
+        );
+        assert_eq!(resolved, SqlDialect::Postgres);
+    }
+
+    #[test]
+    fn explicit_session_override_wins_for_mcp() {
+        let mut session = SessionContext::default();
+        session
+            .extra
+            .insert("dialect".to_string(), "bigquery".to_string());
+        let resolved = resolve_src_dialect(&session, &FrontendProtocol::Mcp, &SqlDialect::Trino);
+        assert_eq!(resolved, SqlDialect::Sqlglot("bigquery".to_string()));
+    }
+
+    #[test]
+    fn explicit_session_override_wins_for_other_protocols_too() {
+        let mut session = SessionContext::default();
+        session
+            .extra
+            .insert("dialect".to_string(), "snowflake".to_string());
+        let resolved =
+            resolve_src_dialect(&session, &FrontendProtocol::TrinoHttp, &SqlDialect::DuckDb);
+        assert_eq!(resolved, SqlDialect::Sqlglot("snowflake".to_string()));
     }
 }

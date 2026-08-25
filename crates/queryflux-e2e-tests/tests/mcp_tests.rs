@@ -108,6 +108,51 @@ async fn execute_query_respects_max_rows() {
 }
 
 #[tokio::test]
+async fn execute_query_rejects_unknown_dialect() {
+    let h = ProtocolWireHarness::new().await.expect("harness");
+    let client = connect(h.mcp_port).await;
+
+    // An unknown `dialect` value must fail loudly (protocol-level error) rather than
+    // being passed through to sqlglot unvalidated.
+    let result = client
+        .call_tool(call(
+            "execute_query",
+            serde_json::json!({ "sql": "SELECT 1", "dialect": "not-a-real-dialect" }),
+        ))
+        .await;
+    assert!(
+        result.is_err(),
+        "expected an unknown dialect to be rejected before execution"
+    );
+
+    let _ = client.cancel().await;
+}
+
+#[tokio::test]
+async fn execute_query_accepts_an_explicit_known_dialect() {
+    let h = ProtocolWireHarness::new().await.expect("harness");
+    let client = connect(h.mcp_port).await;
+
+    // The harness only routes to DuckDB, so this doesn't exercise a real cross-dialect
+    // rewrite — dispatch::resolve_src_dialect_tests covers that logic directly. This
+    // proves the MCP-level plumbing (param -> validation -> session.extra -> dispatch)
+    // works end-to-end over the real wire protocol without breaking execution.
+    let result = client
+        .call_tool(call(
+            "execute_query",
+            serde_json::json!({ "sql": "SELECT 1 AS n", "dialect": "duckdb" }),
+        ))
+        .await
+        .expect("call_tool execute_query");
+    assert!(!is_error(&result), "unexpected tool error: {result:?}");
+
+    let payload = result_json(&result);
+    assert_eq!(payload["rows"][0]["n"], serde_json::json!(1));
+
+    let _ = client.cancel().await;
+}
+
+#[tokio::test]
 async fn list_schemas_returns_schema_names() {
     let h = ProtocolWireHarness::new().await.expect("harness");
     let client = connect(h.mcp_port).await;

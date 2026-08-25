@@ -4,7 +4,7 @@ use std::time::Instant;
 
 use queryflux_auth::{require_query_owner, AuthContext, Credentials};
 use queryflux_core::{
-    query::{ClusterGroupName, FrontendProtocol, ProxyQueryId},
+    query::{ClusterGroupName, FrontendProtocol, ProxyQueryId, SqlDialect},
     session::{AgentContext, SessionContext},
 };
 use queryflux_routing::ChainRouteResult;
@@ -64,6 +64,15 @@ struct ExecuteQueryParams {
     /// Maximum rows to return (default 1000). Bounds the JSON response size; not a
     /// safety mechanism — configure `row_limit` / `read_only` guards for that.
     max_rows: Option<usize>,
+    /// The SQL dialect `sql` is written in, if it differs from the target engine's own
+    /// dialect. MCP has no wire protocol to infer this from (unlike QueryFlux's other
+    /// frontends), so by default no translation is applied — the SQL is assumed to
+    /// already be in the target engine's dialect, the common case for an agent
+    /// iterating against that engine's own schema/errors. Set this only when the SQL
+    /// was written for a *different* engine and should be translated before routing.
+    /// One of: trino, athena, duckdb, starrocks, clickhouse, mysql, postgres, sqlite,
+    /// snowflake, bigquery, databricks, tsql, redshift, exasol, generic.
+    dialect: Option<String>,
     #[serde(flatten)]
     agent: AgentContextParams,
 }
@@ -96,6 +105,12 @@ struct ExplainQueryParams {
     sql: String,
     /// Preferred cluster group name. Falls back to normal routing when omitted.
     engine_hint: Option<String>,
+    /// The SQL dialect `sql` is written in, if it differs from the target engine's own
+    /// dialect. Defaults to no translation (SQL assumed already correct for the target
+    /// engine) — see `execute_query`'s `dialect` parameter for the full explanation.
+    /// One of: trino, athena, duckdb, starrocks, clickhouse, mysql, postgres, sqlite,
+    /// snowflake, bigquery, databricks, tsql, redshift, exasol, generic.
+    dialect: Option<String>,
     #[serde(flatten)]
     agent: AgentContextParams,
 }
@@ -150,6 +165,28 @@ async fn authenticate(
         .authenticate(&creds)
         .await
         .map_err(|e| McpError::invalid_request(e.to_string(), None))
+}
+
+/// Validate a caller-supplied `dialect` tool parameter against `SqlDialect::KNOWN_DIALECT_NAMES`
+/// and resolve it to the exact string `dispatch::resolve_src_dialect` will hand to sqlglot.
+/// Rejects unknown names outright (an `invalid_params` error listing the valid set) rather
+/// than passing them through as `SqlDialect::Sqlglot(name)` unvalidated — a typo should fail
+/// loudly, not silently be interpreted by sqlglot as some other dialect or fail deep inside
+/// translation with a less useful error.
+fn resolve_dialect_override(dialect: Option<&str>) -> Result<Option<String>, McpError> {
+    let Some(name) = dialect else {
+        return Ok(None);
+    };
+    match SqlDialect::from_known_name(name) {
+        Some(parsed) => Ok(Some(parsed.sqlglot_write_name())),
+        None => Err(McpError::invalid_params(
+            format!(
+                "Unknown dialect: {name:?}. Supported: {}",
+                SqlDialect::KNOWN_DIALECT_NAMES.join(", ")
+            ),
+            None,
+        )),
+    }
 }
 
 /// Merge explicit tool-parameter agent fields with any threaded HTTP headers into an
@@ -331,7 +368,7 @@ impl QueryFluxMcpServer {
 #[tool_router]
 impl QueryFluxMcpServer {
     #[tool(
-        description = "Execute a SQL query against a QueryFlux-routed engine. Returns rows as JSON objects keyed by column name, truncated at max_rows (default 1000). Row-level safety policy (read-only, row limits, etc.) is whatever the operator has configured via QueryFlux guardrails — not enforced here."
+        description = "Execute a SQL query against a QueryFlux-routed engine. Returns rows as JSON objects keyed by column name, truncated at max_rows (default 1000). Row-level safety policy (read-only, row limits, etc.) is whatever the operator has configured via QueryFlux guardrails — not enforced here. By default the SQL is assumed to already be written for the target engine (no translation); set `dialect` if it was written for a different engine."
     )]
     async fn execute_query(
         &self,
@@ -339,14 +376,19 @@ impl QueryFluxMcpServer {
             sql,
             engine_hint,
             max_rows,
+            dialect,
             agent,
         }): Parameters<ExecuteQueryParams>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
+        let dialect = resolve_dialect_override(dialect.as_deref())?;
         let headers = extract_headers(&ctx);
         let auth = authenticate(&self.state, &headers).await?;
         let agent_context = resolve_agent_context(&headers, &agent, &auth);
-        let session = session_for(&auth, agent_context);
+        let mut session = session_for(&auth, agent_context);
+        if let Some(d) = dialect {
+            session.extra.insert("dialect".to_string(), d);
+        }
         let group =
             resolve_group(&self.state, &sql, &session, engine_hint.as_deref(), &auth).await?;
 
@@ -474,21 +516,26 @@ impl QueryFluxMcpServer {
     }
 
     #[tool(
-        description = "Return the query plan for a SQL statement without executing it. Runs EXPLAIN <sql> on the routed engine."
+        description = "Return the query plan for a SQL statement without executing it. Runs EXPLAIN <sql> on the routed engine. By default the SQL is assumed to already be written for the target engine (no translation); set `dialect` if it was written for a different engine."
     )]
     async fn explain_query(
         &self,
         Parameters(ExplainQueryParams {
             sql,
             engine_hint,
+            dialect,
             agent,
         }): Parameters<ExplainQueryParams>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
+        let dialect = resolve_dialect_override(dialect.as_deref())?;
         let headers = extract_headers(&ctx);
         let auth = authenticate(&self.state, &headers).await?;
         let agent_context = resolve_agent_context(&headers, &agent, &auth);
-        let session = session_for(&auth, agent_context);
+        let mut session = session_for(&auth, agent_context);
+        if let Some(d) = dialect {
+            session.extra.insert("dialect".to_string(), d);
+        }
         let explain_sql = format!("EXPLAIN {sql}");
         let group = resolve_group(
             &self.state,
@@ -647,5 +694,52 @@ impl ServerHandler for QueryFluxMcpServer {
              Authorization: Bearer <token> and flows through QueryFlux's normal routing, \
              translation, and guardrail pipeline — no separate MCP-specific policy layer.",
         )
+    }
+}
+
+#[cfg(test)]
+mod resolve_dialect_override_tests {
+    use super::resolve_dialect_override;
+
+    #[test]
+    fn none_stays_none() {
+        assert_eq!(resolve_dialect_override(None).unwrap(), None);
+    }
+
+    #[test]
+    fn known_name_resolves_to_its_sqlglot_write_name() {
+        assert_eq!(
+            resolve_dialect_override(Some("postgres")).unwrap(),
+            Some("postgres".to_string())
+        );
+        assert_eq!(
+            resolve_dialect_override(Some("BigQuery")).unwrap(),
+            Some("bigquery".to_string())
+        );
+    }
+
+    #[test]
+    fn alias_resolves_to_the_canonical_sqlglot_write_name() {
+        // "postgresql" is an alias for Postgres, but sqlglot's own write name is "postgres".
+        assert_eq!(
+            resolve_dialect_override(Some("postgresql")).unwrap(),
+            Some("postgres".to_string())
+        );
+    }
+
+    #[test]
+    fn generic_resolves_to_empty_string_matching_sqlglots_base_dialect() {
+        assert_eq!(
+            resolve_dialect_override(Some("generic")).unwrap(),
+            Some(String::new())
+        );
+    }
+
+    #[test]
+    fn unknown_name_is_rejected_with_the_known_list_in_the_error() {
+        let err = resolve_dialect_override(Some("not-a-real-dialect")).unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(msg.contains("not-a-real-dialect"));
+        assert!(msg.contains("trino"));
     }
 }
