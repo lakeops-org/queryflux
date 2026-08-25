@@ -1,0 +1,40 @@
+# MCP frontend against the embedded DuckDB engine — no external database or
+# container needed. Good enough to point an MCP client (Cursor, Claude Code, MCP
+# Inspector, ...) at and start running SQL through an AI agent immediately.
+#
+# auth.provider: none / required: false is fine for this local demo only — see
+# https://queryflux.dev/docs/authentication for real deployments (oidc/static/ldap).
+
+queryflux:
+  externalAddress: http://localhost:8811
+  frontends:
+    trinoHttp:
+      enabled: false
+      port: 8080
+    mcp:
+      enabled: true
+      port: 8811
+  persistence:
+    type: inMemory
+  adminApi:
+    port: 9000
+  auth:
+    provider: none
+    required: false
+
+clusters:
+  duckdb-1:
+    engine: duckDb
+    enabled: true
+
+clusterGroups:
+  duckdb-local:
+    enabled: true
+    maxRunningQueries: 4
+    members: [duckdb-1]
+
+routers:
+  - type: protocolBased
+    mcp: duckdb-local
+
+routingFallback: duckdb-local
