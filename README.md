@@ -13,7 +13,7 @@
 
 <p align="center">
   <a href="https://github.com/lakeops-org/queryflux/actions/workflows/ci.yml?query=branch%3Amain"><img src="https://img.shields.io/github/actions/workflow/status/lakeops-org/queryflux/ci.yml?branch=main&amp;label=build&amp;style=for-the-badge&amp;logo=github&amp;logoColor=white" alt="CI status on main" /></a>
-  <a href="https://github.com/lakeops-org/queryflux/releases"><img src="https://img.shields.io/github/downloads/lakeops-org/queryflux/total?style=for-the-badge&amp;logo=github&amp;logoColor=white&amp;label=downloads" alt="GitHub release downloads" /></a>
+  <a href="https://github.com/lakeops-org/queryflux/pkgs/container/queryflux"><img src="https://ghcr-badge.elias.eu.org/shield/lakeops-org/queryflux/queryflux" alt="GHCR downloads" /></a>
   <a href="https://github.com/lakeops-org/queryflux/releases/latest"><img src="https://img.shields.io/github/v/release/lakeops-org/queryflux?sort=semver&amp;style=for-the-badge&amp;logo=github&amp;logoColor=white&amp;label=release" alt="Latest release" /></a>
   <a href="https://github.com/lakeops-org/queryflux/commits/main/"><img src="https://img.shields.io/github/last-commit/lakeops-org/queryflux?style=for-the-badge&amp;logo=git&amp;logoColor=white&amp;label=last%20commit" alt="Last commit" /></a>
 </p>
