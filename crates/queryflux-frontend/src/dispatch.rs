@@ -33,29 +33,40 @@ use tracing::{debug, info, warn};
 
 use crate::state::{AppState, QueryContext, QueryOutcome};
 
-/// Resolve the source dialect used for translation.
+/// Resolve the source dialect to record for this query.
 ///
 /// An explicit `session.extra["dialect"]` override — set by the MCP frontend when the
-/// caller declares a dialect via the `dialect` tool parameter or an `X-Sql-Dialect`
-/// header — always wins. Otherwise falls back to the protocol's wire-implied default,
-/// *except* for MCP: unlike every other frontend, MCP has no wire protocol that implies
-/// a dialect (an LLM agent can write SQL in anything), so guessing `SqlDialect::Generic`
-/// risks sqlglot parsing/rewriting under its own opinionated base dialect when the SQL
-/// was actually already correct for the target engine. Defaulting to the *target*
-/// dialect instead makes translation a no-op by default (the common case), rather than
-/// a guess that can silently produce wrong SQL.
-fn resolve_src_dialect(
-    session: &SessionContext,
-    protocol: &FrontendProtocol,
-    tgt_dialect: &SqlDialect,
-) -> SqlDialect {
+/// caller declares a dialect via the `dialect` tool parameter — always wins. Otherwise
+/// falls back to the protocol's wire-implied default (`SqlDialect::Generic` for MCP,
+/// same as `FlightSql` — see `FrontendProtocol::default_dialect`). This value is purely
+/// descriptive (what gets persisted on the query record); it does **not** by itself
+/// determine whether translation actually runs — see `should_attempt_translation`. We
+/// deliberately do not infer "the SQL is probably already in the target engine's
+/// dialect" here: that's a guess, and recording a guessed dialect as if the caller
+/// declared it would make the audit trail wrong, not just the translation.
+fn resolve_src_dialect(session: &SessionContext, protocol: &FrontendProtocol) -> SqlDialect {
     if let Some(name) = session.extra.get("dialect") {
         return SqlDialect::Sqlglot(name.clone());
     }
-    if matches!(protocol, FrontendProtocol::Mcp) {
-        return tgt_dialect.clone();
-    }
     protocol.default_dialect()
+}
+
+/// Whether translation (and therefore sqlglot) should be invoked at all for this query.
+///
+/// Every protocol except MCP has a wire-implied dialect, so translation always at least
+/// attempts to run for them (`TranslationService::maybe_translate` itself no-ops when
+/// `src`/`tgt` turn out compatible and no fixup scripts are configured). MCP is the one
+/// case where, absent an explicit `dialect` override, we genuinely don't know the source
+/// dialect — and calling sqlglot with a guessed dialect risks mis-parsing SQL that was
+/// already correct for the target engine. Note that simply recording `Generic` here does
+/// *not* make `maybe_translate` skip on its own: `SqlDialect::Generic.is_compatible_with`
+/// a real target dialect is false, so it would still call sqlglot with an empty `read`
+/// dialect — the exact problem we're avoiding. So when MCP has no override, we skip
+/// calling `maybe_translate` entirely: no dialect is passed to sqlglot, and no configured
+/// fixup scripts run either, since those need a real dialect to parse under too. The SQL
+/// passes through completely unmodified.
+fn should_attempt_translation(session: &SessionContext, protocol: &FrontendProtocol) -> bool {
+    !matches!(protocol, FrontendProtocol::Mcp) || session.extra.contains_key("dialect")
 }
 
 // ---------------------------------------------------------------------------
@@ -339,26 +350,30 @@ pub async fn dispatch_query(
     };
 
     let tgt_dialect = adapter_kind.translation_target_dialect();
-    let src_dialect = resolve_src_dialect(&session, &protocol, &tgt_dialect);
+    let src_dialect = resolve_src_dialect(&session, &protocol);
     let engine_type = adapter_kind.engine_type();
     let original_sql = sql.clone();
-    let sql = match state
-        .translation
-        .maybe_translate(
-            &sql,
-            &src_dialect,
-            &tgt_dialect,
-            &SchemaContext::default(),
-            &group_fixups,
-        )
-        .await
-    {
-        Ok(t) => t,
-        Err(e) => {
-            warn!(id = %query_id, "Translation error: {e}");
-            slot.release().await;
-            return Err(e);
+    let sql = if should_attempt_translation(&session, &protocol) {
+        match state
+            .translation
+            .maybe_translate(
+                &sql,
+                &src_dialect,
+                &tgt_dialect,
+                &SchemaContext::default(),
+                &group_fixups,
+            )
+            .await
+        {
+            Ok(t) => t,
+            Err(e) => {
+                warn!(id = %query_id, "Translation error: {e}");
+                slot.release().await;
+                return Err(e);
+            }
         }
+    } else {
+        sql
     };
     let was_translated = sql != original_sql;
     if was_translated {
@@ -589,11 +604,7 @@ pub async fn dispatch_query(
                     slot.disarm();
                     info!(id = %query_id, backend = %backend_query_id, cluster = %cluster_name, "Query completed on submit");
                     let was_translated = executing.translated_sql.is_some();
-                    let src_dialect = resolve_src_dialect(
-                        &session,
-                        &protocol,
-                        &adapter.translation_target_dialect(),
-                    );
+                    let src_dialect = resolve_src_dialect(&session, &protocol);
                     let ctx = QueryContext {
                         query_id: executing.id.clone(),
                         sql: executing
@@ -1385,64 +1396,70 @@ async fn setup_sync_query(
     );
 
     let tgt_dialect = adapter.translation_target_dialect();
-    let src_dialect = resolve_src_dialect(&session, &protocol, &tgt_dialect);
+    let src_dialect = resolve_src_dialect(&session, &protocol);
     let engine_type = adapter.engine_type();
     let start = Instant::now();
 
     // Translate SQL. On failure: record the query, release the slot, propagate the error.
-    // The caller (execute_to_sink) will notify the sink via on_error.
-    let translated = match state
-        .translation
-        .maybe_translate(
-            &sql,
-            &src_dialect,
-            &tgt_dialect,
-            &SchemaContext::default(),
-            &group_fixups,
-        )
-        .await
-    {
-        Ok(t) => t,
-        Err(e) => {
-            let err_msg = e.to_string();
-            warn!(id = %query_id, "Translation error: {err_msg}");
-            let ctx = QueryContext {
-                query_id: query_id.clone(),
-                sql: sql.clone(),
-                session: session.clone(),
-                protocol: protocol.clone(),
-                group: group.clone(),
-                cluster: cluster_name.clone(),
-                cluster_group_config_id,
-                cluster_config_id,
-                engine_type: engine_type.clone(),
-                src_dialect: src_dialect.clone(),
-                tgt_dialect: tgt_dialect.clone(),
-                was_translated: false,
-                translated_sql: None,
-                query_tags: effective_tags,
-                query_params: params,
-                agent_context: session.resolved_agent_context(),
-            };
-            state.record_query(
-                &ctx,
-                QueryOutcome {
-                    backend_query_id: None,
-                    status: QueryStatus::Failed,
-                    execution_ms: start.elapsed().as_millis() as u64,
-                    rows: None,
-                    error: Some(err_msg),
-                    routing_trace: None,
-                    engine_stats: None,
-                    guard_actions: vec![],
-                    was_guard_blocked: false,
-                    queue_duration_ms: 0,
-                    cache_hit: false,
-                },
-            );
-            slot.release().await;
-            return Err(e);
+    // The caller (execute_to_sink) will notify the sink via on_error. Skipped entirely
+    // (sqlglot never invoked) when should_attempt_translation is false — see its doc
+    // comment for why MCP without a declared dialect takes this path.
+    let translated = if should_attempt_translation(&session, &protocol) {
+        match state
+            .translation
+            .maybe_translate(
+                &sql,
+                &src_dialect,
+                &tgt_dialect,
+                &SchemaContext::default(),
+                &group_fixups,
+            )
+            .await
+        {
+            Ok(t) => t,
+            Err(e) => {
+                let err_msg = e.to_string();
+                warn!(id = %query_id, "Translation error: {err_msg}");
+                let ctx = QueryContext {
+                    query_id: query_id.clone(),
+                    sql: sql.clone(),
+                    session: session.clone(),
+                    protocol: protocol.clone(),
+                    group: group.clone(),
+                    cluster: cluster_name.clone(),
+                    cluster_group_config_id,
+                    cluster_config_id,
+                    engine_type: engine_type.clone(),
+                    src_dialect: src_dialect.clone(),
+                    tgt_dialect: tgt_dialect.clone(),
+                    was_translated: false,
+                    translated_sql: None,
+                    query_tags: effective_tags,
+                    query_params: params,
+                    agent_context: session.resolved_agent_context(),
+                };
+                state.record_query(
+                    &ctx,
+                    QueryOutcome {
+                        backend_query_id: None,
+                        status: QueryStatus::Failed,
+                        execution_ms: start.elapsed().as_millis() as u64,
+                        rows: None,
+                        error: Some(err_msg),
+                        routing_trace: None,
+                        engine_stats: None,
+                        guard_actions: vec![],
+                        was_guard_blocked: false,
+                        queue_duration_ms: 0,
+                        cache_hit: false,
+                    },
+                );
+                slot.release().await;
+                return Err(e);
+            }
         }
+    } else {
+        sql.clone()
     };
 
     let was_translated = translated != sql;
@@ -2464,20 +2481,18 @@ mod resolve_src_dialect_tests {
     use queryflux_core::session::SessionContext;
 
     #[test]
-    fn mcp_defaults_to_target_dialect_not_generic() {
+    fn mcp_without_override_records_generic_not_a_guess() {
+        // No inference here — Generic is the honest "we don't know" value, same as
+        // FlightSql's own default_dialect(). It is not the target engine's dialect.
         let session = SessionContext::default();
-        let resolved = resolve_src_dialect(&session, &FrontendProtocol::Mcp, &SqlDialect::Trino);
-        assert_eq!(resolved, SqlDialect::Trino);
+        let resolved = resolve_src_dialect(&session, &FrontendProtocol::Mcp);
+        assert_eq!(resolved, SqlDialect::Generic);
     }
 
     #[test]
     fn non_mcp_protocol_uses_its_own_wire_implied_default() {
         let session = SessionContext::default();
-        let resolved = resolve_src_dialect(
-            &session,
-            &FrontendProtocol::PostgresWire,
-            &SqlDialect::DuckDb,
-        );
+        let resolved = resolve_src_dialect(&session, &FrontendProtocol::PostgresWire);
         assert_eq!(resolved, SqlDialect::Postgres);
     }
 
@@ -2487,7 +2502,7 @@ mod resolve_src_dialect_tests {
         session
             .extra
             .insert("dialect".to_string(), "bigquery".to_string());
-        let resolved = resolve_src_dialect(&session, &FrontendProtocol::Mcp, &SqlDialect::Trino);
+        let resolved = resolve_src_dialect(&session, &FrontendProtocol::Mcp);
         assert_eq!(resolved, SqlDialect::Sqlglot("bigquery".to_string()));
     }
 
@@ -2497,8 +2512,51 @@ mod resolve_src_dialect_tests {
         session
             .extra
             .insert("dialect".to_string(), "snowflake".to_string());
-        let resolved =
-            resolve_src_dialect(&session, &FrontendProtocol::TrinoHttp, &SqlDialect::DuckDb);
+        let resolved = resolve_src_dialect(&session, &FrontendProtocol::TrinoHttp);
         assert_eq!(resolved, SqlDialect::Sqlglot("snowflake".to_string()));
+    }
+}
+
+#[cfg(test)]
+mod should_attempt_translation_tests {
+    use super::should_attempt_translation;
+    use queryflux_core::query::FrontendProtocol;
+    use queryflux_core::session::SessionContext;
+
+    #[test]
+    fn mcp_without_override_skips_translation() {
+        let session = SessionContext::default();
+        assert!(!should_attempt_translation(
+            &session,
+            &FrontendProtocol::Mcp
+        ));
+    }
+
+    #[test]
+    fn mcp_with_explicit_override_attempts_translation() {
+        let mut session = SessionContext::default();
+        session
+            .extra
+            .insert("dialect".to_string(), "postgres".to_string());
+        assert!(should_attempt_translation(&session, &FrontendProtocol::Mcp));
+    }
+
+    #[test]
+    fn every_other_protocol_always_attempts_translation() {
+        let session = SessionContext::default();
+        for protocol in [
+            FrontendProtocol::TrinoHttp,
+            FrontendProtocol::PostgresWire,
+            FrontendProtocol::MySqlWire,
+            FrontendProtocol::ClickHouseHttp,
+            FrontendProtocol::FlightSql,
+            FrontendProtocol::SnowflakeHttp,
+            FrontendProtocol::SnowflakeSqlApi,
+        ] {
+            assert!(
+                should_attempt_translation(&session, &protocol),
+                "{protocol:?} should always attempt translation (maybe_translate no-ops on its own when compatible)"
+            );
+        }
     }
 }

@@ -182,3 +182,27 @@ def transform(ast, src, dst):
         "unexpected message: {msg}"
     );
 }
+
+/// Real cross-dialect proof for the MCP `dialect` parameter's whole reason to exist:
+/// MySQL quotes identifiers with backticks; DuckDB expects ANSI double quotes. This is
+/// the exact rewrite `dispatch::should_attempt_translation` gates on for MCP — this test
+/// exercises the actual sqlglot call directly (the e2e MCP suite can't: its test harness
+/// uses `TranslationService::disabled()`, same as every other e2e harness, so it never
+/// invokes real translation).
+#[tokio::test]
+async fn mysql_backtick_identifiers_translate_to_duckdb_double_quotes() {
+    require_sqlglot();
+    let t = SqlglotTranslator::new(SqlDialect::MySql, SqlDialect::DuckDb, vec![]);
+    let out = t
+        .translate("SELECT 1 AS `n`", &SchemaContext::default())
+        .await
+        .expect("translate");
+    assert!(
+        !out.contains('`'),
+        "expected backticks rewritten for DuckDB, got: {out}"
+    );
+    assert!(
+        out.contains("\"n\"") || out.contains(" n"),
+        "expected the alias to survive translation, got: {out}"
+    );
+}
