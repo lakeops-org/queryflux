@@ -1,0 +1,39 @@
+# QueryFlux with the MCP frontend enabled, backed by the embedded DuckDB engine.
+# No Trino/Postgres/etc. — this is the fastest path from zero to "point an MCP
+# client at QueryFlux."
+#
+# From this directory:
+#   docker compose up -d --wait
+#
+# MCP endpoint (streamable HTTP): http://localhost:8811/mcp
+# Admin API: http://localhost:9000 · Studio: http://localhost:3000
+
+name: queryflux-example-with-mcp
+
+services:
+  queryflux:
+    image: ghcr.io/lakeops-org/queryflux:latest
+    ports:
+      - "8811:8811"
+      - "9000:9000"
+    volumes:
+      - ./config.yaml:/etc/queryflux/config.yaml:ro
+    environment:
+      RUST_LOG: ${RUST_LOG:-queryflux=info,queryflux_frontend=info}
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:9000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+      start_period: 15s
+    restart: unless-stopped
+
+  queryflux-studio:
+    image: 343959804465.dkr.ecr.us-east-1.amazonaws.com/queryflux-studio:latest
+    ports:
+      - "3000:3000"
+    environment:
+      ADMIN_API_URL: http://queryflux:9000
+    depends_on:
+      - queryflux
+    restart: unless-stopped

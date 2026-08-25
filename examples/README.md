@@ -8,6 +8,7 @@ Several stacks for **QueryFlux** + **Trino** (and optional add-ons). Run command
 |--------|----------|----------|
 | [`minimal/`](minimal-trino/) | Yes | Full Studio (query history, persisted clusters/groups/routing via API), production-like persistence |
 | [`minimal-inmemory/`](minimal-inmemory/) | No | Fastest local tryout; config only in `config.yaml`; no shared query history |
+| [`with-mcp/`](with-mcp/) | No | MCP frontend + embedded DuckDB — point an AI agent (Cursor, Claude Code, MCP Inspector, ...) at QueryFlux with zero external services |
 | [`with-prometheus-grafana/`](with-prometheus-grafana/) | Yes | Same workload as minimal + **Prometheus** + **Grafana** (repo [`grafana/`](../grafana/), local scrape config); **no Studio** |
 | [`full-stack/`](full-stack/) | Yes (host **5433**) | Trino + StarRocks + Iceberg/Lakekeeper + MinIO + TPCH loader |
 | [`full-stack-with-prometheus-grafana/`](full-stack-with-prometheus-grafana/) | Yes (host **5433**) | **`full-stack`** + **Prometheus** + **Grafana**; Grafana on **3001** |
@@ -48,6 +49,23 @@ docker compose up -d --wait
 |---------|-----|
 | SQL (Trino via QueryFlux) | http://localhost:8080 |
 | Trino (direct) | http://localhost:8081 |
+| Admin API | http://localhost:9000 |
+| Studio | http://localhost:3000 |
+
+---
+
+## With MCP (`with-mcp/`)
+
+**QueryFlux** with the **MCP frontend** enabled, backed by the **embedded DuckDB** engine — no Trino, no Postgres, nothing else to run. `persistence.type: inMemory` and `auth.provider: none`, same tradeoffs as `minimal-inmemory/`. Point an MCP client (Cursor, Claude Code, Claude Desktop, MCP Inspector) at the server and start running SQL through an agent immediately. Details: [`with-mcp/README.md`](with-mcp/README.md).
+
+```bash
+cd examples/with-mcp
+docker compose up -d --wait
+```
+
+| Service | URL |
+|---------|-----|
+| MCP endpoint (streamable HTTP) | http://localhost:8811/mcp |
 | Admin API | http://localhost:9000 |
 | Studio | http://localhost:3000 |
 

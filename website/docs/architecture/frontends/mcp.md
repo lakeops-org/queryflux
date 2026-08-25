@@ -25,7 +25,25 @@ The MCP frontend speaks **streamable HTTP** only (`rmcp`'s `transport-streamable
 
 ## Authentication
 
-Requests carry `Authorization: Bearer <token>`, checked against the same `AuthProvider` every other HTTP frontend uses (`none`, `static`, `oidc`, `ldap` — see [Authentication](../../authentication)). There is no MCP-specific auth mechanism.
+Requests carry `Authorization: Bearer <token>`, checked against the same `AuthProvider` every other HTTP frontend uses (`none`, `static`, `oidc`, `ldap` — see [Authentication](../../authentication)). There is no MCP-specific auth mechanism — and specifically, QueryFlux does **not** implement the MCP spec's own OAuth 2.1 authorization flow (PKCE, `.well-known/oauth-authorization-server` discovery, dynamic client registration). A client expecting to auto-discover auth and interactively log a user in against QueryFlux directly won't find that here; every setup in [Connecting a client](#connecting-a-client) below relies on a token obtained some other way and pasted into config.
+
+### Authenticating with an OIDC provider (Keycloak, etc.)
+
+With `auth.provider: oidc`, QueryFlux only *validates* tokens (JWT signature + claims against your IdP's JWKS endpoint) — it never issues them. See [Authentication](../../authentication#frontend-authentication-auth) for the `oidc` config block, and **[`examples/with-keycloak-oidc`](https://github.com/lakeops-org/queryflux/tree/main/examples/with-keycloak-oidc)** for a runnable Keycloak + QueryFlux stack (that example fetches a token via the password grant).
+
+For a token that sits in a static MCP client config rather than a short-lived interactive session, a **client-credentials (service account)** token is usually the better fit — it's not tied to a human's login, and you control its lifetime independently:
+
+```bash
+TOKEN=$(curl -s https://keycloak.internal/realms/my-realm/protocol/openid-connect/token \
+  -d grant_type=client_credentials \
+  -d client_id=queryflux-mcp \
+  -d client_secret="$QUERYFLUX_MCP_CLIENT_SECRET" | jq -r .access_token)
+```
+
+(Requires a Keycloak client with "Service Accounts" enabled.) Two things to plan for either way:
+
+- **The token will expire**, and nothing on QueryFlux's side refreshes it — validation enforces `exp` like any standard JWT check. A client config with a pasted-in token needs either a long-lived access-token setting on that Keycloak client, or periodic manual regeneration.
+- **One token = one identity** for every call made through it. A shared service-account token means all MCP traffic authenticated with it shows up under that one identity in query history — use the [agent-context fields](../../agentic/agent-context) (`agent_id`, `conversation_id`, etc.) to distinguish individual agents/conversations if that matters to you, rather than provisioning per-user OIDC tokens for something as ephemeral as an MCP client config.
 
 ## Tools
 
@@ -65,6 +83,8 @@ Every MCP query is recorded the same way as every other frontend's queries. Unli
 ## Connecting a client
 
 Point any streamable-HTTP MCP client at `http://<host>:<port>/mcp` with a bearer token. Every example below uses `http://localhost:8811/mcp` for local development — QueryFlux does not terminate TLS itself (same as every other frontend), so a bearer token sent to a **remote** host must go through HTTPS or a TLS-terminating reverse proxy in front of QueryFlux; otherwise the token travels in cleartext. Don't hardcode the token in a committed config file — every client below supports pulling it from an environment variable instead.
+
+**[`examples/with-mcp`](https://github.com/lakeops-org/queryflux/tree/main/examples/with-mcp)** is a runnable Docker Compose stack — QueryFlux with the MCP frontend enabled against the embedded DuckDB engine, no other services required — if you'd rather have something running before working through the client configs below.
 
 ### MCP Inspector (quick sanity check)
 
