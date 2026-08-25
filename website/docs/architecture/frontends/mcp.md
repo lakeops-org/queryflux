@@ -46,7 +46,7 @@ Every tool except `get_query_status` / `cancel_query` also accepts the optional 
 
 Every other frontend implies a SQL dialect from its wire protocol — a PostgreSQL wire client is assumed to write Postgres-flavored SQL, for example. MCP has no such signal: an LLM agent can write SQL in any dialect, or (more commonly) in whatever dialect the target engine itself uses. Guessing wrong is worse than not translating at all — a wrong dialect assumption can cause sqlglot to parse the SQL under the wrong syntax rules and silently rewrite it incorrectly.
 
-So `execute_query` and `explain_query` default to applying **no translation** — the SQL is assumed to already match the target engine's dialect, which is the common case. Set `dialect` only when the SQL was written for a *different* engine and should be translated before being routed. Accepted values (case-insensitive):
+So `execute_query` and `explain_query` don't guess at all: with no `dialect` given, translation is skipped entirely — sqlglot is never invoked, and the SQL is sent to the target engine exactly as written (this also means any configured translation fixup scripts don't run for that call, since those need a real dialect to parse under too). This is a deliberate no-op, not an assumption — QueryFlux doesn't claim to know what dialect the SQL is in unless you tell it. Set `dialect` when the SQL was written for a *different* engine and should actually be translated before being routed. Accepted values (case-insensitive):
 
 `trino`, `athena`, `duckdb`, `starrocks`, `clickhouse`, `mysql`, `postgres` (or `postgresql`), `sqlite`, `snowflake`, `bigquery`, `databricks`, `tsql` (or `mssql`), `redshift`, `exasol`, `generic`.
 

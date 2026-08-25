@@ -66,12 +66,13 @@ struct ExecuteQueryParams {
     max_rows: Option<usize>,
     /// The SQL dialect `sql` is written in, if it differs from the target engine's own
     /// dialect. MCP has no wire protocol to infer this from (unlike QueryFlux's other
-    /// frontends), so by default no translation is applied — the SQL is assumed to
-    /// already be in the target engine's dialect, the common case for an agent
-    /// iterating against that engine's own schema/errors. Set this only when the SQL
-    /// was written for a *different* engine and should be translated before routing.
-    /// One of: trino, athena, duckdb, starrocks, clickhouse, mysql, postgres, sqlite,
-    /// snowflake, bigquery, databricks, tsql, redshift, exasol, generic.
+    /// frontends), so by default no translation is attempted at all — sqlglot is never
+    /// invoked, and the SQL is sent to the target engine exactly as written. This is a
+    /// deliberate no-op, not an assumption that the SQL already matches the target
+    /// engine. Set this when the SQL was written for a *different* engine and should be
+    /// translated before routing. One of: trino, athena, duckdb, starrocks, clickhouse,
+    /// mysql, postgres, sqlite, snowflake, bigquery, databricks, tsql, redshift, exasol,
+    /// generic.
     dialect: Option<String>,
     #[serde(flatten)]
     agent: AgentContextParams,
@@ -106,10 +107,10 @@ struct ExplainQueryParams {
     /// Preferred cluster group name. Falls back to normal routing when omitted.
     engine_hint: Option<String>,
     /// The SQL dialect `sql` is written in, if it differs from the target engine's own
-    /// dialect. Defaults to no translation (SQL assumed already correct for the target
-    /// engine) — see `execute_query`'s `dialect` parameter for the full explanation.
-    /// One of: trino, athena, duckdb, starrocks, clickhouse, mysql, postgres, sqlite,
-    /// snowflake, bigquery, databricks, tsql, redshift, exasol, generic.
+    /// dialect. Defaults to skipping translation entirely (sqlglot is never invoked) —
+    /// see `execute_query`'s `dialect` parameter for the full explanation. One of: trino,
+    /// athena, duckdb, starrocks, clickhouse, mysql, postgres, sqlite, snowflake,
+    /// bigquery, databricks, tsql, redshift, exasol, generic.
     dialect: Option<String>,
     #[serde(flatten)]
     agent: AgentContextParams,
@@ -394,7 +395,7 @@ impl QueryFluxMcpServer {
 #[tool_router]
 impl QueryFluxMcpServer {
     #[tool(
-        description = "Execute a SQL query against a QueryFlux-routed engine. Returns rows as JSON objects keyed by column name, truncated at max_rows (default 1000). Row-level safety policy (read-only, row limits, etc.) is whatever the operator has configured via QueryFlux guardrails — not enforced here. By default the SQL is assumed to already be written for the target engine (no translation); set `dialect` if it was written for a different engine. The response includes `conversation_id` — copy that exact value into the `conversation_id` argument on your next QueryFlux tool call in this same conversation, so they're grouped together."
+        description = "Execute a SQL query against a QueryFlux-routed engine. Returns rows as JSON objects keyed by column name, truncated at max_rows (default 1000). Row-level safety policy (read-only, row limits, etc.) is whatever the operator has configured via QueryFlux guardrails — not enforced here. By default no dialect translation is attempted at all (sqlglot is never invoked); set `dialect` if the SQL was written for a different engine than the one it's routed to. The response includes `conversation_id` — copy that exact value into the `conversation_id` argument on your next QueryFlux tool call in this same conversation, so they're grouped together."
     )]
     async fn execute_query(
         &self,
@@ -556,7 +557,7 @@ impl QueryFluxMcpServer {
     }
 
     #[tool(
-        description = "Return the query plan for a SQL statement without executing it. Runs EXPLAIN <sql> on the routed engine. By default the SQL is assumed to already be written for the target engine (no translation); set `dialect` if it was written for a different engine. The response includes `conversation_id` — reuse it on your next QueryFlux tool call in this conversation."
+        description = "Return the query plan for a SQL statement without executing it. Runs EXPLAIN <sql> on the routed engine. By default no dialect translation is attempted at all (sqlglot is never invoked); set `dialect` if the SQL was written for a different engine than the one it's routed to. The response includes `conversation_id` — reuse it on your next QueryFlux tool call in this conversation."
     )]
     async fn explain_query(
         &self,
