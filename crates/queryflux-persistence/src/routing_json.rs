@@ -17,6 +17,7 @@ pub const PROTO_CAMEL_SNAKE: &[(&str, &str)] = &[
     ("flightSql", "flight_sql"),
     ("snowflakeHttp", "snowflake_http"),
     ("snowflakeSqlApi", "snowflake_sql_api"),
+    ("mcp", "mcp"),
 ];
 
 pub fn field<'a>(v: &'a Value, camel: &str, snake: &str) -> Option<&'a Value> {
@@ -509,6 +510,7 @@ mod tests {
             flight_sql: Some("g".into()),
             snowflake_http: Some("g".into()),
             snowflake_sql_api: Some("g".into()),
+            mcp: Some("g".into()),
         };
         let serialized = serde_json::to_value(&all_set).unwrap();
         let obj = serialized.as_object().unwrap();
@@ -542,6 +544,7 @@ mod tests {
             ("flightSql", "flight_sql"),
             ("snowflakeHttp", "snowflake_http"),
             ("snowflakeSqlApi", "snowflake_sql_api"),
+            ("mcp", "mcp"),
         ]
         .into_iter()
         .collect();

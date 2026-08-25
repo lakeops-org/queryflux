@@ -71,6 +71,8 @@ pub enum FrontendProtocol {
     SnowflakeHttp,
     /// Snowflake SQL REST API v2 (`/api/v2/statements`).
     SnowflakeSqlApi,
+    /// Model Context Protocol (streamable HTTP) — MCP tool calls from AI agents.
+    Mcp,
 }
 
 impl FrontendProtocol {
@@ -81,7 +83,7 @@ impl FrontendProtocol {
             FrontendProtocol::PostgresWire => SqlDialect::Postgres,
             FrontendProtocol::MySqlWire => SqlDialect::MySql,
             FrontendProtocol::ClickHouseHttp => SqlDialect::ClickHouse,
-            FrontendProtocol::FlightSql => SqlDialect::Generic,
+            FrontendProtocol::FlightSql | FrontendProtocol::Mcp => SqlDialect::Generic,
             FrontendProtocol::SnowflakeHttp | FrontendProtocol::SnowflakeSqlApi => {
                 SqlDialect::Snowflake
             }
@@ -220,6 +222,54 @@ impl SqlDialect {
             }
         }
     }
+
+    /// Parse a dialect name (case-insensitive) back into a known `SqlDialect` variant.
+    /// Inverse of [`Self::sqlglot_name`], plus a couple of common aliases (`postgresql`,
+    /// `mssql`, `presto`). Returns `None` for anything not in [`Self::KNOWN_DIALECT_NAMES`] —
+    /// callers taking this from an untrusted source (e.g. an MCP tool argument) should
+    /// reject unknown input rather than falling back to [`SqlDialect::Sqlglot`], since that
+    /// would silently accept typos as "any sqlglot dialect name, unvalidated."
+    pub fn from_known_name(name: &str) -> Option<Self> {
+        Some(match name.to_ascii_lowercase().as_str() {
+            "trino" => Self::Trino,
+            "athena" | "presto" => Self::Athena,
+            "duckdb" => Self::DuckDb,
+            "starrocks" => Self::StarRocks,
+            "clickhouse" => Self::ClickHouse,
+            "mysql" => Self::MySql,
+            "postgres" | "postgresql" => Self::Postgres,
+            "sqlite" => Self::Sqlite,
+            "snowflake" => Self::Snowflake,
+            "bigquery" => Self::BigQuery,
+            "databricks" => Self::Databricks,
+            "tsql" | "mssql" => Self::MsSql,
+            "redshift" => Self::Redshift,
+            "exasol" => Self::Exasol,
+            "generic" => Self::Generic,
+            _ => return None,
+        })
+    }
+
+    /// Canonical dialect names accepted by [`Self::from_known_name`] — the set to show a
+    /// caller (e.g. in an MCP tool description) so their input maps onto a real variant
+    /// instead of guessing at sqlglot's own naming.
+    pub const KNOWN_DIALECT_NAMES: &'static [&'static str] = &[
+        "trino",
+        "athena",
+        "duckdb",
+        "starrocks",
+        "clickhouse",
+        "mysql",
+        "postgres",
+        "sqlite",
+        "snowflake",
+        "bigquery",
+        "databricks",
+        "tsql",
+        "redshift",
+        "exasol",
+        "generic",
+    ];
 }
 
 // --- Incoming query (before routing) ---
@@ -497,5 +547,57 @@ mod submitted_by_serde_tests {
         v["session"] = serde_json::to_value(SessionContext::default()).unwrap();
         let q: QueuedQuery = serde_json::from_value(v).expect("legacy queued row");
         assert!(q.submitted_by.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod sql_dialect_tests {
+    use super::*;
+
+    #[test]
+    fn from_known_name_round_trips_every_named_variant() {
+        for name in SqlDialect::KNOWN_DIALECT_NAMES {
+            let parsed =
+                SqlDialect::from_known_name(name).unwrap_or_else(|| panic!("{name} should parse"));
+            assert_ne!(
+                parsed,
+                SqlDialect::Sqlglot(String::new()),
+                "{name} should map to a named variant, not the escape hatch"
+            );
+        }
+    }
+
+    #[test]
+    fn from_known_name_is_case_insensitive() {
+        assert_eq!(
+            SqlDialect::from_known_name("TRINO"),
+            Some(SqlDialect::Trino)
+        );
+        assert_eq!(
+            SqlDialect::from_known_name("BigQuery"),
+            Some(SqlDialect::BigQuery)
+        );
+    }
+
+    #[test]
+    fn from_known_name_accepts_common_aliases() {
+        assert_eq!(
+            SqlDialect::from_known_name("postgresql"),
+            Some(SqlDialect::Postgres)
+        );
+        assert_eq!(
+            SqlDialect::from_known_name("mssql"),
+            Some(SqlDialect::MsSql)
+        );
+        assert_eq!(
+            SqlDialect::from_known_name("presto"),
+            Some(SqlDialect::Athena)
+        );
+    }
+
+    #[test]
+    fn from_known_name_rejects_unknown_input() {
+        assert_eq!(SqlDialect::from_known_name("not-a-real-dialect"), None);
+        assert_eq!(SqlDialect::from_known_name(""), None);
     }
 }

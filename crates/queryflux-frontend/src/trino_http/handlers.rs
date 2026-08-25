@@ -675,7 +675,7 @@ fn extract_credentials(headers: &HeaderMap) -> Credentials {
                 }
             }
         }
-        if let Some(token) = auth.strip_prefix("Bearer ") {
+        if let Some(token) = crate::strip_bearer_prefix(auth) {
             return Credentials {
                 username: None,
                 password: None,

@@ -351,6 +351,12 @@ pub fn build_frontends_status(
                 port: Some(c.port),
             },
         },
+        opt_fe(
+            "mcp",
+            "MCP",
+            "Model Context Protocol streamable-HTTP tool calls for AI agents.",
+            frontends.mcp.as_ref(),
+        ),
     ];
 
     FrontendsStatusDto {
@@ -1084,14 +1090,14 @@ async fn collect_running_queries(
 }
 
 /// Admin cancel path for a queued query (claim release handled by caller).
-async fn delete_queued_if_exists(
+pub(crate) async fn delete_queued_if_exists(
     persistence: &dyn queryflux_persistence::Persistence,
     id: &str,
 ) -> queryflux_core::error::Result<Option<queryflux_core::query::QueuedQuery>> {
     persistence.take_queued(&ProxyQueryId(id.to_string())).await
 }
 
-async fn find_executing_query(
+pub(crate) async fn find_executing_query(
     persistence: &dyn queryflux_persistence::Persistence,
     id: &str,
 ) -> queryflux_core::error::Result<Option<ExecutingQuery>> {
@@ -1187,17 +1193,38 @@ async fn cancel_executing(
     state: &AdminState,
     executing: queryflux_core::query::ExecutingQuery,
 ) -> Response {
-    let Some(adapter) = state.app.adapter(&executing.cluster_name.0).await else {
+    match cancel_executing_query(
+        &state.app,
+        queryflux_core::query::FrontendProtocol::TrinoHttp,
+        &executing,
+        "admin cancelled",
+    )
+    .await
+    {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg).into_response(),
+    }
+}
+
+/// Cancel an in-flight executing query on its backend and record the outcome.
+///
+/// Shared by the admin `DELETE /admin/queries/{id}` handler (above, no ownership check —
+/// admin credentials are already full-privilege) and the MCP `cancel_query` tool (which
+/// checks `require_query_owner` before calling this, since MCP callers authenticate as a
+/// regular user, not an admin).
+pub(crate) async fn cancel_executing_query(
+    app: &Arc<AppState>,
+    protocol: queryflux_core::query::FrontendProtocol,
+    executing: &queryflux_core::query::ExecutingQuery,
+    reason: &str,
+) -> std::result::Result<(), String> {
+    let Some(adapter) = app.adapter(&executing.cluster_name.0).await else {
         warn!(
             id = %executing.id,
             cluster = %executing.cluster_name,
-            "Admin cancel: no adapter for cluster"
+            "Cancel: no adapter for cluster"
         );
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "failed to cancel query on backend",
-        )
-            .into_response();
+        return Err("failed to cancel query on backend".to_string());
     };
     if let Err(e) = adapter
         .cancel_query(&executing.backend_query_id, executing.wire_auth.as_ref())
@@ -1206,44 +1233,33 @@ async fn cancel_executing(
         warn!(
             id = %executing.id,
             backend = %executing.backend_query_id,
-            "Admin adapter cancel failed: {e}"
+            "Adapter cancel failed: {e}"
         );
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "failed to cancel query on backend",
-        )
-            .into_response();
+        return Err("failed to cancel query on backend".to_string());
     }
-    state.app.record_executing_cancelled(
-        &executing,
-        queryflux_core::query::FrontendProtocol::TrinoHttp,
+    app.record_executing_cancelled(
+        executing,
+        protocol,
         adapter.engine_type(),
         adapter.translation_target_dialect(),
-        "admin cancelled",
+        reason,
     );
-    state
-        .app
-        .release_query_slot(
-            &executing.cluster_group,
-            &executing.cluster_name,
-            &executing.id.0,
-        )
-        .await;
-    if let Err(e) = state
-        .app
-        .persistence
-        .delete(&executing.backend_query_id)
-        .await
-    {
-        return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+    app.release_query_slot(
+        &executing.cluster_group,
+        &executing.cluster_name,
+        &executing.id.0,
+    )
+    .await;
+    if let Err(e) = app.persistence.delete(&executing.backend_query_id).await {
+        return Err(e.to_string());
     }
     info!(
         id = %executing.id,
         backend = %executing.backend_query_id,
         owner = %executing.submitted_by,
-        "Admin cancelled executing query"
+        "Cancelled executing query"
     );
-    StatusCode::NO_CONTENT.into_response()
+    Ok(())
 }
 
 /// Distinct agents that have run queries, with aggregate stats.

@@ -33,7 +33,9 @@ const sidebars: SidebarsConfig = {
       label: 'Agentic AI',
       collapsed: false,
       items: [
+        'agentic/overview',
         'agentic/agent-context',
+        'agentic/session-replay',
       ],
     },
     {
@@ -67,6 +69,7 @@ const sidebars: SidebarsConfig = {
         'architecture/frontends/mysql-wire',
         'architecture/frontends/flight-sql',
         'architecture/frontends/snowflake',
+        'architecture/frontends/mcp',
       ],
     },
     {

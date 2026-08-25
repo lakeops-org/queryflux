@@ -196,6 +196,7 @@ fn config_requires_translation(config: &ProxyConfig) -> bool {
                 flight_sql,
                 snowflake_http,
                 snowflake_sql_api,
+                mcp,
             } => {
                 if let Some(g) = trino_http {
                     target_groups.push(g.clone());
@@ -216,6 +217,9 @@ fn config_requires_translation(config: &ProxyConfig) -> bool {
                     target_groups.push(g.clone());
                 }
                 if let Some(g) = snowflake_sql_api {
+                    target_groups.push(g.clone());
+                }
+                if let Some(g) = mcp {
                     target_groups.push(g.clone());
                 }
             }
@@ -282,6 +286,11 @@ fn config_requires_translation(config: &ProxyConfig) -> bool {
     if let Some(ref f) = config.queryflux.frontends.snowflake_http {
         if f.enabled {
             enabled_frontends.push((FrontendProtocol::SnowflakeHttp, SqlDialect::Snowflake));
+        }
+    }
+    if let Some(ref f) = config.queryflux.frontends.mcp {
+        if f.enabled {
+            enabled_frontends.push((FrontendProtocol::Mcp, SqlDialect::Generic));
         }
     }
 

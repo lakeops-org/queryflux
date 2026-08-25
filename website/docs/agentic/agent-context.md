@@ -1,23 +1,23 @@
 ---
-description: Agentic context — attaching agent identity and conversation state to queries via HTTP headers or SQL session params, with full session replay and audit from QueryFlux Studio.
+sidebar_label: Setting agent context
+description: How to attach agent identity and conversation state to queries — via HTTP headers, SQL session params, or MCP tool parameters, depending on the frontend.
 ---
 
-# Agentic context
+# Setting agent context
 
-When an AI agent queries through QueryFlux, it can identify itself and attach conversation state to every query. QueryFlux persists this context alongside every query record so you can replay an agent's full session, correlate queries across steps, and audit what the agent tried — including any guardrail decisions.
+Agentic context can be set in three ways depending on which frontend protocol the agent uses:
 
-Agentic context can be set in two ways depending on which frontend protocol the agent uses:
-
-- **HTTP headers** — for Trino HTTP, Snowflake HTTP, and ClickHouse HTTP frontends.
+- **HTTP headers** — for Trino HTTP, Snowflake HTTP, ClickHouse HTTP, and [MCP](../architecture/frontends/mcp) frontends.
 - **SQL session params** — for MySQL wire and PostgreSQL wire frontends, where HTTP headers are not available.
+- **MCP tool parameters** — the [MCP](../architecture/frontends/mcp) frontend additionally accepts these fields as explicit tool-call arguments, since not every MCP client lets you set custom headers per call.
 
-Both approaches use the same underlying fields and produce identical records in query history.
+All three approaches use the same underlying fields and produce identical records in query history — see [Session replay and guardrails](session-replay) for what gets persisted and how to reconstruct an agent's session afterward.
 
 ---
 
 ## Setting context via HTTP headers
 
-HTTP frontends accept agentic context as request headers. Both `X-Agent-Id` and `X-Conversation-Id` must be present to activate agentic context — if either is missing the query is treated as a non-agentic request.
+HTTP frontends accept agentic context as request headers. Both `X-Agent-Id` and `X-Conversation-Id` must be present to activate agentic context — if either is missing the query is treated as a non-agentic request. **MCP is the one exception** — see [Agent context defaults on MCP](#agent-context-defaults-on-mcp) below.
 
 | Header | Required | Description |
 |--------|----------|-------------|
@@ -79,6 +79,45 @@ Parameters are extracted once at connection time.
 
 ---
 
+## Setting context via MCP tool parameters
+
+The MCP frontend accepts `X-Agent-Id` / `X-Conversation-Id` / etc. as HTTP headers on the streamable-HTTP request, exactly like the other HTTP frontends. But many MCP clients (Claude Desktop and similar consumer hosts) only let you configure headers once for the whole server connection, not per tool call — which makes headers alone a poor fit for per-query agent identity.
+
+To cover that case, every MCP tool (`execute_query`, `list_schemas`, `describe_table`, `explain_query`) also accepts the same fields as explicit, optional arguments:
+
+```json
+{
+  "name": "execute_query",
+  "arguments": {
+    "sql": "SELECT region, COUNT(*) FROM orders WHERE date > DATE '2026-01-01' GROUP BY 1",
+    "agent_id": "my-agent-v2",
+    "conversation_id": "conv-7f3a9b",
+    "step_index": 4,
+    "tool_call_id": "call_abc123",
+    "query_intent": "aggregation"
+  }
+}
+```
+
+When a value is supplied both ways — an `X-Agent-Id` header on the connection *and* an `agent_id` tool argument on the call — the **header wins**, matching the existing precedence between HTTP-header-style and SQL-session-param-style values used by every other frontend.
+
+This mirrors how the wider MCP ecosystem is moving away from relying on transport-level session state for anything that needs to persist across tool calls, in favor of explicit, model-visible arguments — the tool parameters are the reliable path for any MCP client, headers are a free bonus for integrators who control their own HTTP client.
+
+### Agent context defaults on MCP
+
+Every other frontend requires **both** `agent_id` and `conversation_id` to activate agentic context — if a client supplies neither, the query is just a normal, non-agentic query. MCP does not follow that rule: since MCP traffic is agent traffic by definition, a tool call that supplies neither field still gets agent context, so it isn't silently invisible on the **Agents** page.
+
+When `agent_id` / `conversation_id` aren't supplied via header or tool parameter, MCP fills them in:
+
+| Field | Default |
+|-------|---------|
+| `agent_id` | The authenticated identity (`auth.user` — e.g. `"anonymous"` under `auth.provider: none`). |
+| `conversation_id` | The transport's `Mcp-Session-Id`, so every tool call within one MCP session groups together. Falls back to a fresh UUID per call if no session id is available (e.g. a stateless client). |
+
+Explicit headers and tool parameters still override both defaults — this only fills gaps, it never replaces a value you actually sent. Because `conversation_id` defaults to the session id, a client that never sets it explicitly still gets meaningful session-level grouping on the **Conversations** page for free, for as long as its MCP session lives; a client that wants grouping across multiple MCP sessions (or a stable identity independent of transport reconnects) should still set `conversation_id` explicitly.
+
+---
+
 ## Query intent
 
 `X-Query-Intent` (HTTP) or `query_intent` (SQL) classifies what the agent is trying to accomplish. When omitted, QueryFlux infers intent from the SQL using a lightweight heuristic.
@@ -93,62 +132,4 @@ Parameters are extracted once at connection time.
 
 Intent is stored on the query record and visible in Studio. It can also inform guardrail logic — a Python script guard can read `ctx["agent_context"]["query_intent"]` and apply stricter rules to `schema_exploration` queries on large tables.
 
----
-
-## What gets persisted
-
-Each query record in Postgres stores:
-
-| Column | Type | Description |
-|--------|------|-------------|
-| `agent_id` | `TEXT` | From `X-Agent-Id` or `SET agent_id`. |
-| `conversation_id` | `TEXT` | From `X-Conversation-Id` or `SET conversation_id`. |
-| `step_index` | `INTEGER` | From `X-Step-Index` or `SET step_index`. |
-| `tool_call_id` | `TEXT` | From `X-Tool-Call-Id` or `SET tool_call_id`. |
-| `query_intent` | `TEXT` | From `X-Query-Intent`, `SET query_intent`, or inferred. |
-| `guard_actions` | `JSONB` | Ordered list of guard verdicts for this query. |
-| `was_guard_blocked` | `BOOLEAN` | `true` if any guard denied the query. |
-
-`agent_id`, `conversation_id`, and `was_guard_blocked` are indexed for efficient lookup.
-
----
-
-## Replaying a session
-
-With conversation ID and step index you can reconstruct exactly what an agent did:
-
-```sql
--- Full session replay in order
-SELECT
-    step_index,
-    query_intent,
-    sql,
-    status,
-    was_guard_blocked,
-    guard_actions
-FROM query_records
-WHERE conversation_id = 'conv-7f3a9b'
-ORDER BY step_index;
-```
-
-```sql
--- All queries an agent was blocked on
-SELECT created_at, sql, guard_actions
-FROM query_records
-WHERE agent_id = 'my-agent-v2'
-  AND was_guard_blocked = TRUE
-ORDER BY created_at DESC;
-```
-
-QueryFlux Studio shows agentic context inline on the **Queries** page — conversation ID, step index, intent, and the full guard action trail are visible per query without writing SQL.
-
----
-
-## Using guardrails with agentic workloads
-
-Guardrails are a general-purpose SQL safety layer, but they integrate with agentic context in two ways:
-
-1. **Guard decisions are recorded per query** — every `allow`, `warn`, and `deny` is stored in `guard_actions`, so the agent session replay includes the full safety audit trail.
-2. **Python script guards can inspect agent context** — the `ctx` dict passed to a script guard includes `agent_context` with all fields above, so you can write rules that behave differently for agents vs. human clients.
-
-See [Guardrails](../architecture/guardrails) for the full guard configuration reference.
+Next: [Session replay and guardrails](session-replay) covers what gets persisted and how to reconstruct a full agent session from query history.

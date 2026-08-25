@@ -43,3 +43,6 @@ uuid = { version = "1", features = ["v4"] }
 base64 = "0.22"
 flate2 = "1"
 anyhow = { workspace = true }
+rmcp = { version = "3", features = ["server", "transport-streamable-http-server", "transport-streamable-http-server-session"] }
+schemars = "1"
+tokio-util = "0.7"

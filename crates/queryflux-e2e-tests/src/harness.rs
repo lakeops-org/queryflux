@@ -38,6 +38,7 @@ use queryflux_engine_adapters::{
 };
 use queryflux_frontend::{
     flight_sql::FlightSqlFrontend,
+    mcp::McpFrontend,
     mysql_wire::MysqlWireFrontend,
     postgres_wire::PostgresWireFrontend,
     snowflake::SnowflakeFrontend,
@@ -312,6 +313,7 @@ impl TestHarness {
             flight_sql: None,
             snowflake_http: Some(duckdb_group.clone()),
             snowflake_sql_api: Some(duckdb_group),
+            mcp: None,
         }));
         // Route compatibility:
         // - `X-Qf-Group` is our internal E2E routing header (legacy tests).
@@ -573,6 +575,7 @@ impl WireTestHarness {
             flight_sql: None,
             snowflake_http: Some(duckdb_group.clone()),
             snowflake_sql_api: Some(duckdb_group),
+            mcp: None,
         });
 
         let cluster_manager = Arc::new(SimpleClusterGroupManager::new(group_states));
@@ -715,6 +718,7 @@ impl WireTestHarness {
             flight_sql: None,
             snowflake_http: Some(sr_group.clone()),
             snowflake_sql_api: Some(sr_group),
+            mcp: None,
         });
 
         let cluster_manager = Arc::new(SimpleClusterGroupManager::new(group_states));
@@ -825,11 +829,22 @@ pub struct ProtocolWireHarness {
     pub mysql_port: u16,
     pub postgres_port: u16,
     pub flight_port: u16,
+    pub mcp_port: u16,
+    records: Arc<Mutex<Vec<QueryRecord>>>,
     _shutdown_tx: tokio::sync::watch::Sender<bool>,
 }
 
 impl ProtocolWireHarness {
     pub async fn new() -> Result<Self> {
+        Self::new_with_guard_chain(None).await
+    }
+
+    /// Same as `new()`, but installs `guard_chain` as the global guard chain — lets tests
+    /// exercise guardrail enforcement (e.g. `read_only`) end-to-end through a real frontend
+    /// instead of only unit-testing the `Guard` trait in isolation.
+    pub async fn new_with_guard_chain(
+        guard_chain: Option<Arc<queryflux_guardrails::GuardChain>>,
+    ) -> Result<Self> {
         let _ = tracing_subscriber::fmt()
             .with_env_filter("error")
             .try_init();
@@ -877,6 +892,7 @@ impl ProtocolWireHarness {
             flight_sql: Some(duckdb_group.clone()),
             snowflake_http: None,
             snowflake_sql_api: None,
+            mcp: Some(duckdb_group.clone()),
         });
 
         let cluster_manager = Arc::new(SimpleClusterGroupManager::new(group_states));
@@ -885,7 +901,7 @@ impl ProtocolWireHarness {
 
         let live_config = LiveConfig {
             router_chain,
-            guard_chain: None,
+            guard_chain,
             group_guard_chains: HashMap::new(),
             cluster_manager,
             adapters,
@@ -905,12 +921,15 @@ impl ProtocolWireHarness {
                 as Arc<dyn AuthorizationChecker>,
         };
 
+        let records: Arc<Mutex<Vec<QueryRecord>>> = Arc::new(Mutex::new(Vec::new()));
         let state = Arc::new(AppState {
             external_address: "http://127.0.0.1:0".to_string(),
             live: Arc::new(tokio::sync::RwLock::new(live_config)),
             persistence: Arc::new(InMemoryPersistence::new()),
             translation,
-            metrics: Arc::new(NullMetrics),
+            metrics: Arc::new(CapturingMetrics {
+                records: records.clone(),
+            }),
             identity_resolver: Arc::new(BackendIdentityResolver::new()),
             capacity_store: None,
             queue_coordinator: None,
@@ -925,6 +944,7 @@ impl ProtocolWireHarness {
         let mysql_port = bind_ephemeral_port().await?;
         let postgres_port = bind_ephemeral_port().await?;
         let flight_port = bind_ephemeral_port().await?;
+        let mcp_port = bind_ephemeral_port().await?;
 
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
@@ -937,9 +957,10 @@ impl ProtocolWireHarness {
             shutdown_rx.clone(),
         );
         spawn_wire_frontend(
-            FlightSqlFrontend::new(state, flight_port, None),
-            shutdown_rx,
+            FlightSqlFrontend::new(state.clone(), flight_port, None),
+            shutdown_rx.clone(),
         );
+        spawn_wire_frontend(McpFrontend::new(state, mcp_port, None), shutdown_rx);
 
         tokio::time::sleep(Duration::from_millis(100)).await;
 
@@ -947,8 +968,36 @@ impl ProtocolWireHarness {
             mysql_port,
             postgres_port,
             flight_port,
+            mcp_port,
+            records,
             _shutdown_tx: shutdown_tx,
         })
+    }
+
+    pub fn clear_records(&self) {
+        self.records.lock().expect("lock records").clear();
+    }
+
+    pub async fn wait_for_record<F>(&self, predicate: F) -> Option<QueryRecord>
+    where
+        F: Fn(&QueryRecord) -> bool,
+    {
+        // `AppState::record_query` schedules `MetricsStore::record_query` via `tokio::spawn`.
+        // On slow shared runners the task can land after several hundred ms; keep a generous window.
+        for _ in 0..150 {
+            if let Some(record) = self
+                .records
+                .lock()
+                .expect("lock records")
+                .iter()
+                .find(|r| predicate(r))
+                .cloned()
+            {
+                return Some(record);
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        None
     }
 }
 
