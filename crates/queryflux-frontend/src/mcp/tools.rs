@@ -16,7 +16,7 @@ use rmcp::{
     tool, tool_handler, tool_router, ErrorData as McpError, RoleServer, ServerHandler,
 };
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{json, Value};
 use tracing::debug;
 use uuid::Uuid;
 
@@ -291,6 +291,30 @@ async fn resolve_group(
     }
 }
 
+/// Insert the resolved `conversation_id` into a tool's JSON result, with a short note
+/// telling the caller to reuse it on later calls in this conversation.
+///
+/// MCP has no reliable transport-level way to correlate tool calls within one chat (see
+/// `resolve_agent_context`'s doc comment on why we default `conversation_id` at all), and
+/// asking the agent to *invent and remember* an id itself is unreliable — it can forget
+/// to generate one, or drift onto a different value on a later call. Echoing back
+/// whatever value QueryFlux actually resolved (explicit param, header, or the session/
+/// UUID default) gives the agent a concrete value already in its own context to copy
+/// forward, rather than something to recall from scratch — the same "mint a handle and
+/// have the model pass it back" pattern MCP itself recommends for cross-call state.
+fn attach_conversation_hint(result: &mut Value, conversation_id: &str) {
+    if let Value::Object(map) = result {
+        map.insert("conversation_id".to_string(), json!(conversation_id));
+        map.insert(
+            "_hint".to_string(),
+            json!(
+                "Pass this exact conversation_id on your next QueryFlux tool call in this \
+                 conversation to keep them grouped together."
+            ),
+        );
+    }
+}
+
 /// Run `sql` through the standard dispatch pipeline (routing, translation, guardrails,
 /// execution, persistence) and collect the result as JSON. Every tool goes through this
 /// single path so query history, agent-context, and guard enforcement are identical to
@@ -302,6 +326,7 @@ async fn run_query(
     group: ClusterGroupName,
     auth: &AuthContext,
     max_rows: usize,
+    conversation_id: &str,
 ) -> Result<CallToolResult, McpError> {
     let engine_name = group.0.clone();
     let capped = max_rows.min(ABSOLUTE_MAX_ROWS);
@@ -326,7 +351,8 @@ async fn run_query(
     }
 
     let elapsed = start.elapsed().as_millis() as u64;
-    let result = sink.into_result(elapsed, &engine_name);
+    let mut result = sink.into_result(elapsed, &engine_name);
+    attach_conversation_hint(&mut result, conversation_id);
     Ok(CallToolResult::success(vec![ContentBlock::text(
         serde_json::to_string_pretty(&result).unwrap_or_default(),
     )]))
@@ -368,7 +394,7 @@ impl QueryFluxMcpServer {
 #[tool_router]
 impl QueryFluxMcpServer {
     #[tool(
-        description = "Execute a SQL query against a QueryFlux-routed engine. Returns rows as JSON objects keyed by column name, truncated at max_rows (default 1000). Row-level safety policy (read-only, row limits, etc.) is whatever the operator has configured via QueryFlux guardrails — not enforced here. By default the SQL is assumed to already be written for the target engine (no translation); set `dialect` if it was written for a different engine."
+        description = "Execute a SQL query against a QueryFlux-routed engine. Returns rows as JSON objects keyed by column name, truncated at max_rows (default 1000). Row-level safety policy (read-only, row limits, etc.) is whatever the operator has configured via QueryFlux guardrails — not enforced here. By default the SQL is assumed to already be written for the target engine (no translation); set `dialect` if it was written for a different engine. The response includes `conversation_id` — copy that exact value into the `conversation_id` argument on your next QueryFlux tool call in this same conversation, so they're grouped together."
     )]
     async fn execute_query(
         &self,
@@ -385,6 +411,7 @@ impl QueryFluxMcpServer {
         let headers = extract_headers(&ctx);
         let auth = authenticate(&self.state, &headers).await?;
         let agent_context = resolve_agent_context(&headers, &agent, &auth);
+        let conversation_id = agent_context.conversation_id.clone();
         let mut session = session_for(&auth, agent_context);
         if let Some(d) = dialect {
             session.extra.insert("dialect".to_string(), d);
@@ -400,12 +427,13 @@ impl QueryFluxMcpServer {
             group,
             &auth,
             max_rows.unwrap_or(DEFAULT_MAX_ROWS),
+            &conversation_id,
         )
         .await
     }
 
     #[tool(
-        description = "List available schemas/databases on the routed engine. Queries information_schema.schemata through the normal QueryFlux pipeline — the SQL-standard view every supported engine implements, so this works whether or not dialect translation rewrites it further."
+        description = "List available schemas/databases on the routed engine. Queries information_schema.schemata through the normal QueryFlux pipeline — the SQL-standard view every supported engine implements, so this works whether or not dialect translation rewrites it further. The response includes `conversation_id` — reuse it on your next QueryFlux tool call in this conversation."
     )]
     async fn list_schemas(
         &self,
@@ -415,16 +443,26 @@ impl QueryFluxMcpServer {
         let headers = extract_headers(&ctx);
         let auth = authenticate(&self.state, &headers).await?;
         let agent_context = resolve_agent_context(&headers, &agent, &auth);
+        let conversation_id = agent_context.conversation_id.clone();
         let session = session_for(&auth, agent_context);
         let sql = "SELECT schema_name FROM information_schema.schemata".to_string();
         let group =
             resolve_group(&self.state, &sql, &session, engine_hint.as_deref(), &auth).await?;
 
-        run_query(&self.state, sql, session, group, &auth, DEFAULT_MAX_ROWS).await
+        run_query(
+            &self.state,
+            sql,
+            session,
+            group,
+            &auth,
+            DEFAULT_MAX_ROWS,
+            &conversation_id,
+        )
+        .await
     }
 
     #[tool(
-        description = "Describe a table's columns (name, type, nullable) and optionally include sample rows in the same call. Runs DESCRIBE <table>, plus a bounded SELECT * ... LIMIT <sample_rows> when sample_rows > 0."
+        description = "Describe a table's columns (name, type, nullable) and optionally include sample rows in the same call. Runs DESCRIBE <table>, plus a bounded SELECT * ... LIMIT <sample_rows> when sample_rows > 0. The response includes `conversation_id` — reuse it on your next QueryFlux tool call in this conversation."
     )]
     async fn describe_table(
         &self,
@@ -440,6 +478,7 @@ impl QueryFluxMcpServer {
         let headers = extract_headers(&ctx);
         let auth = authenticate(&self.state, &headers).await?;
         let agent_context = resolve_agent_context(&headers, &agent, &auth);
+        let conversation_id = agent_context.conversation_id.clone();
         let qualified = qualify_table(schema.as_deref(), &table);
 
         let describe_session = session_for(&auth, agent_context.clone());
@@ -505,18 +544,19 @@ impl QueryFluxMcpServer {
             None
         };
 
-        let result = json!({
+        let mut result = json!({
             "table": qualified,
             "columns": columns,
             "sample": sample,
         });
+        attach_conversation_hint(&mut result, &conversation_id);
         Ok(CallToolResult::success(vec![ContentBlock::text(
             serde_json::to_string_pretty(&result).unwrap_or_default(),
         )]))
     }
 
     #[tool(
-        description = "Return the query plan for a SQL statement without executing it. Runs EXPLAIN <sql> on the routed engine. By default the SQL is assumed to already be written for the target engine (no translation); set `dialect` if it was written for a different engine."
+        description = "Return the query plan for a SQL statement without executing it. Runs EXPLAIN <sql> on the routed engine. By default the SQL is assumed to already be written for the target engine (no translation); set `dialect` if it was written for a different engine. The response includes `conversation_id` — reuse it on your next QueryFlux tool call in this conversation."
     )]
     async fn explain_query(
         &self,
@@ -532,6 +572,7 @@ impl QueryFluxMcpServer {
         let headers = extract_headers(&ctx);
         let auth = authenticate(&self.state, &headers).await?;
         let agent_context = resolve_agent_context(&headers, &agent, &auth);
+        let conversation_id = agent_context.conversation_id.clone();
         let mut session = session_for(&auth, agent_context);
         if let Some(d) = dialect {
             session.extra.insert("dialect".to_string(), d);
@@ -553,6 +594,7 @@ impl QueryFluxMcpServer {
             group,
             &auth,
             DEFAULT_MAX_ROWS,
+            &conversation_id,
         )
         .await
     }
@@ -692,7 +734,10 @@ impl ServerHandler for QueryFluxMcpServer {
             "QueryFlux MCP server. Tools: execute_query, list_schemas, describe_table, \
              explain_query, get_query_status, cancel_query. Every tool authenticates via \
              Authorization: Bearer <token> and flows through QueryFlux's normal routing, \
-             translation, and guardrail pipeline — no separate MCP-specific policy layer.",
+             translation, and guardrail pipeline — no separate MCP-specific policy layer. \
+             execute_query/list_schemas/describe_table/explain_query responses include a \
+             conversation_id field: copy that exact value into the conversation_id argument \
+             on every later call in this same conversation, so QueryFlux groups them together.",
         )
     }
 }

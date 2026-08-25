@@ -439,3 +439,65 @@ async fn agent_context_defaults_when_absent() {
 
     let _ = client.cancel().await;
 }
+
+/// Proves the actual "copy it forward" mechanism, not just implicit session-based
+/// grouping: extract `conversation_id` from a tool's JSON response (what an agent would
+/// read from its own context) and pass that exact value as the explicit `conversation_id`
+/// argument on a *new*, otherwise-unrelated MCP connection — the resulting query must
+/// still land in the same conversation. This is the behavior the response hint exists to
+/// make reliable even when a client doesn't preserve any transport-level session across
+/// calls (e.g. reconnects between tool calls).
+#[tokio::test]
+async fn execute_query_response_conversation_id_can_be_reused_on_a_new_connection() {
+    let h = ProtocolWireHarness::new().await.expect("harness");
+    h.clear_records();
+
+    let client1 = connect(h.mcp_port).await;
+    let result1 = client1
+        .call_tool(call(
+            "execute_query",
+            serde_json::json!({ "sql": "SELECT 1" }),
+        ))
+        .await
+        .expect("call_tool execute_query");
+    assert!(!is_error(&result1), "unexpected tool error: {result1:?}");
+
+    let payload1 = result_json(&result1);
+    let conversation_id = payload1["conversation_id"]
+        .as_str()
+        .expect("response should include conversation_id")
+        .to_string();
+    assert!(
+        !conversation_id.is_empty(),
+        "conversation_id should not be empty"
+    );
+    assert!(
+        payload1["_hint"].is_string(),
+        "response should include a hint telling the caller to reuse conversation_id"
+    );
+    let _ = client1.cancel().await;
+
+    // A brand new connection — no shared Mcp-Session-Id with the first one — reuses the
+    // conversation_id it read out of the first call's response.
+    let client2 = connect(h.mcp_port).await;
+    let result2 = client2
+        .call_tool(call(
+            "execute_query",
+            serde_json::json!({ "sql": "SELECT 2", "conversation_id": conversation_id }),
+        ))
+        .await
+        .expect("call_tool execute_query");
+    assert!(!is_error(&result2), "unexpected tool error: {result2:?}");
+
+    let record2 = h
+        .wait_for_record(|r| r.sql_preview.contains("SELECT 2"))
+        .await
+        .expect("expected a QueryRecord for the second call");
+    assert_eq!(
+        record2.conversation_id.as_deref(),
+        Some(conversation_id.as_str()),
+        "the id copied from the first response should group the second call with the first"
+    );
+
+    let _ = client2.cancel().await;
+}
