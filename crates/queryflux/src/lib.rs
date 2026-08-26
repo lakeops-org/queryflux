@@ -843,10 +843,6 @@ impl QueryFluxBuilder {
                     );
                     continue;
                 }
-                let cluster_cfg = config.clusters.get(member_name).context(format!(
-                    "group '{group_name}' references unknown cluster '{member_name}'"
-                ))?;
-
                 if !adapters.contains_key(member_name.as_str()) {
                     tracing::warn!(
                         group = %group_name,
@@ -856,15 +852,38 @@ impl QueryFluxBuilder {
                     continue;
                 }
 
-                let engine = cluster_cfg
-                    .engine
-                    .as_ref()
-                    .context(format!("cluster '{member_name}' missing engine"))?;
-                let engine_type = EngineType::from(engine);
+                // Members backed by a YAML `clusters:` entry get engine/endpoint/enabled
+                // from it, same as always. Members that exist only via
+                // `.with_adapter(cluster, AdapterKind)` (no YAML entry — that's the point
+                // of that escape hatch) derive `engine_type` from the adapter itself and
+                // have no endpoint to report.
+                let (engine_type, endpoint, max_q, enabled) = match config.clusters.get(member_name)
+                {
+                    Some(cluster_cfg) => {
+                        let engine = cluster_cfg
+                            .engine
+                            .as_ref()
+                            .context(format!("cluster '{member_name}' missing engine"))?;
+                        (
+                            EngineType::from(engine),
+                            cluster_cfg.endpoint.clone(),
+                            cluster_cfg
+                                .max_running_queries
+                                .unwrap_or(group_config.max_running_queries),
+                            cluster_cfg.enabled,
+                        )
+                    }
+                    None => (
+                        adapters
+                            .get(member_name.as_str())
+                            .expect("checked contains_key above")
+                            .engine_type(),
+                        None,
+                        group_config.max_running_queries,
+                        true,
+                    ),
+                };
 
-                let max_q = cluster_cfg
-                    .max_running_queries
-                    .unwrap_or(group_config.max_running_queries);
                 let cluster_cid = cluster_ids_by_name.get(member_name).copied();
                 let group_cid = group_ids_by_name.get(group_name.as_str()).copied();
                 let state = Arc::new(ClusterState::new(
@@ -873,9 +892,9 @@ impl QueryFluxBuilder {
                     cluster_cid,
                     group_cid,
                     engine_type,
-                    cluster_cfg.endpoint.clone(),
+                    endpoint,
                     max_q,
-                    cluster_cfg.enabled,
+                    enabled,
                 ));
                 states.push(state);
             }

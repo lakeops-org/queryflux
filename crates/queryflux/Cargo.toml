@@ -37,6 +37,10 @@ opentelemetry_sdk = { workspace = true, optional = true }
 opentelemetry-otlp = { workspace = true, optional = true }
 tracing-opentelemetry = { workspace = true, optional = true }
 
+[dev-dependencies]
+arrow = { workspace = true }
+tempfile = "3"
+
 [features]
 default = []
 otlp = ["opentelemetry", "opentelemetry_sdk", "opentelemetry-otlp", "tracing-opentelemetry"]

@@ -4001,6 +4001,7 @@ name = "queryflux"
 version = "0.3.0"
 dependencies = [
  "anyhow",
+ "arrow",
  "async-trait",
  "chrono",
  "futures",
@@ -4022,6 +4023,7 @@ dependencies = [
  "queryflux-translation",
  "reqwest 0.12.28",
  "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-opentelemetry",
