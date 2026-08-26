@@ -103,18 +103,16 @@ pub async fn login_request(
         extra: Default::default(),
         agent_context: None,
     };
-    let routing_result = {
-        let live = state.app.live.read().await;
-        live.router_chain
-            .route_with_trace(
-                "",
-                &session_ctx,
-                &FrontendProtocol::SnowflakeHttp,
-                Some(&auth_ctx),
-            )
-            .await
-    };
-    let (chain_result, mut routing_trace) = match routing_result {
+    let routing_result = state
+        .app
+        .route_query(
+            String::new(),
+            &session_ctx,
+            &FrontendProtocol::SnowflakeHttp,
+            Some(&auth_ctx),
+        )
+        .await;
+    let (_sql, chain_result, mut routing_trace) = match routing_result {
         Ok(r) => r,
         Err(e) => return sf_error("390000", &format!("Routing error: {e}")),
     };

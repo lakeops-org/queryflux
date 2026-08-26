@@ -20,7 +20,10 @@ use queryflux_guardrails::GuardChain;
 use queryflux_metrics::{GuardAction, MetricsStore, QueryRecord};
 use queryflux_persistence::{CapacityStore, Persistence, QueueCoordinator};
 use queryflux_routing::chain::{RouterChain, RoutingTrace};
+use queryflux_routing::ChainRouteResult;
 use queryflux_translation::TranslationService;
+
+use crate::hook::{HookBus, HookContext};
 
 /// Everything that can be hot-reloaded from the DB without restarting the proxy.
 ///
@@ -100,6 +103,10 @@ pub struct AppState {
     pub http_client: reqwest::Client,
     /// Query result cache — `NoopResultCache` when no cache backend is configured.
     pub result_cache: Arc<dyn queryflux_cache::QueryResultCache>,
+    /// Embedder-registered query lifecycle hooks. Static, unlike `LiveConfig`'s
+    /// guards/routers — not re-applied on hot reload. An empty bus (the default when
+    /// no hooks are registered) costs one `Arc` clone on the dispatch path.
+    pub hooks: Arc<HookBus>,
 }
 
 /// Stable per-query metadata that does not change across the query's lifecycle.
@@ -156,6 +163,68 @@ impl AppState {
 
     pub async fn cluster_config_cloned(&self, cluster: &str) -> Option<ClusterConfig> {
         self.live.read().await.cluster_configs.get(cluster).cloned()
+    }
+
+    /// Route `sql`, running `before_route` / `after_route` hooks around the router
+    /// chain. Unifies what used to be `router_chain.route_with_trace` copy-pasted per
+    /// protocol — every frontend (MCP included) now gets a `RoutingTrace` and hook
+    /// coverage from one place. Returns the (possibly hook-rewritten) `sql` alongside
+    /// the routing result, since `before_route` may rewrite it.
+    pub async fn route_query(
+        &self,
+        sql: String,
+        session: &SessionContext,
+        protocol: &FrontendProtocol,
+        auth_ctx: Option<&queryflux_auth::AuthContext>,
+    ) -> queryflux_core::error::Result<(String, ChainRouteResult, RoutingTrace)> {
+        let mut sql = sql;
+        if !self.hooks.is_empty() {
+            let mut ctx = HookContext {
+                sql: sql.clone(),
+                session,
+                protocol,
+                group: None,
+                cluster: None,
+                engine_type: None,
+                query_tags: session.tags(),
+                auth: auth_ctx,
+            };
+            let outcome = self.hooks.before_route(&mut ctx).await;
+            sql = ctx.sql;
+            if let Some(err) = HookBus::deny_err(&outcome) {
+                return Err(err);
+            }
+        }
+
+        let (result, trace) = {
+            let live = self.live.read().await;
+            live.router_chain
+                .route_with_trace(&sql, session, protocol, auth_ctx)
+                .await?
+        };
+
+        if !self.hooks.is_empty() {
+            let group = match &result {
+                ChainRouteResult::Routed(g) => Some(g),
+                ChainRouteResult::Denied { .. } => None,
+            };
+            let ctx = HookContext {
+                sql: sql.clone(),
+                session,
+                protocol,
+                group,
+                cluster: None,
+                engine_type: None,
+                query_tags: session.tags(),
+                auth: auth_ctx,
+            };
+            let outcome = self.hooks.after_route(&ctx).await;
+            if let Some(err) = HookBus::deny_err(&outcome) {
+                return Err(err);
+            }
+        }
+
+        Ok((sql, result, trace))
     }
 
     /// Resolve engine metadata from a live adapter or stored cluster config.
@@ -687,6 +756,7 @@ pub mod test_fixtures {
             instance_id: "test".into(),
             http_client: reqwest::Client::new(),
             result_cache: Arc::new(queryflux_cache::noop::NoopResultCache),
+            hooks: Arc::new(crate::hook::HookBus::default()),
         })
     }
 }

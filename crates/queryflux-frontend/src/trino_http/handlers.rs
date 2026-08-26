@@ -521,16 +521,12 @@ pub async fn post_statement(
         return set_session_response(&query_id.0, &prop_key, &prop_val).into_response();
     }
 
-    // 2. Route — first matching router wins.
-    // `route_with_trace` is CPU-bound (regex match, header lookup); holding the read lock
-    // across this call is fine since it's brief and read-locks don't block each other.
-    let routing_result = {
-        let live = state.live.read().await;
-        live.router_chain
-            .route_with_trace(&sql, &session, &protocol, Some(&auth_ctx))
-            .await
-    };
-    let (chain_result, mut routing_trace) = match routing_result {
+    // 2. Route — first matching router wins. `AppState::route_query` also runs
+    // before_route/after_route hooks and may rewrite `sql`.
+    let routing_result = state
+        .route_query(sql, &session, &protocol, Some(&auth_ctx))
+        .await;
+    let (sql, chain_result, mut routing_trace) = match routing_result {
         Ok(r) => r,
         Err(e) => {
             warn!("Routing error: {e}");
@@ -1648,6 +1644,7 @@ mod cancel_executing_statement_tests {
             instance_id: "test".into(),
             http_client: reqwest::Client::new(),
             result_cache: Arc::new(queryflux_cache::noop::NoopResultCache),
+            hooks: Arc::new(crate::hook::HookBus::default()),
         })
     }
 

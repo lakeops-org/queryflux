@@ -336,13 +336,10 @@ async fn handle_simple_query(
         return Ok(());
     }
 
-    let routing_result = {
-        let live = state.live.read().await;
-        live.router_chain
-            .route_with_trace(sql, session, &protocol, Some(&auth_ctx))
-            .await
-    };
-    let (chain_result, mut routing_trace) = match routing_result {
+    let routing_result = state
+        .route_query(sql.to_string(), session, &protocol, Some(&auth_ctx))
+        .await;
+    let (routed_sql, chain_result, mut routing_trace) = match routing_result {
         Ok(r) => r,
         Err(e) => {
             write_error_response(writer, "42000", &e.to_string()).await?;
@@ -350,6 +347,7 @@ async fn handle_simple_query(
             return Ok(());
         }
     };
+    let sql = routed_sql.as_str();
     let mut group = match chain_result {
         ChainRouteResult::Routed(g) => g,
         ChainRouteResult::Denied { message } => {

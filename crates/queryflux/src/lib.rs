@@ -178,6 +178,8 @@ pub struct QueryFluxBuilder {
     /// Kept separate from `registry`: `FnOnce` factories aren't `Sync`, and `registry`
     /// is wrapped in `Arc` for the reload loop to share, which requires `Sync`.
     frontends: Vec<FrontendFactory>,
+    /// Static on `AppState`, unlike `registry` — not re-applied on `LiveConfig` reload.
+    hooks: Vec<Arc<dyn queryflux_frontend::hook::QueryHook>>,
 }
 
 impl QueryFluxBuilder {
@@ -280,6 +282,14 @@ impl QueryFluxBuilder {
         self
     }
 
+    /// Register a query lifecycle hook, fired in registration order alongside the
+    /// guard chain on every query. Static on `AppState` — not re-registered on
+    /// hot reload, unlike guards/routers/strategies.
+    pub fn hook(mut self, hook: Arc<dyn queryflux_frontend::hook::QueryHook>) -> Self {
+        self.hooks.push(hook);
+        self
+    }
+
     /// Override authentication entirely, skipping the YAML/DB auth provider build.
     pub fn auth_provider(mut self, provider: Arc<dyn queryflux_auth::AuthProvider>) -> Self {
         self.registry.auth_provider = Some(provider);
@@ -298,6 +308,7 @@ impl QueryFluxBuilder {
         })?;
         let registry = Arc::new(self.registry);
         let extra_frontends = self.frontends;
+        let hooks = Arc::new(queryflux_frontend::hook::HookBus::new(self.hooks));
 
         let mut config = YamlFileConfigProvider::new(&config_path)
             .load()
@@ -1394,6 +1405,7 @@ impl QueryFluxBuilder {
                 .build()
                 .expect("build shared http client"),
             result_cache,
+            hooks,
         });
 
         // --- Start admin server (Prometheus /metrics + future /admin/* endpoints) ---

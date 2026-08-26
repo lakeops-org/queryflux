@@ -264,18 +264,16 @@ pub async fn submit_statement(
         extra,
         agent_context: None,
     };
-    let routing_result = {
-        let live = state.app.live.read().await;
-        live.router_chain
-            .route_with_trace(
-                &sql,
-                &session_ctx,
-                &FrontendProtocol::SnowflakeSqlApi,
-                Some(&auth_ctx),
-            )
-            .await
-    };
-    let (chain_result, mut routing_trace) = match routing_result {
+    let routing_result = state
+        .app
+        .route_query(
+            sql,
+            &session_ctx,
+            &FrontendProtocol::SnowflakeSqlApi,
+            Some(&auth_ctx),
+        )
+        .await;
+    let (sql, chain_result, mut routing_trace) = match routing_result {
         Ok(r) => r,
         Err(e) => return sql_api_error(StatusCode::BAD_GATEWAY, "390000", &e.to_string()),
     };

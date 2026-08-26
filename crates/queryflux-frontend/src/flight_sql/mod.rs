@@ -208,13 +208,11 @@ impl FlightSqlService for QueryFluxFlightSql {
             }
         };
 
-        let routing_result = {
-            let live = self.state.live.read().await;
-            live.router_chain
-                .route_with_trace(&sql, &session, &protocol, Some(&auth_ctx))
-                .await
-        };
-        let (chain_result, mut routing_trace) =
+        let routing_result = self
+            .state
+            .route_query(sql, &session, &protocol, Some(&auth_ctx))
+            .await;
+        let (sql, chain_result, mut routing_trace) =
             routing_result.map_err(|e| Status::internal(e.to_string()))?;
         let mut group = match chain_result {
             ChainRouteResult::Routed(g) => g,

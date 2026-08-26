@@ -31,6 +31,7 @@ use queryflux_translation::SchemaContext;
 
 use tracing::{debug, info, warn};
 
+use crate::hook::{HookBus, HookContext};
 use crate::state::{AppState, QueryContext, QueryOutcome};
 
 /// Resolve the source dialect to record for this query.
@@ -352,6 +353,34 @@ pub async fn dispatch_query(
     let tgt_dialect = adapter_kind.translation_target_dialect();
     let src_dialect = resolve_src_dialect(&session, &protocol);
     let engine_type = adapter_kind.engine_type();
+
+    macro_rules! hook_ctx {
+        ($sql:expr) => {
+            HookContext {
+                sql: $sql,
+                session: &session,
+                protocol: &protocol,
+                group: Some(&group),
+                cluster: Some(&cluster_name),
+                engine_type: Some(&engine_type),
+                query_tags: &effective_tags,
+                auth: Some(auth_ctx),
+            }
+        };
+    }
+
+    let sql = if !state.hooks.is_empty() {
+        let mut ctx = hook_ctx!(sql.clone());
+        let outcome = state.hooks.before_translate(&mut ctx).await;
+        if let Some(err) = HookBus::deny_err(&outcome) {
+            slot.release().await;
+            return Err(err);
+        }
+        ctx.sql
+    } else {
+        sql
+    };
+
     let original_sql = sql.clone();
     let sql = if should_attempt_translation(&session, &protocol) {
         match state
@@ -368,6 +397,12 @@ pub async fn dispatch_query(
             Ok(t) => t,
             Err(e) => {
                 warn!(id = %query_id, "Translation error: {e}");
+                if !state.hooks.is_empty() {
+                    state
+                        .hooks
+                        .on_error(&hook_ctx!(original_sql.clone()), &e)
+                        .await;
+                }
                 slot.release().await;
                 return Err(e);
             }
@@ -378,6 +413,14 @@ pub async fn dispatch_query(
     let was_translated = sql != original_sql;
     if was_translated {
         info!(id = %query_id, src = ?src_dialect, tgt = ?tgt_dialect, "SQL translated");
+    }
+
+    if !state.hooks.is_empty() {
+        let outcome = state.hooks.after_translate(&hook_ctx!(sql.clone())).await;
+        if let Some(err) = HookBus::deny_err(&outcome) {
+            slot.release().await;
+            return Err(err);
+        }
     }
 
     // Fallback interpolation for async adapters that don't support native params.
@@ -455,6 +498,14 @@ pub async fn dispatch_query(
         }};
     }
 
+    if !state.hooks.is_empty() {
+        let outcome = state.hooks.before_guard(&hook_ctx!(sql.clone())).await;
+        if let Some(err) = HookBus::deny_err(&outcome) {
+            slot.release().await;
+            return Err(err);
+        }
+    }
+
     if let Some(chain) = &guard_chain {
         let (actions, was_blocked) = chain.run(&guard_ctx, GuardLayer::Plan).await;
         all_guard_actions.extend(actions);
@@ -468,6 +519,14 @@ pub async fn dispatch_query(
         all_guard_actions.extend(actions);
         if was_blocked {
             guard_deny!(std::mem::take(&mut all_guard_actions));
+        }
+    }
+
+    if !state.hooks.is_empty() {
+        let outcome = state.hooks.after_guard(&hook_ctx!(sql.clone())).await;
+        if let Some(err) = HookBus::deny_err(&outcome) {
+            slot.release().await;
+            return Err(err);
         }
     }
 
@@ -486,6 +545,14 @@ pub async fn dispatch_query(
         })
         .collect::<queryflux_core::error::Result<Vec<_>>>()?;
 
+    if !state.hooks.is_empty() {
+        let outcome = state.hooks.before_execute(&hook_ctx!(sql.clone())).await;
+        if let Some(err) = HookBus::deny_err(&outcome) {
+            slot.release().await;
+            return Err(err);
+        }
+    }
+
     match adapter_kind {
         AdapterKind::Async(adapter) => {
             let execution = match adapter
@@ -500,11 +567,17 @@ pub async fn dispatch_query(
             {
                 Ok(e) => e,
                 Err(e) => {
+                    if !state.hooks.is_empty() {
+                        state.hooks.on_error(&hook_ctx!(sql.clone()), &e).await;
+                    }
                     slot.release().await;
                     warn!(id = %query_id, "Submit error: {e}");
                     return Err(e);
                 }
             };
+            if !state.hooks.is_empty() {
+                state.hooks.after_execute(&hook_ctx!(sql.clone())).await;
+            }
 
             if already_queued {
                 let _ = state.persistence.delete_queued(&query_id).await;
@@ -1095,6 +1168,25 @@ impl Drop for SyncCancelGuard {
                     cache_hit: false,
                 },
             );
+            if !state.hooks.is_empty() {
+                // Drop can't be async — fire-and-forget, mirroring spawn_sync_cancel above.
+                tokio::spawn(async move {
+                    let hook_ctx = HookContext {
+                        sql: ctx
+                            .translated_sql
+                            .clone()
+                            .unwrap_or_else(|| ctx.sql.clone()),
+                        session: &ctx.session,
+                        protocol: &ctx.protocol,
+                        group: Some(&ctx.group),
+                        cluster: Some(&ctx.cluster),
+                        engine_type: Some(&ctx.engine_type),
+                        query_tags: &ctx.query_tags,
+                        auth: None,
+                    };
+                    state.hooks.on_cancel(&hook_ctx).await;
+                });
+            }
         }
     }
 }
@@ -1400,6 +1492,33 @@ async fn setup_sync_query(
     let engine_type = adapter.engine_type();
     let start = Instant::now();
 
+    macro_rules! sync_hook_ctx {
+        ($sql:expr) => {
+            HookContext {
+                sql: $sql,
+                session: &session,
+                protocol: &protocol,
+                group: Some(&group),
+                cluster: Some(&cluster_name),
+                engine_type: Some(&engine_type),
+                query_tags: &effective_tags,
+                auth: Some(auth_ctx),
+            }
+        };
+    }
+
+    let sql = if !state.hooks.is_empty() {
+        let mut ctx = sync_hook_ctx!(sql.clone());
+        let outcome = state.hooks.before_translate(&mut ctx).await;
+        if let Some(err) = HookBus::deny_err(&outcome) {
+            slot.release().await;
+            return Err(err);
+        }
+        ctx.sql
+    } else {
+        sql
+    };
+
     // Translate SQL. On failure: record the query, release the slot, propagate the error.
     // The caller (execute_to_sink) will notify the sink via on_error. Skipped entirely
     // (sqlglot never invoked) when should_attempt_translation is false — see its doc
@@ -1420,6 +1539,9 @@ async fn setup_sync_query(
             Err(e) => {
                 let err_msg = e.to_string();
                 warn!(id = %query_id, "Translation error: {err_msg}");
+                if !state.hooks.is_empty() {
+                    state.hooks.on_error(&sync_hook_ctx!(sql.clone()), &e).await;
+                }
                 let ctx = QueryContext {
                     query_id: query_id.clone(),
                     sql: sql.clone(),
@@ -1463,6 +1585,17 @@ async fn setup_sync_query(
     };
 
     let was_translated = translated != sql;
+
+    if !state.hooks.is_empty() {
+        let outcome = state
+            .hooks
+            .after_translate(&sync_hook_ctx!(translated.clone()))
+            .await;
+        if let Some(err) = HookBus::deny_err(&outcome) {
+            slot.release().await;
+            return Err(err);
+        }
+    }
 
     let credentials = match state
         .identity_resolver
@@ -1899,6 +2032,32 @@ pub async fn execute_to_sink(
                 .unwrap_or_default();
             merge_tags(&group_defaults, &session.tags().clone())
         };
+
+        let cache_engine_type = queryflux_core::query::EngineType::Cache;
+        macro_rules! cache_hook_ctx {
+            ($sql:expr) => {
+                HookContext {
+                    sql: $sql,
+                    session: &session,
+                    protocol: &protocol,
+                    group: Some(&group),
+                    cluster: None,
+                    engine_type: Some(&cache_engine_type),
+                    query_tags: &effective_tags,
+                    auth: Some(auth_ctx),
+                }
+            };
+        }
+        if !state.hooks.is_empty() {
+            let outcome = state
+                .hooks
+                .before_guard(&cache_hook_ctx!(sql.clone()))
+                .await;
+            if let Some(err) = HookBus::deny_err(&outcome) {
+                return sink.on_error(&err.to_string()).await;
+            }
+        }
+
         let guard_actions = match run_plan_guards(
             &guard_chain,
             &group_guard_chain,
@@ -1913,6 +2072,13 @@ pub async fn execute_to_sink(
             Err(deny_reason) => return sink.on_error(&deny_reason).await,
         };
 
+        if !state.hooks.is_empty() {
+            let outcome = state.hooks.after_guard(&cache_hook_ctx!(sql.clone())).await;
+            if let Some(err) = HookBus::deny_err(&outcome) {
+                return sink.on_error(&err.to_string()).await;
+            }
+        }
+
         let mut cache_sink_adapter = SinkCacheAdapter(sink);
         match state
             .result_cache
@@ -1922,6 +2088,13 @@ pub async fn execute_to_sink(
             Ok(Some(_stats)) => {
                 info!(cache_key = %key, rows = _stats.row_count, "Cache hit — serving from cache");
                 state.metrics.on_cache_hit(&group.0);
+
+                if !state.hooks.is_empty() {
+                    state
+                        .hooks
+                        .after_execute(&cache_hook_ctx!(sql.clone()))
+                        .await;
+                }
 
                 let ctx = QueryContext {
                     query_id: ProxyQueryId::new(),
@@ -2082,6 +2255,32 @@ async fn execute_to_sink_inner(
         Err(e) => return sink.on_error(&e.to_string()).await,
     };
 
+    macro_rules! sink_hook_ctx {
+        ($sql:expr) => {
+            HookContext {
+                sql: $sql,
+                session: &setup.ctx.session,
+                protocol: &protocol,
+                group: Some(&setup.ctx.group),
+                cluster: Some(&setup.ctx.cluster),
+                engine_type: Some(&setup.ctx.engine_type),
+                query_tags: &setup.ctx.query_tags,
+                auth: Some(auth_ctx),
+            }
+        };
+    }
+
+    if !state.hooks.is_empty() {
+        let outcome = state
+            .hooks
+            .before_guard(&sink_hook_ctx!(setup.translated.clone()))
+            .await;
+        if let Some(err) = HookBus::deny_err(&outcome) {
+            setup.slot.release().await;
+            return sink.on_error(&err.to_string()).await;
+        }
+    }
+
     // Guard chain: runs after translation (SQL is final) and after routing (group is known),
     // before submitting to the engine. Global guards run first; per-group guards are appended.
     {
@@ -2137,8 +2336,30 @@ async fn execute_to_sink_inner(
         setup.guard_actions = all_actions;
     }
 
+    if !state.hooks.is_empty() {
+        let outcome = state
+            .hooks
+            .after_guard(&sink_hook_ctx!(setup.translated.clone()))
+            .await;
+        if let Some(err) = HookBus::deny_err(&outcome) {
+            setup.slot.release().await;
+            return sink.on_error(&err.to_string()).await;
+        }
+    }
+
     if let Err(e) = sink.on_translated_sql(&setup.translated).await {
         return sink.on_error(&e.to_string()).await;
+    }
+
+    if !state.hooks.is_empty() {
+        let outcome = state
+            .hooks
+            .before_execute(&sink_hook_ctx!(setup.translated.clone()))
+            .await;
+        if let Some(err) = HookBus::deny_err(&outcome) {
+            setup.slot.release().await;
+            return sink.on_error(&err.to_string()).await;
+        }
     }
 
     // Native path: skip Arrow when backend connection format matches frontend protocol.
@@ -2176,6 +2397,21 @@ async fn execute_to_sink_inner(
     }
     // Successful completion and engine errors: the query is already finished.
     cancel.disarm();
+
+    if !state.hooks.is_empty() {
+        if let Some(msg) = &outcome.error {
+            let err = QueryFluxError::Engine(msg.clone());
+            state
+                .hooks
+                .on_error(&sink_hook_ctx!(setup.translated.clone()), &err)
+                .await;
+        } else {
+            state
+                .hooks
+                .after_execute(&sink_hook_ctx!(setup.translated.clone()))
+                .await;
+        }
+    }
 
     // Guaranteed single exit: release slot, then record.
     // slot.release() is idempotent and sets released=true so Drop is a no-op.

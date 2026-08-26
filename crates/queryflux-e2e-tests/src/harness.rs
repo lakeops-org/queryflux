@@ -376,6 +376,7 @@ impl TestHarness {
                 .build()
                 .expect("build shared http client"),
             result_cache: Arc::new(queryflux_cache::noop::NoopResultCache),
+            hooks: Arc::new(queryflux_frontend::hook::HookBus::default()),
         });
 
         let trino_fe = TrinoHttpFrontend::new(state.clone(), port, None);
@@ -623,6 +624,7 @@ impl WireTestHarness {
                 .build()
                 .expect("build http client"),
             result_cache: Arc::new(queryflux_cache::noop::NoopResultCache),
+            hooks: Arc::new(queryflux_frontend::hook::HookBus::default()),
         });
 
         let snowflake_fe = SnowflakeFrontend::new(
@@ -766,6 +768,7 @@ impl WireTestHarness {
                 .build()
                 .expect("build http client"),
             result_cache: Arc::new(queryflux_cache::noop::NoopResultCache),
+            hooks: Arc::new(queryflux_frontend::hook::HookBus::default()),
         });
 
         let snowflake_fe = SnowflakeFrontend::new(
@@ -939,6 +942,7 @@ impl ProtocolWireHarness {
                 .build()
                 .expect("build http client"),
             result_cache: Arc::new(queryflux_cache::noop::NoopResultCache),
+            hooks: Arc::new(queryflux_frontend::hook::HookBus::default()),
         });
 
         let mysql_port = bind_ephemeral_port().await?;

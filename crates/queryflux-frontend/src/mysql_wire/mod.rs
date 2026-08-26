@@ -381,19 +381,17 @@ async fn handle_com_query(
         return write_synthetic_multi_column_row(writer, &col_vals, start_seq).await;
     }
 
-    let routing_result = {
-        let live = state.live.read().await;
-        live.router_chain
-            .route_with_trace(sql, session, &protocol, Some(&auth_ctx))
-            .await
-    };
-    let (chain_result, mut routing_trace) = match routing_result {
+    let routing_result = state
+        .route_query(sql.to_string(), session, &protocol, Some(&auth_ctx))
+        .await;
+    let (routed_sql, chain_result, mut routing_trace) = match routing_result {
         Ok(r) => r,
         Err(e) => {
             write_packet(writer, start_seq, &build_err(1105, &e.to_string())).await?;
             return Ok(());
         }
     };
+    let sql = routed_sql.as_str();
     let mut group = match chain_result {
         ChainRouteResult::Routed(g) => g,
         ChainRouteResult::Denied { message } => {
