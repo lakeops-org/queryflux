@@ -112,11 +112,14 @@ pub async fn login_request(
             Some(&auth_ctx),
         )
         .await;
-    let (_sql, chain_result, mut routing_trace) = match routing_result {
+    let (_sql, chain_result, routing_trace) = match routing_result {
         Ok(r) => r,
+        Err(QueryFluxError::Unauthorized(msg)) => return sf_error("390201", &msg),
         Err(e) => return sf_error("390000", &format!("Routing error: {e}")),
     };
-    let mut group = match chain_result {
+    // AppState::route_query already resolved the authorization-aware fallback group
+    // (if the chain used one), so `g` here is final — no separate call needed.
+    let group = match chain_result {
         ChainRouteResult::Routed(g) => g,
         ChainRouteResult::Denied { message } => {
             state.app.record_routing_deny(
@@ -128,15 +131,6 @@ pub async fn login_request(
             );
             return sf_error("390201", &message);
         }
-    };
-    group = match state
-        .app
-        .resolve_routed_group(group, &mut routing_trace, &auth_ctx)
-        .await
-    {
-        Ok(g) => g,
-        Err(QueryFluxError::Unauthorized(msg)) => return sf_error("390201", &msg),
-        Err(e) => return sf_error("390000", &format!("Routing error: {e}")),
     };
 
     let token = state.sessions.create_session(

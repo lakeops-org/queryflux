@@ -212,9 +212,14 @@ impl FlightSqlService for QueryFluxFlightSql {
             .state
             .route_query(sql, &session, &protocol, Some(&auth_ctx))
             .await;
-        let (sql, chain_result, mut routing_trace) =
-            routing_result.map_err(|e| Status::internal(e.to_string()))?;
-        let mut group = match chain_result {
+        let (sql, chain_result, routing_trace) = routing_result.map_err(|e| match e {
+            QueryFluxError::Unauthorized(msg) => Status::permission_denied(msg),
+            other => Status::internal(other.to_string()),
+        })?;
+        // AppState::route_query already resolved the authorization-aware fallback
+        // group (if the chain used one), so `g` here is final — no separate call
+        // needed.
+        let group = match chain_result {
             ChainRouteResult::Routed(g) => g,
             ChainRouteResult::Denied { message } => {
                 self.state.record_routing_deny(
@@ -227,14 +232,6 @@ impl FlightSqlService for QueryFluxFlightSql {
                 return Err(Status::permission_denied(message));
             }
         };
-        group = self
-            .state
-            .resolve_routed_group(group, &mut routing_trace, &auth_ctx)
-            .await
-            .map_err(|e| match e {
-                QueryFluxError::Unauthorized(msg) => Status::permission_denied(msg),
-                other => Status::internal(other.to_string()),
-            })?;
 
         // Channel: sink sends RecordBatches; FlightDataEncoderBuilder encodes them.
         let (tx, rx) =

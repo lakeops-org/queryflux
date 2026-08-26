@@ -384,7 +384,7 @@ async fn handle_com_query(
     let routing_result = state
         .route_query(sql.to_string(), session, &protocol, Some(&auth_ctx))
         .await;
-    let (routed_sql, chain_result, mut routing_trace) = match routing_result {
+    let (routed_sql, chain_result, routing_trace) = match routing_result {
         Ok(r) => r,
         Err(e) => {
             write_packet(writer, start_seq, &build_err(1105, &e.to_string())).await?;
@@ -392,26 +392,14 @@ async fn handle_com_query(
         }
     };
     let sql = routed_sql.as_str();
-    let mut group = match chain_result {
+    // AppState::route_query already resolved the authorization-aware fallback group
+    // (if the chain used one), so `g` here is final — no separate call needed.
+    let group = match chain_result {
         ChainRouteResult::Routed(g) => g,
         ChainRouteResult::Denied { message } => {
             state.record_routing_deny(sql, session, protocol, &message, Some(routing_trace));
             // 1227 = ER_SPECIFIC_ACCESS_DENIED_ERROR
             write_packet(writer, start_seq, &build_err(1227, &message)).await?;
-            return Ok(());
-        }
-    };
-    group = match state
-        .resolve_routed_group(group, &mut routing_trace, &auth_ctx)
-        .await
-    {
-        Ok(g) => g,
-        Err(QueryFluxError::Unauthorized(msg)) => {
-            write_packet(writer, start_seq, &build_err(1227, &msg)).await?;
-            return Ok(());
-        }
-        Err(e) => {
-            write_packet(writer, start_seq, &build_err(1105, &e.to_string())).await?;
             return Ok(());
         }
     };

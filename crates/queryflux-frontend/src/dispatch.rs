@@ -350,9 +350,21 @@ pub async fn dispatch_query(
         }
     };
 
+    // dispatch_query is the async path only. Check this *before* running any
+    // translation/guard/hook work: a sync cluster selected by round-robin in a
+    // mixed group signals the caller to retry via execute_to_sink, which drives
+    // its own slot acquisition loop and runs that work itself — doing it here
+    // too would translate, guard-check, and hook-notify the query twice.
+    if matches!(adapter_kind, AdapterKind::Sync(_)) {
+        slot.release().await;
+        return Err(QueryFluxError::SyncEngineRequired(cluster_name.0.clone()));
+    }
+
     let tgt_dialect = adapter_kind.translation_target_dialect();
     let src_dialect = resolve_src_dialect(&session, &protocol);
     let engine_type = adapter_kind.engine_type();
+
+    let resolved_agent_ctx = session.resolved_agent_context();
 
     macro_rules! hook_ctx {
         ($sql:expr) => {
@@ -365,14 +377,59 @@ pub async fn dispatch_query(
                 engine_type: Some(&engine_type),
                 query_tags: &effective_tags,
                 auth: Some(auth_ctx),
+                rows: None,
+                execution_ms: None,
             }
         };
+    }
+
+    // A hook `Deny` is a query failure like any other: record it in query history
+    // (a fresh row, since no ExecutingQuery was ever persisted for it) so it doesn't
+    // silently vanish the way a guard-chain deny wouldn't.
+    macro_rules! hook_deny {
+        ($sql:expr, $message:expr) => {{
+            let ctx = QueryContext {
+                query_id: query_id.clone(),
+                sql: $sql,
+                session: session.clone(),
+                protocol: protocol.clone(),
+                group: group.clone(),
+                cluster: cluster_name.clone(),
+                cluster_group_config_id,
+                cluster_config_id,
+                engine_type: engine_type.clone(),
+                src_dialect: src_dialect.clone(),
+                tgt_dialect: tgt_dialect.clone(),
+                was_translated: false,
+                translated_sql: None,
+                query_tags: effective_tags.clone(),
+                query_params: vec![],
+                agent_context: resolved_agent_ctx.clone(),
+            };
+            state.record_query(
+                &ctx,
+                QueryOutcome {
+                    backend_query_id: None,
+                    status: QueryStatus::Failed,
+                    execution_ms: 0,
+                    rows: None,
+                    error: Some($message),
+                    routing_trace: None,
+                    engine_stats: None,
+                    guard_actions: vec![],
+                    was_guard_blocked: false,
+                    queue_duration_ms: 0,
+                    cache_hit: false,
+                },
+            );
+        }};
     }
 
     let sql = if !state.hooks.is_empty() {
         let mut ctx = hook_ctx!(sql.clone());
         let outcome = state.hooks.before_translate(&mut ctx).await;
         if let Some(err) = HookBus::deny_err(&outcome) {
+            hook_deny!(ctx.sql.clone(), err.to_string());
             slot.release().await;
             return Err(err);
         }
@@ -418,6 +475,7 @@ pub async fn dispatch_query(
     if !state.hooks.is_empty() {
         let outcome = state.hooks.after_translate(&hook_ctx!(sql.clone())).await;
         if let Some(err) = HookBus::deny_err(&outcome) {
+            hook_deny!(sql.clone(), err.to_string());
             slot.release().await;
             return Err(err);
         }
@@ -432,7 +490,6 @@ pub async fn dispatch_query(
 
     // Guard chain: runs after translation (SQL is final), before engine submission.
     // Global guards run first; per-group guards are appended after.
-    let resolved_agent_ctx = session.resolved_agent_context();
     let mut all_guard_actions: Vec<queryflux_persistence::GuardAction> = Vec::new();
     let sql_parse =
         queryflux_core::sql_classify::SqlParseCache::new(sql.clone(), tgt_dialect.clone());
@@ -493,14 +550,19 @@ pub async fn dispatch_query(
                     cache_hit: false,
                 },
             );
+            let err = QueryFluxError::Engine(deny_reason);
+            if !state.hooks.is_empty() {
+                state.hooks.on_error(&hook_ctx!(sql.clone()), &err).await;
+            }
             slot.release().await;
-            return Err(QueryFluxError::Engine(deny_reason));
+            return Err(err);
         }};
     }
 
     if !state.hooks.is_empty() {
         let outcome = state.hooks.before_guard(&hook_ctx!(sql.clone())).await;
         if let Some(err) = HookBus::deny_err(&outcome) {
+            hook_deny!(sql.clone(), err.to_string());
             slot.release().await;
             return Err(err);
         }
@@ -525,6 +587,7 @@ pub async fn dispatch_query(
     if !state.hooks.is_empty() {
         let outcome = state.hooks.after_guard(&hook_ctx!(sql.clone())).await;
         if let Some(err) = HookBus::deny_err(&outcome) {
+            hook_deny!(sql.clone(), err.to_string());
             slot.release().await;
             return Err(err);
         }
@@ -548,6 +611,7 @@ pub async fn dispatch_query(
     if !state.hooks.is_empty() {
         let outcome = state.hooks.before_execute(&hook_ctx!(sql.clone())).await;
         if let Some(err) = HookBus::deny_err(&outcome) {
+            hook_deny!(sql.clone(), err.to_string());
             slot.release().await;
             return Err(err);
         }
@@ -721,13 +785,7 @@ pub async fn dispatch_query(
                 }
             }
         }
-        AdapterKind::Sync(_) => {
-            // dispatch_query is the async path only. A sync cluster selected by
-            // round-robin in a mixed group signals the caller to retry via
-            // execute_to_sink, which will drive its own slot acquisition loop.
-            slot.release().await;
-            Err(QueryFluxError::SyncEngineRequired(cluster_name.0.clone()))
-        }
+        AdapterKind::Sync(_) => unreachable!("checked and returned early above"),
     }
 }
 
@@ -1152,12 +1210,13 @@ impl Drop for SyncCancelGuard {
         );
         if let (Some(state), Some(ctx)) = (self.state.take(), self.ctx.take()) {
             let backend_query_id = self.id_slot.get().map(|id| id.0);
+            let cancel_elapsed_ms = self.start.elapsed().as_millis() as u64;
             state.record_query(
                 &ctx,
                 QueryOutcome {
                     backend_query_id,
                     status: QueryStatus::Cancelled,
-                    execution_ms: self.start.elapsed().as_millis() as u64,
+                    execution_ms: cancel_elapsed_ms,
                     rows: None,
                     error: Some("client disconnected".to_string()),
                     routing_trace: None,
@@ -1183,6 +1242,8 @@ impl Drop for SyncCancelGuard {
                         engine_type: Some(&ctx.engine_type),
                         query_tags: &ctx.query_tags,
                         auth: None,
+                        rows: None,
+                        execution_ms: Some(cancel_elapsed_ms),
                     };
                     state.hooks.on_cancel(&hook_ctx).await;
                 });
@@ -1503,14 +1564,58 @@ async fn setup_sync_query(
                 engine_type: Some(&engine_type),
                 query_tags: &effective_tags,
                 auth: Some(auth_ctx),
+                rows: None,
+                execution_ms: None,
             }
         };
+    }
+
+    // Mirrors dispatch_query's hook_deny! — a hook Deny is a query failure like any
+    // other and must not silently vanish from query history.
+    macro_rules! sync_hook_deny {
+        ($sql:expr, $message:expr) => {{
+            let ctx = QueryContext {
+                query_id: query_id.clone(),
+                sql: $sql,
+                session: session.clone(),
+                protocol: protocol.clone(),
+                group: group.clone(),
+                cluster: cluster_name.clone(),
+                cluster_group_config_id,
+                cluster_config_id,
+                engine_type: engine_type.clone(),
+                src_dialect: src_dialect.clone(),
+                tgt_dialect: tgt_dialect.clone(),
+                was_translated: false,
+                translated_sql: None,
+                query_tags: effective_tags.clone(),
+                query_params: vec![],
+                agent_context: session.resolved_agent_context(),
+            };
+            state.record_query(
+                &ctx,
+                QueryOutcome {
+                    backend_query_id: None,
+                    status: QueryStatus::Failed,
+                    execution_ms: start.elapsed().as_millis() as u64,
+                    rows: None,
+                    error: Some($message),
+                    routing_trace: None,
+                    engine_stats: None,
+                    guard_actions: vec![],
+                    was_guard_blocked: false,
+                    queue_duration_ms: 0,
+                    cache_hit: false,
+                },
+            );
+        }};
     }
 
     let sql = if !state.hooks.is_empty() {
         let mut ctx = sync_hook_ctx!(sql.clone());
         let outcome = state.hooks.before_translate(&mut ctx).await;
         if let Some(err) = HookBus::deny_err(&outcome) {
+            sync_hook_deny!(ctx.sql.clone(), err.to_string());
             slot.release().await;
             return Err(err);
         }
@@ -1592,6 +1697,7 @@ async fn setup_sync_query(
             .after_translate(&sync_hook_ctx!(translated.clone()))
             .await;
         if let Some(err) = HookBus::deny_err(&outcome) {
+            sync_hook_deny!(translated.clone(), err.to_string());
             slot.release().await;
             return Err(err);
         }
@@ -2045,15 +2151,57 @@ pub async fn execute_to_sink(
                     engine_type: Some(&cache_engine_type),
                     query_tags: &effective_tags,
                     auth: Some(auth_ctx),
+                    rows: None,
+                    execution_ms: None,
                 }
             };
         }
+        macro_rules! cache_hook_deny {
+            ($message:expr) => {{
+                let ctx = QueryContext {
+                    query_id: ProxyQueryId::new(),
+                    sql: sql.chars().take(500).collect(),
+                    session: session.clone(),
+                    protocol: protocol.clone(),
+                    group: group.clone(),
+                    cluster: ClusterName("(cache)".to_string()),
+                    cluster_group_config_id: None,
+                    cluster_config_id: None,
+                    engine_type: queryflux_core::query::EngineType::Cache,
+                    src_dialect: queryflux_core::query::SqlDialect::Generic,
+                    tgt_dialect: queryflux_core::query::SqlDialect::Generic,
+                    was_translated: false,
+                    translated_sql: None,
+                    query_tags: effective_tags.clone(),
+                    query_params: vec![],
+                    agent_context: session.resolved_agent_context(),
+                };
+                state.record_query(
+                    &ctx,
+                    QueryOutcome {
+                        backend_query_id: None,
+                        status: QueryStatus::Failed,
+                        execution_ms: 0,
+                        rows: None,
+                        error: Some($message),
+                        routing_trace: None,
+                        engine_stats: None,
+                        guard_actions: vec![],
+                        was_guard_blocked: false,
+                        queue_duration_ms: 0,
+                        cache_hit: false,
+                    },
+                );
+            }};
+        }
+
         if !state.hooks.is_empty() {
             let outcome = state
                 .hooks
                 .before_guard(&cache_hook_ctx!(sql.clone()))
                 .await;
             if let Some(err) = HookBus::deny_err(&outcome) {
+                cache_hook_deny!(err.to_string());
                 return sink.on_error(&err.to_string()).await;
             }
         }
@@ -2069,12 +2217,22 @@ pub async fn execute_to_sink(
         .await
         {
             Ok(actions) => actions,
-            Err(deny_reason) => return sink.on_error(&deny_reason).await,
+            Err(deny_reason) => {
+                if !state.hooks.is_empty() {
+                    let err = QueryFluxError::Engine(deny_reason.clone());
+                    state
+                        .hooks
+                        .on_error(&cache_hook_ctx!(sql.clone()), &err)
+                        .await;
+                }
+                return sink.on_error(&deny_reason).await;
+            }
         };
 
         if !state.hooks.is_empty() {
             let outcome = state.hooks.after_guard(&cache_hook_ctx!(sql.clone())).await;
             if let Some(err) = HookBus::deny_err(&outcome) {
+                cache_hook_deny!(err.to_string());
                 return sink.on_error(&err.to_string()).await;
             }
         }
@@ -2090,10 +2248,12 @@ pub async fn execute_to_sink(
                 state.metrics.on_cache_hit(&group.0);
 
                 if !state.hooks.is_empty() {
-                    state
-                        .hooks
-                        .after_execute(&cache_hook_ctx!(sql.clone()))
-                        .await;
+                    let ctx = HookContext {
+                        rows: Some(_stats.row_count),
+                        execution_ms: Some(0),
+                        ..cache_hook_ctx!(sql.clone())
+                    };
+                    state.hooks.after_execute(&ctx).await;
                 }
 
                 let ctx = QueryContext {
@@ -2266,8 +2426,35 @@ async fn execute_to_sink_inner(
                 engine_type: Some(&setup.ctx.engine_type),
                 query_tags: &setup.ctx.query_tags,
                 auth: Some(auth_ctx),
+                rows: None,
+                execution_ms: None,
             }
         };
+    }
+
+    // Mirrors dispatch_query's hook_deny! — a hook Deny is a query failure like any
+    // other and must not silently vanish from query history.
+    macro_rules! sink_hook_deny {
+        ($message:expr) => {{
+            let mut deny_ctx = setup.ctx.clone();
+            deny_ctx.sql = setup.translated.clone();
+            state.record_query(
+                &deny_ctx,
+                QueryOutcome {
+                    backend_query_id: None,
+                    status: QueryStatus::Failed,
+                    execution_ms: setup.start.elapsed().as_millis() as u64,
+                    rows: None,
+                    error: Some($message),
+                    routing_trace: None,
+                    engine_stats: None,
+                    guard_actions: vec![],
+                    was_guard_blocked: false,
+                    queue_duration_ms: 0,
+                    cache_hit: false,
+                },
+            );
+        }};
     }
 
     if !state.hooks.is_empty() {
@@ -2276,6 +2463,7 @@ async fn execute_to_sink_inner(
             .before_guard(&sink_hook_ctx!(setup.translated.clone()))
             .await;
         if let Some(err) = HookBus::deny_err(&outcome) {
+            sink_hook_deny!(err.to_string());
             setup.slot.release().await;
             return sink.on_error(&err.to_string()).await;
         }
@@ -2327,6 +2515,13 @@ async fn execute_to_sink_inner(
                         cache_hit: false,
                     },
                 );
+                if !state.hooks.is_empty() {
+                    let err = QueryFluxError::Engine(deny_reason.clone());
+                    state
+                        .hooks
+                        .on_error(&sink_hook_ctx!(setup.translated.clone()), &err)
+                        .await;
+                }
                 return sink.on_error(&deny_reason).await;
             }
         }
@@ -2342,6 +2537,7 @@ async fn execute_to_sink_inner(
             .after_guard(&sink_hook_ctx!(setup.translated.clone()))
             .await;
         if let Some(err) = HookBus::deny_err(&outcome) {
+            sink_hook_deny!(err.to_string());
             setup.slot.release().await;
             return sink.on_error(&err.to_string()).await;
         }
@@ -2357,6 +2553,7 @@ async fn execute_to_sink_inner(
             .before_execute(&sink_hook_ctx!(setup.translated.clone()))
             .await;
         if let Some(err) = HookBus::deny_err(&outcome) {
+            sink_hook_deny!(err.to_string());
             setup.slot.release().await;
             return sink.on_error(&err.to_string()).await;
         }
@@ -2401,15 +2598,19 @@ async fn execute_to_sink_inner(
     if !state.hooks.is_empty() {
         if let Some(msg) = &outcome.error {
             let err = QueryFluxError::Engine(msg.clone());
-            state
-                .hooks
-                .on_error(&sink_hook_ctx!(setup.translated.clone()), &err)
-                .await;
+            let ctx = HookContext {
+                rows: outcome.rows,
+                execution_ms: Some(outcome.elapsed_ms),
+                ..sink_hook_ctx!(setup.translated.clone())
+            };
+            state.hooks.on_error(&ctx, &err).await;
         } else {
-            state
-                .hooks
-                .after_execute(&sink_hook_ctx!(setup.translated.clone()))
-                .await;
+            let ctx = HookContext {
+                rows: outcome.rows,
+                execution_ms: Some(outcome.elapsed_ms),
+                ..sink_hook_ctx!(setup.translated.clone())
+            };
+            state.hooks.after_execute(&ctx).await;
         }
     }
 

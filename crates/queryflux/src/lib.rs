@@ -1514,20 +1514,6 @@ impl QueryFluxBuilder {
             app_state.clone(),
         );
 
-        // --- Start Trino HTTP frontend (honors frontends.trinoHttp.enabled) ---
-        let trino_cfg = config.queryflux.frontends.trino_http.clone();
-        let trino_port = trino_cfg.port;
-
-        if trino_cfg.enabled {
-            info!(
-            "QueryFlux ready — Trino HTTP on :{trino_port}, admin/metrics on :{admin_port}, external address: {external_address}"
-        );
-        } else {
-            info!(
-            "QueryFlux ready — Trino HTTP disabled, admin/metrics on :{admin_port}, external address: {external_address}"
-        );
-        }
-
         if distributed {
             if config
                 .queryflux
@@ -2314,6 +2300,19 @@ impl QueryFlux {
             extra_frontends,
         } = self;
 
+        let admin_port = config.queryflux.admin_api.port;
+        let external_address = &app_state.external_address;
+        if config.queryflux.frontends.trino_http.enabled {
+            let trino_port = config.queryflux.frontends.trino_http.port;
+            info!(
+                "QueryFlux ready — Trino HTTP on :{trino_port}, admin/metrics on :{admin_port}, external address: {external_address}"
+            );
+        } else {
+            info!(
+                "QueryFlux ready — Trino HTTP disabled, admin/metrics on :{admin_port}, external address: {external_address}"
+            );
+        }
+
         // Spawn all enabled frontends as tasks. Each frontend observes `shutdown_rx`
         // internally: axum-based frontends use `with_graceful_shutdown` (stop accepting,
         // finish in-flight requests), wire-based frontends break their accept loop, and
@@ -3007,15 +3006,33 @@ async fn build_live_config(
                 continue;
             }
             // Resolve member: check base records first, then expanded variant names.
-            let record = match records_by_name.get(member_name.as_str()) {
-                Some(r) => *r,
-                None => match expanded_to_parent.get(member_name.as_str()) {
-                    Some(r) => *r,
-                    None => {
-                        tracing::warn!(group = %group_name, cluster = %member_name, "Reload: group references unknown cluster");
-                        continue;
-                    }
-                },
+            let record = records_by_name
+                .get(member_name.as_str())
+                .or_else(|| expanded_to_parent.get(member_name.as_str()))
+                .copied();
+            let Some(record) = record else {
+                // No DB record for this member — it may be a `.with_adapter()`-registered
+                // cluster instead, which by design has no backing ClusterConfigRecord.
+                // Mirrors the equivalent fallback in QueryFluxBuilder::build()'s Pass 2.
+                if let Some((_, adapter)) = registry
+                    .adapters
+                    .iter()
+                    .find(|(name, _)| name == member_name.as_str())
+                {
+                    states.push(Arc::new(ClusterState::new(
+                        ClusterName(member_name.clone()),
+                        group_key.clone(),
+                        None,
+                        group_ids_by_name.get(group_name.as_str()).copied(),
+                        adapter.engine_type(),
+                        None,
+                        group_config.max_running_queries,
+                        true,
+                    )));
+                } else {
+                    tracing::warn!(group = %group_name, cluster = %member_name, "Reload: group references unknown cluster");
+                }
+                continue;
             };
             if !cache.adapters.contains_key(member_name.as_str()) {
                 tracing::info!(group = %group_name, cluster = %member_name, "Reload: skipping disabled/missing cluster in group");

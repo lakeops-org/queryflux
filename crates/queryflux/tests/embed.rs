@@ -195,6 +195,9 @@ impl RouterTrait for AlwaysMockRouter {
 struct RecordingHook {
     before_execute: Mutex<Vec<String>>,
     errors: Mutex<Vec<String>>,
+    /// (sql, rows) from after_execute — proves outcome data reaches the hook, not
+    /// just the sql/session/protocol fields before_route already carries.
+    after_execute: Mutex<Vec<(String, Option<u64>)>>,
 }
 
 #[async_trait]
@@ -202,6 +205,13 @@ impl QueryHook for RecordingHook {
     async fn before_execute(&self, ctx: &HookContext<'_>) -> HookOutcome {
         self.before_execute.lock().unwrap().push(ctx.sql.clone());
         HookOutcome::Continue
+    }
+
+    async fn after_execute(&self, ctx: &HookContext<'_>) {
+        self.after_execute
+            .lock()
+            .unwrap()
+            .push((ctx.sql.clone(), ctx.rows));
     }
 
     async fn on_error(&self, ctx: &HookContext<'_>, err: &QueryFluxError) {
@@ -315,6 +325,11 @@ async fn hook_records_before_execute_and_on_error() {
     assert_eq!(
         hook.before_execute.lock().unwrap().as_slice(),
         ["SELECT 1".to_string()]
+    );
+    assert_eq!(
+        hook.after_execute.lock().unwrap().as_slice(),
+        [("SELECT 1".to_string(), Some(1))],
+        "after_execute must carry the real row count, not just sql/session/protocol"
     );
     assert!(hook.errors.lock().unwrap().is_empty());
 

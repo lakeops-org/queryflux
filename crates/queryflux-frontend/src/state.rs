@@ -188,20 +188,40 @@ impl AppState {
                 engine_type: None,
                 query_tags: session.tags(),
                 auth: auth_ctx,
+                rows: None,
+                execution_ms: None,
             };
             let outcome = self.hooks.before_route(&mut ctx).await;
             sql = ctx.sql;
             if let Some(err) = HookBus::deny_err(&outcome) {
+                self.record_routing_deny(&sql, session, protocol.clone(), &err.to_string(), None);
                 return Err(err);
             }
         }
 
-        let (result, trace) = {
+        let (mut result, mut trace) = {
             let live = self.live.read().await;
             live.router_chain
                 .route_with_trace(&sql, session, protocol, auth_ctx)
                 .await?
         };
+
+        // Resolve the final group now (authorization-aware first-fit when the chain
+        // fell back to the static default) so after_route hooks — and the
+        // ChainRouteResult this method returns — always reflect the group the query
+        // actually dispatches against, never a pre-fallback candidate. Skipped when
+        // there's no AuthContext to check authorization against (resolve_routed_group
+        // requires one unconditionally; a router that matched explicitly needs no
+        // resolution anyway, since it already returns early in that case).
+        if let (ChainRouteResult::Routed(routed), Some(auth)) = (&result, auth_ctx) {
+            match self
+                .resolve_routed_group(routed.clone(), &mut trace, auth)
+                .await
+            {
+                Ok(resolved) => result = ChainRouteResult::Routed(resolved),
+                Err(e) => return Err(e),
+            }
+        }
 
         if !self.hooks.is_empty() {
             let group = match &result {
@@ -217,9 +237,18 @@ impl AppState {
                 engine_type: None,
                 query_tags: session.tags(),
                 auth: auth_ctx,
+                rows: None,
+                execution_ms: None,
             };
             let outcome = self.hooks.after_route(&ctx).await;
             if let Some(err) = HookBus::deny_err(&outcome) {
+                self.record_routing_deny(
+                    &sql,
+                    session,
+                    protocol.clone(),
+                    &err.to_string(),
+                    Some(trace),
+                );
                 return Err(err);
             }
         }

@@ -24,6 +24,13 @@ use queryflux_core::{
 /// owned rather than borrowed so `before_route` / `before_translate` can rewrite it —
 /// the caller reads `ctx.sql` back after the hook call to pick up any change. There is
 /// deliberately no `query_id`: routing runs before every frontend mints one.
+///
+/// `rows` / `execution_ms` are `None` everywhere except where a result is actually
+/// known: `after_execute` and `on_error` on the sync (MySQL/Postgres/FlightSQL) and
+/// cache-hit paths. The async (Trino submit/poll) path's `after_execute` fires at
+/// submission-accepted, before the engine has produced a result, so both stay `None`
+/// there — polling for the final result happens in a separate code path this hook
+/// system doesn't observe yet.
 pub struct HookContext<'a> {
     pub sql: String,
     pub session: &'a SessionContext,
@@ -33,6 +40,8 @@ pub struct HookContext<'a> {
     pub engine_type: Option<&'a EngineType>,
     pub query_tags: &'a QueryTags,
     pub auth: Option<&'a AuthContext>,
+    pub rows: Option<u64>,
+    pub execution_ms: Option<u64>,
 }
 
 /// What a [`QueryHook`] callback wants dispatch to do next.

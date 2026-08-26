@@ -23,6 +23,7 @@ use uuid::Uuid;
 use crate::{
     admin::{cancel_executing_query, delete_queued_if_exists, find_executing_query},
     dispatch::execute_to_sink,
+    hook::{HookBus, HookContext},
     mcp::sink::JsonResultSink,
     state::AppState,
 };
@@ -273,14 +274,59 @@ async fn resolve_group(
     auth: &AuthContext,
 ) -> Result<(ClusterGroupName, String), McpError> {
     if let Some(hint) = engine_hint {
-        let live = state.live.read().await;
-        if live.group_members.contains_key(hint) {
-            return Ok((ClusterGroupName(hint.to_string()), sql));
+        // An explicit engine_hint skips RouterChain evaluation (the caller already
+        // named the group), but must not skip before_route/after_route hooks —
+        // every other frontend, and MCP calls without a hint, always run them.
+        let protocol = FrontendProtocol::Mcp;
+        let mut sql = sql;
+        if !state.hooks.is_empty() {
+            let mut ctx = HookContext {
+                sql: sql.clone(),
+                session,
+                protocol: &protocol,
+                group: None,
+                cluster: None,
+                engine_type: None,
+                query_tags: session.tags(),
+                auth: Some(auth),
+                rows: None,
+                execution_ms: None,
+            };
+            let outcome = state.hooks.before_route(&mut ctx).await;
+            sql = ctx.sql;
+            if let Some(err) = HookBus::deny_err(&outcome) {
+                return Err(McpError::invalid_request(err.to_string(), None));
+            }
         }
-        return Err(McpError::invalid_params(
-            format!("Unknown engine group: {hint}"),
-            None,
-        ));
+
+        if !state.live.read().await.group_members.contains_key(hint) {
+            return Err(McpError::invalid_params(
+                format!("Unknown engine group: {hint}"),
+                None,
+            ));
+        }
+        let group = ClusterGroupName(hint.to_string());
+
+        if !state.hooks.is_empty() {
+            let ctx = HookContext {
+                sql: sql.clone(),
+                session,
+                protocol: &protocol,
+                group: Some(&group),
+                cluster: None,
+                engine_type: None,
+                query_tags: session.tags(),
+                auth: Some(auth),
+                rows: None,
+                execution_ms: None,
+            };
+            let outcome = state.hooks.after_route(&ctx).await;
+            if let Some(err) = HookBus::deny_err(&outcome) {
+                return Err(McpError::invalid_request(err.to_string(), None));
+            }
+        }
+
+        return Ok((group, sql));
     }
 
     let (sql, decision, _trace) = state
