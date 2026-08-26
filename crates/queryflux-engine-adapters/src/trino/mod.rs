@@ -1366,6 +1366,22 @@ impl crate::EngineAdapterFactory for TrinoFactory {
             config,
         ))))
     }
+
+    async fn build_from_cluster_config(
+        &self,
+        cluster_name: ClusterName,
+        group: ClusterGroupName,
+        cfg: &ClusterConfig,
+        cluster_name_str: &str,
+    ) -> Result<crate::AdapterKind> {
+        use crate::EngineConfigParseable;
+        let config = TrinoConfig::from_cluster_config(cfg, cluster_name_str)?;
+        Ok(AdapterKind::Async(Arc::new(TrinoAdapter::new(
+            cluster_name,
+            group,
+            config,
+        ))))
+    }
 }
 
 fn trino_cancel_succeeded(status: StatusCode) -> bool {

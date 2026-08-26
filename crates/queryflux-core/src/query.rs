@@ -73,6 +73,12 @@ pub enum FrontendProtocol {
     SnowflakeSqlApi,
     /// Model Context Protocol (streamable HTTP) — MCP tool calls from AI agents.
     Mcp,
+    /// An embedder-registered frontend not shipped in-tree. `name` identifies it for
+    /// history/routing traces; `dialect` is the SQL dialect its clients speak.
+    Custom {
+        name: String,
+        dialect: SqlDialect,
+    },
 }
 
 impl FrontendProtocol {
@@ -87,6 +93,7 @@ impl FrontendProtocol {
             FrontendProtocol::SnowflakeHttp | FrontendProtocol::SnowflakeSqlApi => {
                 SqlDialect::Snowflake
             }
+            FrontendProtocol::Custom { dialect, .. } => dialect.clone(),
         }
     }
 }
@@ -128,6 +135,10 @@ pub enum EngineType {
     Undispatched,
     /// Result served from cache — no backend engine involved.
     Cache,
+    /// An embedder-registered engine not shipped in-tree. Adapters that need a dialect
+    /// other than [`SqlDialect::Generic`] should override `translation_target_dialect()`
+    /// rather than relying on this variant's `dialect()`.
+    Custom(String),
 }
 
 impl EngineType {
@@ -151,6 +162,7 @@ impl EngineType {
             EngineType::SingleStore => SqlDialect::MySql,
             EngineType::Undispatched => SqlDialect::Generic,
             EngineType::Cache => SqlDialect::Generic,
+            EngineType::Custom(_) => SqlDialect::Generic,
         }
     }
 }

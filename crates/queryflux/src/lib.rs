@@ -6,6 +6,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use async_trait::async_trait;
 use queryflux_auth::{
     AllowAllAuthorization, BackendIdentityResolver, LdapAuthProvider, NoneAuthProvider,
     OidcAuthProvider, OpenFgaAuthorizationClient, SimpleAuthorizationPolicy, StaticAuthProvider,
@@ -91,10 +92,92 @@ pub async fn run_migration(config: &str) -> Result<()> {
     Ok(())
 }
 
+/// A frontend constructed lazily once `AppState` exists, since most frontends need it
+/// to dispatch queries (e.g. via `execute_to_sink`).
+pub type FrontendFactory = Box<
+    dyn FnOnce(Arc<queryflux_frontend::state::AppState>) -> Box<dyn FrontendListenerTrait> + Send,
+>;
+
+/// Extra plugins (engines, guards, routers, frontends, strategies, translation scripts)
+/// registered on a [`QueryFluxBuilder`]. Re-applied on every `LiveConfig` rebuild —
+/// initial load and hot reload alike — so extras survive an admin-API config reload.
+#[derive(Default)]
+pub struct PluginRegistry {
+    engines: Vec<Arc<dyn queryflux_engine_adapters::EngineAdapterFactory>>,
+    /// Pre-built adapters registered via `.with_adapter(cluster, AdapterKind)` — config
+    /// never round-trips through core for these; the embedder constructs them directly.
+    adapters: Vec<(String, queryflux_engine_adapters::AdapterKind)>,
+    guards: Vec<Arc<dyn Guard>>,
+    group_guards: HashMap<String, Vec<Arc<dyn Guard>>>,
+    routers_prepend: Vec<Arc<dyn RouterTrait>>,
+    routers_append: Vec<Arc<dyn RouterTrait>>,
+    strategies:
+        HashMap<String, Arc<dyn queryflux_cluster_manager::strategy::ClusterSelectionStrategy>>,
+    translation_scripts: Vec<String>,
+    auth_provider: Option<Arc<dyn queryflux_auth::AuthProvider>>,
+}
+
+impl PluginRegistry {
+    fn merge_builtin_engines(&mut self) {
+        self.engines.extend(
+            registered_engines::all_factories()
+                .into_iter()
+                .map(Arc::from),
+        );
+    }
+}
+
+/// A [`Guard`] wrapping a shared, reusable `Arc<dyn Guard>` so the same registered
+/// plugin guard can be re-inserted into a fresh `GuardChain` on every reload without
+/// requiring `Guard: Clone`.
+struct SharedGuard(Arc<dyn Guard>);
+
+#[async_trait]
+impl Guard for SharedGuard {
+    fn name(&self) -> &'static str {
+        self.0.name()
+    }
+    fn layer(&self) -> queryflux_guardrails::context::GuardLayer {
+        self.0.layer()
+    }
+    async fn check(
+        &self,
+        ctx: &queryflux_guardrails::context::GuardContext<'_>,
+    ) -> queryflux_guardrails::context::GuardResult {
+        self.0.check(ctx).await
+    }
+}
+
+/// A [`RouterTrait`] wrapping a shared, reusable `Arc<dyn RouterTrait>` — same rationale
+/// as [`SharedGuard`], for routers re-inserted into a fresh `RouterChain` on every reload.
+struct SharedRouter(Arc<dyn RouterTrait>);
+
+#[async_trait]
+impl RouterTrait for SharedRouter {
+    fn type_name(&self) -> &'static str {
+        self.0.type_name()
+    }
+    async fn route(
+        &self,
+        sql: &str,
+        session: &queryflux_core::session::SessionContext,
+        frontend_protocol: &queryflux_core::query::FrontendProtocol,
+        auth_ctx: Option<&queryflux_auth::AuthContext>,
+    ) -> queryflux_core::error::Result<queryflux_routing::RoutingDecision> {
+        self.0
+            .route(sql, session, frontend_protocol, auth_ctx)
+            .await
+    }
+}
+
 /// Builder for a [`QueryFlux`] instance. Construct with [`QueryFlux::builder`].
 #[derive(Default)]
 pub struct QueryFluxBuilder {
     config_path: Option<String>,
+    registry: PluginRegistry,
+    /// Kept separate from `registry`: `FnOnce` factories aren't `Sync`, and `registry`
+    /// is wrapped in `Arc` for the reload loop to share, which requires `Sync`.
+    frontends: Vec<FrontendFactory>,
 }
 
 impl QueryFluxBuilder {
@@ -107,7 +190,99 @@ impl QueryFluxBuilder {
     /// Register the engines/frontends the shipped `queryflux` binary ships with.
     /// Embedders that only want a subset of built-in engines can skip this and
     /// register individual plugins instead.
-    pub fn with_builtin_plugins(self) -> Self {
+    pub fn with_builtin_plugins(mut self) -> Self {
+        self.registry.merge_builtin_engines();
+        self
+    }
+
+    /// Register an extra backend engine, constructible via the admin API's
+    /// `engine_key` → factory lookup (not YAML — see the crate-level docs).
+    pub fn engine(
+        mut self,
+        factory: Box<dyn queryflux_engine_adapters::EngineAdapterFactory>,
+    ) -> Self {
+        self.registry.engines.push(Arc::from(factory));
+        self
+    }
+
+    /// Register a pre-built adapter directly under `cluster`, bypassing config
+    /// parsing entirely. Placed in the `"_"` placeholder group like every other
+    /// adapter at construction time; a router or `cluster_groups` entry assigns it
+    /// to a real group.
+    pub fn with_adapter(
+        mut self,
+        cluster: impl Into<String>,
+        adapter: queryflux_engine_adapters::AdapterKind,
+    ) -> Self {
+        self.registry.adapters.push((cluster.into(), adapter));
+        self
+    }
+
+    /// Register an extra guard, appended after the YAML/DB guard chain (global — runs
+    /// for every query regardless of cluster group).
+    pub fn guard(mut self, guard: Box<dyn Guard>) -> Self {
+        self.registry.guards.push(Arc::from(guard));
+        self
+    }
+
+    /// Register an extra guard for one cluster group, appended after that group's
+    /// YAML/DB guard chain.
+    pub fn group_guard(mut self, group: impl Into<String>, guard: Box<dyn Guard>) -> Self {
+        self.registry
+            .group_guards
+            .entry(group.into())
+            .or_default()
+            .push(Arc::from(guard));
+        self
+    }
+
+    /// Register an extra router, evaluated before the YAML/DB router chain (first look).
+    pub fn router_prepend(mut self, router: Box<dyn RouterTrait>) -> Self {
+        self.registry.routers_prepend.push(Arc::from(router));
+        self
+    }
+
+    /// Register an extra router, evaluated after the YAML/DB router chain but before
+    /// the static fallback group.
+    pub fn router_append(mut self, router: Box<dyn RouterTrait>) -> Self {
+        self.registry.routers_append.push(Arc::from(router));
+        self
+    }
+
+    /// Override the cluster-selection strategy for `group`, in place of whatever YAML
+    /// configures (or the round-robin default).
+    pub fn strategy(
+        mut self,
+        group: impl Into<String>,
+        strategy: Arc<dyn queryflux_cluster_manager::strategy::ClusterSelectionStrategy>,
+    ) -> Self {
+        self.registry.strategies.insert(group.into(), strategy);
+        self
+    }
+
+    /// Register an extra post-sqlglot Python translation fixup, merged into every
+    /// group's translation script chain alongside YAML/DB `user_scripts`.
+    pub fn translation_script(mut self, script: impl Into<String>) -> Self {
+        self.registry.translation_scripts.push(script.into());
+        self
+    }
+
+    /// Register an extra frontend, spawned once at [`QueryFlux::serve`]. Frontends need
+    /// `Arc<AppState>` to dispatch queries, so this takes a factory rather than a
+    /// pre-built listener.
+    pub fn frontend(
+        mut self,
+        factory: impl FnOnce(Arc<queryflux_frontend::state::AppState>) -> Box<dyn FrontendListenerTrait>
+            + Send
+            + 'static,
+    ) -> Self {
+        self.frontends.push(Box::new(factory));
+        self
+    }
+
+    /// Override authentication entirely, skipping the YAML/DB auth provider build.
+    pub fn auth_provider(mut self, provider: Arc<dyn queryflux_auth::AuthProvider>) -> Self {
+        self.registry.auth_provider = Some(provider);
         self
     }
 
@@ -121,6 +296,8 @@ impl QueryFluxBuilder {
                 "QueryFluxBuilder: config_path not set — call .config_path(...) before .build()"
             )
         })?;
+        let registry = Arc::new(self.registry);
+        let extra_frontends = self.frontends;
 
         let mut config = YamlFileConfigProvider::new(&config_path)
             .load()
@@ -476,7 +653,7 @@ impl QueryFluxBuilder {
 
         // Build the engine registry up front so it can be used for validation and AppState.
         let engine_registry = Arc::new(queryflux_core::engine_registry::EngineRegistry::new(
-            registered_engines::all_descriptors(),
+            registered_engines::all_descriptors(&registry.engines),
         ));
 
         // --- Validate cluster configs against the engine registry ---
@@ -524,6 +701,7 @@ impl QueryFluxBuilder {
                     let cluster_name = ClusterName(record.name.clone());
                     let placeholder_group = ClusterGroupName("_".to_string());
                     match registered_engines::build_adapter_from_record(
+                        &registry.engines,
                         cluster_name,
                         placeholder_group,
                         &record.engine_key,
@@ -565,6 +743,7 @@ impl QueryFluxBuilder {
                         let cluster_name = ClusterName(exp.expanded_name.clone());
                         let placeholder_group = ClusterGroupName("_".to_string());
                         match registered_engines::build_adapter_from_record(
+                            &registry.engines,
                             cluster_name,
                             placeholder_group,
                             &record.engine_key,
@@ -595,6 +774,7 @@ impl QueryFluxBuilder {
                 let cluster_name = ClusterName(cluster_name_str.clone());
                 let placeholder_group = ClusterGroupName("_".to_string());
                 match registered_engines::build_adapter(
+                    &registry.engines,
                     cluster_name,
                     placeholder_group,
                     cluster_cfg,
@@ -614,6 +794,12 @@ impl QueryFluxBuilder {
                     }
                 }
             }
+        }
+
+        // Extra adapters registered via `.with_adapter(cluster, AdapterKind)` — config
+        // never round-trips through core for these; they're already fully built.
+        for (cluster_name_str, adapter) in &registry.adapters {
+            adapters.insert(cluster_name_str.clone(), adapter.clone());
         }
 
         // Pass 2 — one group entry per cluster_group, resolving member cluster names.
@@ -683,8 +869,11 @@ impl QueryFluxBuilder {
                 states.push(state);
             }
 
-            let strategy = strategy_from_config(group_config.strategy.as_ref())
-                .context(format!("group '{group_name}' cluster-selection strategy"))?;
+            let strategy = match registry.strategies.get(group_name) {
+                Some(s) => s.clone(),
+                None => strategy_from_config(group_config.strategy.as_ref())
+                    .context(format!("group '{group_name}' cluster-selection strategy"))?,
+            };
             group_members.insert(group_name.clone(), group_config.members.clone());
             group_order.push(group_name.clone());
             group_states.insert(group_key, (states, strategy));
@@ -793,13 +982,24 @@ impl QueryFluxBuilder {
             }
         }
 
+        // Extra routers prepend (first look, before YAML/DB routers) or append (after
+        // YAML/DB routers, before the static fallback), per how they were registered.
+        for r in registry.routers_prepend.iter().rev() {
+            routers.insert(0, Box::new(SharedRouter(r.clone())));
+        }
+        for r in &registry.routers_append {
+            routers.push(Box::new(SharedRouter(r.clone())));
+        }
         let router_chain = RouterChain::new(routers, fallback);
 
         config
             .validate_startup_security()
             .map_err(|e| anyhow::anyhow!("Startup security validation failed: {e}"))?;
 
-        let auth_provider = build_auth_provider(&config.auth)?;
+        let auth_provider = match &registry.auth_provider {
+            Some(p) => p.clone(),
+            None => build_auth_provider(&config.auth)?,
+        };
         let authorization = build_authorization(
             &config.authorization,
             &config.cluster_groups,
@@ -899,7 +1099,8 @@ impl QueryFluxBuilder {
         let identity_resolver = Arc::new(BackendIdentityResolver::new());
         let cluster_configs = config.clusters.clone();
 
-        let group_translation_scripts: HashMap<String, Vec<String>> = if let Some(pg) = &backend {
+        let mut group_translation_scripts: HashMap<String, Vec<String>> = if let Some(pg) = &backend
+        {
             pg.load_group_translation_bodies()
                 .await
                 .unwrap_or_else(|e| {
@@ -909,6 +1110,14 @@ impl QueryFluxBuilder {
         } else {
             HashMap::new()
         };
+        if !registry.translation_scripts.is_empty() {
+            for name in config.cluster_groups.keys() {
+                group_translation_scripts
+                    .entry(name.clone())
+                    .or_default()
+                    .extend(registry.translation_scripts.iter().cloned());
+            }
+        }
         let guard_script_bodies =
             load_guard_script_bodies(backend.as_deref().map(|b| b as &dyn AdminStore)).await;
 
@@ -917,11 +1126,13 @@ impl QueryFluxBuilder {
         // resolves to an empty chain (the user may have intentionally cleared guards).
         let (guard_chain, group_guard_chains) = if let Some(pg) = &backend {
             match pg.get_proxy_setting("guardrails_config").await {
-                Ok(Some(v)) => build_guard_chains_from_db_value(&v, &guard_script_bodies),
-                _ => build_guard_chains(&config, &guard_script_bodies),
+                Ok(Some(v)) => {
+                    build_guard_chains_from_db_value(&v, &guard_script_bodies, &registry)
+                }
+                _ => build_guard_chains(&config, &guard_script_bodies, &registry),
             }
         } else {
-            build_guard_chains(&config, &guard_script_bodies)
+            build_guard_chains(&config, &guard_script_bodies, &registry)
         };
 
         // --- Startup validation: referential integrity of routing → groups → adapters ---
@@ -1229,18 +1440,23 @@ impl QueryFluxBuilder {
             backend.is_some(),
         ));
 
-        let test_cluster_fn: TestClusterFn = Arc::new(|engine_key, config_json| {
-            Box::pin(async move {
-                let adapter = registered_engines::build_adapter_from_record(
-                    ClusterName("__test__".to_string()),
-                    ClusterGroupName("__test__".to_string()),
-                    &engine_key,
-                    &config_json,
-                )
-                .await?;
-                Ok(adapter.health_check().await)
+        let test_cluster_fn: TestClusterFn = {
+            let registry = registry.clone();
+            Arc::new(move |engine_key, config_json| {
+                let registry = registry.clone();
+                Box::pin(async move {
+                    let adapter = registered_engines::build_adapter_from_record(
+                        &registry.engines,
+                        ClusterName("__test__".to_string()),
+                        ClusterGroupName("__test__".to_string()),
+                        &engine_key,
+                        &config_json,
+                    )
+                    .await?;
+                    Ok(adapter.health_check().await)
+                })
             })
-        });
+        };
 
         let admin_store_for_reload = admin_store.clone();
         let cors_origins = config.queryflux.admin_api.cors_allowed_origins.clone();
@@ -1670,6 +1886,7 @@ impl QueryFluxBuilder {
             let notify = config_reload_notify.clone();
             let admin_for_reload = admin_store_for_reload;
             let metrics = app_state.metrics.clone();
+            let registry = registry.clone();
             let periodic_secs = config.queryflux.periodic_config_reload_interval_secs();
             let mut shutdown_rx = shutdown_rx.clone();
 
@@ -1697,6 +1914,7 @@ impl QueryFluxBuilder {
                     cache: &tokio::sync::Mutex<AdapterReloadCache>,
                     live: &Arc<tokio::sync::RwLock<LiveConfig>>,
                     metrics: &Arc<dyn MetricsStore>,
+                    registry: &Arc<PluginRegistry>,
                 ) {
                     let mut cache_guard = cache.lock().await;
                     // Snapshot the pieces a reload must never silently weaken; the
@@ -1710,7 +1928,9 @@ impl QueryFluxBuilder {
                             group_guard_chains: l.group_guard_chains.clone(),
                         }
                     };
-                    match reload_live_config(backend, &mut cache_guard, &prev, metrics).await {
+                    match reload_live_config(backend, &mut cache_guard, &prev, metrics, registry)
+                        .await
+                    {
                         Ok(new_live) => {
                             *live.write().await = new_live;
                             tracing::info!("Live config reloaded from backend");
@@ -1726,22 +1946,32 @@ impl QueryFluxBuilder {
                     admin: &Option<Arc<dyn AdminStore>>,
                     live: &Arc<tokio::sync::RwLock<LiveConfig>>,
                     metrics: &Arc<dyn MetricsStore>,
+                    registry: &Arc<PluginRegistry>,
                 ) {
                     if let Some(store) = admin {
                         let guard_script_bodies =
                             load_guard_script_bodies_from_admin(store.as_ref()).await;
                         match store.get_proxy_setting("guardrails_config").await {
                             Ok(Some(v)) => {
-                                let (global, groups) =
-                                    build_guard_chains_from_db_value(&v, &guard_script_bodies);
+                                let (global, groups) = build_guard_chains_from_db_value(
+                                    &v,
+                                    &guard_script_bodies,
+                                    registry,
+                                );
                                 let mut w = live.write().await;
                                 w.guard_chain = global;
                                 w.group_guard_chains = groups;
                             }
                             Ok(None) => {
+                                // No DB-stored guardrails config — registry extras still apply.
+                                let (global, groups) = build_guard_chains_from_db_value(
+                                    &serde_json::Value::Null,
+                                    &guard_script_bodies,
+                                    registry,
+                                );
                                 let mut w = live.write().await;
-                                w.guard_chain = None;
-                                w.group_guard_chains = HashMap::new();
+                                w.guard_chain = global;
+                                w.group_guard_chains = groups;
                             }
                             Err(e) => {
                                 metrics.on_config_reload_failure("guard_reload");
@@ -1757,16 +1987,17 @@ impl QueryFluxBuilder {
                     live: &Arc<tokio::sync::RwLock<LiveConfig>>,
                     admin: &Option<Arc<dyn AdminStore>>,
                     metrics: &Arc<dyn MetricsStore>,
+                    registry: &Arc<PluginRegistry>,
                 ) {
                     if let Some(backend) = backend {
-                        do_reload(backend, cache, live, metrics).await;
+                        do_reload(backend, cache, live, metrics, registry).await;
                     } else {
                         // YAML-mode reload contract: without a Postgres backend, routing rules,
                         // cluster configs, and adapters are fixed at startup from the YAML file
                         // and cannot change at runtime. Only guard chains (stored in the admin
                         // store) can be hot-reloaded via the admin API. Routing or cluster
                         // changes in YAML require a process restart.
-                        reload_guard_chain_from_admin(admin, live, metrics).await;
+                        reload_guard_chain_from_admin(admin, live, metrics, registry).await;
                     }
                 }
 
@@ -1818,8 +2049,15 @@ impl QueryFluxBuilder {
                             }
                         }
                         coalesce_revisions(&mut revision_rx).await;
-                        do_reload_or_guard(&backend, &cache, &live, &admin_for_reload, &metrics)
-                            .await;
+                        do_reload_or_guard(
+                            &backend,
+                            &cache,
+                            &live,
+                            &admin_for_reload,
+                            &metrics,
+                            &registry,
+                        )
+                        .await;
                     },
                     Some(interval_secs) => {
                         let mut interval =
@@ -1843,6 +2081,7 @@ impl QueryFluxBuilder {
                                 &live,
                                 &admin_for_reload,
                                 &metrics,
+                                &registry,
                             )
                             .await;
                         }
@@ -1998,6 +2237,8 @@ impl QueryFluxBuilder {
             config,
             shutdown_tx,
             shutdown_rx,
+            registry,
+            extra_frontends,
         })
     }
 }
@@ -2011,6 +2252,8 @@ pub struct QueryFlux {
     config: queryflux_core::config::ProxyConfig,
     shutdown_tx: tokio::sync::watch::Sender<bool>,
     shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    registry: Arc<PluginRegistry>,
+    extra_frontends: Vec<FrontendFactory>,
 }
 
 impl QueryFlux {
@@ -2036,6 +2279,8 @@ impl QueryFlux {
             config,
             shutdown_tx,
             shutdown_rx,
+            registry: _registry,
+            extra_frontends,
         } = self;
 
         // Spawn all enabled frontends as tasks. Each frontend observes `shutdown_rx`
@@ -2132,6 +2377,19 @@ impl QueryFlux {
             }
         });
 
+        // Embedder-registered extra frontends (`.frontend(...)`). Spawned the same way
+        // as the built-ins, but collected in a `Vec` since there can be any number of
+        // them — they don't participate in the named-branch `select!` below that logs
+        // an unexpected built-in exit, but they do observe `shutdown_rx` and are joined
+        // during the drain phase like every other frontend.
+        let mut extra_handles = Vec::with_capacity(extra_frontends.len());
+        for make_frontend in extra_frontends {
+            let state = app_state.clone();
+            let rx = shutdown_rx.clone();
+            let frontend = make_frontend(state);
+            extra_handles.push(tokio::spawn(async move { frontend.listen(rx).await }));
+        }
+
         // Wait for either a shutdown signal or an unexpected frontend exit.
         let shutdown_signal = async {
             let ctrl_c = tokio::signal::ctrl_c();
@@ -2185,6 +2443,7 @@ impl QueryFlux {
                 snowflake_handle,
                 mcp_handle,
             );
+            let _ = futures::future::join_all(extra_handles).await;
 
             // Poll persistence until no executing or queued queries remain (or until
             // the outer timeout fires). This covers spawned wire-protocol connection
@@ -2504,9 +2763,18 @@ async fn build_live_config(
     group_ids_by_name: &HashMap<String, i64>,
     routers_cfg: &[queryflux_core::config::RouterConfig],
     routing_fallback: &str,
-    group_translation_scripts: HashMap<String, Vec<String>>,
+    mut group_translation_scripts: HashMap<String, Vec<String>>,
     cache: &mut AdapterReloadCache,
+    registry: &Arc<PluginRegistry>,
 ) -> Result<LiveConfig> {
+    if !registry.translation_scripts.is_empty() {
+        for name in cluster_groups.keys() {
+            group_translation_scripts
+                .entry(name.clone())
+                .or_default()
+                .extend(registry.translation_scripts.iter().cloned());
+        }
+    }
     use queryflux_cluster_manager::{
         cluster_state::ClusterState,
         simple::SimpleClusterGroupManager,
@@ -2607,6 +2875,7 @@ async fn build_live_config(
         let cluster_name = ClusterName(cluster_name_str.clone());
         let placeholder_group = ClusterGroupName("_".to_string());
         let adapter = match registered_engines::build_adapter_from_record(
+            &registry.engines,
             cluster_name,
             placeholder_group,
             &record.engine_key,
@@ -2655,6 +2924,7 @@ async fn build_live_config(
         let cluster_name = ClusterName(expanded_name.clone());
         let placeholder_group = ClusterGroupName("_".to_string());
         let adapter = match registered_engines::build_adapter_from_record(
+            &registry.engines,
             cluster_name,
             placeholder_group,
             &parent.engine_key,
@@ -2781,26 +3051,30 @@ async fn build_live_config(
             states.push(state);
         }
 
-        let strategy = match strategy_from_config(group_config.strategy.as_ref()) {
-            Ok(s) => {
-                cache.strategies.insert(group_name.clone(), s.clone());
-                s
-            }
-            Err(e) => {
-                if let Some(prev) = cache.strategies.get(group_name.as_str()) {
-                    tracing::warn!(
-                        group = %group_name,
-                        error = %e,
-                        "Reload: failed to build cluster-selection strategy; keeping this group's previous strategy"
-                    );
-                    prev.clone()
-                } else {
-                    tracing::warn!(
-                        group = %group_name,
-                        error = %e,
-                        "Reload: failed to build cluster-selection strategy; no previous strategy cached, falling back to round robin"
-                    );
-                    Arc::new(RoundRobinStrategy::new())
+        let strategy = if let Some(s) = registry.strategies.get(group_name) {
+            s.clone()
+        } else {
+            match strategy_from_config(group_config.strategy.as_ref()) {
+                Ok(s) => {
+                    cache.strategies.insert(group_name.clone(), s.clone());
+                    s
+                }
+                Err(e) => {
+                    if let Some(prev) = cache.strategies.get(group_name.as_str()) {
+                        tracing::warn!(
+                            group = %group_name,
+                            error = %e,
+                            "Reload: failed to build cluster-selection strategy; keeping this group's previous strategy"
+                        );
+                        prev.clone()
+                    } else {
+                        tracing::warn!(
+                            group = %group_name,
+                            error = %e,
+                            "Reload: failed to build cluster-selection strategy; no previous strategy cached, falling back to round robin"
+                        );
+                        Arc::new(RoundRobinStrategy::new())
+                    }
                 }
             }
         };
@@ -2980,6 +3254,12 @@ async fn build_live_config(
             }
         }
     }
+    for r in registry.routers_prepend.iter().rev() {
+        routers.insert(0, Box::new(SharedRouter(r.clone())));
+    }
+    for r in &registry.routers_append {
+        routers.push(Box::new(SharedRouter(r.clone())));
+    }
     let router_chain = RouterChain::new(routers, fallback);
 
     let group_default_tags: HashMap<String, QueryTags> = cluster_groups
@@ -3085,6 +3365,7 @@ async fn reload_live_config(
     cache: &mut AdapterReloadCache,
     prev: &PreservedLive,
     metrics: &Arc<dyn MetricsStore>,
+    registry: &Arc<PluginRegistry>,
 ) -> Result<LiveConfig> {
     let cluster_records = pg
         .list_cluster_configs()
@@ -3157,8 +3438,16 @@ async fn reload_live_config(
         &routing_fallback,
         group_translation_scripts,
         cache,
+        registry,
     )
     .await?;
+
+    // Extra adapters registered via `.with_adapter(cluster, AdapterKind)` — not backed
+    // by any DB row, so `build_live_config` never sees them; keep them alive across reload.
+    for (cluster_name_str, adapter) in &registry.adapters {
+        live.adapters
+            .insert(cluster_name_str.clone(), adapter.clone());
+    }
 
     // Carry forward the pieces build_live_config seeds with placeholders. The
     // DB reads below only *override* these on success — a missing row or a
@@ -3173,7 +3462,8 @@ async fn reload_live_config(
     // "never configured via admin" — keep the previous (e.g. YAML) chains.
     match pg.get_proxy_setting("guardrails_config").await {
         Ok(Some(v)) => {
-            let (global, groups) = build_guard_chains_from_db_value(&v, &guard_script_bodies);
+            let (global, groups) =
+                build_guard_chains_from_db_value(&v, &guard_script_bodies, registry);
             live.guard_chain = global;
             live.group_guard_chains = groups;
         }
@@ -3453,6 +3743,7 @@ fn make_http_webhook_guard(
 fn build_chain_from_yaml_specs(
     specs: &[queryflux_core::config::GuardSpecConfig],
     guard_script_bodies: &HashMap<i64, String>,
+    extra: &[Arc<dyn Guard>],
 ) -> Option<Arc<GuardChain>> {
     use queryflux_core::config::{GuardFailBehaviorConfig, GuardKindConfig};
     let mut guards: Vec<Box<dyn Guard>> = Vec::new();
@@ -3488,6 +3779,9 @@ fn build_chain_from_yaml_specs(
             }
         }
     }
+    for g in extra {
+        guards.push(Box::new(SharedGuard(g.clone())));
+    }
     if guards.is_empty() {
         None
     } else {
@@ -3495,23 +3789,48 @@ fn build_chain_from_yaml_specs(
     }
 }
 
-/// Build global + per-group guard chains from the YAML `guardrails:` section.
+/// Build global + per-group guard chains from the YAML `guardrails:` section, with
+/// `registry`'s extra guards appended after the YAML chain (global to `guards`, per-group
+/// to `group_guards`). A group with no YAML guards still gets a chain if the registry has
+/// extras for it — this must not early-return `(None, {})` before extras are applied.
 fn build_guard_chains(
     config: &queryflux_core::config::ProxyConfig,
     guard_script_bodies: &HashMap<i64, String>,
+    registry: &PluginRegistry,
 ) -> (Option<Arc<GuardChain>>, HashMap<String, Arc<GuardChain>>) {
-    let Some(cfg) = config.guardrails.as_ref() else {
-        return (None, HashMap::new());
-    };
-    let global = build_chain_from_yaml_specs(&cfg.global, guard_script_bodies);
-    let groups = cfg
-        .groups
-        .iter()
-        .filter_map(|(name, specs)| {
-            build_chain_from_yaml_specs(specs, guard_script_bodies)
-                .map(|chain| (name.clone(), chain))
+    let empty: Vec<queryflux_core::config::GuardSpecConfig> = Vec::new();
+    let global_specs: &[queryflux_core::config::GuardSpecConfig] = config
+        .guardrails
+        .as_ref()
+        .map(|cfg| cfg.global.as_slice())
+        .unwrap_or(&empty);
+    let global = build_chain_from_yaml_specs(global_specs, guard_script_bodies, &registry.guards);
+
+    let mut groups: HashMap<String, Arc<GuardChain>> = config
+        .guardrails
+        .as_ref()
+        .map(|cfg| {
+            cfg.groups
+                .iter()
+                .filter_map(|(name, specs)| {
+                    let extra = registry
+                        .group_guards
+                        .get(name)
+                        .map(Vec::as_slice)
+                        .unwrap_or(&[]);
+                    build_chain_from_yaml_specs(specs, guard_script_bodies, extra)
+                        .map(|chain| (name.clone(), chain))
+                })
+                .collect()
         })
-        .collect();
+        .unwrap_or_default();
+    // Groups with registry extras but no YAML guard spec of their own.
+    for (name, extra) in &registry.group_guards {
+        groups.entry(name.clone()).or_insert_with(|| {
+            build_chain_from_yaml_specs(&[], guard_script_bodies, extra)
+                .expect("non-empty extra guards always build a chain")
+        });
+    }
     (global, groups)
 }
 
@@ -3519,6 +3838,7 @@ fn build_guard_chains(
 fn build_chain_from_db_specs(
     specs: &serde_json::Value,
     guard_script_bodies: &HashMap<i64, String>,
+    extra: &[Arc<dyn Guard>],
 ) -> Option<Arc<GuardChain>> {
     struct DbGuardSpec {
         kind: String,
@@ -3611,6 +3931,9 @@ fn build_chain_from_db_specs(
             })),
         }
     }
+    for g in extra {
+        guards.push(Box::new(SharedGuard(g.clone())));
+    }
     if guards.is_empty() {
         None
     } else {
@@ -3618,36 +3941,52 @@ fn build_chain_from_db_specs(
     }
 }
 
-/// Build global + per-group guard chains from the flat JSON format stored by the Studio UI.
+/// Build global + per-group guard chains from the flat JSON format stored by the Studio UI,
+/// with `registry`'s extra guards appended the same way [`build_guard_chains`] does for YAML.
 ///
 /// The DB format mirrors `GuardrailsConfig` from the TypeScript API types:
 /// `{ global: GuardSpecDto[], groups: Record<string, GuardSpecDto[]> }`.
 fn build_guard_chains_from_db_value(
     v: &serde_json::Value,
     guard_script_bodies: &HashMap<i64, String>,
+    registry: &PluginRegistry,
 ) -> (Option<Arc<GuardChain>>, HashMap<String, Arc<GuardChain>>) {
-    let Some(obj) = v.as_object() else {
-        return (None, HashMap::new());
-    };
+    let empty_obj = serde_json::Map::new();
+    let obj = v.as_object().unwrap_or(&empty_obj);
     let global_val = obj
         .get("global")
         .cloned()
         .unwrap_or(serde_json::Value::Array(vec![]));
-    let global = build_chain_from_db_specs(&global_val, guard_script_bodies);
+    let global = build_chain_from_db_specs(&global_val, guard_script_bodies, &registry.guards);
 
-    let groups = obj
+    let mut groups: HashMap<String, Arc<GuardChain>> = obj
         .get("groups")
         .and_then(|g| g.as_object())
         .map(|groups_obj| {
             groups_obj
                 .iter()
                 .filter_map(|(name, specs)| {
-                    build_chain_from_db_specs(specs, guard_script_bodies)
+                    let extra = registry
+                        .group_guards
+                        .get(name)
+                        .map(Vec::as_slice)
+                        .unwrap_or(&[]);
+                    build_chain_from_db_specs(specs, guard_script_bodies, extra)
                         .map(|chain| (name.clone(), chain))
                 })
                 .collect()
         })
         .unwrap_or_default();
+    for (name, extra) in &registry.group_guards {
+        groups.entry(name.clone()).or_insert_with(|| {
+            build_chain_from_db_specs(
+                &serde_json::Value::Array(vec![]),
+                guard_script_bodies,
+                extra,
+            )
+            .expect("non-empty extra guards always build a chain")
+        });
+    }
 
     (global, groups)
 }
@@ -3858,7 +4197,7 @@ mod tests {
                 max_rows: None,
                 applies_to: None,
             }];
-            let chain = build_chain_from_yaml_specs(&specs, &HashMap::new())
+            let chain = build_chain_from_yaml_specs(&specs, &HashMap::new(), &[])
                 .expect("chain should be built");
             let ctx = plan_ctx(&engine, &group, &tags);
             let (actions, blocked) = chain.run(&ctx, GuardLayer::Plan).await;
@@ -3895,7 +4234,7 @@ mod tests {
             assert!(err.contains("script"), "{err}");
 
             // Misconfigured guards still deny if validation is bypassed (e.g. DB reload).
-            let chain = build_chain_from_yaml_specs(&specs, &HashMap::new())
+            let chain = build_chain_from_yaml_specs(&specs, &HashMap::new(), &[])
                 .expect("chain should be built");
             let ctx = plan_ctx(&engine, &group, &tags);
             let (_, blocked) = chain.run(&ctx, GuardLayer::Plan).await;
@@ -3908,8 +4247,8 @@ mod tests {
             let group = ClusterGroupName("default".to_string());
             let tags = QueryTags::new();
             let specs = serde_json::json!([{ "kind": "future_kind" }]);
-            let chain =
-                build_chain_from_db_specs(&specs, &HashMap::new()).expect("chain should be built");
+            let chain = build_chain_from_db_specs(&specs, &HashMap::new(), &[])
+                .expect("chain should be built");
             let ctx = plan_ctx(&engine, &group, &tags);
             let (actions, blocked) = chain.run(&ctx, GuardLayer::Plan).await;
             assert!(blocked);
@@ -3939,7 +4278,7 @@ mod tests {
                 max_rows: None,
                 applies_to: None,
             }];
-            let chain = build_chain_from_yaml_specs(&specs, &HashMap::new())
+            let chain = build_chain_from_yaml_specs(&specs, &HashMap::new(), &[])
                 .expect("chain should be built");
             let ctx = plan_ctx(&engine, &group, &tags);
             let (_, blocked) = chain.run(&ctx, GuardLayer::Plan).await;
@@ -3966,7 +4305,7 @@ mod tests {
                 max_rows: None,
                 applies_to: None,
             }];
-            let chain = build_chain_from_yaml_specs(&specs, &HashMap::new())
+            let chain = build_chain_from_yaml_specs(&specs, &HashMap::new(), &[])
                 .expect("chain should be built");
             let ctx = plan_ctx(&engine, &group, &tags);
             let (actions, blocked) = chain.run(&ctx, GuardLayer::Plan).await;
@@ -3999,7 +4338,7 @@ mod tests {
                 max_rows: None,
                 applies_to: None,
             }];
-            let chain = build_chain_from_yaml_specs(&specs, &HashMap::new())
+            let chain = build_chain_from_yaml_specs(&specs, &HashMap::new(), &[])
                 .expect("chain should be built");
             let ctx = plan_ctx(&engine, &group, &tags);
             let (_, blocked) = chain.run(&ctx, GuardLayer::Plan).await;
@@ -4019,8 +4358,8 @@ mod tests {
                 "url": "ftp://evil.example/guard",
                 "fail_behavior": "allow"
             }]);
-            let chain =
-                build_chain_from_db_specs(&specs, &HashMap::new()).expect("chain should be built");
+            let chain = build_chain_from_db_specs(&specs, &HashMap::new(), &[])
+                .expect("chain should be built");
             let ctx = plan_ctx(&engine, &group, &tags);
             let (actions, blocked) = chain.run(&ctx, GuardLayer::Plan).await;
             assert!(blocked);

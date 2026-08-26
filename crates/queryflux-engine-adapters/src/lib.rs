@@ -495,4 +495,23 @@ pub trait EngineAdapterFactory: Send + Sync {
         group: ClusterGroupName,
         json: &serde_json::Value,
     ) -> Result<AdapterKind>;
+
+    /// Build an adapter instance from a YAML-loaded [`ClusterConfig`].
+    ///
+    /// Built-in engines override this. Engines that are only ever created via the
+    /// admin API — which includes every embedder-registered custom engine, since
+    /// custom `engine` values are not YAML-nameable — can rely on the default, which
+    /// rejects YAML construction with a clear error.
+    async fn build_from_cluster_config(
+        &self,
+        _cluster_name: ClusterName,
+        _group: ClusterGroupName,
+        _cfg: &ClusterConfig,
+        cluster_name_str: &str,
+    ) -> Result<AdapterKind> {
+        Err(queryflux_core::error::QueryFluxError::Engine(format!(
+            "cluster '{cluster_name_str}': engine '{}' cannot be created from YAML config — use the admin API",
+            self.engine_key()
+        )))
+    }
 }
