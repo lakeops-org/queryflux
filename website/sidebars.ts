@@ -56,6 +56,7 @@ const sidebars: SidebarsConfig = {
         'architecture/observability',
         'architecture/adding-engine-support',
         'architecture/auth-authz-design',
+        'architecture/embedding',
       ],
     },
     {

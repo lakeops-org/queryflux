@@ -94,7 +94,7 @@ In **`crates/queryflux-core/src/config.rs`**:
 
 ### Step 5 — Binary startup (`queryflux`)
 
-In **`crates/queryflux/src/main.rs`**:
+In **`crates/queryflux/src/lib.rs`**:
 
 - Construct your frontend when config is **`Some`**.
 - Spawn **`listen()`** alongside Trino / Postgres / … (see **`select!`** around other frontends).
@@ -162,4 +162,4 @@ Studio does **not** implement wire protocols; it only displays status from the A
 - [`crates/queryflux-core/src/config.rs`](https://github.com/lakeops-org/queryflux/blob/main/crates/queryflux-core/src/config.rs) — `FrontendsConfig`, `RouterConfig`
 - [`crates/queryflux-frontend/src/dispatch.rs`](https://github.com/lakeops-org/queryflux/blob/main/crates/queryflux-frontend/src/dispatch.rs) — `dispatch_query`, `execute_to_sink`
 - [`crates/queryflux-routing/src/implementations/protocol_based.rs`](https://github.com/lakeops-org/queryflux/blob/main/crates/queryflux-routing/src/implementations/protocol_based.rs) — protocol → group
-- [`crates/queryflux/src/main.rs`](https://github.com/lakeops-org/queryflux/blob/main/crates/queryflux/src/main.rs) — listener startup, router construction
+- [`crates/queryflux/src/lib.rs`](https://github.com/lakeops-org/queryflux/blob/main/crates/queryflux/src/lib.rs) — listener startup, router construction

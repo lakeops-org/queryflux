@@ -18,6 +18,7 @@ members = [
     "crates/queryflux-fingerprint",
     "crates/queryflux-guardrails",
     "crates/queryflux-cli",
+    "examples/embed-queryflux",
 ]
 
 [workspace.package]

@@ -332,7 +332,7 @@ After a write, the proxy hot-reloads adapters and custom query maps without rest
 |---|---|
 | Variant expansion | `crates/queryflux-core/src/config.rs` — `expand_cluster_variants()` |
 | DB migration | `crates/queryflux-persistence/src/postgres/migrations/20260704000001_cluster_variants.sql` |
-| Health / reconcile loops | `crates/queryflux/src/main.rs` |
+| Health / reconcile loops | `crates/queryflux/src/lib.rs` |
 | Custom query maps | `crates/queryflux-frontend/src/state.rs` — `LiveConfig` |
 | ADBC introspection | `crates/queryflux-engine-adapters/src/adbc/introspection.rs` and driver modules |
 | CapacityStore | `crates/queryflux-persistence/src/lib.rs` |

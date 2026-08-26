@@ -1753,6 +1753,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "embed-queryflux"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "arrow",
+ "async-trait",
+ "axum",
+ "queryflux",
+ "queryflux-auth",
+ "queryflux-core",
+ "queryflux-frontend",
+ "queryflux-guardrails",
+ "queryflux-routing",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "equivalent"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"

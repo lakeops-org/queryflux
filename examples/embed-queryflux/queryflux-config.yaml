@@ -1,0 +1,33 @@
+queryflux:
+  externalAddress: http://localhost:8080
+  frontends:
+    trinoHttp:
+      enabled: true
+      port: 8080
+  persistence:
+    type: inMemory
+  adminApi:
+    port: 9000
+
+clusters:
+  duckdb-1:
+    engine: duckDb
+    enabled: true
+    # No databasePath — DuckDB runs in-memory.
+
+clusterGroups:
+  analytics:
+    enabled: true
+    maxRunningQueries: 4
+    members: [duckdb-1]
+    strategy:
+      type: roundRobin
+
+routers:
+  - type: protocolBased
+    trinoHttp: analytics
+
+routingFallback: analytics
+
+translation:
+  errorOnUnsupported: false
