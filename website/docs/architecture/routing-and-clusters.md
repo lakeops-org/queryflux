@@ -31,7 +31,7 @@ When the query finishes (success, failure, or cancel), **`release_cluster`** dec
 
 ## Router types (config → code)
 
-Configured under `routers:` in YAML (`queryflux_core::config::RouterConfig`). Wired in `queryflux/src/main.rs`.
+Configured under `routers:` in YAML (`queryflux_core::config::RouterConfig`). Wired in `queryflux/src/lib.rs`.
 
 | `type` | Behavior |
 |--------|----------|
@@ -77,7 +77,7 @@ routers:
 
 When **`persistence.type`** is **`postgres`**, routing rules and cluster/group definitions loaded from the database are held in memory inside **`LiveConfig`** (including the compiled **`RouterChain`**). Each request reads the current chain from that shared snapshot (`Arc<tokio::sync::RwLock<LiveConfig>>` in `queryflux-frontend`).
 
-- **Periodic refresh:** `queryflux.configReloadIntervalSecs` in YAML (default **30** when omitted) controls how often a background task re-reads Postgres and replaces **`LiveConfig`** in one atomic swap. Implementation: `crates/queryflux/src/main.rs` (reload task) and `reload_live_config` → `load_routing_config`.
+- **Periodic refresh:** `queryflux.configReloadIntervalSecs` in YAML (default **30** when omitted) controls how often a background task re-reads Postgres and replaces **`LiveConfig`** in one atomic swap. Implementation: `crates/queryflux/src/lib.rs` (reload task) and `reload_live_config` → `load_routing_config`.
 - **`0` disables polling only:** With **`configReloadIntervalSecs: 0`**, there is no timer-driven refresh; the in-memory config stays as loaded at startup until an **immediate refresh** runs (below).
 - **Immediate refresh:** After Studio/admin API writes to routing, clusters, or groups, the proxy **notifies** the same task so a reload runs without waiting for the interval (`config_reload_notify` in `admin.rs`).
 - **YAML-only mode:** With **`inMemory`** persistence there is no DB reload loop; routing comes from the process config at startup until restart.

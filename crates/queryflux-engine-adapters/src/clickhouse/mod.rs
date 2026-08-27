@@ -776,6 +776,22 @@ impl crate::EngineAdapterFactory for ClickHouseFactory {
             config,
         )?)))
     }
+
+    async fn build_from_cluster_config(
+        &self,
+        cluster_name: ClusterName,
+        group: ClusterGroupName,
+        cfg: &ClusterConfig,
+        cluster_name_str: &str,
+    ) -> Result<AdapterKind> {
+        use crate::EngineConfigParseable;
+        let config = ClickHouseConfig::from_cluster_config(cfg, cluster_name_str)?;
+        Ok(AdapterKind::Sync(Arc::new(ClickHouseAdapter::new(
+            cluster_name,
+            group,
+            config,
+        )?)))
+    }
 }
 
 #[cfg(test)]

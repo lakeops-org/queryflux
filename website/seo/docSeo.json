@@ -81,6 +81,18 @@
       "title": "Snowflake Frontend",
       "description": "Snowflake HTTP wire and SQL API v2 on one port — SnowSQL, Python connector, and JDBC without a Snowflake account."
     },
+    "architecture/embedding/overview": {
+      "title": "Embedding QueryFlux",
+      "description": "Construct QueryFlux as a library with QueryFlux::builder() — register compiled-in plugins and dispatch queries directly, instead of running the shipped binary."
+    },
+    "architecture/embedding/plugins": {
+      "title": "Embedding Plugins",
+      "description": "Every plugin kind QueryFlux::builder() accepts — engines, guards, routers, strategies, translation scripts, frontends, auth — with a worked example for each."
+    },
+    "architecture/embedding/hooks": {
+      "title": "Query Lifecycle Hooks",
+      "description": "QueryHook observes or intercepts a query at every pipeline stage — routing, translation, guards, execution, errors, and cancellation."
+    },
     "architecture/adding-support/overview": {
       "title": "Extending QueryFlux Overview",
       "description": "Add a backend engine adapter or a new client protocol — Rust crates, Studio UI, and documentation checklist."

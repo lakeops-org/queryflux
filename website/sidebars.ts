@@ -84,6 +84,16 @@ const sidebars: SidebarsConfig = {
     },
     {
       type: 'category',
+      label: 'Embedding QueryFlux',
+      collapsed: true,
+      items: [
+        'architecture/embedding/overview',
+        'architecture/embedding/plugins',
+        'architecture/embedding/hooks',
+      ],
+    },
+    {
+      type: 'category',
       label: 'Project',
       collapsed: true,
       items: [

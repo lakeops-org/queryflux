@@ -264,22 +264,25 @@ pub async fn submit_statement(
         extra,
         agent_context: None,
     };
-    let routing_result = {
-        let live = state.app.live.read().await;
-        live.router_chain
-            .route_with_trace(
-                &sql,
-                &session_ctx,
-                &FrontendProtocol::SnowflakeSqlApi,
-                Some(&auth_ctx),
-            )
-            .await
-    };
-    let (chain_result, mut routing_trace) = match routing_result {
+    let routing_result = state
+        .app
+        .route_query(
+            sql,
+            &session_ctx,
+            &FrontendProtocol::SnowflakeSqlApi,
+            Some(&auth_ctx),
+        )
+        .await;
+    let (sql, chain_result, routing_trace) = match routing_result {
         Ok(r) => r,
+        Err(QueryFluxError::Unauthorized(msg)) => {
+            return sql_api_error(StatusCode::FORBIDDEN, "390201", &msg);
+        }
         Err(e) => return sql_api_error(StatusCode::BAD_GATEWAY, "390000", &e.to_string()),
     };
-    let mut group = match chain_result {
+    // AppState::route_query already resolved the authorization-aware fallback group
+    // (if the chain used one), so `g` here is final — no separate call needed.
+    let group = match chain_result {
         ChainRouteResult::Routed(g) => g,
         ChainRouteResult::Denied { message } => {
             state.app.record_routing_deny(
@@ -291,17 +294,6 @@ pub async fn submit_statement(
             );
             return sql_api_error(StatusCode::FORBIDDEN, "390201", &message);
         }
-    };
-    group = match state
-        .app
-        .resolve_routed_group(group, &mut routing_trace, &auth_ctx)
-        .await
-    {
-        Ok(g) => g,
-        Err(QueryFluxError::Unauthorized(msg)) => {
-            return sql_api_error(StatusCode::FORBIDDEN, "390201", &msg);
-        }
-        Err(e) => return sql_api_error(StatusCode::BAD_GATEWAY, "390000", &e.to_string()),
     };
 
     let handle = Uuid::new_v4().to_string();

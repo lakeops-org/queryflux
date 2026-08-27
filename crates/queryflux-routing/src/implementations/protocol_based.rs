@@ -43,6 +43,9 @@ impl RouterTrait for ProtocolBasedRouter {
             FrontendProtocol::SnowflakeHttp => self.snowflake_http.clone(),
             FrontendProtocol::SnowflakeSqlApi => self.snowflake_sql_api.clone(),
             FrontendProtocol::Mcp => self.mcp.clone(),
+            // Not YAML/DB-configurable — a custom frontend relies on a registered
+            // `RouterTrait` instead of this built-in protocol-keyed router.
+            FrontendProtocol::Custom { .. } => None,
         };
         Ok(group.into())
     }

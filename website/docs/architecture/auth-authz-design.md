@@ -755,7 +755,7 @@ auth:
 ### `queryflux-frontend/src/trino_http/handlers.rs`
 - Extract `Authorization` header → `Credentials` → `auth_provider.authenticate()` → `AuthContext` (before calling `route_with_trace()`)
 - Pass `&auth_ctx` to routers
-- **Default routing** (here, not in dispatch): if `route_with_trace()` returns `used_fallback == true`, iterate `state.group_configs` in config order; call `state.authorization.check(auth_ctx, group)` for each; pick first authorized group; only use static `routingFallback` if none found. `state` needs ordered group config list for this (add to `AppState`).
+- **Default routing**: if `route_with_trace()` returns `used_fallback == true`, iterate `state.group_configs` in config order; call `state.authorization.check(auth_ctx, group)` for each; pick first authorized group; only use static `routingFallback` if none found. Implemented as `AppState::resolve_routed_group`, called from inside `AppState::route_query` itself (not per-handler) so every frontend gets it — and so `after_route` query hooks see the final, post-fallback group, not the router chain's raw candidate.
 - Thread `AuthContext` through to dispatch
 
 ### `queryflux-frontend/src/postgres_wire/mod.rs`

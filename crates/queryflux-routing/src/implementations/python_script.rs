@@ -65,16 +65,18 @@ impl RouterTrait for PythonScriptRouter {
     }
 }
 
-fn protocol_camel(p: FrontendProtocol) -> &'static str {
+fn protocol_camel(p: FrontendProtocol) -> String {
     match p {
-        FrontendProtocol::TrinoHttp => "trinoHttp",
-        FrontendProtocol::PostgresWire => "postgresWire",
-        FrontendProtocol::MySqlWire => "mysqlWire",
-        FrontendProtocol::ClickHouseHttp => "clickHouseHttp",
-        FrontendProtocol::FlightSql => "flightSql",
-        FrontendProtocol::SnowflakeHttp => "snowflakeHttp",
-        FrontendProtocol::SnowflakeSqlApi => "snowflakeSqlApi",
-        FrontendProtocol::Mcp => "mcp",
+        FrontendProtocol::TrinoHttp => "trinoHttp".to_string(),
+        FrontendProtocol::PostgresWire => "postgresWire".to_string(),
+        FrontendProtocol::MySqlWire => "mysqlWire".to_string(),
+        FrontendProtocol::ClickHouseHttp => "clickHouseHttp".to_string(),
+        FrontendProtocol::FlightSql => "flightSql".to_string(),
+        FrontendProtocol::SnowflakeHttp => "snowflakeHttp".to_string(),
+        FrontendProtocol::SnowflakeSqlApi => "snowflakeSqlApi".to_string(),
+        FrontendProtocol::Mcp => "mcp".to_string(),
+        // The custom frontend's own name — Python routing scripts see it verbatim.
+        FrontendProtocol::Custom { name, .. } => name,
     }
 }
 

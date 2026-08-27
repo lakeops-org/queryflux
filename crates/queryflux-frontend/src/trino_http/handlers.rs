@@ -521,16 +521,12 @@ pub async fn post_statement(
         return set_session_response(&query_id.0, &prop_key, &prop_val).into_response();
     }
 
-    // 2. Route — first matching router wins.
-    // `route_with_trace` is CPU-bound (regex match, header lookup); holding the read lock
-    // across this call is fine since it's brief and read-locks don't block each other.
-    let routing_result = {
-        let live = state.live.read().await;
-        live.router_chain
-            .route_with_trace(&sql, &session, &protocol, Some(&auth_ctx))
-            .await
-    };
-    let (chain_result, mut routing_trace) = match routing_result {
+    // 2. Route — first matching router wins. `AppState::route_query` also runs
+    // before_route/after_route hooks and may rewrite `sql`.
+    let routing_result = state
+        .route_query(sql, &session, &protocol, Some(&auth_ctx))
+        .await;
+    let (sql, chain_result, routing_trace) = match routing_result {
         Ok(r) => r,
         Err(e) => {
             warn!("Routing error: {e}");
@@ -545,29 +541,16 @@ pub async fn post_statement(
             return trino_error_response(&tmp_id.0, msg).into_response();
         }
     };
-    let mut group = match chain_result {
+    // AppState::route_query already resolved the authorization-aware fallback group
+    // (if the chain used one) before returning, so `g` here is final — no separate
+    // resolve_routed_group call needed.
+    let group = match chain_result {
         ChainRouteResult::Routed(g) => g,
         ChainRouteResult::Denied { message } => {
             warn!(%message, user = %auth_ctx.user, "Query denied by routing rule");
             let query_id =
                 state.record_routing_deny(&sql, &session, protocol, &message, Some(routing_trace));
             return trino_error_response(&query_id.0, &message).into_response();
-        }
-    };
-    group = match state
-        .resolve_routed_group(group, &mut routing_trace, &auth_ctx)
-        .await
-    {
-        Ok(g) => g,
-        Err(QueryFluxError::Unauthorized(msg)) => {
-            warn!(user = %auth_ctx.user, "{msg}");
-            let tmp_id = ProxyQueryId::new();
-            return trino_error_response(&tmp_id.0, &msg).into_response();
-        }
-        Err(e) => {
-            warn!("Routing resolution error: {e}");
-            let tmp_id = ProxyQueryId::new();
-            return trino_error_response(&tmp_id.0, &e.to_string()).into_response();
         }
     };
 
@@ -1648,6 +1631,7 @@ mod cancel_executing_statement_tests {
             instance_id: "test".into(),
             http_client: reqwest::Client::new(),
             result_cache: Arc::new(queryflux_cache::noop::NoopResultCache),
+            hooks: Arc::new(crate::hook::HookBus::default()),
         })
     }
 

@@ -23,6 +23,7 @@ use uuid::Uuid;
 use crate::{
     admin::{cancel_executing_query, delete_queued_if_exists, find_executing_query},
     dispatch::execute_to_sink,
+    hook::{HookBus, HookContext},
     mcp::sink::JsonResultSink,
     state::AppState,
 };
@@ -259,35 +260,82 @@ fn session_for(auth: &AuthContext, agent_context: AgentContext) -> SessionContex
 }
 
 /// Resolve the target cluster group: use `engine_hint` if it names a real group,
-/// otherwise route normally through the configured `RouterChain`.
+/// otherwise route normally through `AppState::route_query` (running before_route /
+/// after_route hooks and picking up a `RoutingTrace` like every other frontend).
+///
+/// Returns `sql` back alongside the group since `before_route` may rewrite it — the
+/// `engine_hint` shortcut skips routing (and hooks) entirely, so it returns `sql`
+/// unmodified.
 async fn resolve_group(
     state: &AppState,
-    sql: &str,
+    sql: String,
     session: &SessionContext,
     engine_hint: Option<&str>,
     auth: &AuthContext,
-) -> Result<ClusterGroupName, McpError> {
+) -> Result<(ClusterGroupName, String), McpError> {
     if let Some(hint) = engine_hint {
-        let live = state.live.read().await;
-        if live.group_members.contains_key(hint) {
-            return Ok(ClusterGroupName(hint.to_string()));
+        // An explicit engine_hint skips RouterChain evaluation (the caller already
+        // named the group), but must not skip before_route/after_route hooks —
+        // every other frontend, and MCP calls without a hint, always run them.
+        let protocol = FrontendProtocol::Mcp;
+        let mut sql = sql;
+        if !state.hooks.is_empty() {
+            let mut ctx = HookContext {
+                sql: sql.clone(),
+                session,
+                protocol: &protocol,
+                group: None,
+                cluster: None,
+                engine_type: None,
+                query_tags: session.tags(),
+                auth: Some(auth),
+                rows: None,
+                execution_ms: None,
+            };
+            let outcome = state.hooks.before_route(&mut ctx).await;
+            sql = ctx.sql;
+            if let Some(err) = HookBus::deny_err(&outcome) {
+                return Err(McpError::invalid_request(err.to_string(), None));
+            }
         }
-        return Err(McpError::invalid_params(
-            format!("Unknown engine group: {hint}"),
-            None,
-        ));
+
+        if !state.live.read().await.group_members.contains_key(hint) {
+            return Err(McpError::invalid_params(
+                format!("Unknown engine group: {hint}"),
+                None,
+            ));
+        }
+        let group = ClusterGroupName(hint.to_string());
+
+        if !state.hooks.is_empty() {
+            let ctx = HookContext {
+                sql: sql.clone(),
+                session,
+                protocol: &protocol,
+                group: Some(&group),
+                cluster: None,
+                engine_type: None,
+                query_tags: session.tags(),
+                auth: Some(auth),
+                rows: None,
+                execution_ms: None,
+            };
+            let outcome = state.hooks.after_route(&ctx).await;
+            if let Some(err) = HookBus::deny_err(&outcome) {
+                return Err(McpError::invalid_request(err.to_string(), None));
+            }
+        }
+
+        return Ok((group, sql));
     }
 
-    let decision = {
-        let live = state.live.read().await;
-        live.router_chain
-            .route(sql, session, &FrontendProtocol::Mcp, Some(auth))
-            .await
-    }
-    .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+    let (sql, decision, _trace) = state
+        .route_query(sql, session, &FrontendProtocol::Mcp, Some(auth))
+        .await
+        .map_err(|e| McpError::internal_error(e.to_string(), None))?;
 
     match decision {
-        ChainRouteResult::Routed(group) => Ok(group),
+        ChainRouteResult::Routed(group) => Ok((group, sql)),
         ChainRouteResult::Denied { message } => Err(McpError::invalid_request(message, None)),
     }
 }
@@ -417,8 +465,8 @@ impl QueryFluxMcpServer {
         if let Some(d) = dialect {
             session.extra.insert("dialect".to_string(), d);
         }
-        let group =
-            resolve_group(&self.state, &sql, &session, engine_hint.as_deref(), &auth).await?;
+        let (group, sql) =
+            resolve_group(&self.state, sql, &session, engine_hint.as_deref(), &auth).await?;
 
         debug!(sql = %sql, group = %group, "MCP execute_query");
         run_query(
@@ -447,8 +495,8 @@ impl QueryFluxMcpServer {
         let conversation_id = agent_context.conversation_id.clone();
         let session = session_for(&auth, agent_context);
         let sql = "SELECT schema_name FROM information_schema.schemata".to_string();
-        let group =
-            resolve_group(&self.state, &sql, &session, engine_hint.as_deref(), &auth).await?;
+        let (group, sql) =
+            resolve_group(&self.state, sql, &session, engine_hint.as_deref(), &auth).await?;
 
         run_query(
             &self.state,
@@ -484,9 +532,9 @@ impl QueryFluxMcpServer {
 
         let describe_session = session_for(&auth, agent_context.clone());
         let describe_sql = format!("DESCRIBE {qualified}");
-        let group = resolve_group(
+        let (group, describe_sql) = resolve_group(
             &self.state,
-            &describe_sql,
+            describe_sql,
             &describe_session,
             engine_hint.as_deref(),
             &auth,
@@ -579,9 +627,9 @@ impl QueryFluxMcpServer {
             session.extra.insert("dialect".to_string(), d);
         }
         let explain_sql = format!("EXPLAIN {sql}");
-        let group = resolve_group(
+        let (group, explain_sql) = resolve_group(
             &self.state,
-            &explain_sql,
+            explain_sql,
             &session,
             engine_hint.as_deref(),
             &auth,

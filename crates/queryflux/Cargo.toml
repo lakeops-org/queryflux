@@ -22,6 +22,8 @@ queryflux-cluster-manager = { workspace = true }
 queryflux-metrics = { workspace = true }
 queryflux-cache = { workspace = true }
 queryflux-cli = { workspace = true }
+async-trait = { workspace = true }
+futures = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
@@ -34,6 +36,10 @@ opentelemetry = { workspace = true, optional = true }
 opentelemetry_sdk = { workspace = true, optional = true }
 opentelemetry-otlp = { workspace = true, optional = true }
 tracing-opentelemetry = { workspace = true, optional = true }
+
+[dev-dependencies]
+arrow = { workspace = true }
+tempfile = "3"
 
 [features]
 default = []
