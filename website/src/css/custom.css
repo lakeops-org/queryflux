@@ -1008,6 +1008,45 @@ html[data-theme='dark'] .pagination-nav__link:hover {
   min-width: 0;
 }
 
+.theme-doc-markdown {
+  min-width: 0;
+  max-width: 100%;
+}
+
+.theme-doc-toc-desktop {
+  z-index: 1;
+  background: var(--ifm-background-color);
+}
+
+/*
+ * Docs layout: homepage --qf-page-max (72rem) is too tight once the left sidebar
+ * is accounted for — the article + On this page sit in a centered island with
+ * empty strips on both sides, and min-width:0 on every .col crushed the TOC.
+ * Fill the pane next to the sidebar; keep the outline as a stable strip.
+ */
+@media (min-width: 997px) {
+  .docMainContainer > .container {
+    max-width: 100%;
+    margin-left: 0;
+    margin-right: 0;
+    padding-left: 2rem;
+    padding-right: 1.75rem;
+  }
+
+  [class*='docItemCol'] {
+    min-width: 0;
+    max-width: none !important;
+    flex: 1 1 0;
+  }
+
+  .docMainContainer .col.col--3 {
+    flex: 0 0 16.5rem;
+    max-width: 16.5rem;
+    min-width: 16.5rem;
+    padding-left: 1.25rem;
+  }
+}
+
 .theme-doc-markdown.markdown .theme-code-block {
   max-width: 100%;
 }
@@ -1053,12 +1092,16 @@ html[data-theme='dark'] .admonition {
   box-shadow: 0 1px 2px rgba(0, 0, 0, 0.4);
 }
 
-/* Tables — rounded container + brand-tinted header instead of a bare Infima grid */
+/* Tables — Infima uses display:block + overflow-x:auto so wide tables scroll
+   inside the content column instead of spilling. Keep that, plus rounded
+   chrome. display:table makes overflow-x a no-op and is what caused the
+   plugins glance table to render under the On This Page list. */
 .markdown table {
-  display: table;
+  display: block;
   width: 100%;
+  max-width: 100%;
+  overflow-x: auto;
   border-radius: 0.65rem;
-  overflow: hidden;
   border: 1px solid var(--ifm-color-emphasis-200);
   box-shadow: 0 1px 2px rgba(15, 23, 42, 0.04);
 }

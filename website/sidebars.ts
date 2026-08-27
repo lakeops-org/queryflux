@@ -56,7 +56,6 @@ const sidebars: SidebarsConfig = {
         'architecture/observability',
         'architecture/adding-engine-support',
         'architecture/auth-authz-design',
-        'architecture/embedding',
       ],
     },
     {
@@ -81,6 +80,16 @@ const sidebars: SidebarsConfig = {
         'architecture/adding-support/overview',
         'architecture/adding-support/frontend',
         'architecture/adding-support/backend',
+      ],
+    },
+    {
+      type: 'category',
+      label: 'Embedding QueryFlux',
+      collapsed: true,
+      items: [
+        'architecture/embedding/overview',
+        'architecture/embedding/plugins',
+        'architecture/embedding/hooks',
       ],
     },
     {

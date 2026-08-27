@@ -20,7 +20,7 @@ There are also two different ways to *add* an engine or frontend, depending on w
 | Path | Who it's for | How |
 |------|---------------|-----|
 | **Contributor** (this guide) | Adding a backend/frontend that ships in-tree, in this repo | A PR against `queryflux-engine-adapters` / `queryflux-frontend` following the guides below |
-| **Compiled-in plugin** | Embedding QueryFlux in your own binary with a private or one-off engine/guard/router/frontend | `QueryFlux::builder().engine(...)` / `.guard(...)` / `.frontend(...)` — see **[Embedding QueryFlux](../embedding.md)** |
+| **Compiled-in plugin** | Embedding QueryFlux in your own binary with a private or one-off engine/guard/router/frontend | `QueryFlux::builder().engine(...)` / `.guard(...)` / `.frontend(...)` — see **[Embedding QueryFlux](../embedding/overview.md)** |
 
 The compiled-in path needs no changes to this repo at all — it's a separate crate
 depending on `queryflux` as a library. Reach for it when the engine/plugin is private,
@@ -38,7 +38,7 @@ ship for everyone.
 
 ## Related reading
 
-- [Embedding QueryFlux](../embedding.md) — compiled-in plugins via `QueryFlux::builder()`  
+- [Embedding QueryFlux](../embedding/overview.md) — compiled-in plugins via `QueryFlux::builder()`  
 - [Frontends](../frontends/overview.md) — Trino HTTP, Postgres wire, MySQL wire, Flight SQL  
 - [system-map.md](../system-map.md) — End-to-end flow  
 - [query-translation.md](../query-translation.md) — Dialects and sqlglot  

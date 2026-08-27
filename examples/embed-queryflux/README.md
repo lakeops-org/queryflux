@@ -43,5 +43,5 @@ Set `RUST_LOG=info` to see `LoggingRouter` and `AuditHook` fire on every query.
   group, an empty `routers:` list (so `LoggingRouter`, prepended in code, is the only
   router — it always falls through to `routingFallback: analytics`).
 
-See [`website/docs/architecture/embedding.md`](../../website/docs/architecture/embedding.md)
+See [`website/docs/architecture/embedding/overview.md`](../../website/docs/architecture/embedding/overview.md)
 for the full reference.

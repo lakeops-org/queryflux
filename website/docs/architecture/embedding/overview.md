@@ -1,39 +1,45 @@
 ---
 sidebar_label: Overview
 title: Embedding QueryFlux
-description: Construct QueryFlux as a library with QueryFlux::builder() — register compiled-in plugins and dispatch queries directly, instead of running the shipped binary.
+description: "Construct QueryFlux as a library with QueryFlux::builder() — register compiled-in plugins and dispatch queries directly, instead of running the shipped binary."
+image: img/queryflux-hero-banner.png
 ---
 
 # Embedding QueryFlux
 
-QueryFlux is a workspace of library crates. The `queryflux` crate additionally exposes a
-`QueryFlux::builder()` so you can construct an instance in your own binary, register
-compiled-in plugins, and observe or intercept every query — instead of running the
-shipped `queryflux` binary against a YAML file.
+The `queryflux` binary is a YAML-driven proxy. The same crate is also a library: you
+construct a `QueryFlux` in your own Rust program, register extra engines, guards,
+routers, frontends, or hooks in code, and either serve the usual listeners or dispatch
+queries yourself.
 
-This is **Rust builder only**: plugins are compiled into your binary, not loaded at
-runtime (no `dlopen`, no WASM). YAML/DB config does not need to name your custom
-plugins — they're registered in code and survive config hot-reload.
+That is the path for a product binary that ships private routing logic, a custom
+backend, or an internal HTTP API — without forking this repo. Plugins are ordinary
+Rust types compiled into your binary. They are not named in YAML, and a Studio config
+edit will not drop them.
 
-The shipped binary is itself a thin consumer of this same builder:
+The shipped binary is the same builder with only the built-in engines registered:
 
 ```rust
 QueryFlux::builder()
     .config_path(path)
     .with_builtin_plugins()
-    .build().await?
-    .serve().await
+    .build()
+    .await?
+    .serve()
+    .await
 ```
 
-A full working example lives in [`examples/embed-queryflux/`](https://github.com/lakeops-org/queryflux/tree/main/examples/embed-queryflux) — one file registering
-every plugin kind (see [Plugins](plugins.md) and [Query lifecycle hooks](hooks.md)),
-runnable with `cargo run -p embed-queryflux`.
+[`examples/embed-queryflux/`](https://github.com/lakeops-org/queryflux/tree/main/examples/embed-queryflux)
+is a complete program: DuckDB from YAML, plus a DDL-blocking guard, a logging router, an
+audit hook, and a tiny `POST /query` frontend. Run it with
+`cargo run -p embed-queryflux`.
 
-## The builder
+## Builder
 
 ```rust
 QueryFlux::builder()
     .config_path("config.yaml")
+    .with_builtin_plugins()
     .engine(Box::new(AcmeFactory))
     .guard(Box::new(CostCapGuard { max_usd: 1.0 }))
     .router_prepend(Box::new(GeoRouter::new()))
@@ -47,37 +53,39 @@ QueryFlux::builder()
     .await
 ```
 
-`build()` loads `config.yaml`, constructs the router/guard/adapter chain, and starts
-background maintenance tasks (config hot-reload, health checks, capacity
-coordination) — but does not start listening for client connections. It returns a
-`QueryFlux` handle; call [`app_state()`](#dispatching-without-serving) to inspect or
-dispatch against the live state directly, or call `serve()` to spawn every frontend
-and block until shutdown.
+You still point at a `config.yaml` — clusters, groups, frontends, auth, persistence.
+The builder methods *add* to that config; they do not replace it, except
+`.auth_provider(...)`, which takes over authentication entirely.
 
-`build()` also initializes a `tracing_subscriber` from `RUST_LOG` — but via
-`try_init()`, not `init()`, so it's a no-op (not a panic) if your host process already
-installed a global subscriber. If you want QueryFlux's logs and you set up your own
-subscriber first, install it *before* calling `.build()`, or don't install one at all
-and let QueryFlux's stand.
+`.with_builtin_plugins()` registers the engines the binary ships (Trino, DuckDB,
+StarRocks, ClickHouse, Athena, ADBC). Skip it if you only want engines you register
+yourself.
 
-See [Plugins](plugins.md) for every kind of thing you can register on the builder, and
-[Query lifecycle hooks](hooks.md) for `.hook(...)`.
+`build()` loads config, wires routers / guards / adapters, and starts background work
+(config reload, health checks, capacity). It does **not** bind client ports. `serve()`
+starts every enabled YAML frontend plus any `.frontend(...)` you registered, then
+blocks until shutdown.
 
-## Dispatching without serving
+If your process already installed a `tracing` subscriber, `build()` leaves it alone
+(`try_init`). Otherwise it installs one from `RUST_LOG`. Set yours up before `build()`
+if you want control of log format.
 
-`QueryFlux::app_state()` returns the same `Arc<AppState>` every frontend dispatches
-through. This is useful for tests or for a custom frontend that wants to call
-`queryflux_frontend::dispatch::execute_to_sink` / `dispatch_query` directly, without
-going through `serve()`'s network listeners at all — see
+Every registrable type is documented on [Plugins](plugins.md). Query lifecycle
+callbacks are on [Hooks](hooks.md).
+
+## Dispatch without `serve()`
+
+`QueryFlux::app_state()` is the same `Arc<AppState>` the Trino / Postgres / MySQL
+listeners use. Tests and in-process frontends call
+`queryflux_frontend::dispatch::execute_to_sink` (or `dispatch_query`) against it
+directly — no sockets.
+
 [`crates/queryflux/tests/embed.rs`](https://github.com/lakeops-org/queryflux/blob/main/crates/queryflux/tests/embed.rs)
-for a complete example: a mock adapter registered via `.with_adapter()`, a guard that
-denies `DROP`, and a hook that records `before_execute` / `on_error`, all exercised
-through the real dispatch path with no listening socket.
+does that: a mock adapter via `.with_adapter()`, a guard that denies `DROP`, a hook
+that records `before_execute` / `on_error`.
 
-## Out of scope
+## In-tree vs your binary
 
-Runtime `.so` / WASM plugin loading, YAML-nameable custom engine/guard kinds, and
-process-level hooks (`on_start` / `on_reload`) are not part of this API. See
-[Extending QueryFlux](../adding-support/overview.md) for adding a new **in-tree** backend
-or frontend (the contributor path — a PR against this repo) as opposed to registering a
-**compiled-in** plugin from your own binary (this section).
+To add an engine or protocol that should ship for everyone, follow
+[Extending QueryFlux](../adding-support/overview.md) and open a PR. Embedding is for
+code that stays in *your* crate.
