@@ -101,6 +101,18 @@ catalogProvider:
   #       - { name: order_id, dataType: BIGINT, nullable: false }
   #       - { name: total, dataType: "DECIMAL(10,2)", nullable: true }
   #
+  # AWS Glue Data Catalog — direct Glue API access (format-agnostic: sees
+  # Iceberg, Hive/Parquet, and any other table format Glue tracks). `auth` is
+  # optional and follows the same shape as engine cluster `auth`; omit it to
+  # use the default AWS credential chain (env vars, ECS task role, EC2
+  # instance profile, etc.).
+  # type: glue
+  # region: us-east-1
+  # auth:
+  #   type: roleArn
+  #   roleArn: arn:aws:iam::123456789012:role/queryflux-glue-readonly
+  #   externalId: ${GLUE_EXTERNAL_ID}
+  #
   # Wrap any provider with a TTL cache:
   # type: caching
   # ttlSeconds: 300

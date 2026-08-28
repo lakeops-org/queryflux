@@ -547,6 +547,15 @@ export interface StaticTableSchemaDto {
   columns: StaticColumnDefDto[];
 }
 
+/**
+ * AWS credentials for the `glue` provider — same shape as engine cluster
+ * config's `ClusterAuth` (only `accessKey`/`roleArn` apply to AWS; omitted
+ * means the default AWS credential chain).
+ */
+export type GlueAuthConfig =
+  | { type: "accessKey"; accessKeyId: string; secretAccessKey: string; sessionToken?: string | null }
+  | { type: "roleArn"; roleArn: string; externalId?: string | null };
+
 export type CatalogProviderConfig =
   | { type: "null" }
   | { type: "static"; schemas: StaticTableSchemaDto[] }
@@ -554,8 +563,7 @@ export type CatalogProviderConfig =
   | { type: "engineDelegate"; clusterGroup: string }
   /** Not yet implemented server-side — builds but degrades to a no-op. */
   | { type: "hiveMetastore"; uri: string }
-  /** Not yet implemented server-side — builds but degrades to a no-op. */
-  | { type: "glue"; region?: string | null }
+  | { type: "glue"; region?: string | null; auth?: GlueAuthConfig | null }
   | {
       type: "caching";
       ttlSeconds: number;

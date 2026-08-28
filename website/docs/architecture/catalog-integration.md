@@ -54,6 +54,27 @@ catalogProvider:
         - { name: total, dataType: "DECIMAL(10,2)", nullable: true }
 ```
 
+### `glue`
+
+Talks directly to the [AWS Glue Data Catalog](https://docs.aws.amazon.com/glue/latest/dg/components-overview.html#data-catalog-intro) API — format-agnostic, so it sees Hive/Parquet, CSV/JSON, and Iceberg tables alike (unlike going through Iceberg's own Glue catalog client, which would only see Iceberg-format tables). Glue has no catalog concept of its own — every database/table lives under the caller's AWS account, so `list_catalogs()` always reports the single synthetic name `AwsDataCatalog`, matching the convention the Athena backend adapter already uses.
+
+| Field | Description |
+|-------|-------------|
+| `region` | AWS region (optional — falls back to the default region resolution) |
+| `auth` | Optional, same shape as engine cluster `auth` (`accessKey` or `roleArn`; `basic`/`bearer`/`keyPair` don't apply to AWS). Omitted: the default AWS credential chain (env vars, ECS task role, EC2 instance profile, ...). |
+
+```yaml
+catalogProvider:
+  type: glue
+  region: us-east-1
+  auth:
+    type: roleArn
+    roleArn: arn:aws:iam::123456789012:role/queryflux-glue-readonly
+    externalId: ${GLUE_EXTERNAL_ID}
+```
+
+Column types come straight from Glue's own type strings (e.g. `bigint`, `struct<a:int>`) rather than a normalized SQL type — `sqlglot`'s optimizer accepts most of them as-is. Partition keys are included alongside regular columns, since they're valid in `WHERE`/`SELECT` on a Hive-style partitioned table. Nullability isn't exposed by Glue's `Column` type, so every column defaults to nullable.
+
 ### `caching`
 
 Wraps another provider with a TTL + capacity-bounded cache. Only successful lookups are cached — an error is never pinned for `ttlSeconds`, so a transient catalog outage self-heals on the next call.
@@ -102,7 +123,6 @@ These variants parse and build successfully, but currently degrade to a no-op pr
 | Type | Fields | Notes |
 |------|--------|-------|
 | `engineDelegate` | `clusterGroup` | Delegates to a cluster group's own adapter (Trino, DuckDB, StarRocks, Athena, ClickHouse) |
-| `glue` | `region` | AWS Glue Data Catalog |
 | `hiveMetastore` | `uri` | Hive Metastore (Thrift) |
 
 Use [`/admin/config/catalog/test`](#admin-api) to check whether a given config actually does anything, rather than silently degrading unnoticed.
@@ -124,7 +144,7 @@ curl -u admin:admin -X POST http://localhost:9000/admin/config/catalog/test \
   -d '{"config": {"type": "static", "schemas": []}}'
 ```
 
-A `PUT` never fails startup or a running proxy: an invalid `type` is rejected with `400`, but a *structurally valid* config for an unimplemented provider (e.g. `glue`) is accepted — it will simply degrade to a no-op at build time. Use the `/test` endpoint first if you want to know that ahead of saving.
+A `PUT` never fails startup or a running proxy: an invalid `type` is rejected with `400`, but a *structurally valid* config for an unimplemented provider (e.g. `hiveMetastore`) is accepted — it will simply degrade to a no-op at build time. A `glue` config that's structurally valid but fails to actually build (unreachable AWS, bad credentials) degrades the same way. Use the `/test` endpoint first if you want to know that ahead of saving.
 
 Studio's **Catalog** page (left nav) is a thin UI over these same three endpoints — a `type:` picker per provider, recursive nesting for `caching`/`fallback`, and the same test-connection button.
 
@@ -132,5 +152,5 @@ Studio's **Catalog** page (left nav) is a thin UI over these same three endpoint
 
 - `CatalogProvider` (`queryflux_core::catalog`) is the one generic trait every integration implements — `list_catalogs`, `list_databases`, `list_tables`, `get_table_schema`, plus a default `get_schemas_for_query` that batches `get_table_schema` calls.
 - The live provider is hot-reloadable: it lives on `LiveConfig` (not a static `AppState` field), carried forward on a reload unless `catalog_config` has a new, successfully-parsed value — a reload must never silently regress to `NullCatalogProvider` and quietly stop discovering schema for already-working translation.
-- Real integrations are deliberately **engine-independent** — catalog discovery must work even when no query engine is configured or healthy. A future `glue`/`hiveMetastore` implementation talks directly to the catalog service; `engineDelegate` (also not yet implemented) is the one intentional exception, an opt-in convenience that delegates to an already-configured cluster group's adapter.
+- Real integrations are deliberately **engine-independent** — catalog discovery must work even when no query engine is configured or healthy. `glue` (and a future `hiveMetastore`) talk directly to the catalog service; `engineDelegate` (not yet implemented) is the one intentional exception, an opt-in convenience that delegates to an already-configured cluster group's adapter.
 - See [`architecture/query-translation`](./query-translation) for how `SchemaContext` flows into `sqlglot`'s optimizer, and [`architecture/system-map`](./system-map) for where this fits in the overall request path.

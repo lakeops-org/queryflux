@@ -2,16 +2,17 @@
 //! (Glue, Iceberg REST, Snowflake, ...) behind one `CatalogProvider` trait
 //! (`queryflux_core::catalog`), feeding schema-aware SQL translation.
 //!
-//! **Foundation phase** (this crate today): `Static`/`Caching`/`Fallback`, plus the
-//! `build_catalog_provider` factory that turns YAML config into a live provider.
-//! Real external integrations (Glue, Iceberg REST, Snowflake, engine-delegated
-//! discovery) land in a follow-up phase — see `plans/` for the full design. Until
-//! then, every config variant beyond `Null`/`Static`/`Caching`/`Fallback` degrades
-//! to a no-op `NullCatalogProvider` with a startup warning, exactly like an
-//! unreachable external catalog would at runtime — never a hard failure.
+//! Implemented today: `Static`/`Caching`/`Fallback` (no external dependency) and
+//! `Glue` (direct AWS Glue Data Catalog access — format-agnostic, unlike going
+//! through Iceberg's own Glue catalog client). `EngineDelegate`/`HiveMetastore`
+//! remain unimplemented — see `plans/` for the full design. Any unimplemented
+//! variant, or a real integration that fails to build (bad credentials,
+//! unreachable endpoint), degrades to a no-op `NullCatalogProvider` with a
+//! startup warning rather than refusing to boot.
 
 pub mod caching;
 pub mod fallback;
+pub mod glue;
 pub mod static_provider;
 
 use std::future::Future;
@@ -23,6 +24,7 @@ use queryflux_core::config::CatalogProviderConfig;
 
 pub use caching::CachingCatalogProvider;
 pub use fallback::FallbackCatalogProvider;
+pub use glue::GlueCatalogProvider;
 pub use static_provider::StaticCatalogProvider;
 
 /// Builds a live `CatalogProvider` tree from config. Recursive (`Caching`/`Fallback`
@@ -56,13 +58,18 @@ pub fn build_catalog_provider(
                 Arc::new(NullCatalogProvider) as Arc<dyn CatalogProvider>
             }
 
-            CatalogProviderConfig::Glue { .. } => {
-                tracing::warn!(
-                    "catalogProvider: type 'glue' is not implemented yet — using a \
-                     no-op catalog provider (schema-aware translation will fall back \
-                     to dialect-only)"
-                );
-                Arc::new(NullCatalogProvider) as Arc<dyn CatalogProvider>
+            CatalogProviderConfig::Glue { region, auth } => {
+                match GlueCatalogProvider::new(region.clone(), auth.clone()).await {
+                    Ok(provider) => Arc::new(provider) as Arc<dyn CatalogProvider>,
+                    Err(e) => {
+                        tracing::warn!(
+                            "catalogProvider: failed to build 'glue' provider ({e}) — \
+                             using a no-op catalog provider (schema-aware translation \
+                             will fall back to dialect-only)"
+                        );
+                        Arc::new(NullCatalogProvider) as Arc<dyn CatalogProvider>
+                    }
+                }
             }
 
             CatalogProviderConfig::HiveMetastore { .. } => {

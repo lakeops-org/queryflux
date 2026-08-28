@@ -1908,6 +1908,12 @@ pub enum CatalogProviderConfig {
     },
     Glue {
         region: Option<String>,
+        /// AWS credentials — reuses the same `ClusterAuth` shape as engine cluster
+        /// config (`accessKey`/`roleArn`; `basic`/`bearer`/`keyPair` don't apply
+        /// here). Omitted: the default AWS credential chain (env vars, ECS task
+        /// role, EC2 instance profile, etc.).
+        #[serde(default)]
+        auth: Option<ClusterAuth>,
     },
     Caching {
         #[serde(rename = "ttlSeconds")]
@@ -3298,7 +3304,7 @@ auth:
 /// These tests exist so both classes of bug can't silently reappear.
 #[cfg(test)]
 mod catalog_provider_config_tests {
-    use super::CatalogProviderConfig;
+    use super::{CatalogProviderConfig, ClusterAuth};
 
     #[test]
     fn null_is_the_default_and_parses_from_yaml() {
@@ -3398,12 +3404,44 @@ secondary:
         assert!(matches!(
             glue,
             CatalogProviderConfig::Glue {
-                region: Some(ref r)
+                region: Some(ref r),
+                auth: None,
             } if r == "us-east-1"
         ));
 
         let hms: CatalogProviderConfig =
             serde_yaml::from_str("type: hiveMetastore\nuri: thrift://localhost:9083\n").unwrap();
         assert!(matches!(hms, CatalogProviderConfig::HiveMetastore { .. }));
+    }
+
+    #[test]
+    fn glue_role_arn_auth_parses() {
+        let yaml = r#"
+type: glue
+region: us-east-1
+auth:
+  type: roleArn
+  roleArn: arn:aws:iam::123456789012:role/queryflux-glue-readonly
+  externalId: queryflux-ext-id
+"#;
+        let glue: CatalogProviderConfig = serde_yaml::from_str(yaml).unwrap();
+        match glue {
+            CatalogProviderConfig::Glue {
+                region: Some(region),
+                auth:
+                    Some(ClusterAuth::RoleArn {
+                        role_arn,
+                        external_id,
+                    }),
+            } => {
+                assert_eq!(region, "us-east-1");
+                assert_eq!(
+                    role_arn,
+                    "arn:aws:iam::123456789012:role/queryflux-glue-readonly"
+                );
+                assert_eq!(external_id.as_deref(), Some("queryflux-ext-id"));
+            }
+            other => panic!("expected Glue with RoleArn auth, got {other:?}"),
+        }
     }
 }

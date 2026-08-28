@@ -9,6 +9,13 @@ queryflux-core = { workspace = true }
 async-trait = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+# Same generation as the Athena adapter's aws-sdk-athena — direct Glue Data
+# Catalog access, format-agnostic (unlike iceberg-catalog-glue, which only sees
+# Iceberg-format tables).
+aws-sdk-glue = "1"
+aws-config = { version = "1", default-features = false, features = ["rustls", "rt-tokio"] }
+aws-credential-types = "1"
+aws-types = "1"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "macros"] }

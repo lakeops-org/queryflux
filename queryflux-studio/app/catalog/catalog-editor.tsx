@@ -2,7 +2,12 @@
 
 import React, { useState } from "react";
 import { putCatalogProviderConfig, testCatalogProviderConfig } from "@/lib/api";
-import type { CatalogProviderConfig, StaticColumnDefDto, StaticTableSchemaDto } from "@/lib/api-types";
+import type {
+  CatalogProviderConfig,
+  GlueAuthConfig,
+  StaticColumnDefDto,
+  StaticTableSchemaDto,
+} from "@/lib/api-types";
 import { Field, SectionHeader, TextInput, SaveBar } from "@/components/studio-settings";
 import { Database, Plus, Trash2 } from "lucide-react";
 
@@ -17,7 +22,7 @@ const DEFAULTS: Record<ProviderType, CatalogProviderConfig> = {
   static: { type: "static", schemas: [] },
   engineDelegate: { type: "engineDelegate", clusterGroup: "" },
   hiveMetastore: { type: "hiveMetastore", uri: "" },
-  glue: { type: "glue", region: null },
+  glue: { type: "glue", region: null, auth: null },
   caching: {
     type: "caching",
     ttlSeconds: 300,
@@ -44,7 +49,78 @@ const TYPE_LABELS: Record<ProviderType, string> = {
 // Declared in config, but the backend doesn't have a real implementation for
 // these yet — they build successfully and degrade to a no-op provider rather
 // than failing, per queryflux_catalog::build_catalog_provider.
-const UNIMPLEMENTED = new Set<ProviderType>(["engineDelegate", "hiveMetastore", "glue"]);
+const UNIMPLEMENTED = new Set<ProviderType>(["engineDelegate", "hiveMetastore"]);
+
+const GLUE_AUTH_LABELS: Record<"none" | GlueAuthConfig["type"], string> = {
+  none: "Default AWS credential chain",
+  accessKey: "Static access key",
+  roleArn: "Assume IAM role",
+};
+
+function GlueAuthEditor({
+  auth,
+  onChange,
+}: {
+  auth: GlueAuthConfig | null | undefined;
+  onChange: (v: GlueAuthConfig | null) => void;
+}) {
+  const kind = auth?.type ?? "none";
+  return (
+    <div className="space-y-3">
+      <Field label="Credentials">
+        <select
+          className="w-full max-w-xs px-2.5 py-1.5 text-xs rounded-lg border border-slate-200 bg-white text-slate-900 focus:outline-none focus:ring-2 focus:ring-indigo-300"
+          value={kind}
+          onChange={(e) => {
+            const next = e.target.value as "none" | GlueAuthConfig["type"];
+            if (next === "none") onChange(null);
+            else if (next === "accessKey")
+              onChange({ type: "accessKey", accessKeyId: "", secretAccessKey: "" });
+            else onChange({ type: "roleArn", roleArn: "" });
+          }}
+        >
+          {(Object.entries(GLUE_AUTH_LABELS) as [string, string][]).map(([k, label]) => (
+            <option key={k} value={k}>
+              {label}
+            </option>
+          ))}
+        </select>
+      </Field>
+
+      {auth?.type === "accessKey" && (
+        <div className="grid grid-cols-2 gap-4">
+          <TextInput
+            label="Access key ID"
+            value={auth.accessKeyId}
+            onChange={(v) => onChange({ ...auth, accessKeyId: v })}
+          />
+          <TextInput
+            label="Secret access key"
+            type="password"
+            value={auth.secretAccessKey}
+            onChange={(v) => onChange({ ...auth, secretAccessKey: v })}
+          />
+        </div>
+      )}
+
+      {auth?.type === "roleArn" && (
+        <div className="grid grid-cols-2 gap-4">
+          <TextInput
+            label="Role ARN"
+            value={auth.roleArn}
+            onChange={(v) => onChange({ ...auth, roleArn: v })}
+            placeholder="arn:aws:iam::123456789012:role/queryflux-glue-readonly"
+          />
+          <TextInput
+            label="External ID (optional)"
+            value={auth.externalId ?? ""}
+            onChange={(v) => onChange({ ...auth, externalId: v || null })}
+          />
+        </div>
+      )}
+    </div>
+  );
+}
 
 // ---------------------------------------------------------------------------
 // Static schema editor — one row per table, columns as a "name:TYPE" shorthand
@@ -204,12 +280,16 @@ function CatalogProviderConfigEditor({
       )}
 
       {value.type === "glue" && (
-        <div className="mt-3">
+        <div className="mt-3 space-y-4">
           <TextInput
             label="AWS region (optional)"
             value={value.region ?? ""}
             onChange={(region) => onChange({ ...value, region: region || null })}
             placeholder="us-east-1"
+          />
+          <GlueAuthEditor
+            auth={value.auth}
+            onChange={(auth) => onChange({ ...value, auth })}
           />
         </div>
       )}
