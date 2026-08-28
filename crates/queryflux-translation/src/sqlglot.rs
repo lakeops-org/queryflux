@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use async_trait::async_trait;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
@@ -8,6 +10,124 @@ use queryflux_core::{
 use tracing::debug;
 
 use crate::{SchemaContext, TranslatorTrait};
+
+/// A table reference as written in the SQL, before catalog/database defaulting.
+/// Distinct from (and unrelated to) the `TableRef` used elsewhere in this org for
+/// query-history intelligence — this one is fed straight into catalog lookup for
+/// schema-aware translation and never persisted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TableRef {
+    pub catalog: Option<String>,
+    pub database: Option<String>,
+    pub table: String,
+}
+
+/// Parse `sql` under `dialect` and return every distinct table it references (via
+/// sqlglot's `exp.Table` nodes), excluding names that resolve to a CTE defined in
+/// the same query rather than a real table. Best-effort: a parse failure yields
+/// `Ok(vec![])`, not an error — callers should treat that identically to "no
+/// schema info available" and fall back to dialect-only translation.
+pub fn extract_table_refs(sql: &str, dialect: &str) -> Result<Vec<TableRef>> {
+    Python::attach(|py| extract_table_refs_with_gil(py, sql, dialect))
+}
+
+/// Async wrapper around `extract_table_refs`, off the async executor (same
+/// `spawn_blocking` pattern `SqlglotTranslator::translate` already uses for GIL work).
+pub async fn extract_table_refs_async(sql: String, dialect: String) -> Result<Vec<TableRef>> {
+    tokio::task::spawn_blocking(move || extract_table_refs(&sql, &dialect))
+        .await
+        .map_err(|e| QueryFluxError::Translation(format!("spawn_blocking error: {e}")))?
+}
+
+fn extract_table_refs_with_gil(py: Python<'_>, sql: &str, dialect: &str) -> Result<Vec<TableRef>> {
+    let sqlglot = PyModule::import(py, "sqlglot")
+        .map_err(|e| QueryFluxError::Translation(format!("Failed to import sqlglot: {e}")))?;
+    let exp = PyModule::import(py, "sqlglot.expressions").map_err(|e| {
+        QueryFluxError::Translation(format!("Failed to import sqlglot.expressions: {e}"))
+    })?;
+
+    let parse_kwargs = PyDict::new(py);
+    parse_kwargs.set_item("dialect", dialect).ok();
+    let tree = match sqlglot.call_method("parse_one", (sql,), Some(&parse_kwargs)) {
+        Ok(t) => t,
+        Err(e) => {
+            debug!("extract_table_refs: parse_one failed, treating as no refs: {e}");
+            return Ok(vec![]);
+        }
+    };
+
+    // CTE aliases shadow same-named real tables within this query — an unqualified
+    // reference to one is never a catalog lookup target.
+    let cte_cls = exp
+        .getattr("CTE")
+        .map_err(|e| QueryFluxError::Translation(format!("no sqlglot.expressions.CTE: {e}")))?;
+    let ctes = tree
+        .call_method1("find_all", (cte_cls,))
+        .map_err(|e| QueryFluxError::Translation(format!("find_all(CTE) failed: {e}")))?;
+    let mut cte_aliases: HashSet<String> = HashSet::new();
+    for cte in ctes
+        .try_iter()
+        .map_err(|e| QueryFluxError::Translation(format!("iterate CTEs failed: {e}")))?
+    {
+        let cte = cte.map_err(|e| QueryFluxError::Translation(format!("CTE item failed: {e}")))?;
+        // `alias_or_name` is a sqlglot property, not a method — plain attribute access.
+        if let Ok(alias) = cte
+            .getattr("alias_or_name")
+            .and_then(|v| v.extract::<String>())
+        {
+            if !alias.is_empty() {
+                cte_aliases.insert(alias);
+            }
+        }
+    }
+
+    let table_cls = exp
+        .getattr("Table")
+        .map_err(|e| QueryFluxError::Translation(format!("no sqlglot.expressions.Table: {e}")))?;
+    let tables = tree
+        .call_method1("find_all", (table_cls,))
+        .map_err(|e| QueryFluxError::Translation(format!("find_all(Table) failed: {e}")))?;
+
+    let mut refs = Vec::new();
+    let mut seen: HashSet<(String, String, String)> = HashSet::new();
+    for table in tables
+        .try_iter()
+        .map_err(|e| QueryFluxError::Translation(format!("iterate tables failed: {e}")))?
+    {
+        let table =
+            table.map_err(|e| QueryFluxError::Translation(format!("table item failed: {e}")))?;
+        let name: String = table
+            .getattr("name")
+            .and_then(|v| v.extract())
+            .unwrap_or_default();
+        if name.is_empty() {
+            continue; // e.g. a derived/subquery table with no literal name
+        }
+        let catalog: String = table
+            .getattr("catalog")
+            .and_then(|v| v.extract())
+            .unwrap_or_default();
+        let database: String = table
+            .getattr("db")
+            .and_then(|v| v.extract())
+            .unwrap_or_default();
+
+        if catalog.is_empty() && database.is_empty() && cte_aliases.contains(&name) {
+            continue;
+        }
+
+        let key = (catalog.clone(), database.clone(), name.clone());
+        if !seen.insert(key) {
+            continue;
+        }
+        refs.push(TableRef {
+            catalog: (!catalog.is_empty()).then_some(catalog),
+            database: (!database.is_empty()).then_some(database),
+            table: name,
+        });
+    }
+    Ok(refs)
+}
 
 /// SQL translator backed by the sqlglot Python library (via PyO3).
 pub struct SqlglotTranslator {
@@ -254,4 +374,62 @@ fn run_fixup_scripts(
         .map_err(|e| QueryFluxError::Translation(format!("transform: extract failed: {e}")))?;
 
     Ok(result)
+}
+
+#[cfg(test)]
+mod extract_table_refs_tests {
+    use super::*;
+
+    #[test]
+    fn extracts_qualified_and_unqualified_tables() {
+        let refs = extract_table_refs("SELECT * FROM hive.analytics.orders", "trino").unwrap();
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].catalog.as_deref(), Some("hive"));
+        assert_eq!(refs[0].database.as_deref(), Some("analytics"));
+        assert_eq!(refs[0].table, "orders");
+
+        let refs = extract_table_refs("SELECT x FROM t", "trino").unwrap();
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].catalog, None);
+        assert_eq!(refs[0].database, None);
+        assert_eq!(refs[0].table, "t");
+    }
+
+    #[test]
+    fn extracts_all_tables_in_a_join_without_duplicates() {
+        let refs = extract_table_refs(
+            "SELECT * FROM orders o JOIN orders x ON o.id = x.id JOIN customers c ON o.customer_id = c.id",
+            "trino",
+        )
+        .unwrap();
+        let names: std::collections::HashSet<_> = refs.iter().map(|r| r.table.as_str()).collect();
+        // `orders` is joined against itself under two aliases — must appear once.
+        assert_eq!(names, ["orders", "customers"].into_iter().collect());
+    }
+
+    #[test]
+    fn cte_aliases_are_excluded_but_real_tables_survive() {
+        let refs = extract_table_refs(
+            "WITH recent AS (SELECT a FROM real_table) SELECT * FROM recent",
+            "trino",
+        )
+        .unwrap();
+        let names: Vec<&str> = refs.iter().map(|r| r.table.as_str()).collect();
+        assert_eq!(names, vec!["real_table"]);
+    }
+
+    #[test]
+    fn malformed_sql_yields_empty_not_error() {
+        let refs = extract_table_refs("SELECT FROM WHERE", "trino").unwrap();
+        assert!(refs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn async_wrapper_matches_sync_result() {
+        let refs = extract_table_refs_async("SELECT * FROM t".to_string(), "trino".to_string())
+            .await
+            .unwrap();
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].table, "t");
+    }
 }

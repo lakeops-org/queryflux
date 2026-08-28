@@ -13,6 +13,7 @@ members = [
     "crates/queryflux-engine-adapters",
     "crates/queryflux-frontend",
     "crates/queryflux-cluster-manager",
+    "crates/queryflux-catalog",
     "crates/queryflux-config",
     "crates/queryflux-metrics",
     "crates/queryflux-fingerprint",
@@ -72,6 +73,7 @@ dashmap = "6.1.0"
 
 # Internal crates
 queryflux-core = { path = "crates/queryflux-core" }
+queryflux-catalog = { path = "crates/queryflux-catalog" }
 queryflux-auth = { path = "crates/queryflux-auth" }
 queryflux-persistence = { path = "crates/queryflux-persistence" }
 queryflux-routing = { path = "crates/queryflux-routing" }

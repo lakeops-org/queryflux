@@ -662,13 +662,23 @@ async fn main() -> Result<()> {
 
     // --- Build translation service ---
     let translation = Arc::new(
-        TranslationService::new_sqlglot(config.translation.python_scripts.clone()).unwrap_or_else(
-            |e| {
+        TranslationService::new_sqlglot(config.translation.python_scripts.clone())
+            .unwrap_or_else(|e| {
                 tracing::warn!("sqlglot unavailable ({e}), translation disabled");
                 TranslationService::disabled()
-            },
-        ),
+            })
+            .with_schema_resolution_timeout(std::time::Duration::from_millis(
+                config.translation.schema_resolution_timeout_ms,
+            )),
     );
+
+    // --- Build catalog provider ---
+    // Feeds `translation.resolve_schema_context` so sqlglot's optimizer can qualify
+    // columns/types instead of falling back to dialect-only translation. Never fails
+    // startup: an unimplemented or misconfigured integration degrades to a no-op
+    // (see `queryflux_catalog::build_catalog_provider`), same philosophy as `translation` above.
+    let catalog: Arc<dyn queryflux_core::catalog::CatalogProvider> =
+        queryflux_catalog::build_catalog_provider(&config.catalog_provider).await;
 
     // --- Build router chain ---
     let fallback = ClusterGroupName(config.routing_fallback.clone());
@@ -1121,6 +1131,7 @@ async fn main() -> Result<()> {
         live: live.clone(),
         persistence,
         translation,
+        catalog,
         metrics,
         identity_resolver,
         capacity_store,

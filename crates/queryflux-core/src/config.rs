@@ -1866,10 +1866,25 @@ pub struct TranslationConfig {
     /// Scripts mutate `ast` in-place; `src`/`dst` carry the dialect names.
     #[serde(default)]
     pub python_scripts: Vec<String>,
+    /// Max time to spend on catalog lookup for schema-aware translation before
+    /// falling back to dialect-only translation. Default 1500ms.
+    #[serde(default = "default_schema_resolution_timeout_ms")]
+    pub schema_resolution_timeout_ms: u64,
+}
+
+fn default_schema_resolution_timeout_ms() -> u64 {
+    1500
 }
 
 // --- Catalog provider ---
 
+// NOTE: `rename_all = "camelCase"` on this container does NOT reliably reach
+// multi-word field names *inside* struct-like variants of an internally-tagged
+// (`tag = "type"`) enum with this serde/serde_yaml version combination — confirmed
+// empirically (deserialization silently reports the snake_case name as "missing"
+// even when the container attribute claims camelCase). Every multi-word variant
+// field below has an explicit `#[serde(rename = "...")]` because of this; don't
+// rely on the container-level rename_all for new fields added here.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase", tag = "type")]
 pub enum CatalogProviderConfig {
@@ -1878,8 +1893,14 @@ pub enum CatalogProviderConfig {
     Static {
         schemas: Vec<StaticTableSchema>,
     },
-    Trino {
+    /// Delegates catalog discovery to a cluster group's own adapter (Trino, DuckDB,
+    /// StarRocks, Athena, or ClickHouse — whichever engine the group runs). Opt-in
+    /// convenience/fallback, not a recommended default: its accuracy and availability
+    /// are tied to that cluster group's health. Not yet implemented — see
+    /// `plans/` catalog integration plan for phasing.
+    EngineDelegate {
         /// Name of the cluster group to use for metadata queries.
+        #[serde(rename = "clusterGroup")]
         cluster_group: String,
     },
     HiveMetastore {
@@ -1889,9 +1910,14 @@ pub enum CatalogProviderConfig {
         region: Option<String>,
     },
     Caching {
+        #[serde(rename = "ttlSeconds")]
         ttl_seconds: u64,
+        #[serde(rename = "maxEntries")]
         max_entries: usize,
-        #[serde(flatten)]
+        /// The wrapped provider, e.g. `delegate: { type: static, schemas: [] }`.
+        /// Deliberately *not* `#[serde(flatten)]`: `CatalogProviderConfig` is itself
+        /// an internally-tagged enum (`tag = "type"`), so flattening it here would
+        /// require two `type` keys in the same YAML mapping — nest it instead.
         delegate: Box<CatalogProviderConfig>,
     },
     Fallback {
@@ -3257,5 +3283,127 @@ auth:
             }),
         };
         assert!(authz.validate().is_err());
+    }
+}
+
+/// Regression coverage for `CatalogProviderConfig` YAML round-tripping.
+///
+/// This enum's variants went untested against real YAML for a long time (it was
+/// declared but never wired to a live provider), and that let two real bugs slip
+/// in unnoticed: `#[serde(flatten)]` on a nested internally-tagged enum requiring
+/// two `type` keys in one mapping, and `rename_all = "camelCase"` on the
+/// container not reaching multi-word field names inside this enum's variants
+/// (confirmed empirically against this serde/serde_yaml version combination —
+/// every such field now has an explicit `#[serde(rename = "...")]` instead).
+/// These tests exist so both classes of bug can't silently reappear.
+#[cfg(test)]
+mod catalog_provider_config_tests {
+    use super::CatalogProviderConfig;
+
+    #[test]
+    fn null_is_the_default_and_parses_from_yaml() {
+        assert!(matches!(
+            CatalogProviderConfig::default(),
+            CatalogProviderConfig::Null
+        ));
+        let cfg: CatalogProviderConfig = serde_yaml::from_str("type: null\n").unwrap();
+        assert!(matches!(cfg, CatalogProviderConfig::Null));
+    }
+
+    #[test]
+    fn static_schemas_round_trip_camel_case() {
+        let yaml = r#"
+type: static
+schemas:
+  - catalog: hive
+    database: analytics
+    table: orders
+    columns:
+      - { name: order_id, dataType: BIGINT, nullable: false }
+"#;
+        let cfg: CatalogProviderConfig = serde_yaml::from_str(yaml).unwrap();
+        match cfg {
+            CatalogProviderConfig::Static { schemas } => {
+                assert_eq!(schemas.len(), 1);
+                assert_eq!(schemas[0].table, "orders");
+                assert_eq!(schemas[0].columns[0].data_type, "BIGINT");
+            }
+            other => panic!("expected Static, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn engine_delegate_cluster_group_uses_camel_case_key() {
+        let cfg: CatalogProviderConfig =
+            serde_yaml::from_str("type: engineDelegate\nclusterGroup: trino-default\n").unwrap();
+        match cfg {
+            CatalogProviderConfig::EngineDelegate { cluster_group } => {
+                assert_eq!(cluster_group, "trino-default");
+            }
+            other => panic!("expected EngineDelegate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn caching_wraps_a_nested_delegate_not_flattened() {
+        let yaml = r#"
+type: caching
+ttlSeconds: 300
+maxEntries: 10000
+delegate:
+  type: static
+  schemas: []
+"#;
+        let cfg: CatalogProviderConfig = serde_yaml::from_str(yaml).unwrap();
+        match cfg {
+            CatalogProviderConfig::Caching {
+                ttl_seconds,
+                max_entries,
+                delegate,
+            } => {
+                assert_eq!(ttl_seconds, 300);
+                assert_eq!(max_entries, 10000);
+                assert!(matches!(*delegate, CatalogProviderConfig::Static { .. }));
+            }
+            other => panic!("expected Caching, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fallback_primary_and_secondary_nest_independently() {
+        // "null" must be quoted here — a bare YAML `null` parses as YAML's null
+        // type, not the string the `type` tag needs to match the Null variant.
+        let yaml = r#"
+type: fallback
+primary:
+  type: static
+  schemas: []
+secondary:
+  type: "null"
+"#;
+        let cfg: CatalogProviderConfig = serde_yaml::from_str(yaml).unwrap();
+        match cfg {
+            CatalogProviderConfig::Fallback { primary, secondary } => {
+                assert!(matches!(*primary, CatalogProviderConfig::Static { .. }));
+                assert!(matches!(*secondary, CatalogProviderConfig::Null));
+            }
+            other => panic!("expected Fallback, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn glue_and_hive_metastore_parse() {
+        let glue: CatalogProviderConfig =
+            serde_yaml::from_str("type: glue\nregion: us-east-1\n").unwrap();
+        assert!(matches!(
+            glue,
+            CatalogProviderConfig::Glue {
+                region: Some(ref r)
+            } if r == "us-east-1"
+        ));
+
+        let hms: CatalogProviderConfig =
+            serde_yaml::from_str("type: hiveMetastore\nuri: thrift://localhost:9083\n").unwrap();
+        assert!(matches!(hms, CatalogProviderConfig::HiveMetastore { .. }));
     }
 }

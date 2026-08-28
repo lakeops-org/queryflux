@@ -5,6 +5,7 @@ use chrono::Utc;
 use queryflux_auth::{AuthProvider, AuthorizationChecker, BackendIdentityResolver};
 use queryflux_cluster_manager::{cluster_state::ClusterState, ClusterGroupManager};
 use queryflux_core::{
+    catalog::CatalogProvider,
     config::ClusterConfig,
     params::QueryParams,
     query::{
@@ -83,6 +84,11 @@ pub struct AppState {
     // Static (never reloaded):
     pub persistence: Arc<dyn Persistence>,
     pub translation: Arc<TranslationService>,
+    /// Discovers table/column metadata for schema-aware translation
+    /// (`TranslationService::resolve_schema_context`). `NullCatalogProvider` when no
+    /// `catalogProvider` is configured — every call site treats that identically to
+    /// "catalog lookup found nothing," never as an error.
+    pub catalog: Arc<dyn CatalogProvider>,
     pub metrics: Arc<dyn MetricsStore>,
     /// Resolves per-user `QueryCredentials` from `AuthContext` + cluster `queryAuth` config.
     pub identity_resolver: Arc<BackendIdentityResolver>,
@@ -680,6 +686,7 @@ pub mod test_fixtures {
             live: Arc::new(RwLock::new(live)),
             persistence: Arc::new(InMemoryPersistence::new()),
             translation: Arc::new(TranslationService::disabled()),
+            catalog: Arc::new(queryflux_core::catalog::NullCatalogProvider),
             metrics,
             identity_resolver: Arc::new(BackendIdentityResolver::new()),
             capacity_store: None,

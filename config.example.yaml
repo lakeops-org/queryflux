@@ -80,6 +80,44 @@ translation:
   #         if dst == "athena":
   #             for table in ast.find_all(exp.Table):
   #                 table.set("catalog", None)
+  # Max time to spend on catalog lookup (see `catalogProvider` below) before
+  # falling back to dialect-only translation. Default 1500ms.
+  # schemaResolutionTimeoutMs: 1500
+
+# Native catalog integration — discovers table/column metadata so schema-aware SQL
+# translation (sqlglot's optimizer) can qualify columns/types, not just transpile
+# syntax. Defaults to `type: null` (no metadata, dialect-only translation only).
+catalogProvider:
+  type: null
+  # --- Other provider examples ---
+  # A literal, hand-declared schema — zero external dependencies, useful for
+  # testing or a small fixed set of tables.
+  # type: static
+  # schemas:
+  #   - catalog: hive
+  #     database: analytics
+  #     table: orders
+  #     columns:
+  #       - { name: order_id, dataType: BIGINT, nullable: false }
+  #       - { name: total, dataType: "DECIMAL(10,2)", nullable: true }
+  #
+  # Wrap any provider with a TTL cache:
+  # type: caching
+  # ttlSeconds: 300
+  # maxEntries: 10000
+  # delegate:
+  #   type: static
+  #   schemas: []
+  #
+  # Try a primary provider, fall back to a secondary on error (or a missing
+  # table, for get_table_schema specifically). Note: "null" must be quoted here —
+  # a bare YAML `null` parses as YAML's null type, not the string tag `type` expects.
+  # type: fallback
+  # primary:
+  #   type: static
+  #   schemas: []
+  # secondary:
+  #   type: "null"
 
 routers:
   - type: protocolBased

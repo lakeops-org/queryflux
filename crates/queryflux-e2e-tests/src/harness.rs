@@ -364,6 +364,7 @@ impl TestHarness {
             live: Arc::new(tokio::sync::RwLock::new(live_config)),
             persistence: Arc::new(InMemoryPersistence::new()),
             translation,
+            catalog: Arc::new(queryflux_core::catalog::NullCatalogProvider),
             metrics: Arc::new(CapturingMetrics {
                 records: records.clone(),
             }),
@@ -613,6 +614,7 @@ impl WireTestHarness {
             live: Arc::new(tokio::sync::RwLock::new(live_config)),
             persistence: Arc::new(InMemoryPersistence::new()),
             translation,
+            catalog: Arc::new(queryflux_core::catalog::NullCatalogProvider),
             metrics: Arc::new(NullMetrics),
             identity_resolver: Arc::new(BackendIdentityResolver::new()),
             capacity_store: None,
@@ -756,6 +758,7 @@ impl WireTestHarness {
             live: Arc::new(tokio::sync::RwLock::new(live_config)),
             persistence: Arc::new(InMemoryPersistence::new()),
             translation,
+            catalog: Arc::new(queryflux_core::catalog::NullCatalogProvider),
             metrics: Arc::new(NullMetrics),
             identity_resolver: Arc::new(BackendIdentityResolver::new()),
             capacity_store: None,
@@ -927,6 +930,7 @@ impl ProtocolWireHarness {
             live: Arc::new(tokio::sync::RwLock::new(live_config)),
             persistence: Arc::new(InMemoryPersistence::new()),
             translation,
+            catalog: Arc::new(queryflux_core::catalog::NullCatalogProvider),
             metrics: Arc::new(CapturingMetrics {
                 records: records.clone(),
             }),

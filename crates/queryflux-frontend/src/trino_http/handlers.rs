@@ -1641,6 +1641,7 @@ mod cancel_executing_statement_tests {
             live: Arc::new(RwLock::new(live)),
             persistence: Arc::new(InMemoryPersistence::new()),
             translation: Arc::new(TranslationService::disabled()),
+            catalog: Arc::new(queryflux_core::catalog::NullCatalogProvider),
             metrics: Arc::new(NoopMetricsStore),
             identity_resolver: Arc::new(BackendIdentityResolver::new()),
             capacity_store: None,

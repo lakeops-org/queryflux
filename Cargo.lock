@@ -4007,6 +4007,7 @@ dependencies = [
  "opentelemetry_sdk",
  "queryflux-auth",
  "queryflux-cache",
+ "queryflux-catalog",
  "queryflux-cli",
  "queryflux-cluster-manager",
  "queryflux-config",
@@ -4077,6 +4078,16 @@ dependencies = [
  "tokio",
  "tracing",
  "xxhash-rust",
+]
+
+[[package]]
+name = "queryflux-catalog"
+version = "0.3.0"
+dependencies = [
+ "async-trait",
+ "queryflux-core",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
