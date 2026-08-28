@@ -57,11 +57,12 @@ The Trino HTTP frontend populates `SessionContext` as follows:
 | Field | Source |
 |-------|--------|
 | `user` | `X-Trino-User` header |
-| `database` | `X-Trino-Catalog` header |
+| `catalog` | `X-Trino-Catalog` header |
+| `database` | `X-Trino-Schema` header |
 | `tags` | `X-Trino-Client-Tags` and `X-Trino-Session` headers (extracted at request time) |
 | `extra` | All request headers, lowercased (e.g. `x-trino-user`, `x-trino-catalog`, `x-trino-schema`) |
 
-Routers and the `pythonScript` router can inspect any header via `ctx["extra"]` (e.g. `ctx["extra"].get("x-trino-source")`). The common fields `ctx["user"]` and `ctx["database"]` are preferred for user/catalog routing.
+Routers and the `pythonScript` router can inspect any header via `ctx["extra"]` (e.g. `ctx["extra"].get("x-trino-source")`). The common fields `ctx["user"]`, `ctx["catalog"]`, and `ctx["database"]` are preferred for user/catalog/schema routing — `catalog`/`database` here follow Trino's own three-part `catalog.schema.table` naming, not two names for the same thing.
 
 ## Query tags
 
@@ -94,7 +95,6 @@ curl -X POST http://localhost:8080/v1/statement \
 | Feature | Status |
 |---------|--------|
 | Prepared statements | Not supported. The Trino HTTP protocol does not use a separate prepare/execute flow; all queries arrive as raw SQL. |
-| `X-Trino-Schema` as routing hint | The `X-Trino-Schema` header is stored in `extra` and forwarded to the backend but is not mapped to `SessionContext.database`. Use `X-Trino-Catalog` for the `ctx["database"]` routing field. |
 | TLS termination | Not handled by QueryFlux. Use an external TLS terminator in front of the Trino HTTP listener. |
 
 ## Related

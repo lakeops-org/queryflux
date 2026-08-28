@@ -357,7 +357,13 @@ pub async fn dispatch_query(
     let sql = if should_attempt_translation(&session, &protocol) {
         let schema_context = state
             .translation
-            .resolve_schema_context(&sql, &src_dialect, &catalog, None, session.database())
+            .resolve_schema_context(
+                &sql,
+                &src_dialect,
+                &catalog,
+                session.catalog(),
+                session.database(),
+            )
             .await;
         match state
             .translation
@@ -1413,7 +1419,13 @@ async fn setup_sync_query(
     let translated = if should_attempt_translation(&session, &protocol) {
         let schema_context = state
             .translation
-            .resolve_schema_context(&sql, &src_dialect, &catalog, None, session.database())
+            .resolve_schema_context(
+                &sql,
+                &src_dialect,
+                &catalog,
+                session.catalog(),
+                session.database(),
+            )
             .await;
         match state
             .translation

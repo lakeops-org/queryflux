@@ -255,8 +255,8 @@ impl AppState {
             was_translated: ctx.was_translated,
             translated_sql: ctx.translated_sql.clone(),
             user: ctx.session.user().map(|s| s.to_string()),
-            catalog: ctx.session.database().map(|s| s.to_string()),
-            database: None,
+            catalog: ctx.session.catalog().map(|s| s.to_string()),
+            database: ctx.session.database().map(|s| s.to_string()),
             sql_preview: ctx.sql.chars().take(500).collect(),
             status: outcome.status,
             routing_trace: outcome

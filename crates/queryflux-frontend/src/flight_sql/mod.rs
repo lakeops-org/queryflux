@@ -121,6 +121,10 @@ impl QueryFluxFlightSql {
         SessionContext {
             user,
             database: None,
+            // Not yet extracted — Flight SQL commands (e.g. CommandGetTables) do
+            // carry catalog/schema filters, but no current-catalog session concept
+            // is wired up here yet.
+            catalog: None,
             tags: queryflux_core::tags::QueryTags::new(),
             extra: headers,
             agent_context: None,

@@ -144,8 +144,17 @@ impl AgentContext {
 pub struct SessionContext {
     /// Resolved user identity (extracted at connection time by the frontend).
     pub user: Option<String>,
-    /// Target database/catalog hint for routing and catalog providers.
+    /// Target database/schema hint for routing and catalog providers. For
+    /// protocols with a real catalog layer (Trino, Snowflake), this is the
+    /// *schema* — the catalog goes in `catalog` below. For protocols without one
+    /// (Postgres, MySQL/StarRocks), this is simply the selected database.
     pub database: Option<String>,
+    /// Target catalog hint, for protocols that have a separate catalog concept
+    /// from database/schema (Trino's `X-Trino-Catalog`, Snowflake's database).
+    /// `None` for protocols with no catalog layer — never assume it falls back
+    /// to `database`, the two are genuinely different things per-protocol.
+    #[serde(default)]
+    pub catalog: Option<String>,
     /// Query tags for routing and metrics.
     pub tags: QueryTags,
     /// Protocol-specific key-value data. Frontends own the key conventions.
@@ -166,9 +175,16 @@ impl SessionContext {
         self.user.as_deref()
     }
 
-    /// Extract the target database/catalog hint.
+    /// Extract the target database/schema hint (see field doc comment for what
+    /// this means per-protocol — it is *not* the catalog for Trino/Snowflake).
     pub fn database(&self) -> Option<&str> {
         self.database.as_deref()
+    }
+
+    /// Extract the target catalog hint. `None` for protocols without a catalog
+    /// layer (Postgres, MySQL/StarRocks) — never falls back to `database`.
+    pub fn catalog(&self) -> Option<&str> {
+        self.catalog.as_deref()
     }
 
     /// Resolve agent identity for this session.
@@ -232,9 +248,31 @@ mod tests {
         let s = SessionContext::default();
         assert_eq!(s.user(), None);
         assert_eq!(s.database(), None);
+        assert_eq!(s.catalog(), None);
         assert!(s.tags().is_empty());
         assert!(s.extra.is_empty());
         assert_eq!(s.client_source(), None);
+    }
+
+    #[test]
+    fn catalog_and_database_are_independent() {
+        let s = SessionContext {
+            catalog: Some("hive".to_string()),
+            database: Some("analytics".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(s.catalog(), Some("hive"));
+        assert_eq!(s.database(), Some("analytics"));
+    }
+
+    #[test]
+    fn deserializes_json_missing_catalog_field() {
+        // Backward compat: rows persisted before `catalog` existed (e.g. queued
+        // queries stored as JSON in Postgres) must still deserialize.
+        let json = r#"{"user":"alice","database":"hive","tags":{},"extra":{}}"#;
+        let s: SessionContext = serde_json::from_str(json).unwrap();
+        assert_eq!(s.database(), Some("hive"));
+        assert_eq!(s.catalog(), None);
     }
 
     #[test]

@@ -318,16 +318,47 @@ fn extract_session(headers: &HeaderMap) -> SessionContext {
     }
     let tags = extract_trino_tags(&h);
     let user = h.get("x-trino-user").cloned();
-    let database = h.get("x-trino-catalog").cloned();
+    // `X-Trino-Catalog` / `X-Trino-Schema` map onto our catalog.database.table model
+    // as catalog/database respectively — Trino's own three-part naming, not two
+    // different names for the same thing.
+    let catalog = h.get("x-trino-catalog").cloned();
+    let database = h.get("x-trino-schema").cloned();
     // Agent context is NOT extracted here — it is derived lazily from `extra` in
     // dispatch.rs via `session.resolved_agent_context()`. All HTTP frontends that
     // store headers in `extra` (lowercase) automatically support agent headers.
     SessionContext {
         user,
         database,
+        catalog,
         tags,
         extra: h,
         agent_context: None,
+    }
+}
+
+#[cfg(test)]
+mod extract_session_tests {
+    use super::extract_session;
+    use axum::http::HeaderMap;
+
+    #[test]
+    fn catalog_and_schema_headers_map_to_distinct_fields() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-trino-user", "alice".parse().unwrap());
+        headers.insert("x-trino-catalog", "hive".parse().unwrap());
+        headers.insert("x-trino-schema", "analytics".parse().unwrap());
+
+        let session = extract_session(&headers);
+        assert_eq!(session.catalog(), Some("hive"));
+        assert_eq!(session.database(), Some("analytics"));
+    }
+
+    #[test]
+    fn missing_headers_leave_both_none() {
+        let headers = HeaderMap::new();
+        let session = extract_session(&headers);
+        assert_eq!(session.catalog(), None);
+        assert_eq!(session.database(), None);
     }
 }
 

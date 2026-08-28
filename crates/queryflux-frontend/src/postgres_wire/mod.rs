@@ -211,6 +211,8 @@ async fn handle_connection(
     let session = SessionContext {
         user: if user.is_empty() { None } else { Some(user) },
         database,
+        // Postgres wire has no catalog concept — just a database.
+        catalog: None,
         tags,
         extra,
         agent_context: None,
@@ -784,6 +786,7 @@ mod tests {
         SessionContext {
             user: None,
             database: None,
+            catalog: None,
             tags: queryflux_core::tags::QueryTags::new(),
             extra,
             agent_context: None,

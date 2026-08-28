@@ -148,7 +148,7 @@ curl -X POST http://localhost:8443/api/v2/statements \
 | Async query execution (`asyncExec: true`) | Not supported. `query-monitoring-request` returns an empty polling response so the connector stops polling. All queries run synchronously. |
 | Query cancel (`DELETE /queries/v1/{id}`, `DELETE /api/v2/statements/{handle}`) | No-op — synchronous execution cannot be interrupted mid-flight via HTTP. Returns a success response. |
 | SQL REST API v2 polling (`GET /api/v2/statements/{handle}`) | Stub — returns HTTP 404 with "already complete" message. |
-| `database` in SQL REST API v2 | Not extracted. `SessionContext.database` is always `None`; protocolBased routing on database hint is not available for REST v2 clients. |
+| `schema` as a routing hint | The request body's top-level `database` field populates both `SessionContext.database` and `SessionContext.catalog` (Snowflake's database maps onto our `catalog.database.table` model as the catalog) — `schema` is captured into `extra["snowflake.schema"]` but not mapped onto a dedicated field yet, so it isn't available for `protocolBased` routing on its own. |
 | Query tags | Not extracted for either sub-protocol. The `tags` router type cannot be used with Snowflake frontends. |
 | Multiple statements per request | Not supported. Only the first statement in the request body is executed. |
 | Transactions (`BEGIN` / `COMMIT` / `ROLLBACK`) | No transaction state is maintained. These statements are forwarded to the backend as-is. |
