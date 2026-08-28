@@ -72,6 +72,12 @@ pub struct LiveConfig {
     /// Checks whether an authenticated user may access a cluster group — hot-reloaded
     /// when security config changes via admin API.
     pub authorization: Arc<dyn AuthorizationChecker>,
+    /// Discovers table/column metadata for schema-aware translation
+    /// (`TranslationService::resolve_schema_context`) — hot-reloaded when catalog
+    /// config changes via the admin API. `NullCatalogProvider` when no
+    /// `catalogProvider` is configured; every call site treats that identically to
+    /// "catalog lookup found nothing," never as an error.
+    pub catalog: Arc<dyn CatalogProvider>,
 }
 
 /// Shared application state — passed to every handler via `axum::extract::State`.
@@ -84,11 +90,6 @@ pub struct AppState {
     // Static (never reloaded):
     pub persistence: Arc<dyn Persistence>,
     pub translation: Arc<TranslationService>,
-    /// Discovers table/column metadata for schema-aware translation
-    /// (`TranslationService::resolve_schema_context`). `NullCatalogProvider` when no
-    /// `catalogProvider` is configured — every call site treats that identically to
-    /// "catalog lookup found nothing," never as an error.
-    pub catalog: Arc<dyn CatalogProvider>,
     pub metrics: Arc<dyn MetricsStore>,
     /// Resolves per-user `QueryCredentials` from `AuthContext` + cluster `queryAuth` config.
     pub identity_resolver: Arc<BackendIdentityResolver>,
@@ -680,13 +681,13 @@ pub mod test_fixtures {
             auth_provider: Arc::new(NoneAuthProvider::new(auth_required)) as Arc<dyn AuthProvider>,
             authorization: Arc::new(AllowAllAuthorization::default())
                 as Arc<dyn AuthorizationChecker>,
+            catalog: Arc::new(queryflux_core::catalog::NullCatalogProvider),
         };
         Arc::new(AppState {
             external_address: "http://127.0.0.1:8080".into(),
             live: Arc::new(RwLock::new(live)),
             persistence: Arc::new(InMemoryPersistence::new()),
             translation: Arc::new(TranslationService::disabled()),
-            catalog: Arc::new(queryflux_core::catalog::NullCatalogProvider),
             metrics,
             identity_resolver: Arc::new(BackendIdentityResolver::new()),
             capacity_store: None,

@@ -436,6 +436,6 @@ curl -s -X POST http://localhost:8080/v1/statement \
 | P1 | QueryFlux Studio — management UI | **Done** |
 | P1 | Athena backend | **Done** |
 | P1 | Authentication / authorization (`queryflux-auth`) | **Done** |
-| P2 | Wire `SchemaContext` from catalog into dispatch | Planned |
+| P2 | Wire `SchemaContext` from catalog into dispatch — see [Catalog Provider](./catalog-integration) | **Done** (foundation: `static`/`caching`/`fallback`; `glue`/`hiveMetastore`/`engineDelegate` still planned) |
 | P3 | ClickHouse backend (HTTP, Arrow) | **Done** |
 | P3 | ClickHouse HTTP frontend | Planned |

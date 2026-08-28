@@ -5,6 +5,7 @@ import Link from "next/link";
 import {
   Bot,
   BookOpen,
+  Database,
   FileCode,
   LayoutDashboard,
   List,
@@ -30,6 +31,7 @@ const nav = [
   { href: "/guardrails", label: "Guardrails", icon: ShieldCheck },
   { href: "/protocols", label: "Protocols", icon: Radio },
   { href: "/routing", label: "Routing", icon: Route },
+  { href: "/catalog", label: "Catalog", icon: Database },
   { href: "/swagger", label: "API Reference", icon: BookOpen },
 ];
 

@@ -357,6 +357,7 @@ impl TestHarness {
             auth_provider: Arc::new(NoneAuthProvider::new(false)) as Arc<dyn AuthProvider>,
             authorization: Arc::new(AllowAllAuthorization::default())
                 as Arc<dyn AuthorizationChecker>,
+            catalog: Arc::new(queryflux_core::catalog::NullCatalogProvider),
         };
         let records = Arc::new(Mutex::new(Vec::<QueryRecord>::new()));
         let state = Arc::new(AppState {
@@ -364,7 +365,6 @@ impl TestHarness {
             live: Arc::new(tokio::sync::RwLock::new(live_config)),
             persistence: Arc::new(InMemoryPersistence::new()),
             translation,
-            catalog: Arc::new(queryflux_core::catalog::NullCatalogProvider),
             metrics: Arc::new(CapturingMetrics {
                 records: records.clone(),
             }),
@@ -607,6 +607,7 @@ impl WireTestHarness {
             auth_provider: Arc::new(NoneAuthProvider::new(false)) as Arc<dyn AuthProvider>,
             authorization: Arc::new(AllowAllAuthorization::default())
                 as Arc<dyn AuthorizationChecker>,
+            catalog: Arc::new(queryflux_core::catalog::NullCatalogProvider),
         };
 
         let state = Arc::new(AppState {
@@ -614,7 +615,6 @@ impl WireTestHarness {
             live: Arc::new(tokio::sync::RwLock::new(live_config)),
             persistence: Arc::new(InMemoryPersistence::new()),
             translation,
-            catalog: Arc::new(queryflux_core::catalog::NullCatalogProvider),
             metrics: Arc::new(NullMetrics),
             identity_resolver: Arc::new(BackendIdentityResolver::new()),
             capacity_store: None,
@@ -751,6 +751,7 @@ impl WireTestHarness {
             auth_provider: Arc::new(NoneAuthProvider::new(false)) as Arc<dyn AuthProvider>,
             authorization: Arc::new(AllowAllAuthorization::default())
                 as Arc<dyn AuthorizationChecker>,
+            catalog: Arc::new(queryflux_core::catalog::NullCatalogProvider),
         };
 
         let state = Arc::new(AppState {
@@ -758,7 +759,6 @@ impl WireTestHarness {
             live: Arc::new(tokio::sync::RwLock::new(live_config)),
             persistence: Arc::new(InMemoryPersistence::new()),
             translation,
-            catalog: Arc::new(queryflux_core::catalog::NullCatalogProvider),
             metrics: Arc::new(NullMetrics),
             identity_resolver: Arc::new(BackendIdentityResolver::new()),
             capacity_store: None,
@@ -922,6 +922,7 @@ impl ProtocolWireHarness {
             auth_provider: Arc::new(NoneAuthProvider::new(false)) as Arc<dyn AuthProvider>,
             authorization: Arc::new(AllowAllAuthorization::default())
                 as Arc<dyn AuthorizationChecker>,
+            catalog: Arc::new(queryflux_core::catalog::NullCatalogProvider),
         };
 
         let records: Arc<Mutex<Vec<QueryRecord>>> = Arc::new(Mutex::new(Vec::new()));
@@ -930,7 +931,6 @@ impl ProtocolWireHarness {
             live: Arc::new(tokio::sync::RwLock::new(live_config)),
             persistence: Arc::new(InMemoryPersistence::new()),
             translation,
-            catalog: Arc::new(queryflux_core::catalog::NullCatalogProvider),
             metrics: Arc::new(CapturingMetrics {
                 records: records.clone(),
             }),

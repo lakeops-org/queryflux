@@ -182,6 +182,7 @@ pub async fn dispatch_query(
         cluster_cfg,
         adapters,
         max_queued_queries,
+        catalog,
     ) = {
         let live = state.live.read().await;
         (
@@ -211,6 +212,7 @@ pub async fn dispatch_query(
                 .get(&group.0)
                 .copied()
                 .flatten(),
+            live.catalog.clone(),
         )
     };
 
@@ -355,7 +357,7 @@ pub async fn dispatch_query(
     let sql = if should_attempt_translation(&session, &protocol) {
         let schema_context = state
             .translation
-            .resolve_schema_context(&sql, &src_dialect, &state.catalog, None, session.database())
+            .resolve_schema_context(&sql, &src_dialect, &catalog, None, session.database())
             .await;
         match state
             .translation
@@ -1290,7 +1292,7 @@ async fn setup_sync_query(
 ) -> Result<SyncQuerySetup> {
     let query_id = ProxyQueryId::new();
 
-    let (cluster_manager, group_fixups, group_default_tags, wait_timeout_secs) = {
+    let (cluster_manager, group_fixups, group_default_tags, wait_timeout_secs, catalog) = {
         let live = state.live.read().await;
         let wait_timeout_secs = live
             .group_capacity_wait_timeout_secs
@@ -1308,6 +1310,7 @@ async fn setup_sync_query(
                 .cloned()
                 .unwrap_or_default(),
             wait_timeout_secs,
+            live.catalog.clone(),
         )
     };
     let effective_tags: QueryTags = merge_tags(&group_default_tags, &session.tags().clone());
@@ -1410,7 +1413,7 @@ async fn setup_sync_query(
     let translated = if should_attempt_translation(&session, &protocol) {
         let schema_context = state
             .translation
-            .resolve_schema_context(&sql, &src_dialect, &state.catalog, None, session.database())
+            .resolve_schema_context(&sql, &src_dialect, &catalog, None, session.database())
             .await;
         match state
             .translation

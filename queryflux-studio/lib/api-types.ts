@@ -523,3 +523,52 @@ export interface GuardrailsConfig {
   /** Per-group additional guards. Group name → guard list. */
   groups: Record<string, GuardSpecDto[]>;
 }
+
+// ---------------------------------------------------------------------------
+// Catalog provider config (GET/PUT /admin/config/catalog, POST .../test)
+//
+// Feeds schema-aware SQL translation (queryflux_core::catalog::CatalogProvider).
+// A true discriminated union (not the flat-optional-fields style used above for
+// GuardSpecDto) because `caching`/`fallback` recursively nest another
+// CatalogProviderConfig — TS narrows `.type` correctly through the recursion,
+// which the flat style doesn't support.
+// ---------------------------------------------------------------------------
+
+export interface StaticColumnDefDto {
+  name: string;
+  dataType: string;
+  nullable: boolean;
+}
+
+export interface StaticTableSchemaDto {
+  catalog: string;
+  database: string;
+  table: string;
+  columns: StaticColumnDefDto[];
+}
+
+export type CatalogProviderConfig =
+  | { type: "null" }
+  | { type: "static"; schemas: StaticTableSchemaDto[] }
+  /** Not yet implemented server-side — builds but degrades to a no-op. */
+  | { type: "engineDelegate"; clusterGroup: string }
+  /** Not yet implemented server-side — builds but degrades to a no-op. */
+  | { type: "hiveMetastore"; uri: string }
+  /** Not yet implemented server-side — builds but degrades to a no-op. */
+  | { type: "glue"; region?: string | null }
+  | {
+      type: "caching";
+      ttlSeconds: number;
+      maxEntries: number;
+      delegate: CatalogProviderConfig;
+    }
+  | {
+      type: "fallback";
+      primary: CatalogProviderConfig;
+      secondary: CatalogProviderConfig;
+    };
+
+export interface TestCatalogProviderResponse {
+  ok: boolean;
+  message: string;
+}

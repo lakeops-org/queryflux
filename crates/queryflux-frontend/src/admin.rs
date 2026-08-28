@@ -56,6 +56,19 @@ pub type TestClusterFn = Arc<
         + Sync,
 >;
 
+/// Callback type for testing a `catalogProvider` config without persisting it.
+/// Receives the raw config JSON → returns `Ok(true)` if the provider was built and
+/// responded to a smoke-test call, `Ok(false)` if it degraded to a no-op (e.g. an
+/// unimplemented provider type) or the smoke-test call itself returned an error,
+/// `Err(msg)` if the config didn't even parse into a `CatalogProviderConfig`.
+pub type TestCatalogProviderFn = Arc<
+    dyn Fn(
+            serde_json::Value,
+        ) -> Pin<Box<dyn Future<Output = anyhow::Result<(bool, String)>> + Send>>
+        + Send
+        + Sync,
+>;
+
 // ---------------------------------------------------------------------------
 // OpenAPI spec
 // ---------------------------------------------------------------------------
@@ -123,6 +136,9 @@ pub struct ClusterStateDto {
         put_routing_config_handler,
         get_guardrails_config_handler,
         put_guardrails_config_handler,
+        get_catalog_config_handler,
+        put_catalog_config_handler,
+        test_catalog_config_handler,
         // Agents & conversations
         list_agents_handler,
         list_conversations_handler,
@@ -147,6 +163,8 @@ pub struct ClusterStateDto {
         queryflux_persistence::cluster_config::RenameConfigRequest,
         queryflux_persistence::query_history::AgentSummary,
         queryflux_persistence::query_history::ConversationSummary,
+        TestCatalogProviderRequest,
+        TestCatalogProviderResponse,
     )),
     tags(
         (name = "admin", description = "Cluster and query management"),
@@ -536,6 +554,9 @@ struct AdminState {
     admin_store: Option<Arc<dyn AdminStore>>,
     security_config: Arc<SecurityConfigDto>,
     routing_config: Arc<RoutingConfigDto>,
+    /// Startup (YAML) `catalogProvider` config — GET's fallback when nothing has
+    /// been persisted via the admin API yet.
+    catalog_provider_config: Arc<queryflux_core::config::CatalogProviderConfig>,
     engine_registry: Arc<EngineRegistry>,
     /// Wake the config reload task immediately after mutating persisted config.
     /// Uses `ConfigRevisionStore::bump_revision()` for distributed notification
@@ -547,6 +568,8 @@ struct AdminState {
     admin_creds: Arc<AdminCredentialsManager>,
     /// Test a cluster config (build adapter + health_check) without persisting it.
     test_cluster_fn: TestClusterFn,
+    /// Test a catalogProvider config (build it + smoke-test) without persisting it.
+    test_catalog_provider_fn: TestCatalogProviderFn,
     /// Query result cache for invalidation endpoints.
     result_cache: Arc<dyn queryflux_cache::QueryResultCache>,
     /// Shared proxy state — in-flight queries, adapters, slot release.
@@ -564,11 +587,13 @@ pub struct AdminFrontend {
     port: u16,
     security_config: Arc<SecurityConfigDto>,
     routing_config: Arc<RoutingConfigDto>,
+    catalog_provider_config: Arc<queryflux_core::config::CatalogProviderConfig>,
     engine_registry: Arc<EngineRegistry>,
     config_reload_notify: Arc<tokio::sync::Notify>,
     frontends_status: FrontendsStatusDto,
     admin_creds: Arc<AdminCredentialsManager>,
     test_cluster_fn: TestClusterFn,
+    test_catalog_provider_fn: TestCatalogProviderFn,
     cors_allowed_origins: Vec<String>,
     result_cache: Arc<dyn queryflux_cache::QueryResultCache>,
     app: Arc<AppState>,
@@ -583,11 +608,13 @@ impl AdminFrontend {
         port: u16,
         security_config: Arc<SecurityConfigDto>,
         routing_config: Arc<RoutingConfigDto>,
+        catalog_provider_config: Arc<queryflux_core::config::CatalogProviderConfig>,
         engine_registry: Arc<EngineRegistry>,
         config_reload_notify: Arc<tokio::sync::Notify>,
         frontends_status: FrontendsStatusDto,
         admin_creds: Arc<AdminCredentialsManager>,
         test_cluster_fn: TestClusterFn,
+        test_catalog_provider_fn: TestCatalogProviderFn,
         cors_allowed_origins: Vec<String>,
         result_cache: Arc<dyn queryflux_cache::QueryResultCache>,
         app: Arc<AppState>,
@@ -599,11 +626,13 @@ impl AdminFrontend {
             port,
             security_config,
             routing_config,
+            catalog_provider_config,
             engine_registry,
             config_reload_notify,
             frontends_status,
             admin_creds,
             test_cluster_fn,
+            test_catalog_provider_fn,
             cors_allowed_origins,
             result_cache,
             app,
@@ -617,11 +646,13 @@ impl AdminFrontend {
             admin_store: self.admin_store.clone(),
             security_config: self.security_config.clone(),
             routing_config: self.routing_config.clone(),
+            catalog_provider_config: self.catalog_provider_config.clone(),
             engine_registry: self.engine_registry.clone(),
             config_reload_notify: self.config_reload_notify.clone(),
             frontends_status: self.frontends_status.clone(),
             admin_creds: self.admin_creds.clone(),
             test_cluster_fn: self.test_cluster_fn.clone(),
+            test_catalog_provider_fn: self.test_catalog_provider_fn.clone(),
             result_cache: self.result_cache.clone(),
             app: self.app.clone(),
         });
@@ -712,6 +743,14 @@ impl AdminFrontend {
             .route(
                 "/admin/config/guardrails",
                 get(get_guardrails_config_handler).put(put_guardrails_config_handler),
+            )
+            .route(
+                "/admin/config/catalog",
+                get(get_catalog_config_handler).put(put_catalog_config_handler),
+            )
+            .route(
+                "/admin/config/catalog/test",
+                post(test_catalog_config_handler),
             )
             // Cache invalidation endpoints
             .route("/admin/cache", delete(invalidate_all_cache_handler))
@@ -2683,6 +2722,112 @@ async fn put_guardrails_config_handler(
             StatusCode::NO_CONTENT.into_response()
         }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Catalog provider config (schema-aware translation source)
+// ---------------------------------------------------------------------------
+
+/// Get the current `catalogProvider` configuration. Falls back to the
+/// startup (YAML) value when nothing has been persisted via this API yet.
+#[utoipa::path(
+    get,
+    path = "/admin/config/catalog",
+    tag = "config",
+    responses(
+        (status = 200, description = "CatalogProviderConfig JSON (tagged by `type`)", body = serde_json::Value),
+    )
+)]
+async fn get_catalog_config_handler(State(state): State<Arc<AdminState>>) -> impl IntoResponse {
+    if let Some(store) = &state.admin_store {
+        if let Ok(Some(v)) = store.get_proxy_setting("catalog_config").await {
+            return Json(v).into_response();
+        }
+    }
+    Json(state.catalog_provider_config.as_ref()).into_response()
+}
+
+/// Replace the `catalogProvider` configuration. Structurally validated against
+/// `CatalogProviderConfig` before persisting (same tagged-enum shape as YAML's
+/// `catalogProvider:` block) — an unimplemented provider type (e.g. `glue` in the
+/// current release) is accepted, since it degrades to a no-op provider at build
+/// time rather than being rejected here; use `/admin/config/catalog/test` to check
+/// whether a config actually does anything useful before saving it.
+#[utoipa::path(
+    put,
+    path = "/admin/config/catalog",
+    tag = "config",
+    request_body = serde_json::Value,
+    responses(
+        (status = 204, description = "Saved"),
+        (status = 400, description = "Invalid catalogProvider config", body = str),
+        (status = 503, description = "Persistence not configured", body = str),
+        (status = 500, description = "Internal error", body = str),
+    )
+)]
+async fn put_catalog_config_handler(
+    State(state): State<Arc<AdminState>>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let Some(store) = &state.admin_store else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Persistence not configured",
+        )
+            .into_response();
+    };
+    if let Err(e) =
+        serde_json::from_value::<queryflux_core::config::CatalogProviderConfig>(body.clone())
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            format!("invalid catalogProvider config: {e}"),
+        )
+            .into_response();
+    }
+    match store.set_proxy_setting("catalog_config", body).await {
+        Ok(()) => {
+            notify_live_config_reload(&state);
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+struct TestCatalogProviderRequest {
+    config: serde_json::Value,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+struct TestCatalogProviderResponse {
+    ok: bool,
+    message: String,
+}
+
+/// Build a `catalogProvider` config and smoke-test it, without persisting it.
+#[utoipa::path(
+    post,
+    path = "/admin/config/catalog/test",
+    tag = "config",
+    request_body = TestCatalogProviderRequest,
+    responses(
+        (status = 200, description = "Test result", body = TestCatalogProviderResponse),
+        (status = 500, description = "Internal error", body = str),
+    )
+)]
+async fn test_catalog_config_handler(
+    State(state): State<Arc<AdminState>>,
+    Json(body): Json<TestCatalogProviderRequest>,
+) -> impl IntoResponse {
+    match (state.test_catalog_provider_fn)(body.config).await {
+        Ok((ok, message)) => Json(TestCatalogProviderResponse { ok, message }).into_response(),
+        Err(e) => Json(TestCatalogProviderResponse {
+            ok: false,
+            message: e.to_string(),
+        })
+        .into_response(),
     }
 }
 

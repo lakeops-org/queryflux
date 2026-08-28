@@ -1635,13 +1635,13 @@ mod cancel_executing_statement_tests {
             auth_provider: Arc::new(NoneAuthProvider::new(false)) as Arc<dyn AuthProvider>,
             authorization: Arc::new(AllowAllAuthorization::default())
                 as Arc<dyn AuthorizationChecker>,
+            catalog: Arc::new(queryflux_core::catalog::NullCatalogProvider),
         };
         Arc::new(AppState {
             external_address: "http://127.0.0.1:8080".into(),
             live: Arc::new(RwLock::new(live)),
             persistence: Arc::new(InMemoryPersistence::new()),
             translation: Arc::new(TranslationService::disabled()),
-            catalog: Arc::new(queryflux_core::catalog::NullCatalogProvider),
             metrics: Arc::new(NoopMetricsStore),
             identity_resolver: Arc::new(BackendIdentityResolver::new()),
             capacity_store: None,
