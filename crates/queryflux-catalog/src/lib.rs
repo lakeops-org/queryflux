@@ -38,7 +38,33 @@ pub use static_provider::StaticCatalogProvider;
 pub fn build_catalog_provider(
     cfg: &CatalogProviderConfig,
 ) -> Pin<Box<dyn Future<Output = Arc<dyn CatalogProvider>> + Send + '_>> {
+    build_catalog_provider_inner(cfg, false)
+}
+
+/// Integrations that make a real network call per lookup — worth flagging when
+/// they're configured without a `Caching` ancestor, since every schema-aware
+/// translation attempt on a table QueryFlux hasn't seen recently will otherwise
+/// pay that round-trip. Grows as more real integrations (Iceberg REST, ...) land.
+fn is_network_calling(cfg: &CatalogProviderConfig) -> bool {
+    matches!(cfg, CatalogProviderConfig::Glue { .. })
+}
+
+/// `cached`: true when this call is already inside a `Caching` ancestor —
+/// threaded down (not part of the public signature, which callers shouldn't
+/// need to know about) so a network-calling leaf can warn when it isn't.
+fn build_catalog_provider_inner(
+    cfg: &CatalogProviderConfig,
+    cached: bool,
+) -> Pin<Box<dyn Future<Output = Arc<dyn CatalogProvider>> + Send + '_>> {
     Box::pin(async move {
+        if is_network_calling(cfg) && !cached {
+            tracing::warn!(
+                "catalogProvider: this provider makes a real network call on every \
+                 uncached lookup — consider wrapping it in `type: caching` \
+                 (schema rarely changes, so a TTL of several minutes or more is \
+                 usually safe) to avoid adding that latency to every query"
+            );
+        }
         match cfg {
             CatalogProviderConfig::Null => {
                 Arc::new(NullCatalogProvider) as Arc<dyn CatalogProvider>
@@ -86,7 +112,7 @@ pub fn build_catalog_provider(
                 max_entries,
                 delegate,
             } => {
-                let inner = build_catalog_provider(delegate).await;
+                let inner = build_catalog_provider_inner(delegate, true).await;
                 Arc::new(CachingCatalogProvider::new(
                     inner,
                     *ttl_seconds,
@@ -95,8 +121,11 @@ pub fn build_catalog_provider(
             }
 
             CatalogProviderConfig::Fallback { primary, secondary } => {
-                let primary = build_catalog_provider(primary).await;
-                let secondary = build_catalog_provider(secondary).await;
+                // `cached` propagates unchanged: wrapping the whole Fallback in
+                // Caching covers both sides, but a bare Fallback over two
+                // network-calling providers should warn for each independently.
+                let primary = build_catalog_provider_inner(primary, cached).await;
+                let secondary = build_catalog_provider_inner(secondary, cached).await;
                 Arc::new(FallbackCatalogProvider::new(primary, secondary))
                     as Arc<dyn CatalogProvider>
             }
@@ -121,6 +150,25 @@ mod tests {
         })
         .await;
         assert!(provider.list_catalogs().await.unwrap().is_empty());
+    }
+
+    #[test]
+    fn is_network_calling_flags_glue_only() {
+        assert!(is_network_calling(&CatalogProviderConfig::Glue {
+            region: None,
+            auth: None,
+        }));
+        assert!(!is_network_calling(&CatalogProviderConfig::Null));
+        assert!(!is_network_calling(&CatalogProviderConfig::Static {
+            schemas: vec![]
+        }));
+        // Caching/Fallback/EngineDelegate/HiveMetastore are checked at their own
+        // leaves during recursion, not flagged as "network-calling" themselves.
+        assert!(!is_network_calling(
+            &CatalogProviderConfig::EngineDelegate {
+                cluster_group: "g".to_string()
+            }
+        ));
     }
 
     #[tokio::test]

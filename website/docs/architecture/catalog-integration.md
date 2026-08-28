@@ -75,9 +75,11 @@ catalogProvider:
 
 Column types come straight from Glue's own type strings (e.g. `bigint`, `struct<a:int>`) rather than a normalized SQL type — `sqlglot`'s optimizer accepts most of them as-is. Partition keys are included alongside regular columns, since they're valid in `WHERE`/`SELECT` on a Hive-style partitioned table. Nullability isn't exposed by Glue's `Column` type, so every column defaults to nullable.
 
+> **Performance:** `glue` makes a real network call per uncached lookup — wrap it in [`caching`](#caching) (below) unless you have a reason not to. A `catalogProvider` config for a network-calling integration with no `caching` ancestor logs a startup warning saying exactly this; Studio's Catalog page defaults the "AWS Glue" picker to a caching-wrapped config for the same reason.
+
 ### `caching`
 
-Wraps another provider with a TTL + capacity-bounded cache. Only successful lookups are cached — an error is never pinned for `ttlSeconds`, so a transient catalog outage self-heals on the next call.
+Wraps another provider with a TTL + capacity-bounded cache. Only successful lookups are cached — an error is never pinned for `ttlSeconds`, so a transient catalog outage self-heals on the next call. Table schemas change far less often than query results, so a longer TTL than you'd use for a [query result cache](./caching) — several minutes to hours — is usually safe.
 
 | Field | Description |
 |-------|-------------|

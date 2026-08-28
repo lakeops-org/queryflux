@@ -17,12 +17,23 @@ interface Props {
 
 type ProviderType = CatalogProviderConfig["type"];
 
+const BARE_GLUE: CatalogProviderConfig = { type: "glue", region: null, auth: null };
+
 const DEFAULTS: Record<ProviderType, CatalogProviderConfig> = {
   null: { type: "null" },
   static: { type: "static", schemas: [] },
   engineDelegate: { type: "engineDelegate", clusterGroup: "" },
   hiveMetastore: { type: "hiveMetastore", uri: "" },
-  glue: { type: "glue", region: null, auth: null },
+  // Glue makes a real network call per uncached lookup — default to
+  // caching-wrapped so picking "AWS Glue" from the type picker doesn't quietly
+  // add that latency to every query. Still fully editable/removable: change the
+  // top-level type back to "glue" (or edit the delegate) to go uncached.
+  glue: {
+    type: "caching",
+    ttlSeconds: 300,
+    maxEntries: 10000,
+    delegate: BARE_GLUE,
+  },
   caching: {
     type: "caching",
     ttlSeconds: 300,
@@ -296,6 +307,14 @@ function CatalogProviderConfigEditor({
 
       {value.type === "caching" && (
         <div className="mt-3 space-y-3">
+          {value.delegate.type === "glue" && (
+            <p className="text-xs text-slate-500">
+              Selecting &ldquo;AWS Glue&rdquo; defaults to wrapping it in a cache — Glue
+              makes a real network call per uncached lookup, and table schemas
+              rarely change. Set the wrapped provider below back to a bare
+              &ldquo;AWS Glue&rdquo; type if you want every lookup to hit Glue directly.
+            </p>
+          )}
           <div className="grid grid-cols-2 gap-4 max-w-sm">
             <TextInput
               label="TTL (seconds)"
