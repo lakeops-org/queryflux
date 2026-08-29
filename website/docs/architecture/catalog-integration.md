@@ -23,7 +23,9 @@ With no `catalogProvider` configured (the default), a `NullCatalogProvider` retu
 
 ## Configuration
 
-`catalogProvider` is a single top-level YAML key, hot-reloadable via the [admin API](#admin-api) or Studio's **Catalog** page. It's a tagged union (`type:` selects the variant); some variants wrap another `catalogProvider` value recursively.
+`catalogProvider` is a single top-level YAML key, hot-reloadable via the [admin API](#admin-api) or Studio's **Catalog** page. It's a tagged union (`type:` selects the variant); `fallback` wraps two more `catalogProvider` values recursively.
+
+Every real (network-calling) provider carries its own optional `cache` field — caching is a property of that provider's config, not a separate wrapper type to remember to nest.
 
 ### `null` (default)
 
@@ -34,26 +36,6 @@ catalogProvider:
   type: null
 ```
 
-### `static`
-
-A literal, hand-declared schema. No network calls — the simplest provider, useful for testing or a small fixed set of tables.
-
-| Field | Description |
-|-------|-------------|
-| `schemas` | List of `{ catalog, database, table, columns: [{ name, dataType, nullable }] }` |
-
-```yaml
-catalogProvider:
-  type: static
-  schemas:
-    - catalog: hive
-      database: analytics
-      table: orders
-      columns:
-        - { name: order_id, dataType: BIGINT, nullable: false }
-        - { name: total, dataType: "DECIMAL(10,2)", nullable: true }
-```
-
 ### `glue`
 
 Talks directly to the [AWS Glue Data Catalog](https://docs.aws.amazon.com/glue/latest/dg/components-overview.html#data-catalog-intro) API — format-agnostic, so it sees Hive/Parquet, CSV/JSON, and Iceberg tables alike (unlike going through Iceberg's own Glue catalog client, which would only see Iceberg-format tables). Glue has no catalog concept of its own — every database/table lives under the caller's AWS account, so `list_catalogs()` always reports the single synthetic name `AwsDataCatalog`, matching the convention the Athena backend adapter already uses.
@@ -62,6 +44,7 @@ Talks directly to the [AWS Glue Data Catalog](https://docs.aws.amazon.com/glue/l
 |-------|-------------|
 | `region` | AWS region (optional — falls back to the default region resolution) |
 | `auth` | Optional, same shape as engine cluster `auth` (`accessKey` or `roleArn`; `basic`/`bearer`/`keyPair` don't apply to AWS). Omitted: the default AWS credential chain (env vars, ECS task role, EC2 instance profile, ...). |
+| `cache` | Optional `{ ttlSeconds, maxEntries }` — see [Caching](#caching) below. Strongly recommended: omitting it logs a startup warning. |
 
 ```yaml
 catalogProvider:
@@ -71,35 +54,27 @@ catalogProvider:
     type: roleArn
     roleArn: arn:aws:iam::123456789012:role/queryflux-glue-readonly
     externalId: ${GLUE_EXTERNAL_ID}
+  cache:
+    ttlSeconds: 300
+    maxEntries: 10000
 ```
 
 Column types come straight from Glue's own type strings (e.g. `bigint`, `struct<a:int>`) rather than a normalized SQL type — `sqlglot`'s optimizer accepts most of them as-is. Partition keys are included alongside regular columns, since they're valid in `WHERE`/`SELECT` on a Hive-style partitioned table. Nullability isn't exposed by Glue's `Column` type, so every column defaults to nullable.
 
-> **Performance:** `glue` makes a real network call per uncached lookup — wrap it in [`caching`](#caching) (below) unless you have a reason not to. A `catalogProvider` config for a network-calling integration with no `caching` ancestor logs a startup warning saying exactly this; Studio's Catalog page defaults the "AWS Glue" picker to a caching-wrapped config for the same reason.
+### Caching
 
-### `caching`
-
-Wraps another provider with a TTL + capacity-bounded cache. Only successful lookups are cached — an error is never pinned for `ttlSeconds`, so a transient catalog outage self-heals on the next call. Table schemas change far less often than query results, so a longer TTL than you'd use for a [query result cache](./caching) — several minutes to hours — is usually safe.
+Every network-calling provider's `cache` field wraps it in a TTL + capacity-bounded cache. Only successful lookups are cached — an error is never pinned for `ttlSeconds`, so a transient catalog outage self-heals on the next call. Table schemas change far less often than query results, so a longer TTL than you'd use for a [query result cache](./caching) — several minutes to hours — is usually safe.
 
 | Field | Description |
 |-------|-------------|
 | `ttlSeconds` | How long a cached result stays valid |
 | `maxEntries` | Capacity bound (FIFO eviction beyond this) |
-| `delegate` | The wrapped `catalogProvider` config |
 
-```yaml
-catalogProvider:
-  type: caching
-  ttlSeconds: 300
-  maxEntries: 10000
-  delegate:
-    type: static
-    schemas: []
-```
+A config for a network-calling provider with no `cache` set logs a startup warning recommending one; Studio's Catalog page defaults the "AWS Glue" picker to a cache-enabled config for the same reason (uncheck the box there, or omit `cache` in YAML, if you actually want every lookup to hit the backing service directly).
 
 ### `fallback`
 
-Tries `primary` first, falls through to `secondary` on any error, and — for a single table lookup specifically — when `primary` doesn't have that table (an empty `list_tables`/`list_databases` result does **not** trigger fallback, since that's a legitimate answer, not a "try harder" signal).
+Tries `primary` first, falls through to `secondary` on any error, and — for a single table lookup specifically — when `primary` doesn't have that table (an empty `list_tables`/`list_databases` result does **not** trigger fallback, since that's a legitimate answer, not a "try harder" signal). Each side configures its own `cache` independently — `fallback` composes two *sources*, it isn't itself a caching concern.
 
 | Field | Description |
 |-------|-------------|
@@ -110,8 +85,9 @@ Tries `primary` first, falls through to `secondary` on any error, and — for a 
 catalogProvider:
   type: fallback
   primary:
-    type: static
-    schemas: []
+    type: glue
+    region: us-east-1
+    cache: { ttlSeconds: 300, maxEntries: 10000 }
   secondary:
     # a bare YAML `null` parses as YAML's null type, not the string tag
     # this enum's `type` field needs — quote it.
@@ -120,12 +96,12 @@ catalogProvider:
 
 ### Declared but not yet implemented
 
-These variants parse and build successfully, but currently degrade to a no-op provider (same behavior as `type: null`) with a startup warning — real integrations land in a follow-up release:
+These variants parse and build successfully, but currently degrade to a no-op provider (same behavior as `type: null`) with a startup warning — real integrations land in a follow-up release. Both already carry the same `cache` field `glue` does, so no config migration is needed once they're implemented:
 
 | Type | Fields | Notes |
 |------|--------|-------|
-| `engineDelegate` | `clusterGroup` | Delegates to a cluster group's own adapter (Trino, DuckDB, StarRocks, Athena, ClickHouse) |
-| `hiveMetastore` | `uri` | Hive Metastore (Thrift) |
+| `engineDelegate` | `clusterGroup`, `cache` | Delegates to a cluster group's own adapter (Trino, DuckDB, StarRocks, Athena, ClickHouse) |
+| `hiveMetastore` | `uri`, `cache` | Hive Metastore (Thrift) |
 
 Use [`/admin/config/catalog/test`](#admin-api) to check whether a given config actually does anything, rather than silently degrading unnoticed.
 
@@ -138,17 +114,17 @@ curl -u admin:admin http://localhost:9000/admin/config/catalog
 # Replace it — structurally validated, then persisted and hot-reloaded
 curl -u admin:admin -X PUT http://localhost:9000/admin/config/catalog \
   -H 'content-type: application/json' \
-  -d '{"type": "static", "schemas": []}'
+  -d '{"type": "glue", "region": "us-east-1", "cache": {"ttlSeconds": 300, "maxEntries": 10000}}'
 
 # Build a config and smoke-test it (list_catalogs()) without persisting it
 curl -u admin:admin -X POST http://localhost:9000/admin/config/catalog/test \
   -H 'content-type: application/json' \
-  -d '{"config": {"type": "static", "schemas": []}}'
+  -d '{"config": {"type": "glue", "region": "us-east-1"}}'
 ```
 
 A `PUT` never fails startup or a running proxy: an invalid `type` is rejected with `400`, but a *structurally valid* config for an unimplemented provider (e.g. `hiveMetastore`) is accepted — it will simply degrade to a no-op at build time. A `glue` config that's structurally valid but fails to actually build (unreachable AWS, bad credentials) degrades the same way. Use the `/test` endpoint first if you want to know that ahead of saving.
 
-Studio's **Catalog** page (left nav) is a thin UI over these same three endpoints — a `type:` picker per provider, recursive nesting for `caching`/`fallback`, and the same test-connection button.
+Studio's **Catalog** page (left nav) is a thin UI over these same three endpoints — a `type:` picker per provider, a cache checkbox on every provider that has one, recursive nesting for `fallback`, and the same test-connection button.
 
 ## Architecture notes
 

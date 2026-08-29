@@ -2,14 +2,9 @@
 
 import React, { useState } from "react";
 import { putCatalogProviderConfig, testCatalogProviderConfig } from "@/lib/api";
-import type {
-  CatalogProviderConfig,
-  GlueAuthConfig,
-  StaticColumnDefDto,
-  StaticTableSchemaDto,
-} from "@/lib/api-types";
+import type { CatalogCacheConfigDto, CatalogProviderConfig, GlueAuthConfig } from "@/lib/api-types";
 import { Field, SectionHeader, TextInput, SaveBar } from "@/components/studio-settings";
-import { Database, Plus, Trash2 } from "lucide-react";
+import { Database } from "lucide-react";
 
 interface Props {
   initialConfig: CatalogProviderConfig | null;
@@ -17,29 +12,16 @@ interface Props {
 
 type ProviderType = CatalogProviderConfig["type"];
 
-const BARE_GLUE: CatalogProviderConfig = { type: "glue", region: null, auth: null };
+const DEFAULT_CACHE: CatalogCacheConfigDto = { ttlSeconds: 300, maxEntries: 10000 };
 
 const DEFAULTS: Record<ProviderType, CatalogProviderConfig> = {
   null: { type: "null" },
-  static: { type: "static", schemas: [] },
-  engineDelegate: { type: "engineDelegate", clusterGroup: "" },
-  hiveMetastore: { type: "hiveMetastore", uri: "" },
-  // Glue makes a real network call per uncached lookup — default to
-  // caching-wrapped so picking "AWS Glue" from the type picker doesn't quietly
-  // add that latency to every query. Still fully editable/removable: change the
-  // top-level type back to "glue" (or edit the delegate) to go uncached.
-  glue: {
-    type: "caching",
-    ttlSeconds: 300,
-    maxEntries: 10000,
-    delegate: BARE_GLUE,
-  },
-  caching: {
-    type: "caching",
-    ttlSeconds: 300,
-    maxEntries: 10000,
-    delegate: { type: "null" },
-  },
+  engineDelegate: { type: "engineDelegate", clusterGroup: "", cache: null },
+  hiveMetastore: { type: "hiveMetastore", uri: "", cache: null },
+  // Glue makes a real network call per uncached lookup — cache is on by
+  // default here so picking "AWS Glue" doesn't quietly add that latency to
+  // every query. Fully editable/removable via the checkbox in its section.
+  glue: { type: "glue", region: null, auth: null, cache: DEFAULT_CACHE },
   fallback: {
     type: "fallback",
     primary: { type: "null" },
@@ -49,11 +31,9 @@ const DEFAULTS: Record<ProviderType, CatalogProviderConfig> = {
 
 const TYPE_LABELS: Record<ProviderType, string> = {
   null: "None",
-  static: "Static (literal schema)",
   engineDelegate: "Engine delegate",
   hiveMetastore: "Hive Metastore",
   glue: "AWS Glue",
-  caching: "Caching (wraps another provider)",
   fallback: "Fallback (primary → secondary)",
 };
 
@@ -61,6 +41,57 @@ const TYPE_LABELS: Record<ProviderType, string> = {
 // these yet — they build successfully and degrade to a no-op provider rather
 // than failing, per queryflux_catalog::build_catalog_provider.
 const UNIMPLEMENTED = new Set<ProviderType>(["engineDelegate", "hiveMetastore"]);
+
+// ---------------------------------------------------------------------------
+// Cache field editor — shared by every network-calling provider's config.
+// ---------------------------------------------------------------------------
+
+function CacheFieldEditor({
+  cache,
+  onChange,
+}: {
+  cache: CatalogCacheConfigDto | null | undefined;
+  onChange: (v: CatalogCacheConfigDto | null) => void;
+}) {
+  const enabled = cache != null;
+  return (
+    <div className="space-y-2">
+      <label className="flex items-center gap-2 text-xs font-medium text-slate-700 cursor-pointer">
+        <input
+          type="checkbox"
+          checked={enabled}
+          onChange={(e) => onChange(e.target.checked ? DEFAULT_CACHE : null)}
+        />
+        Cache lookups
+      </label>
+      <p className="text-xs text-slate-400">
+        Recommended — without this, every schema-aware translation attempt on a table QueryFlux
+        hasn&rsquo;t seen recently makes a fresh network call. Table schemas change rarely, so a
+        TTL of several minutes to hours is normally safe.
+      </p>
+      {enabled && cache && (
+        <div className="grid grid-cols-2 gap-4 max-w-sm pt-1">
+          <TextInput
+            label="TTL (seconds)"
+            type="number"
+            value={String(cache.ttlSeconds)}
+            onChange={(v) => onChange({ ...cache, ttlSeconds: Number(v) || 0 })}
+          />
+          <TextInput
+            label="Max entries"
+            type="number"
+            value={String(cache.maxEntries)}
+            onChange={(v) => onChange({ ...cache, maxEntries: Number(v) || 0 })}
+          />
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Glue auth sub-form
+// ---------------------------------------------------------------------------
 
 const GLUE_AUTH_LABELS: Record<"none" | GlueAuthConfig["type"], string> = {
   none: "Default AWS credential chain",
@@ -134,96 +165,8 @@ function GlueAuthEditor({
 }
 
 // ---------------------------------------------------------------------------
-// Static schema editor — one row per table, columns as a "name:TYPE" shorthand
-// (comma-separated; nullable always defaults to true through this UI — edit
-// the persisted JSON directly via the admin API if you need nullable: false).
-// ---------------------------------------------------------------------------
-
-function parseColumns(text: string): StaticColumnDefDto[] {
-  return text
-    .split(",")
-    .map((s) => s.trim())
-    .filter(Boolean)
-    .map((pair) => {
-      const [name, dataType] = pair.split(":").map((s) => s.trim());
-      return { name: name || pair, dataType: dataType || "VARCHAR", nullable: true };
-    });
-}
-
-function columnsToText(columns: StaticColumnDefDto[]): string {
-  return columns.map((c) => `${c.name}:${c.dataType}`).join(", ");
-}
-
-function StaticSchemasEditor({
-  schemas,
-  onChange,
-}: {
-  schemas: StaticTableSchemaDto[];
-  onChange: (v: StaticTableSchemaDto[]) => void;
-}) {
-  const update = (idx: number, patch: Partial<StaticTableSchemaDto>) => {
-    const next = schemas.slice();
-    next[idx] = { ...next[idx], ...patch };
-    onChange(next);
-  };
-  const remove = (idx: number) => onChange(schemas.filter((_, i) => i !== idx));
-  const add = () =>
-    onChange([...schemas, { catalog: "", database: "", table: "", columns: [] }]);
-
-  return (
-    <div className="space-y-3">
-      {schemas.length === 0 && <p className="text-xs text-slate-400">No tables declared yet.</p>}
-      {schemas.map((schema, idx) => (
-        <div key={idx} className="border border-slate-200 rounded-lg p-3 space-y-2">
-          <div className="flex items-start justify-between gap-2">
-            <div className="grid grid-cols-3 gap-2 flex-1">
-              <TextInput
-                label="Catalog"
-                value={schema.catalog}
-                onChange={(v) => update(idx, { catalog: v })}
-              />
-              <TextInput
-                label="Database"
-                value={schema.database}
-                onChange={(v) => update(idx, { database: v })}
-              />
-              <TextInput
-                label="Table"
-                value={schema.table}
-                onChange={(v) => update(idx, { table: v })}
-              />
-            </div>
-            <button
-              type="button"
-              onClick={() => remove(idx)}
-              className="mt-5 text-slate-400 hover:text-red-600"
-              title="Remove table"
-            >
-              <Trash2 size={14} />
-            </button>
-          </div>
-          <TextInput
-            label="Columns (name:TYPE, comma-separated)"
-            value={columnsToText(schema.columns)}
-            onChange={(v) => update(idx, { columns: parseColumns(v) })}
-            placeholder="order_id:BIGINT, total:DECIMAL(10,2)"
-          />
-        </div>
-      ))}
-      <button
-        type="button"
-        onClick={add}
-        className="flex items-center gap-1.5 text-xs font-semibold text-indigo-600 hover:text-indigo-700"
-      >
-        <Plus size={13} /> Add table
-      </button>
-    </div>
-  );
-}
-
-// ---------------------------------------------------------------------------
 // Recursive CatalogProviderConfig editor — one dispatcher, indented on nesting
-// (only `caching`/`fallback` recurse, wrapping another CatalogProviderConfig).
+// (only `fallback` recurses, wrapping two more CatalogProviderConfig values).
 // ---------------------------------------------------------------------------
 
 function CatalogProviderConfigEditor({
@@ -259,34 +202,27 @@ function CatalogProviderConfigEditor({
         </p>
       )}
 
-      {value.type === "static" && (
-        <div className="mt-3">
-          <StaticSchemasEditor
-            schemas={value.schemas}
-            onChange={(schemas) => onChange({ ...value, schemas })}
-          />
-        </div>
-      )}
-
       {value.type === "engineDelegate" && (
-        <div className="mt-3">
+        <div className="mt-3 space-y-4">
           <TextInput
             label="Cluster group"
             value={value.clusterGroup}
             onChange={(clusterGroup) => onChange({ ...value, clusterGroup })}
             placeholder="trino-default"
           />
+          <CacheFieldEditor cache={value.cache} onChange={(cache) => onChange({ ...value, cache })} />
         </div>
       )}
 
       {value.type === "hiveMetastore" && (
-        <div className="mt-3">
+        <div className="mt-3 space-y-4">
           <TextInput
             label="Metastore URI"
             value={value.uri}
             onChange={(uri) => onChange({ ...value, uri })}
             placeholder="thrift://localhost:9083"
           />
+          <CacheFieldEditor cache={value.cache} onChange={(cache) => onChange({ ...value, cache })} />
         </div>
       )}
 
@@ -298,47 +234,8 @@ function CatalogProviderConfigEditor({
             onChange={(region) => onChange({ ...value, region: region || null })}
             placeholder="us-east-1"
           />
-          <GlueAuthEditor
-            auth={value.auth}
-            onChange={(auth) => onChange({ ...value, auth })}
-          />
-        </div>
-      )}
-
-      {value.type === "caching" && (
-        <div className="mt-3 space-y-3">
-          {value.delegate.type === "glue" && (
-            <p className="text-xs text-slate-500">
-              Selecting &ldquo;AWS Glue&rdquo; defaults to wrapping it in a cache — Glue
-              makes a real network call per uncached lookup, and table schemas
-              rarely change. Set the wrapped provider below back to a bare
-              &ldquo;AWS Glue&rdquo; type if you want every lookup to hit Glue directly.
-            </p>
-          )}
-          <div className="grid grid-cols-2 gap-4 max-w-sm">
-            <TextInput
-              label="TTL (seconds)"
-              type="number"
-              value={String(value.ttlSeconds)}
-              onChange={(v) => onChange({ ...value, ttlSeconds: Number(v) || 0 })}
-            />
-            <TextInput
-              label="Max entries"
-              type="number"
-              value={String(value.maxEntries)}
-              onChange={(v) => onChange({ ...value, maxEntries: Number(v) || 0 })}
-            />
-          </div>
-          <div>
-            <p className="text-[10px] font-semibold text-slate-400 uppercase tracking-widest mb-1.5">
-              Wrapped provider
-            </p>
-            <CatalogProviderConfigEditor
-              value={value.delegate}
-              onChange={(delegate) => onChange({ ...value, delegate })}
-              depth={depth + 1}
-            />
-          </div>
+          <GlueAuthEditor auth={value.auth} onChange={(auth) => onChange({ ...value, auth })} />
+          <CacheFieldEditor cache={value.cache} onChange={(cache) => onChange({ ...value, cache })} />
         </div>
       )}
 

@@ -64,7 +64,7 @@ These are the next items actively being worked on or immediately queued.
 
 Translation was **dialect-only** — `sqlglot.transpile(sql, read=src, write=tgt)` — which handles syntax differences but can't resolve semantic gaps that require knowing the target schema (e.g. resolving ambiguous column references against actual table definitions). The foundation for schema-aware translation now exists: a pluggable `CatalogProvider` populates `SchemaContext`, which `sqlglot.optimizer.optimize` uses with a `MappingSchema` — dialect-only remains the automatic fallback whenever no schema is available or optimization fails. See [Catalog Provider](./architecture/catalog-integration) for the full picture.
 
-What's still ahead: `hiveMetastore` and `engineDelegate` are declared in config but currently degrade to a no-op provider. `static`, `caching`, `fallback`, and `glue` (direct AWS Glue Data Catalog access) are implemented.
+What's still ahead: `hiveMetastore` and `engineDelegate` are declared in config but currently degrade to a no-op provider. `fallback` (composes two providers) and `glue` (direct AWS Glue Data Catalog access, with a built-in `cache` field) are implemented.
 
 ### ClickHouse HTTP frontend
 

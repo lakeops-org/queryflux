@@ -1885,14 +1885,34 @@ fn default_schema_resolution_timeout_ms() -> u64 {
 // even when the container attribute claims camelCase). Every multi-word variant
 // field below has an explicit `#[serde(rename = "...")]` because of this; don't
 // rely on the container-level rename_all for new fields added here.
+/// TTL + capacity-bounded cache for one catalog provider's lookups. Every
+/// provider that makes a real network call per lookup carries this as its own
+/// `cache` field (rather than a separate wrapper type to remember to nest) —
+/// table/column metadata rarely changes, so a much longer TTL than a query
+/// result cache is normally safe. `None` (the default) means every lookup
+/// goes straight to the backing service.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CatalogCacheConfig {
+    #[serde(default = "default_catalog_cache_ttl_seconds")]
+    pub ttl_seconds: u64,
+    #[serde(default = "default_catalog_cache_max_entries")]
+    pub max_entries: usize,
+}
+
+fn default_catalog_cache_ttl_seconds() -> u64 {
+    300
+}
+
+fn default_catalog_cache_max_entries() -> usize {
+    10_000
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase", tag = "type")]
 pub enum CatalogProviderConfig {
     #[default]
     Null,
-    Static {
-        schemas: Vec<StaticTableSchema>,
-    },
     /// Delegates catalog discovery to a cluster group's own adapter (Trino, DuckDB,
     /// StarRocks, Athena, or ClickHouse — whichever engine the group runs). Opt-in
     /// convenience/fallback, not a recommended default: its accuracy and availability
@@ -1902,9 +1922,13 @@ pub enum CatalogProviderConfig {
         /// Name of the cluster group to use for metadata queries.
         #[serde(rename = "clusterGroup")]
         cluster_group: String,
+        #[serde(default)]
+        cache: Option<CatalogCacheConfig>,
     },
     HiveMetastore {
         uri: String,
+        #[serde(default)]
+        cache: Option<CatalogCacheConfig>,
     },
     Glue {
         region: Option<String>,
@@ -1914,40 +1938,17 @@ pub enum CatalogProviderConfig {
         /// role, EC2 instance profile, etc.).
         #[serde(default)]
         auth: Option<ClusterAuth>,
+        #[serde(default)]
+        cache: Option<CatalogCacheConfig>,
     },
-    Caching {
-        #[serde(rename = "ttlSeconds")]
-        ttl_seconds: u64,
-        #[serde(rename = "maxEntries")]
-        max_entries: usize,
-        /// The wrapped provider, e.g. `delegate: { type: static, schemas: [] }`.
-        /// Deliberately *not* `#[serde(flatten)]`: `CatalogProviderConfig` is itself
-        /// an internally-tagged enum (`tag = "type"`), so flattening it here would
-        /// require two `type` keys in the same YAML mapping — nest it instead.
-        delegate: Box<CatalogProviderConfig>,
-    },
+    /// Tries `primary` first, falls through to `secondary` on error (or a missing
+    /// single table, for `get_table_schema` specifically). Each side configures
+    /// its own `cache` independently — this is about composing two *sources*,
+    /// not about caching.
     Fallback {
         primary: Box<CatalogProviderConfig>,
         secondary: Box<CatalogProviderConfig>,
     },
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct StaticTableSchema {
-    pub catalog: String,
-    pub database: String,
-    pub table: String,
-    pub columns: Vec<StaticColumnDef>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct StaticColumnDef {
-    pub name: String,
-    pub data_type: String,
-    #[serde(default = "default_true")]
-    pub nullable: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -3317,61 +3318,18 @@ mod catalog_provider_config_tests {
     }
 
     #[test]
-    fn static_schemas_round_trip_camel_case() {
-        let yaml = r#"
-type: static
-schemas:
-  - catalog: hive
-    database: analytics
-    table: orders
-    columns:
-      - { name: order_id, dataType: BIGINT, nullable: false }
-"#;
-        let cfg: CatalogProviderConfig = serde_yaml::from_str(yaml).unwrap();
-        match cfg {
-            CatalogProviderConfig::Static { schemas } => {
-                assert_eq!(schemas.len(), 1);
-                assert_eq!(schemas[0].table, "orders");
-                assert_eq!(schemas[0].columns[0].data_type, "BIGINT");
-            }
-            other => panic!("expected Static, got {other:?}"),
-        }
-    }
-
-    #[test]
     fn engine_delegate_cluster_group_uses_camel_case_key() {
         let cfg: CatalogProviderConfig =
             serde_yaml::from_str("type: engineDelegate\nclusterGroup: trino-default\n").unwrap();
         match cfg {
-            CatalogProviderConfig::EngineDelegate { cluster_group } => {
+            CatalogProviderConfig::EngineDelegate {
+                cluster_group,
+                cache,
+            } => {
                 assert_eq!(cluster_group, "trino-default");
+                assert!(cache.is_none());
             }
             other => panic!("expected EngineDelegate, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn caching_wraps_a_nested_delegate_not_flattened() {
-        let yaml = r#"
-type: caching
-ttlSeconds: 300
-maxEntries: 10000
-delegate:
-  type: static
-  schemas: []
-"#;
-        let cfg: CatalogProviderConfig = serde_yaml::from_str(yaml).unwrap();
-        match cfg {
-            CatalogProviderConfig::Caching {
-                ttl_seconds,
-                max_entries,
-                delegate,
-            } => {
-                assert_eq!(ttl_seconds, 300);
-                assert_eq!(max_entries, 10000);
-                assert!(matches!(*delegate, CatalogProviderConfig::Static { .. }));
-            }
-            other => panic!("expected Caching, got {other:?}"),
         }
     }
 
@@ -3382,15 +3340,15 @@ delegate:
         let yaml = r#"
 type: fallback
 primary:
-  type: static
-  schemas: []
+  type: glue
+  region: us-east-1
 secondary:
   type: "null"
 "#;
         let cfg: CatalogProviderConfig = serde_yaml::from_str(yaml).unwrap();
         match cfg {
             CatalogProviderConfig::Fallback { primary, secondary } => {
-                assert!(matches!(*primary, CatalogProviderConfig::Static { .. }));
+                assert!(matches!(*primary, CatalogProviderConfig::Glue { .. }));
                 assert!(matches!(*secondary, CatalogProviderConfig::Null));
             }
             other => panic!("expected Fallback, got {other:?}"),
@@ -3398,7 +3356,7 @@ secondary:
     }
 
     #[test]
-    fn glue_and_hive_metastore_parse() {
+    fn glue_and_hive_metastore_parse_with_no_cache_by_default() {
         let glue: CatalogProviderConfig =
             serde_yaml::from_str("type: glue\nregion: us-east-1\n").unwrap();
         assert!(matches!(
@@ -3406,16 +3364,20 @@ secondary:
             CatalogProviderConfig::Glue {
                 region: Some(ref r),
                 auth: None,
+                cache: None,
             } if r == "us-east-1"
         ));
 
         let hms: CatalogProviderConfig =
             serde_yaml::from_str("type: hiveMetastore\nuri: thrift://localhost:9083\n").unwrap();
-        assert!(matches!(hms, CatalogProviderConfig::HiveMetastore { .. }));
+        assert!(matches!(
+            hms,
+            CatalogProviderConfig::HiveMetastore { cache: None, .. }
+        ));
     }
 
     #[test]
-    fn glue_role_arn_auth_parses() {
+    fn glue_role_arn_auth_and_cache_parse_together() {
         let yaml = r#"
 type: glue
 region: us-east-1
@@ -3423,6 +3385,9 @@ auth:
   type: roleArn
   roleArn: arn:aws:iam::123456789012:role/queryflux-glue-readonly
   externalId: queryflux-ext-id
+cache:
+  ttlSeconds: 600
+  maxEntries: 5000
 "#;
         let glue: CatalogProviderConfig = serde_yaml::from_str(yaml).unwrap();
         match glue {
@@ -3433,6 +3398,7 @@ auth:
                         role_arn,
                         external_id,
                     }),
+                cache: Some(cache),
             } => {
                 assert_eq!(region, "us-east-1");
                 assert_eq!(
@@ -3440,8 +3406,25 @@ auth:
                     "arn:aws:iam::123456789012:role/queryflux-glue-readonly"
                 );
                 assert_eq!(external_id.as_deref(), Some("queryflux-ext-id"));
+                assert_eq!(cache.ttl_seconds, 600);
+                assert_eq!(cache.max_entries, 5000);
             }
-            other => panic!("expected Glue with RoleArn auth, got {other:?}"),
+            other => panic!("expected Glue with RoleArn auth + cache, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cache_ttl_and_max_entries_default_when_omitted() {
+        let yaml = "type: glue\nregion: us-east-1\ncache: {}\n";
+        let glue: CatalogProviderConfig = serde_yaml::from_str(yaml).unwrap();
+        match glue {
+            CatalogProviderConfig::Glue {
+                cache: Some(cache), ..
+            } => {
+                assert_eq!(cache.ttl_seconds, 300);
+                assert_eq!(cache.max_entries, 10_000);
+            }
+            other => panic!("expected Glue with defaulted cache, got {other:?}"),
         }
     }
 }

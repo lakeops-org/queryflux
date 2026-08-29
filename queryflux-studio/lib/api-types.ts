@@ -529,22 +529,21 @@ export interface GuardrailsConfig {
 //
 // Feeds schema-aware SQL translation (queryflux_core::catalog::CatalogProvider).
 // A true discriminated union (not the flat-optional-fields style used above for
-// GuardSpecDto) because `caching`/`fallback` recursively nest another
+// GuardSpecDto) because `fallback` recursively nests another
 // CatalogProviderConfig — TS narrows `.type` correctly through the recursion,
 // which the flat style doesn't support.
+//
+// Caching is a `cache` field on each real (network-calling) provider's own
+// config, not a separate wrapper type to remember to nest.
 // ---------------------------------------------------------------------------
 
-export interface StaticColumnDefDto {
-  name: string;
-  dataType: string;
-  nullable: boolean;
-}
-
-export interface StaticTableSchemaDto {
-  catalog: string;
-  database: string;
-  table: string;
-  columns: StaticColumnDefDto[];
+/** TTL + capacity-bounded cache for one provider's lookups. `undefined`/`null`
+ * on the owning provider means every lookup goes straight to the backing
+ * service — table/column metadata rarely changes, so a much longer TTL than a
+ * query result cache is normally safe. */
+export interface CatalogCacheConfigDto {
+  ttlSeconds: number;
+  maxEntries: number;
 }
 
 /**
@@ -558,17 +557,15 @@ export type GlueAuthConfig =
 
 export type CatalogProviderConfig =
   | { type: "null" }
-  | { type: "static"; schemas: StaticTableSchemaDto[] }
   /** Not yet implemented server-side — builds but degrades to a no-op. */
-  | { type: "engineDelegate"; clusterGroup: string }
+  | { type: "engineDelegate"; clusterGroup: string; cache?: CatalogCacheConfigDto | null }
   /** Not yet implemented server-side — builds but degrades to a no-op. */
-  | { type: "hiveMetastore"; uri: string }
-  | { type: "glue"; region?: string | null; auth?: GlueAuthConfig | null }
+  | { type: "hiveMetastore"; uri: string; cache?: CatalogCacheConfigDto | null }
   | {
-      type: "caching";
-      ttlSeconds: number;
-      maxEntries: number;
-      delegate: CatalogProviderConfig;
+      type: "glue";
+      region?: string | null;
+      auth?: GlueAuthConfig | null;
+      cache?: CatalogCacheConfigDto | null;
     }
   | {
       type: "fallback";

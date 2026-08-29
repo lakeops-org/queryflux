@@ -90,50 +90,33 @@ translation:
 catalogProvider:
   type: null
   # --- Other provider examples ---
-  # A literal, hand-declared schema — zero external dependencies, useful for
-  # testing or a small fixed set of tables.
-  # type: static
-  # schemas:
-  #   - catalog: hive
-  #     database: analytics
-  #     table: orders
-  #     columns:
-  #       - { name: order_id, dataType: BIGINT, nullable: false }
-  #       - { name: total, dataType: "DECIMAL(10,2)", nullable: true }
-  #
   # AWS Glue Data Catalog — direct Glue API access (format-agnostic: sees
   # Iceberg, Hive/Parquet, and any other table format Glue tracks). `auth` is
   # optional and follows the same shape as engine cluster `auth`; omit it to
   # use the default AWS credential chain (env vars, ECS task role, EC2
-  # instance profile, etc.). Wrapped in `caching` here since Glue makes a real
-  # network call per uncached lookup and table schemas rarely change — a bare
-  # `type: glue` (no caching ancestor) logs a startup warning recommending this.
-  # type: caching
-  # ttlSeconds: 300
-  # maxEntries: 10000
-  # delegate:
-  #   type: glue
-  #   region: us-east-1
-  #   auth:
-  #     type: roleArn
-  #     roleArn: arn:aws:iam::123456789012:role/queryflux-glue-readonly
-  #     externalId: ${GLUE_EXTERNAL_ID}
-  #
-  # Wrap any provider with a TTL cache:
-  # type: caching
-  # ttlSeconds: 300
-  # maxEntries: 10000
-  # delegate:
-  #   type: static
-  #   schemas: []
+  # instance profile, etc.). `cache` is a field on the provider itself (not a
+  # separate wrapper type) — Glue makes a real network call per uncached
+  # lookup and table schemas rarely change, so a longer TTL than a query
+  # result cache is normally safe; a `glue` config with no `cache` logs a
+  # startup warning recommending one.
+  # type: glue
+  # region: us-east-1
+  # auth:
+  #   type: roleArn
+  #   roleArn: arn:aws:iam::123456789012:role/queryflux-glue-readonly
+  #   externalId: ${GLUE_EXTERNAL_ID}
+  # cache:
+  #   ttlSeconds: 300
+  #   maxEntries: 10000
   #
   # Try a primary provider, fall back to a secondary on error (or a missing
   # table, for get_table_schema specifically). Note: "null" must be quoted here —
   # a bare YAML `null` parses as YAML's null type, not the string tag `type` expects.
   # type: fallback
   # primary:
-  #   type: static
-  #   schemas: []
+  #   type: glue
+  #   region: us-east-1
+  #   cache: { ttlSeconds: 300, maxEntries: 10000 }
   # secondary:
   #   type: "null"
 

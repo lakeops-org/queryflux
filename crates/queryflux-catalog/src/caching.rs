@@ -39,10 +39,10 @@ struct Inner {
 }
 
 /// Wraps a `CatalogProvider`, caching each method's results independently by its
-/// arguments, matching the `catalogProvider: { type: caching, ttlSeconds,
-/// maxEntries, delegate: {...} }` config shape. Only `Ok` results are cached — an
-/// error is never pinned for `ttl_seconds`, so a transient catalog outage
-/// self-heals on the very next call instead of being cached as a failure.
+/// arguments — built by `maybe_cached` in `lib.rs` for any provider configured
+/// with a `cache: { ttlSeconds, maxEntries }` field. Only `Ok` results are
+/// cached — an error is never pinned for `ttl_seconds`, so a transient catalog
+/// outage self-heals on the very next call instead of being cached as a failure.
 pub struct CachingCatalogProvider {
     delegate: Arc<dyn CatalogProvider>,
     ttl: Duration,

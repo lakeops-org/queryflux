@@ -10,8 +10,9 @@ use queryflux_core::error::Result;
 /// secondary }` config shape. Falls through to `secondary` on:
 /// - any `Err` from `primary`, for every method;
 /// - `get_table_schema` specifically returning `Ok(None)` — "not found in primary"
-///   is exactly the fallback use case (e.g. an engine-delegate primary plus a
-///   static secondary for tables the engine doesn't know about yet).
+///   is exactly the fallback use case (e.g. a Glue primary plus a second Glue
+///   account, or an engine-delegate, as secondary for tables the first doesn't
+///   know about).
 ///
 /// `list_tables`/`list_databases`/`list_catalogs` do **not** fall through on an
 /// empty `Ok` result — an empty catalog/database is a legitimate answer there,
