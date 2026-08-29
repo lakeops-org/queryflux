@@ -58,9 +58,9 @@ pub type TestClusterFn = Arc<
 
 /// Callback type for testing a `catalogProvider` config without persisting it.
 /// Receives the raw config JSON → returns `Ok(true)` if the provider was built and
-/// responded to a smoke-test call, `Ok(false)` if it degraded to a no-op (e.g. an
-/// unimplemented provider type) or the smoke-test call itself returned an error,
-/// `Err(msg)` if the config didn't even parse into a `CatalogProviderConfig`.
+/// a real connectivity check against it succeeded, `Ok(false)` if either the build
+/// or the connectivity check failed (message explains which and why), `Err(msg)`
+/// if the config didn't even parse into a `CatalogProviderConfig`.
 pub type TestCatalogProviderFn = Arc<
     dyn Fn(
             serde_json::Value,

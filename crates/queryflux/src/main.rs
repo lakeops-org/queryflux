@@ -1207,25 +1207,31 @@ async fn main() -> Result<()> {
             let cfg = serde_json::from_value::<queryflux_core::config::CatalogProviderConfig>(
                 config_json,
             )?;
-            let requested_null = matches!(cfg, queryflux_core::config::CatalogProviderConfig::Null);
-            let provider = queryflux_catalog::build_catalog_provider(&cfg).await;
-            if provider.is_null() && !requested_null {
-                return Ok((
-                    false,
-                    "This catalogProvider type is not implemented yet — it built \
-                         successfully but degrades to a no-op (schema-aware translation \
-                         will fall back to dialect-only)."
-                        .to_string(),
-                ));
+            if matches!(cfg, queryflux_core::config::CatalogProviderConfig::Null) {
+                return Ok((true, "No catalog configured (type: null).".to_string()));
             }
-            match provider.list_catalogs().await {
-                Ok(catalogs) => Ok((
+            // Uses the fallible builder, not `build_catalog_provider` — this
+            // needs the real construction error, not a silent degrade to a
+            // no-op. Every real provider ignores its `catalog` argument (Glue/
+            // HiveMetastore/IcebergRest each expose exactly one synthetic
+            // catalog), so any string works here.
+            let provider = match queryflux_catalog::try_build_catalog_provider(&cfg).await {
+                Ok(provider) => provider,
+                Err(e) => return Ok((false, format!("Failed to build provider: {e}"))),
+            };
+            // `list_catalogs()` is a hardcoded synthetic single-entry result for
+            // every real provider (Glue/HMS/Iceberg REST have no native "list
+            // catalogs" call) — it makes no network call at all, so it can't
+            // prove connectivity. `list_databases` does: it's the cheapest call
+            // that actually round-trips to the backing service for all three.
+            match provider.list_databases("").await {
+                Ok(databases) => Ok((
                     true,
-                    format!("Connected — {} catalog(s) visible", catalogs.len()),
+                    format!("Connected — {} database(s) visible", databases.len()),
                 )),
                 Err(e) => Ok((
                     false,
-                    format!("Built provider, but a test call failed: {e}"),
+                    format!("Built provider, but listing databases failed: {e}"),
                 )),
             }
         })
