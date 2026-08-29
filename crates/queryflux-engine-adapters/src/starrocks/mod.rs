@@ -298,7 +298,11 @@ impl StarRocksAdapter {
         params: &queryflux_core::params::QueryParams,
         batch_tx: &tokio::sync::mpsc::Sender<Result<RecordBatch>>,
     ) -> Result<()> {
-        if let Some(db) = session.database() {
+        // StarRocks has no catalog concept of its own — a client's `catalog`
+        // (e.g. Trino's `x-trino-catalog` with no `x-trino-schema`) is the
+        // intended database just as much as an explicit `database` hint, so
+        // fall back to it when no database was set.
+        if let Some(db) = session.database().or(session.catalog()) {
             let use_sql = format!("USE `{}`", db.replace('`', "``"));
             conn.query_drop(&use_sql)
                 .await

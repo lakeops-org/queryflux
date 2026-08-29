@@ -583,7 +583,11 @@ impl crate::SyncAdapter for ClickHouseAdapter {
             _ => sql.to_string(),
         };
         let mut req = self.query_request_with_id(&effective_sql, "ArrowStream", &query_id);
-        if let Some(db) = session.database() {
+        // ClickHouse has no catalog concept of its own — a client's `catalog`
+        // (e.g. Trino's `x-trino-catalog` with no `x-trino-schema`) is the
+        // intended database just as much as an explicit `database` hint, so
+        // fall back to it when no database was set.
+        if let Some(db) = session.database().or(session.catalog()) {
             req = req.query(&[("database", db)]);
         }
         if !tags.is_empty() {
