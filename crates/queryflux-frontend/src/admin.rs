@@ -9,7 +9,8 @@ use axum::{
     routing::{delete, get, patch, post},
     Json, Router,
 };
-use queryflux_auth::AdminCredentialsManager;
+use queryflux_auth::{AdminCredentialsManager, AuthContext, AuthorizationChecker};
+use queryflux_cluster_manager::ClusterGroupManager;
 use queryflux_core::{
     config::{
         AuthConfig, AuthProviderConfig, AuthorizationConfig, AuthorizationProviderConfig,
@@ -17,8 +18,14 @@ use queryflux_core::{
     },
     engine_registry::EngineRegistry,
     error::{QueryFluxError, Result},
-    query::{BackendQueryId, ClusterGroupName, ClusterName, ExecutingQuery, ProxyQueryId},
+    query::{
+        BackendQueryId, ClusterGroupName, ClusterName, EngineType, ExecutingQuery,
+        FrontendProtocol, ProxyQueryId,
+    },
+    session::SessionContext,
+    tags::{merge_tags, QueryTags},
 };
+use queryflux_guardrails::{GuardChain, GuardContext, GuardLayer};
 use queryflux_metrics::prometheus_store::PrometheusMetrics;
 use queryflux_persistence::{
     cluster_config::{
@@ -31,8 +38,10 @@ use queryflux_persistence::{
     },
     routing_json::{enrich_routers_for_api, resolve_routers_for_storage},
     script_library::{UpsertUserScript, UserScriptRecord, KIND_GUARD},
-    AdminStore,
+    AdminStore, GuardAction,
 };
+use queryflux_routing::{chain::RouterChain, chain::RoutingTrace, ChainRouteResult};
+use queryflux_translation::TranslationService;
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 use tower_http::cors::{Any, CorsLayer};
@@ -43,6 +52,7 @@ use std::future::Future;
 use std::pin::Pin;
 
 use crate::{
+    routing_resolve::{check_group_authorized, resolve_routed_group},
     state::{AppState, LiveConfig},
     FrontendListenerTrait, ShutdownRx,
 };
@@ -127,6 +137,8 @@ pub struct ClusterStateDto {
         list_agents_handler,
         list_conversations_handler,
         get_conversation_handler,
+        // Routing preview
+        route_explain_handler,
     ),
     components(schemas(
         ClusterStateDto,
@@ -140,6 +152,9 @@ pub struct ClusterStateDto {
         UpsertUserScript,
         ProtocolFrontendDto,
         FrontendsStatusDto,
+        RouteExplainRequest,
+        RouteExplainResponse,
+        GroupCapacityDto,
         queryflux_persistence::cluster_config::ClusterConfigRecord,
         queryflux_persistence::cluster_config::UpsertClusterConfig,
         queryflux_persistence::cluster_config::ClusterGroupConfigRecord,
@@ -722,6 +737,8 @@ impl AdminFrontend {
             // Auth management endpoints
             .route("/admin/auth/status", get(auth_status_handler))
             .route("/admin/auth/change-password", post(change_password_handler))
+            // Routing preview — dry-run, no query is executed and no capacity is consumed
+            .route("/admin/route-explain", post(route_explain_handler))
             .layer(middleware::from_fn_with_state(
                 state.clone(),
                 admin_auth_middleware,
@@ -1371,6 +1388,311 @@ async fn get_conversation_handler(
         Ok(rows) => Json::<Vec<QuerySummary>>(rows).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Route explain — dry-run routing/guard/capacity preview
+// ---------------------------------------------------------------------------
+
+/// Request body for `POST /admin/route-explain`.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct RouteExplainRequest {
+    pub sql: String,
+    /// Wire protocol to route as — same values as `protocolBased` router config
+    /// (`trinoHttp`, `postgresWire`, `mysqlWire`, `clickhouseHttp`, `flightSql`,
+    /// `snowflakeHttp`, `snowflakeSqlApi`).
+    #[schema(value_type = String)]
+    pub protocol: FrontendProtocol,
+    /// Simulated identity for authorization-aware routing and guard preview.
+    /// **Not verified against any `AuthProvider`** — this endpoint answers "if a query came
+    /// in as this user, what would happen," which is what makes it useful for testing
+    /// `allowGroups`/`allowUsers` rules before rolling them out. Because it sits behind the
+    /// same admin Basic-auth gate as every other `/admin/*` route, an admin credential
+    /// holder can already probe outcomes for any simulated user — that is the intended use,
+    /// not a bypass of real authentication.
+    #[serde(default)]
+    pub user: Option<String>,
+    #[serde(default)]
+    pub groups: Vec<String>,
+    #[serde(default)]
+    pub database: Option<String>,
+    /// Query tags, e.g. `{"team": "eng", "batch": null}` — same shape session tags use.
+    #[serde(default)]
+    pub tags: QueryTags,
+}
+
+/// Response body for `POST /admin/route-explain`. Nothing here is persisted — this is a
+/// pure computation over already-loaded config and live cluster state.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct RouteExplainResponse {
+    /// Same shape Studio already renders for a historical query's `routing_trace`.
+    #[schema(value_type = Object)]
+    pub routing_trace: RoutingTrace,
+    /// Set when a router or authorization check would deny the query before it ever reaches
+    /// guardrails or dispatch. When set, `guard_actions` is empty and `capacity` is absent —
+    /// nothing downstream of the deny was evaluated.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub denied: Option<String>,
+    /// Guard verdicts from the pre-dispatch guard pass (global chain, then the resolved
+    /// group's chain). Empty when no guardrails are configured for the resolved group.
+    #[schema(value_type = Vec<Object>)]
+    pub guard_actions: Vec<GuardAction>,
+    /// True if any guard action above was a deny — the query would never reach dispatch.
+    pub would_be_guard_blocked: bool,
+    /// Best-effort, moment-in-time capacity snapshot of the resolved group's members.
+    /// Unlike `routing_trace`/`guard_actions` (deterministic, config-driven — the same
+    /// answer whether you ask now or later), this reflects live runtime state that can
+    /// change before you act on it. It also doesn't check the group's `maxQueuedQueries`
+    /// admission limit — `would_queue: true` means "would not dispatch immediately," not
+    /// a guarantee the query would successfully queue rather than being rejected. Treat
+    /// this field as advisory; for authoritative live state, poll `GET /admin/clusters`.
+    /// Absent when `denied` is set (no group was resolved).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub capacity: Option<GroupCapacityDto>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct GroupCapacityDto {
+    pub group_name: String,
+    pub members: Vec<ClusterStateDto>,
+    /// True when no member is currently enabled, healthy, and under `max_running_queries` —
+    /// i.e. the query would not dispatch immediately, as of this snapshot. Best-effort: see
+    /// the caveat on `RouteExplainResponse::capacity`.
+    pub would_queue: bool,
+}
+
+fn empty_route_explain_response(mut trace: RoutingTrace, denied: String) -> RouteExplainResponse {
+    // route_with_trace already sets trace.denied for a router-level Deny, but
+    // resolve_routed_group and the unconditional authorization check below it never
+    // touch the trace — set it here too so RoutingTraceView (which branches on
+    // trace.denied, not on the top-level field) renders consistently with `denied`
+    // regardless of which stage produced the denial.
+    trace.denied = Some(denied.clone());
+    RouteExplainResponse {
+        routing_trace: trace,
+        denied: Some(denied),
+        guard_actions: Vec::new(),
+        would_be_guard_blocked: false,
+        capacity: None,
+    }
+}
+
+/// Preview where a query would route, whether it would be authorized, and whether any
+/// guardrail would block it — **without executing the query or consuming any capacity**.
+/// The primary, deterministic answer this endpoint exists to give: routing/authz/guardrail
+/// verdicts are config-driven, so the same request gives the same answer whether config
+/// hasn't changed since. Also includes a best-effort capacity snapshot as a bonus signal
+/// (see the caveat on `RouteExplainResponse::capacity`) — live runtime state, not something
+/// this endpoint tries to make authoritative.
+///
+/// Mirrors the real dispatch order exactly (route → fallback-resolve → authorize → guard
+/// preview → capacity), so the answer this endpoint gives matches what would actually
+/// happen. Never calls `ClusterGroupManager::acquire_cluster` — capacity is read via the
+/// same live snapshot `/admin/clusters` uses, so calling this endpoint has no side effects.
+#[utoipa::path(
+    post,
+    path = "/admin/route-explain",
+    tag = "admin",
+    request_body = RouteExplainRequest,
+    responses(
+        (status = 200, description = "Routing/guard/capacity preview", body = RouteExplainResponse),
+        (status = 500, description = "Internal error", body = str),
+    )
+)]
+async fn route_explain_handler(
+    State(state): State<Arc<AdminState>>,
+    Json(req): Json<RouteExplainRequest>,
+) -> impl IntoResponse {
+    // Snapshot everything needed from LiveConfig in one lock acquisition — same discipline
+    // dispatch_query uses — so no lock is held across the awaits in build_route_explain_response.
+    let (
+        router_chain,
+        authorization,
+        guard_chain,
+        group_guard_chains,
+        group_default_tags,
+        group_translation_scripts,
+        group_order,
+        cluster_manager,
+    ) = {
+        let live = state.live.read().await;
+        (
+            live.router_chain.clone(),
+            live.authorization.clone(),
+            live.guard_chain.clone(),
+            live.group_guard_chains.clone(),
+            live.group_default_tags.clone(),
+            live.group_translation_scripts.clone(),
+            live.group_order.clone(),
+            live.cluster_manager.clone(),
+        )
+    };
+
+    match build_route_explain_response(
+        router_chain.as_ref(),
+        authorization.as_ref(),
+        guard_chain.as_deref(),
+        &group_guard_chains,
+        &group_default_tags,
+        &group_translation_scripts,
+        &group_order,
+        cluster_manager.as_ref(),
+        state.app.translation.as_ref(),
+        &req,
+    )
+    .await
+    {
+        Ok(resp) => Json(resp).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+/// Core logic behind [`route_explain_handler`], factored out so it can be unit-tested with
+/// lightweight fixtures instead of a full `AdminState`. Mirrors the real dispatch order
+/// exactly (route → fallback-resolve → authorize → guard preview → capacity) and never calls
+/// `ClusterGroupManager::acquire_cluster` — capacity is read via the same live snapshot
+/// `/admin/clusters` uses, so calling it has no side effects.
+#[allow(clippy::too_many_arguments)]
+async fn build_route_explain_response(
+    router_chain: &RouterChain,
+    authorization: &dyn AuthorizationChecker,
+    guard_chain: Option<&GuardChain>,
+    group_guard_chains: &HashMap<String, Arc<GuardChain>>,
+    group_default_tags: &HashMap<String, QueryTags>,
+    group_translation_scripts: &HashMap<String, Vec<String>>,
+    group_order: &[String],
+    cluster_manager: &dyn ClusterGroupManager,
+    translation: &TranslationService,
+    req: &RouteExplainRequest,
+) -> Result<RouteExplainResponse> {
+    let auth_ctx = AuthContext {
+        user: req.user.clone().unwrap_or_else(|| "anonymous".to_string()),
+        groups: req.groups.clone(),
+        ..Default::default()
+    };
+    let session = SessionContext {
+        user: req.user.clone(),
+        database: req.database.clone(),
+        tags: req.tags.clone(),
+        ..Default::default()
+    };
+
+    let (chain_result, mut trace) = router_chain
+        .route_with_trace(&req.sql, &session, &req.protocol, Some(&auth_ctx))
+        .await?;
+
+    let group = match chain_result {
+        ChainRouteResult::Denied { message } => {
+            return Ok(empty_route_explain_response(trace, message));
+        }
+        ChainRouteResult::Routed(group) => group,
+    };
+
+    // Fallback-only authorization-aware reroute — mirrors what frontends do today.
+    let group = match resolve_routed_group(group_order, authorization, group, &mut trace, &auth_ctx)
+        .await
+    {
+        Ok(g) => g,
+        Err(e) => return Ok(empty_route_explain_response(trace, e.to_string())),
+    };
+
+    // Unconditional per-group authorization check — dispatch enforces this for every
+    // resolved group, not just ones reached via fallback. Same helper dispatch_query and
+    // execute_to_sink use, so this can't quietly disagree with what they'd decide.
+    if let Some(msg) = check_group_authorized(authorization, &auth_ctx, &group).await {
+        return Ok(empty_route_explain_response(trace, msg));
+    }
+
+    // Live capacity — READ-ONLY. Never call acquire_cluster here: that mutates real state
+    // (increments a running-query counter with nothing to ever release it).
+    let all_states = cluster_manager.all_cluster_states().await?;
+    let members: Vec<_> = all_states
+        .into_iter()
+        .filter(|s| s.group_name.0 == group.0)
+        .collect();
+    // Guard dialect parsing needs a concrete engine type; the first member stands in for the
+    // group. Groups with heterogeneous engine types across members are not modeled here — a
+    // guard that would pass on one member's dialect but not another's is a known limitation.
+    let engine_type = members
+        .first()
+        .map(|m| m.engine_type.clone())
+        .unwrap_or(EngineType::Undispatched);
+    let would_queue = !members
+        .iter()
+        .any(|m| m.enabled && m.is_healthy && m.running_queries < m.max_running_queries);
+    let capacity = GroupCapacityDto {
+        group_name: group.0.clone(),
+        members: members
+            .into_iter()
+            .map(|s| ClusterStateDto {
+                group_name: s.group_name.0,
+                cluster_name: s.cluster_name.0,
+                engine_type: format!("{:?}", s.engine_type),
+                endpoint: s.endpoint,
+                running_queries: s.running_queries,
+                queued_queries: s.queued_queries,
+                max_running_queries: s.max_running_queries,
+                is_healthy: s.is_healthy,
+                enabled: s.enabled,
+            })
+            .collect(),
+        would_queue,
+    };
+
+    // Guard preview — same chain-run pattern production uses pre-dispatch, but with the
+    // resolved group's real engine type (more accurate than the placeholder engine type
+    // production uses before cluster selection has happened). dispatch_query runs guards
+    // *after* translation, against the final SQL (see "Guard chain: runs after translation"
+    // in dispatch.rs) — translate here too so a client-dialect query routed to a
+    // different-dialect engine is guard-checked against the SQL that would actually run,
+    // not against SQL in the client's dialect parsed as if it were the engine's.
+    let group_fixups = group_translation_scripts
+        .get(&group.0)
+        .cloned()
+        .unwrap_or_default();
+    let translated_sql = translation
+        .maybe_translate(
+            &req.sql,
+            &req.protocol.default_dialect(),
+            &engine_type.dialect(),
+            &queryflux_translation::SchemaContext::default(),
+            &group_fixups,
+        )
+        .await?;
+    let effective_tags = merge_tags(
+        &group_default_tags
+            .get(&group.0)
+            .cloned()
+            .unwrap_or_default(),
+        &session.tags,
+    );
+    let resolved_agent_ctx = session.resolved_agent_context();
+    let guard_ctx = GuardContext {
+        sql: &req.sql,
+        translated_sql: &translated_sql,
+        engine_type: &engine_type,
+        cluster_group: &group,
+        user: session.user(),
+        agent_context: resolved_agent_ctx.as_ref(),
+        query_tags: &effective_tags,
+    };
+    let group_guard_chain = group_guard_chains.get(&group.0).map(|c| c.as_ref());
+    // Same shared function dispatch_query and execute_to_sink_inner run their guard
+    // chains through — see queryflux_guardrails::run_guard_chains.
+    let (guard_actions, would_be_guard_blocked) = queryflux_guardrails::run_guard_chains(
+        [guard_chain, group_guard_chain],
+        &guard_ctx,
+        GuardLayer::Plan,
+    )
+    .await;
+
+    Ok(RouteExplainResponse {
+        routing_trace: trace,
+        denied: None,
+        guard_actions,
+        would_be_guard_blocked,
+        capacity: Some(capacity),
+    })
 }
 
 /// Dashboard stats for the last hour. Requires Postgres persistence.
@@ -2710,19 +3032,32 @@ async fn invalidate_group_cache_handler(
 #[cfg(test)]
 mod tests {
     use super::{
-        collect_running_queries, delete_queued_if_exists, sql_preview, GuardrailsConfigDto,
-        SecurityConfigDto,
+        build_route_explain_response, collect_running_queries, delete_queued_if_exists,
+        sql_preview, GuardrailsConfigDto, RouteExplainRequest, SecurityConfigDto,
     };
     use chrono::Utc;
+    use queryflux_auth::{AllowAllAuthorization, AuthorizationChecker, SimpleAuthorizationPolicy};
+    use queryflux_cluster_manager::{
+        cluster_state::ClusterState,
+        simple::SimpleClusterGroupManager,
+        strategy::{ClusterSelectionStrategy, RoundRobinStrategy},
+        ClusterGroupManager,
+    };
     use queryflux_core::config::{
-        AuthConfig, AuthProviderConfig, AuthorizationConfig, StaticUserEntry, StaticUsersConfig,
+        AuthConfig, AuthProviderConfig, AuthorizationConfig, ClusterGroupAuthorizationConfig,
+        QueryRegexRule, RegexRouteAction, StaticUserEntry, StaticUsersConfig,
     };
     use queryflux_core::query::{
-        BackendQueryId, ClusterGroupName, ClusterName, ExecutingQuery, FrontendProtocol,
-        ProxyQueryId, QueuedQuery,
+        BackendQueryId, ClusterGroupName, ClusterName, EngineType, ExecutingQuery,
+        FrontendProtocol, ProxyQueryId, QueuedQuery,
     };
     use queryflux_core::session::SessionContext;
+    use queryflux_guardrails::{built_in::ReadOnlyGuard, GuardChain};
     use queryflux_persistence::{in_memory::InMemoryPersistence, Persistence};
+    use queryflux_routing::{
+        chain::RouterChain, implementations::query_regex::QueryRegexRouter, RouterTrait,
+    };
+    use queryflux_translation::TranslationService;
     use serde_json::json;
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -2947,5 +3282,274 @@ mod tests {
         }))
         .expect("shape should parse");
         assert!(ftp_url.validate().unwrap_err().contains("http or https"));
+    }
+
+    // -----------------------------------------------------------------
+    // route_explain_handler / build_route_explain_response
+    // -----------------------------------------------------------------
+
+    /// (cluster_name, max_running, running, enabled, healthy)
+    fn cluster_manager_with_members(
+        group: &str,
+        members: Vec<(&str, u64, u64, bool, bool)>,
+    ) -> Arc<dyn ClusterGroupManager> {
+        let group_name = ClusterGroupName(group.to_string());
+        let states: Vec<Arc<ClusterState>> = members
+            .into_iter()
+            .map(|(name, max_running, running, enabled, healthy)| {
+                let state = Arc::new(ClusterState::new(
+                    ClusterName(name.to_string()),
+                    group_name.clone(),
+                    None,
+                    None,
+                    EngineType::Trino,
+                    Some(format!("http://{name}.test:8080")),
+                    max_running,
+                    enabled,
+                ));
+                state.set_running_queries(running);
+                state.set_healthy(healthy);
+                state
+            })
+            .collect();
+        let mut groups = HashMap::new();
+        groups.insert(
+            group_name,
+            (
+                states,
+                Arc::new(RoundRobinStrategy::new()) as Arc<dyn ClusterSelectionStrategy>,
+            ),
+        );
+        Arc::new(SimpleClusterGroupManager::new(groups))
+    }
+
+    fn explain_request(sql: &str) -> RouteExplainRequest {
+        RouteExplainRequest {
+            sql: sql.to_string(),
+            protocol: FrontendProtocol::TrinoHttp,
+            user: None,
+            groups: vec![],
+            database: None,
+            tags: HashMap::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn route_explain_denied_by_router_skips_capacity_and_guards() {
+        let router = QueryRegexRouter::from_rules(vec![QueryRegexRule {
+            regex: r"(?i)^\s*DROP".into(),
+            target_group: None,
+            action: RegexRouteAction::Deny,
+            error: Some("no drops".into()),
+        }]);
+        let routers: Vec<Box<dyn RouterTrait>> = vec![Box::new(router)];
+        let chain = RouterChain::new(routers, ClusterGroupName("default".into()));
+        let authorization: Arc<dyn AuthorizationChecker> =
+            Arc::new(AllowAllAuthorization::default());
+        let cluster_manager =
+            cluster_manager_with_members("default", vec![("c1", 5, 0, true, true)]);
+
+        let resp = build_route_explain_response(
+            &chain,
+            authorization.as_ref(),
+            None,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &["default".to_string()],
+            cluster_manager.as_ref(),
+            &TranslationService::disabled(),
+            &explain_request("DROP TABLE t"),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(resp.denied.as_deref(), Some("no drops"));
+        assert!(resp.capacity.is_none());
+        assert!(resp.guard_actions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn route_explain_fallback_reroutes_to_authorized_group() {
+        // No routers match -> fallback fires -> resolve_routed_group picks the first
+        // group in group_order the simulated user is authorized for.
+        let chain = RouterChain::new(vec![], ClusterGroupName("default".into()));
+        let policies = HashMap::from([
+            (
+                "analytics".to_string(),
+                ClusterGroupAuthorizationConfig {
+                    allow_groups: vec!["team-a".into()],
+                    allow_users: vec![],
+                },
+            ),
+            (
+                "default".to_string(),
+                ClusterGroupAuthorizationConfig {
+                    allow_groups: vec!["team-b".into()],
+                    allow_users: vec![],
+                },
+            ),
+        ]);
+        let authorization: Arc<dyn AuthorizationChecker> =
+            Arc::new(SimpleAuthorizationPolicy::new(policies));
+        let cluster_manager =
+            cluster_manager_with_members("analytics", vec![("c1", 5, 0, true, true)]);
+
+        let mut req = explain_request("SELECT 1");
+        req.groups = vec!["team-a".to_string()];
+
+        let resp = build_route_explain_response(
+            &chain,
+            authorization.as_ref(),
+            None,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &["analytics".to_string(), "default".to_string()],
+            cluster_manager.as_ref(),
+            &TranslationService::disabled(),
+            &req,
+        )
+        .await
+        .unwrap();
+
+        assert!(resp.denied.is_none());
+        assert_eq!(resp.routing_trace.final_group, "analytics");
+        assert!(resp.routing_trace.used_fallback);
+        assert_eq!(resp.capacity.unwrap().group_name, "analytics");
+    }
+
+    #[tokio::test]
+    async fn route_explain_read_only_guard_blocks_write() {
+        let chain = RouterChain::new(vec![], ClusterGroupName("default".into()));
+        let authorization: Arc<dyn AuthorizationChecker> =
+            Arc::new(AllowAllAuthorization::default());
+        let cluster_manager =
+            cluster_manager_with_members("default", vec![("c1", 5, 0, true, true)]);
+        let group_guard_chains: HashMap<String, Arc<GuardChain>> = HashMap::from([(
+            "default".to_string(),
+            Arc::new(GuardChain::new(vec![Box::new(ReadOnlyGuard)])),
+        )]);
+
+        let resp = build_route_explain_response(
+            &chain,
+            authorization.as_ref(),
+            None,
+            &group_guard_chains,
+            &HashMap::new(),
+            &HashMap::new(),
+            &["default".to_string()],
+            cluster_manager.as_ref(),
+            &TranslationService::disabled(),
+            &explain_request("INSERT INTO t VALUES (1)"),
+        )
+        .await
+        .unwrap();
+
+        assert!(resp.denied.is_none());
+        assert!(resp.would_be_guard_blocked);
+        assert_eq!(resp.guard_actions.len(), 1);
+        assert_eq!(resp.guard_actions[0].action, "deny");
+        assert_eq!(
+            resp.guard_actions[0].code.as_deref(),
+            Some("READ_ONLY_VIOLATION")
+        );
+    }
+
+    #[tokio::test]
+    async fn route_explain_would_queue_true_when_group_is_full() {
+        let chain = RouterChain::new(vec![], ClusterGroupName("default".into()));
+        let authorization: Arc<dyn AuthorizationChecker> =
+            Arc::new(AllowAllAuthorization::default());
+        // Single member, at capacity (running == max).
+        let cluster_manager =
+            cluster_manager_with_members("default", vec![("c1", 2, 2, true, true)]);
+
+        let resp = build_route_explain_response(
+            &chain,
+            authorization.as_ref(),
+            None,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &["default".to_string()],
+            cluster_manager.as_ref(),
+            &TranslationService::disabled(),
+            &explain_request("SELECT 1"),
+        )
+        .await
+        .unwrap();
+
+        assert!(resp.capacity.unwrap().would_queue);
+    }
+
+    #[tokio::test]
+    async fn route_explain_would_queue_false_with_one_healthy_member_under_capacity() {
+        let chain = RouterChain::new(vec![], ClusterGroupName("default".into()));
+        let authorization: Arc<dyn AuthorizationChecker> =
+            Arc::new(AllowAllAuthorization::default());
+        // One disabled member (would never be picked) plus one healthy, under-capacity member.
+        let cluster_manager = cluster_manager_with_members(
+            "default",
+            vec![("c1", 5, 5, false, true), ("c2", 5, 1, true, true)],
+        );
+
+        let resp = build_route_explain_response(
+            &chain,
+            authorization.as_ref(),
+            None,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &["default".to_string()],
+            cluster_manager.as_ref(),
+            &TranslationService::disabled(),
+            &explain_request("SELECT 1"),
+        )
+        .await
+        .unwrap();
+
+        let capacity = resp.capacity.unwrap();
+        assert!(!capacity.would_queue);
+        assert_eq!(capacity.members.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn route_explain_auth_denial_sets_trace_denied_too() {
+        // Regression test: an authorization-stage denial (not a router-stage deny) must
+        // set routing_trace.denied, not just the top-level `denied` field — otherwise
+        // Studio's RoutingTraceView (which branches on trace.denied) renders a normal
+        // "Final group" success footer alongside a separate "would be denied" banner.
+        let chain = RouterChain::new(vec![], ClusterGroupName("default".into()));
+        let policies = HashMap::from([(
+            "default".to_string(),
+            ClusterGroupAuthorizationConfig {
+                allow_groups: vec!["nobody-has-this".into()],
+                allow_users: vec![],
+            },
+        )]);
+        let authorization: Arc<dyn AuthorizationChecker> =
+            Arc::new(SimpleAuthorizationPolicy::new(policies));
+        let cluster_manager =
+            cluster_manager_with_members("default", vec![("c1", 5, 0, true, true)]);
+
+        let resp = build_route_explain_response(
+            &chain,
+            authorization.as_ref(),
+            None,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &["default".to_string()],
+            cluster_manager.as_ref(),
+            &TranslationService::disabled(),
+            &explain_request("SELECT 1"),
+        )
+        .await
+        .unwrap();
+
+        assert!(resp.denied.is_some());
+        assert_eq!(resp.routing_trace.denied, resp.denied);
+        assert!(resp.capacity.is_none());
     }
 }

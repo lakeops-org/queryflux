@@ -148,12 +148,56 @@ export interface RoutingTrace {
   decisions: RoutingDecision[];
   final_group: string;
   used_fallback: boolean;
+  /** Present when routing ended in a deny (final_group may be empty). */
+  denied?: string | null;
 }
 
 export interface RoutingDecision {
   router_type: string;
   matched: boolean;
   result?: string | null;
+  /** Present when this router denied the query. */
+  deny_message?: string | null;
+}
+
+// ---------------------------------------------------------------------------
+// Route explain (POST /admin/route-explain) — dry-run routing/guard/capacity preview
+// ---------------------------------------------------------------------------
+
+export interface RouteExplainRequest {
+  sql: string;
+  protocol: string;
+  user?: string | null;
+  groups?: string[];
+  database?: string | null;
+  tags?: Record<string, string | null>;
+}
+
+export interface GroupCapacityDto {
+  group_name: string;
+  members: ClusterStateDto[];
+  /**
+   * True when no member is currently enabled, healthy, and under max_running_queries —
+   * i.e. would not dispatch immediately, as of this snapshot. Best-effort: doesn't check
+   * the group's maxQueuedQueries admission limit, so `true` isn't a guarantee the query
+   * would successfully queue rather than being rejected.
+   */
+  would_queue: boolean;
+}
+
+export interface RouteExplainResponse {
+  routing_trace: RoutingTrace;
+  /** Set when a router or authorization check would deny the query. */
+  denied?: string | null;
+  guard_actions: GuardAction[];
+  would_be_guard_blocked: boolean;
+  /**
+   * Best-effort, moment-in-time capacity snapshot — unlike routing_trace/guard_actions
+   * (deterministic, config-driven), this reflects live runtime state that can change
+   * before you act on it. Treat as advisory; poll GET /admin/clusters for authoritative
+   * live state. Absent when `denied` is set — no group was resolved.
+   */
+  capacity?: GroupCapacityDto | null;
 }
 
 /** Per-cluster-group aggregated stats from `GET /admin/group-stats`. */

@@ -4,7 +4,7 @@ pub mod config;
 pub mod context;
 pub mod external;
 
-pub use chain::GuardChain;
+pub use chain::{run_guard_chains, GuardChain};
 pub use config::{GuardChainConfig, GuardGroupConfig, GuardKind, GuardLayerConfig};
 pub use context::{GuardContext, GuardLayer, GuardResult};
 

@@ -46,6 +46,32 @@ impl GuardChain {
     }
 }
 
+/// Runs each configured chain in order — typically the global chain, then a per-group
+/// chain — for the given layer, stopping at the first deny. Returns the combined actions
+/// across however many chains ran, and whether the last one to run denied.
+///
+/// This is the one place "what does it mean to guard-check a query" is defined. Every
+/// caller that needs a guard verdict (the sync dispatch path before engine submission, the
+/// async cache pre-check, and the `/admin/route-explain` dry-run preview) calls this so
+/// they can't quietly disagree about what running the guards means.
+pub async fn run_guard_chains<'a>(
+    chains: impl IntoIterator<Item = Option<&'a GuardChain>>,
+    ctx: &GuardContext<'_>,
+    layer: GuardLayer,
+) -> (Vec<GuardAction>, bool) {
+    let mut all_actions = Vec::new();
+    let mut was_blocked = false;
+    for chain in chains.into_iter().flatten() {
+        let (actions, blocked) = chain.run(ctx, layer.clone()).await;
+        all_actions.extend(actions);
+        if blocked {
+            was_blocked = true;
+            break;
+        }
+    }
+    (all_actions, was_blocked)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -181,6 +207,55 @@ mod tests {
         assert_eq!(actions.len(), 2);
         assert_eq!(actions[1].guard, "blocker");
         assert_eq!(actions[1].action, "deny");
+        assert!(blocked);
+    }
+
+    #[tokio::test]
+    async fn run_guard_chains_skips_none_entries() {
+        let tc = TestCtx::plan_select_fixture();
+        let (actions, blocked) = run_guard_chains([None, None], &tc.ctx(), GuardLayer::Plan).await;
+        assert!(actions.is_empty());
+        assert!(!blocked);
+    }
+
+    #[tokio::test]
+    async fn run_guard_chains_runs_global_then_group_and_combines_actions() {
+        let global = GuardChain::new(vec![Box::new(TestGuard {
+            name: "global",
+            layer: GuardLayer::Plan,
+            result: GuardResult::allow(),
+        })]);
+        let group = GuardChain::new(vec![Box::new(TestGuard {
+            name: "group",
+            layer: GuardLayer::Plan,
+            result: GuardResult::warn("careful"),
+        })]);
+        let tc = TestCtx::plan_select_fixture();
+        let (actions, blocked) =
+            run_guard_chains([Some(&global), Some(&group)], &tc.ctx(), GuardLayer::Plan).await;
+        assert_eq!(actions.len(), 2);
+        assert_eq!(actions[0].guard, "global");
+        assert_eq!(actions[1].guard, "group");
+        assert!(!blocked);
+    }
+
+    #[tokio::test]
+    async fn run_guard_chains_stops_at_global_deny_without_running_group_chain() {
+        let global = GuardChain::new(vec![Box::new(TestGuard {
+            name: "global_blocker",
+            layer: GuardLayer::Plan,
+            result: GuardResult::deny("nope", "N"),
+        })]);
+        let group = GuardChain::new(vec![Box::new(TestGuard {
+            name: "never_runs",
+            layer: GuardLayer::Plan,
+            result: GuardResult::deny("should not run", "X"),
+        })]);
+        let tc = TestCtx::plan_select_fixture();
+        let (actions, blocked) =
+            run_guard_chains([Some(&global), Some(&group)], &tc.ctx(), GuardLayer::Plan).await;
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].guard, "global_blocker");
         assert!(blocked);
     }
 }

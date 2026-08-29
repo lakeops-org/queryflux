@@ -105,6 +105,7 @@ or remap Grafana in `docker-compose.yml` (`ports: ["3001:3000"]`).
 | Clusters | All cluster groups and member clusters — health, running/queued counts, enable/disable, max concurrency. In distributed mode, **running** reflects reconcile-published backend ground truth. |
 | Queries | Searchable, filterable query history — SQL, status, duration, engine, routing trace |
 | Engines | Engine registry — supported engines, connection types, config fields |
+| Route Explain | Dry-run routing/guard/capacity preview for a SQL string + simulated identity — no execution, no persistence |
 
 Studio requires **Postgres persistence** to be configured — query history, cluster config, and dashboard stats are read from the DB. Without Postgres, the clusters page works (from in-memory state) but history pages return empty.
 
@@ -134,6 +135,7 @@ The admin API is served on port 9000 alongside `/metrics`. An OpenAPI spec is av
 | `GET` | `/admin/config/groups` | List all persisted group configs |
 | `DELETE` | `/admin/cache` | Invalidate all cached query results |
 | `DELETE` | `/admin/cache/{group}` | Invalidate cached results for a group |
+| `POST` | `/admin/route-explain` | Dry-run routing/guard/capacity preview — no execution, nothing persisted. See [Route explain](./routing-and-clusters#route-explain-dry-run) |
 | `GET` | `/openapi.json` | OpenAPI spec |
 | `GET` | `/docs` | Swagger UI |
 

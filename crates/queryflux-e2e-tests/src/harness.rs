@@ -331,7 +331,7 @@ impl TestHarness {
 
         let cluster_manager = Arc::new(SimpleClusterGroupManager::new(group_states));
         let translation = Arc::new(TranslationService::disabled());
-        let router_chain = RouterChain::new(routers, fallback);
+        let router_chain = Arc::new(RouterChain::new(routers, fallback));
 
         let tmp = TcpListener::bind("127.0.0.1:0").await?;
         let port = tmp.local_addr()?.port();
@@ -580,7 +580,7 @@ impl WireTestHarness {
 
         let cluster_manager = Arc::new(SimpleClusterGroupManager::new(group_states));
         let translation = Arc::new(TranslationService::disabled());
-        let router_chain = RouterChain::new(vec![router], group.clone());
+        let router_chain = Arc::new(RouterChain::new(vec![router], group.clone()));
 
         let tmp = TcpListener::bind("127.0.0.1:0").await?;
         let port = tmp.local_addr()?.port();
@@ -723,7 +723,7 @@ impl WireTestHarness {
 
         let cluster_manager = Arc::new(SimpleClusterGroupManager::new(group_states));
         let translation = Arc::new(TranslationService::disabled());
-        let router_chain = RouterChain::new(vec![router], group.clone());
+        let router_chain = Arc::new(RouterChain::new(vec![router], group.clone()));
 
         let tmp = TcpListener::bind("127.0.0.1:0").await?;
         let port = tmp.local_addr()?.port();
@@ -897,7 +897,7 @@ impl ProtocolWireHarness {
 
         let cluster_manager = Arc::new(SimpleClusterGroupManager::new(group_states));
         let translation = Arc::new(TranslationService::disabled());
-        let router_chain = RouterChain::new(vec![router], group.clone());
+        let router_chain = Arc::new(RouterChain::new(vec![router], group.clone()));
 
         let live_config = LiveConfig {
             router_chain,
