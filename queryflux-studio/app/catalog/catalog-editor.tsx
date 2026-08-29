@@ -2,7 +2,12 @@
 
 import React, { useState } from "react";
 import { putCatalogProviderConfig, testCatalogProviderConfig } from "@/lib/api";
-import type { CatalogCacheConfigDto, CatalogProviderConfig, GlueAuthConfig } from "@/lib/api-types";
+import type {
+  CatalogCacheConfigDto,
+  CatalogProviderConfig,
+  GlueAuthConfig,
+  IcebergRestAuthConfig,
+} from "@/lib/api-types";
 import { Field, SectionHeader, TextInput, SaveBar } from "@/components/studio-settings";
 import { Database } from "lucide-react";
 
@@ -14,14 +19,21 @@ type ProviderType = CatalogProviderConfig["type"];
 
 const DEFAULT_CACHE: CatalogCacheConfigDto = { ttlSeconds: 300, maxEntries: 10000 };
 
+// Every real provider here makes a network call per uncached lookup — cache
+// is on by default so picking one doesn't quietly add that latency to every
+// query. Fully editable/removable via the checkbox in its section.
 const DEFAULTS: Record<ProviderType, CatalogProviderConfig> = {
   null: { type: "null" },
-  engineDelegate: { type: "engineDelegate", clusterGroup: "", cache: null },
-  hiveMetastore: { type: "hiveMetastore", uri: "", cache: null },
-  // Glue makes a real network call per uncached lookup — cache is on by
-  // default here so picking "AWS Glue" doesn't quietly add that latency to
-  // every query. Fully editable/removable via the checkbox in its section.
+  hiveMetastore: { type: "hiveMetastore", uri: "", cache: DEFAULT_CACHE },
   glue: { type: "glue", region: null, auth: null, cache: DEFAULT_CACHE },
+  icebergRest: {
+    type: "icebergRest",
+    uri: "",
+    warehouse: null,
+    catalogName: "",
+    auth: null,
+    cache: DEFAULT_CACHE,
+  },
   fallback: {
     type: "fallback",
     primary: { type: "null" },
@@ -31,16 +43,11 @@ const DEFAULTS: Record<ProviderType, CatalogProviderConfig> = {
 
 const TYPE_LABELS: Record<ProviderType, string> = {
   null: "None",
-  engineDelegate: "Engine delegate",
   hiveMetastore: "Hive Metastore",
   glue: "AWS Glue",
+  icebergRest: "Iceberg REST Catalog",
   fallback: "Fallback (primary → secondary)",
 };
-
-// Declared in config, but the backend doesn't have a real implementation for
-// these yet — they build successfully and degrade to a no-op provider rather
-// than failing, per queryflux_catalog::build_catalog_provider.
-const UNIMPLEMENTED = new Set<ProviderType>(["engineDelegate", "hiveMetastore"]);
 
 // ---------------------------------------------------------------------------
 // Cache field editor — shared by every network-calling provider's config.
@@ -165,6 +172,74 @@ function GlueAuthEditor({
 }
 
 // ---------------------------------------------------------------------------
+// Iceberg REST auth sub-form
+// ---------------------------------------------------------------------------
+
+const ICEBERG_REST_AUTH_LABELS: Record<"none" | IcebergRestAuthConfig["type"], string> = {
+  none: "None",
+  oauth2ClientCredentials: "OAuth2 client credentials",
+  bearerToken: "Bearer token",
+};
+
+function IcebergRestAuthEditor({
+  auth,
+  onChange,
+}: {
+  auth: IcebergRestAuthConfig | null | undefined;
+  onChange: (v: IcebergRestAuthConfig | null) => void;
+}) {
+  const kind = auth?.type ?? "none";
+  return (
+    <div className="space-y-3">
+      <Field label="Auth">
+        <select
+          className="w-full max-w-xs px-2.5 py-1.5 text-xs rounded-lg border border-slate-200 bg-white text-slate-900 focus:outline-none focus:ring-2 focus:ring-indigo-300"
+          value={kind}
+          onChange={(e) => {
+            const next = e.target.value as "none" | IcebergRestAuthConfig["type"];
+            if (next === "none") onChange(null);
+            else if (next === "oauth2ClientCredentials")
+              onChange({ type: "oauth2ClientCredentials", clientId: "", clientSecret: "" });
+            else onChange({ type: "bearerToken", token: "" });
+          }}
+        >
+          {(Object.entries(ICEBERG_REST_AUTH_LABELS) as [string, string][]).map(([k, label]) => (
+            <option key={k} value={k}>
+              {label}
+            </option>
+          ))}
+        </select>
+      </Field>
+
+      {auth?.type === "oauth2ClientCredentials" && (
+        <div className="grid grid-cols-2 gap-4">
+          <TextInput
+            label="Client ID"
+            value={auth.clientId}
+            onChange={(v) => onChange({ ...auth, clientId: v })}
+          />
+          <TextInput
+            label="Client secret"
+            type="password"
+            value={auth.clientSecret}
+            onChange={(v) => onChange({ ...auth, clientSecret: v })}
+          />
+        </div>
+      )}
+
+      {auth?.type === "bearerToken" && (
+        <TextInput
+          label="Token"
+          type="password"
+          value={auth.token}
+          onChange={(v) => onChange({ ...auth, token: v })}
+        />
+      )}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Recursive CatalogProviderConfig editor — one dispatcher, indented on nesting
 // (only `fallback` recurses, wrapping two more CatalogProviderConfig values).
 // ---------------------------------------------------------------------------
@@ -194,26 +269,6 @@ function CatalogProviderConfigEditor({
         </select>
       </Field>
 
-      {UNIMPLEMENTED.has(value.type) && (
-        <p className="text-xs text-amber-600 mt-1.5">
-          Not implemented yet in this release — builds but degrades to a no-op (schema-aware
-          translation falls back to dialect-only). Use &ldquo;Test connection&rdquo; below to
-          confirm.
-        </p>
-      )}
-
-      {value.type === "engineDelegate" && (
-        <div className="mt-3 space-y-4">
-          <TextInput
-            label="Cluster group"
-            value={value.clusterGroup}
-            onChange={(clusterGroup) => onChange({ ...value, clusterGroup })}
-            placeholder="trino-default"
-          />
-          <CacheFieldEditor cache={value.cache} onChange={(cache) => onChange({ ...value, cache })} />
-        </div>
-      )}
-
       {value.type === "hiveMetastore" && (
         <div className="mt-3 space-y-4">
           <TextInput
@@ -235,6 +290,33 @@ function CatalogProviderConfigEditor({
             placeholder="us-east-1"
           />
           <GlueAuthEditor auth={value.auth} onChange={(auth) => onChange({ ...value, auth })} />
+          <CacheFieldEditor cache={value.cache} onChange={(cache) => onChange({ ...value, cache })} />
+        </div>
+      )}
+
+      {value.type === "icebergRest" && (
+        <div className="mt-3 space-y-4">
+          <TextInput
+            label="REST catalog URI"
+            value={value.uri}
+            onChange={(uri) => onChange({ ...value, uri })}
+            placeholder="https://polaris.example.com/api/catalog"
+          />
+          <div className="grid grid-cols-2 gap-4">
+            <TextInput
+              label="Catalog name"
+              value={value.catalogName}
+              onChange={(catalogName) => onChange({ ...value, catalogName })}
+              placeholder="prod"
+            />
+            <TextInput
+              label="Warehouse (optional)"
+              value={value.warehouse ?? ""}
+              onChange={(warehouse) => onChange({ ...value, warehouse: warehouse || null })}
+              placeholder="s3://my-bucket/warehouse"
+            />
+          </div>
+          <IcebergRestAuthEditor auth={value.auth} onChange={(auth) => onChange({ ...value, auth })} />
           <CacheFieldEditor cache={value.cache} onChange={(cache) => onChange({ ...value, cache })} />
         </div>
       )}

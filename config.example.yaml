@@ -109,6 +109,32 @@ catalogProvider:
   #   ttlSeconds: 300
   #   maxEntries: 10000
   #
+  # Iceberg REST Catalog protocol — Polaris, Tabular, Unity's REST endpoint, or
+  # Snowflake's Horizon endpoint for Snowflake-managed Iceberg tables. `uri` is
+  # the catalog's REST endpoint; `catalogName` is just echoed back by
+  # list_catalogs() (the protocol has no "list catalogs" call — one REST
+  # endpoint *is* one catalog). `auth` is optional; omit for an unauthenticated
+  # (e.g. local dev) catalog server.
+  # type: icebergRest
+  # uri: https://polaris.example.com/api/catalog
+  # warehouse: s3://my-bucket/warehouse
+  # catalogName: prod
+  # auth:
+  #   type: oauth2ClientCredentials
+  #   clientId: ${ICEBERG_REST_CLIENT_ID}
+  #   clientSecret: ${ICEBERG_REST_CLIENT_SECRET}
+  # cache:
+  #   ttlSeconds: 300
+  #   maxEntries: 10000
+  #
+  # Raw Hive Metastore Thrift protocol — format-agnostic (plain Hive/Parquet
+  # tables, not just Iceberg-format ones registered in HMS).
+  # type: hiveMetastore
+  # uri: thrift://localhost:9083
+  # cache:
+  #   ttlSeconds: 300
+  #   maxEntries: 10000
+  #
   # Try a primary provider, fall back to a secondary on error (or a missing
   # table, for get_table_schema specifically). Note: "null" must be quoted here —
   # a bare YAML `null` parses as YAML's null type, not the string tag `type` expects.

@@ -555,16 +555,27 @@ export type GlueAuthConfig =
   | { type: "accessKey"; accessKeyId: string; secretAccessKey: string; sessionToken?: string | null }
   | { type: "roleArn"; roleArn: string; externalId?: string | null };
 
+/** Auth for the `icebergRest` provider — maps directly onto the REST protocol's
+ * own `credential`/`token` property keys. */
+export type IcebergRestAuthConfig =
+  | { type: "oauth2ClientCredentials"; clientId: string; clientSecret: string }
+  | { type: "bearerToken"; token: string };
+
 export type CatalogProviderConfig =
   | { type: "null" }
-  /** Not yet implemented server-side — builds but degrades to a no-op. */
-  | { type: "engineDelegate"; clusterGroup: string; cache?: CatalogCacheConfigDto | null }
-  /** Not yet implemented server-side — builds but degrades to a no-op. */
   | { type: "hiveMetastore"; uri: string; cache?: CatalogCacheConfigDto | null }
   | {
       type: "glue";
       region?: string | null;
       auth?: GlueAuthConfig | null;
+      cache?: CatalogCacheConfigDto | null;
+    }
+  | {
+      type: "icebergRest";
+      uri: string;
+      warehouse?: string | null;
+      catalogName: string;
+      auth?: IcebergRestAuthConfig | null;
       cache?: CatalogCacheConfigDto | null;
     }
   | {

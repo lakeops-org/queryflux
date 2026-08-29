@@ -1,14 +1,13 @@
 //! Catalog discovery for QueryFlux — pluggable, format-agnostic integrations
-//! (Glue, Iceberg REST, Snowflake, ...) behind one `CatalogProvider` trait
+//! (Glue, Iceberg REST, Hive Metastore, ...) behind one `CatalogProvider` trait
 //! (`queryflux_core::catalog`), feeding schema-aware SQL translation.
 //!
-//! Implemented today: `Glue` (direct AWS Glue Data Catalog access — format-agnostic,
-//! unlike going through Iceberg's own Glue catalog client) and `Fallback` (composes
-//! two providers, primary-then-secondary). `EngineDelegate`/`HiveMetastore` remain
-//! unimplemented — see `plans/` for the full design. Any unimplemented variant, or
-//! a real integration that fails to build (bad credentials, unreachable endpoint),
-//! degrades to a no-op `NullCatalogProvider` with a startup warning rather than
-//! refusing to boot.
+//! Implemented: `Glue` (direct AWS Glue Data Catalog access), `IcebergRest`
+//! (Iceberg REST Catalog protocol — Polaris, Tabular, etc.), `HiveMetastore`
+//! (raw Thrift protocol), and `Fallback` (composes two providers,
+//! primary-then-secondary). A real integration that fails to build (bad
+//! credentials, unreachable endpoint) degrades to a no-op `NullCatalogProvider`
+//! with a startup warning rather than refusing to boot.
 //!
 //! Caching is a `cache: Option<CatalogCacheConfig>` field on each real provider's
 //! own config, not a separate wrapper type an operator has to remember to nest —
@@ -17,6 +16,8 @@
 pub mod caching;
 pub mod fallback;
 pub mod glue;
+pub mod hive_metastore;
+pub mod iceberg_rest;
 
 use std::future::Future;
 use std::pin::Pin;
@@ -28,6 +29,8 @@ use queryflux_core::config::{CatalogCacheConfig, CatalogProviderConfig};
 pub use caching::CachingCatalogProvider;
 pub use fallback::FallbackCatalogProvider;
 pub use glue::GlueCatalogProvider;
+pub use hive_metastore::HiveMetastoreCatalogProvider;
+pub use iceberg_rest::IcebergRestCatalogProvider;
 
 /// Wraps `provider` in a `CachingCatalogProvider` when `cache` is configured;
 /// otherwise warns that every lookup will hit the backing service directly. Only
@@ -72,18 +75,6 @@ pub fn build_catalog_provider(
                 Arc::new(NullCatalogProvider) as Arc<dyn CatalogProvider>
             }
 
-            // `cache` is accepted (forward-compatible schema) but unused — nothing
-            // to wrap yet, since this degrades straight to a no-op below.
-            CatalogProviderConfig::EngineDelegate { cluster_group, .. } => {
-                tracing::warn!(
-                    cluster_group = %cluster_group,
-                    "catalogProvider: type 'engineDelegate' is not implemented yet — \
-                     using a no-op catalog provider (schema-aware translation will \
-                     fall back to dialect-only)"
-                );
-                Arc::new(NullCatalogProvider) as Arc<dyn CatalogProvider>
-            }
-
             CatalogProviderConfig::Glue {
                 region,
                 auth,
@@ -100,13 +91,45 @@ pub fn build_catalog_provider(
                 }
             },
 
-            CatalogProviderConfig::HiveMetastore { .. } => {
-                tracing::warn!(
-                    "catalogProvider: type 'hiveMetastore' is not implemented yet — \
-                     using a no-op catalog provider (schema-aware translation will \
-                     fall back to dialect-only)"
-                );
-                Arc::new(NullCatalogProvider) as Arc<dyn CatalogProvider>
+            CatalogProviderConfig::HiveMetastore { uri, cache } => {
+                match HiveMetastoreCatalogProvider::new(uri).await {
+                    Ok(provider) => maybe_cached(Arc::new(provider), cache),
+                    Err(e) => {
+                        tracing::warn!(
+                            "catalogProvider: failed to build 'hiveMetastore' provider \
+                             ({e}) — using a no-op catalog provider (schema-aware \
+                             translation will fall back to dialect-only)"
+                        );
+                        Arc::new(NullCatalogProvider) as Arc<dyn CatalogProvider>
+                    }
+                }
+            }
+
+            CatalogProviderConfig::IcebergRest {
+                uri,
+                warehouse,
+                catalog_name,
+                auth,
+                cache,
+            } => {
+                match IcebergRestCatalogProvider::new(
+                    catalog_name,
+                    uri,
+                    warehouse.as_deref(),
+                    auth.as_ref(),
+                )
+                .await
+                {
+                    Ok(provider) => maybe_cached(Arc::new(provider), cache),
+                    Err(e) => {
+                        tracing::warn!(
+                            "catalogProvider: failed to build 'icebergRest' provider \
+                             ({e}) — using a no-op catalog provider (schema-aware \
+                             translation will fall back to dialect-only)"
+                        );
+                        Arc::new(NullCatalogProvider) as Arc<dyn CatalogProvider>
+                    }
+                }
             }
 
             CatalogProviderConfig::Fallback { primary, secondary } => {
@@ -130,9 +153,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unimplemented_variants_degrade_to_null_rather_than_panic() {
-        let provider = build_catalog_provider(&CatalogProviderConfig::EngineDelegate {
-            cluster_group: "trino-default".to_string(),
+    async fn unbuildable_provider_degrades_to_null_rather_than_panic() {
+        // Unresolvable host — fails at construction (DNS resolution), no network
+        // I/O needed to prove the degrade-not-panic contract.
+        let provider = build_catalog_provider(&CatalogProviderConfig::HiveMetastore {
+            uri: "not a valid host!!".to_string(),
             cache: None,
         })
         .await;
@@ -142,8 +167,8 @@ mod tests {
     #[tokio::test]
     async fn fallback_composes_recursively() {
         let cfg = CatalogProviderConfig::Fallback {
-            primary: Box::new(CatalogProviderConfig::EngineDelegate {
-                cluster_group: "trino-default".to_string(),
+            primary: Box::new(CatalogProviderConfig::HiveMetastore {
+                uri: "not a valid host!!".to_string(),
                 cache: None,
             }),
             secondary: Box::new(CatalogProviderConfig::Null),

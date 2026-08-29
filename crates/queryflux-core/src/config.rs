@@ -1913,19 +1913,11 @@ fn default_catalog_cache_max_entries() -> usize {
 pub enum CatalogProviderConfig {
     #[default]
     Null,
-    /// Delegates catalog discovery to a cluster group's own adapter (Trino, DuckDB,
-    /// StarRocks, Athena, or ClickHouse — whichever engine the group runs). Opt-in
-    /// convenience/fallback, not a recommended default: its accuracy and availability
-    /// are tied to that cluster group's health. Not yet implemented — see
-    /// `plans/` catalog integration plan for phasing.
-    EngineDelegate {
-        /// Name of the cluster group to use for metadata queries.
-        #[serde(rename = "clusterGroup")]
-        cluster_group: String,
-        #[serde(default)]
-        cache: Option<CatalogCacheConfig>,
-    },
+    /// Raw Hive Metastore Thrift protocol — format-agnostic (plain Hive/Parquet
+    /// tables, not just Iceberg), same reasoning as `Glue` avoiding
+    /// `iceberg-catalog-glue`.
     HiveMetastore {
+        /// `thrift://host:port` (the `thrift://` scheme is optional).
         uri: String,
         #[serde(default)]
         cache: Option<CatalogCacheConfig>,
@@ -1941,6 +1933,24 @@ pub enum CatalogProviderConfig {
         #[serde(default)]
         cache: Option<CatalogCacheConfig>,
     },
+    /// Iceberg REST Catalog protocol (Polaris, Tabular, Unity's REST endpoint,
+    /// Snowflake's Horizon endpoint for Snowflake-managed Iceberg tables). Named
+    /// after the protocol, not any one vendor, consistent with `Glue`/
+    /// `HiveMetastore` being named after their protocol/service.
+    IcebergRest {
+        uri: String,
+        #[serde(default)]
+        warehouse: Option<String>,
+        /// The REST protocol has no "list catalogs" endpoint — one REST catalog
+        /// endpoint *is* one catalog — so this name is just echoed back by
+        /// `list_catalogs()`.
+        #[serde(rename = "catalogName")]
+        catalog_name: String,
+        #[serde(default)]
+        auth: Option<IcebergRestAuthConfig>,
+        #[serde(default)]
+        cache: Option<CatalogCacheConfig>,
+    },
     /// Tries `primary` first, falls through to `secondary` on error (or a missing
     /// single table, for `get_table_schema` specifically). Each side configures
     /// its own `cache` independently — this is about composing two *sources*,
@@ -1949,6 +1959,27 @@ pub enum CatalogProviderConfig {
         primary: Box<CatalogProviderConfig>,
         secondary: Box<CatalogProviderConfig>,
     },
+}
+
+/// Authentication for an `IcebergRest` catalog provider. Maps directly onto
+/// `iceberg-catalog-rest`'s own property keys (`credential`/`token`) — see the
+/// `NOTE:` above `CatalogCacheConfig` for why every multi-word field here has
+/// an explicit `#[serde(rename = "...")]`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum IcebergRestAuthConfig {
+    // Explicit `#[serde(rename)]` on the tag itself too, not just the fields —
+    // an acronym-heavy name like this is exactly the case the `rename_all`
+    // NOTE above warns is unreliable, so this doesn't lean on it at all.
+    #[serde(rename = "oauth2ClientCredentials")]
+    OAuth2ClientCredentials {
+        #[serde(rename = "clientId")]
+        client_id: String,
+        #[serde(rename = "clientSecret")]
+        client_secret: String,
+    },
+    #[serde(rename = "bearerToken")]
+    BearerToken { token: String },
 }
 
 // ---------------------------------------------------------------------------
@@ -3305,7 +3336,7 @@ auth:
 /// These tests exist so both classes of bug can't silently reappear.
 #[cfg(test)]
 mod catalog_provider_config_tests {
-    use super::{CatalogProviderConfig, ClusterAuth};
+    use super::{CatalogProviderConfig, ClusterAuth, IcebergRestAuthConfig};
 
     #[test]
     fn null_is_the_default_and_parses_from_yaml() {
@@ -3318,18 +3349,59 @@ mod catalog_provider_config_tests {
     }
 
     #[test]
-    fn engine_delegate_cluster_group_uses_camel_case_key() {
-        let cfg: CatalogProviderConfig =
-            serde_yaml::from_str("type: engineDelegate\nclusterGroup: trino-default\n").unwrap();
+    fn iceberg_rest_catalog_name_uses_camel_case_key() {
+        let cfg: CatalogProviderConfig = serde_yaml::from_str(
+            "type: icebergRest\nuri: https://polaris.example.com/api/catalog\ncatalogName: prod\n",
+        )
+        .unwrap();
         match cfg {
-            CatalogProviderConfig::EngineDelegate {
-                cluster_group,
+            CatalogProviderConfig::IcebergRest {
+                uri,
+                warehouse,
+                catalog_name,
+                auth,
                 cache,
             } => {
-                assert_eq!(cluster_group, "trino-default");
+                assert_eq!(uri, "https://polaris.example.com/api/catalog");
+                assert!(warehouse.is_none());
+                assert_eq!(catalog_name, "prod");
+                assert!(auth.is_none());
                 assert!(cache.is_none());
             }
-            other => panic!("expected EngineDelegate, got {other:?}"),
+            other => panic!("expected IcebergRest, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn iceberg_rest_oauth2_client_credentials_auth_parses() {
+        let yaml = r#"
+type: icebergRest
+uri: https://polaris.example.com/api/catalog
+catalogName: prod
+warehouse: s3://my-bucket/warehouse
+auth:
+  type: oauth2ClientCredentials
+  clientId: my-client
+  clientSecret: my-secret
+"#;
+        let cfg: CatalogProviderConfig = serde_yaml::from_str(yaml).unwrap();
+        match cfg {
+            CatalogProviderConfig::IcebergRest {
+                warehouse: Some(warehouse),
+                auth:
+                    Some(IcebergRestAuthConfig::OAuth2ClientCredentials {
+                        client_id,
+                        client_secret,
+                    }),
+                ..
+            } => {
+                assert_eq!(warehouse, "s3://my-bucket/warehouse");
+                assert_eq!(client_id, "my-client");
+                assert_eq!(client_secret, "my-secret");
+            }
+            other => {
+                panic!("expected IcebergRest with OAuth2ClientCredentials auth, got {other:?}")
+            }
         }
     }
 

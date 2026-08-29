@@ -61,6 +61,55 @@ catalogProvider:
 
 Column types come straight from Glue's own type strings (e.g. `bigint`, `struct<a:int>`) rather than a normalized SQL type — `sqlglot`'s optimizer accepts most of them as-is. Partition keys are included alongside regular columns, since they're valid in `WHERE`/`SELECT` on a Hive-style partitioned table. Nullability isn't exposed by Glue's `Column` type, so every column defaults to nullable.
 
+### `hiveMetastore`
+
+Talks the *raw* Hive Metastore Thrift protocol directly — format-agnostic, so it sees plain Hive/Parquet tables as well as Iceberg-format tables registered in HMS (unlike going through Iceberg's own HMS catalog client, which only understands the latter).
+
+| Field | Description |
+|-------|-------------|
+| `uri` | `thrift://host:port` (the `thrift://` scheme is optional) |
+| `cache` | Optional `{ ttlSeconds, maxEntries }` — see [Caching](#caching) below. Strongly recommended: omitting it logs a startup warning. |
+
+```yaml
+catalogProvider:
+  type: hiveMetastore
+  uri: thrift://localhost:9083
+  cache:
+    ttlSeconds: 300
+    maxEntries: 10000
+```
+
+HMS has no catalog concept of its own — every database/table lives under one metastore, so `list_catalogs()` reports a single synthetic name (`hive_metastore`). Column types come straight from HMS's own Hive type strings, same convention as `glue`. Partition keys are included alongside regular columns. A missing table (HMS's `NoSuchObjectException`) is treated as a normal "not found" answer, not an error.
+
+### `icebergRest`
+
+Speaks the [Iceberg REST Catalog protocol](https://iceberg.apache.org/spec/#rest-catalog) — served by Polaris, Tabular, Unity's REST endpoint, or Snowflake's own Horizon endpoint for Snowflake-managed Iceberg tables. Unlike `glue`/`hiveMetastore`, this is the one integration built on the upstream `iceberg`/`iceberg-catalog-rest` crates rather than a hand-rolled client — the REST protocol genuinely *is* Iceberg-specific (a REST catalog endpoint only ever serves Iceberg tables), so there's no format-agnostic reason to avoid it here.
+
+| Field | Description |
+|-------|-------------|
+| `uri` | The catalog's REST endpoint |
+| `warehouse` | Optional warehouse location, if the catalog server requires one |
+| `catalogName` | The protocol has no "list catalogs" call — one REST endpoint *is* one catalog — so this is just echoed back by `list_catalogs()` |
+| `auth` | Optional: `oauth2ClientCredentials` (`clientId`/`clientSecret`) or `bearerToken` (`token`). Omitted for an unauthenticated catalog server. |
+| `cache` | Optional `{ ttlSeconds, maxEntries }` — see [Caching](#caching) below. Strongly recommended: omitting it logs a startup warning. |
+
+```yaml
+catalogProvider:
+  type: icebergRest
+  uri: https://polaris.example.com/api/catalog
+  warehouse: s3://my-bucket/warehouse
+  catalogName: prod
+  auth:
+    type: oauth2ClientCredentials
+    clientId: ${ICEBERG_REST_CLIENT_ID}
+    clientSecret: ${ICEBERG_REST_CLIENT_SECRET}
+  cache:
+    ttlSeconds: 300
+    maxEntries: 10000
+```
+
+A database maps onto a (possibly multi-level) Iceberg namespace — dotted components round-trip, e.g. `"a.b"` ↔ namespace `["a", "b"]`. Column types come from Iceberg's own typed schema (`iceberg::spec::PrimitiveType`), mapped to a SQL type name (`Decimal{precision,scale}` → `DECIMAL(p,s)`, `Timestamptz` → `TIMESTAMP WITH TIME ZONE`, etc.); a nested struct/list/map column falls back to Iceberg's own rendering of that type rather than failing the whole lookup.
+
 ### Caching
 
 Every network-calling provider's `cache` field wraps it in a TTL + capacity-bounded cache. Only successful lookups are cached — an error is never pinned for `ttlSeconds`, so a transient catalog outage self-heals on the next call. Table schemas change far less often than query results, so a longer TTL than you'd use for a [query result cache](./caching) — several minutes to hours — is usually safe.
@@ -94,17 +143,6 @@ catalogProvider:
     type: "null"
 ```
 
-### Declared but not yet implemented
-
-These variants parse and build successfully, but currently degrade to a no-op provider (same behavior as `type: null`) with a startup warning — real integrations land in a follow-up release. Both already carry the same `cache` field `glue` does, so no config migration is needed once they're implemented:
-
-| Type | Fields | Notes |
-|------|--------|-------|
-| `engineDelegate` | `clusterGroup`, `cache` | Delegates to a cluster group's own adapter (Trino, DuckDB, StarRocks, Athena, ClickHouse) |
-| `hiveMetastore` | `uri`, `cache` | Hive Metastore (Thrift) |
-
-Use [`/admin/config/catalog/test`](#admin-api) to check whether a given config actually does anything, rather than silently degrading unnoticed.
-
 ## Admin API
 
 ```bash
@@ -122,7 +160,7 @@ curl -u admin:admin -X POST http://localhost:9000/admin/config/catalog/test \
   -d '{"config": {"type": "glue", "region": "us-east-1"}}'
 ```
 
-A `PUT` never fails startup or a running proxy: an invalid `type` is rejected with `400`, but a *structurally valid* config for an unimplemented provider (e.g. `hiveMetastore`) is accepted — it will simply degrade to a no-op at build time. A `glue` config that's structurally valid but fails to actually build (unreachable AWS, bad credentials) degrades the same way. Use the `/test` endpoint first if you want to know that ahead of saving.
+A `PUT` never fails startup or a running proxy: an invalid `type` is rejected with `400`, but a *structurally valid* config that fails to actually build (unreachable endpoint, bad credentials, unresolvable host) degrades to a no-op provider at build time rather than refusing to save. Use the `/test` endpoint first if you want to know that ahead of saving.
 
 Studio's **Catalog** page (left nav) is a thin UI over these same three endpoints — a `type:` picker per provider, a cache checkbox on every provider that has one, recursive nesting for `fallback`, and the same test-connection button.
 
@@ -130,5 +168,6 @@ Studio's **Catalog** page (left nav) is a thin UI over these same three endpoint
 
 - `CatalogProvider` (`queryflux_core::catalog`) is the one generic trait every integration implements — `list_catalogs`, `list_databases`, `list_tables`, `get_table_schema`, plus a default `get_schemas_for_query` that batches `get_table_schema` calls.
 - The live provider is hot-reloadable: it lives on `LiveConfig` (not a static `AppState` field), carried forward on a reload unless `catalog_config` has a new, successfully-parsed value — a reload must never silently regress to `NullCatalogProvider` and quietly stop discovering schema for already-working translation.
-- Real integrations are deliberately **engine-independent** — catalog discovery must work even when no query engine is configured or healthy. `glue` (and a future `hiveMetastore`) talk directly to the catalog service; `engineDelegate` (not yet implemented) is the one intentional exception, an opt-in convenience that delegates to an already-configured cluster group's adapter.
+- Every integration is deliberately **engine-independent** — catalog discovery works even when no query engine is configured or healthy. `glue`, `hiveMetastore`, and `icebergRest` all talk directly to the catalog service, never through a routed query.
+- Catalogs are format-agnostic integrations, not Iceberg wrappers: `glue` and `hiveMetastore` use their own native (non-Iceberg) clients because both catalog tables of any format, not just Iceberg — only `icebergRest` is built on the upstream `iceberg`/`iceberg-catalog-rest` crates, because that protocol genuinely is Iceberg-only.
 - See [`architecture/query-translation`](./query-translation) for how `SchemaContext` flows into `sqlglot`'s optimizer, and [`architecture/system-map`](./system-map) for where this fits in the overall request path.
