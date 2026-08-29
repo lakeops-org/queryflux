@@ -172,10 +172,13 @@ jobs:
       - name: Unit & integration tests (nextest)
         run: make test
 
+      # Postgres ignored tests share one DATABASE_URL, migrate() on setup, and a static
+      # CAPACITY_TEST_LOCK — they must run in one process (cargo test), not nextest
+      # (which spawns each lib test in its own process).
       - name: Postgres integration tests (queryflux-persistence)
         env:
           DATABASE_URL: postgres://queryflux:queryflux@localhost:5432/queryflux_test
-        run: cargo nextest run -p queryflux-persistence --run-ignored all
+        run: cargo test -p queryflux-persistence -- --include-ignored
 
       # E2E: same target dir as clippy/tests — only compiles queryflux-e2e-tests if not already built.
       # Always on main pushes; on PRs only when runtime/docker paths change.
