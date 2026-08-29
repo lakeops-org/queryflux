@@ -1,34 +1,21 @@
-# Verify server-only image on PRs (host platform only, no push).
+# Verify server-only image (host platform only, no push).
 # Unified (server+studio) image is built on release — see release.yml / docker-publish-tag.yml.
 #   One Dockerfile: docker/queryflux/Dockerfile — targets runtime-server | runtime-unified
+#
+# PR automation is disabled to save Actions minutes. Re-enable pull_request in `on:` when
+# you want per-PR Docker builds again. Run manually: Actions → "Docker — QueryFlux (verify)".
 
 name: Docker — QueryFlux (verify)
 
 on:
-  pull_request:
-    types:
-      - opened
-      - synchronize
-      - reopened
-      - ready_for_review
-    paths:
-      - 'crates/**'
-      - 'docker/**'
-      - 'Cargo.toml'
-      - 'Cargo.lock'
-      - 'requirements.txt'
-      - 'queryflux-studio/**'
-      - 'scripts/**'
-      - '.github/workflows/docker-verify.yml'
+  workflow_dispatch:
 
-# New pushes to the same PR cancel an in-progress docker verify run.
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
   docker-verify:
-    if: github.event.pull_request.draft == false
     runs-on: ubuntu-latest
     permissions:
       contents: read
