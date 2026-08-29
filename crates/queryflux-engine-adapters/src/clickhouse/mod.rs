@@ -583,7 +583,7 @@ impl crate::SyncAdapter for ClickHouseAdapter {
             _ => sql.to_string(),
         };
         let mut req = self.query_request_with_id(&effective_sql, "ArrowStream", &query_id);
-        if let Some(db) = session.database() {
+        if let Some(db) = session.database_hint() {
             req = req.query(&[("database", db)]);
         }
         if !tags.is_empty() {

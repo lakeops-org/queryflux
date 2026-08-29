@@ -35,8 +35,7 @@ env:
   RUST_TOOLCHAIN_VERSION: "1.91.1"
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
-  # libduckdb-sys: point at system-installed lib so rust-lld resolves -lduckdb reliably.
-  # The "Install libduckdb" step in each job puts the .so + headers there.
+  # libduckdb-sys: system libduckdb (.so + headers) from install-libduckdb.sh; mold linker in rust job.
   DUCKDB_LIB_DIR: /usr/local/lib
   DUCKDB_INCLUDE_DIR: /usr/local/include
   # Must match duckdb crate version: duckdb 1.85.1 → libduckdb-sys 1.10501.0 → DuckDB v1.5.1.
@@ -85,6 +84,12 @@ jobs:
     needs: [gate, fmt]
     runs-on: ubuntu-latest
     timeout-minutes: 120
+    # Faster CI dev builds: no debuginfo, mold linker (see corrode compile-times tips).
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_DEV_STRIP: debuginfo
+      RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
     permissions:
       contents: read
     services:
@@ -119,6 +124,9 @@ jobs:
               - 'scripts/**'
               - '.github/workflows/ci.yml'
 
+      - name: Install mold linker
+        run: sudo apt-get update && sudo apt-get install -y mold
+
       - name: Install libduckdb
         run: bash scripts/install-libduckdb.sh
 
@@ -126,6 +134,10 @@ jobs:
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN_VERSION }}
           components: clippy
+
+      - uses: taiki-e/install-action@742a3317eac7bd62f91cd888b4eead5e784ba833 # v2
+        with:
+          tool: nextest
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -157,13 +169,13 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets --all-features --exclude queryflux-bench -- -D warnings
 
-      - name: Unit & integration tests (make test)
+      - name: Unit & integration tests (nextest)
         run: make test
 
       - name: Postgres integration tests (queryflux-persistence)
         env:
           DATABASE_URL: postgres://queryflux:queryflux@localhost:5432/queryflux_test
-        run: cargo test -p queryflux-persistence -- --include-ignored
+        run: cargo nextest run -p queryflux-persistence --run-ignored all
 
       # E2E: same target dir as clippy/tests — only compiles queryflux-e2e-tests if not already built.
       # Always on main pushes; on PRs only when runtime/docker paths change.

@@ -187,6 +187,13 @@ impl SessionContext {
         self.catalog.as_deref()
     }
 
+    /// Database name for backends without a separate catalog layer (ClickHouse HTTP
+    /// `database` param; StarRocks `USE`). Prefers `database` (e.g. Trino
+    /// `X-Trino-Schema`), then `catalog` (e.g. `X-Trino-Catalog` when schema is omitted).
+    pub fn database_hint(&self) -> Option<&str> {
+        self.database.as_deref().or(self.catalog.as_deref())
+    }
+
     /// Resolve agent identity for this session.
     ///
     /// Returns `session.agent_context` if explicitly set (e.g. by the MCP frontend),
@@ -263,6 +270,17 @@ mod tests {
         };
         assert_eq!(s.catalog(), Some("hive"));
         assert_eq!(s.database(), Some("analytics"));
+        assert_eq!(s.database_hint(), Some("analytics"));
+    }
+
+    #[test]
+    fn database_hint_falls_back_to_catalog() {
+        let s = SessionContext {
+            catalog: Some("system".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(s.database(), None);
+        assert_eq!(s.database_hint(), Some("system"));
     }
 
     #[test]
