@@ -85,6 +85,17 @@ fn iceberg_err(context: &str, e: iceberg::Error) -> QueryFluxError {
     QueryFluxError::Catalog(format!("Iceberg REST catalog {context}: {e}"))
 }
 
+/// Whether `e` means "the table genuinely doesn't exist" rather than a real
+/// error. `RestCatalog::load_table`'s 404 path (verified against
+/// `iceberg-catalog-rest` 0.7.0's own source) surprisingly reports
+/// `ErrorKind::Unexpected` with a hardcoded message, not `ErrorKind::TableNotFound`
+/// — so the message text is checked too, not just the kind. `TableNotFound` is
+/// still checked first in case a future crate version fixes the classification.
+fn is_table_not_found(e: &iceberg::Error) -> bool {
+    e.kind() == iceberg::ErrorKind::TableNotFound
+        || (e.kind() == iceberg::ErrorKind::Unexpected && e.message().contains("does not exist"))
+}
+
 #[async_trait]
 impl CatalogProvider for IcebergRestCatalogProvider {
     async fn list_catalogs(&self) -> Result<Vec<String>> {
@@ -124,7 +135,7 @@ impl CatalogProvider for IcebergRestCatalogProvider {
 
         let loaded = match self.catalog.load_table(&table_ident).await {
             Ok(t) => t,
-            Err(e) if e.kind() == iceberg::ErrorKind::TableNotFound => return Ok(None),
+            Err(e) if is_table_not_found(&e) => return Ok(None),
             Err(e) => return Err(iceberg_err("load_table", e)),
         };
 
@@ -209,5 +220,165 @@ mod tests {
     fn dotted_database_name_round_trips_through_namespace_ident() {
         let ns = namespace_ident("a.b").unwrap();
         assert_eq!(ns.inner(), vec!["a".to_string(), "b".to_string()]);
+    }
+
+    // --- Real network-level tests, against a mocked REST server (mockito).
+    // `/v1/config` is mocked in every test: the REST catalog client fetches
+    // it lazily on the first real operation (verified against
+    // `iceberg-catalog-rest` 0.7.0's own `RestCatalogBuilder::load`, which
+    // does no network I/O itself — see its doc comment upstream), so every
+    // real call pairs it with the operation-specific mock, same as
+    // `iceberg-catalog-rest`'s own test suite does.
+
+    async fn config_mock(server: &mut mockito::ServerGuard) -> mockito::Mock {
+        server
+            .mock("GET", "/v1/config")
+            .with_status(200)
+            .with_body(r#"{"overrides": {}, "defaults": {}}"#)
+            .create_async()
+            .await
+    }
+
+    #[tokio::test]
+    async fn list_databases_round_trips_through_a_real_rest_call() {
+        let mut server = mockito::Server::new_async().await;
+        let _config = config_mock(&mut server).await;
+        let _list_ns = server
+            .mock("GET", "/v1/namespaces")
+            .with_status(200)
+            .with_body(r#"{"namespaces": [["sales"], ["marketing"]]}"#)
+            .create_async()
+            .await;
+
+        let provider = IcebergRestCatalogProvider::new("test_catalog", &server.url(), None, None)
+            .await
+            .unwrap();
+        let mut databases = provider.list_databases("").await.unwrap();
+        databases.sort();
+        assert_eq!(
+            databases,
+            vec!["marketing".to_string(), "sales".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn list_tables_round_trips_through_a_real_rest_call() {
+        let mut server = mockito::Server::new_async().await;
+        let _config = config_mock(&mut server).await;
+        let _list_tables = server
+            .mock("GET", "/v1/namespaces/sales/tables")
+            .with_status(200)
+            .with_body(
+                r#"{"identifiers": [
+                    {"namespace": ["sales"], "name": "orders"},
+                    {"namespace": ["sales"], "name": "customers"}
+                ]}"#,
+            )
+            .create_async()
+            .await;
+
+        let provider = IcebergRestCatalogProvider::new("test_catalog", &server.url(), None, None)
+            .await
+            .unwrap();
+        let mut tables = provider.list_tables("", "sales").await.unwrap();
+        tables.sort();
+        assert_eq!(tables, vec!["customers".to_string(), "orders".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn get_table_schema_maps_typed_columns_from_a_real_response() {
+        let mut server = mockito::Server::new_async().await;
+        let _config = config_mock(&mut server).await;
+        let _load_table = server
+            .mock("GET", "/v1/namespaces/sales/tables/orders")
+            .with_status(200)
+            .with_body(
+                r#"{
+                    "metadata-location": "s3://warehouse/sales/orders/metadata/00001.metadata.json",
+                    "metadata": {
+                        "format-version": 1,
+                        "table-uuid": "b55d9dda-6561-423a-8bfc-787980ce421f",
+                        "location": "s3://warehouse/sales/orders",
+                        "last-updated-ms": 1646787054459,
+                        "last-column-id": 2,
+                        "schema": {
+                            "type": "struct",
+                            "schema-id": 0,
+                            "fields": [
+                                {"id": 1, "name": "id", "required": true, "type": "long"},
+                                {"id": 2, "name": "amount", "required": false, "type": "decimal(10,2)"}
+                            ]
+                        },
+                        "current-schema-id": 0,
+                        "schemas": [{
+                            "type": "struct",
+                            "schema-id": 0,
+                            "fields": [
+                                {"id": 1, "name": "id", "required": true, "type": "long"},
+                                {"id": 2, "name": "amount", "required": false, "type": "decimal(10,2)"}
+                            ]
+                        }],
+                        "partition-spec": [],
+                        "default-spec-id": 0,
+                        "partition-specs": [{"spec-id": 0, "fields": []}],
+                        "last-partition-id": 999,
+                        "default-sort-order-id": 0,
+                        "sort-orders": [{"order-id": 0, "fields": []}],
+                        "properties": {},
+                        "current-snapshot-id": -1,
+                        "refs": {},
+                        "snapshots": [],
+                        "snapshot-log": [],
+                        "metadata-log": []
+                    }
+                }"#,
+            )
+            .create_async()
+            .await;
+
+        let provider = IcebergRestCatalogProvider::new("test_catalog", &server.url(), None, None)
+            .await
+            .unwrap();
+        let schema = provider
+            .get_table_schema("", "sales", "orders")
+            .await
+            .unwrap()
+            .expect("table should be found");
+        assert_eq!(schema.database, "sales");
+        assert_eq!(schema.table, "orders");
+        let id_col = schema.columns.iter().find(|c| c.name == "id").unwrap();
+        assert_eq!(id_col.data_type, "BIGINT");
+        assert!(!id_col.nullable); // required: true
+        let amount_col = schema.columns.iter().find(|c| c.name == "amount").unwrap();
+        assert_eq!(amount_col.data_type, "DECIMAL(10,2)");
+        assert!(amount_col.nullable); // required: false
+    }
+
+    #[tokio::test]
+    async fn get_table_schema_returns_none_on_a_real_404() {
+        let mut server = mockito::Server::new_async().await;
+        let _config = config_mock(&mut server).await;
+        // Matches `RestCatalog::load_table`'s actual 404 handling (verified
+        // against 0.7.0's own source): it reports `ErrorKind::Unexpected`
+        // with a hardcoded message, not `ErrorKind::TableNotFound` — this
+        // test exists specifically to catch a regression in that message-text
+        // check if a future crate version changes the wording.
+        let _load_table = server
+            .mock("GET", "/v1/namespaces/sales/tables/missing")
+            .with_status(404)
+            .with_body(
+                r#"{"error": {"message": "Table does not exist: sales.missing", "type": "NoSuchTableException", "code": 404}}"#,
+            )
+            .create_async()
+            .await;
+
+        let provider = IcebergRestCatalogProvider::new("test_catalog", &server.url(), None, None)
+            .await
+            .unwrap();
+        let schema = provider
+            .get_table_schema("", "sales", "missing")
+            .await
+            .unwrap();
+        assert!(schema.is_none());
     }
 }

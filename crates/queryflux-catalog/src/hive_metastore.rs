@@ -181,4 +181,94 @@ mod tests {
         let result = HiveMetastoreCatalogProvider::new("not a valid host!!").await;
         assert!(result.is_err());
     }
+
+    // --- Real network-level tests, against an in-process fake HMS server ---
+    // (`crate::test_support::fake_hms_server`). Each test uses its own fixed
+    // port since tests in this binary run concurrently.
+
+    use crate::test_support::fake_hms_server;
+
+    #[tokio::test]
+    async fn list_databases_round_trips_through_real_thrift_call() {
+        let addr = fake_hms_server::start(
+            19181,
+            fake_hms_server::Fixture {
+                databases: vec!["sales".to_string(), "marketing".to_string()],
+                ..Default::default()
+            },
+        )
+        .await;
+        let provider = HiveMetastoreCatalogProvider::new(&addr.to_string())
+            .await
+            .unwrap();
+        let mut databases = provider.list_databases("").await.unwrap();
+        databases.sort();
+        assert_eq!(
+            databases,
+            vec!["marketing".to_string(), "sales".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn list_tables_round_trips_through_real_thrift_call() {
+        let addr = fake_hms_server::start(
+            19182,
+            fake_hms_server::Fixture {
+                tables: vec!["orders".to_string(), "customers".to_string()],
+                ..Default::default()
+            },
+        )
+        .await;
+        let provider = HiveMetastoreCatalogProvider::new(&addr.to_string())
+            .await
+            .unwrap();
+        let mut tables = provider.list_tables("", "sales").await.unwrap();
+        tables.sort();
+        assert_eq!(tables, vec!["customers".to_string(), "orders".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn get_table_schema_maps_columns_and_partition_keys_from_a_real_response() {
+        let addr = fake_hms_server::start(
+            19183,
+            fake_hms_server::Fixture {
+                table: Some(fake_hms_server::sample_table()),
+                ..Default::default()
+            },
+        )
+        .await;
+        let provider = HiveMetastoreCatalogProvider::new(&addr.to_string())
+            .await
+            .unwrap();
+        let schema = provider
+            .get_table_schema("", "sales", "orders")
+            .await
+            .unwrap()
+            .expect("table should be found");
+        assert_eq!(schema.database, "sales");
+        assert_eq!(schema.table, "orders");
+        // One regular column (`id`) + one partition key (`dt`) — both should
+        // be present, since partition keys are real queryable columns.
+        let names: Vec<&str> = schema.columns.iter().map(|c| c.name.as_str()).collect();
+        assert!(names.contains(&"id"));
+        assert!(names.contains(&"dt"));
+        let id_col = schema.columns.iter().find(|c| c.name == "id").unwrap();
+        assert_eq!(id_col.data_type, "BIGINT");
+    }
+
+    #[tokio::test]
+    async fn get_table_schema_returns_none_for_no_such_object_exception() {
+        // Fixture's `table` is `None` — the fake server returns
+        // NoSuchObjectException, exercising the real error-mapping path (not
+        // just the client-side match arm in isolation).
+        let addr = fake_hms_server::start(19184, fake_hms_server::Fixture::default()).await;
+        let provider = HiveMetastoreCatalogProvider::new(&addr.to_string())
+            .await
+            .unwrap();
+        let schema = provider
+            .get_table_schema("", "sales", "does_not_exist")
+            .await
+            .unwrap();
+        assert!(schema.is_none());
+    }
 }

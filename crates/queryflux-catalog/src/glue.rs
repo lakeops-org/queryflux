@@ -273,4 +273,125 @@ mod tests {
         .unwrap_err();
         assert!(err.to_string().contains("unsupported auth type"), "{err}");
     }
+
+    // --- Real network-level tests, against a canned HTTP client
+    // (`StaticReplayClient`) so GetDatabases/GetTables/GetTable round-trip
+    // through the real aws-sdk-glue AWS-JSON-1.1 (de)serialization path —
+    // exactly the layer that was never exercised before (see the `/test`
+    // endpoint bug this was written to catch: `list_catalogs()` makes no
+    // network call at all, so nothing here previously proved a config
+    // actually works end to end).
+
+    use aws_smithy_http_client::test_util::{ReplayEvent, StaticReplayClient};
+    use aws_smithy_types::body::SdkBody;
+
+    fn test_provider(events: Vec<ReplayEvent>) -> GlueCatalogProvider {
+        let http_client = StaticReplayClient::new(events);
+        let config = aws_sdk_glue::Config::builder()
+            .behavior_version(BehaviorVersion::latest())
+            .region(Region::new("us-east-1"))
+            .credentials_provider(Credentials::new("test", "test", None, None, "test"))
+            .http_client(http_client)
+            .build();
+        GlueCatalogProvider {
+            client: aws_sdk_glue::Client::from_conf(config),
+        }
+    }
+
+    /// The request half of a `ReplayEvent` is only checked by
+    /// `assert_requests_match` (not called here), so any well-formed request
+    /// works as the recorded "expected" value.
+    fn any_request() -> http::Request<SdkBody> {
+        http::Request::builder()
+            .method("POST")
+            .uri("https://glue.us-east-1.amazonaws.com/")
+            .body(SdkBody::empty())
+            .unwrap()
+    }
+
+    fn json_response(status: u16, body: &str) -> http::Response<SdkBody> {
+        http::Response::builder()
+            .status(status)
+            .header("content-type", "application/x-amz-json-1.1")
+            .body(SdkBody::from(body.to_string()))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn list_databases_round_trips_through_a_real_http_call() {
+        let provider = test_provider(vec![ReplayEvent::new(
+            any_request(),
+            json_response(
+                200,
+                r#"{"DatabaseList": [{"Name": "sales"}, {"Name": "marketing"}]}"#,
+            ),
+        )]);
+        let mut databases = provider.list_databases("").await.unwrap();
+        databases.sort();
+        assert_eq!(
+            databases,
+            vec!["marketing".to_string(), "sales".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn list_tables_round_trips_through_a_real_http_call() {
+        let provider = test_provider(vec![ReplayEvent::new(
+            any_request(),
+            json_response(
+                200,
+                r#"{"TableList": [{"Name": "orders"}, {"Name": "customers"}]}"#,
+            ),
+        )]);
+        let mut tables = provider.list_tables("", "sales").await.unwrap();
+        tables.sort();
+        assert_eq!(tables, vec!["customers".to_string(), "orders".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn get_table_schema_maps_columns_from_a_real_response() {
+        let provider = test_provider(vec![ReplayEvent::new(
+            any_request(),
+            json_response(
+                200,
+                r#"{"Table": {
+                    "Name": "orders",
+                    "DatabaseName": "sales",
+                    "StorageDescriptor": {"Columns": [{"Name": "id", "Type": "bigint"}]},
+                    "PartitionKeys": [{"Name": "dt", "Type": "string"}]
+                }}"#,
+            ),
+        )]);
+        let schema = provider
+            .get_table_schema("", "sales", "orders")
+            .await
+            .unwrap()
+            .expect("table should be found");
+        assert_eq!(schema.database, "sales");
+        assert_eq!(schema.table, "orders");
+        let names: Vec<&str> = schema.columns.iter().map(|c| c.name.as_str()).collect();
+        assert!(names.contains(&"id"));
+        assert!(names.contains(&"dt")); // partition key included alongside columns
+        let id_col = schema.columns.iter().find(|c| c.name == "id").unwrap();
+        assert_eq!(id_col.data_type, "BIGINT");
+    }
+
+    #[tokio::test]
+    async fn get_table_schema_returns_none_for_a_real_entity_not_found_response() {
+        let provider = test_provider(vec![ReplayEvent::new(
+            any_request(),
+            // AWS JSON 1.1 errors are HTTP 400 with an `__type` field — this
+            // is the real wire shape, not just the client-side match arm
+            // (`is_entity_not_found_exception()`) tested in isolation.
+            json_response(
+                400,
+                r#"{"__type": "EntityNotFoundException", "Message": "Entity Not Found"}"#,
+            ),
+        )]);
+        let schema = provider
+            .get_table_schema("", "sales", "does_not_exist")
+            .await
+            .unwrap();
+        assert!(schema.is_none());
+    }
 }

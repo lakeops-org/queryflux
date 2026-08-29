@@ -18,6 +18,8 @@ pub mod fallback;
 pub mod glue;
 pub mod hive_metastore;
 pub mod iceberg_rest;
+#[cfg(test)]
+pub(crate) mod test_support;
 
 use std::future::Future;
 use std::pin::Pin;
