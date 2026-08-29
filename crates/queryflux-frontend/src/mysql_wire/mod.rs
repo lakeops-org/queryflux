@@ -202,6 +202,8 @@ async fn handle_connection(
     let mut session = SessionContext {
         user: if user.is_empty() { None } else { Some(user) },
         database: schema,
+        // MySQL wire / StarRocks has no catalog concept — just a database/schema.
+        catalog: None,
         extra: HashMap::new(),
         tags: QueryTags::new(),
         agent_context: None,
@@ -1732,6 +1734,7 @@ mod tests {
         let mut session = queryflux_core::session::SessionContext {
             user: None,
             database: None,
+            catalog: None,
             tags: queryflux_core::tags::QueryTags::new(),
             extra: std::collections::HashMap::new(),
             agent_context: None,

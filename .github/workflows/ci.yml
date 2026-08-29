@@ -12,6 +12,11 @@ on:
       - '.github/PULL_REQUEST_TEMPLATE/**'
       - 'LICENSE*'
   pull_request:
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - ready_for_review
     paths-ignore:
       - 'website/**'
       - 'docs/**'
@@ -21,17 +26,16 @@ on:
       - '.github/PULL_REQUEST_TEMPLATE/**'
       - 'LICENSE*'
 
-# One active run per ref: new pushes cancel older in-progress runs on the same branch/PR.
+# One active run per PR or branch: a new push cancels any in-progress run for the same target.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 env:
   RUST_TOOLCHAIN_VERSION: "1.91.1"
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
-  # libduckdb-sys: point at system-installed lib so rust-lld resolves -lduckdb reliably.
-  # The "Install libduckdb" step in each job puts the .so + headers there.
+  # libduckdb-sys: system libduckdb (.so + headers) from install-libduckdb.sh; mold linker in rust job.
   DUCKDB_LIB_DIR: /usr/local/lib
   DUCKDB_INCLUDE_DIR: /usr/local/include
   # Must match duckdb crate version: duckdb 1.85.1 → libduckdb-sys 1.10501.0 → DuckDB v1.5.1.
@@ -40,9 +44,18 @@ env:
   DUCKDB_LIBDUCKDB_LINUX_AMD64_SHA256: "21aec66a60eae1696270ba715a481ab066a88d99a62718d0577579ac1a7a4834"
 
 jobs:
-  # Fast, no PyO3 / no compile — runs in parallel with clippy + unit tests.
+  # Draft PRs skip all CI jobs (push to main still runs). Mark ready for review to trigger checks.
+  gate:
+    name: PR ready
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "CI enabled"
+
+  # Fast gate — nothing else runs until fmt passes.
   fmt:
     name: Check formatting
+    needs: gate
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@44c2b7a8a4ea60a981eaca3cf939b5f4305c123b # v4.1.5
@@ -54,6 +67,7 @@ jobs:
 
   helm:
     name: Helm chart
+    needs: [gate, fmt]
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -64,74 +78,18 @@ jobs:
       - uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4.3.1
       - run: make helm-check
 
-  clippy:
-    name: Clippy
+  # One compile: clippy (--all-targets) then unit + Postgres + optional E2E reuse the same target dir.
+  rust:
+    name: Rust (clippy, unit & E2E)
+    needs: [gate, fmt]
     runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@44c2b7a8a4ea60a981eaca3cf939b5f4305c123b # v4.1.5
-
-      - name: Install libduckdb
-        run: bash scripts/install-libduckdb.sh
-
-      - uses: dtolnay/rust-toolchain@d8352f6b1d2e870bc5716e7a6d9b65c4cc244a1a
-        with:
-          toolchain: ${{ env.RUST_TOOLCHAIN_VERSION }}
-          components: clippy
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: queryflux
-          cache-on-failure: true
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
-      - name: Python venv (sqlglot / PyO3)
-        run: |
-          python3 -m venv .venv
-          .venv/bin/pip install -r requirements.txt
-          echo "PYO3_PYTHON=${GITHUB_WORKSPACE}/.venv/bin/python3" >> "$GITHUB_ENV"
-          echo "PYTHONPATH=$(.venv/bin/python3 -c 'import site; print(site.getsitepackages()[0])')" >> "$GITHUB_ENV"
-
-      # Exclude queryflux-bench: duplicate link of main stack; benchmark.yml builds it.
-      - run: cargo clippy --workspace --all-targets --all-features --exclude queryflux-bench -- -D warnings
-
-  unit-test:
-    name: Unit & integration tests
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@44c2b7a8a4ea60a981eaca3cf939b5f4305c123b # v4.1.5
-
-      - name: Install libduckdb
-        run: bash scripts/install-libduckdb.sh
-
-      - uses: dtolnay/rust-toolchain@d8352f6b1d2e870bc5716e7a6d9b65c4cc244a1a
-        with:
-          toolchain: ${{ env.RUST_TOOLCHAIN_VERSION }}
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: queryflux
-          cache-on-failure: true
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
-      - name: Python venv (sqlglot / PyO3)
-        run: |
-          python3 -m venv .venv
-          .venv/bin/pip install -r requirements.txt
-          echo "PYO3_PYTHON=${GITHUB_WORKSPACE}/.venv/bin/python3" >> "$GITHUB_ENV"
-          echo "PYTHONPATH=$(.venv/bin/python3 -c 'import site; print(site.getsitepackages()[0])')" >> "$GITHUB_ENV"
-
-      - name: Unit & integration tests (make test)
-        run: make test
-
-  postgres-test:
-    name: Postgres integration tests
-    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    # Faster CI dev builds: no debuginfo, mold linker (see corrode compile-times tips).
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_DEV_STRIP: debuginfo
+      RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
     permissions:
       contents: read
     services:
@@ -153,34 +111,79 @@ jobs:
         with:
           persist-credentials: false
 
+      - uses: dorny/paths-filter@v3
+        id: paths
+        with:
+          filters: |
+            e2e:
+              - 'crates/**'
+              - 'docker/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'requirements.txt'
+              - 'scripts/**'
+              - '.github/workflows/ci.yml'
+
+      - name: Install mold linker
+        run: sudo apt-get update && sudo apt-get install -y mold
+
       - name: Install libduckdb
         run: bash scripts/install-libduckdb.sh
 
       - uses: dtolnay/rust-toolchain@d8352f6b1d2e870bc5716e7a6d9b65c4cc244a1a
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN_VERSION }}
+          components: clippy
+
+      - uses: taiki-e/install-action@742a3317eac7bd62f91cd888b4eead5e784ba833 # v2
+        with:
+          tool: nextest
 
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: queryflux
           cache-on-failure: true
+          cache-all-crates: true
 
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: actions/cache@v4
+        id: venv-cache
+        with:
+          path: .venv
+          key: venv-${{ runner.os }}-py3.12-${{ hashFiles('requirements.txt') }}
+
+      - name: Python venv (sqlglot / PyO3)
+        run: |
+          if [ ! -x .venv/bin/python3 ]; then
+            python3 -m venv .venv
+            .venv/bin/pip install -r requirements.txt
+          fi
+          echo "PYO3_PYTHON=${GITHUB_WORKSPACE}/.venv/bin/python3" >> "$GITHUB_ENV"
+          echo "PYTHONPATH=$(.venv/bin/python3 -c 'import site; print(site.getsitepackages()[0])')" >> "$GITHUB_ENV"
+
+      # Clippy first — fail fast before tests or E2E. --all-targets compiles test crates once for later steps.
+      # Exclude queryflux-bench: duplicate link of main stack; benchmark.yml builds it.
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --all-features --exclude queryflux-bench -- -D warnings
+
+      - name: Unit & integration tests (nextest)
+        run: make test
+
+      # Postgres ignored tests share one DATABASE_URL, migrate() on setup, and a static
+      # CAPACITY_TEST_LOCK — they must run in one process (cargo test), not nextest
+      # (which spawns each lib test in its own process).
       - name: Postgres integration tests (queryflux-persistence)
         env:
           DATABASE_URL: postgres://queryflux:queryflux@localhost:5432/queryflux_test
         run: cargo test -p queryflux-persistence -- --include-ignored
 
-  e2e:
-    name: E2E tests (Docker)
-    needs: [fmt, clippy]
-    runs-on: ubuntu-latest
-    timeout-minutes: 90
-    steps:
-      - uses: actions/checkout@44c2b7a8a4ea60a981eaca3cf939b5f4305c123b # v4.1.5
-
-      # StarRocks all-in-one + Trino + Lakekeeper stack needs many GB of layer space;
-      # default ubuntu-latest root FS often fills during `docker compose pull`.
-      - name: Free disk space
+      # E2E: same target dir as clippy/tests — only compiles queryflux-e2e-tests if not already built.
+      # Always on main pushes; on PRs only when runtime/docker paths change.
+      - name: Free disk space (e2e)
+        if: github.event_name == 'push' || steps.paths.outputs.e2e == 'true'
         uses: jlumbroso/free-disk-space@v1.3.1
         with:
           tool-cache: false
@@ -190,40 +193,19 @@ jobs:
           large-packages: true
           swap-storage: true
 
-      - name: Install libduckdb
-        run: bash scripts/install-libduckdb.sh
-
-      - uses: dtolnay/rust-toolchain@d8352f6b1d2e870bc5716e7a6d9b65c4cc244a1a
-        with:
-          toolchain: ${{ env.RUST_TOOLCHAIN_VERSION }}
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: queryflux
-          cache-on-failure: true
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
-      - name: Python venv (sqlglot / PyO3)
-        run: |
-          python3 -m venv .venv
-          .venv/bin/pip install -r requirements.txt
-          echo "PYO3_PYTHON=${GITHUB_WORKSPACE}/.venv/bin/python3" >> "$GITHUB_ENV"
-          echo "PYTHONPATH=$(.venv/bin/python3 -c 'import site; print(site.getsitepackages()[0])')" >> "$GITHUB_ENV"
-
       - name: Install Trino ADBC driver (dbc)
+        if: github.event_name == 'push' || steps.paths.outputs.e2e == 'true'
         run: |
           bash scripts/install-adbc-trino-driver.sh
           echo "${HOME}/.local/bin" >> "${GITHUB_PATH}"
 
-      # Same stack as `make test-e2e`, but split so "Engine logs" / `compose down` still run if `cargo test` fails.
       - name: Start e2e Docker stack (Trino + StarRocks + ClickHouse + sentinel)
+        if: github.event_name == 'push' || steps.paths.outputs.e2e == 'true'
         run: |
           docker compose -f docker/docker-compose.test.yml --project-directory . up -d --wait --wait-timeout 300 trino starrocks clickhouse sentinel
 
       - name: E2E tests (queryflux-e2e-tests)
+        if: github.event_name == 'push' || steps.paths.outputs.e2e == 'true'
         env:
           TRINO_URL: http://localhost:18081
           TRINO_ADBC_URI: http://localhost:18081
@@ -235,12 +217,12 @@ jobs:
           cargo test -p queryflux-e2e-tests --manifest-path Cargo.toml -- --test-threads=1 --include-ignored
 
       - name: Engine logs (debug on failure)
-        if: failure()
+        if: failure() && (github.event_name == 'push' || steps.paths.outputs.e2e == 'true')
         run: |
           docker compose -f docker/docker-compose.test.yml --project-directory . logs --no-color --tail=200 trino || true
           docker compose -f docker/docker-compose.test.yml --project-directory . logs --no-color --tail=200 starrocks || true
           docker compose -f docker/docker-compose.test.yml --project-directory . logs --no-color --tail=200 clickhouse || true
 
       - name: Stop e2e Docker stack
-        if: always()
+        if: always() && (github.event_name == 'push' || steps.paths.outputs.e2e == 'true')
         run: docker compose -f docker/docker-compose.test.yml --project-directory . down

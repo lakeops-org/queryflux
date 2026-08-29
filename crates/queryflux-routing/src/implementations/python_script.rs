@@ -119,6 +119,7 @@ fn build_routing_ctx<'py>(
     ctx.set_item("protocol", protocol_camel(protocol))?;
     set_opt_str(&ctx, py, "user", &session.user)?;
     set_opt_str(&ctx, py, "database", &session.database)?;
+    set_opt_str(&ctx, py, "catalog", &session.catalog)?;
     ctx.set_item("extra", str_str_dict(py, &session.extra)?)?;
 
     if let Some(a) = auth {

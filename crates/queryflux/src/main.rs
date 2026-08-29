@@ -14,7 +14,7 @@ use queryflux_core::query::{ClusterGroupName, ClusterName, EngineType};
 use queryflux_frontend::{
     admin::{
         build_frontends_status, AdminFrontend, RoutingConfigDto as AdminRoutingConfigDto,
-        SecurityConfigDto as AdminSecurityConfigDto, TestClusterFn,
+        SecurityConfigDto as AdminSecurityConfigDto, TestCatalogProviderFn, TestClusterFn,
     },
     flight_sql::FlightSqlFrontend,
     mcp::McpFrontend,
@@ -662,13 +662,23 @@ async fn main() -> Result<()> {
 
     // --- Build translation service ---
     let translation = Arc::new(
-        TranslationService::new_sqlglot(config.translation.python_scripts.clone()).unwrap_or_else(
-            |e| {
+        TranslationService::new_sqlglot(config.translation.python_scripts.clone())
+            .unwrap_or_else(|e| {
                 tracing::warn!("sqlglot unavailable ({e}), translation disabled");
                 TranslationService::disabled()
-            },
-        ),
+            })
+            .with_schema_resolution_timeout(std::time::Duration::from_millis(
+                config.translation.schema_resolution_timeout_ms,
+            )),
     );
+
+    // --- Build catalog provider ---
+    // Feeds `translation.resolve_schema_context` so sqlglot's optimizer can qualify
+    // columns/types instead of falling back to dialect-only translation. Never fails
+    // startup: an unimplemented or misconfigured integration degrades to a no-op
+    // (see `queryflux_catalog::build_catalog_provider`), same philosophy as `translation` above.
+    let catalog: Arc<dyn queryflux_core::catalog::CatalogProvider> =
+        queryflux_catalog::build_catalog_provider(&config.catalog_provider).await;
 
     // --- Build router chain ---
     let fallback = ClusterGroupName(config.routing_fallback.clone());
@@ -960,6 +970,7 @@ async fn main() -> Result<()> {
         group_cache_settings,
         auth_provider,
         authorization,
+        catalog,
     };
     // Seed the reload cache. When Postgres is active, fingerprint `engine_key` + JSONB config
     // (same format as `build_live_config` on reload) so an engine change rebuilds adapters even
@@ -1148,6 +1159,7 @@ async fn main() -> Result<()> {
         &config.routing_fallback,
         &config.routers,
     ));
+    let catalog_provider_config = Arc::new(config.catalog_provider.clone());
     let config_reload_notify = Arc::new(tokio::sync::Notify::new());
 
     let frontends_status = build_frontends_status(
@@ -1190,6 +1202,41 @@ async fn main() -> Result<()> {
         })
     });
 
+    let test_catalog_provider_fn: TestCatalogProviderFn = Arc::new(|config_json| {
+        Box::pin(async move {
+            let cfg = serde_json::from_value::<queryflux_core::config::CatalogProviderConfig>(
+                config_json,
+            )?;
+            if matches!(cfg, queryflux_core::config::CatalogProviderConfig::Null) {
+                return Ok((true, "No catalog configured (type: null).".to_string()));
+            }
+            // Uses the fallible builder, not `build_catalog_provider` — this
+            // needs the real construction error, not a silent degrade to a
+            // no-op. Every real provider ignores its `catalog` argument (Glue/
+            // HiveMetastore/IcebergRest each expose exactly one synthetic
+            // catalog), so any string works here.
+            let provider = match queryflux_catalog::try_build_catalog_provider(&cfg).await {
+                Ok(provider) => provider,
+                Err(e) => return Ok((false, format!("Failed to build provider: {e}"))),
+            };
+            // `list_catalogs()` is a hardcoded synthetic single-entry result for
+            // every real provider (Glue/HMS/Iceberg REST have no native "list
+            // catalogs" call) — it makes no network call at all, so it can't
+            // prove connectivity. `list_databases` does: it's the cheapest call
+            // that actually round-trips to the backing service for all three.
+            match provider.list_databases("").await {
+                Ok(databases) => Ok((
+                    true,
+                    format!("Connected — {} database(s) visible", databases.len()),
+                )),
+                Err(e) => Ok((
+                    false,
+                    format!("Built provider, but listing databases failed: {e}"),
+                )),
+            }
+        })
+    });
+
     let admin_store_for_reload = admin_store.clone();
     let cors_origins = config.queryflux.admin_api.cors_allowed_origins.clone();
     if cors_origins.is_empty() {
@@ -1205,11 +1252,13 @@ async fn main() -> Result<()> {
         admin_port,
         security_config,
         routing_config,
+        catalog_provider_config,
         engine_registry,
         config_reload_notify.clone(),
         frontends_status,
         admin_creds,
         test_cluster_fn,
+        test_catalog_provider_fn,
         cors_origins,
         app_state.result_cache.clone(),
         app_state.clone(),
@@ -1645,6 +1694,7 @@ async fn main() -> Result<()> {
                         authorization: l.authorization.clone(),
                         guard_chain: l.guard_chain.clone(),
                         group_guard_chains: l.group_guard_chains.clone(),
+                        catalog: l.catalog.clone(),
                     }
                 };
                 match reload_live_config(backend, &mut cache_guard, &prev, metrics).await {
@@ -1683,6 +1733,35 @@ async fn main() -> Result<()> {
                         Err(e) => {
                             metrics.on_config_reload_failure("guard_reload");
                             tracing::warn!("Guard chain reload failed: {e}");
+                        }
+                    }
+                    // Catalog provider: same admin-store-only reload contract as guard
+                    // chains above — a `Null` provider is always a safe fallback (schema-aware
+                    // translation just degrades to dialect-only), unlike auth/authz.
+                    match store.get_proxy_setting("catalog_config").await {
+                        Ok(Some(v)) => {
+                            match serde_json::from_value::<
+                                queryflux_core::config::CatalogProviderConfig,
+                            >(v)
+                            {
+                                Ok(cfg) => {
+                                    let provider =
+                                        queryflux_catalog::build_catalog_provider(&cfg).await;
+                                    live.write().await.catalog = provider;
+                                }
+                                Err(e) => {
+                                    metrics.on_config_reload_failure("catalog_reload");
+                                    tracing::warn!("Catalog config parse failed: {e}");
+                                }
+                            }
+                        }
+                        Ok(None) => {
+                            live.write().await.catalog =
+                                Arc::new(queryflux_core::catalog::NullCatalogProvider);
+                        }
+                        Err(e) => {
+                            metrics.on_config_reload_failure("catalog_reload");
+                            tracing::warn!("Catalog config reload failed: {e}");
                         }
                     }
                 }
@@ -2942,6 +3021,10 @@ async fn build_live_config(
         group_cache_settings,
         auth_provider: Arc::new(NoneAuthProvider::new(false)),
         authorization: Arc::new(AllowAllAuthorization::default()),
+        // Placeholder — `reload_live_config` immediately overwrites this with the
+        // carried-forward previous value (and possibly a fresh one from
+        // `catalog_config`), same as `auth_provider`/`authorization` above.
+        catalog: Arc::new(queryflux_core::catalog::NullCatalogProvider),
     })
 }
 
@@ -2958,6 +3041,7 @@ struct PreservedLive {
     authorization: Arc<dyn queryflux_auth::AuthorizationChecker>,
     guard_chain: Option<Arc<GuardChain>>,
     group_guard_chains: HashMap<String, Arc<GuardChain>>,
+    catalog: Arc<dyn queryflux_core::catalog::CatalogProvider>,
 }
 
 async fn reload_live_config(
@@ -3047,6 +3131,7 @@ async fn reload_live_config(
     live.authorization = prev.authorization.clone();
     live.guard_chain = prev.guard_chain.clone();
     live.group_guard_chains = prev.group_guard_chains.clone();
+    live.catalog = prev.catalog.clone();
 
     // Guardrails from DB (UI-managed) override carried-over chains. An admin
     // "clear" still writes an empty `global` row, so Ok(None) can only mean
@@ -3118,6 +3203,30 @@ async fn reload_live_config(
         Err(e) => {
             metrics.on_config_reload_failure("auth_rebuild");
             tracing::warn!("Reload: security_config read failed; keeping previous auth: {e}")
+        }
+    }
+
+    // Rebuild the catalog provider from persisted config. A missing row means
+    // "never configured via admin" (keep the carried-over, e.g. startup-YAML,
+    // provider); a parse failure keeps the previous provider too — a reload must
+    // never silently fall back to `NullCatalogProvider` and quietly stop
+    // discovering schema for already-working translation.
+    match pg.get_proxy_setting("catalog_config").await {
+        Ok(Some(v)) => {
+            match serde_json::from_value::<queryflux_core::config::CatalogProviderConfig>(v) {
+                Ok(cfg) => live.catalog = queryflux_catalog::build_catalog_provider(&cfg).await,
+                Err(e) => {
+                    metrics.on_config_reload_failure("catalog_reload");
+                    tracing::warn!(
+                        "Reload: catalog_config parse failed; keeping previous catalog: {e}"
+                    )
+                }
+            }
+        }
+        Ok(None) => {}
+        Err(e) => {
+            metrics.on_config_reload_failure("catalog_reload");
+            tracing::warn!("Reload: catalog_config read failed; keeping previous catalog: {e}")
         }
     }
 

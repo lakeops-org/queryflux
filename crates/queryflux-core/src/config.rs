@@ -1866,56 +1866,120 @@ pub struct TranslationConfig {
     /// Scripts mutate `ast` in-place; `src`/`dst` carry the dialect names.
     #[serde(default)]
     pub python_scripts: Vec<String>,
+    /// Max time to spend on catalog lookup for schema-aware translation before
+    /// falling back to dialect-only translation. Default 1500ms.
+    #[serde(default = "default_schema_resolution_timeout_ms")]
+    pub schema_resolution_timeout_ms: u64,
+}
+
+fn default_schema_resolution_timeout_ms() -> u64 {
+    1500
 }
 
 // --- Catalog provider ---
+
+// NOTE: `rename_all = "camelCase"` on this container does NOT reliably reach
+// multi-word field names *inside* struct-like variants of an internally-tagged
+// (`tag = "type"`) enum with this serde/serde_yaml version combination — confirmed
+// empirically (deserialization silently reports the snake_case name as "missing"
+// even when the container attribute claims camelCase). Every multi-word variant
+// field below has an explicit `#[serde(rename = "...")]` because of this; don't
+// rely on the container-level rename_all for new fields added here.
+/// TTL + capacity-bounded cache for one catalog provider's lookups. Every
+/// provider that makes a real network call per lookup carries this as its own
+/// `cache` field (rather than a separate wrapper type to remember to nest) —
+/// table/column metadata rarely changes, so a much longer TTL than a query
+/// result cache is normally safe. `None` (the default) means every lookup
+/// goes straight to the backing service.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CatalogCacheConfig {
+    #[serde(default = "default_catalog_cache_ttl_seconds")]
+    pub ttl_seconds: u64,
+    #[serde(default = "default_catalog_cache_max_entries")]
+    pub max_entries: usize,
+}
+
+fn default_catalog_cache_ttl_seconds() -> u64 {
+    300
+}
+
+fn default_catalog_cache_max_entries() -> usize {
+    10_000
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase", tag = "type")]
 pub enum CatalogProviderConfig {
     #[default]
     Null,
-    Static {
-        schemas: Vec<StaticTableSchema>,
-    },
-    Trino {
-        /// Name of the cluster group to use for metadata queries.
-        cluster_group: String,
-    },
+    /// Raw Hive Metastore Thrift protocol — format-agnostic (plain Hive/Parquet
+    /// tables, not just Iceberg), same reasoning as `Glue` avoiding
+    /// `iceberg-catalog-glue`.
     HiveMetastore {
+        /// `thrift://host:port` (the `thrift://` scheme is optional).
         uri: String,
+        #[serde(default)]
+        cache: Option<CatalogCacheConfig>,
     },
     Glue {
         region: Option<String>,
+        /// AWS credentials — reuses the same `ClusterAuth` shape as engine cluster
+        /// config (`accessKey`/`roleArn`; `basic`/`bearer`/`keyPair` don't apply
+        /// here). Omitted: the default AWS credential chain (env vars, ECS task
+        /// role, EC2 instance profile, etc.).
+        #[serde(default)]
+        auth: Option<ClusterAuth>,
+        #[serde(default)]
+        cache: Option<CatalogCacheConfig>,
     },
-    Caching {
-        ttl_seconds: u64,
-        max_entries: usize,
-        #[serde(flatten)]
-        delegate: Box<CatalogProviderConfig>,
+    /// Iceberg REST Catalog protocol (Polaris, Tabular, Unity's REST endpoint,
+    /// Snowflake's Horizon endpoint for Snowflake-managed Iceberg tables). Named
+    /// after the protocol, not any one vendor, consistent with `Glue`/
+    /// `HiveMetastore` being named after their protocol/service.
+    IcebergRest {
+        uri: String,
+        #[serde(default)]
+        warehouse: Option<String>,
+        /// The REST protocol has no "list catalogs" endpoint — one REST catalog
+        /// endpoint *is* one catalog — so this name is just echoed back by
+        /// `list_catalogs()`.
+        #[serde(rename = "catalogName")]
+        catalog_name: String,
+        #[serde(default)]
+        auth: Option<IcebergRestAuthConfig>,
+        #[serde(default)]
+        cache: Option<CatalogCacheConfig>,
     },
+    /// Tries `primary` first, falls through to `secondary` on error (or a missing
+    /// single table, for `get_table_schema` specifically). Each side configures
+    /// its own `cache` independently — this is about composing two *sources*,
+    /// not about caching.
     Fallback {
         primary: Box<CatalogProviderConfig>,
         secondary: Box<CatalogProviderConfig>,
     },
 }
 
+/// Authentication for an `IcebergRest` catalog provider. Maps directly onto
+/// `iceberg-catalog-rest`'s own property keys (`credential`/`token`) — see the
+/// `NOTE:` above `CatalogCacheConfig` for why every multi-word field here has
+/// an explicit `#[serde(rename = "...")]`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct StaticTableSchema {
-    pub catalog: String,
-    pub database: String,
-    pub table: String,
-    pub columns: Vec<StaticColumnDef>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct StaticColumnDef {
-    pub name: String,
-    pub data_type: String,
-    #[serde(default = "default_true")]
-    pub nullable: bool,
+#[serde(tag = "type")]
+pub enum IcebergRestAuthConfig {
+    // Explicit `#[serde(rename)]` on the tag itself too, not just the fields —
+    // an acronym-heavy name like this is exactly the case the `rename_all`
+    // NOTE above warns is unreliable, so this doesn't lean on it at all.
+    #[serde(rename = "oauth2ClientCredentials")]
+    OAuth2ClientCredentials {
+        #[serde(rename = "clientId")]
+        client_id: String,
+        #[serde(rename = "clientSecret")]
+        client_secret: String,
+    },
+    #[serde(rename = "bearerToken")]
+    BearerToken { token: String },
 }
 
 // ---------------------------------------------------------------------------
@@ -3257,5 +3321,182 @@ auth:
             }),
         };
         assert!(authz.validate().is_err());
+    }
+}
+
+/// Regression coverage for `CatalogProviderConfig` YAML round-tripping.
+///
+/// This enum's variants went untested against real YAML for a long time (it was
+/// declared but never wired to a live provider), and that let two real bugs slip
+/// in unnoticed: `#[serde(flatten)]` on a nested internally-tagged enum requiring
+/// two `type` keys in one mapping, and `rename_all = "camelCase"` on the
+/// container not reaching multi-word field names inside this enum's variants
+/// (confirmed empirically against this serde/serde_yaml version combination —
+/// every such field now has an explicit `#[serde(rename = "...")]` instead).
+/// These tests exist so both classes of bug can't silently reappear.
+#[cfg(test)]
+mod catalog_provider_config_tests {
+    use super::{CatalogProviderConfig, ClusterAuth, IcebergRestAuthConfig};
+
+    #[test]
+    fn null_is_the_default_and_parses_from_yaml() {
+        assert!(matches!(
+            CatalogProviderConfig::default(),
+            CatalogProviderConfig::Null
+        ));
+        let cfg: CatalogProviderConfig = serde_yaml::from_str("type: null\n").unwrap();
+        assert!(matches!(cfg, CatalogProviderConfig::Null));
+    }
+
+    #[test]
+    fn iceberg_rest_catalog_name_uses_camel_case_key() {
+        let cfg: CatalogProviderConfig = serde_yaml::from_str(
+            "type: icebergRest\nuri: https://polaris.example.com/api/catalog\ncatalogName: prod\n",
+        )
+        .unwrap();
+        match cfg {
+            CatalogProviderConfig::IcebergRest {
+                uri,
+                warehouse,
+                catalog_name,
+                auth,
+                cache,
+            } => {
+                assert_eq!(uri, "https://polaris.example.com/api/catalog");
+                assert!(warehouse.is_none());
+                assert_eq!(catalog_name, "prod");
+                assert!(auth.is_none());
+                assert!(cache.is_none());
+            }
+            other => panic!("expected IcebergRest, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn iceberg_rest_oauth2_client_credentials_auth_parses() {
+        let yaml = r#"
+type: icebergRest
+uri: https://polaris.example.com/api/catalog
+catalogName: prod
+warehouse: s3://my-bucket/warehouse
+auth:
+  type: oauth2ClientCredentials
+  clientId: my-client
+  clientSecret: my-secret
+"#;
+        let cfg: CatalogProviderConfig = serde_yaml::from_str(yaml).unwrap();
+        match cfg {
+            CatalogProviderConfig::IcebergRest {
+                warehouse: Some(warehouse),
+                auth:
+                    Some(IcebergRestAuthConfig::OAuth2ClientCredentials {
+                        client_id,
+                        client_secret,
+                    }),
+                ..
+            } => {
+                assert_eq!(warehouse, "s3://my-bucket/warehouse");
+                assert_eq!(client_id, "my-client");
+                assert_eq!(client_secret, "my-secret");
+            }
+            other => {
+                panic!("expected IcebergRest with OAuth2ClientCredentials auth, got {other:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn fallback_primary_and_secondary_nest_independently() {
+        // "null" must be quoted here — a bare YAML `null` parses as YAML's null
+        // type, not the string the `type` tag needs to match the Null variant.
+        let yaml = r#"
+type: fallback
+primary:
+  type: glue
+  region: us-east-1
+secondary:
+  type: "null"
+"#;
+        let cfg: CatalogProviderConfig = serde_yaml::from_str(yaml).unwrap();
+        match cfg {
+            CatalogProviderConfig::Fallback { primary, secondary } => {
+                assert!(matches!(*primary, CatalogProviderConfig::Glue { .. }));
+                assert!(matches!(*secondary, CatalogProviderConfig::Null));
+            }
+            other => panic!("expected Fallback, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn glue_and_hive_metastore_parse_with_no_cache_by_default() {
+        let glue: CatalogProviderConfig =
+            serde_yaml::from_str("type: glue\nregion: us-east-1\n").unwrap();
+        assert!(matches!(
+            glue,
+            CatalogProviderConfig::Glue {
+                region: Some(ref r),
+                auth: None,
+                cache: None,
+            } if r == "us-east-1"
+        ));
+
+        let hms: CatalogProviderConfig =
+            serde_yaml::from_str("type: hiveMetastore\nuri: thrift://localhost:9083\n").unwrap();
+        assert!(matches!(
+            hms,
+            CatalogProviderConfig::HiveMetastore { cache: None, .. }
+        ));
+    }
+
+    #[test]
+    fn glue_role_arn_auth_and_cache_parse_together() {
+        let yaml = r#"
+type: glue
+region: us-east-1
+auth:
+  type: roleArn
+  roleArn: arn:aws:iam::123456789012:role/queryflux-glue-readonly
+  externalId: queryflux-ext-id
+cache:
+  ttlSeconds: 600
+  maxEntries: 5000
+"#;
+        let glue: CatalogProviderConfig = serde_yaml::from_str(yaml).unwrap();
+        match glue {
+            CatalogProviderConfig::Glue {
+                region: Some(region),
+                auth:
+                    Some(ClusterAuth::RoleArn {
+                        role_arn,
+                        external_id,
+                    }),
+                cache: Some(cache),
+            } => {
+                assert_eq!(region, "us-east-1");
+                assert_eq!(
+                    role_arn,
+                    "arn:aws:iam::123456789012:role/queryflux-glue-readonly"
+                );
+                assert_eq!(external_id.as_deref(), Some("queryflux-ext-id"));
+                assert_eq!(cache.ttl_seconds, 600);
+                assert_eq!(cache.max_entries, 5000);
+            }
+            other => panic!("expected Glue with RoleArn auth + cache, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cache_ttl_and_max_entries_default_when_omitted() {
+        let yaml = "type: glue\nregion: us-east-1\ncache: {}\n";
+        let glue: CatalogProviderConfig = serde_yaml::from_str(yaml).unwrap();
+        match glue {
+            CatalogProviderConfig::Glue {
+                cache: Some(cache), ..
+            } => {
+                assert_eq!(cache.ttl_seconds, 300);
+                assert_eq!(cache.max_entries, 10_000);
+            }
+            other => panic!("expected Glue with defaulted cache, got {other:?}"),
+        }
     }
 }

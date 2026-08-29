@@ -10,6 +10,7 @@ path = "src/main.rs"
 
 [dependencies]
 queryflux-core = { workspace = true }
+queryflux-catalog = { workspace = true }
 queryflux-auth = { workspace = true }
 queryflux-config = { workspace = true }
 queryflux-persistence = { workspace = true }

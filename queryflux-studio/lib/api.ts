@@ -1,6 +1,7 @@
 import type {
   AgentListParams,
   AgentSummary,
+  CatalogProviderConfig,
   ClusterStateDto,
   ConversationListParams,
   ConversationSummary,
@@ -11,6 +12,7 @@ import type {
   GuardrailsConfig,
   QueryHistoryRecord,
   QueryListParams,
+  TestCatalogProviderResponse,
 } from "./api-types";
 import {
   SESSION_COOKIE_NAME,
@@ -246,6 +248,20 @@ export async function getGuardrailsConfig(): Promise<GuardrailsConfig> {
 
 export async function putGuardrailsConfig(config: GuardrailsConfig): Promise<void> {
   return apiPutNoContent("/admin/config/guardrails", config);
+}
+
+export async function getCatalogProviderConfig(): Promise<CatalogProviderConfig> {
+  return apiFetch<CatalogProviderConfig>("/admin/config/catalog");
+}
+
+export async function putCatalogProviderConfig(config: CatalogProviderConfig): Promise<void> {
+  return apiPutNoContent("/admin/config/catalog", config);
+}
+
+export async function testCatalogProviderConfig(
+  config: CatalogProviderConfig,
+): Promise<TestCatalogProviderResponse> {
+  return apiPost("/admin/config/catalog/test", { config });
 }
 
 export async function getEngineStats(hours = 24): Promise<EngineStatRow[]> {

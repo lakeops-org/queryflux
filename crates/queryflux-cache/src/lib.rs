@@ -79,6 +79,9 @@ impl CacheKey {
         hasher.update(sql.as_bytes());
         hasher.update(group.as_bytes());
         hasher.update(user.as_bytes());
+        if let Some(catalog) = &session.catalog {
+            hasher.update(catalog.as_bytes());
+        }
         if let Some(db) = &session.database {
             hasher.update(db.as_bytes());
         }
@@ -242,6 +245,25 @@ mod tests {
         };
         let s2 = SessionContext {
             database: Some("db2".to_string()),
+            ..Default::default()
+        };
+        let k1 = CacheKey::new("SELECT 1", "grp", &s1, "alice", &[]);
+        let k2 = CacheKey::new("SELECT 1", "grp", &s2, "alice", &[]);
+        assert_ne!(k1.hex, k2.hex);
+    }
+
+    #[test]
+    fn cache_key_different_catalog_same_database() {
+        // Same schema name under two different catalogs (e.g. Trino's
+        // hive.sales.orders vs. iceberg.sales.orders) must not collide.
+        let s1 = SessionContext {
+            catalog: Some("hive".to_string()),
+            database: Some("sales".to_string()),
+            ..Default::default()
+        };
+        let s2 = SessionContext {
+            catalog: Some("iceberg".to_string()),
+            database: Some("sales".to_string()),
             ..Default::default()
         };
         let k1 = CacheKey::new("SELECT 1", "grp", &s1, "alice", &[]);

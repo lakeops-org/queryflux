@@ -523,3 +523,68 @@ export interface GuardrailsConfig {
   /** Per-group additional guards. Group name → guard list. */
   groups: Record<string, GuardSpecDto[]>;
 }
+
+// ---------------------------------------------------------------------------
+// Catalog provider config (GET/PUT /admin/config/catalog, POST .../test)
+//
+// Feeds schema-aware SQL translation (queryflux_core::catalog::CatalogProvider).
+// A true discriminated union (not the flat-optional-fields style used above for
+// GuardSpecDto) because `fallback` recursively nests another
+// CatalogProviderConfig — TS narrows `.type` correctly through the recursion,
+// which the flat style doesn't support.
+//
+// Caching is a `cache` field on each real (network-calling) provider's own
+// config, not a separate wrapper type to remember to nest.
+// ---------------------------------------------------------------------------
+
+/** TTL + capacity-bounded cache for one provider's lookups. `undefined`/`null`
+ * on the owning provider means every lookup goes straight to the backing
+ * service — table/column metadata rarely changes, so a much longer TTL than a
+ * query result cache is normally safe. */
+export interface CatalogCacheConfigDto {
+  ttlSeconds: number;
+  maxEntries: number;
+}
+
+/**
+ * AWS credentials for the `glue` provider — same shape as engine cluster
+ * config's `ClusterAuth` (only `accessKey`/`roleArn` apply to AWS; omitted
+ * means the default AWS credential chain).
+ */
+export type GlueAuthConfig =
+  | { type: "accessKey"; accessKeyId: string; secretAccessKey: string; sessionToken?: string | null }
+  | { type: "roleArn"; roleArn: string; externalId?: string | null };
+
+/** Auth for the `icebergRest` provider — maps directly onto the REST protocol's
+ * own `credential`/`token` property keys. */
+export type IcebergRestAuthConfig =
+  | { type: "oauth2ClientCredentials"; clientId: string; clientSecret: string }
+  | { type: "bearerToken"; token: string };
+
+export type CatalogProviderConfig =
+  | { type: "null" }
+  | { type: "hiveMetastore"; uri: string; cache?: CatalogCacheConfigDto | null }
+  | {
+      type: "glue";
+      region?: string | null;
+      auth?: GlueAuthConfig | null;
+      cache?: CatalogCacheConfigDto | null;
+    }
+  | {
+      type: "icebergRest";
+      uri: string;
+      warehouse?: string | null;
+      catalogName: string;
+      auth?: IcebergRestAuthConfig | null;
+      cache?: CatalogCacheConfigDto | null;
+    }
+  | {
+      type: "fallback";
+      primary: CatalogProviderConfig;
+      secondary: CatalogProviderConfig;
+    };
+
+export interface TestCatalogProviderResponse {
+  ok: boolean;
+  message: string;
+}

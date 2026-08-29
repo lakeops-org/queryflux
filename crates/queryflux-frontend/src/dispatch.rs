@@ -27,7 +27,6 @@ use queryflux_engine_adapters::{
 };
 use queryflux_guardrails::{GuardChain, GuardContext, GuardLayer};
 use queryflux_metrics::MetricsStore;
-use queryflux_translation::SchemaContext;
 
 use tracing::{debug, info, warn};
 
@@ -183,6 +182,7 @@ pub async fn dispatch_query(
         cluster_cfg,
         adapters,
         max_queued_queries,
+        catalog,
     ) = {
         let live = state.live.read().await;
         (
@@ -212,6 +212,7 @@ pub async fn dispatch_query(
                 .get(&group.0)
                 .copied()
                 .flatten(),
+            live.catalog.clone(),
         )
     };
 
@@ -354,13 +355,23 @@ pub async fn dispatch_query(
     let engine_type = adapter_kind.engine_type();
     let original_sql = sql.clone();
     let sql = if should_attempt_translation(&session, &protocol) {
+        let schema_context = state
+            .translation
+            .resolve_schema_context(
+                &sql,
+                &src_dialect,
+                &catalog,
+                session.catalog(),
+                session.database(),
+            )
+            .await;
         match state
             .translation
             .maybe_translate(
                 &sql,
                 &src_dialect,
                 &tgt_dialect,
-                &SchemaContext::default(),
+                &schema_context,
                 &group_fixups,
             )
             .await
@@ -1287,7 +1298,7 @@ async fn setup_sync_query(
 ) -> Result<SyncQuerySetup> {
     let query_id = ProxyQueryId::new();
 
-    let (cluster_manager, group_fixups, group_default_tags, wait_timeout_secs) = {
+    let (cluster_manager, group_fixups, group_default_tags, wait_timeout_secs, catalog) = {
         let live = state.live.read().await;
         let wait_timeout_secs = live
             .group_capacity_wait_timeout_secs
@@ -1305,6 +1316,7 @@ async fn setup_sync_query(
                 .cloned()
                 .unwrap_or_default(),
             wait_timeout_secs,
+            live.catalog.clone(),
         )
     };
     let effective_tags: QueryTags = merge_tags(&group_default_tags, &session.tags().clone());
@@ -1405,13 +1417,23 @@ async fn setup_sync_query(
     // (sqlglot never invoked) when should_attempt_translation is false — see its doc
     // comment for why MCP without a declared dialect takes this path.
     let translated = if should_attempt_translation(&session, &protocol) {
+        let schema_context = state
+            .translation
+            .resolve_schema_context(
+                &sql,
+                &src_dialect,
+                &catalog,
+                session.catalog(),
+                session.database(),
+            )
+            .await;
         match state
             .translation
             .maybe_translate(
                 &sql,
                 &src_dialect,
                 &tgt_dialect,
-                &SchemaContext::default(),
+                &schema_context,
                 &group_fixups,
             )
             .await

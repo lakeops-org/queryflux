@@ -241,6 +241,9 @@ pub async fn query_request(
     let session_ctx = SessionContext {
         user: Some(auth_ctx.user.clone()),
         database: Some(database.clone()),
+        // See the matching comment in snowflake/http/handlers/session.rs — mapped
+        // onto our catalog.database.table model as catalog, not database.
+        catalog: Some(database.clone()),
         tags: QueryTags::default(),
         extra,
         agent_context: None,

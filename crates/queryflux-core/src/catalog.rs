@@ -75,6 +75,18 @@ pub trait CatalogProvider: Send + Sync {
         }
         Ok(schemas)
     }
+
+    /// True for a provider that is known to always return empty results (i.e.
+    /// `NullCatalogProvider`). Lets callers on a hot path (schema-aware translation)
+    /// skip catalog lookup — and any SQL parsing needed just to build the lookup
+    /// request — entirely when no real catalog is configured, rather than paying
+    /// that cost only to get an empty answer back. Composite providers (caching,
+    /// fallback) are not required to propagate this from their delegate(s): it's a
+    /// fast-path hint, not a correctness requirement — worst case, a query pays for
+    /// a lookup that returns nothing, exactly as it would without this method.
+    fn is_null(&self) -> bool {
+        false
+    }
 }
 
 /// No-op catalog provider — returns empty results, sqlglot does best-effort translation.
@@ -98,5 +110,8 @@ impl CatalogProvider for NullCatalogProvider {
         _table: &str,
     ) -> Result<Option<TableSchema>> {
         Ok(None)
+    }
+    fn is_null(&self) -> bool {
+        true
     }
 }

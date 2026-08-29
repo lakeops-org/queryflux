@@ -9,14 +9,22 @@ on:
       - opened
       - edited
       - synchronize
+      - reopened
+      - ready_for_review
       - labeled
       - unlabeled
+
+# New pushes to the same PR cancel an in-progress title check.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 permissions:
   pull-requests: write
 
 jobs:
   check:
+    if: github.event.pull_request.draft == false
     runs-on: ubuntu-latest
     steps:
       - uses: thehanimo/pr-title-checker@v1.4.3

@@ -3,10 +3,20 @@ name: Docs build
 
 on:
   pull_request:
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - ready_for_review
     paths:
       - 'website/**'
       - '.github/workflows/docs-build.yml'
   workflow_dispatch:
+
+# New pushes to the same PR cancel an in-progress docs build.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
@@ -14,6 +24,7 @@ permissions:
 jobs:
   docusaurus:
     name: Docusaurus build
+    if: github.event_name == 'workflow_dispatch' || github.event.pull_request.draft == false
     runs-on: ubuntu-latest
     defaults:
       run:

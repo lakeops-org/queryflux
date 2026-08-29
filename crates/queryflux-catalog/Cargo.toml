@@ -1,0 +1,44 @@
+[package]
+name = "queryflux-catalog"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+queryflux-core = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+# Same generation as the Athena adapter's aws-sdk-athena — direct Glue Data
+# Catalog access, format-agnostic (unlike iceberg-catalog-glue, which only sees
+# Iceberg-format tables).
+aws-sdk-glue = "1"
+aws-config = { version = "1", default-features = false, features = ["rustls", "rt-tokio"] }
+aws-credential-types = "1"
+aws-types = "1"
+# Iceberg REST Catalog client — the protocol here genuinely is Iceberg-specific
+# (a REST catalog server only ever serves Iceberg tables), unlike Glue/HMS, so
+# reusing the upstream client is the right call rather than hand-rolling one.
+iceberg = "0.7"
+iceberg-catalog-rest = "0.7"
+# Hive Metastore — the *raw* Thrift client (not iceberg-catalog-hms, which only
+# understands Iceberg-format tables registered in HMS). Same crates this org's
+# iceberg-rust fork depends on for its own HMS catalog support.
+hive_metastore = "0.2"
+volo-thrift = "0.10"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util", "macros"] }
+# Iceberg REST Catalog is plain HTTP/JSON, so a real (mocked) HTTP server is
+# the natural way to test it end to end.
+mockito = "1"
+# Glue speaks AWS's JSON 1.1 protocol over HTTP — these let a test swap in a
+# canned HTTP client (StaticReplayClient) so GetDatabases/GetTables/GetTable
+# round-trip through the real aws-sdk-glue (de)serialization path.
+aws-smithy-http-client = { version = "1", features = ["test-util"] }
+aws-smithy-types = "1"
+http = "1"
+# Needed to stand up an in-process fake Hive Metastore server for tests — its
+# generated trait references `::pilota::FastStr` directly.
+pilota = "0.11"
+volo = "0.10"

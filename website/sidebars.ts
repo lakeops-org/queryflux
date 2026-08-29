@@ -47,6 +47,7 @@ const sidebars: SidebarsConfig = {
         'architecture/motivation-and-goals',
         'architecture/system-map',
         'architecture/query-translation',
+        'architecture/catalog-integration',
         'architecture/routing-and-clusters',
         'architecture/cluster-variants-and-health',
         'architecture/caching',

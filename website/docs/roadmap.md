@@ -62,9 +62,9 @@ These are the next items actively being worked on or immediately queued.
 
 ### Schema-aware SQL translation
 
-Today's translation is **dialect-only**: `sqlglot.transpile(sql, read=src, write=tgt)`. It handles syntax differences but cannot resolve semantic gaps that require knowing the target schema — e.g. resolving ambiguous column references, pushing down predicates, or rewriting unsupported functions against actual table definitions.
+Translation was **dialect-only** — `sqlglot.transpile(sql, read=src, write=tgt)` — which handles syntax differences but can't resolve semantic gaps that require knowing the target schema (e.g. resolving ambiguous column references against actual table definitions). The foundation for schema-aware translation now exists: a pluggable `CatalogProvider` populates `SchemaContext`, which `sqlglot.optimizer.optimize` uses with a `MappingSchema` — dialect-only remains the automatic fallback whenever no schema is available or optimization fails. See [Catalog Provider](./architecture/catalog-integration) for the full picture.
 
-The plan: wire `SchemaContext` (populated from catalog discovery via `EngineAdapterTrait::list_tables` / `describe_table`) into the dispatch path so the translator can call `sqlglot.optimizer.optimize` with a `MappingSchema`. Dialect-only remains the fallback when the schema is unavailable or optimization fails.
+Implemented catalog providers: `glue` (direct AWS Glue Data Catalog access), `hiveMetastore` (raw Hive Metastore Thrift protocol), `icebergRest` (Iceberg REST Catalog protocol — Polaris, Tabular, etc.), and `fallback` (composes two providers). Each real provider carries its own optional `cache` field.
 
 ### ClickHouse HTTP frontend
 

@@ -76,7 +76,7 @@ SELECT * FROM qf.my_catalog.my_schema.my_table LIMIT 10;
 | `DoAction` / `ListActions` | Not implemented. |
 | Prepared statements (`CreatePreparedStatement`, `ClosePreparedStatement`, `ExecutePreparedStatement`) | Not implemented. |
 | Query tags | Not extracted. `SessionContext.tags` is always empty; the `tags` router type cannot be used with Flight SQL clients. |
-| `database` hint | Not extracted. `SessionContext.database` is always `None`; only `user` and metadata entries in `extra` are available for routing. |
+| `database`/`catalog` hint | Not extracted. `SessionContext.database` and `SessionContext.catalog` are always `None`; only `user` and metadata entries in `extra` are available for routing. |
 | TLS | Not terminated by QueryFlux. Use an external TLS terminator or gRPC plaintext. |
 
 ## Related

@@ -115,6 +115,7 @@ mod tests {
             auth_provider: Arc::new(queryflux_auth::NoneAuthProvider::new(false)),
             authorization: Arc::new(SimpleAuthorizationPolicy::new(policies))
                 as Arc<dyn AuthorizationChecker>,
+            catalog: Arc::new(queryflux_core::catalog::NullCatalogProvider),
         }
     }
 

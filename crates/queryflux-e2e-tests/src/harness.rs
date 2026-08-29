@@ -357,6 +357,7 @@ impl TestHarness {
             auth_provider: Arc::new(NoneAuthProvider::new(false)) as Arc<dyn AuthProvider>,
             authorization: Arc::new(AllowAllAuthorization::default())
                 as Arc<dyn AuthorizationChecker>,
+            catalog: Arc::new(queryflux_core::catalog::NullCatalogProvider),
         };
         let records = Arc::new(Mutex::new(Vec::<QueryRecord>::new()));
         let state = Arc::new(AppState {
@@ -606,6 +607,7 @@ impl WireTestHarness {
             auth_provider: Arc::new(NoneAuthProvider::new(false)) as Arc<dyn AuthProvider>,
             authorization: Arc::new(AllowAllAuthorization::default())
                 as Arc<dyn AuthorizationChecker>,
+            catalog: Arc::new(queryflux_core::catalog::NullCatalogProvider),
         };
 
         let state = Arc::new(AppState {
@@ -749,6 +751,7 @@ impl WireTestHarness {
             auth_provider: Arc::new(NoneAuthProvider::new(false)) as Arc<dyn AuthProvider>,
             authorization: Arc::new(AllowAllAuthorization::default())
                 as Arc<dyn AuthorizationChecker>,
+            catalog: Arc::new(queryflux_core::catalog::NullCatalogProvider),
         };
 
         let state = Arc::new(AppState {
@@ -919,6 +922,7 @@ impl ProtocolWireHarness {
             auth_provider: Arc::new(NoneAuthProvider::new(false)) as Arc<dyn AuthProvider>,
             authorization: Arc::new(AllowAllAuthorization::default())
                 as Arc<dyn AuthorizationChecker>,
+            catalog: Arc::new(queryflux_core::catalog::NullCatalogProvider),
         };
 
         let records: Arc<Mutex<Vec<QueryRecord>>> = Arc::new(Mutex::new(Vec::new()));

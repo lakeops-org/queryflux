@@ -259,7 +259,10 @@ pub async fn submit_statement(
 
     let session_ctx = SessionContext {
         user: Some(auth_ctx.user.clone()),
-        database,
+        database: database.clone(),
+        // See the matching comment in snowflake/http/handlers/session.rs — mapped
+        // onto our catalog.database.table model as catalog, not database.
+        catalog: database,
         tags: QueryTags::default(),
         extra,
         agent_context: None,

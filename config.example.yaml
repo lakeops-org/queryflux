@@ -80,6 +80,71 @@ translation:
   #         if dst == "athena":
   #             for table in ast.find_all(exp.Table):
   #                 table.set("catalog", None)
+  # Max time to spend on catalog lookup (see `catalogProvider` below) before
+  # falling back to dialect-only translation. Default 1500ms.
+  # schemaResolutionTimeoutMs: 1500
+
+# Native catalog integration — discovers table/column metadata so schema-aware SQL
+# translation (sqlglot's optimizer) can qualify columns/types, not just transpile
+# syntax. Defaults to `type: null` (no metadata, dialect-only translation only).
+catalogProvider:
+  type: null
+  # --- Other provider examples ---
+  # AWS Glue Data Catalog — direct Glue API access (format-agnostic: sees
+  # Iceberg, Hive/Parquet, and any other table format Glue tracks). `auth` is
+  # optional and follows the same shape as engine cluster `auth`; omit it to
+  # use the default AWS credential chain (env vars, ECS task role, EC2
+  # instance profile, etc.). `cache` is a field on the provider itself (not a
+  # separate wrapper type) — Glue makes a real network call per uncached
+  # lookup and table schemas rarely change, so a longer TTL than a query
+  # result cache is normally safe; a `glue` config with no `cache` logs a
+  # startup warning recommending one.
+  # type: glue
+  # region: us-east-1
+  # auth:
+  #   type: roleArn
+  #   roleArn: arn:aws:iam::123456789012:role/queryflux-glue-readonly
+  #   externalId: ${GLUE_EXTERNAL_ID}
+  # cache:
+  #   ttlSeconds: 300
+  #   maxEntries: 10000
+  #
+  # Iceberg REST Catalog protocol — Polaris, Tabular, Unity's REST endpoint, or
+  # Snowflake's Horizon endpoint for Snowflake-managed Iceberg tables. `uri` is
+  # the catalog's REST endpoint; `catalogName` is just echoed back by
+  # list_catalogs() (the protocol has no "list catalogs" call — one REST
+  # endpoint *is* one catalog). `auth` is optional; omit for an unauthenticated
+  # (e.g. local dev) catalog server.
+  # type: icebergRest
+  # uri: https://polaris.example.com/api/catalog
+  # warehouse: s3://my-bucket/warehouse
+  # catalogName: prod
+  # auth:
+  #   type: oauth2ClientCredentials
+  #   clientId: ${ICEBERG_REST_CLIENT_ID}
+  #   clientSecret: ${ICEBERG_REST_CLIENT_SECRET}
+  # cache:
+  #   ttlSeconds: 300
+  #   maxEntries: 10000
+  #
+  # Raw Hive Metastore Thrift protocol — format-agnostic (plain Hive/Parquet
+  # tables, not just Iceberg-format ones registered in HMS).
+  # type: hiveMetastore
+  # uri: thrift://localhost:9083
+  # cache:
+  #   ttlSeconds: 300
+  #   maxEntries: 10000
+  #
+  # Try a primary provider, fall back to a secondary on error (or a missing
+  # table, for get_table_schema specifically). Note: "null" must be quoted here —
+  # a bare YAML `null` parses as YAML's null type, not the string tag `type` expects.
+  # type: fallback
+  # primary:
+  #   type: glue
+  #   region: us-east-1
+  #   cache: { ttlSeconds: 300, maxEntries: 10000 }
+  # secondary:
+  #   type: "null"
 
 routers:
   - type: protocolBased

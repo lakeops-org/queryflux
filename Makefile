@@ -19,6 +19,13 @@ endif
 TPCH_SCALE ?= tiny
 export TPCH_SCALE
 
+# Prefer nextest when installed (CI); fall back to cargo test for local dev.
+ifneq ($(shell command -v cargo-nextest 2>/dev/null),)
+TEST_RUNNER = cargo nextest run --workspace --exclude queryflux-e2e-tests --exclude queryflux-bench -E 'kind(test)'
+else
+TEST_RUNNER = $(CARGO) test --tests --workspace --exclude queryflux-e2e-tests --exclude queryflux-bench
+endif
+
 .PHONY: dev stop logs build lint clippy check helm-check test benchmark benchmark-build benchmark-run test-e2e clean setup
 
 ## Create virtualenv and install Python dependencies (sqlglot etc.)
@@ -65,15 +72,15 @@ clippy:
 helm-check:
 	scripts/check-helm-chart.sh
 
-## Run unit/integration tests (no external services needed).
-## Same command as CI `.github/workflows/ci.yml` (`make test`).
+## Run integration tests in `tests/` (no external services needed).
+## Same command as CI `.github/workflows/ci.yml` (`make test`); uses nextest when installed.
 ## PYO3_PYTHON + PYTHONPATH: PyO3 (routing + translation). The venv must include `sqlglot`
 ## (`pip install -r requirements.txt` via `make setup`) for `queryflux-translation` transform tests.
 test:
 	@test -f .venv/bin/python3 || (echo "Run 'make setup' first" && exit 1)
 	PYO3_PYTHON=$(shell pwd)/.venv/bin/python3 \
 	PYTHONPATH=$(PYTHONPATH_VENV) \
-	$(CARGO) test --tests --workspace --exclude queryflux-e2e-tests --exclude queryflux-bench
+	$(TEST_RUNNER)
 
 ## Micro-benchmark: mock Trino + StarRocks backends vs QueryFlux (release build).
 ## Optional: QUERYFLUX_BENCH_WARMUP, QUERYFLUX_BENCH_ITERATIONS, QUERYFLUX_BENCH_TRINO_POLL.

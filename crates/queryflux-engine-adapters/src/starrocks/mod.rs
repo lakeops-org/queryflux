@@ -298,7 +298,7 @@ impl StarRocksAdapter {
         params: &queryflux_core::params::QueryParams,
         batch_tx: &tokio::sync::mpsc::Sender<Result<RecordBatch>>,
     ) -> Result<()> {
-        if let Some(db) = session.database() {
+        if let Some(db) = session.database_hint() {
             let use_sql = format!("USE `{}`", db.replace('`', "``"));
             conn.query_drop(&use_sql)
                 .await

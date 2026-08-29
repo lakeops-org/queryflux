@@ -5,6 +5,7 @@ use chrono::Utc;
 use queryflux_auth::{AuthProvider, AuthorizationChecker, BackendIdentityResolver};
 use queryflux_cluster_manager::{cluster_state::ClusterState, ClusterGroupManager};
 use queryflux_core::{
+    catalog::CatalogProvider,
     config::ClusterConfig,
     params::QueryParams,
     query::{
@@ -71,6 +72,12 @@ pub struct LiveConfig {
     /// Checks whether an authenticated user may access a cluster group — hot-reloaded
     /// when security config changes via admin API.
     pub authorization: Arc<dyn AuthorizationChecker>,
+    /// Discovers table/column metadata for schema-aware translation
+    /// (`TranslationService::resolve_schema_context`) — hot-reloaded when catalog
+    /// config changes via the admin API. `NullCatalogProvider` when no
+    /// `catalogProvider` is configured; every call site treats that identically to
+    /// "catalog lookup found nothing," never as an error.
+    pub catalog: Arc<dyn CatalogProvider>,
 }
 
 /// Shared application state — passed to every handler via `axum::extract::State`.
@@ -248,8 +255,8 @@ impl AppState {
             was_translated: ctx.was_translated,
             translated_sql: ctx.translated_sql.clone(),
             user: ctx.session.user().map(|s| s.to_string()),
-            catalog: ctx.session.database().map(|s| s.to_string()),
-            database: None,
+            catalog: ctx.session.catalog().map(|s| s.to_string()),
+            database: ctx.session.database().map(|s| s.to_string()),
             sql_preview: ctx.sql.chars().take(500).collect(),
             status: outcome.status,
             routing_trace: outcome
@@ -674,6 +681,7 @@ pub mod test_fixtures {
             auth_provider: Arc::new(NoneAuthProvider::new(auth_required)) as Arc<dyn AuthProvider>,
             authorization: Arc::new(AllowAllAuthorization::default())
                 as Arc<dyn AuthorizationChecker>,
+            catalog: Arc::new(queryflux_core::catalog::NullCatalogProvider),
         };
         Arc::new(AppState {
             external_address: "http://127.0.0.1:8080".into(),
