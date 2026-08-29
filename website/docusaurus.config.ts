@@ -24,6 +24,13 @@ const config: Config = {
   organizationName: 'lakeops-org',
   projectName: 'queryflux',
 
+  // Baked at build/start time (Node); read in the client via siteConfig.customFields.
+  customFields: {
+    openPanelClientId:
+      process.env.OPENPANEL_CLIENT_ID ?? 'f88d1483-36bc-4a52-8333-7f5865e78d16',
+    openPanelDisabled: process.env.OPENPANEL_DISABLED === 'true',
+  },
+
   // https://docusaurus.io/docs/deployment#deploying-to-github-pages
   trailingSlash: false,
 

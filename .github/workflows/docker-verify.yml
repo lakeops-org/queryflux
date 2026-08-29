@@ -1,34 +1,35 @@
-# Verify both image targets on PRs (host platform only, no push).
+# Verify server-only image on PRs (host platform only, no push).
+# Unified (server+studio) image is built on release — see release.yml / docker-publish-tag.yml.
 #   One Dockerfile: docker/queryflux/Dockerfile — targets runtime-server | runtime-unified
 
 name: Docker — QueryFlux (verify)
 
 on:
   pull_request:
-    paths-ignore:
-      - 'website/**'
-      - 'docs/**'
-      - '**/*.md'
-      - '.github/ISSUE_TEMPLATE/**'
-      - '.github/DISCUSSION_TEMPLATE/**'
-      - '.github/PULL_REQUEST_TEMPLATE/**'
-      - 'LICENSE*'
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - ready_for_review
+    paths:
+      - 'crates/**'
+      - 'docker/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'requirements.txt'
+      - 'queryflux-studio/**'
+      - 'scripts/**'
+      - '.github/workflows/docker-verify.yml'
+
+# New pushes to the same PR cancel an in-progress docker verify run.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 jobs:
   docker-verify:
+    if: github.event.pull_request.draft == false
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: server-only
-            file: docker/queryflux/Dockerfile
-            target: runtime-server
-            tag: queryflux:pr-verify-slim
-          - name: server-and-studio
-            file: docker/queryflux/Dockerfile
-            target: runtime-unified
-            tag: queryflux:pr-verify-full
     permissions:
       contents: read
     steps:
@@ -37,14 +38,16 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Build ${{ matrix.name }} (no push)
+      - name: Build server-only (no push)
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: ${{ matrix.file }}
-          target: ${{ matrix.target }}
+          file: docker/queryflux/Dockerfile
+          target: runtime-server
           push: false
           load: true
-          tags: ${{ matrix.tag }}
+          tags: queryflux:pr-verify-slim
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
           build-args: |
             CARGO_BUILD_JOBS=4
