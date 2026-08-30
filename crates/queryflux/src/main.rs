@@ -53,6 +53,81 @@ use tracing::info;
 
 mod registered_engines;
 
+type FrontendTaskResult = queryflux_core::error::Result<()>;
+
+/// Owns only the frontend listeners that are actually running.
+///
+/// Keeping disabled frontends out of the task set is important for graceful
+/// shutdown: a placeholder future that never completes would make the drain
+/// timeout the only way to leave the process.
+#[derive(Default)]
+struct FrontendTasks {
+    tasks: tokio::task::JoinSet<FrontendTaskResult>,
+    names: HashMap<tokio::task::Id, &'static str>,
+}
+
+struct FrontendTaskExit {
+    name: &'static str,
+    result: std::result::Result<FrontendTaskResult, tokio::task::JoinError>,
+}
+
+impl FrontendTasks {
+    fn spawn<F>(&mut self, name: &'static str, task: F)
+    where
+        F: std::future::Future<Output = FrontendTaskResult> + Send + 'static,
+    {
+        let handle = self.tasks.spawn(task);
+        self.names.insert(handle.id(), name);
+    }
+
+    fn spawn_if_enabled<F>(&mut self, name: &'static str, enabled: bool, task: F)
+    where
+        F: std::future::Future<Output = FrontendTaskResult> + Send + 'static,
+    {
+        if enabled {
+            self.spawn(name, task);
+        }
+    }
+
+    async fn join_next(&mut self) -> Option<FrontendTaskExit> {
+        let result = self.tasks.join_next_with_id().await?;
+        Some(match result {
+            Ok((id, result)) => FrontendTaskExit {
+                name: self.names.remove(&id).unwrap_or("unknown frontend"),
+                result: Ok(result),
+            },
+            Err(error) => FrontendTaskExit {
+                name: self.names.remove(&error.id()).unwrap_or("unknown frontend"),
+                result: Err(error),
+            },
+        })
+    }
+
+    async fn drain(&mut self) {
+        while let Some(exit) = self.join_next().await {
+            match exit.result {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    tracing::warn!(
+                        frontend = exit.name,
+                        "Frontend failed while draining: {error}"
+                    )
+                }
+                Err(error) => tracing::warn!(
+                    frontend = exit.name,
+                    "Frontend task failed while draining: {error}"
+                ),
+            }
+        }
+    }
+
+    fn outstanding_names(&self) -> Vec<&'static str> {
+        let mut names: Vec<_> = self.names.values().copied().collect();
+        names.sort_unstable();
+        names
+    }
+}
+
 /// Returns `true` when the interval fired (continue work), `false` on shutdown.
 async fn tick_or_shutdown(
     interval: &mut tokio::time::Interval,
@@ -2002,95 +2077,73 @@ async fn main() -> Result<()> {
     // internally: axum-based frontends use `with_graceful_shutdown` (stop accepting,
     // finish in-flight requests), wire-based frontends break their accept loop, and
     // tonic (Flight SQL) uses `serve_with_shutdown`.
-    let mut trino_handle = tokio::spawn({
+    let mut frontend_tasks = FrontendTasks::default();
+
+    frontend_tasks.spawn_if_enabled("Trino HTTP", trino_cfg.enabled, {
         let state = app_state.clone();
         let rx = shutdown_rx.clone();
         let cfg = trino_cfg;
         async move {
-            if cfg.enabled {
-                TrinoHttpFrontend::new(state, cfg.port, cfg.max_connections)
-                    .listen(rx)
-                    .await
-            } else {
-                std::future::pending::<queryflux_core::error::Result<()>>().await
-            }
+            TrinoHttpFrontend::new(state, cfg.port, cfg.max_connections)
+                .listen(rx)
+                .await
         }
     });
-    let mut admin_handle = tokio::spawn({
+    frontend_tasks.spawn("Admin", {
         let rx = shutdown_rx.clone();
         async move { admin.listen(rx).await }
     });
-    let mut mysql_handle = tokio::spawn({
-        let state = app_state.clone();
-        let rx = shutdown_rx.clone();
-        let cfg = config.queryflux.frontends.mysql_wire.clone();
-        async move {
-            match cfg {
-                Some(c) if c.enabled => {
-                    MysqlWireFrontend::new(state, c.port, c.max_connections)
-                        .listen(rx)
-                        .await
-                }
-                _ => std::future::pending::<queryflux_core::error::Result<()>>().await,
+    if let Some(cfg) = config.queryflux.frontends.mysql_wire.clone() {
+        frontend_tasks.spawn_if_enabled("MySQL wire", cfg.enabled, {
+            let state = app_state.clone();
+            let rx = shutdown_rx.clone();
+            async move {
+                MysqlWireFrontend::new(state, cfg.port, cfg.max_connections)
+                    .listen(rx)
+                    .await
             }
-        }
-    });
-    let mut postgres_handle = tokio::spawn({
-        let state = app_state.clone();
-        let rx = shutdown_rx.clone();
-        let cfg = config.queryflux.frontends.postgres_wire.clone();
-        async move {
-            match cfg {
-                Some(c) if c.enabled => {
-                    PostgresWireFrontend::new(state, c.port, c.max_connections)
-                        .listen(rx)
-                        .await
-                }
-                _ => std::future::pending::<queryflux_core::error::Result<()>>().await,
+        });
+    }
+    if let Some(cfg) = config.queryflux.frontends.postgres_wire.clone() {
+        frontend_tasks.spawn_if_enabled("Postgres wire", cfg.enabled, {
+            let state = app_state.clone();
+            let rx = shutdown_rx.clone();
+            async move {
+                PostgresWireFrontend::new(state, cfg.port, cfg.max_connections)
+                    .listen(rx)
+                    .await
             }
-        }
-    });
-    let mut flight_sql_handle = tokio::spawn({
-        let state = app_state.clone();
-        let rx = shutdown_rx.clone();
-        let cfg = config.queryflux.frontends.flight_sql.clone();
-        async move {
-            match cfg {
-                Some(c) if c.enabled => {
-                    FlightSqlFrontend::new(state, c.port, c.max_connections)
-                        .listen(rx)
-                        .await
-                }
-                _ => std::future::pending::<queryflux_core::error::Result<()>>().await,
+        });
+    }
+    if let Some(cfg) = config.queryflux.frontends.flight_sql.clone() {
+        frontend_tasks.spawn_if_enabled("Flight SQL", cfg.enabled, {
+            let state = app_state.clone();
+            let rx = shutdown_rx.clone();
+            async move {
+                FlightSqlFrontend::new(state, cfg.port, cfg.max_connections)
+                    .listen(rx)
+                    .await
             }
-        }
-    });
-    let mut snowflake_handle = tokio::spawn({
-        let state = app_state.clone();
-        let rx = shutdown_rx.clone();
-        let cfg = config.queryflux.frontends.snowflake_http.clone();
-        async move {
-            match cfg {
-                Some(c) if c.enabled => SnowflakeFrontend::new(state, c).listen(rx).await,
-                _ => std::future::pending::<queryflux_core::error::Result<()>>().await,
+        });
+    }
+    if let Some(cfg) = config.queryflux.frontends.snowflake_http.clone() {
+        frontend_tasks.spawn_if_enabled("Snowflake", cfg.enabled, {
+            let state = app_state.clone();
+            let rx = shutdown_rx.clone();
+            async move { SnowflakeFrontend::new(state, cfg).listen(rx).await }
+        });
+    }
+    if let Some(cfg) = config.queryflux.frontends.mcp.clone() {
+        frontend_tasks.spawn_if_enabled("MCP", cfg.enabled, {
+            let state = app_state.clone();
+            let rx = shutdown_rx.clone();
+            async move {
+                McpFrontend::new(state, cfg.port, cfg.max_connections)
+                    .listen(rx)
+                    .await
             }
-        }
-    });
-    let mut mcp_handle = tokio::spawn({
-        let state = app_state.clone();
-        let rx = shutdown_rx.clone();
-        let cfg = config.queryflux.frontends.mcp.clone();
-        async move {
-            match cfg {
-                Some(c) if c.enabled => {
-                    McpFrontend::new(state, c.port, c.max_connections)
-                        .listen(rx)
-                        .await
-                }
-                _ => std::future::pending::<queryflux_core::error::Result<()>>().await,
-            }
-        }
-    });
+        });
+    }
 
     // Wait for either a shutdown signal or an unexpected frontend exit.
     let shutdown_signal = async {
@@ -2114,13 +2167,15 @@ async fn main() -> Result<()> {
 
     tokio::select! {
         _ = shutdown_signal => {},
-        r = &mut trino_handle   => { if let Ok(Err(e)) = r { tracing::error!("Trino HTTP exited unexpectedly: {e}"); } },
-        r = &mut admin_handle   => { if let Ok(Err(e)) = r { tracing::error!("Admin exited unexpectedly: {e}"); } },
-        r = &mut mysql_handle   => { if let Ok(Err(e)) = r { tracing::error!("MySQL wire exited unexpectedly: {e}"); } },
-        r = &mut postgres_handle => { if let Ok(Err(e)) = r { tracing::error!("Postgres wire exited unexpectedly: {e}"); } },
-        r = &mut flight_sql_handle => { if let Ok(Err(e)) = r { tracing::error!("Flight SQL exited unexpectedly: {e}"); } },
-        r = &mut snowflake_handle => { if let Ok(Err(e)) = r { tracing::error!("Snowflake exited unexpectedly: {e}"); } },
-        r = &mut mcp_handle => { if let Ok(Err(e)) = r { tracing::error!("MCP exited unexpectedly: {e}"); } },
+        exit = frontend_tasks.join_next() => {
+            if let Some(exit) = exit {
+                match exit.result {
+                    Ok(Ok(())) => tracing::warn!(frontend = exit.name, "Frontend exited unexpectedly"),
+                    Ok(Err(error)) => tracing::error!(frontend = exit.name, "Frontend exited unexpectedly: {error}"),
+                    Err(error) => tracing::error!(frontend = exit.name, "Frontend task failed: {error}"),
+                }
+            }
+        },
     }
 
     // --- Phase 1: signal all frontends to stop accepting new connections ---
@@ -2132,19 +2187,11 @@ async fn main() -> Result<()> {
     tracing::info!("Draining in-flight requests (timeout: {drain_timeout_secs}s)...");
 
     let drain_future = async {
-        // Wait for all frontends to finish processing in-flight requests.
+        // Wait for enabled frontends to finish processing in-flight requests.
         // Axum frontends complete when all connections are done; wire frontends
         // return immediately from their accept loop but spawned connection tasks
         // continue running.
-        let _ = tokio::join!(
-            trino_handle,
-            admin_handle,
-            mysql_handle,
-            postgres_handle,
-            flight_sql_handle,
-            snowflake_handle,
-            mcp_handle,
-        );
+        frontend_tasks.drain().await;
 
         // Poll persistence until no executing or queued queries remain (or until
         // the outer timeout fires). This covers spawned wire-protocol connection
@@ -2176,6 +2223,7 @@ async fn main() -> Result<()> {
         .await
         .is_err()
     {
+        let outstanding_frontends = frontend_tasks.outstanding_names();
         let executing = app_state
             .persistence
             .list_all()
@@ -2191,6 +2239,7 @@ async fn main() -> Result<()> {
         tracing::warn!(
             executing,
             queued,
+            ?outstanding_frontends,
             "Drain timeout reached after {drain_timeout_secs}s — forcing shutdown"
         );
     }
@@ -3703,6 +3752,36 @@ fn in_memory_metrics(
 
 #[cfg(test)]
 mod tests {
+    mod frontend_tasks {
+        use std::time::Duration;
+
+        use super::super::FrontendTasks;
+
+        #[tokio::test]
+        async fn disabled_frontend_does_not_block_shutdown_drain() {
+            let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+            let mut frontends = FrontendTasks::default();
+
+            frontends.spawn("enabled", async move {
+                shutdown_rx
+                    .wait_for(|shutdown| *shutdown)
+                    .await
+                    .expect("shutdown sender should remain available");
+                Ok(())
+            });
+            frontends.spawn_if_enabled("disabled", false, std::future::pending());
+
+            shutdown_tx
+                .send(true)
+                .expect("enabled frontend is listening");
+            tokio::time::timeout(Duration::from_millis(250), frontends.drain())
+                .await
+                .expect("disabled frontend must not hold the drain open");
+
+            assert!(frontends.outstanding_names().is_empty());
+        }
+    }
+
     mod unauthenticated_passthrough_warning {
         use super::super::unauthenticated_passthrough_clusters;
         use queryflux_core::config::ProxyConfig;
