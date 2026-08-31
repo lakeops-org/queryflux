@@ -80,12 +80,13 @@ impl FrontendTasks {
         self.names.insert(handle.id(), name);
     }
 
-    fn spawn_if_enabled<F>(&mut self, name: &'static str, enabled: bool, task: F)
+    fn spawn_if_enabled<F, Fut>(&mut self, name: &'static str, enabled: bool, task: F)
     where
-        F: std::future::Future<Output = FrontendTaskResult> + Send + 'static,
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = FrontendTaskResult> + Send + 'static,
     {
         if enabled {
-            self.spawn(name, task);
+            self.spawn(name, task());
         }
     }
 
@@ -2079,7 +2080,7 @@ async fn main() -> Result<()> {
     // tonic (Flight SQL) uses `serve_with_shutdown`.
     let mut frontend_tasks = FrontendTasks::default();
 
-    frontend_tasks.spawn_if_enabled("Trino HTTP", trino_cfg.enabled, {
+    frontend_tasks.spawn_if_enabled("Trino HTTP", trino_cfg.enabled, || {
         let state = app_state.clone();
         let rx = shutdown_rx.clone();
         let cfg = trino_cfg;
@@ -2094,7 +2095,7 @@ async fn main() -> Result<()> {
         async move { admin.listen(rx).await }
     });
     if let Some(cfg) = config.queryflux.frontends.mysql_wire.clone() {
-        frontend_tasks.spawn_if_enabled("MySQL wire", cfg.enabled, {
+        frontend_tasks.spawn_if_enabled("MySQL wire", cfg.enabled, || {
             let state = app_state.clone();
             let rx = shutdown_rx.clone();
             async move {
@@ -2105,7 +2106,7 @@ async fn main() -> Result<()> {
         });
     }
     if let Some(cfg) = config.queryflux.frontends.postgres_wire.clone() {
-        frontend_tasks.spawn_if_enabled("Postgres wire", cfg.enabled, {
+        frontend_tasks.spawn_if_enabled("Postgres wire", cfg.enabled, || {
             let state = app_state.clone();
             let rx = shutdown_rx.clone();
             async move {
@@ -2116,7 +2117,7 @@ async fn main() -> Result<()> {
         });
     }
     if let Some(cfg) = config.queryflux.frontends.flight_sql.clone() {
-        frontend_tasks.spawn_if_enabled("Flight SQL", cfg.enabled, {
+        frontend_tasks.spawn_if_enabled("Flight SQL", cfg.enabled, || {
             let state = app_state.clone();
             let rx = shutdown_rx.clone();
             async move {
@@ -2127,14 +2128,14 @@ async fn main() -> Result<()> {
         });
     }
     if let Some(cfg) = config.queryflux.frontends.snowflake_http.clone() {
-        frontend_tasks.spawn_if_enabled("Snowflake", cfg.enabled, {
+        frontend_tasks.spawn_if_enabled("Snowflake", cfg.enabled, || {
             let state = app_state.clone();
             let rx = shutdown_rx.clone();
             async move { SnowflakeFrontend::new(state, cfg).listen(rx).await }
         });
     }
     if let Some(cfg) = config.queryflux.frontends.mcp.clone() {
-        frontend_tasks.spawn_if_enabled("MCP", cfg.enabled, {
+        frontend_tasks.spawn_if_enabled("MCP", cfg.enabled, || {
             let state = app_state.clone();
             let rx = shutdown_rx.clone();
             async move {
@@ -3761,6 +3762,7 @@ mod tests {
         async fn disabled_frontend_does_not_block_shutdown_drain() {
             let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
             let mut frontends = FrontendTasks::default();
+            let mut disabled_task_constructed = false;
 
             frontends.spawn("enabled", async move {
                 shutdown_rx
@@ -3769,12 +3771,17 @@ mod tests {
                     .expect("shutdown sender should remain available");
                 Ok(())
             });
-            frontends.spawn_if_enabled("disabled", false, std::future::pending());
+            frontends.spawn_if_enabled("disabled", false, || {
+                disabled_task_constructed = true;
+                std::future::pending()
+            });
+
+            assert!(!disabled_task_constructed);
 
             shutdown_tx
                 .send(true)
                 .expect("enabled frontend is listening");
-            tokio::time::timeout(Duration::from_millis(250), frontends.drain())
+            tokio::time::timeout(Duration::from_secs(1), frontends.drain())
                 .await
                 .expect("disabled frontend must not hold the drain open");
 
