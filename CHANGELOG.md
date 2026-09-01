@@ -1,5 +1,26 @@
 # Changelog
 
+## [0.4.0](https://github.com/lakeops-org/queryflux/compare/queryflux-v0.3.0...queryflux-v0.4.0) (2026-09-01)
+
+
+### Features
+
+* ADBC key-pair (JWT) auth for Snowflake clusters ([#181](https://github.com/lakeops-org/queryflux/issues/181)) ([1840447](https://github.com/lakeops-org/queryflux/commit/18404478c7a8c7f0be0dc9c4d8a68c14e158db19))
+* cluster variants, ADBC health/reconcile, and distributed runnin… ([#93](https://github.com/lakeops-org/queryflux/issues/93)) ([7f3226f](https://github.com/lakeops-org/queryflux/commit/7f3226fd237f57a909a4aa27f4e4403592ad9d74))
+* **cluster-manager:** Python-scripted cluster selection strategy ([#173](https://github.com/lakeops-org/queryflux/issues/173)) ([77ef45d](https://github.com/lakeops-org/queryflux/commit/77ef45da7f8a208e5a4796341108804f78a2f621))
+* MCP (Model Context Protocol) frontend ([#190](https://github.com/lakeops-org/queryflux/issues/190)) ([ee6deee](https://github.com/lakeops-org/queryflux/commit/ee6deeeb4cd28023d32adfd5ca934eb3916151d0))
+* passthrough queryAuth mode for ADBC/Snowflake ([#184](https://github.com/lakeops-org/queryflux/issues/184)) ([119ec3d](https://github.com/lakeops-org/queryflux/commit/119ec3dc01ca1dc020c74b2306e32753083f0d2d))
+* remove EngineDelegate, add real Iceberg REST + Hive Metastore catalog providers ([#208](https://github.com/lakeops-org/queryflux/issues/208)) ([2ad9df9](https://github.com/lakeops-org/queryflux/commit/2ad9df9b14433aaca896c189f7d889b7c1859f10))
+* session-scoped ADBC pooling for Snowflake USE ROLE/WAREHOUSE/SCHEMA ([#182](https://github.com/lakeops-org/queryflux/issues/182)) ([661399e](https://github.com/lakeops-org/queryflux/commit/661399e4fd67077526d3b4b58841dbe74871b1de))
+
+
+### Bug Fixes
+
+* allow test: as a valid PR title type ([#186](https://github.com/lakeops-org/queryflux/issues/186)) ([5e5099e](https://github.com/lakeops-org/queryflux/commit/5e5099e83609cb908c0219c26bc9bfa6e4088945))
+* avoid waiting full drain timeout during idle shutdown ([#209](https://github.com/lakeops-org/queryflux/issues/209)) ([dbbf26a](https://github.com/lakeops-org/queryflux/commit/dbbf26a9f58ee831585ce0de840cbd0a98b9ab03))
+* reject double-bang PR titles like "feat!!: x" ([#187](https://github.com/lakeops-org/queryflux/issues/187)) ([26c1e5a](https://github.com/lakeops-org/queryflux/commit/26c1e5a5a1da4eb93ac8bb0473ec73ed68a0b604))
+* use ADBC execute_update for DDL/DML wire OK responses ([#101](https://github.com/lakeops-org/queryflux/issues/101)) ([9e51319](https://github.com/lakeops-org/queryflux/commit/9e5131941a22e42b688f849f34e0cfc1cb1c87d3))
+
 ## [0.3.0](https://github.com/lakeops-org/queryflux/compare/queryflux-v0.2.0...queryflux-v0.3.0) (2026-08-19)
 
 
