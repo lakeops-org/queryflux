@@ -337,4 +337,4 @@ After a write, the proxy hot-reloads adapters and custom query maps without rest
 | ADBC introspection | `crates/queryflux-engine-adapters/src/adbc/introspection.rs` and driver modules |
 | CapacityStore | `crates/queryflux-persistence/src/lib.rs` |
 | Distributed coordination schema | `crates/queryflux-persistence/src/postgres/migrations/20260611000001_distributed_coordination.sql` |
-| Studio forms | `queryflux-studio/components/add-cluster-dialog.tsx`, `app/clusters/clusters-grid.tsx` |
+| Studio forms | `components/add-cluster-dialog.tsx`, `app/clusters/clusters-grid.tsx` in [queryflux-console](https://github.com/lakeops-org/queryflux-console) |

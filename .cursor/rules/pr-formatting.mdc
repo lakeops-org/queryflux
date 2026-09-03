@@ -28,6 +28,6 @@ Before **creating, updating, or pushing** a branch for a pull request:
    CARGO_TARGET_DIR=target cargo test …
    ```
 
-CI uses Rust **1.91.1**. Formatting is `cargo fmt --all -- --check`. There is no separate Prettier step for `queryflux-studio` today.
+CI uses Rust **1.91.1**. Formatting is `cargo fmt --all -- --check`. QueryFlux Studio frontend checks are maintained separately in the `queryflux-console` repository.
 
 If formatting CI fails with checkout/SSL errors (not a diff from rustfmt), re-run the failed workflow after confirming local `cargo fmt --all -- --check` passes.

@@ -182,6 +182,7 @@ jobs:
           outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
           build-args: |
             CARGO_BUILD_JOBS=4
+            QUERYFLUX_CONSOLE_IMAGE=ghcr.io/lakeops-org/queryflux-console:${{ inputs.image_tag }}
           cache-from: type=gha,scope=queryflux-full-${{ matrix.suffix }}
           cache-to: type=gha,mode=max,scope=queryflux-full-${{ matrix.suffix }}
 

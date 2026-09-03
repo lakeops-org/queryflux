@@ -46,11 +46,20 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       base: ${{ steps.compute.outputs.base }}
+      console_tag: ${{ steps.compute.outputs.console_tag }}
     steps:
       - id: compute
         run: |
           raw="${{ needs.release_please.outputs.tag_name }}"
-          echo "base=${raw#queryflux-}" >> "$GITHUB_OUTPUT"
+          base="${raw#queryflux-}"
+
+          echo "base=${base}" >> "$GITHUB_OUTPUT"
+
+          if [ -n "$base" ]; then
+            echo "console_tag=${base}" >> "$GITHUB_OUTPUT"
+          else
+            echo "console_tag=latest" >> "$GITHUB_OUTPUT"
+          fi
 
   # Snapshot website/docs into a new Docusaurus version so the published site tracks
   # releases instead of drifting (docs stayed pinned at 0.1.2 while the crate moved past
@@ -199,7 +208,7 @@ jobs:
 
   build-full:
     name: Build server + Studio (${{ matrix.suffix }})
-    needs: [release_please]
+    needs: [release_please, docker_tag_base]
     strategy:
       fail-fast: false
       matrix:
@@ -235,6 +244,7 @@ jobs:
           outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
           build-args: |
             CARGO_BUILD_JOBS=4
+            QUERYFLUX_CONSOLE_IMAGE=ghcr.io/lakeops-org/queryflux-console:${{ needs.docker_tag_base.outputs.console_tag }}
           cache-from: type=gha,scope=queryflux-full-${{ matrix.suffix }}
           cache-to: type=gha,mode=max,scope=queryflux-full-${{ matrix.suffix }}
 

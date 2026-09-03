@@ -17,6 +17,8 @@
 #
 # Final `cargo build` has no `--locked` (stub vs full crate sources); `cargo chef cook` uses `--locked`.
 
+ARG QUERYFLUX_CONSOLE_IMAGE=ghcr.io/lakeops-org/queryflux-console:latest
+
 # =============================================================================
 # Chef base — Python + Rust (rustup, cargo-chef)
 # =============================================================================
@@ -137,19 +139,9 @@ RUN set -eu; command -v dbc; dbc install trino \
  && dbc install bigquery
 
 # =============================================================================
-# QueryFlux Studio (Next.js standalone) — used by runtime-unified only
+# QueryFlux Console — pre-built standalone image used by runtime-unified
 # =============================================================================
-FROM node:20-bookworm-slim AS studio-deps
-WORKDIR /studio
-COPY queryflux-studio/package.json queryflux-studio/package-lock.json ./
-RUN npm ci
-
-FROM node:20-bookworm-slim AS studio-builder
-WORKDIR /studio
-COPY --from=studio-deps /studio/node_modules ./node_modules
-COPY queryflux-studio/ .
-ENV NEXT_TELEMETRY_DISABLED=1
-RUN npm run build
+FROM ${QUERYFLUX_CONSOLE_IMAGE} AS studio-image
 
 # =============================================================================
 # Runtime: server + Studio + Node (bundled UI)
@@ -186,9 +178,7 @@ RUN python3 -m venv /opt/venv && \
 COPY --from=builder /queryflux-binary /app/queryflux
 COPY --from=builder /queryflux-libduckdb.so /usr/local/lib/libduckdb.so
 COPY --from=adbc-drivers /root/.config/adbc/drivers/ /usr/local/lib/adbc/
-COPY --from=studio-builder /studio/public /app/studio/public
-COPY --from=studio-builder --chown=queryflux:queryflux /studio/.next/standalone /app/studio
-COPY --from=studio-builder --chown=queryflux:queryflux /studio/.next/static /app/studio/.next/static
+COPY --from=studio-image --chown=queryflux:queryflux /app/ /app/studio/
 
 COPY docker/queryflux-unified/entrypoint-unified.sh /app/entrypoint-unified.sh
 RUN chmod +x /app/queryflux /app/entrypoint-unified.sh

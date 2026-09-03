@@ -133,7 +133,6 @@ queryflux/
 │   ├── queryflux-fingerprint/      # Query fingerprinting (AST-based deduplication)
 │   ├── queryflux-bench/            # Proxy overhead benchmarks (mock backends)
 │   └── queryflux-e2e-tests/        # Integration tests
-├── queryflux-studio/               # Next.js management UI (cluster monitoring, query history)
 ├── prometheus/                     # Prometheus scrape config
 ├── grafana/                        # Grafana provisioning + dashboards
 ├── docker/                         # Docker Compose files
@@ -142,6 +141,8 @@ queryflux/
 ├── config.local.yaml               # Example config for local development
 └── Makefile                        # build / run / test shortcuts
 ```
+
+QueryFlux Studio is maintained separately in the [queryflux-console](https://github.com/lakeops-org/queryflux-console) repository.
 
 ---
 

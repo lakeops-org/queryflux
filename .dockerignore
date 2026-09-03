@@ -10,10 +10,6 @@ target/
 .venv/
 venv/
 
-# Studio: unified image copies queryflux-studio/; keep heavy dirs out of context.
-queryflux-studio/node_modules/
-queryflux-studio/.next/
-
 # Other UI roots (not used by Dockerfiles)
 ui/
 

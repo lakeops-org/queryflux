@@ -120,7 +120,7 @@ Other router types (**header**, **tags**, **queryRegex**, …) usually need **no
 
 ### Step 8 — Studio (optional)
 
-- **`queryflux-studio/app/protocols/page.tsx`** — if you want an icon on the Protocols page, extend **`PROTOCOL_SIMPLE_ICONS`** keyed by the **`id`** your admin DTO uses (match **`build_frontends_status`**).
+- **[`app/protocols/page.tsx`](https://github.com/lakeops-org/queryflux-console/blob/main/app/protocols/page.tsx)** in the `queryflux-console` repository — if you want an icon on the Protocols page, extend **`PROTOCOL_SIMPLE_ICONS`** keyed by the **`id`** your admin DTO uses (match **`build_frontends_status`**).
 
 Studio does **not** implement wire protocols; it only displays status from the Admin API.
 
