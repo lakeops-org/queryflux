@@ -118,17 +118,19 @@ Until the adapter exists, your `EngineConfig` variant may **`bail!("Engine <name
 
 ## QueryFlux Studio (optional but typical)
 
-Studio lives in **`queryflux-studio/`** at the repo root (Next.js). It talks to the Admin API; it does **not** embed Rust. Today, **Rust `descriptor()` and the TypeScript `descriptor` must match by hand** (same `engineKey`, field keys, auth). The proxy also serves **`GET /admin/engine-registry`**.
+Studio lives in the separate **[queryflux-console](https://github.com/lakeops-org/queryflux-console)** repository (Next.js). It talks to the Admin API; it does **not** embed Rust. Today, **Rust `descriptor()` and the TypeScript `descriptor` must match by hand** (same `engineKey`, field keys, auth). The proxy also serves **`GET /admin/engine-registry`**.
+
+Paths in this section are relative to the `queryflux-console` repository.
 
 **Minimum Studio work**
 
-1. **`queryflux-studio/lib/studio-engines/engines/<engine>.ts`** — export a **`StudioEngineModule`** with **`descriptor`** (mirror Rust), **`catalog`**, and optional **`validateFlat`**, **`customFormId`**, **`engineAffinity`**, **`extraTypeAliases`**.
-2. **`queryflux-studio/lib/studio-engines/manifest.ts`** — import and append to **`STUDIO_ENGINE_MODULES`**.
-3. **`queryflux-studio/components/engine-catalog.ts`** — add **`{ k: "studio", engineKey: "<same as Rust>" }`** to **`ENGINE_CATALOG_SLOTS`** so the engine appears in the picker.
+1. **`lib/studio-engines/engines/<engine>.ts`** — export a **`StudioEngineModule`** with **`descriptor`** (mirror Rust), **`catalog`**, and optional **`validateFlat`**, **`customFormId`**, **`engineAffinity`**, **`extraTypeAliases`**.
+2. **`lib/studio-engines/manifest.ts`** — import and append to **`STUDIO_ENGINE_MODULES`**.
+3. **`components/engine-catalog.ts`** — add **`{ k: "studio", engineKey: "<same as Rust>" }`** to **`ENGINE_CATALOG_SLOTS`** so the engine appears in the picker.
 
-**If you add new top-level keys** inside the persisted `config` JSON that the flat form must edit, update **`queryflux-studio/lib/cluster-persist-form.ts`** (`MANAGED_CONFIG_JSON_KEYS`, flat ↔ JSON helpers, **`buildValidateShape`**).
+**If you add new top-level keys** inside the persisted `config` JSON that the flat form must edit, update **`lib/cluster-persist-form.ts`** (`MANAGED_CONFIG_JSON_KEYS`, flat ↔ JSON helpers, **`buildValidateShape`**).
 
-**If the generic form is not enough**, register a custom component in **`queryflux-studio/components/cluster-config/studio-engine-forms.tsx`** and set **`customFormId`** on the module.
+**If the generic form is not enough**, register a custom component in **`components/cluster-config/studio-engine-forms.tsx`** and set **`customFormId`** on the module.
 
 | User-facing area | Main file(s) |
 |------------------|----------------|

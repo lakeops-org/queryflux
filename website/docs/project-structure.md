@@ -21,7 +21,6 @@ queryflux/
 ├── development.md · contribute.md · benchmark.md
 │
 ├── crates/                       # Rust workspace (see below)
-├── queryflux-studio/           # QueryFlux Studio — Next.js admin UI
 ├── examples/                     # Docker Compose examples (minimal, observability, full stack)
 │   ├── minimal-trino/
 │   ├── minimal-inmemory/
@@ -33,8 +32,7 @@ queryflux/
 │   ├── docker-compose.yml        # Stack used by `make env`
 │   ├── test/                     # E2E stack (`docker-compose.test.yml`, fakesnow)
 │   ├── fixtures/                 # SQL init, TPCH helpers, test data seeds
-│   ├── queryflux/                # QueryFlux container build
-│   └── queryflux-studio/         # Studio container build
+│   └── queryflux/                # QueryFlux container build
 ├── website/                      # Docusaurus documentation site
 ├── grafana/                      # Dashboards & provisioning
 ├── prometheus/                   # Example scrape config (host-oriented)
@@ -66,7 +64,7 @@ Authoritative workspace membership is **`Cargo.toml`** `[workspace] members`.
 
 | Path | Purpose |
 | --- | --- |
-| `queryflux-studio/` | Studio SPA: clusters, queries, routing — talks to QueryFlux **admin API** |
+| [queryflux-console](https://github.com/lakeops-org/queryflux-console) | Separate QueryFlux Studio repository: clusters, queries, routing — talks to QueryFlux **admin API** |
 | `examples/` | **Self-contained** compose files; run from each subdirectory |
 | `docker/` | Compose for **repo development** (`make env` / `make test-e2e`) and **Dockerfile** trees |
 | `grafana/` · `prometheus/` | Dashboards and sample Prometheus config |
