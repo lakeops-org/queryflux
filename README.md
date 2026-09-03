@@ -278,7 +278,6 @@ queryflux/
 │   ├── queryflux-auth/             # Authentication and authorization
 │   ├── queryflux-bench/            # Proxy overhead benchmarks
 │   └── queryflux-e2e-tests/        # Integration tests
-├── queryflux-studio/               # Management UI (Next.js — Studio)
 ├── examples/                       # Docker Compose quickstarts (see examples/README.md)
 ├── grafana/                        # Grafana dashboards
 ├── prometheus/                     # Prometheus config
@@ -287,11 +286,12 @@ queryflux/
 │   ├── docker-compose.yml          # Local dev stack (`make dev`)
 │   ├── fixtures/                   # SQL init, test data (shared with examples)
 │   ├── test/                       # E2E stack: docker-compose.test.yml, fakesnow helpers
-│   ├── queryflux/                  # QueryFlux Dockerfile
-│   └── queryflux-studio/           # Studio Dockerfile
+│   └── queryflux/                  # QueryFlux Dockerfile
 ├── docs/                           # Architecture markdown
 ├── website/                        # Docusaurus documentation site
 ```
+
+QueryFlux Studio is maintained separately in the [queryflux-console](https://github.com/lakeops-org/queryflux-console) repository.
 
 ## Development
 

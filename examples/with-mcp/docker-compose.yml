@@ -29,7 +29,7 @@ services:
     restart: unless-stopped
 
   queryflux-studio:
-    image: 343959804465.dkr.ecr.us-east-1.amazonaws.com/queryflux-studio:latest
+    image: ghcr.io/lakeops-org/queryflux-console:latest
     ports:
       - "3000:3000"
     environment:

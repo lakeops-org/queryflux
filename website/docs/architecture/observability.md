@@ -83,7 +83,7 @@ Grafana is auto-configured via two provisioning files:
 
 QueryFlux Studio is a Next.js web UI served separately from the proxy. It talks to the Admin REST API on port 9000.
 
-**Start:** `cd queryflux-studio && npm run dev` (or build and serve for production)
+**Start:** Clone the [queryflux-console](https://github.com/lakeops-org/queryflux-console) repository and run `npm run dev` (or build and serve for production).
 
 **Default URL:** http://localhost:3000
 
