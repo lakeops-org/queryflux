@@ -18,6 +18,7 @@ members = [
     "crates/queryflux-metrics",
     "crates/queryflux-fingerprint",
     "crates/queryflux-guardrails",
+    "crates/queryflux-access-control",
     "crates/queryflux-cli",
 ]
 
@@ -85,6 +86,7 @@ queryflux-config = { path = "crates/queryflux-config" }
 queryflux-metrics = { path = "crates/queryflux-metrics" }
 queryflux-fingerprint = { path = "crates/queryflux-fingerprint" }
 queryflux-guardrails = { path = "crates/queryflux-guardrails" }
+queryflux-access-control = { path = "crates/queryflux-access-control" }
 queryflux-cache = { path = "crates/queryflux-cache" }
 queryflux-cli = { path = "crates/queryflux-cli" }
 

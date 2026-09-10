@@ -5159,6 +5159,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "queryflux-access-control"
+version = "0.3.0"
+dependencies = [
+ "async-trait",
+ "queryflux-core",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "url",
+]
+
+[[package]]
 name = "queryflux-auth"
 version = "0.3.0"
 dependencies = [
@@ -5482,6 +5496,8 @@ dependencies = [
  "async-trait",
  "pyo3",
  "queryflux-core",
+ "serde",
+ "serde_json",
  "tokio",
  "tracing",
 ]
