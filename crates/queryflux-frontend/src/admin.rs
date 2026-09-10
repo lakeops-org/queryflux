@@ -2935,6 +2935,7 @@ mod tests {
                 was_guard_blocked: false,
                 submitted_by: "alice".into(),
                 wire_auth: None,
+                queue_duration_ms: 0,
             })
             .await
             .unwrap();

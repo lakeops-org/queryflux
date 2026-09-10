@@ -364,7 +364,7 @@ impl AppState {
                 engine_stats: None,
                 guard_actions,
                 was_guard_blocked: executing.was_guard_blocked,
-                queue_duration_ms: 0,
+                queue_duration_ms: executing.queue_duration_ms,
                 cache_hit: false,
             },
         );
@@ -586,6 +586,7 @@ mod record_terminal_tests {
             was_guard_blocked: false,
             submitted_by: "bob".into(),
             wire_auth: None,
+            queue_duration_ms: 2500,
         };
         state.record_executing_cancelled(
             &executing,
@@ -606,6 +607,7 @@ mod record_terminal_tests {
         assert_eq!(rows.len(), 1);
         assert!(rows[0].status.contains("Cancelled"));
         assert_eq!(rows[0].error_message.as_deref(), Some("client cancelled"));
+        assert_eq!(rows[0].queue_duration_ms, 2500);
     }
 }
 

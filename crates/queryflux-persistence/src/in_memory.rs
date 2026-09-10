@@ -1369,6 +1369,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn executing_queue_duration_survives_upsert() {
+        let store = InMemoryPersistence::new();
+        let now = chrono::Utc::now();
+        store
+            .upsert(ExecutingQuery {
+                id: ProxyQueryId("q-qd".into()),
+                sql: "SELECT 1".into(),
+                translated_sql: None,
+                cluster_group: ClusterGroupName("test".into()),
+                cluster_name: queryflux_core::query::ClusterName("trino".into()),
+                cluster_group_config_id: None,
+                cluster_config_id: None,
+                backend_query_id: BackendQueryId("backend-qd".into()),
+                poll_base_url: None,
+                creation_time: now,
+                last_accessed: now,
+                query_tags: Default::default(),
+                agent_context: None,
+                submitted_guard_actions: vec![],
+                was_guard_blocked: false,
+                submitted_by: "alice".into(),
+                wire_auth: None,
+                queue_duration_ms: 4200,
+            })
+            .await
+            .unwrap();
+
+        let got = store
+            .get(&BackendQueryId("backend-qd".into()))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(got.queue_duration_ms, 4200);
+
+        // Legacy rows without the field deserialize as 0.
+        let legacy = serde_json::json!({
+            "id": "legacy",
+            "sql": "SELECT 1",
+            "translated_sql": null,
+            "cluster_group": "test",
+            "cluster_name": "trino",
+            "backend_query_id": "b",
+            "poll_base_url": null,
+            "creation_time": now,
+            "last_accessed": now,
+            "submitted_by": "alice"
+        });
+        let parsed: ExecutingQuery = serde_json::from_value(legacy).unwrap();
+        assert_eq!(parsed.queue_duration_ms, 0);
+    }
+
+    #[tokio::test]
     async fn queued_submitted_by_survives_upsert() {
         let store = InMemoryPersistence::new();
         let mut q = make_queued("q-owner");

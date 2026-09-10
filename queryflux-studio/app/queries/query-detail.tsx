@@ -13,6 +13,13 @@ export function QueryDetailContent({ query }: { query: QueryHistoryRecord }) {
       <div className="px-6 py-5 grid grid-cols-2 gap-4 border-b border-slate-100">
         <MetaItem icon={<Clock size={13} />} label="Time" value={formatDateTime(new Date(query.created_at))} />
         <MetaItem icon={<Clock size={13} />} label="Duration" value={formatDuration(query.execution_duration_ms)} />
+        {query.queue_duration_ms > 0 && (
+          <MetaItem
+            icon={<Clock size={13} />}
+            label="Queue wait"
+            value={formatDuration(query.queue_duration_ms)}
+          />
+        )}
         <MetaItem icon={<Server size={13} />} label="Cluster" value={`${query.cluster_group} / ${query.cluster_name}`} />
         <MetaItem icon={<Hash size={13} />} label="Protocol" value={query.frontend_protocol} />
         <MetaItem icon={<User size={13} />} label="User" value={query.username ?? "—"} />

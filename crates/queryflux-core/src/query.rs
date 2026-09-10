@@ -346,6 +346,13 @@ pub struct ExecutingQuery {
     /// Absent on rows written before this field existed (`serviceAccount`-equivalent).
     #[serde(default)]
     pub wire_auth: Option<StoredWireAuth>,
+    /// Time spent waiting for cluster capacity before this query was submitted to the
+    /// backend. Captured at dequeue/dispatch so the poll/cancel handlers — which never
+    /// see the original queue row — can include it in the final `QueryOutcome` and
+    /// client-visible timings. Defaults to 0 for rows written before this field existed
+    /// and for queries that never queued.
+    #[serde(default)]
+    pub queue_duration_ms: u64,
 }
 
 /// Wire-level auth material persisted alongside an [`ExecutingQuery`] so poll/cancel can

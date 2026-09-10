@@ -1265,7 +1265,7 @@ pub async fn get_executing_statement(
                     engine_stats: None,
                     guard_actions: submit_guard_actions,
                     was_guard_blocked: submit_was_guard_blocked,
-                    queue_duration_ms: 0,
+                    queue_duration_ms: executing.queue_duration_ms,
                     cache_hit: false,
                 },
             );
@@ -1303,7 +1303,7 @@ pub async fn get_executing_statement(
                         engine_stats,
                         guard_actions: submit_guard_actions,
                         was_guard_blocked: submit_was_guard_blocked,
-                        queue_duration_ms: 0,
+                        queue_duration_ms: executing.queue_duration_ms,
                         cache_hit: false,
                     },
                 );
@@ -1340,7 +1340,7 @@ pub async fn get_executing_statement(
                     engine_stats: None,
                     guard_actions: submit_guard_actions,
                     was_guard_blocked: submit_was_guard_blocked,
-                    queue_duration_ms: 0,
+                    queue_duration_ms: executing.queue_duration_ms,
                     cache_hit: false,
                 },
             );
@@ -1365,6 +1365,7 @@ pub async fn get_executing_statement(
                     queued: false,
                     scheduled: false,
                     elapsed_time_millis: elapsed_ms,
+                    queued_time_millis: executing.queue_duration_ms,
                     ..Default::default()
                 },
                 error: Some(TrinoError {
@@ -1703,6 +1704,7 @@ mod cancel_executing_statement_tests {
             was_guard_blocked: false,
             submitted_by: "anonymous".into(),
             wire_auth: None,
+            queue_duration_ms: 0,
         };
         state
             .persistence

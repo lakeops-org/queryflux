@@ -559,6 +559,7 @@ pub async fn dispatch_query(
                 was_guard_blocked: false,
                 submitted_by: auth_ctx.user.clone(),
                 wire_auth: wire_auth.clone(),
+                queue_duration_ms,
             };
 
             match execution {
@@ -590,9 +591,6 @@ pub async fn dispatch_query(
                         )));
                     }
                     slot.disarm();
-                    // TODO: persist queue_duration_ms so the poll handler can include it
-                    // in the final QueryOutcome. Either add a field to ExecutingQuery or
-                    // store it in a side-channel (e.g. a metadata column).
                     info!(id = %query_id, backend = %backend_query_id, cluster = %cluster_name, queue_ms = queue_duration_ms, "Query submitted (async)");
 
                     let proxy_next_uri = poll_token
@@ -649,7 +647,6 @@ pub async fn dispatch_query(
                         status,
                         error,
                         engine_stats,
-                        queue_duration_ms,
                     )
                     .await;
                     Ok(DispatchOutcome::Async {
@@ -680,7 +677,6 @@ async fn finalize_async_terminal_on_submit(
     status: QueryStatus,
     error: Option<String>,
     engine_stats: Option<QueryEngineStats>,
-    queue_duration_ms: u64,
 ) {
     let elapsed_ms = (Utc::now() - executing.creation_time)
         .num_milliseconds()
@@ -706,7 +702,7 @@ async fn finalize_async_terminal_on_submit(
         engine_stats,
         guard_actions: vec![],
         was_guard_blocked: false,
-        queue_duration_ms,
+        queue_duration_ms: executing.queue_duration_ms,
         cache_hit: false,
     };
     if !stored_actions.is_empty() {
