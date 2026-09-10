@@ -293,6 +293,11 @@ pub async fn dispatch_query(
         }
     };
 
+    // Capacity wait only — capture before identity, translation, guards, and submit.
+    let queue_duration_ms = queued_since
+        .map(|t| (Utc::now() - t).num_milliseconds().max(0) as u64)
+        .unwrap_or(0);
+
     // RAII guard: from here on the local slot and global lease are released on
     // every exit — including the future being dropped when the client
     // disconnects mid-dispatch, which previously leaked the lease permanently
@@ -520,9 +525,6 @@ pub async fn dispatch_query(
             if already_queued {
                 let _ = state.persistence.delete_queued(&query_id).await;
             }
-            let queue_duration_ms = queued_since
-                .map(|t| (Utc::now() - t).num_milliseconds().max(0) as u64)
-                .unwrap_or(0);
             if queue_duration_ms > 0 {
                 debug!(id = %query_id, queue_ms = queue_duration_ms, "Queued query dispatched");
             }
