@@ -46,6 +46,15 @@ impl ConfigProvider for YamlFileConfigProvider {
             })?;
         }
 
+        if let Some(access_control) = &config.access_control {
+            access_control.validate().map_err(|e| {
+                QueryFluxError::Config(format!(
+                    "Invalid access_control in {}: {e}",
+                    self.path.display()
+                ))
+            })?;
+        }
+
         Ok(config)
     }
 }
@@ -100,5 +109,56 @@ guardrails:
 
         let provider = YamlFileConfigProvider::new(&path);
         provider.load().await.expect("valid guardrails should load");
+    }
+
+    #[tokio::test]
+    async fn load_rejects_invalid_access_control_url() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.yaml");
+        tokio::fs::write(
+            &path,
+            r#"
+queryflux: {}
+accessControl:
+  opa:
+    url: "not a url"
+"#,
+        )
+        .await
+        .expect("write config");
+
+        let provider = YamlFileConfigProvider::new(&path);
+        let err = provider
+            .load()
+            .await
+            .expect_err("invalid access_control url must fail");
+        assert!(err.to_string().contains("url"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn load_accepts_valid_access_control() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.yaml");
+        tokio::fs::write(
+            &path,
+            r#"
+queryflux: {}
+accessControl:
+  opa:
+    url: http://localhost:8181
+    decisionPath: /v1/data/queryflux/access
+  operations: [table.select]
+  failOpen: false
+"#,
+        )
+        .await
+        .expect("write config");
+
+        let provider = YamlFileConfigProvider::new(&path);
+        let cfg = provider
+            .load()
+            .await
+            .expect("valid access_control should load");
+        assert!(cfg.access_control.is_some());
     }
 }

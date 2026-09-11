@@ -16,6 +16,7 @@ queryflux-config = { workspace = true }
 queryflux-persistence = { workspace = true }
 queryflux-routing = { workspace = true }
 queryflux-guardrails = { workspace = true }
+queryflux-access-control = { workspace = true }
 queryflux-translation = { workspace = true }
 queryflux-engine-adapters = { workspace = true }
 queryflux-frontend = { workspace = true }

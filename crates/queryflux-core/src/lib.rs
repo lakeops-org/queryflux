@@ -1,3 +1,4 @@
+pub mod access_config;
 pub mod access_model;
 pub mod catalog;
 pub mod config;
