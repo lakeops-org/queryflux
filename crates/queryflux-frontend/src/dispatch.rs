@@ -385,6 +385,7 @@ pub async fn dispatch_query(
     // decision (including row filters / column masks) is intent-level and answerable from
     // what the client actually sent. See `access_control_guard::run_access_control_stage`.
     let mut all_guard_actions: Vec<queryflux_persistence::GuardAction> = Vec::new();
+    let mut access_control_rewrote = false;
     let sql = if let Some(guard) = &access_control_guard {
         use crate::access_control_guard::{run_access_control_stage, AccessStageOutcome};
         match run_access_control_stage(
@@ -409,6 +410,7 @@ pub async fn dispatch_query(
                 action,
             } => {
                 all_guard_actions.push(action);
+                access_control_rewrote = true;
                 rewritten
             }
             AccessStageOutcome::Denied { reason, action, .. } => {
@@ -479,6 +481,66 @@ pub async fn dispatch_query(
     let was_translated = sql != original_sql;
     if was_translated {
         info!(id = %query_id, src = ?src_dialect, tgt = ?tgt_dialect, "SQL translated");
+    }
+
+    // Invariant assert (NOT a second guard stage): access control already decided intent
+    // on the source SQL above. This is a narrow safety net over our own scan-site rewrite
+    // and `maybe_translate`, guarding against a bug in either turning a read into a write.
+    // Scoped to only run when access control actually rewrote the query, using the cheap
+    // Rust-native (no Python) classifier, so ordinary queries pay nothing extra.
+    if access_control_rewrote {
+        let src_read_like =
+            queryflux_core::sql_classify::SqlParseCache::new(original_sql.clone(), src_dialect.clone())
+                .is_read_like_async()
+                .await;
+        let final_read_like =
+            queryflux_core::sql_classify::SqlParseCache::new(sql.clone(), tgt_dialect.clone())
+                .is_read_like_async()
+                .await;
+        if src_read_like && !final_read_like {
+            let reason = "access-control invariant violated: statement kind changed from read to non-read after rewrite/translation".to_string();
+            warn!(id = %query_id, "{reason}");
+            let ctx = QueryContext {
+                query_id: query_id.clone(),
+                sql: original_sql.clone(),
+                session: session.clone(),
+                protocol: protocol.clone(),
+                group: group.clone(),
+                cluster: cluster_name.clone(),
+                cluster_group_config_id,
+                cluster_config_id,
+                engine_type: engine_type.clone(),
+                src_dialect: src_dialect.clone(),
+                tgt_dialect: tgt_dialect.clone(),
+                was_translated,
+                translated_sql: if was_translated {
+                    Some(sql.clone())
+                } else {
+                    None
+                },
+                query_tags: effective_tags.clone(),
+                query_params: vec![],
+                agent_context: resolved_agent_ctx.clone(),
+            };
+            state.record_query(
+                &ctx,
+                QueryOutcome {
+                    backend_query_id: None,
+                    status: QueryStatus::Denied,
+                    execution_ms: 0,
+                    rows: None,
+                    error: Some(reason.clone()),
+                    routing_trace: None,
+                    engine_stats: None,
+                    guard_actions: all_guard_actions.clone(),
+                    was_guard_blocked: true,
+                    queue_duration_ms: 0,
+                    cache_hit: false,
+                },
+            );
+            slot.release().await;
+            return Err(QueryFluxError::Unauthorized(reason));
+        }
     }
 
     // Fallback interpolation for async adapters that don't support native params.
@@ -1530,6 +1592,7 @@ async fn setup_sync_query(
     // dispatch path for the full rationale). On deny: record the query, release the slot,
     // propagate. On rewrite: `access_controlled_sql` replaces `sql` for translation below.
     let mut pre_guard_actions: Vec<queryflux_persistence::GuardAction> = Vec::new();
+    let mut access_control_rewrote = false;
     let access_controlled_sql = if let Some(guard) = &access_control_guard {
         use crate::access_control_guard::{run_access_control_stage, AccessStageOutcome};
         match run_access_control_stage(
@@ -1551,6 +1614,7 @@ async fn setup_sync_query(
             }
             AccessStageOutcome::Rewritten { sql: rewritten, action } => {
                 pre_guard_actions.push(action);
+                access_control_rewrote = true;
                 rewritten
             }
             AccessStageOutcome::Denied { reason, action, .. } => {
@@ -1659,6 +1723,65 @@ async fn setup_sync_query(
     };
 
     let was_translated = translated != sql;
+
+    // Invariant assert (NOT a second guard stage — see the async dispatch path for the
+    // full rationale). Scoped to only run when access control actually rewrote the query.
+    if access_control_rewrote {
+        let src_read_like =
+            queryflux_core::sql_classify::SqlParseCache::new(sql.clone(), src_dialect.clone())
+                .is_read_like_async()
+                .await;
+        let final_read_like = queryflux_core::sql_classify::SqlParseCache::new(
+            translated.clone(),
+            tgt_dialect.clone(),
+        )
+        .is_read_like_async()
+        .await;
+        if src_read_like && !final_read_like {
+            let reason = "access-control invariant violated: statement kind changed from read to non-read after rewrite/translation".to_string();
+            warn!(id = %query_id, "{reason}");
+            let ctx = QueryContext {
+                query_id: query_id.clone(),
+                sql: sql.clone(),
+                session: session.clone(),
+                protocol: protocol.clone(),
+                group: group.clone(),
+                cluster: cluster_name.clone(),
+                cluster_group_config_id,
+                cluster_config_id,
+                engine_type: engine_type.clone(),
+                src_dialect: src_dialect.clone(),
+                tgt_dialect: tgt_dialect.clone(),
+                was_translated,
+                translated_sql: if was_translated {
+                    Some(translated.clone())
+                } else {
+                    None
+                },
+                query_tags: effective_tags,
+                query_params: params,
+                agent_context: session.resolved_agent_context(),
+            };
+            state.record_query(
+                &ctx,
+                QueryOutcome {
+                    backend_query_id: None,
+                    status: QueryStatus::Denied,
+                    execution_ms: start.elapsed().as_millis() as u64,
+                    rows: None,
+                    error: Some(reason.clone()),
+                    routing_trace: None,
+                    engine_stats: None,
+                    guard_actions: pre_guard_actions,
+                    was_guard_blocked: true,
+                    queue_duration_ms: 0,
+                    cache_hit: false,
+                },
+            );
+            slot.release().await;
+            return Err(QueryFluxError::Unauthorized(reason));
+        }
+    }
 
     let credentials = match state
         .identity_resolver
