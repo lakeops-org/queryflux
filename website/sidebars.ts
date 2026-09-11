@@ -54,6 +54,7 @@ const sidebars: SidebarsConfig = {
         'architecture/query-tags',
         'architecture/query-params',
         'architecture/guardrails',
+        'architecture/access-control',
         'architecture/observability',
         'architecture/adding-engine-support',
         'architecture/auth-authz-design',

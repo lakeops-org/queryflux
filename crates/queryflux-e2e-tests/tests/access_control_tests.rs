@@ -216,6 +216,74 @@ async fn allowed_table_with_row_filter_only_returns_matching_rows() {
     );
 }
 
+/// A fixup script that monkey-patches the translated AST from a `Select` into a `Delete`
+/// referencing the same table — simulating a buggy operator-authored translation fixup
+/// script mutating the query after our own scan-site rewrite. Proves the post-rewrite
+/// invariant assert in `dispatch.rs` (Phase 4 step 4a) denies rather than silently letting
+/// a read become a write.
+const SELECT_TO_DELETE_FIXUP: &str = r#"
+import sqlglot.expressions as exp
+
+def transform(ast, src: str, dst: str) -> None:
+    # Only mangle SELECTs — leave CREATE TABLE / INSERT (used to seed the test table)
+    # completely alone, so the only thing this simulates is a fixup bug that corrupts
+    # a read query specifically.
+    if not isinstance(ast, exp.Select):
+        return
+    tables = list(ast.find_all(exp.Table))
+    if not tables:
+        return
+    new_delete = exp.Delete(this=tables[0].copy())
+    ast.__class__ = new_delete.__class__
+    ast.args.clear()
+    ast.args.update(new_delete.args)
+"#;
+
+#[tokio::test]
+async fn fixup_script_turning_read_into_write_is_denied_by_invariant_assert() {
+    let (opa_url, stub) = start_opa_stub().await;
+    // Any row filter forces the access-control guard down the `Rewrite` path, which is
+    // what arms the post-translation invariant assert (see `dispatch.rs`).
+    stub.lock()
+        .unwrap()
+        .row_filters
+        .insert("orders".to_string(), "amount > 0".to_string());
+
+    let guard = build_guard(&opa_url);
+    let h = ProtocolWireHarness::new_with_access_control_and_fixups(
+        Some(guard),
+        vec![SELECT_TO_DELETE_FIXUP.to_string()],
+    )
+    .await
+    .expect("harness");
+    let client = pg_connect(h.postgres_port).await;
+
+    pg_run(&client, "CREATE TABLE orders (id INTEGER, amount INTEGER)")
+        .await
+        .expect("create table");
+
+    let err = pg_run(&client, "SELECT id FROM orders")
+        .await
+        .expect_err("a fixup script turning the read into a write must be denied");
+    assert!(!err.is_empty());
+
+    let record = h
+        .wait_for_record(|r| r.sql_preview.to_lowercase().contains("select id from orders"))
+        .await
+        .expect("denied query should be recorded");
+    assert_eq!(format!("{:?}", record.status), "Denied");
+    assert!(record.was_guard_blocked);
+    assert!(
+        record
+            .error_message
+            .as_deref()
+            .unwrap_or_default()
+            .contains("invariant"),
+        "expected an invariant-assert denial reason, got: {:?}",
+        record.error_message
+    );
+}
+
 #[tokio::test]
 async fn opa_unreachable_fails_closed_by_default() {
     // Point at a port nothing is listening on.

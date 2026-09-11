@@ -16,6 +16,10 @@ Each guard inspects the translated SQL (after dialect translation, before engine
 
 Every verdict is recorded in `guard_actions` on the query record, alongside a `was_guard_blocked` flag, making the full guard history queryable from Studio and the Admin API.
 
+> For per-table/column allow-deny, row filtering, and column masking against a
+> policy engine (OPA), see [Data access control](./access-control) — it runs as one more
+> guard in this same chain, but before dialect translation rather than after.
+
 ---
 
 ## How the chain works
