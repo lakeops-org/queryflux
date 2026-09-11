@@ -84,6 +84,10 @@ pub struct ProxyConfig {
     /// Omit to disable all guardrails.
     #[serde(default)]
     pub guardrails: Option<GuardrailsConfig>,
+    /// Data-level access control (OPA row filtering, column masking, table/column
+    /// allow-deny). Omit to disable.
+    #[serde(default)]
+    pub access_control: Option<crate::access_config::AccessControlConfig>,
 }
 
 impl ProxyConfig {
@@ -93,6 +97,9 @@ impl ProxyConfig {
         self.authorization.validate()?;
         if let Some(guardrails) = &self.guardrails {
             guardrails.validate()?;
+        }
+        if let Some(access_control) = &self.access_control {
+            access_control.validate()?;
         }
         Ok(())
     }

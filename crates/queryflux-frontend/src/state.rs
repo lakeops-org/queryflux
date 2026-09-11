@@ -36,6 +36,9 @@ pub struct LiveConfig {
     /// Per-group guard chains — appended after the global chain for queries routed
     /// to that group. Missing entry means no group-specific guards for that group.
     pub group_guard_chains: HashMap<String, Arc<GuardChain>>,
+    /// Data-level access-control guard (OPA row filtering / column masking / table-column
+    /// allow-deny), run on the source SQL before dialect translation. `None` disables it.
+    pub access_control_guard: Option<Arc<crate::access_control_guard::OpaAccessGuard>>,
     pub cluster_manager: Arc<dyn ClusterGroupManager>,
     /// cluster_name → adapter (one adapter per physical cluster, shared across groups).
     pub adapters: HashMap<String, AdapterKind>,
@@ -667,6 +670,7 @@ pub mod test_fixtures {
             router_chain: RouterChain::new(vec![], group_name.clone()),
             guard_chain: None,
             group_guard_chains: HashMap::new(),
+            access_control_guard: None,
             cluster_manager: Arc::new(SimpleClusterGroupManager::new(groups)),
             adapters: HashMap::new(),
             health_check_targets: vec![],
