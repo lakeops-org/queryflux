@@ -26,6 +26,8 @@
   <a href="https://join.slack.com/t/queryfluxworkspace/shared_invite/zt-3v7qedxj9-o8ElCLGK0UXT8xBU0_bD8w">Slack community</a>
   &nbsp;·&nbsp;
   <a href="https://queryflux.dev/">Documentation</a>
+  &nbsp;·&nbsp;
+  <a href="https://lakeops.dev/blog/the-future-isnt-one-engine">Why a control plane</a>
 </p>
 
 # <p align="center"><big>Universal SQL multi-engine query router and proxy in Rust</big></p>
@@ -35,6 +37,8 @@ QueryFlux sits between SQL clients and multiple backend query engines, providing
 ## Overview
 
 QueryFlux lets you connect any SQL client using standard protocols (Trino HTTP, PostgreSQL wire, MySQL wire, Snowflake HTTP wire + SQL API v2, and Arrow Flight SQL) and route queries to the right backend engine — Trino, DuckDB, StarRocks, Athena, or ClickHouse — based on flexible routing rules. SQL dialects are translated automatically when needed via [sqlglot](https://github.com/tobymao/sqlglot).
+
+The future of data platforms is not one engine — it is a control plane over specialized engines on shared data. [The Future Isn't One Engine. It's a Control Plane.](https://lakeops.dev/blog/the-future-isnt-one-engine) explains why QueryFlux sits above the engines, and how it pairs with LakeOps for table maintenance.
 
 ```
 Client (Trino CLI / psql / mysql / Snowflake connectors)

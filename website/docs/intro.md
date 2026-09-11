@@ -40,7 +40,7 @@ Modern stacks mix **many query engines** — each with its own wire protocol and
 - **SLA protection** — cap concurrent queries per group; queue at the proxy instead of overloading backends.
 - **Transparent migration** — split traffic by weight between engines without client changes.
 
-For a deeper product rationale, see **[Motivation and goals](/docs/architecture/motivation-and-goals)** and **[Benchmarks](/docs/benchmarks)**.
+For a deeper product rationale, see **[Motivation and goals](/docs/architecture/motivation-and-goals)** and **[Benchmarks](/docs/benchmarks)**. For the control-plane argument — why engines should stay replaceable — read **[The Future Isn't One Engine. It's a Control Plane.](https://lakeops.dev/blog/the-future-isnt-one-engine)** on the LakeOps blog.
 
 ---
 
@@ -113,3 +113,4 @@ Use these when you already know what you are looking for:
 | **[Contribute](/docs/contribute)** | PRs, issues, community |
 | **[Project structure](/docs/project-structure)** | Repository layout |
 | **[Roadmap](/docs/roadmap)** | Shipped vs planned features |
+| **[The Future Isn't One Engine](https://lakeops.dev/blog/the-future-isnt-one-engine)** | Why routing belongs in a control plane, not inside a warehouse |
