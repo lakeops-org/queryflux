@@ -5317,6 +5317,7 @@ dependencies = [
  "futures",
  "mysql_async",
  "prost 0.14.3",
+ "queryflux-access-control",
  "queryflux-auth",
  "queryflux-cache",
  "queryflux-cluster-manager",

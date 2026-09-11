@@ -853,6 +853,25 @@ impl ProtocolWireHarness {
     pub async fn new_with_guard_chain(
         guard_chain: Option<Arc<queryflux_guardrails::GuardChain>>,
     ) -> Result<Self> {
+        Self::build(guard_chain, None, 2).await
+    }
+
+    /// Same as `new()`, but installs `access_control_guard` as the pre-translation
+    /// access-control guard — lets tests exercise OPA-backed row filtering / column
+    /// masking / table-column allow-deny end-to-end through a real frontend. Uses a
+    /// single-connection DuckDB pool so `CREATE TABLE` / `INSERT` / `SELECT` in the same
+    /// test see consistent state (DuckDB's `:memory:` is per-connection, not shared).
+    pub async fn new_with_access_control(
+        access_control_guard: Option<Arc<queryflux_frontend::access_control_guard::OpaAccessGuard>>,
+    ) -> Result<Self> {
+        Self::build(None, access_control_guard, 1).await
+    }
+
+    async fn build(
+        guard_chain: Option<Arc<queryflux_guardrails::GuardChain>>,
+        access_control_guard: Option<Arc<queryflux_frontend::access_control_guard::OpaAccessGuard>>,
+        pool_size: usize,
+    ) -> Result<Self> {
         let _ = tracing_subscriber::fmt()
             .with_env_filter("error")
             .try_init();
@@ -876,7 +895,7 @@ impl ProtocolWireHarness {
                 DuckDbConfig {
                     database_path: None,
                     motherduck_token: None,
-                    pool_size: 2,
+                    pool_size,
                     max_result_buffer_bytes: DEFAULT_MAX_RESULT_BUFFER_BYTES,
                 },
             )
@@ -911,7 +930,7 @@ impl ProtocolWireHarness {
             router_chain,
             guard_chain,
             group_guard_chains: HashMap::new(),
-            access_control_guard: None,
+            access_control_guard,
             cluster_manager,
             adapters,
             health_check_targets: vec![],

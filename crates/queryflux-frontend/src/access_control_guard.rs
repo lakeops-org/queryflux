@@ -119,7 +119,7 @@ impl Guard for OpaAccessGuard {
             Some(cache) => cache.statements_async().await.map(<[_]>::to_vec),
             None => None,
         };
-        let operation = classify_operation(stmts.as_deref());
+        let operation = classify_operation(stmts.as_deref(), ctx.sql);
 
         if !self.controller.evaluates(&operation) {
             return GuardResult::allow();
@@ -285,25 +285,97 @@ impl Guard for OpaAccessGuard {
     }
 }
 
-fn classify_operation(stmts: Option<&[Expression]>) -> Operation {
-    let kind = stmts
-        .and_then(|s| s.first())
-        .map(|e| {
-            format!("{e:?}")
-                .split(['(', ' ', '{'])
-                .next()
-                .unwrap_or("")
-                .to_string()
-        })
-        .unwrap_or_default();
-    match kind.as_str() {
-        "Insert" => Operation("table.insert".to_string()),
-        "Update" => Operation("table.update".to_string()),
-        "Delete" => Operation("table.delete".to_string()),
-        _ => Operation::table_select(),
+/// Classify the query's namespaced operation from its first parsed statement.
+///
+/// Deliberately narrow: only true DQL maps to `table.select` and only DML writes map to
+/// `table.insert/update/delete`. Everything else — DDL, `Expression::Command` (BEGIN/COMMIT/
+/// CREATE/ALTER/DROP/anything the parser doesn't model precisely — see
+/// `sql_classify::is_read_stmt`'s doc comment), `SHOW`, `DESCRIBE` — maps to `statement.other`,
+/// which is never in the default `operations` allowlist, so the stage is skipped for it
+/// rather than mistakenly treating (say) a `CREATE TABLE orders (...)` as a read of `orders`
+/// eligible for row-filter rewriting.
+///
+/// When `polyglot-sql` couldn't parse the statement at all, fall back to the same string
+/// heuristic the built-in guards use (`is_read_like_fallback`) rather than defaulting to
+/// "skip the stage" — a query that heuristically looks like a read should still be
+/// evaluated even if this particular parser choked on it (resource extraction uses a
+/// different, Python-sqlglot-based parser, so a `polyglot-sql` failure here doesn't imply
+/// extraction will also fail).
+fn classify_operation(stmts: Option<&[Expression]>, sql: &str) -> Operation {
+    match stmts.and_then(|s| s.first()) {
+        Some(
+            Expression::Select(_)
+            | Expression::Union(_)
+            | Expression::Intersect(_)
+            | Expression::Except(_)
+            | Expression::Subquery(_),
+        ) => Operation::table_select(),
+        Some(Expression::Insert(_)) => Operation("table.insert".to_string()),
+        Some(Expression::Update(_)) => Operation("table.update".to_string()),
+        Some(Expression::Delete(_)) => Operation("table.delete".to_string()),
+        Some(_) => Operation("statement.other".to_string()),
+        None if queryflux_core::sql_classify::is_read_like_fallback(sql) => {
+            Operation::table_select()
+        }
+        None => Operation("statement.other".to_string()),
     }
 }
 
 fn engine_name(e: &EngineType) -> String {
     format!("{e:?}").to_lowercase()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use queryflux_core::query::SqlDialect;
+    use queryflux_core::sql_classify::SqlParseCache;
+
+    async fn classify(sql: &str) -> Operation {
+        let cache = SqlParseCache::new(sql.to_string(), SqlDialect::Postgres);
+        let stmts = cache.statements_async().await.map(<[_]>::to_vec);
+        classify_operation(stmts.as_deref(), sql)
+    }
+
+    #[tokio::test]
+    async fn select_classifies_as_table_select() {
+        assert_eq!(classify("SELECT * FROM orders").await, Operation::table_select());
+        assert_eq!(
+            classify("WITH x AS (SELECT 1) SELECT * FROM x").await,
+            Operation::table_select()
+        );
+    }
+
+    #[tokio::test]
+    async fn dml_classifies_by_kind() {
+        assert_eq!(
+            classify("INSERT INTO orders VALUES (1)").await.as_str(),
+            "table.insert"
+        );
+        assert_eq!(
+            classify("UPDATE orders SET x = 1").await.as_str(),
+            "table.update"
+        );
+        assert_eq!(
+            classify("DELETE FROM orders WHERE id = 1").await.as_str(),
+            "table.delete"
+        );
+    }
+
+    /// Regression test: a `CREATE TABLE ... (col_list)` must never be classified as
+    /// `table.select` — the referenced table name in the DDL is a definition target, not
+    /// something to extract-and-rewrite as if it were a read. Caught by an e2e test that
+    /// tried to apply a row filter to a `CREATE TABLE` statement and mangled it.
+    #[tokio::test]
+    async fn ddl_is_not_table_select() {
+        let op = classify("CREATE TABLE orders (id INTEGER, amount INTEGER)").await;
+        assert_ne!(op, Operation::table_select());
+        assert_eq!(op.as_str(), "statement.other");
+    }
+
+    #[tokio::test]
+    async fn show_and_describe_are_not_table_select() {
+        assert_eq!(classify("SHOW TABLES").await.as_str(), "statement.other");
+        assert_eq!(classify("DESCRIBE orders").await.as_str(), "statement.other");
+    }
 }
