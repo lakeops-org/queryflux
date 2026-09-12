@@ -40,6 +40,21 @@ const sidebars: SidebarsConfig = {
     },
     {
       type: 'category',
+      label: 'Access Control',
+      collapsed: false,
+      items: [
+        'access-control/overview',
+        'access-control/opa',
+        {
+          type: 'category',
+          label: 'Use cases',
+          collapsed: false,
+          items: ['access-control/customer-api-row-filters'],
+        },
+      ],
+    },
+    {
+      type: 'category',
       label: 'Architecture',
       collapsed: true,
       items: [
@@ -54,7 +69,6 @@ const sidebars: SidebarsConfig = {
         'architecture/query-tags',
         'architecture/query-params',
         'architecture/guardrails',
-        'architecture/access-control',
         'architecture/observability',
         'architecture/adding-engine-support',
         'architecture/auth-authz-design',

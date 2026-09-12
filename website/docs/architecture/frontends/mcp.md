@@ -70,11 +70,11 @@ So `execute_query` and `explain_query` don't guess at all: with no `dialect` giv
 
 An unrecognized value is rejected with an `invalid_params` error listing the accepted set, rather than being passed through to sqlglot unvalidated.
 
-## Guardrails
+## Guardrails and access control
 
-MCP queries flow through the exact same configurable `GuardChain` as every other frontend — `read_only`, `row_limit`, `require_predicate`, Python-script guards, and HTTP webhook guards all apply automatically to any group that serves MCP traffic, with no MCP-specific guard code involved. There is no default guard policy baked into the MCP frontend itself; if you want agent-facing queries restricted (e.g. read-only, row-capped), configure that the same way you would for any other frontend — see [Guardrails](../guardrails) for the full guard configuration reference.
+MCP queries flow through the same `GuardChain` as every other frontend — built-in guards (`read_only`, `row_limit`, `require_predicate`, …), `python_script` / `http_webhook` guards, and [access control](../../access-control/overview) (`opa_access`) all apply automatically to any group that serves MCP traffic, with no MCP-specific guard code involved. There is no default guard policy baked into the MCP frontend itself; configure restrictions the same way as for any other frontend — see [Guardrails](../guardrails).
 
-Column/PII masking is not currently available for any frontend, MCP included — it's tracked as a separate, unimplemented design (row filtering and column masking via an external policy engine).
+Row filters and column masks are available via OPA access control (same pipeline as Trino HTTP and other frontends).
 
 ## Query history and session replay
 
@@ -159,7 +159,7 @@ Most other MCP-capable tools (Windsurf, VS Code's MCP support, etc.) follow the 
 | MCP Resources (e.g. `schema:///{table}` subscriptions) | Not implemented. |
 | Natural-language-to-SQL, semantic routing, result caching, query rewriting | Explicitly out of scope for this frontend — QueryFlux routes and executes the SQL it's given. |
 | Async submit/poll execution model | `execute_query` is synchronous — it blocks until the query completes. `get_query_status` / `cancel_query` are best-effort against the existing in-flight query registry (useful from a concurrent tool call), not a full async job API. |
-| Column/PII masking | Not implemented for any frontend yet. |
+| Column masks / row filters | Available via [access control](../../access-control/overview) (`opa_access`) — not MCP-specific. |
 | TLS | Not terminated by QueryFlux. Use an external TLS terminator in front of QueryFlux for any deployment where the bearer token crosses an untrusted network. |
 
 ## Related
@@ -167,4 +167,5 @@ Most other MCP-capable tools (Windsurf, VS Code's MCP support, etc.) follow the 
 - [Frontends overview](overview.md) — shared dispatch and session model
 - [Setting agent context](../../agentic/agent-context) — how MCP populates agent identity, via headers and tool parameters
 - [Session replay and guardrails](../../agentic/session-replay) — what gets persisted and how to reconstruct an agent's session
-- [Guardrails](../guardrails) — configuring `read_only`, `row_limit`, and other guards
+- [Guardrails](../guardrails) — built-in guards
+- [Access control](../../access-control/overview) — OPA row filters and column masks

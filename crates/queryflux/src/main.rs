@@ -1243,6 +1243,7 @@ async fn main() -> Result<()> {
         &config.routers,
     ));
     let catalog_provider_config = Arc::new(config.catalog_provider.clone());
+    let access_control_config = Arc::new(config.access_control.clone());
     let config_reload_notify = Arc::new(tokio::sync::Notify::new());
 
     let frontends_status = build_frontends_status(
@@ -1302,6 +1303,21 @@ async fn main() -> Result<()> {
                 Ok(provider) => provider,
                 Err(e) => return Ok((false, format!("Failed to build provider: {e}"))),
             };
+            if matches!(
+                cfg,
+                queryflux_core::config::CatalogProviderConfig::Static { .. }
+            ) {
+                return match provider.list_tables("", "").await {
+                    Ok(tables) => Ok((
+                        true,
+                        format!("Static catalog — {} table(s) configured", tables.len()),
+                    )),
+                    Err(e) => Ok((
+                        false,
+                        format!("Built static catalog, but listing tables failed: {e}"),
+                    )),
+                };
+            }
             // `list_catalogs()` is a hardcoded synthetic single-entry result for
             // every real provider (Glue/HMS/Iceberg REST have no native "list
             // catalogs" call) — it makes no network call at all, so it can't
@@ -1336,6 +1352,7 @@ async fn main() -> Result<()> {
         security_config,
         routing_config,
         catalog_provider_config,
+        access_control_config,
         engine_registry,
         config_reload_notify.clone(),
         frontends_status,
@@ -1846,6 +1863,22 @@ async fn main() -> Result<()> {
                         Err(e) => {
                             metrics.on_config_reload_failure("catalog_reload");
                             tracing::warn!("Catalog config reload failed: {e}");
+                        }
+                    }
+                    match store.get_proxy_setting("access_control_config").await {
+                        Ok(Some(v)) => match apply_stored_access_control(&v) {
+                            Ok(guard) => {
+                                live.write().await.access_control_guard = guard;
+                            }
+                            Err(e) => {
+                                metrics.on_config_reload_failure("access_control_reload");
+                                tracing::warn!("Access control config parse/build failed: {e}");
+                            }
+                        },
+                        Ok(None) => {}
+                        Err(e) => {
+                            metrics.on_config_reload_failure("access_control_reload");
+                            tracing::warn!("Access control config reload failed: {e}");
                         }
                     }
                 }
@@ -3193,8 +3226,8 @@ async fn reload_live_config(
     live.authorization = prev.authorization.clone();
     live.guard_chain = prev.guard_chain.clone();
     live.group_guard_chains = prev.group_guard_chains.clone();
-    // Access control is YAML-only in this pass (no admin/DB-managed override yet, unlike
-    // guardrails above) — always carried forward from the previous generation.
+    // Access control is YAML at startup; Studio/admin PUT `access_control_config`
+    // overrides it on reload (same contract as catalog / guardrails).
     live.access_control_guard = prev.access_control_guard.clone();
     live.catalog = prev.catalog.clone();
 
@@ -3292,6 +3325,25 @@ async fn reload_live_config(
         Err(e) => {
             metrics.on_config_reload_failure("catalog_reload");
             tracing::warn!("Reload: catalog_config read failed; keeping previous catalog: {e}")
+        }
+    }
+
+    match pg.get_proxy_setting("access_control_config").await {
+        Ok(Some(v)) => match apply_stored_access_control(&v) {
+            Ok(guard) => live.access_control_guard = guard,
+            Err(e) => {
+                metrics.on_config_reload_failure("access_control_reload");
+                tracing::warn!(
+                    "Reload: access_control_config parse/build failed; keeping previous: {e}"
+                )
+            }
+        },
+        Ok(None) => {}
+        Err(e) => {
+            metrics.on_config_reload_failure("access_control_reload");
+            tracing::warn!(
+                "Reload: access_control_config read failed; keeping previous access control: {e}"
+            )
         }
     }
 
@@ -3507,19 +3559,24 @@ fn make_http_webhook_guard(
 /// (`ProxyConfig::validate_startup_security`), any residual build failure here (e.g. the
 /// OPA client couldn't be constructed) aborts startup rather than silently disabling
 /// enforcement the operator explicitly configured.
-fn build_access_control_guard(config: &queryflux_core::config::ProxyConfig) -> Option<Arc<OpaAccessGuard>> {
+fn build_access_control_guard(
+    config: &queryflux_core::config::ProxyConfig,
+) -> Option<Arc<OpaAccessGuard>> {
     let cfg = config.access_control.as_ref()?;
-    // No metrics wiring yet for this decision path — a follow-up can bridge
-    // `AccessMetricsSink` to `queryflux_metrics::MetricsStore`.
-    let metrics: Arc<dyn queryflux_access_control::AccessMetricsSink> =
-        Arc::new(queryflux_access_control::NoopMetrics);
-    let controller = queryflux_access_control::build_controller(cfg, metrics)
-        .unwrap_or_else(|e| panic!("access_control config failed to build (should have been caught by startup validation): {e}"));
-    Some(Arc::new(OpaAccessGuard::new(
-        Arc::new(controller),
-        cfg.session_param_keys.clone(),
-        cfg.on_missing_schema,
-    )))
+    Some(OpaAccessGuard::try_from_config(cfg).unwrap_or_else(|e| {
+        panic!(
+            "access_control config failed to build (should have been caught by startup validation): {e}"
+        )
+    }))
+}
+
+fn apply_stored_access_control(
+    v: &serde_json::Value,
+) -> std::result::Result<Option<Arc<OpaAccessGuard>>, String> {
+    match queryflux_core::access_config::AccessControlConfig::from_admin_value(v)? {
+        None => Ok(None),
+        Some(cfg) => Ok(Some(OpaAccessGuard::try_from_config(&cfg)?)),
+    }
 }
 
 /// Build YAML guard specs into a `GuardChain`. Returns `None` when the list is empty
@@ -4096,7 +4153,10 @@ mod tests {
                 .expect("chain should be built");
             let ctx = plan_ctx(&engine, &group, &tags);
             let (actions, outcome) = chain.run(&ctx, GuardLayer::Plan).await;
-            assert!(is_blocked(&outcome), "non-http(s) webhook URL must deny at construction");
+            assert!(
+                is_blocked(&outcome),
+                "non-http(s) webhook URL must deny at construction"
+            );
             assert_eq!(actions[0].guard, "http_webhook");
             assert!(actions[0]
                 .reason
@@ -4182,6 +4242,8 @@ mod tests {
                 frontend_protocol: FrontendProtocol::TrinoHttp,
                 source_dialect: SqlDialect::Trino,
                 target_dialect: SqlDialect::DuckDb,
+                was_rewritten: false,
+                rewritten_sql: None,
                 was_translated: false,
                 translated_sql: None,
                 user: None,

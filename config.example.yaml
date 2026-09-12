@@ -164,19 +164,33 @@ routingFallback: duckdb-local
 
 # Data-level access control (row filtering, column masking, table/column allow-deny).
 # Runs on the source SQL before dialect translation, as a guard in the same pipeline
-# stage as `guardrails` above. Omit this section to disable entirely.
+# stage as `guardrails` above. Omit this section to disable entirely. See
+# website/docs/access-control/overview.md and access-control/opa.md.
 # accessControl:
-#   provider: opa                     # the only provider today, and the default
-#   opa:
-#     url: http://localhost:8181
-#     decisionPath: /v1/data/queryflux/access
-#     timeoutMs: 1000
-#     # bearerToken: "..."
-#     # clientCredentials: { clientId: ..., clientSecret: ..., tokenEndpoint: ... }
-#   operations: [table.select]        # add table.insert/update/delete to cover writes
-#   onMissingSchema: evaluate          # evaluate (send all-columns) | deny
-#   failOpen: false                    # provider timeout/error denies by default
-#   cacheTtlMs: 5000                   # decision cache; 0 disables
-#   sessionParamKeys: [customer_id]    # SessionContext.extra keys forwarded as context only
+#   enabled: true                      # global default; per-group override below
+#   # Named policy-provider connections. Must include "default" — every group without an
+#   # explicit groups.<name>.connection override resolves to it. Most deployments define
+#   # only "default"; add another entry only when a group genuinely needs a different
+#   # endpoint (network segmentation, blast-radius isolation, a per-team OPA during a
+#   # provider migration) — for "different rules per team on the same OPA", branch in Rego
+#   # on input.context.clusterGroup instead of adding a connection.
+#   connections:
+#     default:
+#       provider: opa                  # the only provider today, and the default
+#       opa:
+#         url: http://localhost:8181
+#         decisionPath: /v1/data/queryflux/access
+#         timeoutMs: 1000
+#         # bearerToken: "..."
+#         # clientCredentials: { clientId: ..., clientSecret: ..., tokenEndpoint: ... }
+#       operations: [table.select]     # add table.insert/update/delete to cover writes
+#       onMissingSchema: evaluate      # evaluate (send all-columns) | deny
+#       failOpen: false                # provider timeout/error denies by default
+#       cacheTtlMs: 5000               # decision cache; 0 disables
+#       sessionParamKeys: [customer_id]  # SessionContext.extra keys forwarded as context only
+#     # eu-sandbox:                    # optional: a second connection for a segmented group
+#     #   opa: { url: https://eu-opa.internal, decisionPath: /v1/data/queryflux/access }
 #   groups:
 #     trino-prod: { failOpen: false }
+#     sandbox: { enabled: false }      # skip OPA entirely for this cluster group
+#     # eu-group: { connection: eu-sandbox }   # route this group to the "eu-sandbox" connection

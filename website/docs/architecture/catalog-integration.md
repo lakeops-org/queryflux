@@ -36,6 +36,28 @@ catalogProvider:
   type: null
 ```
 
+### `static`
+
+Table/column metadata declared inline in config — no network calls. Intended for local demos, integration tests, and small fixed-schema deployments. Keys are **bare table names** (`customers`, not `catalog.db.customers`).
+
+| Field | Description |
+|-------|-------------|
+| `tables` | Map of table name → `{ columns: [{ name, dataType, nullable? }] }` |
+
+```yaml
+catalogProvider:
+  type: static
+  tables:
+    customers:
+      columns:
+        - name: id
+          dataType: INTEGER
+        - name: ssn
+          dataType: VARCHAR
+```
+
+When [access control](../access-control/overview) applies column masks, a catalog (static or live) is required to enumerate columns for `SELECT *` rewrites. Without one, behavior depends on `onMissingSchema` (`evaluate` vs `deny`).
+
 ### `glue`
 
 Talks directly to the [AWS Glue Data Catalog](https://docs.aws.amazon.com/glue/latest/dg/components-overview.html#data-catalog-intro) API — format-agnostic, so it sees Hive/Parquet, CSV/JSON, and Iceberg tables alike (unlike going through Iceberg's own Glue catalog client, which would only see Iceberg-format tables). Glue has no catalog concept of its own — every database/table lives under the caller's AWS account, so `list_catalogs()` always reports the single synthetic name `AwsDataCatalog`, matching the convention the Athena backend adapter already uses.

@@ -1,3 +1,4 @@
+pub mod access_control;
 pub mod harness;
 pub mod iceberg_seed;
 pub mod snowflake_client;

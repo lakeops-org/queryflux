@@ -59,12 +59,7 @@ impl GuardChain {
             }
         }
 
-        (
-            actions,
-            GuardChainOutcome::Proceed {
-                sql: rewritten_sql,
-            },
-        )
+        (actions, GuardChainOutcome::Proceed { sql: rewritten_sql })
     }
 }
 

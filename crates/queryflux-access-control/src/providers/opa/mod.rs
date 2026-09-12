@@ -70,7 +70,10 @@ impl OpaProvider {
             .ok()?;
         let body: serde_json::Value = resp.json().await.ok()?;
         let token = body.get("access_token")?.as_str()?.to_string();
-        let expires_in = body.get("expires_in").and_then(|v| v.as_u64()).unwrap_or(300);
+        let expires_in = body
+            .get("expires_in")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(300);
         let exp = Instant::now() + Duration::from_secs(expires_in);
         *self.token_cache.lock().await = Some((token.clone(), exp));
         Some(token)

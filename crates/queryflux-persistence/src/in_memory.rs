@@ -111,8 +111,10 @@ impl InMemoryPersistence {
             protocol: format!("{:?}", record.frontend_protocol),
             username: record.user,
             sql_preview: record.sql_preview,
+            rewritten_sql: record.rewritten_sql,
             translated_sql: record.translated_sql,
             status: format!("{:?}", record.status),
+            was_rewritten: record.was_rewritten,
             was_translated: record.was_translated,
             source_dialect: format!("{:?}", record.source_dialect),
             target_dialect: format!("{:?}", record.target_dialect),
@@ -329,6 +331,7 @@ impl QueryHistoryStore for InMemoryPersistence {
 
         let failed = recent.iter().filter(|r| r.status == "Failed").count() as f64;
         let translated = recent.iter().filter(|r| r.was_translated).count() as f64;
+        let rewritten = recent.iter().filter(|r| r.was_rewritten).count() as f64;
         let avg_ms = recent
             .iter()
             .map(|r| r.execution_duration_ms as f64)
@@ -340,6 +343,7 @@ impl QueryHistoryStore for InMemoryPersistence {
             error_rate_last_hour: failed / total as f64,
             avg_duration_ms_last_hour: avg_ms,
             translation_rate_last_hour: translated / total as f64,
+            rewrite_rate_last_hour: rewritten / total as f64,
         })
     }
 
@@ -1023,6 +1027,7 @@ fn engine_stat_row(engine_type: String, rows: &[&QuerySummary]) -> EngineStatRow
     let failed = rows.iter().filter(|r| r.status == "Failed").count() as i64;
     let cancelled = rows.iter().filter(|r| r.status == "Cancelled").count() as i64;
     let translated = rows.iter().filter(|r| r.was_translated).count() as i64;
+    let rewritten = rows.iter().filter(|r| r.was_rewritten).count() as i64;
     let total_rows = rows.iter().filter_map(|r| r.rows_returned).sum::<i64>();
     let exec_times: Vec<i64> = rows.iter().map(|r| r.execution_duration_ms).collect();
     let queue_times: Vec<i64> = rows.iter().map(|r| r.queue_duration_ms).collect();
@@ -1038,6 +1043,7 @@ fn engine_stat_row(engine_type: String, rows: &[&QuerySummary]) -> EngineStatRow
         max_execution_ms: exec_times.iter().copied().max().unwrap_or(0),
         avg_queue_ms: mean(&queue_times),
         translated_queries: translated,
+        rewritten_queries: rewritten,
         total_rows_returned: total_rows,
     }
 }
@@ -1052,6 +1058,7 @@ fn group_stat_row(
     let failed = rows.iter().filter(|r| r.status == "Failed").count() as i64;
     let cancelled = rows.iter().filter(|r| r.status == "Cancelled").count() as i64;
     let translated = rows.iter().filter(|r| r.was_translated).count() as i64;
+    let rewritten = rows.iter().filter(|r| r.was_rewritten).count() as i64;
     let total_rows = rows.iter().filter_map(|r| r.rows_returned).sum::<i64>();
     let exec_times: Vec<i64> = rows.iter().map(|r| r.execution_duration_ms).collect();
     let queue_times: Vec<i64> = rows.iter().map(|r| r.queue_duration_ms).collect();
@@ -1068,6 +1075,7 @@ fn group_stat_row(
         max_execution_ms: exec_times.iter().copied().max().unwrap_or(0),
         avg_queue_ms: mean(&queue_times),
         translated_queries: translated,
+        rewritten_queries: rewritten,
         total_rows_returned: total_rows,
     }
 }
@@ -1572,6 +1580,8 @@ mod tests {
             frontend_protocol: FrontendProtocol::TrinoHttp,
             source_dialect: SqlDialect::Trino,
             target_dialect: SqlDialect::Generic,
+            was_rewritten: false,
+            rewritten_sql: None,
             was_translated: false,
             translated_sql: None,
             user: None,
