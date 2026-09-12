@@ -95,18 +95,21 @@ struct ConnectionRuntime {
 }
 
 pub struct OpaAccessGuard {
-    /// Keyed by connection name; always contains `"default"` (config validation enforces
-    /// this — see `AccessControlConfig::validate`).
+    /// Keyed by connection name. No name is reserved or required to be present.
     connections: HashMap<String, ConnectionRuntime>,
     global_enabled: bool,
     group_enabled: HashMap<String, Option<bool>>,
-    /// Only groups with an explicit `groups.<name>.connection` override; absence means
-    /// `"default"`.
+    /// Only groups with an explicit `groups.<name>.connection` override; absence falls back
+    /// to `default_connection`.
     group_connection: HashMap<String, String>,
+    /// `accessControl.defaultConnection` — the connection a group without an explicit
+    /// override resolves to. `None` means such a group gets no access control at all.
+    default_connection: Option<String>,
 }
 
 impl OpaAccessGuard {
-    /// Whether access control runs for queries routed to `group`.
+    /// Whether access control is administratively enabled for `group`. Does **not** by
+    /// itself mean access control runs for it — see [`Self::connection_name_for_group`].
     pub fn enabled_for_group(&self, group: &str) -> bool {
         if let Some(enabled) = self
             .group_enabled
@@ -118,28 +121,23 @@ impl OpaAccessGuard {
         self.global_enabled
     }
 
-    /// The named connection `group` resolves to (its own override, else `"default"`).
-    pub fn connection_name_for_group<'a>(&'a self, group: &str) -> &'a str {
+    /// The named connection `group` resolves to: its own override, else
+    /// `default_connection`. `None` means access control does not apply to this group.
+    pub fn connection_name_for_group<'a>(&'a self, group: &str) -> Option<&'a str> {
         self.group_connection
             .get(group)
             .map(String::as_str)
-            .unwrap_or(queryflux_core::access_config::DEFAULT_CONNECTION)
+            .or(self.default_connection.as_deref())
     }
 
-    fn connection_for_group(&self, group: &str) -> &ConnectionRuntime {
-        let name = self.connection_name_for_group(group);
-        self.connections.get(name).unwrap_or_else(|| {
-            // Unreachable given `AccessControlConfig::validate`, which rejects a group
-            // referencing an undefined connection and requires "default" to exist.
-            self.connections
-                .get(queryflux_core::access_config::DEFAULT_CONNECTION)
-                .expect("accessControl.connections must include \"default\"")
-        })
+    fn connection_for_group(&self, group: &str) -> Option<&ConnectionRuntime> {
+        self.connection_name_for_group(group)
+            .and_then(|name| self.connections.get(name))
     }
 
     /// Build the rewriting guard from validated `accessControl` config. One
     /// [`AccessController`] (its own HTTP client, cache, fail-open policy) is built per named
-    /// connection — most deployments define only `"default"`.
+    /// connection.
     pub fn try_from_config(
         cfg: &queryflux_core::access_config::AccessControlConfig,
     ) -> Result<Arc<Self>, String> {
@@ -175,6 +173,7 @@ impl OpaAccessGuard {
             global_enabled: cfg.enabled,
             group_enabled,
             group_connection,
+            default_connection: cfg.default_connection.clone(),
         }))
     }
 }
@@ -190,7 +189,11 @@ impl Guard for OpaAccessGuard {
     }
 
     async fn check(&self, ctx: &GuardContext<'_>) -> GuardResult {
-        let conn = self.connection_for_group(&ctx.cluster_group.0);
+        // No connection resolves for this group (no explicit override and no
+        // `defaultConnection`) — access control simply does not apply here.
+        let Some(conn) = self.connection_for_group(&ctx.cluster_group.0) else {
+            return GuardResult::allow();
+        };
 
         let stmts = match ctx.sql_parse {
             Some(cache) => cache.statements_async().await.map(<[_]>::to_vec),
@@ -555,6 +558,7 @@ mod tests {
 
         let cfg = AccessControlConfig {
             enabled: true,
+            default_connection: Some("default".to_string()),
             connections: HashMap::from([
                 ("default".to_string(), opa_connection(&default_url)),
                 ("eu".to_string(), opa_connection(&eu_url)),
@@ -570,8 +574,8 @@ mod tests {
         };
         let guard = OpaAccessGuard::try_from_config(&cfg).expect("build guard");
 
-        assert_eq!(guard.connection_name_for_group("trino-prod"), "default");
-        assert_eq!(guard.connection_name_for_group("eu-group"), "eu");
+        assert_eq!(guard.connection_name_for_group("trino-prod"), Some("default"));
+        assert_eq!(guard.connection_name_for_group("eu-group"), Some("eu"));
 
         let dialect = SqlDialect::Postgres;
         let engine_type = EngineType::Trino;
@@ -615,6 +619,55 @@ mod tests {
                 assert!(sql.contains("source = 'eu'"), "got: {sql}")
             }
             other => panic!("expected a rewrite from the eu connection, got {other:?}"),
+        }
+    }
+
+    /// With no `defaultConnection` set, a group that doesn't explicitly opt into a named
+    /// connection gets no access control at all — `check()` allows without ever calling the
+    /// stub, distinct from an explicit allow decision.
+    #[tokio::test]
+    async fn group_with_no_resolvable_connection_is_allowed_without_a_call() {
+        let stub_url = start_tagged_stub("only").await;
+        let cfg = AccessControlConfig {
+            enabled: true,
+            default_connection: None,
+            connections: HashMap::from([("only".to_string(), opa_connection(&stub_url))]),
+            groups: HashMap::from([(
+                "opted-in".to_string(),
+                GroupOverride {
+                    enabled: None,
+                    fail_open: None,
+                    connection: Some("only".to_string()),
+                },
+            )]),
+        };
+        let guard = OpaAccessGuard::try_from_config(&cfg).expect("build guard");
+
+        assert_eq!(guard.connection_name_for_group("unrelated-group"), None);
+        assert_eq!(guard.connection_name_for_group("opted-in"), Some("only"));
+
+        let dialect = SqlDialect::Postgres;
+        let engine_type = EngineType::Trino;
+        let sql = "SELECT id FROM orders";
+        let sql_parse = SqlParseCache::new(sql.to_string(), dialect.clone());
+        let attributes = BTreeMap::new();
+        let query_tags = QueryTags::new();
+        let session_extra = HashMap::new();
+
+        let unrelated_group = ClusterGroupName("unrelated-group".to_string());
+        let ctx = plan_ctx(
+            sql,
+            &dialect,
+            &engine_type,
+            &unrelated_group,
+            &attributes,
+            &query_tags,
+            &session_extra,
+            &sql_parse,
+        );
+        match guard.check(&ctx).await {
+            GuardResult::Allow { .. } => {}
+            other => panic!("expected a plain allow (no connection resolved), got {other:?}"),
         }
     }
 }

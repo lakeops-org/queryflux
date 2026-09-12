@@ -184,6 +184,7 @@ accessControl:
             r#"
 queryflux: {}
 accessControl:
+  defaultConnection: default
   connections:
     default:
       opa:
@@ -208,10 +209,44 @@ accessControl:
             .expect("valid multi-connection access_control should load")
             .access_control
             .expect("accessControl block");
-        assert_eq!(cfg.connection_name_for_group("eu-group"), "eu-sandbox");
-        assert_eq!(cfg.connection_name_for_group("trino-prod"), "default");
+        assert_eq!(cfg.connection_name_for_group("eu-group"), Some("eu-sandbox"));
+        assert_eq!(cfg.connection_name_for_group("trino-prod"), Some("default"));
         assert!(cfg.enabled_for_group("trino-prod"));
         assert!(!cfg.enabled_for_group("sandbox"));
+    }
+
+    #[tokio::test]
+    async fn load_group_with_no_default_connection_resolves_to_none() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.yaml");
+        tokio::fs::write(
+            &path,
+            r#"
+queryflux: {}
+accessControl:
+  connections:
+    eu-sandbox:
+      opa:
+        url: https://eu-opa.internal
+  groups:
+    eu-group:
+      connection: eu-sandbox
+"#,
+        )
+        .await
+        .expect("write config");
+
+        let provider = YamlFileConfigProvider::new(&path);
+        let cfg = provider
+            .load()
+            .await
+            .expect("valid access_control without a default connection should load")
+            .access_control
+            .expect("accessControl block");
+        assert_eq!(cfg.connection_name_for_group("eu-group"), Some("eu-sandbox"));
+        // No `defaultConnection` and no per-group override — access control simply
+        // doesn't apply to this group.
+        assert_eq!(cfg.connection_name_for_group("trino-prod"), None);
     }
 
     #[tokio::test]

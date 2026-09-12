@@ -67,6 +67,7 @@ auth:
         groups: [customer_portal]
 
 accessControl:
+  defaultConnection: default
   connections:
     default:
       provider: opa
@@ -81,7 +82,7 @@ accessControl:
       sessionParamKeys: [customer]
 ```
 
-Shared knobs: [Access control overview](overview.md) (`enabled`, per–cluster-group scope on the **Access Control** page, `sessionParamKeys`, …). OPA URL, wire format, and mask types: [OPA provider](opa.md). Scope for the API's cluster group must be **enabled** or OPA is skipped for that route.
+Shared knobs: [Access control overview](overview.md) (`enabled`, per–cluster-group scope on the **Access Control** page, `sessionParamKeys`, …). OPA URL, wire format, and mask types: [OPA provider](opa.md). The API's cluster group must be **enabled** and resolve a connection (via `defaultConnection` above, or its own `groups.<name>.connection`) or access control is skipped for that route.
 
 ---
 

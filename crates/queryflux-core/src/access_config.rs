@@ -2,10 +2,6 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-/// The name every cluster group resolves to when it (and no `groups.<name>` override) names
-/// a connection explicitly. Always required in `connections`.
-pub const DEFAULT_CONNECTION: &str = "default";
-
 /// Operation names the guard can currently classify and enforce. `operations` is an
 /// allowlist, so anything outside this set would silently never match.
 pub const SUPPORTED_OPERATIONS: &[&str] = &[
@@ -93,11 +89,11 @@ impl Default for OpaProviderConfig {
     }
 }
 
-/// One named policy-provider connection. Every cluster group resolves to exactly one
-/// connection — its own `groups.<name>.connection`, or `"default"` when unset — so a
-/// segmented deployment (a sandboxed VPC, a different compliance boundary, a per-team OPA
-/// during a provider migration) doesn't have to share one HTTP endpoint, cache, or
-/// fail-open policy across every group. Most deployments need only `"default"`.
+/// One named policy-provider connection. A cluster group resolves to a connection via its
+/// own `groups.<name>.connection`, or the top-level `defaultConnection` when unset — there
+/// is no reserved connection name. A segmented deployment (a sandboxed VPC, a different
+/// compliance boundary, a per-team OPA during a provider migration) adds another named entry
+/// instead of sharing one HTTP endpoint, cache, or fail-open policy across every group.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AccessConnectionConfig {
@@ -221,8 +217,9 @@ pub struct GroupOverride {
     pub enabled: Option<bool>,
     #[serde(default)]
     pub fail_open: Option<bool>,
-    /// Named entry in `accessControl.connections` this group uses. Omit to use
-    /// `"default"`. Must reference a key present in `connections`.
+    /// Named entry in `accessControl.connections` this group uses. Omit to inherit
+    /// [`AccessControlConfig::default_connection`]. Must reference a key present in
+    /// `connections` when set.
     #[serde(default)]
     pub connection: Option<String>,
 }
@@ -234,29 +231,28 @@ pub struct AccessControlConfig {
     /// Default for cluster groups without an explicit `groups.<name>.enabled` override.
     #[serde(default = "default_enabled")]
     pub enabled: bool,
-    /// Named policy-provider connections. Must include a `"default"` entry — every group
-    /// without an explicit `groups.<name>.connection` override resolves to it. Most
-    /// deployments define only `"default"`; add more only when a group genuinely needs a
-    /// different endpoint (network segmentation, blast-radius isolation, migration).
-    #[serde(default = "default_connections")]
+    /// Named connection groups resolve to when they have no explicit
+    /// `groups.<name>.connection` override. `None` means such groups get **no** access
+    /// control at all, regardless of `enabled` — there is nothing to route them to. Must
+    /// reference a key present in `connections` when set.
+    #[serde(default)]
+    pub default_connection: Option<String>,
+    /// Named policy-provider connections. No name is reserved or required — a group only
+    /// gets access control when it resolves to one, via its own `groups.<name>.connection`
+    /// or `defaultConnection`.
+    #[serde(default)]
     pub connections: HashMap<String, AccessConnectionConfig>,
     /// Per-cluster-group overrides: on/off, fail-open, and which named connection to use.
     #[serde(default)]
     pub groups: HashMap<String, GroupOverride>,
 }
 
-fn default_connections() -> HashMap<String, AccessConnectionConfig> {
-    HashMap::from([(
-        DEFAULT_CONNECTION.to_string(),
-        AccessConnectionConfig::default(),
-    )])
-}
-
 impl Default for AccessControlConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            connections: default_connections(),
+            default_connection: None,
+            connections: HashMap::new(),
             groups: HashMap::new(),
         }
     }
@@ -265,10 +261,10 @@ impl Default for AccessControlConfig {
 impl AccessControlConfig {
     /// Parse a Studio / Admin API blob.
     ///
-    /// JSON `null`, or a bare `{ "enabled": false }` with no `connections`, turns access
-    /// control off entirely. Any other object is deserialized as [`AccessControlConfig`]
-    /// and validated. `enabled: false` **with** a `connections` block is kept loaded (not
-    /// disabled) so per-group `groups.<name>.enabled: true` can still opt in.
+    /// JSON `null`, or any body with no (or an empty) `connections` map, turns access
+    /// control off entirely — with nothing under `connections`, no group could ever resolve
+    /// a connection anyway. Any other object is deserialized as [`AccessControlConfig`] and
+    /// validated.
     pub fn from_admin_value(v: &serde_json::Value) -> Result<Option<Self>, String> {
         if v.is_null() {
             return Ok(None);
@@ -277,7 +273,7 @@ impl AccessControlConfig {
             .get("connections")
             .and_then(|c| c.as_object())
             .is_some_and(|o| !o.is_empty());
-        if v.get("enabled").and_then(|e| e.as_bool()) == Some(false) && !has_connections {
+        if !has_connections {
             return Ok(None);
         }
         let mut obj = v.clone();
@@ -301,7 +297,9 @@ impl AccessControlConfig {
         Ok(Some(cfg))
     }
 
-    /// Whether access control runs for queries routed to `group`.
+    /// Whether access control is administratively enabled for `group`. Does **not** by
+    /// itself mean access control runs — `group` must also resolve a connection; see
+    /// [`Self::connection_name_for_group`].
     pub fn enabled_for_group(&self, group: &str) -> bool {
         self.groups
             .get(group)
@@ -309,26 +307,32 @@ impl AccessControlConfig {
             .unwrap_or(self.enabled)
     }
 
-    /// The named connection `group` resolves to (its own override, else `"default"`).
-    pub fn connection_name_for_group<'a>(&'a self, group: &str) -> &'a str {
+    /// The named connection `group` resolves to: its own override, else
+    /// [`Self::default_connection`]. `None` means access control does not apply to this
+    /// group at all, regardless of [`Self::enabled_for_group`].
+    pub fn connection_name_for_group<'a>(&'a self, group: &str) -> Option<&'a str> {
         self.groups
             .get(group)
             .and_then(|g| g.connection.as_deref())
-            .unwrap_or(DEFAULT_CONNECTION)
+            .or(self.default_connection.as_deref())
     }
 
-    /// The resolved connection config for `group`. `None` only if config validation was
-    /// skipped — `validate()` guarantees every group's resolved name exists.
+    /// The resolved connection config for `group`, if any.
     pub fn connection_for_group(&self, group: &str) -> Option<&AccessConnectionConfig> {
-        self.connections.get(self.connection_name_for_group(group))
+        self.connection_name_for_group(group)
+            .and_then(|name| self.connections.get(name))
     }
 
     pub fn validate(&self) -> Result<(), String> {
-        if !self.connections.contains_key(DEFAULT_CONNECTION) {
-            return Err("accessControl.connections must include a \"default\" entry".to_string());
-        }
         for (name, conn) in &self.connections {
             conn.validate(name)?;
+        }
+        if let Some(name) = &self.default_connection {
+            if !self.connections.contains_key(name) {
+                return Err(format!(
+                    "accessControl.defaultConnection {name:?} is not defined under accessControl.connections"
+                ));
+            }
         }
         for (group, ov) in &self.groups {
             if let Some(conn_name) = &ov.connection {
@@ -355,6 +359,11 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+        assert!(
+            AccessControlConfig::from_admin_value(&json!({ "connections": {} }))
+                .unwrap()
+                .is_none()
+        );
         assert!(AccessControlConfig::from_admin_value(&json!(null))
             .unwrap()
             .is_none());
@@ -364,8 +373,9 @@ mod tests {
     fn from_admin_value_enabled_opa() {
         let v = json!({
             "enabled": true,
+            "defaultConnection": "prod",
             "connections": {
-                "default": {
+                "prod": {
                     "provider": "opa",
                     "opa": { "url": "http://opa:8181", "decisionPath": "/v1/data/queryflux/access" },
                     "sessionParamKeys": ["customer"]
@@ -373,35 +383,50 @@ mod tests {
             }
         });
         let cfg = AccessControlConfig::from_admin_value(&v).unwrap().unwrap();
-        let default = &cfg.connections[DEFAULT_CONNECTION];
-        assert_eq!(default.opa.as_ref().unwrap().url, "http://opa:8181");
-        assert_eq!(default.session_param_keys, vec!["customer"]);
+        let prod = &cfg.connections["prod"];
+        assert_eq!(prod.opa.as_ref().unwrap().url, "http://opa:8181");
+        assert_eq!(prod.session_param_keys, vec!["customer"]);
+        assert_eq!(cfg.connection_name_for_group("anything"), Some("prod"));
     }
 
     #[test]
     fn from_admin_value_rejects_bad_url() {
         let v = json!({
-            "connections": { "default": { "opa": { "url": "not-a-url" } } }
+            "connections": { "prod": { "opa": { "url": "not-a-url" } } }
         });
         assert!(AccessControlConfig::from_admin_value(&v).is_err());
     }
 
     #[test]
-    fn from_admin_value_missing_default_connection_rejected() {
+    fn from_admin_value_rejects_unknown_default_connection() {
         let v = json!({
-            "connections": {
-                "eu": { "opa": { "url": "http://opa:8181" } }
-            }
+            "defaultConnection": "does-not-exist",
+            "connections": { "prod": { "opa": { "url": "http://opa:8181" } } }
         });
         assert!(AccessControlConfig::from_admin_value(&v).is_err());
+    }
+
+    #[test]
+    fn from_admin_value_no_default_connection_keeps_config() {
+        // A connection can exist purely for groups that explicitly opt into it, with no
+        // fleet-wide default at all.
+        let v = json!({
+            "connections": { "eu": { "opa": { "url": "http://opa:8181" } } },
+            "groups": { "eu-group": { "connection": "eu" } }
+        });
+        let cfg = AccessControlConfig::from_admin_value(&v).unwrap().unwrap();
+        assert_eq!(cfg.default_connection, None);
+        assert_eq!(cfg.connection_name_for_group("eu-group"), Some("eu"));
+        assert_eq!(cfg.connection_name_for_group("other-group"), None);
     }
 
     #[test]
     fn from_admin_value_global_off_with_connections_keeps_config() {
         let v = json!({
             "enabled": false,
+            "defaultConnection": "prod",
             "connections": {
-                "default": { "opa": { "url": "http://opa:8181", "decisionPath": "/v1/data/queryflux/access" } }
+                "prod": { "opa": { "url": "http://opa:8181", "decisionPath": "/v1/data/queryflux/access" } }
             },
             "groups": { "analytics": { "enabled": true } }
         });
@@ -442,8 +467,13 @@ mod tests {
     }
 
     #[test]
-    fn connection_resolution_defaults_and_overrides() {
-        let mut cfg = AccessControlConfig::default();
+    fn connection_resolution_default_and_overrides() {
+        let mut cfg = AccessControlConfig {
+            default_connection: Some("prod".to_string()),
+            ..Default::default()
+        };
+        cfg.connections
+            .insert("prod".to_string(), AccessConnectionConfig::default());
         cfg.connections.insert(
             "eu".to_string(),
             AccessConnectionConfig {
@@ -462,11 +492,8 @@ mod tests {
                 connection: Some("eu".to_string()),
             },
         );
-        assert_eq!(cfg.connection_name_for_group("eu-group"), "eu");
-        assert_eq!(
-            cfg.connection_name_for_group("trino-prod"),
-            DEFAULT_CONNECTION
-        );
+        assert_eq!(cfg.connection_name_for_group("eu-group"), Some("eu"));
+        assert_eq!(cfg.connection_name_for_group("trino-prod"), Some("prod"));
         assert_eq!(
             cfg.connection_for_group("eu-group")
                 .unwrap()
@@ -477,6 +504,16 @@ mod tests {
             "https://eu-opa.internal"
         );
         cfg.validate().expect("valid config with two connections");
+    }
+
+    #[test]
+    fn connection_resolution_none_when_no_default_and_no_override() {
+        let mut cfg = AccessControlConfig::default();
+        cfg.connections
+            .insert("eu".to_string(), AccessConnectionConfig::default());
+        // No `defaultConnection` set — a group with no explicit override gets nothing.
+        assert_eq!(cfg.connection_name_for_group("trino-prod"), None);
+        assert!(cfg.connection_for_group("trino-prod").is_none());
     }
 
     #[test]
@@ -561,5 +598,15 @@ mod tests {
                 "{bad}: {err}"
             );
         }
+    }
+
+    #[test]
+    fn validate_rejects_unknown_default_connection() {
+        let cfg = AccessControlConfig {
+            default_connection: Some("does-not-exist".to_string()),
+            ..Default::default()
+        };
+        let err = cfg.validate().unwrap_err();
+        assert!(err.contains("does-not-exist"), "unexpected error: {err}");
     }
 }

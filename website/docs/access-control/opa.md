@@ -26,13 +26,14 @@ OPA does **not** replace frontend authentication (`auth`) or cluster-group autho
 
 ## Configuration
 
-QueryFlux **connects** to OPA; it does not store or edit Rego. In Studio, **Access Control** is URL / decision path / credentials for the `default` connection, plus **scope by cluster group** (global default and per-group inherit / enabled / disabled). The same fields live under `accessControl.connections.<name>:` in YAML — most deployments need only `"default"`:
+QueryFlux **connects** to OPA; it does not store or edit Rego. In Studio, **Access Control** lets you add any number of named connections (URL / decision path / credentials each), pick which one is the **default**, and set **scope by cluster group** (global default and per-group inherit / enabled / disabled, plus which connection). The same fields live under `accessControl.connections.<name>:` in YAML — most deployments need only one, named as `defaultConnection`:
 
 ```yaml
 accessControl:
   enabled: true                     # default for groups without groups.<name>.enabled
+  defaultConnection: prod           # groups without an override use this connection
   connections:
-    default:
+    prod:
       provider: opa                 # default when a connection is defined
       opa:
         url: http://localhost:8181
@@ -64,11 +65,11 @@ accessControl:
 | `connections.<name>.opa.bearerToken` | — | Static bearer token if this OPA requires auth. |
 | `connections.<name>.opa.clientCredentials` | — | OAuth2 client-credentials fetch for a bearer token. |
 
-`accessControl.connections` must include a `"default"` entry, and `provider: opa` without an `opa:` block on that connection fails validation at startup. Shared knobs (`enabled`, `operations`, `failOpen`, `sessionParamKeys`, …) are documented in the [overview](overview.md#enabling-access-control).
+No connection name is reserved. `provider: opa` without an `opa:` block on a connection fails validation at startup, and so does a `defaultConnection` or `groups.<name>.connection` that names a connection not defined under `connections`. Without `defaultConnection` set, a group with no explicit `groups.<name>.connection` override gets **no access control at all**. Shared knobs (`enabled`, `operations`, `failOpen`, `sessionParamKeys`, …) are documented in the [overview](overview.md#enabling-access-control).
 
 ### Scope (which groups call which connection)
 
-Scope — which **cluster groups** run access control, and which named connection each uses — is configured under `accessControl.groups`. The `default` connection's on/off scope is edited on the **Access Control** page in Studio (not on the Clusters group form); a `groups.<name>.connection` override to a non-default connection is YAML/Admin-API only today. See [Scope by cluster group](overview.md#scope-by-cluster-group) and [Multiple connections](overview.md#multiple-connections).
+Scope — which **cluster groups** run access control, and which named connection each uses — is configured under `accessControl.groups` and edited on the **Access Control** page in Studio (not on the Clusters group form). See [Scope by cluster group](overview.md#scope-by-cluster-group) and [Multiple connections](overview.md#multiple-connections).
 
 Different rules per team on the **same** OPA: branch in Rego on `input.context.clusterGroup` and `input.identity.groups` — that's the common case, and it's one bundle to `opa test`. A genuinely different **OPA server** per team (network segmentation, blast-radius isolation, migrating one group to a new provider) is a second named `connections` entry plus `groups.<name>.connection`, not a separate QueryFlux instance.
 
@@ -397,7 +398,7 @@ curl -s -u admin:admin -X POST http://localhost:9000/admin/access-control/dry-ru
   }'
 ```
 
-If `clusterGroup` has access control disabled in config, the response is `{ "outcome": "skip", ... }` instead of calling OPA. Every response also carries `"connection"` — the named connection `clusterGroup` resolved to (`"default"` unless `accessControl.groups.<name>.connection` says otherwise) — so a dry-run against a group routed to a non-default connection is unambiguous about which OPA server actually answered.
+If `clusterGroup` has access control disabled, or has no resolvable connection (no `groups.<name>.connection` override and no `defaultConnection` configured), the response is `{ "outcome": "skip", "reason": "..." }` instead of calling OPA. Every other response also carries `"connection"` — the named connection `clusterGroup` resolved to — so a dry-run against a group routed to a non-default connection is unambiguous about which OPA server actually answered.
 
 Or call OPA directly to debug Rego without QueryFlux:
 

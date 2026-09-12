@@ -28,12 +28,12 @@ QueryFlux does **not** author policy. It **connects** to OPA and enforces whatev
 | Question | Answer |
 | --- | --- |
 | Where does policy live? | In the **OPA bundle** (Rego). Not in QueryFlux YAML, not in Studio. |
-| What does Studio configure? | The **default** OPA connection (URL, decision path, auth) and **scope** (which cluster groups call it). Additional named connections are YAML/Admin-API only for now — see [Multiple connections](#multiple-connections) below. |
+| What does Studio configure? | Any number of named OPA connections (URL, decision path, auth), which one is the **default**, and **scope** (which cluster groups call which connection). |
 | Where is scope edited? | The **Access Control** page — same pattern as `guardrails.global` + `guardrails.groups`, not on the Clusters / group form. |
 | Different rules for different teams? | Prefer branching in Rego on `input.context.clusterGroup` / identity — it's one bundle, one deploy, testable with `opa test`. Reach for a second **connection** (below) only when the constraint is the connection itself: network segmentation, blast-radius isolation, or a per-team OPA during a migration. |
 | Multiple access-control engines on one query? | **No** — one `opa_access` decision per query, from exactly one resolved connection. |
 
-At query time: routing picks a **cluster group** → QueryFlux resolves `accessControl.enabled` + `accessControl.groups.<name>.enabled`, and which **connection** the group uses (`groups.<name>.connection`, else `"default"`) → if enabled, one call to that connection's provider → rewrite or deny → then guardrails / translation / engine.
+At query time: routing picks a **cluster group** → QueryFlux resolves `accessControl.enabled` + `accessControl.groups.<name>.enabled`, and which **connection** the group uses (`groups.<name>.connection`, else `accessControl.defaultConnection`) → if enabled **and** a connection resolves, one call to that connection's provider → rewrite or deny → then guardrails / translation / engine. No name is reserved: with no `defaultConnection` set, a group with no explicit override gets no access control at all.
 
 ---
 
@@ -120,13 +120,14 @@ Worked example (API service account + `customer=7`): **[Customer API — per-ten
 
 ## Enabling access control
 
-Minimal skeleton — one connection, named `"default"`, used by every cluster group:
+Minimal skeleton — one connection, used by every cluster group via `defaultConnection`:
 
 ```yaml
 accessControl:
   enabled: true                     # default for groups without an override
+  defaultConnection: prod           # connection groups fall back to; no name is reserved
   connections:
-    default:
+    prod:
       provider: opa
       opa:
         url: http://localhost:8181
@@ -148,7 +149,8 @@ accessControl:
 | Setting | Meaning |
 | --- | --- |
 | `enabled` | Global default: run access control for a cluster group unless `groups.<name>.enabled` overrides. Default: `true` when `accessControl` is set. Set `false` to opt in only where groups explicitly set `enabled: true`. |
-| `connections` | Map of named policy-provider connections. Must include `"default"` — see [Multiple connections](#multiple-connections). |
+| `defaultConnection` | Named entry under `connections` that a group uses when it has no explicit `groups.<name>.connection` override. **Unset means such a group gets no access control at all** — there's nothing to route it to. Must reference a key under `connections` when set. |
+| `connections` | Map of named policy-provider connections. No name is reserved — see [Multiple connections](#multiple-connections). |
 | `connections.<name>.operations` | Only these namespaced ops hit that connection's provider; others skip the stage. Default: `[table.select]`. |
 | `connections.<name>.onMissingSchema` | When columns can't be resolved (`SELECT *` without catalog): `evaluate` still calls the provider with "all columns"; `deny` fails closed. |
 | `connections.<name>.failOpen` | Provider timeout/transport error → allow (`true`) or deny (`false`, default) for groups on this connection. |
@@ -156,13 +158,13 @@ accessControl:
 | `connections.<name>.sessionParamKeys` | Which `SessionContext.extra` keys become `context.sessionParams` for this connection. |
 | `groups.<name>.enabled` | Per cluster group: inherit global default (omit), force on (`true`), or skip OPA (`false`). |
 | `groups.<name>.failOpen` | Override fail-open for one cluster group, regardless of which connection it uses. |
-| `groups.<name>.connection` | Which named connection this group uses. Omit for `"default"`. Must reference a key under `connections`. |
+| `groups.<name>.connection` | Which named connection this group uses. Omit to inherit `defaultConnection`. Must reference a key under `connections` when set. |
 
 Full OPA wire format, Rego package shape, and auth to the OPA server: **[OPA provider](opa.md)**.
 
 ### Scope by cluster group
 
-One connection can apply fleet-wide, but **not every cluster group has to use it**, and not every group has to use the *same* connection:
+A connection can apply fleet-wide via `defaultConnection`, but **not every cluster group has to use it**, and not every group has to use the *same* connection:
 
 | Pattern | Config |
 | --- | --- |
@@ -170,14 +172,15 @@ One connection can apply fleet-wide, but **not every cluster group has to use it
 | **Opt-in only** | `enabled: false` + `groups.analytics.enabled: true` for each group that should call OPA |
 | **Per-group fail-open** | `groups.<name>.failOpen` overrides that connection's `failOpen` when it errors |
 | **A group on a different connection** | `groups.<name>.connection: <name>` — see [Multiple connections](#multiple-connections) |
+| **No fleet-wide default at all** | Omit `defaultConnection`; only groups with an explicit `groups.<name>.connection` get access control |
 
-Resolution order for group `G`: `groups.G.enabled` if set, else global `enabled` (default `true`). If the result is `false`, QueryFlux **skips** access control entirely for that group — no HTTP call, no `opa_access` rewrite.
+Resolution for group `G` has **two independent gates**, both must pass: (1) `groups.G.enabled` if set, else global `enabled` (default `true`); (2) `groups.G.connection` if set, else `defaultConnection` — if neither names a connection, access control does not apply to `G` regardless of (1). If either gate fails, QueryFlux **skips** access control entirely for that group — no HTTP call, no `opa_access` rewrite.
 
 Configure scope on the **Access Control** page in Studio (or `accessControl.groups` in YAML). The **Clusters** page does not own this setting — group detail shows a read-only **Access control** badge (`OPA on` / `Skipped` / `Off`) and links here; editing stays on Access Control.
 
 ### Multiple connections
 
-Most deployments need only `"default"`. A named connection is its own HTTP endpoint, decision cache, and fail-open policy — reach for a second one when the constraint is genuinely the **connection**, not the policy:
+Most deployments need only one connection, named as `defaultConnection`. A named connection is its own HTTP endpoint, decision cache, and fail-open policy — reach for a second one when the constraint is genuinely the **connection**, not the policy:
 
 - **Network segmentation** — a cluster group in a separate VPC/tenant boundary that can't reach the fleet's OPA.
 - **Blast-radius isolation** — a bad bundle push to one team's OPA shouldn't require coordinating a deploy with every other team.
@@ -188,19 +191,20 @@ For everything else — "analysts see different columns than engineers," "the EU
 ```yaml
 accessControl:
   enabled: true
+  defaultConnection: prod
   connections:
-    default:
+    prod:
       opa: { url: http://opa.internal:8181, decisionPath: /v1/data/queryflux/access }
     eu-sandbox:
       opa: { url: https://eu-opa.internal, decisionPath: /v1/data/queryflux/access }
   groups:
-    trino-prod: {}                        # → "default"
+    trino-prod: {}                        # → "prod" (the default)
     eu-group: { connection: eu-sandbox }  # → "eu-sandbox"
 ```
 
-Each connection is a full [`OpaProviderConfig`](opa.md) (its own URL, timeout, credentials, `operations`, `onMissingSchema`, cache, `sessionParamKeys`); a group resolves to exactly one. Config validation rejects a `groups.<name>.connection` that isn't defined under `connections`, and rejects `accessControl.connections` missing a `"default"` entry.
+Each connection is a full [`OpaProviderConfig`](opa.md) (its own URL, timeout, credentials, `operations`, `onMissingSchema`, cache, `sessionParamKeys`); a group resolves to at most one. Config validation rejects a `groups.<name>.connection` or `defaultConnection` that isn't defined under `connections`. Connection names are arbitrary — `"default"` is not special, just a common label.
 
-Configuring more than `"default"` is YAML / Admin API (`PUT /admin/config/access-control`) only for now — Studio's **Access Control** page edits the default connection and per-group scope, not additional named connections.
+Studio's **Access Control** page can add, edit, and remove any number of named connections, and set which one is `defaultConnection`.
 
 ---
 
@@ -309,11 +313,11 @@ The **Access Control** page (`GET`/`PUT /admin/config/access-control`) persists 
 
 | Studio section | What it saves |
 | --- | --- |
-| **Provider** | Disconnect (`{ "enabled": false }`, no `connections`) turns `opa_access` off entirely; otherwise the `connections.default` connection stays loaded |
-| **Connect to OPA** | `connections.default.opa.{url,decisionPath,timeoutMs}`, bearer / OAuth credentials |
-| **Scope by cluster group** | Global **Enabled by default** + per-group **Inherit / Enabled / Disabled** |
+| **Provider** | Disconnect (no `connections`) turns `opa_access` off entirely; otherwise the listed connections stay loaded |
+| **Connections** | Add/edit/remove any number of named connections — each one's `opa.{url,decisionPath,timeoutMs}`, bearer / OAuth credentials — and which one is `defaultConnection` |
+| **Scope by cluster group** | Global **Enabled by default** + per-group **Inherit / Enabled / Disabled**, plus which connection each group uses (once more than one exists) |
 
-`operations`, `onMissingSchema`, cache, `failOpen`, `sessionParamKeys`, per-group `failOpen`, and additional named `connections` beyond `"default"` are configured via **YAML or a direct `PUT /admin/config/access-control` body**, not exposed in the Studio form yet.
+`operations`, `onMissingSchema`, cache, `failOpen`, and `sessionParamKeys` (per connection) are configured via **YAML or a direct `PUT /admin/config/access-control` body**, not exposed in the Studio form yet.
 
 QueryFlux does **not** edit Rego in Studio. Secrets are never returned on GET — leave token fields blank to keep stored values (each connection's `opa.bearerToken` / `opa.clientCredentials.clientSecret` round-trips independently).
 
@@ -325,7 +329,7 @@ YAML is the fallback until you save once via the Admin API; after that the datab
 
 `POST /admin/access-control/dry-run` (Admin API, Basic-auth protected) evaluates a query against the configured provider and returns the decision plus rewritten SQL — without executing or touching a cluster.
 
-If access control is **disabled for the request's `clusterGroup`**, the response is `{ "outcome": "skip", "reason": "access control is disabled for this cluster group" }`.
+If access control is **disabled for the request's `clusterGroup`**, or the group has **no resolvable connection** (no `groups.<name>.connection` override and no `defaultConnection` configured), the response is `{ "outcome": "skip", "reason": "..." }` with a reason distinguishing the two. Every other response also carries `"connection"` — the named connection `clusterGroup` resolved to.
 
 Column masks need a column list for scan-site rewrite. Dry-run resolves that from the live catalog when configured; you can also pass an explicit `schema` map (`table → { column → type }`). Named-column queries (not `SELECT *`) can still rewrite from columns mentioned in the SQL.
 
@@ -344,7 +348,7 @@ Column masks on `SELECT *` need a column list. Configure a [catalog integration]
 - **Backend views** — policy is asked about the **view name** the query names, not underlying tables. Author grants against what the SQL references.
 - **Dynamic SQL** — table names built by string concatenation aren't resolvable by static extraction.
 - **One rewriting access-control guard per query** — `opa_access` only, from exactly one resolved connection.
-- **Additional connections are YAML/Admin-API only** — Studio's Access Control page edits `"default"` and per-group scope; a second named connection (see [Multiple connections](#multiple-connections)) isn't editable from the Studio form yet.
+- **`operations`, `onMissingSchema`, cache, `failOpen`, and `sessionParamKeys`** (per connection) are YAML/Admin-API only — not exposed in the Studio connection form yet.
 - **Scope is not editable on the cluster group form** — enable/disable/connection per group is only under `accessControl.groups` / the Access Control page (Clusters shows a read-only badge).
 - **Session params are not auto-filters** — OPA must return explicit `rowFilters`; QueryFlux never substitutes `sessionParams` into SQL itself.
 - **Trino `X-Trino-Session`** is not split into extra keys — use a header whose name matches `sessionParamKeys` (see [Customer API row filters](customer-api-row-filters)).

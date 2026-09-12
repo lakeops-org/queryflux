@@ -257,6 +257,7 @@ pub fn build_guard_with(opa_url: &str, opts: GuardOpts) -> Arc<OpaAccessGuard> {
     };
     let cfg = AccessControlConfig {
         enabled: true,
+        default_connection: Some("default".to_string()),
         connections: HashMap::from([("default".to_string(), connection)]),
         groups: HashMap::new(),
     };

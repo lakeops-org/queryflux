@@ -167,15 +167,18 @@ routingFallback: duckdb-local
 # stage as `guardrails` above. Omit this section to disable entirely. See
 # website/docs/access-control/overview.md and access-control/opa.md.
 # accessControl:
-#   enabled: true                      # global default; per-group override below
-#   # Named policy-provider connections. Must include "default" — every group without an
-#   # explicit groups.<name>.connection override resolves to it. Most deployments define
-#   # only "default"; add another entry only when a group genuinely needs a different
-#   # endpoint (network segmentation, blast-radius isolation, a per-team OPA during a
-#   # provider migration) — for "different rules per team on the same OPA", branch in Rego
-#   # on input.context.clusterGroup instead of adding a connection.
+#   enabled: true                      # global default; per-group `enabled` override below
+#   # `defaultConnection` names which entry under `connections` a cluster group uses when it
+#   # has no explicit `groups.<name>.connection` override. No connection name is reserved —
+#   # if you omit `defaultConnection`, a group with no explicit override gets NO access
+#   # control at all (nothing to route it to). Most deployments name one connection here and
+#   # never touch `groups.<name>.connection`; add another connection only when a group
+#   # genuinely needs a different endpoint (network segmentation, blast-radius isolation, a
+#   # per-team OPA during a provider migration) — for "different rules per team on the same
+#   # OPA", branch in Rego on input.context.clusterGroup instead of adding a connection.
+#   defaultConnection: prod
 #   connections:
-#     default:
+#     prod:
 #       provider: opa                  # the only provider today, and the default
 #       opa:
 #         url: http://localhost:8181
@@ -191,6 +194,6 @@ routingFallback: duckdb-local
 #     # eu-sandbox:                    # optional: a second connection for a segmented group
 #     #   opa: { url: https://eu-opa.internal, decisionPath: /v1/data/queryflux/access }
 #   groups:
-#     trino-prod: { failOpen: false }
-#     sandbox: { enabled: false }      # skip OPA entirely for this cluster group
-#     # eu-group: { connection: eu-sandbox }   # route this group to the "eu-sandbox" connection
+#     trino-prod: { failOpen: false }  # inherits `defaultConnection` (prod)
+#     sandbox: { enabled: false }      # skip access control entirely for this cluster group
+#     # eu-group: { connection: eu-sandbox }   # route this group to the "eu-sandbox" connection instead
