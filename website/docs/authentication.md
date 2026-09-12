@@ -7,15 +7,16 @@ image: img/queryflux-hero-banner.png
 ---
 # Authentication, authorization & backend identity
 
-QueryFlux separates three questions, each configured independently:
+QueryFlux separates four questions, each configured independently:
 
 | Question | Config key | Answers |
 | --- | --- | --- |
 | **Who is this client?** | `auth` | none, static users, OIDC, LDAP |
 | **What are they allowed to do?** | `authorization` | allow-all, per-group allow-lists, OpenFGA |
 | **Which identity reaches the backend engine?** | `clusters[].queryAuth` | the service account, the client's own credential, an impersonated user, or an exchanged token |
+| **Which tables/columns may they see?** | `accessControl` | allow/deny, row filters, and column masks via OPA ([overview](./access-control/overview)); connection + per–cluster-group scope in Studio **Access Control**, policy in Rego |
 
-The first two gate access to QueryFlux itself. The third — **backend identity** — decides what Trino, ClickHouse, StarRocks, or Snowflake see as the query's principal, which matters for the backend's own audit log, row-level security, and access control.
+The first two gate access to QueryFlux itself. The third — **backend identity** — decides what Trino, ClickHouse, StarRocks, or Snowflake see as the query's principal, which matters for the backend's own audit log, row-level security, and access control. The fourth — **data access control** — rewrites or denies SQL at the gateway based on the verified client identity; see **[Access control](./access-control/overview)**.
 
 ---
 
@@ -165,3 +166,9 @@ curl -X POST http://localhost:8080/v1/statement \
 ```
 
 See the example's own README for the full walkthrough, including how to swap between the three `queryAuth` modes.
+
+---
+
+## Related: data access control
+
+Gateway auth/authz and backend identity do not by themselves rewrite SQL for row filters or column masks. For identity-driven table grants, filters, and masks via OPA, see **[Access control](./access-control/overview)** and **[OPA provider](./access-control/opa)**.

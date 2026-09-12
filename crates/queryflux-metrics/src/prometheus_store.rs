@@ -16,6 +16,8 @@ pub struct PrometheusMetrics {
     query_duration_seconds: HistogramVec,
     /// queryflux_translated_queries_total{src_dialect, tgt_dialect}
     translated_total: CounterVec,
+    /// queryflux_rewritten_queries_total{src_dialect}
+    rewritten_total: CounterVec,
     /// queryflux_running_queries{cluster_group, cluster_name}
     running_queries: prometheus::GaugeVec,
     /// queryflux_queued_queries{cluster_group}
@@ -89,6 +91,14 @@ impl PrometheusMetrics {
                 "Total queries that required SQL dialect translation",
             ),
             &["src_dialect", "tgt_dialect"],
+        )?;
+
+        let rewritten_total = CounterVec::new(
+            Opts::new(
+                "queryflux_rewritten_queries_total",
+                "Total queries rewritten by access control before dialect translation",
+            ),
+            &["src_dialect"],
         )?;
 
         let running_queries = prometheus::GaugeVec::new(
@@ -185,6 +195,7 @@ impl PrometheusMetrics {
         registry.register(Box::new(queries_total.clone()))?;
         registry.register(Box::new(query_duration_seconds.clone()))?;
         registry.register(Box::new(translated_total.clone()))?;
+        registry.register(Box::new(rewritten_total.clone()))?;
         registry.register(Box::new(running_queries.clone()))?;
         registry.register(Box::new(queued_queries.clone()))?;
         registry.register(Box::new(query_tags_total.clone()))?;
@@ -203,6 +214,7 @@ impl PrometheusMetrics {
             queries_total,
             query_duration_seconds,
             translated_total,
+            rewritten_total,
             running_queries,
             queued_queries,
             query_tags_total,
@@ -326,6 +338,10 @@ impl MetricsStore for PrometheusMetrics {
             let src = format!("{:?}", record.source_dialect);
             let tgt = format!("{:?}", record.target_dialect);
             self.translated_total.with_label_values(&[&src, &tgt]).inc();
+        }
+        if record.was_rewritten {
+            let src = format!("{:?}", record.source_dialect);
+            self.rewritten_total.with_label_values(&[&src]).inc();
         }
 
         // Emit one counter increment per tag, filtered through the deny list.

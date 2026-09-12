@@ -1199,15 +1199,10 @@ pub async fn get_executing_statement(
         .max(0) as u64;
 
     // Build query context once — reused for success, failure, and poll-error record_query calls.
-    let was_translated = executing.translated_sql.is_some();
-    let ctx = QueryContext {
+    let (original_sql, pipeline) = crate::sql_pipeline::pipeline_from_executing(&executing);
+    let mut ctx = QueryContext {
         query_id: executing.id.clone(),
-        // original SQL: when translated, translated_sql holds it; otherwise sql is original
-        sql: executing
-            .translated_sql
-            .as_deref()
-            .unwrap_or(&executing.sql)
-            .to_string(),
+        sql: original_sql,
         session: session.clone(),
         protocol: FrontendProtocol::TrinoHttp,
         group: executing.cluster_group.clone(),
@@ -1217,16 +1212,15 @@ pub async fn get_executing_statement(
         engine_type: adapter.engine_type(),
         src_dialect: FrontendProtocol::TrinoHttp.default_dialect(),
         tgt_dialect: adapter.translation_target_dialect(),
-        was_translated,
-        translated_sql: if was_translated {
-            Some(executing.sql.clone())
-        } else {
-            None
-        },
+        was_rewritten: false,
+        rewritten_sql: None,
+        was_translated: false,
+        translated_sql: None,
         query_tags: effective_tags,
         query_params: vec![],
         agent_context: executing.agent_context.clone(),
     };
+    crate::sql_pipeline::apply_pipeline(&mut ctx, &pipeline);
 
     // Guard actions captured at submit time — injected into the final record_query call.
     let submit_guard_actions: Vec<queryflux_persistence::GuardAction> = match serde_json::from_value(
@@ -1690,6 +1684,9 @@ mod cancel_executing_statement_tests {
         let executing = ExecutingQuery {
             id: ProxyQueryId("proxy-1".into()),
             sql: "SELECT 1".into(),
+            client_sql: None,
+            rewritten_sql: None,
+            was_dialect_translated: false,
             translated_sql: None,
             cluster_group: group_name,
             cluster_name,

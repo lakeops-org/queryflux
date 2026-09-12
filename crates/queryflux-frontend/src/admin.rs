@@ -18,6 +18,7 @@ use queryflux_core::{
     engine_registry::EngineRegistry,
     error::{QueryFluxError, Result},
     query::{BackendQueryId, ClusterGroupName, ClusterName, ExecutingQuery, ProxyQueryId},
+    schema_context::SchemaContext,
 };
 use queryflux_metrics::prometheus_store::PrometheusMetrics;
 use queryflux_persistence::{
@@ -137,6 +138,8 @@ pub struct ClusterStateDto {
         get_guardrails_config_handler,
         put_guardrails_config_handler,
         access_control_dry_run_handler,
+        get_access_control_config_handler,
+        put_access_control_config_handler,
         get_catalog_config_handler,
         put_catalog_config_handler,
         test_catalog_config_handler,
@@ -560,6 +563,8 @@ struct AdminState {
     /// Startup (YAML) `catalogProvider` config — GET's fallback when nothing has
     /// been persisted via the admin API yet.
     catalog_provider_config: Arc<queryflux_core::config::CatalogProviderConfig>,
+    /// Startup (YAML) `accessControl` — GET's fallback when nothing has been persisted yet.
+    access_control_config: Arc<Option<queryflux_core::access_config::AccessControlConfig>>,
     engine_registry: Arc<EngineRegistry>,
     /// Wake the config reload task immediately after mutating persisted config.
     /// Uses `ConfigRevisionStore::bump_revision()` for distributed notification
@@ -591,6 +596,7 @@ pub struct AdminFrontend {
     security_config: Arc<SecurityConfigDto>,
     routing_config: Arc<RoutingConfigDto>,
     catalog_provider_config: Arc<queryflux_core::config::CatalogProviderConfig>,
+    access_control_config: Arc<Option<queryflux_core::access_config::AccessControlConfig>>,
     engine_registry: Arc<EngineRegistry>,
     config_reload_notify: Arc<tokio::sync::Notify>,
     frontends_status: FrontendsStatusDto,
@@ -612,6 +618,7 @@ impl AdminFrontend {
         security_config: Arc<SecurityConfigDto>,
         routing_config: Arc<RoutingConfigDto>,
         catalog_provider_config: Arc<queryflux_core::config::CatalogProviderConfig>,
+        access_control_config: Arc<Option<queryflux_core::access_config::AccessControlConfig>>,
         engine_registry: Arc<EngineRegistry>,
         config_reload_notify: Arc<tokio::sync::Notify>,
         frontends_status: FrontendsStatusDto,
@@ -630,6 +637,7 @@ impl AdminFrontend {
             security_config,
             routing_config,
             catalog_provider_config,
+            access_control_config,
             engine_registry,
             config_reload_notify,
             frontends_status,
@@ -650,6 +658,7 @@ impl AdminFrontend {
             security_config: self.security_config.clone(),
             routing_config: self.routing_config.clone(),
             catalog_provider_config: self.catalog_provider_config.clone(),
+            access_control_config: self.access_control_config.clone(),
             engine_registry: self.engine_registry.clone(),
             config_reload_notify: self.config_reload_notify.clone(),
             frontends_status: self.frontends_status.clone(),
@@ -746,6 +755,10 @@ impl AdminFrontend {
             .route(
                 "/admin/config/guardrails",
                 get(get_guardrails_config_handler).put(put_guardrails_config_handler),
+            )
+            .route(
+                "/admin/config/access-control",
+                get(get_access_control_config_handler).put(put_access_control_config_handler),
             )
             .route(
                 "/admin/access-control/dry-run",
@@ -2732,6 +2745,184 @@ async fn put_guardrails_config_handler(
     }
 }
 
+const ACCESS_CONTROL_SETTING_KEY: &str = "access_control_config";
+
+fn access_control_admin_json(
+    cfg: Option<&queryflux_core::access_config::AccessControlConfig>,
+) -> serde_json::Value {
+    match cfg {
+        None => serde_json::json!({ "enabled": false }),
+        Some(cfg) => {
+            let mut v = serde_json::to_value(cfg).unwrap_or_else(|_| serde_json::json!({}));
+            redact_access_control_secrets(&mut v);
+            v
+        }
+    }
+}
+
+/// Redact OPA secrets in every entry of `connections` (one `opa.bearerToken` /
+/// `opa.clientCredentials.clientSecret` per named connection), replacing each with a
+/// `*Set` boolean flag. A no-op if `connections` isn't an object (e.g. a malformed body).
+fn redact_access_control_secrets(v: &mut serde_json::Value) {
+    let Some(conns) = v.get_mut("connections").and_then(|c| c.as_object_mut()) else {
+        return;
+    };
+    for conn in conns.values_mut() {
+        let Some(opa) = conn.get_mut("opa").and_then(|o| o.as_object_mut()) else {
+            continue;
+        };
+        let token_set = opa
+            .get("bearerToken")
+            .and_then(|t| t.as_str())
+            .is_some_and(|s| !s.is_empty());
+        opa.insert("bearerTokenSet".into(), serde_json::json!(token_set));
+        opa.remove("bearerToken");
+        if let Some(cc) = opa
+            .get_mut("clientCredentials")
+            .and_then(|c| c.as_object_mut())
+        {
+            let secret_set = cc
+                .get("clientSecret")
+                .and_then(|s| s.as_str())
+                .is_some_and(|s| !s.is_empty());
+            cc.insert("clientSecretSet".into(), serde_json::json!(secret_set));
+            cc.remove("clientSecret");
+        }
+    }
+}
+
+/// For each named connection in `incoming`, fill in a blank `opa.bearerToken` /
+/// `opa.clientCredentials.clientSecret` from the same-named connection in `previous` — so a
+/// GET (which never returns secrets) round-tripped through a PUT doesn't blank them out.
+/// A connection present only in `incoming` (newly added) has nothing to merge from.
+fn merge_access_control_secrets(incoming: &mut serde_json::Value, previous: &serde_json::Value) {
+    let Some(prev_conns) = previous.get("connections").and_then(|c| c.as_object()) else {
+        return;
+    };
+    let Some(conns) = incoming.get_mut("connections").and_then(|c| c.as_object_mut()) else {
+        return;
+    };
+    for (name, conn) in conns.iter_mut() {
+        let Some(prev_opa) = prev_conns.get(name).and_then(|c| c.get("opa")) else {
+            continue;
+        };
+        let Some(opa) = conn.get_mut("opa").and_then(|o| o.as_object_mut()) else {
+            continue;
+        };
+        let incoming_token_empty = opa
+            .get("bearerToken")
+            .and_then(|t| t.as_str())
+            .is_none_or(|s| s.is_empty());
+        if incoming_token_empty {
+            if let Some(prev) = prev_opa.get("bearerToken") {
+                opa.insert("bearerToken".into(), prev.clone());
+            }
+        }
+        let Some(prev_cc) = prev_opa.get("clientCredentials") else {
+            continue;
+        };
+        let Some(cc) = opa
+            .get_mut("clientCredentials")
+            .and_then(|c| c.as_object_mut())
+        else {
+            continue;
+        };
+        let incoming_secret_empty = cc
+            .get("clientSecret")
+            .and_then(|s| s.as_str())
+            .is_none_or(|s| s.is_empty());
+        if incoming_secret_empty {
+            if let Some(prev) = prev_cc.get("clientSecret") {
+                cc.insert("clientSecret".into(), prev.clone());
+            }
+        }
+    }
+}
+
+/// Get the current access-control configuration. Falls back to startup YAML when
+/// nothing has been persisted via this API yet. Secrets are never returned — only
+/// `bearerTokenSet` / `clientSecretSet` flags.
+#[utoipa::path(
+    get,
+    path = "/admin/config/access-control",
+    tag = "config",
+    responses(
+        (status = 200, description = "Access-control config JSON (`{ provider, opa, … }`)", body = serde_json::Value),
+    )
+)]
+async fn get_access_control_config_handler(
+    State(state): State<Arc<AdminState>>,
+) -> impl IntoResponse {
+    if let Some(store) = &state.admin_store {
+        if let Ok(Some(mut v)) = store.get_proxy_setting(ACCESS_CONTROL_SETTING_KEY).await {
+            redact_access_control_secrets(&mut v);
+            return Json(v).into_response();
+        }
+    }
+    Json(access_control_admin_json(
+        state.access_control_config.as_ref().as_ref(),
+    ))
+    .into_response()
+}
+
+/// Replace the access-control configuration. `{ "enabled": false }` with no `connections`
+/// (or JSON `null`) turns the `opa_access` guard off entirely. Otherwise the body is a full
+/// [`AccessControlConfig`](queryflux_core::access_config::AccessControlConfig): `enabled`,
+/// `connections` (a map of named connections, must include `"default"`), and `groups`
+/// (per-cluster-group `enabled` / `failOpen` / `connection` overrides).
+#[utoipa::path(
+    put,
+    path = "/admin/config/access-control",
+    tag = "config",
+    request_body = serde_json::Value,
+    responses(
+        (status = 204, description = "Saved"),
+        (status = 400, description = "Invalid accessControl config", body = str),
+        (status = 503, description = "Persistence not configured", body = str),
+        (status = 500, description = "Internal error", body = str),
+    )
+)]
+async fn put_access_control_config_handler(
+    State(state): State<Arc<AdminState>>,
+    Json(mut body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let Some(store) = &state.admin_store else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Persistence not configured",
+        )
+            .into_response();
+    };
+    let previous = match store.get_proxy_setting(ACCESS_CONTROL_SETTING_KEY).await {
+        Ok(Some(v)) => v,
+        Ok(None) => state
+            .access_control_config
+            .as_ref()
+            .as_ref()
+            .map(|c| serde_json::to_value(c).unwrap_or(serde_json::json!({})))
+            .unwrap_or(serde_json::json!({})),
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    };
+    merge_access_control_secrets(&mut body, &previous);
+    if let Err(e) = queryflux_core::access_config::AccessControlConfig::from_admin_value(&body) {
+        return (
+            StatusCode::BAD_REQUEST,
+            format!("invalid accessControl config: {e}"),
+        )
+            .into_response();
+    }
+    match store
+        .set_proxy_setting(ACCESS_CONTROL_SETTING_KEY, body)
+        .await
+    {
+        Ok(()) => {
+            notify_live_config_reload(&state);
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Access control (OPA row filtering / column masking / table-column allow-deny) dry-run
 // ---------------------------------------------------------------------------
@@ -2754,6 +2945,10 @@ struct AccessControlDryRunRequest {
     #[serde(default)]
     engine: Option<String>,
     identity: DryRunIdentity,
+    /// Optional table → { column → type } map used to apply column masks.
+    /// When omitted, resolved from the live catalog (same as a real query).
+    #[serde(default)]
+    schema: Option<HashMap<String, HashMap<String, String>>>,
 }
 
 /// `engine` as sent in a dry-run request → the engine the policy sees. Absent means Trino.
@@ -2792,8 +2987,9 @@ struct DryRunIdentity {
 /// Runs the same `OpaAccessGuard` the live query path uses, on the SQL exactly as given
 /// (source dialect — this does not run dialect translation, so the rewritten SQL shown is
 /// what the guard produces before `maybe_translate`, not final target-engine SQL). The table
-/// schema is resolved through the configured catalog like a live query, and `engine` sets the
-/// `context.engine` the policy sees (default `trino`).
+/// schema comes from `schema` on the request if present, otherwise it is resolved through the
+/// configured catalog like a live query, and `engine` sets the `context.engine` the policy sees
+/// (default `trino`).
 ///
 /// It goes through the same decision cache as live queries: a repeated dry run can return an
 /// answer up to `cacheTtlMs` old, and an allowed decision it computes can be reused by an
@@ -2820,6 +3016,14 @@ async fn access_control_dry_run_handler(
             .into_response();
     };
 
+    if !guard.enabled_for_group(&body.cluster_group) {
+        return Json(serde_json::json!({
+            "outcome": "skip",
+            "reason": "access control is disabled for this cluster group"
+        }))
+        .into_response();
+    }
+
     let dialect = queryflux_core::query::SqlDialect::Sqlglot(body.dialect.clone());
     let cluster_group = queryflux_core::query::ClusterGroupName(body.cluster_group.clone());
     let engine_type = match parse_dry_run_engine(body.engine.as_deref()) {
@@ -2832,11 +3036,19 @@ async fn access_control_dry_run_handler(
         queryflux_core::sql_classify::SqlParseCache::new(body.sql.clone(), dialect.clone());
 
     let catalog = state.live.read().await.catalog.clone();
-    let schema_ctx = state
-        .app
-        .translation
-        .resolve_schema_context(&body.sql, &dialect, &catalog, None, None)
-        .await;
+    let schema_ctx = if let Some(tables) = body.schema.filter(|t| !t.is_empty()) {
+        SchemaContext {
+            catalog: None,
+            database: None,
+            tables,
+        }
+    } else {
+        state
+            .app
+            .translation
+            .resolve_schema_context(&body.sql, &dialect, &catalog, None, None)
+            .await
+    };
 
     let ctx = queryflux_guardrails::context::GuardContext {
         sql: &body.sql,
@@ -2854,11 +3066,14 @@ async fn access_control_dry_run_handler(
         sql_parse: Some(&sql_parse),
     };
 
+    let connection = guard
+        .connection_name_for_group(&body.cluster_group)
+        .to_string();
     let result = {
         use queryflux_guardrails::built_in::Guard as _;
         guard.check(&ctx).await
     };
-    let response = match result {
+    let mut response = match result {
         queryflux_guardrails::context::GuardResult::Deny { reason, code } => {
             serde_json::json!({ "outcome": "deny", "reason": reason, "code": code })
         }
@@ -2872,6 +3087,9 @@ async fn access_control_dry_run_handler(
             serde_json::json!({ "outcome": "warn", "reason": reason })
         }
     };
+    if let Some(obj) = response.as_object_mut() {
+        obj.insert("connection".to_string(), serde_json::json!(connection));
+    }
     Json(response).into_response()
 }
 
@@ -3077,6 +3295,7 @@ mod tests {
         assert_eq!(req.identity.groups, vec!["analysts"]);
         assert!(req.identity.roles.is_empty());
         assert!(req.identity.attributes.is_empty());
+        assert!(req.schema.is_none());
     }
 
     /// The engine reaches the policy as `context.engine`, so it must be settable — and an
@@ -3136,6 +3355,9 @@ mod tests {
             .upsert(ExecutingQuery {
                 id: ProxyQueryId("exec-1".into()),
                 sql: "SELECT 1".into(),
+                client_sql: None,
+                rewritten_sql: None,
+                was_dialect_translated: false,
                 translated_sql: None,
                 cluster_group: ClusterGroupName("analytics".into()),
                 cluster_name: ClusterName("trino".into()),
@@ -3309,5 +3531,81 @@ mod tests {
         }))
         .expect("shape should parse");
         assert!(ftp_url.validate().unwrap_err().contains("http or https"));
+    }
+
+    #[test]
+    fn redact_access_control_secrets_strips_tokens() {
+        let mut v = json!({
+            "enabled": true,
+            "connections": {
+                "default": {
+                    "opa": {
+                        "url": "http://opa:8181",
+                        "bearerToken": "sekrit",
+                        "clientCredentials": {
+                            "clientId": "qf",
+                            "clientSecret": "shh",
+                            "tokenEndpoint": "https://idp.example/token"
+                        }
+                    }
+                }
+            }
+        });
+        super::redact_access_control_secrets(&mut v);
+        let opa = v["connections"]["default"]["opa"].as_object().unwrap();
+        assert_eq!(opa.get("bearerToken"), None);
+        assert_eq!(opa["bearerTokenSet"], true);
+        let cc = opa["clientCredentials"].as_object().unwrap();
+        assert_eq!(cc.get("clientSecret"), None);
+        assert_eq!(cc["clientSecretSet"], true);
+        assert_eq!(cc["clientId"], "qf");
+    }
+
+    #[test]
+    fn merge_access_control_secrets_keeps_previous_when_blank() {
+        let previous = json!({
+            "connections": {
+                "default": {
+                    "opa": {
+                        "bearerToken": "keep-me",
+                        "clientCredentials": { "clientSecret": "keep-secret" }
+                    }
+                }
+            }
+        });
+        let mut incoming = json!({
+            "enabled": true,
+            "connections": {
+                "default": {
+                    "opa": {
+                        "url": "http://opa:8181",
+                        "bearerToken": "",
+                        "clientCredentials": { "clientId": "qf", "clientSecret": "", "tokenEndpoint": "https://idp/token" }
+                    }
+                }
+            }
+        });
+        super::merge_access_control_secrets(&mut incoming, &previous);
+        assert_eq!(incoming["connections"]["default"]["opa"]["bearerToken"], "keep-me");
+        assert_eq!(
+            incoming["connections"]["default"]["opa"]["clientCredentials"]["clientSecret"],
+            "keep-secret"
+        );
+    }
+
+    #[test]
+    fn merge_access_control_secrets_leaves_new_connection_alone() {
+        // A brand-new connection (not present in `previous`) has nothing to merge from;
+        // its blank secret fields must be left as-is rather than panicking.
+        let previous = json!({ "connections": { "default": { "opa": { "bearerToken": "keep-me" } } } });
+        let mut incoming = json!({
+            "connections": {
+                "default": { "opa": { "bearerToken": "" } },
+                "eu": { "opa": { "url": "https://eu-opa", "bearerToken": "" } }
+            }
+        });
+        super::merge_access_control_secrets(&mut incoming, &previous);
+        assert_eq!(incoming["connections"]["default"]["opa"]["bearerToken"], "keep-me");
+        assert_eq!(incoming["connections"]["eu"]["opa"]["bearerToken"], "");
     }
 }

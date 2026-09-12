@@ -294,13 +294,85 @@ def rewrite_table_scans(sql, dialect, schema_json, policies_json):
             )
         return cands[0] if cands else None
 
-    def col_list_for(policy_table, node):
-        # explicit schema columns win; else derive from the scan is impossible -> error
+    def _star_selects_this_scan(table_node):
+        p = table_node.parent
+        while p is not None:
+            if isinstance(p, exp.Select):
+                for e in p.expressions:
+                    if isinstance(e, exp.Star):
+                        return True
+                    if isinstance(e, exp.Column) and e.name == "*":
+                        return True
+                return False
+            p = p.parent
+        return False
+
+    def _enclosing_select(table_node):
+        p = table_node.parent
+        while p is not None:
+            if isinstance(p, exp.Select):
+                return p
+            p = p.parent
+        return None
+
+    def _in_select_scope(node, select):
+        p = node.parent
+        while p is not None:
+            if isinstance(p, exp.Select):
+                return p is select
+            p = p.parent
+        return False
+
+    def col_list_for(policy_table, node, masks):
+        # explicit schema columns win; else named references in the *enclosing*
+        # SELECT (plus every masked column) are enough for a projection.
+        # Unqualified names are taken only from that SELECT so a join's
+        # `IN (SELECT id FROM t)` still projects `id` on the inner scan.
+        # SELECT * still needs schema — we cannot invent the rest of the table.
         cand = [policy_table.lower(), policy_table.rsplit(".", 1)[-1].lower()]
         for tname, cols in schema.items():
             if tname.lower() in cand or tname.rsplit(".", 1)[-1].lower() in cand:
                 return list(cols)
-        return None
+        if _star_selects_this_scan(node):
+            return None
+        alias = (node.alias or node.name or "").lower()
+        names = []
+        seen = set()
+
+        def add(n):
+            if not n:
+                return
+            k = n.lower()
+            if k not in seen:
+                seen.add(k)
+                names.append(n)
+
+        for mcol in masks:
+            add(mcol)
+        scope = _enclosing_select(node)
+        src = scope if scope is not None else tree
+        sole_in_scope = False
+        if scope is not None:
+            tables_here = [
+                tbl
+                for tbl in scope.find_all(exp.Table)
+                if tbl.name
+                and not (not tbl.catalog and not tbl.db and tbl.name.lower() in ctes)
+                and _in_select_scope(tbl, scope)
+            ]
+            sole_in_scope = len(tables_here) == 1
+        for col in src.find_all(exp.Column):
+            if not col.name or col.name == "*":
+                continue
+            if scope is not None and not _in_select_scope(col, scope):
+                continue
+            tbl = (col.table or "").lower()
+            if tbl:
+                if tbl == alias or tbl in cand:
+                    add(col.name)
+            elif sole_in_scope:
+                add(col.name)
+        return names if names else None
 
     replaced = 0
     for t in list(tree.find_all(exp.Table)):
@@ -319,7 +391,7 @@ def rewrite_table_scans(sql, dialect, schema_json, policies_json):
 
         # projection
         if masks:
-            cols = col_list_for(policy["table"], t)
+            cols = col_list_for(policy["table"], t, masks)
             if not cols:
                 raise ValueError("cannot enumerate columns for masked table %r" % policy["table"])
             selects = []
@@ -551,9 +623,54 @@ mod tests {
     }
 
     #[test]
-    fn rewrite_masked_table_without_schema_errors() {
+    fn rewrite_mask_named_columns_without_schema() {
+        let out = rewrite_table_scans(
+            "SELECT name, ssn FROM finance.transactions ORDER BY id",
+            &SqlDialect::Trino,
+            &SchemaContext::default(),
+            &[TablePolicy {
+                table: "finance.transactions".into(),
+                row_filters: vec!["region = 'EU'".into()],
+                masked_columns: vec![("ssn".into(), "NULL".into())],
+            }],
+        )
+        .unwrap();
+        let lower = out.to_lowercase();
+        assert!(lower.contains("null"), "got: {out}");
+        assert!(lower.contains("region = 'eu'"), "got: {out}");
+        assert!(
+            lower.contains("as ssn") || lower.contains("ssn"),
+            "masked column must stay addressable: {out}"
+        );
+    }
+
+    #[test]
+    fn rewrite_mask_in_subquery_projects_unqualified_id() {
+        let out = rewrite_table_scans(
+            "SELECT a.id, b.id FROM customers a \
+             JOIN customers b ON a.id < b.id \
+             WHERE a.id IN (SELECT id FROM customers)",
+            &SqlDialect::Trino,
+            &SchemaContext::default(),
+            &[TablePolicy {
+                table: "customers".into(),
+                row_filters: vec!["region = 'EU'".into()],
+                masked_columns: vec![("ssn".into(), "NULL".into())],
+            }],
+        )
+        .unwrap();
+        let lower = out.to_lowercase();
+        assert!(
+            lower.contains("in (select id from"),
+            "IN subquery must keep projecting id, got: {out}"
+        );
+        assert!(lower.contains("null"), "mask must still apply: {out}");
+    }
+
+    #[test]
+    fn rewrite_masked_star_without_schema_errors() {
         let err = rewrite_table_scans(
-            "SELECT ssn FROM finance.transactions",
+            "SELECT * FROM finance.transactions",
             &SqlDialect::Trino,
             &SchemaContext::default(),
             &[TablePolicy {

@@ -4,129 +4,13 @@
 //!
 //! Run with: `cargo test -p queryflux-e2e-tests --test access_control_tests`
 
-use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex};
-
-use axum::{extract::State, routing::post, Json, Router};
-use queryflux_access_control::{build_controller, AccessControlConfig, NoopMetrics};
-use queryflux_core::access_config::{OnMissingSchema, OpaProviderConfig, ProviderKind};
+use queryflux_e2e_tests::access_control::{build_guard, pg_connect, pg_run, start_opa_stub};
 use queryflux_e2e_tests::harness::ProtocolWireHarness;
-use queryflux_frontend::access_control_guard::OpaAccessGuard;
-use serde_json::{json, Value};
-use tokio::net::TcpListener;
-use tokio_postgres::SimpleQueryMessage;
-
-/// Shared, mutable decision table the stub OPA server consults per request.
-#[derive(Default)]
-struct StubState {
-    deny_tables: HashSet<String>,
-    row_filters: HashMap<String, String>,
-}
-
-async fn opa_handler(
-    State(state): State<Arc<Mutex<StubState>>>,
-    Json(body): Json<Value>,
-) -> Json<Value> {
-    let resources = body["input"]["action"]["resources"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default();
-    let st = state.lock().unwrap();
-    let mut out = Vec::new();
-    for r in resources {
-        let table = r["table"].as_str().unwrap_or("").to_string();
-        let mut entry = json!({ "table": table, "allow": true });
-        if st.deny_tables.contains(&table) {
-            entry["allow"] = json!(false);
-            entry["reason"] = json!("denied by stub policy");
-        } else if let Some(filter) = st.row_filters.get(&table) {
-            entry["rowFilters"] = json!([{ "expression": filter }]);
-        }
-        out.push(entry);
-    }
-    Json(json!({ "result": { "resources": out } }))
-}
-
-/// Start the stub OPA server and return its base URL + a handle to mutate decisions.
-async fn start_opa_stub() -> (String, Arc<Mutex<StubState>>) {
-    let state = Arc::new(Mutex::new(StubState::default()));
-    let app = Router::new()
-        .route("/v1/data/queryflux/access", post(opa_handler))
-        .with_state(state.clone());
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind opa stub");
-    let addr = listener.local_addr().expect("stub addr");
-    tokio::spawn(async move {
-        axum::serve(listener, app).await.ok();
-    });
-    (format!("http://{addr}"), state)
-}
-
-/// Build a real `OpaAccessGuard` pointed at the stub, evaluating every SELECT.
-fn build_guard(opa_url: &str) -> Arc<OpaAccessGuard> {
-    let cfg = AccessControlConfig {
-        provider: ProviderKind::Opa,
-        opa: Some(OpaProviderConfig {
-            url: opa_url.to_string(),
-            decision_path: "/v1/data/queryflux/access".to_string(),
-            timeout_ms: 2_000,
-            bearer_token: None,
-            client_credentials: None,
-        }),
-        operations: vec!["table.select".to_string()],
-        on_missing_schema: OnMissingSchema::Evaluate,
-        fail_open: false,
-        cache_ttl_ms: 0, // disable caching so every test query hits the stub fresh
-        cache_capacity: 100,
-        session_param_keys: vec![],
-        groups: HashMap::new(),
-    };
-    let controller =
-        build_controller(&cfg, Arc::new(NoopMetrics)).expect("build access controller");
-    Arc::new(OpaAccessGuard::new(
-        Arc::new(controller),
-        cfg.session_param_keys.clone(),
-        cfg.on_missing_schema,
-    ))
-}
-
-async fn pg_connect(port: u16) -> tokio_postgres::Client {
-    let url = format!("postgresql://testuser@127.0.0.1:{port}/postgres");
-    let (client, connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls)
-        .await
-        .expect("postgres wire connect");
-    tokio::spawn(async move {
-        let _ = connection.await;
-    });
-    client
-}
-
-async fn pg_run(client: &tokio_postgres::Client, sql: &str) -> Result<Vec<Vec<String>>, String> {
-    let messages = client
-        .simple_query(sql)
-        .await
-        .map_err(|e| format!("{e:?}"))?;
-    let mut rows = Vec::new();
-    for msg in messages {
-        if let SimpleQueryMessage::Row(row) = msg {
-            let mut vals = Vec::new();
-            for i in 0..row.len() {
-                vals.push(row.get(i).unwrap_or("").to_string());
-            }
-            rows.push(vals);
-        }
-    }
-    Ok(rows)
-}
 
 #[tokio::test]
 async fn denied_table_is_rejected_and_audited() {
     let (opa_url, stub) = start_opa_stub().await;
-    stub.lock()
-        .unwrap()
-        .deny_tables
-        .insert("secret".to_string());
+    stub.lock().unwrap().deny("secret");
 
     let guard = build_guard(&opa_url);
     let h = ProtocolWireHarness::new_with_access_control(Some(guard))
@@ -161,10 +45,7 @@ async fn denied_table_is_rejected_and_audited() {
 #[tokio::test]
 async fn allowed_table_with_row_filter_only_returns_matching_rows() {
     let (opa_url, stub) = start_opa_stub().await;
-    stub.lock()
-        .unwrap()
-        .row_filters
-        .insert("orders".to_string(), "amount > 100".to_string());
+    stub.lock().unwrap().filter("orders", "amount > 100");
 
     let guard = build_guard(&opa_url);
     let h = ProtocolWireHarness::new_with_access_control(Some(guard))
@@ -244,10 +125,7 @@ async fn fixup_script_turning_read_into_write_is_denied_by_invariant_assert() {
     let (opa_url, stub) = start_opa_stub().await;
     // Any row filter forces the access-control guard down the `Rewrite` path, which is
     // what arms the post-translation invariant assert (see `dispatch.rs`).
-    stub.lock()
-        .unwrap()
-        .row_filters
-        .insert("orders".to_string(), "amount > 0".to_string());
+    stub.lock().unwrap().filter("orders", "amount > 0");
 
     let guard = build_guard(&opa_url);
     let h = ProtocolWireHarness::new_with_access_control_and_fixups(
@@ -268,7 +146,11 @@ async fn fixup_script_turning_read_into_write_is_denied_by_invariant_assert() {
     assert!(!err.is_empty());
 
     let record = h
-        .wait_for_record(|r| r.sql_preview.to_lowercase().contains("select id from orders"))
+        .wait_for_record(|r| {
+            r.sql_preview
+                .to_lowercase()
+                .contains("select id from orders")
+        })
         .await
         .expect("denied query should be recorded");
     assert_eq!(format!("{:?}", record.status), "Denied");

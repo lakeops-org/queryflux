@@ -46,6 +46,7 @@ Everything below is implemented and available on the `main` branch.
 | | Backend identity (`queryAuth`): `serviceAccount`, `passthrough`, `impersonate`, `tokenExchange` — see **[Authentication & identity](./authentication)** |
 | | Trino: all four modes. ClickHouse: `impersonate` (`EXECUTE AS`, self-hosted 25.11+). StarRocks: `passthrough` (LDAP, TLS-required). Snowflake (ADBC): `tokenExchange` and `passthrough` (both per-identity connection pools) |
 | | Snowflake (ADBC): session-scoped connection pooling for `USE ROLE`/`USE WAREHOUSE`/`USE SCHEMA`, intercepted client-side and applied per-session without leaking state across a shared pooled connection |
+| **Access control** | Data-level access control via OPA — table/column allow-deny, row filters, column masks — see **[Access control](./access-control/overview)** and **[OPA](./access-control/opa)** |
 | **Observability** | Prometheus metrics: queries, duration, translation, running, queued |
 | | Grafana dashboard (auto-provisioned) |
 | | QueryFlux Studio — Next.js UI: clusters, query history, engine registry |

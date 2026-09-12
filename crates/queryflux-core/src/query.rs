@@ -300,7 +300,18 @@ impl IncomingQuery {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExecutingQuery {
     pub id: ProxyQueryId,
+    /// Final SQL sent to the engine (after rewrite and dialect translation).
     pub sql: String,
+    /// Client-submitted SQL. Preferred over legacy `translated_sql` for the original text.
+    #[serde(default)]
+    pub client_sql: Option<String>,
+    /// Source-dialect SQL after access-control rewrite, before dialect translation.
+    #[serde(default)]
+    pub rewritten_sql: Option<String>,
+    /// True when dialect translation changed SQL after the access-control stage.
+    #[serde(default)]
+    pub was_dialect_translated: bool,
+    /// Legacy: held client SQL when any pipeline stage changed the query. Prefer `client_sql`.
     pub translated_sql: Option<String>,
     pub cluster_group: ClusterGroupName,
     pub cluster_name: ClusterName,
