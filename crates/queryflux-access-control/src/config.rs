@@ -4,5 +4,5 @@
 
 pub use queryflux_core::access_config::{
     AccessConnectionConfig, AccessControlConfig, ClientCredentials, GroupOverride,
-    OnMissingSchema, OpaProviderConfig, ProviderKind, DEFAULT_CONNECTION,
+    OnMissingSchema, OpaProviderConfig, ProviderKind,
 };

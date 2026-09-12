@@ -91,8 +91,9 @@ clusters:
 ```yaml
 accessControl:
   enabled: true                     # default for cluster groups; false = opt-in per group
+  defaultConnection: prod           # groups without an override use this connection
   connections:
-    default:
+    prod:
       provider: opa
       opa:
         url: http://localhost:8181
@@ -111,10 +112,11 @@ accessControl:
 When set, QueryFlux connects to **OPA** and asks whether the verified identity may read each referenced table, then optionally rewrites SQL with row filters and column masks **before** dialect translation. QueryFlux does not author the policy (Rego stays in OPA).
 
 - **`enabled`** — global default for cluster groups; `false` means opt-in only where `groups.<name>.enabled: true`.
-- **`connections`** — named policy-provider connections; must include `"default"`. Most deployments need only that one.
+- **`connections`** — named policy-provider connections. No name is reserved.
+- **`defaultConnection`** — which connection a group uses when it has no explicit `groups.<name>.connection` override. **Unset means such a group gets no access control at all.**
 - **`groups.<name>.enabled`** — per cluster group: inherit (omit), force on, or skip OPA (`false`).
-- **`groups.<name>.connection`** — route this group to a different named connection instead of `"default"` (network segmentation, blast-radius isolation, provider migration — see [Multiple connections](./access-control/overview#multiple-connections)).
-- **Studio** — the **Access Control** page edits the `default` connection + scope; additional named connections are YAML/Admin-API only.
+- **`groups.<name>.connection`** — route this group to a different named connection instead of `defaultConnection` (network segmentation, blast-radius isolation, provider migration — see [Multiple connections](./access-control/overview#multiple-connections)).
+- **Studio** — the **Access Control** page can add/edit/remove any number of connections and set `defaultConnection` + per-group scope.
 
 Omit the block (or `{ "enabled": false }` with no `connections`, via the Admin API) to disconnect. Full reference: **[Access control](./access-control/overview)** and **[OPA provider](./access-control/opa)**.
 

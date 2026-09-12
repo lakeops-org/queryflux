@@ -3004,6 +3004,14 @@ async fn access_control_dry_run_handler(
         }))
         .into_response();
     }
+    let Some(connection) = guard.connection_name_for_group(&body.cluster_group) else {
+        return Json(serde_json::json!({
+            "outcome": "skip",
+            "reason": "this cluster group has no resolvable connection (no groups.<name>.connection override and no defaultConnection configured)"
+        }))
+        .into_response();
+    };
+    let connection = connection.to_string();
 
     let dialect = queryflux_core::query::SqlDialect::Sqlglot(body.dialect.clone());
     let cluster_group = queryflux_core::query::ClusterGroupName(body.cluster_group.clone());
@@ -3044,9 +3052,6 @@ async fn access_control_dry_run_handler(
         sql_parse: Some(&sql_parse),
     };
 
-    let connection = guard
-        .connection_name_for_group(&body.cluster_group)
-        .to_string();
     let result = {
         use queryflux_guardrails::built_in::Guard as _;
         guard.check(&ctx).await

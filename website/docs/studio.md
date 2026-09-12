@@ -133,14 +133,15 @@ The **Guardrails** sidebar page edits the SQL-shape chain (built-ins such as `re
 
 | What you configure | Where in Studio |
 | --- | --- |
-| Disconnect OPA entirely | **Provider** → *None — access control off* |
-| OPA URL, decision path, timeout, auth | **Provider** → *OPA* → **OPA connection** |
+| Disconnect access control entirely | **Provider** → *None — access control off* |
+| Add / edit / remove a named connection | **Connections** — each has its own URL, decision path, timeout, auth |
+| Which connection is the fallback | **Connections** → **Default connection** |
 | Default on/off for all groups | **Scope by cluster group** → *Enabled by default for all cluster groups* |
-| Per-group inherit / enabled / disabled | **Scope by cluster group** table (*OPA for this group* column) |
+| Per-group inherit / enabled / disabled, and which connection | **Scope by cluster group** table |
 
-Operations, cache, `sessionParamKeys`, fail-open, `onMissingSchema`, and any named connection beyond `"default"` are **YAML / direct Admin API only** — not exposed in the Studio form yet.
+Operations, cache, `sessionParamKeys`, fail-open, and `onMissingSchema` (per connection) are **YAML / direct Admin API only** — not exposed in the Studio connection form yet.
 
-Studio edits the **`default`** connection. Scope controls *which cluster groups call it*, not *which Rego package* — different rules per group usually belong in OPA (`input.context.clusterGroup`), not a second connection. QueryFlux itself does support additional named connections (a different OPA URL for a specific cluster group — network segmentation, blast-radius isolation, a provider migration) via `accessControl.connections` in YAML or a `PUT /admin/config/access-control` body; see [Multiple connections](./access-control/overview#multiple-connections). Studio doesn't have a UI for adding one yet.
+Studio can define any number of named connections — no name is reserved. Scope controls *which cluster groups call which connection*, not *which Rego package* — different rules per group usually belong in OPA (`input.context.clusterGroup`), not a second connection; reach for one only for network segmentation, blast-radius isolation, or a provider migration. **Without a default connection set, a group with no explicit override gets no access control at all** — see [Multiple connections](./access-control/overview#multiple-connections).
 
 Saving requires **`persistence.type: postgres`** (same as Catalog / Guardrails). Config is stored in `proxy_settings` and hot-reloads without restart. Bearer tokens are never shown after save — leave the field blank to keep the stored secret. YAML `accessControl:` is the bootstrap fallback until the first Studio save.
 
