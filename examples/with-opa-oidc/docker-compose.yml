@@ -39,7 +39,10 @@ services:
     volumes:
       - ./keycloak-realm.json:/opt/keycloak/data/import/queryflux-realm.json:ro
     healthcheck:
-      test: ["CMD-SHELL", "exec 3<>/dev/tcp/127.0.0.1/8080; echo -e 'GET /health/ready HTTP/1.1\\r\\nHost: localhost\\r\\nConnection: close\\r\\n\\r\\n' >&3; grep -q '200\\|\"status\":\"UP\"' <&3"]
+      # KC_HEALTH_ENABLED serves /health/ready on the management interface
+      # (port 9000 by default in Keycloak 26.x), NOT the main HTTP port 8080 —
+      # hitting 8080 here 404s forever even once Keycloak is fully up.
+      test: ["CMD-SHELL", "exec 3<>/dev/tcp/127.0.0.1/9000; echo -e 'GET /health/ready HTTP/1.1\\r\\nHost: localhost\\r\\nConnection: close\\r\\n\\r\\n' >&3; grep -q '200\\|\"status\":\"UP\"' <&3"]
       interval: 10s
       timeout: 5s
       retries: 20
