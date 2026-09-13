@@ -811,3 +811,283 @@ async fn multiple_masks_on_one_table() {
     assert_eq!(rows[0][1], "****6666");
     assert_eq!(rows[0][2], "hidden");
 }
+
+// ---------------------------------------------------------------------------
+// Additional complex-SQL coverage: outer joins, multi-table joins with distinct
+// policies, aggregation, CASE expressions, correlated subqueries, set-operation
+// dedup, and pagination — all through the real rewrite -> translate -> DuckDB path.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn left_join_preserves_outer_semantics_through_row_filter() {
+    // Filtering customers to EU must not turn a LEFT JOIN into an INNER JOIN: Ben's
+    // (US, filtered out) order still has to appear, with NULL customer columns — exactly
+    // what a real database's row-level security does, because the filter applies at the
+    // scan, before the join, not as a post-join predicate.
+    let (opa_url, stub) = start_opa_stub().await;
+    stub.lock().unwrap().filter("customers", "region = 'EU'");
+
+    let h = harness_with_catalog(&opa_url).await;
+    let client = pg_connect(h.postgres_port).await;
+    seed_customers(&client).await;
+    seed_orders(&client).await;
+
+    let rows = pg_run(
+        &client,
+        "SELECT o.id, c.name FROM orders o
+         LEFT JOIN customers c ON o.customer_id = c.id
+         ORDER BY o.id",
+    )
+    .await
+    .expect("left join");
+    assert_eq!(
+        rows,
+        vec![
+            vec!["10".to_string(), "Ana".to_string()],
+            vec!["11".to_string(), "Ana".to_string()],
+            vec!["12".to_string(), "".to_string()], // Ben (US) filtered out — NULL, row kept
+            vec!["13".to_string(), "Cam".to_string()],
+        ]
+    );
+}
+
+#[tokio::test]
+async fn three_way_join_applies_three_independent_policies() {
+    // customers: row-filtered. orders: row-filtered (a different predicate). payroll:
+    // column-masked (no filter). All three policies must apply simultaneously within one
+    // rewrite pass, each at its own scan site.
+    let (opa_url, stub) = start_opa_stub().await;
+    {
+        let mut st = stub.lock().unwrap();
+        st.filter("customers", "region = 'EU'");
+        st.filter("orders", "amount > 100");
+        st.mask("payroll", mask("salary", MaskType::Null));
+    }
+
+    let h = harness_with_catalog(&opa_url).await;
+    let client = pg_connect(h.postgres_port).await;
+    seed_customers(&client).await;
+    seed_orders(&client).await;
+    seed_payroll(&client).await;
+
+    // customers ∩ EU = {1, 3}; orders ∩ amount>100 = {11 (cust 1), 12 (cust 2)};
+    // payroll has rows for {1, 2}. Three-way join on customer id 1 is the only survivor:
+    // it's EU, has an order > 100 (11), and has a payroll row (masked to NULL).
+    let rows = pg_run_named(
+        &client,
+        "SELECT c.id AS cid, o.id AS oid, p.salary AS salary
+         FROM customers c
+         JOIN orders o ON c.id = o.customer_id
+         JOIN payroll p ON c.id = p.id
+         ORDER BY c.id",
+    )
+    .await
+    .expect("three-way join");
+    assert_eq!(rows.len(), 1, "expected exactly one surviving row, got {rows:?}");
+    assert_eq!(rows[0].get("cid").map(String::as_str), Some("1"));
+    assert_eq!(rows[0].get("oid").map(String::as_str), Some("11"));
+    assert_eq!(rows[0].get("salary").map(String::as_str), Some(""));
+}
+
+#[tokio::test]
+async fn group_by_having_aggregates_only_filtered_rows() {
+    // Row filter excludes order 12 (US); GROUP BY / HAVING must aggregate over what's
+    // left, not the full table.
+    let (opa_url, stub) = start_opa_stub().await;
+    stub.lock().unwrap().filter("orders", "region = 'EU'");
+
+    let h = harness_with_catalog(&opa_url).await;
+    let client = pg_connect(h.postgres_port).await;
+    seed_orders(&client).await;
+
+    // EU orders: (10, cust1, 50), (11, cust1, 150), (13, cust3, 80).
+    let rows = pg_run_named(
+        &client,
+        "SELECT customer_id AS cust, COUNT(*) AS cnt, SUM(amount) AS total
+         FROM orders
+         GROUP BY customer_id
+         HAVING COUNT(*) > 1
+         ORDER BY customer_id",
+    )
+    .await
+    .expect("group by / having");
+    // Only customer 1 has more than one EU order (10 and 11); customer 3 (one order) and
+    // customer 2 (no EU orders at all) must both be excluded by HAVING.
+    assert_eq!(rows.len(), 1, "got {rows:?}");
+    assert_eq!(rows[0].get("cust").map(String::as_str), Some("1"));
+    assert_eq!(rows[0].get("cnt").map(String::as_str), Some("2"));
+    assert_eq!(rows[0].get("total").map(String::as_str), Some("200"));
+}
+
+#[tokio::test]
+async fn group_by_masked_date_column_groups_on_the_masked_value() {
+    // GROUP BY the DATE_SHOW_YEAR-masked `hired` column must group on the truncated
+    // (masked) value, not the raw date underneath — proving the mask is applied before
+    // grouping, at the scan, not as a display-only transform on already-grouped rows.
+    let (opa_url, stub) = start_opa_stub().await;
+    {
+        let mut st = stub.lock().unwrap();
+        st.filter("customers", "region = 'EU'");
+        st.mask("customers", mask("hired", MaskType::DateShowYear));
+    }
+
+    let h = harness_with_catalog(&opa_url).await;
+    let client = pg_connect(h.postgres_port).await;
+    seed_customers(&client).await;
+
+    // EU customers: Ana (hired 2020-06-15), Cam (hired 2019-12-31) — distinct years, so
+    // two groups, each truncated to January 1st of its year.
+    let rows = pg_run(
+        &client,
+        "SELECT hired, COUNT(*) FROM customers GROUP BY hired ORDER BY hired",
+    )
+    .await
+    .expect("group by masked date");
+    assert_eq!(rows.len(), 2, "got {rows:?}");
+    assert!(rows[0][0].starts_with("2019") && rows[0][0].ends_with("01-01"), "{rows:?}");
+    assert!(rows[1][0].starts_with("2020") && rows[1][0].ends_with("01-01"), "{rows:?}");
+    assert_eq!(rows[0][1], "1");
+    assert_eq!(rows[1][1], "1");
+}
+
+#[tokio::test]
+async fn case_expression_evaluates_against_the_masked_projection() {
+    // A CASE expression built on top of a masked column must see the masked value, not
+    // the raw one underneath — proves masking happens at the scan-site projection, so
+    // every downstream expression (not just a bare SELECT of the column) is affected.
+    let (opa_url, stub) = start_opa_stub().await;
+    stub.lock()
+        .unwrap()
+        .mask("customers", mask("ssn", MaskType::ShowLast4));
+
+    let h = harness_with_catalog(&opa_url).await;
+    let client = pg_connect(h.postgres_port).await;
+    seed_customers(&client).await;
+
+    // Every raw SSN in the seed data starts with a 3-digit prefix (e.g. "111-22-3333");
+    // no masked value (always "****....") can ever match a "starts with digits" pattern.
+    let rows = pg_run(
+        &client,
+        "SELECT id, CASE WHEN ssn LIKE '1__-%' THEN 'raw-leaked' ELSE 'masked' END AS flag
+         FROM customers ORDER BY id",
+    )
+    .await
+    .expect("case expression");
+    assert!(
+        rows.iter().all(|r| r[1] == "masked"),
+        "a CASE built on the masked column must never see the raw SSN, got {rows:?}"
+    );
+}
+
+#[tokio::test]
+async fn correlated_scalar_subquery_counts_only_filtered_orders() {
+    // A correlated scalar subquery in the SELECT list must see the row-filtered version
+    // of the table it references, the same as any other reference to that table.
+    let (opa_url, stub) = start_opa_stub().await;
+    {
+        let mut st = stub.lock().unwrap();
+        st.filter("customers", "region = 'EU'");
+        st.filter("orders", "amount > 60");
+    }
+
+    let h = harness_with_catalog(&opa_url).await;
+    let client = pg_connect(h.postgres_port).await;
+    seed_customers(&client).await;
+    seed_orders(&client).await;
+
+    // EU customers: 1, 3. Orders with amount > 60: 11 (cust 1, 150), 12 (cust 2, 200),
+    // 13 (cust 3, 80) — order 10 (cust 1, 50) is filtered out.
+    let rows = pg_run(
+        &client,
+        "SELECT c.id,
+                (SELECT COUNT(*) FROM orders o WHERE o.customer_id = c.id) AS order_count
+         FROM customers c
+         ORDER BY c.id",
+    )
+    .await
+    .expect("correlated scalar subquery");
+    assert_eq!(
+        rows,
+        vec![
+            vec!["1".to_string(), "1".to_string()], // only order 11 (order 10 filtered out)
+            vec!["3".to_string(), "1".to_string()], // order 13
+        ]
+    );
+}
+
+#[tokio::test]
+async fn plain_union_dedupes_across_masked_rows() {
+    // CONSTANT-masks every row's email to the same literal, then UNIONs two overlapping
+    // selections. Plain UNION (not UNION ALL) must dedupe against the *masked* output —
+    // proving the mask applies before set-operation dedup, not after.
+    let (opa_url, stub) = start_opa_stub().await;
+    stub.lock()
+        .unwrap()
+        .mask("customers", constant_mask("email", "hidden"));
+
+    let h = harness_with_catalog(&opa_url).await;
+    let client = pg_connect(h.postgres_port).await;
+    seed_customers(&client).await;
+
+    let rows = pg_run(
+        &client,
+        "SELECT email FROM customers WHERE id IN (1, 2)
+         UNION
+         SELECT email FROM customers WHERE id IN (2, 3)",
+    )
+    .await
+    .expect("union");
+    assert_eq!(
+        rows,
+        vec![vec!["hidden".to_string()]],
+        "every row masks to the same constant, so plain UNION must collapse to one row"
+    );
+}
+
+#[tokio::test]
+async fn order_by_limit_offset_paginates_the_filtered_set() {
+    // LIMIT/OFFSET must operate on the row-filtered, ordered set — not on the full table
+    // with the filter applied afterward, which would silently return the wrong page.
+    let (opa_url, stub) = start_opa_stub().await;
+    stub.lock().unwrap().filter("orders", "region = 'EU'");
+
+    let h = harness_with_catalog(&opa_url).await;
+    let client = pg_connect(h.postgres_port).await;
+    seed_orders(&client).await;
+
+    // EU orders in id order: 10, 11, 13 (12 is US, filtered out). OFFSET 1 LIMIT 1 must
+    // land on 11, not on 12 (which would appear only if the filter were applied too late).
+    let rows = pg_run(&client, "SELECT id FROM orders ORDER BY id LIMIT 1 OFFSET 1")
+        .await
+        .expect("paginated select");
+    assert_eq!(parse_ids(&rows), vec![11]);
+}
+
+#[tokio::test]
+async fn three_level_nested_ctes_propagate_filter_and_mask() {
+    // A CTE built on a CTE built on a CTE (three levels deep) must still see the
+    // row-filtered, column-masked base table at the bottom.
+    let (opa_url, stub) = start_opa_stub().await;
+    {
+        let mut st = stub.lock().unwrap();
+        st.filter("customers", "region = 'EU'");
+        st.mask("customers", mask("ssn", MaskType::ShowLast4));
+    }
+
+    let h = harness_with_catalog(&opa_url).await;
+    let client = pg_connect(h.postgres_port).await;
+    seed_customers(&client).await;
+
+    let rows = pg_run(
+        &client,
+        "WITH base AS (SELECT id, ssn FROM customers),
+              mid AS (SELECT id, ssn FROM base),
+              top AS (SELECT id, ssn FROM mid)
+         SELECT id, ssn FROM top ORDER BY id",
+    )
+    .await
+    .expect("three-level nested cte");
+    assert_eq!(parse_ids(&rows), vec![1, 3]);
+    assert_eq!(rows[0][1], "****3333");
+    assert_eq!(rows[1][1], "****9999");
+}
