@@ -70,17 +70,21 @@ After sqlglot finishes translation, QueryFlux runs each script in order — firs
 Each script must define a `transform` function:
 
 ```python
-def transform(ast, src: str, dst: str) -> None:
+def transform(sql: str, src: str, dst: str) -> str:
     ...
 ```
 
-| Parameter | Type             | Description                                                 |
-|-----------|------------------|-------------------------------------------------------------|
-| `ast`     | `sqlglot.Expression` | Root AST node of the **already-translated** SQL — mutate in-place |
-| `src`     | `str`            | Source dialect name (sqlglot name, e.g. `"trino"`)          |
-| `dst`     | `str`            | Target dialect name (sqlglot name, e.g. `"athena"`)         |
+| Parameter | Type  | Description                                                          |
+|-----------|-------|-----------------------------------------------------------------------|
+| `sql`     | `str` | The **already-translated** SQL text                                   |
+| `src`     | `str` | Source dialect name (sqlglot name, e.g. `"trino"`)                    |
+| `dst`     | `str` | Target dialect name (sqlglot name, e.g. `"athena"`)                   |
 
-Top-level imports and helper functions are fully supported — the script is executed as a module before `transform` is called. QueryFlux re-serializes the AST using the target dialect once, **after all scripts have run**.
+**Returns** the (possibly modified) SQL text as a `str`.
+
+Scripts are handed plain SQL text, not a live AST object — this keeps them decoupled from whatever SQL library QueryFlux uses internally to translate. If you need real AST-level control, `import sqlglot` (or any other parser) yourself inside the script, parse `sql`, mutate your own tree, and return `.sql(dialect=dst)`. That tool choice is entirely up to the script and never binds QueryFlux to it.
+
+Top-level imports and helper functions are fully supported — the script is executed as a module before `transform` is called. Scripts run **in order**, and each one receives the previous script's *returned string* as its `sql` argument.
 
 ### When scripts run
 
@@ -94,44 +98,56 @@ Trino clients use three-part names (`catalog.database.table`). Athena has no cat
 translation:
   pythonScripts:
     - |
+      import sqlglot
       import sqlglot.expressions as exp
 
-      def transform(ast, src: str, dst: str) -> None:
-          if dst == "athena":
-              for table in ast.find_all(exp.Table):
-                  table.set("catalog", None)
+      def transform(sql: str, src: str, dst: str) -> str:
+          if dst != "athena":
+              return sql
+          ast = sqlglot.parse_one(sql, dialect=dst)
+          for table in ast.find_all(exp.Table):
+              table.set("catalog", None)
+          return ast.sql(dialect=dst)
 ```
 
 ### Example — multiple scripts
 
-Scripts are composable. Each sees the same `ast` (as mutated by previous scripts), so they chain:
+Scripts are composable. Each receives the **string** returned by the previous script, so they chain:
 
 ```yaml
 translation:
   pythonScripts:
     - |
+      import sqlglot
       import sqlglot.expressions as exp
 
-      def transform(ast, src: str, dst: str) -> None:
+      def transform(sql: str, src: str, dst: str) -> str:
           # Strip catalog when targeting Athena (any source dialect)
-          if dst == "athena":
-              for table in ast.find_all(exp.Table):
-                  table.set("catalog", None)
+          if dst != "athena":
+              return sql
+          ast = sqlglot.parse_one(sql, dialect=dst)
+          for table in ast.find_all(exp.Table):
+              table.set("catalog", None)
+          return ast.sql(dialect=dst)
     - |
+      import sqlglot
       import sqlglot.expressions as exp
 
-      def transform(ast, src: str, dst: str) -> None:
+      def transform(sql: str, src: str, dst: str) -> str:
           # Force uppercase schema names in DuckDB (environment-specific convention)
-          if dst == "duckdb":
-              for table in ast.find_all(exp.Table):
-                  db = table.args.get("db")
-                  if db:
-                      db.set("this", db.name.upper())
+          if dst != "duckdb":
+              return sql
+          ast = sqlglot.parse_one(sql, dialect=dst)
+          for table in ast.find_all(exp.Table):
+              db = table.args.get("db")
+              if db:
+                  db.set("this", db.name.upper())
+          return ast.sql(dialect=dst)
 ```
 
 ### Per-group scripts
 
-In addition to global YAML scripts, you can attach **reusable scripts** to individual cluster groups via the Admin UI (**Scripts** page → **Groups** page). Per-group scripts run after the global ones and follow the same `transform(ast, src, dst)` contract. This is useful when different groups target different engines and need distinct fixups.
+In addition to global YAML scripts, you can attach **reusable scripts** to individual cluster groups via the Admin UI (**Scripts** page → **Groups** page). Per-group scripts run after the global ones and follow the same `transform(sql, src, dst) -> str` contract. This is useful when different groups target different engines and need distinct fixups.
 
 ### Error handling
 
@@ -141,8 +157,8 @@ If a script raises a Python exception, the query fails with a `Translation` erro
 
 - Scripts run inside a `spawn_blocking` task on Tokio's blocking thread pool because they hold the Python GIL.
 - Each script is executed in its own globals dict (same approach as `PythonScriptRouter`), so imports and helper functions defined at module level work correctly.
-- The `ast` is parsed from the sqlglot-translated SQL in the **target dialect** before scripts run. Mutations do not need to account for the source dialect's syntax.
-- Re-serialization happens once at the end via `ast.sql(dialect=dst)`, keeping overhead independent of the number of scripts.
+- QueryFlux never parses or holds an AST across scripts — `sql` is already the sqlglot-translated text in the **target dialect** when scripts start running, and only the returned string from each `transform()` call crosses back. A script that parses `sql` with sqlglot (or anything else) is working with its own private tree, not something QueryFlux passes between scripts.
+- A script's `transform()` must return a `str`; returning anything else (including `None`, e.g. a script with no `return` statement) is a `Translation` error.
 
 ## Failure modes
 

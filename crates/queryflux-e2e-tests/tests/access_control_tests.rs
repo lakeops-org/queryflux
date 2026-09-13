@@ -103,21 +103,21 @@ async fn allowed_table_with_row_filter_only_returns_matching_rows() {
 /// invariant assert in `dispatch.rs` (Phase 4 step 4a) denies rather than silently letting
 /// a read become a write.
 const SELECT_TO_DELETE_FIXUP: &str = r#"
+import sqlglot
 import sqlglot.expressions as exp
 
-def transform(ast, src: str, dst: str) -> None:
+def transform(sql: str, src: str, dst: str) -> str:
     # Only mangle SELECTs — leave CREATE TABLE / INSERT (used to seed the test table)
     # completely alone, so the only thing this simulates is a fixup bug that corrupts
     # a read query specifically.
+    ast = sqlglot.parse_one(sql, dialect=dst)
     if not isinstance(ast, exp.Select):
-        return
+        return sql
     tables = list(ast.find_all(exp.Table))
     if not tables:
-        return
-    new_delete = exp.Delete(this=tables[0].copy())
-    ast.__class__ = new_delete.__class__
-    ast.args.clear()
-    ast.args.update(new_delete.args)
+        return sql
+    delete = exp.Delete(this=tables[0].copy())
+    return delete.sql(dialect=dst)
 "#;
 
 #[tokio::test]

@@ -67,19 +67,25 @@ clusterGroups:
 translation:
   errorOnUnsupported: false
   # Optional Python scripts run after every sqlglot translation.
-  # Each script must define: def transform(ast, src, dst) -> None
-  # `ast` is a sqlglot AST to mutate in-place, `src`/`dst` are dialect names.
-  # Import sqlglot.expressions as needed (for example: `import sqlglot.expressions as exp`).
+  # Each script must define: def transform(sql, src, dst) -> str
+  # `sql` is the translated SQL text, `src`/`dst` are dialect names; return the
+  # (possibly modified) SQL text. Scripts are given plain text, not a live AST,
+  # so QueryFlux never binds you to a specific SQL library — parse `sql` with
+  # sqlglot (or anything else) yourself if you need AST-level control.
   # pythonScripts:
   #   - |
+  #     import sqlglot
   #     import sqlglot.expressions as exp
   #
-  #     def transform(ast, src, dst) -> None:
+  #     def transform(sql, src, dst) -> str:
   #         # Athena has no catalog layer — strip catalog from 3-part table references.
   #         # hive.my_db.my_table  →  my_db.my_table
-  #         if dst == "athena":
-  #             for table in ast.find_all(exp.Table):
-  #                 table.set("catalog", None)
+  #         if dst != "athena":
+  #             return sql
+  #         ast = sqlglot.parse_one(sql, dialect=dst)
+  #         for table in ast.find_all(exp.Table):
+  #             table.set("catalog", None)
+  #         return ast.sql(dialect=dst)
   # Max time to spend on catalog lookup (see `catalogProvider` below) before
   # falling back to dialect-only translation. Default 1500ms.
   # schemaResolutionTimeoutMs: 1500

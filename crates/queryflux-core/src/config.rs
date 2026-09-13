@@ -1873,9 +1873,11 @@ pub struct TranslationConfig {
     #[serde(default)]
     pub error_on_unsupported: bool,
     /// Python scripts run after every sqlglot translation.
-    /// Each script must define `def transform(ast, src: str, dst: str) -> None:`.
+    /// Each script must define `def transform(sql: str, src: str, dst: str) -> str:`.
     /// Top-level imports and helper functions are supported.
-    /// Scripts mutate `ast` in-place; `src`/`dst` carry the dialect names.
+    /// Scripts receive the SQL text and return the (possibly modified) SQL text;
+    /// `src`/`dst` carry the dialect names. A script that needs AST-level control
+    /// can `import sqlglot` (or any other parser) itself and return `.sql(dialect=dst)`.
     #[serde(default)]
     pub python_scripts: Vec<String>,
     /// Max time to spend on catalog lookup for schema-aware translation before

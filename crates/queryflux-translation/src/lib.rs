@@ -61,9 +61,10 @@ impl TranslatorTrait for PassthroughTranslator {
 /// Returns the original SQL unchanged when dialects match (zero overhead).
 ///
 /// User-defined Python scripts run after every sqlglot translation. Each script
-/// must define `def transform(ast, src: str, dst: str) -> None:`. Top-level
-/// imports and helper functions are fully supported. Scripts mutate `ast`
-/// in-place.
+/// must define `def transform(sql: str, src: str, dst: str) -> str:`. Top-level
+/// imports and helper functions are fully supported. Scripts receive SQL text and
+/// return SQL text — a script that needs AST-level control can `import sqlglot`
+/// (or any other parser) itself and return `.sql(dialect=dst)`.
 /// Default catalog-lookup timeout for `resolve_schema_context` when the caller
 /// doesn't override it via `with_schema_resolution_timeout` — matches
 /// `TranslationConfig`'s own default.

@@ -134,7 +134,7 @@ pub struct SqlglotTranslator {
     source: SqlDialect,
     target: SqlDialect,
     /// User-defined Python scripts executed in order after sqlglot translation.
-    /// Each script must define `def transform(ast, src: str, dst: str) -> None`.
+    /// Each script must define `def transform(sql: str, src: str, dst: str) -> str`.
     python_scripts: Vec<String>,
 }
 
@@ -207,11 +207,11 @@ fn translate_with_gil(
             translate_with_schema(py, &sqlglot, sql, src, tgt, schema_context)?
         };
 
-        // 2. Run user fixup scripts in order. Each may mutate the AST in-place.
+        // 2. Run user fixup scripts in order. Each receives SQL text and returns SQL text.
         if python_scripts.is_empty() {
             return Ok(translated);
         }
-        run_fixup_scripts(py, &sqlglot, &translated, src, tgt, python_scripts)
+        run_fixup_scripts(py, &translated, src, tgt, python_scripts)
     })
 }
 
@@ -300,37 +300,42 @@ fn translate_with_schema(
 ///
 /// Each script must define a function with this signature:
 /// ```python
-/// def transform(ast, src: str, dst: str) -> None:
-///     # ast: sqlglot AST (already translated to the dst dialect) — mutate in-place
+/// def transform(sql: str, src: str, dst: str) -> str:
+///     # sql: the SQL text (already translated to the dst dialect)
 ///     # src: source dialect name (e.g. "trino")
 ///     # dst: target dialect name (e.g. "athena")
+///     # returns: the (possibly modified) SQL text
 /// ```
+///
+/// Scripts are given plain SQL text, not a live AST object — this keeps them decoupled
+/// from whatever SQL library QueryFlux uses internally. A script that needs real AST
+/// power can still `import sqlglot` (or any other parser) itself, parse `sql`, mutate its
+/// own tree, and return `.sql(dialect=dst)`; that library choice is entirely the script's
+/// own business and never binds QueryFlux to it.
 ///
 /// Imports and helper functions may appear at module level. Example:
 /// ```python
+/// import sqlglot
 /// import sqlglot.expressions as exp
 ///
-/// def transform(ast, src: str, dst: str) -> None:
-///     if dst == "athena":
-///         for table in ast.find_all(exp.Table):
-///             table.set("catalog", None)
+/// def transform(sql: str, src: str, dst: str) -> str:
+///     if dst != "athena":
+///         return sql
+///     ast = sqlglot.parse_one(sql, dialect=dst)
+///     for table in ast.find_all(exp.Table):
+///         table.set("catalog", None)
+///     return ast.sql(dialect=dst)
 /// ```
 ///
-/// The AST is re-serialized once after all scripts run.
+/// Scripts run in order, each receiving the previous script's returned SQL text.
 fn run_fixup_scripts(
     py: Python<'_>,
-    sqlglot: &Bound<'_, PyModule>,
     sql: &str,
     src: &str,
     tgt: &str,
     scripts: &[String],
 ) -> Result<String> {
-    // Parse the already-translated SQL in the target dialect.
-    let parse_kwargs = PyDict::new(py);
-    parse_kwargs.set_item("dialect", tgt).ok();
-    let ast = sqlglot
-        .call_method("parse_one", (sql,), Some(&parse_kwargs))
-        .map_err(|e| QueryFluxError::Translation(format!("transform: parse_one failed: {e}")))?;
+    let mut current = sql.to_string();
 
     for (i, script) in scripts.iter().enumerate() {
         // Execute the script in its own globals dict so that top-level imports
@@ -357,23 +362,22 @@ fn run_fixup_scripts(
                 ))
             })?;
 
-        transform_fn.call1((&ast, src, tgt)).map_err(|e| {
+        let result = transform_fn
+            .call1((current.as_str(), src, tgt))
+            .map_err(|e| {
+                QueryFluxError::Translation(format!(
+                    "translation script {i} transform() call failed: {e}"
+                ))
+            })?;
+
+        current = result.extract().map_err(|e| {
             QueryFluxError::Translation(format!(
-                "translation script {i} transform() call failed: {e}"
+                "translation script {i} transform() must return a str: {e}"
             ))
         })?;
     }
 
-    // Re-serialize once after all scripts have run.
-    let sql_kwargs = PyDict::new(py);
-    sql_kwargs.set_item("dialect", tgt).ok();
-    let result: String = ast
-        .call_method("sql", (), Some(&sql_kwargs))
-        .map_err(|e| QueryFluxError::Translation(format!("transform: ast.sql() failed: {e}")))?
-        .extract()
-        .map_err(|e| QueryFluxError::Translation(format!("transform: extract failed: {e}")))?;
-
-    Ok(result)
+    Ok(current)
 }
 
 #[cfg(test)]
