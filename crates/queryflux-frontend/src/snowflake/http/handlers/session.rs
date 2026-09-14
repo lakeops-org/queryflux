@@ -98,14 +98,9 @@ pub async fn login_request(
     // query in this session lands on the same cluster group.
     let session_ctx = SessionContext {
         user: Some(auth_ctx.user.clone()),
-        database: database.clone(),
-        // Snowflake's "database" is the top-level namespace, mapping onto our
-        // catalog.database.table model as *catalog*, not database — mirrored here
-        // rather than also renaming `database` (Snowflake's schema, tracked
-        // separately in `extra["snowflake.schema"]` where captured) to avoid
-        // changing what existing `session.database()` consumers see for Snowflake
-        // sessions. TODO: thread `extra["snowflake.schema"]` into a real
-        // `database` value once this session-store path captures it too.
+        // Map Snowflake database.schema.table onto catalog.database.table,
+        // matching the context constructed for subsequent query requests.
+        database: schema.clone().filter(|s| !s.is_empty()),
         catalog: database.clone(),
         tags: QueryTags::default(),
         extra: Default::default(),

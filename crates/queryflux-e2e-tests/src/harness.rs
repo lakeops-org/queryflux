@@ -519,6 +519,8 @@ async fn is_lakekeeper_ready(url: &str) -> bool {
 
 pub struct WireTestHarness {
     pub port: u16,
+    /// Allows tests to observe routing and backend dispatch through the real HTTP frontend.
+    pub live: Arc<tokio::sync::RwLock<LiveConfig>>,
     pub session_idle_timeout_secs: u64,
     pub session_max_age_secs: u64,
     _shutdown_tx: tokio::sync::oneshot::Sender<()>,
@@ -627,6 +629,7 @@ impl WireTestHarness {
             result_cache: Arc::new(queryflux_cache::noop::NoopResultCache),
         });
 
+        let live = state.live.clone();
         let snowflake_fe = SnowflakeFrontend::new(
             state,
             SnowflakeHttpFrontendConfig {
@@ -657,6 +660,7 @@ impl WireTestHarness {
             port,
             session_idle_timeout_secs,
             session_max_age_secs,
+            live,
             _shutdown_tx: shutdown_tx,
         })
     }
@@ -771,6 +775,7 @@ impl WireTestHarness {
             result_cache: Arc::new(queryflux_cache::noop::NoopResultCache),
         });
 
+        let live = state.live.clone();
         let snowflake_fe = SnowflakeFrontend::new(
             state,
             SnowflakeHttpFrontendConfig {
@@ -801,6 +806,7 @@ impl WireTestHarness {
             port,
             session_idle_timeout_secs,
             session_max_age_secs,
+            live,
             _shutdown_tx: shutdown_tx,
         }))
     }

@@ -25,6 +25,7 @@ axum = { workspace = true }
 tower = { version = "0.5", features = ["limit"] }
 tower-http = { workspace = true }
 bytes = { workspace = true }
+polyglot-sql = { workspace = true }
 chrono = { workspace = true }
 reqwest = { workspace = true }
 url = { workspace = true }

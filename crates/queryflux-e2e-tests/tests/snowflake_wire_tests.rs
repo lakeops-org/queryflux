@@ -592,3 +592,410 @@ async fn starrocks_sql_api_error_on_bad_sql() {
     assert!(!result.success, "bad SQL should return success=false");
     assert!(result.error.is_some(), "should carry an error message");
 }
+
+// Observe the real HTTP login and query paths without requiring a Snowflake account.
+mod session_schema {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    use async_trait::async_trait;
+    use queryflux_auth::{AuthContext, QueryCredentials};
+    use queryflux_core::{
+        catalog::{CatalogProvider, TableSchema},
+        error::Result,
+        params::QueryParams,
+        query::{ClusterGroupName, EngineType, FrontendProtocol},
+        session::SessionContext,
+        sql_classify::ExecutionHints,
+        tags::QueryTags,
+    };
+    use queryflux_engine_adapters::{AdapterKind, BackendQueryIdSlot, SyncAdapter, SyncExecution};
+    use queryflux_routing::{chain::RouterChain, RouterTrait, RoutingDecision};
+
+    #[derive(Default)]
+    struct ObservedSessions {
+        login: Mutex<Vec<SessionContext>>,
+        query: Mutex<Vec<SessionContext>>,
+        lookups: Mutex<Vec<(String, String, String)>>,
+    }
+
+    struct ObservingRouter(Arc<ObservedSessions>);
+
+    #[async_trait]
+    impl RouterTrait for ObservingRouter {
+        fn type_name(&self) -> &'static str {
+            "ObserveSession"
+        }
+
+        async fn route(
+            &self,
+            _sql: &str,
+            session: &SessionContext,
+            _protocol: &FrontendProtocol,
+            _auth: Option<&AuthContext>,
+        ) -> Result<RoutingDecision> {
+            self.0.login.lock().unwrap().push(session.clone());
+            Ok(RoutingDecision::NoMatch)
+        }
+    }
+
+    #[async_trait]
+    impl CatalogProvider for ObservedSessions {
+        async fn list_catalogs(&self) -> Result<Vec<String>> {
+            Ok(vec![])
+        }
+        async fn list_databases(&self, _catalog: &str) -> Result<Vec<String>> {
+            Ok(vec![])
+        }
+        async fn list_tables(&self, _catalog: &str, _database: &str) -> Result<Vec<String>> {
+            Ok(vec![])
+        }
+        async fn get_table_schema(
+            &self,
+            catalog: &str,
+            database: &str,
+            table: &str,
+        ) -> Result<Option<TableSchema>> {
+            self.lookups.lock().unwrap().push((
+                catalog.to_string(),
+                database.to_string(),
+                table.to_string(),
+            ));
+            Ok(None)
+        }
+    }
+
+    struct ObservingAdapter {
+        inner: Arc<dyn SyncAdapter>,
+        observed: Arc<ObservedSessions>,
+    }
+
+    #[async_trait]
+    impl SyncAdapter for ObservingAdapter {
+        async fn execute_as_arrow(
+            &self,
+            sql: &str,
+            session: &SessionContext,
+            credentials: &QueryCredentials,
+            tags: &QueryTags,
+            params: &QueryParams,
+            hints: ExecutionHints,
+            id_slot: &BackendQueryIdSlot,
+        ) -> Result<SyncExecution> {
+            self.observed.query.lock().unwrap().push(session.clone());
+            self.inner
+                .execute_as_arrow(sql, session, credentials, tags, params, hints, id_slot)
+                .await
+        }
+        fn engine_type(&self) -> EngineType {
+            self.inner.engine_type()
+        }
+        async fn health_check(&self) -> bool {
+            self.inner.health_check().await
+        }
+        async fn list_catalogs(&self) -> Result<Vec<String>> {
+            self.inner.list_catalogs().await
+        }
+        async fn list_databases(&self, catalog: &str) -> Result<Vec<String>> {
+            self.inner.list_databases(catalog).await
+        }
+        async fn list_tables(&self, catalog: &str, database: &str) -> Result<Vec<String>> {
+            self.inner.list_tables(catalog, database).await
+        }
+        async fn describe_table(
+            &self,
+            catalog: &str,
+            database: &str,
+            table: &str,
+        ) -> Result<Option<TableSchema>> {
+            self.inner.describe_table(catalog, database, table).await
+        }
+    }
+
+    async fn observe(h: &WireTestHarness) -> Arc<ObservedSessions> {
+        let observed = Arc::new(ObservedSessions::default());
+        let mut live = h.live.write().await;
+        live.router_chain = RouterChain::new(
+            vec![Box::new(ObservingRouter(observed.clone()))],
+            ClusterGroupName("duckdb".to_string()),
+        );
+        live.catalog = observed.clone();
+        let adapter = live.adapters.values_mut().next().expect("DuckDB adapter");
+        *adapter = AdapterKind::Sync(Arc::new(ObservingAdapter {
+            inner: adapter.as_sync().expect("sync adapter"),
+            observed: observed.clone(),
+        }));
+        observed
+    }
+
+    async fn login(h: &WireTestHarness, schema: Option<&str>) -> SnowflakeWireClient {
+        let mut data = json!({
+            "LOGIN_NAME": "testuser",
+            "DATABASE_NAME": "REPORTING"
+        });
+        if let Some(schema) = schema {
+            data["SCHEMA_NAME"] = json!(schema);
+        }
+        let response: serde_json::Value = reqwest::Client::new()
+            .post(format!("{}/session/v1/login-request", h.base_url()))
+            .query(&[("roleName", "ANALYST"), ("warehouse", "ANALYTICS_WH")])
+            .json(&json!({"data": data}))
+            .send()
+            .await
+            .expect("login request")
+            .json()
+            .await
+            .expect("login response");
+        assert_eq!(response["success"], true, "{response}");
+        assert_eq!(response["data"]["sessionInfo"]["databaseName"], "REPORTING");
+        assert_eq!(
+            response["data"]["sessionInfo"]["schemaName"],
+            schema.unwrap_or_default()
+        );
+        assert_eq!(response["data"]["sessionInfo"]["roleName"], "ANALYST");
+        assert_eq!(
+            response["data"]["sessionInfo"]["warehouseName"],
+            "ANALYTICS_WH"
+        );
+        let mut client = SnowflakeWireClient::new(&h.base_url());
+        client.session_token = Some(
+            response["data"]["token"]
+                .as_str()
+                .expect("token")
+                .to_string(),
+        );
+        client
+    }
+
+    #[tokio::test]
+    async fn login_schema_reaches_routing_context() {
+        let h = WireTestHarness::new(0, 0).await.expect("harness");
+        let observed = observe(&h).await;
+        let mut client = login(&h, Some("ANALYTICS")).await;
+        let sessions = observed.login.lock().unwrap().clone();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].catalog(), Some("REPORTING"));
+        assert_eq!(sessions[0].database(), Some("ANALYTICS"));
+        client.logout().await.expect("logout");
+    }
+
+    #[tokio::test]
+    async fn missing_database_stays_unset_in_query_context() {
+        let h = WireTestHarness::new(0, 0).await.expect("harness");
+        let observed = observe(&h).await;
+
+        let response: serde_json::Value = reqwest::Client::new()
+            .post(format!("{}/session/v1/login-request", h.base_url()))
+            .json(&json!({
+                "data": {
+                    "LOGIN_NAME": "testuser"
+                }
+            }))
+            .send()
+            .await
+            .expect("login request")
+            .json()
+            .await
+            .expect("login response");
+
+        assert_eq!(response["success"], true, "{response}");
+        assert_eq!(response["data"]["sessionInfo"]["databaseName"], "");
+
+        let mut client = SnowflakeWireClient::new(&h.base_url());
+        client.session_token = Some(
+            response["data"]["token"]
+                .as_str()
+                .expect("token")
+                .to_string(),
+        );
+
+        let result = client.query("SELECT 1", None).await.unwrap();
+        assert!(result.success, "{:?}", result.error);
+
+        let session = observed.query.lock().unwrap().last().unwrap().clone();
+
+        assert_eq!(session.catalog(), None);
+
+        client.logout().await.expect("logout");
+    }
+
+    #[tokio::test]
+    async fn login_and_use_schema_reach_query_context_and_catalog_lookup() {
+        let h = WireTestHarness::new(0, 0).await.expect("harness");
+        let observed = observe(&h).await;
+        let mut client = login(&h, Some("ANALYTICS")).await;
+        let created = client
+            .query("CREATE TABLE schema_probe (id INTEGER)", None)
+            .await
+            .unwrap();
+        assert!(created.success, "{:?}", created.error);
+        observed.query.lock().unwrap().clear();
+        observed.lookups.lock().unwrap().clear();
+
+        for schema in ["ANALYTICS", "ARCHIVE"] {
+            if schema == "ARCHIVE" {
+                let result = client.query("USE SCHEMA ARCHIVE", None).await.unwrap();
+                assert!(result.success, "{:?}", result.error);
+            }
+            let result = client
+                .query("SELECT id FROM schema_probe", None)
+                .await
+                .unwrap();
+            assert!(result.success, "{:?}", result.error);
+            let session = observed.query.lock().unwrap().last().unwrap().clone();
+            assert_eq!(session.catalog(), Some("REPORTING"));
+            assert_eq!(session.database(), Some(schema));
+            for (key, value) in [
+                ("snowflake.schema", schema),
+                ("snowflake.role", "ANALYST"),
+                ("snowflake.warehouse", "ANALYTICS_WH"),
+            ] {
+                assert_eq!(session.extra.get(key).map(String::as_str), Some(value));
+            }
+        }
+        // USE SCHEMA is handled locally; only the two SELECTs reach the adapter.
+        assert_eq!(observed.query.lock().unwrap().len(), 2);
+        assert_eq!(
+            *observed.lookups.lock().unwrap(),
+            vec![
+                (
+                    "REPORTING".into(),
+                    "ANALYTICS".into(),
+                    "schema_probe".into()
+                ),
+                ("REPORTING".into(), "ARCHIVE".into(), "schema_probe".into()),
+            ]
+        );
+        client.logout().await.expect("logout");
+    }
+
+    #[tokio::test]
+    async fn use_namespace_reaches_next_query_context() {
+        let h = WireTestHarness::new(0, 0).await.expect("harness");
+        let observed = observe(&h).await;
+        for (sql, catalog, schema) in [
+            ("USE SCHEMA SALES", "REPORTING", Some("SALES")),
+            ("USE SCHEMA ARCHIVE.SALES", "ARCHIVE", Some("SALES")),
+            (r#"USE SCHEMA "ARCHIVE"."SALES""#, "ARCHIVE", Some("SALES")),
+            (
+                r#"USE SCHEMA "Archive.Db"."Sa""les.Data""#,
+                "Archive.Db",
+                Some("Sa\"les.Data"),
+            ),
+            (
+                r#"USE SCHEMA "ARCHIVE.SALES""#,
+                "REPORTING",
+                Some("ARCHIVE.SALES"),
+            ),
+            ("USE DATABASE ARCHIVE", "ARCHIVE", None),
+            ("USE ARCHIVE", "ARCHIVE", None),
+            (r#"USE DATABASE "Archive.Db""#, "Archive.Db", None),
+        ] {
+            let mut client = login(&h, Some("ANALYTICS")).await;
+            let selected = client.query("USE SCHEMA PREVIOUS", None).await.unwrap();
+            assert!(selected.success, "{:?}", selected.error);
+            observed.query.lock().unwrap().clear();
+
+            let response: serde_json::Value = reqwest::Client::new()
+                .post(format!("{}/queries/v1/query-request", h.base_url()))
+                .header(
+                    "Authorization",
+                    format!(
+                        "Snowflake Token=\"{}\"",
+                        client.session_token.as_ref().unwrap()
+                    ),
+                )
+                .json(&json!({"sqlText": sql}))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            assert_eq!(response["success"], true, "{sql}: {response}");
+            assert_eq!(response["data"]["finalDatabaseName"], catalog, "{sql}");
+            assert_eq!(
+                response["data"]["finalSchemaName"],
+                schema.unwrap_or_default(),
+                "{sql}"
+            );
+            assert!(
+                observed.query.lock().unwrap().is_empty(),
+                "USE must stay local"
+            );
+
+            let result = client.query("SELECT 1", None).await.unwrap();
+            assert!(result.success, "{sql}: {:?}", result.error);
+            let sessions = observed.query.lock().unwrap().clone();
+            assert_eq!(sessions.len(), 1, "{sql}");
+            assert_eq!(sessions[0].catalog(), Some(catalog), "{sql}");
+            assert_eq!(sessions[0].database(), schema, "{sql}");
+            assert_eq!(
+                sessions[0]
+                    .extra
+                    .get("snowflake.schema")
+                    .map(String::as_str),
+                schema,
+                "{sql}"
+            );
+            assert_eq!(
+                sessions[0].extra.get("snowflake.role").map(String::as_str),
+                Some("ANALYST")
+            );
+            assert_eq!(
+                sessions[0]
+                    .extra
+                    .get("snowflake.warehouse")
+                    .map(String::as_str),
+                Some("ANALYTICS_WH")
+            );
+            client.logout().await.expect("logout");
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_or_empty_schema_does_not_use_database_as_schema() {
+        let h = WireTestHarness::new(0, 0).await.expect("harness");
+        let observed = observe(&h).await;
+        for schema in [None, Some("")] {
+            let mut client = login(&h, schema).await;
+            let result = client.query("SELECT 1", None).await.unwrap();
+            assert!(result.success, "{:?}", result.error);
+            for session in [
+                observed.login.lock().unwrap().last().unwrap().clone(),
+                observed.query.lock().unwrap().last().unwrap().clone(),
+            ] {
+                assert_eq!(session.catalog(), Some("REPORTING"));
+                assert_eq!(session.database(), None);
+                assert!(!session.extra.contains_key("snowflake.schema"));
+            }
+            client.logout().await.expect("logout");
+        }
+    }
+
+    #[tokio::test]
+    async fn starrocks_login_schema_resolves_unqualified_table() {
+        let Some(h) = starrocks_harness().await else {
+            eprintln!(
+                "SKIP starrocks_login_schema_resolves_unqualified_table: StarRocks not reachable"
+            );
+            return;
+        };
+
+        let mut client = login(&h, Some("information_schema")).await;
+
+        let result = client
+            .query(
+                "SELECT schema_name FROM schemata \
+                 WHERE schema_name = 'information_schema' LIMIT 1",
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert!(result.success, "{:?}", result.error);
+        assert_eq!(result.total_rows, 1);
+
+        client.logout().await.expect("logout");
+    }
+}
