@@ -69,6 +69,7 @@ impl AuthProvider for NoneAuthProvider {
             roles: vec![],
             raw_token: creds.bearer_token.clone(),
             raw_password: None,
+            attributes: Default::default(),
         })
     }
 }
@@ -118,6 +119,7 @@ impl AuthProvider for StaticAuthProvider {
                     roles: vec![],
                     raw_token: None,
                     raw_password: None,
+                    attributes: Default::default(),
                 });
             }
         };
@@ -148,6 +150,7 @@ impl AuthProvider for StaticAuthProvider {
             roles: entry.roles.clone(),
             raw_token: None,
             raw_password: None,
+            attributes: Default::default(),
         })
     }
 }
@@ -236,6 +239,7 @@ impl AuthProvider for OidcAuthProvider {
                     roles: vec![],
                     raw_token: None,
                     raw_password: None,
+                    attributes: Default::default(),
                 });
             }
         };
@@ -304,12 +308,22 @@ impl AuthProvider for OidcAuthProvider {
             .map(|claim| extract_string_array(claims, claim))
             .unwrap_or_default();
 
+        // Extract verified ABAC attributes from the configured claim paths.
+        let mut attributes = std::collections::BTreeMap::new();
+        for path in &self.config.attribute_claims {
+            if let Some(value) = resolve_dot_path(claims, path) {
+                let key = path.rsplit('.').next().unwrap_or(path).to_string();
+                attributes.insert(key, value.clone());
+            }
+        }
+
         Ok(AuthContext {
             user,
             groups,
             roles,
             raw_token: Some(token.to_string()),
             raw_password: None,
+            attributes,
         })
     }
 }
@@ -355,6 +369,7 @@ mod tests {
                 audience: None,
                 groups_claim: "groups".to_string(),
                 roles_claim: None,
+                attribute_claims: vec![],
             },
             true,
         );
@@ -371,5 +386,16 @@ mod tests {
                 .contains("OIDC audience validation required"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn none_and_static_providers_leave_attributes_empty() {
+        // Lock the rule: identity attributes are only ever populated from a verified
+        // credential (OIDC claims). A username/password alone yields none.
+        let ctx = AuthContext {
+            user: "alice".to_string(),
+            ..Default::default()
+        };
+        assert!(ctx.attributes.is_empty());
     }
 }

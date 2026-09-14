@@ -206,11 +206,16 @@ fn bounded_timeout(timeout_ms: Option<u64>) -> Duration {
 
 fn guard_payload(ctx: &GuardContext<'_>) -> serde_json::Value {
     json!({
+        // `sql` is the source SQL the client sent — guards now run before dialect
+        // translation. `dialect` is its source dialect; `engine_type` the eventual target.
         "sql": ctx.sql,
-        "translated_sql": ctx.translated_sql,
+        "dialect": format!("{:?}", ctx.dialect),
         "engine_type": format!("{:?}", ctx.engine_type),
         "cluster_group": ctx.cluster_group.0,
         "user": ctx.user,
+        "groups": ctx.groups,
+        "roles": ctx.roles,
+        "attributes": ctx.attributes,
         "agent_context": ctx.agent_context,
         "query_tags": ctx.query_tags,
     })
@@ -259,9 +264,10 @@ fn run_python_guard(script: &str, payload: serde_json::Value) -> Result<GuardRes
 mod tests {
     use super::*;
     use queryflux_core::{
-        query::{ClusterGroupName, EngineType},
+        query::{ClusterGroupName, EngineType, SqlDialect},
         tags::QueryTags,
     };
+    use std::collections::{BTreeMap, HashMap};
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         net::TcpListener,
@@ -269,32 +275,45 @@ mod tests {
 
     struct TestCtx {
         sql: String,
-        translated_sql: String,
+        dialect: SqlDialect,
         engine_type: EngineType,
         cluster_group: ClusterGroupName,
         query_tags: QueryTags,
+        groups: Vec<String>,
+        roles: Vec<String>,
+        attributes: BTreeMap<String, serde_json::Value>,
+        session_extra: HashMap<String, String>,
     }
 
     impl TestCtx {
         fn new(sql: &str) -> Self {
             Self {
                 sql: sql.to_string(),
-                translated_sql: sql.to_string(),
+                dialect: EngineType::DuckDb.dialect(),
                 engine_type: EngineType::DuckDb,
                 cluster_group: ClusterGroupName("default".to_string()),
                 query_tags: QueryTags::new(),
+                groups: Vec::new(),
+                roles: Vec::new(),
+                attributes: BTreeMap::new(),
+                session_extra: HashMap::new(),
             }
         }
 
         fn ctx(&self) -> GuardContext<'_> {
             GuardContext {
                 sql: &self.sql,
-                translated_sql: &self.translated_sql,
+                dialect: &self.dialect,
                 engine_type: &self.engine_type,
                 cluster_group: &self.cluster_group,
                 user: Some("alice"),
+                groups: &self.groups,
+                roles: &self.roles,
+                attributes: &self.attributes,
                 agent_context: None,
                 query_tags: &self.query_tags,
+                session_extra: &self.session_extra,
+                schema: None,
                 sql_parse: None,
             }
         }

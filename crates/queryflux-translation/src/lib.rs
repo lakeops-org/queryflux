@@ -1,28 +1,19 @@
+pub mod access;
 pub mod sqlglot;
+
+pub use access::{
+    extract_resources, render_mask, rewrite_table_scans, ExtractedResource, MaskRenderError,
+    TablePolicy,
+};
 
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+pub use queryflux_core::schema_context::SchemaContext;
 use queryflux_core::{catalog::CatalogProvider, error::Result, query::SqlDialect};
 pub use sqlglot::{extract_table_refs_async, SqlglotTranslator, TableRef};
-
-/// Schema context passed to the translator so sqlglot can produce accurate output.
-/// Maps table name → { column name → SQL type string }.
-#[derive(Debug, Default, Clone)]
-pub struct SchemaContext {
-    pub catalog: Option<String>,
-    pub database: Option<String>,
-    /// table_name → { col_name → type_string }
-    pub tables: HashMap<String, HashMap<String, String>>,
-}
-
-impl SchemaContext {
-    pub fn is_empty(&self) -> bool {
-        self.tables.is_empty()
-    }
-}
 
 /// Translates SQL from one dialect to another.
 ///
@@ -70,9 +61,10 @@ impl TranslatorTrait for PassthroughTranslator {
 /// Returns the original SQL unchanged when dialects match (zero overhead).
 ///
 /// User-defined Python scripts run after every sqlglot translation. Each script
-/// must define `def transform(ast, src: str, dst: str) -> None:`. Top-level
-/// imports and helper functions are fully supported. Scripts mutate `ast`
-/// in-place.
+/// must define `def transform(sql: str, src: str, dst: str) -> str:`. Top-level
+/// imports and helper functions are fully supported. Scripts receive SQL text and
+/// return SQL text — a script that needs AST-level control can `import sqlglot`
+/// (or any other parser) itself and return `.sql(dialect=dst)`.
 /// Default catalog-lookup timeout for `resolve_schema_context` when the caller
 /// doesn't override it via `with_schema_resolution_timeout` — matches
 /// `TranslationConfig`'s own default.

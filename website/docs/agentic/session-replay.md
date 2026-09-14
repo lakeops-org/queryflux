@@ -62,7 +62,8 @@ QueryFlux Studio shows agentic context inline on the **Queries** page — conver
 
 Guardrails are a general-purpose SQL safety layer — they apply to every frontend identically, agent traffic included, with no agent-specific policy layer. They integrate with agentic context in two ways:
 
-1. **Guard decisions are recorded per query** — every `allow`, `warn`, and `deny` is stored in `guard_actions`, so the agent session replay above includes the full safety audit trail.
-2. **Python script guards can inspect agent context** — the `ctx` dict passed to a script guard includes `agent_context` with all the fields above, so you can write rules that behave differently for agents vs. human clients (e.g. stricter row limits for `schema_exploration` queries from an unrecognized `agent_id`).
+1. **Guard decisions are recorded per query** — every `allow`, `warn`, `rewrite`, and `deny` is stored in `guard_actions`, so the agent session replay above includes the full safety audit trail.
+2. **`python_script` and `http_webhook` guards can inspect agent context** — the `ctx` passed to a script guard, or POSTed to a webhook guard, includes `agent_context` with all the fields above, so you can write rules that behave differently for agents vs. human clients (e.g. stricter row limits for `schema_exploration` queries from an unrecognized `agent_id`). See [Guardrails § Python script guards](../architecture/guardrails#python-script-guards).
+3. **Use built-in guards and access control** — configure `read_only`, `row_limit`, and [OPA access control](../access-control/overview) for agent-facing groups the same way as for human clients.
 
 See [Guardrails](../architecture/guardrails) for the full guard configuration reference, and [MCP Frontend](../architecture/frontends/mcp) for how this applies to MCP-originated queries specifically — MCP has no guard policy of its own, it flows through the same `GuardChain` as everything else.

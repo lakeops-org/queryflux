@@ -1,4 +1,5 @@
 pub mod abort;
+pub mod access_control_guard;
 pub mod admin;
 pub mod dispatch;
 pub mod flight_sql;
@@ -7,6 +8,7 @@ pub mod mysql_wire;
 pub mod postgres_wire;
 pub mod routing_resolve;
 pub mod snowflake;
+pub mod sql_pipeline;
 pub mod state;
 pub mod tee_sink;
 pub mod trino_http;

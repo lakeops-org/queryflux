@@ -1,4 +1,5 @@
-//! Integration tests for YAML/config `translation.pythonScripts`: Python `transform(ast, src, dst)`.
+//! Integration tests for YAML/config `translation.pythonScripts`:
+//! Python `transform(sql: str, src: str, dst: str) -> str`.
 //!
 //! Requires a working PyO3 interpreter with `sqlglot` on `PYTHONPATH` (same as CI: venv + `pip install -r requirements.txt`).
 //! Run: `cargo test -p queryflux-translation`
@@ -22,10 +23,14 @@ async fn translate_trino(sql: &str, scripts: Vec<String>) -> queryflux_core::err
 #[tokio::test]
 async fn transform_script_rewrites_literal() {
     require_sqlglot();
+    // The script is handed plain SQL text; it's free to parse it with sqlglot itself,
+    // mutate its own AST, and hand back the regenerated SQL text.
     let script = r#"
+import sqlglot
 import sqlglot.expressions as exp
 
-def transform(ast, src, dst):
+def transform(sql: str, src: str, dst: str) -> str:
+    ast = sqlglot.parse_one(sql, dialect=dst)
     for lit in ast.find_all(exp.Literal):
         try:
             if int(lit.this) == 1:
@@ -33,6 +38,7 @@ def transform(ast, src, dst):
                 break
         except (TypeError, ValueError):
             pass
+    return ast.sql(dialect=dst)
 "#;
     let out = translate_trino("SELECT 1", vec![script.to_string()])
         .await
@@ -47,12 +53,14 @@ def transform(ast, src, dst):
 async fn transform_script_noop_when_dst_filter_not_met() {
     require_sqlglot();
     let script = r#"
+import sqlglot
 import sqlglot.expressions as exp
 
-def transform(ast, src, dst):
+def transform(sql: str, src: str, dst: str) -> str:
     # Only rewrite when hypothetically targeting mysql — trino->trino should skip
     if dst != "mysql":
-        return
+        return sql
+    ast = sqlglot.parse_one(sql, dialect=dst)
     for lit in ast.find_all(exp.Literal):
         try:
             if int(lit.this) == 1:
@@ -60,6 +68,7 @@ def transform(ast, src, dst):
                 break
         except (TypeError, ValueError):
             pass
+    return ast.sql(dialect=dst)
 "#;
     let out = translate_trino("SELECT 1", vec![script.to_string()])
         .await
@@ -73,21 +82,29 @@ def transform(ast, src, dst):
 #[tokio::test]
 async fn transform_scripts_run_in_order() {
     require_sqlglot();
+    // Each script receives the previous script's *returned string* — proves the
+    // string-in/string-out chaining, not a shared live object.
     let s1 = r#"
+import sqlglot
 import sqlglot.expressions as exp
 
-def transform(ast, src, dst):
+def transform(sql: str, src: str, dst: str) -> str:
+    ast = sqlglot.parse_one(sql, dialect=dst)
     for t in ast.find_all(exp.Table):
         if t.name == "a":
             t.set("this", exp.to_identifier("b"))
+    return ast.sql(dialect=dst)
 "#;
     let s2 = r#"
+import sqlglot
 import sqlglot.expressions as exp
 
-def transform(ast, src, dst):
+def transform(sql: str, src: str, dst: str) -> str:
+    ast = sqlglot.parse_one(sql, dialect=dst)
     for t in ast.find_all(exp.Table):
         if t.name == "b":
             t.set("this", exp.to_identifier("c"))
+    return ast.sql(dialect=dst)
 "#;
     let out = translate_trino("SELECT * FROM a", vec![s1.to_string(), s2.to_string()])
         .await
@@ -100,23 +117,44 @@ def transform(ast, src, dst):
 }
 
 #[tokio::test]
+async fn transform_script_can_skip_sqlglot_entirely() {
+    require_sqlglot();
+    // Proves the contract really is string-in/string-out: a script that does plain
+    // text manipulation (no sqlglot import at all) works exactly the same way.
+    let script = r#"
+def transform(sql: str, src: str, dst: str) -> str:
+    return sql.replace("SELECT 1", "SELECT 42")
+"#;
+    let out = translate_trino("SELECT 1", vec![script.to_string()])
+        .await
+        .expect("translate");
+    assert!(out.contains("42"), "expected string-only rewrite, got: {out}");
+}
+
+#[tokio::test]
 async fn translation_service_appends_group_fixups_after_global() {
     require_sqlglot();
     let global = r#"
+import sqlglot
 import sqlglot.expressions as exp
 
-def transform(ast, src, dst):
+def transform(sql: str, src: str, dst: str) -> str:
+    ast = sqlglot.parse_one(sql, dialect=dst)
     for t in ast.find_all(exp.Table):
         if t.name == "x":
             t.set("this", exp.to_identifier("y"))
+    return ast.sql(dialect=dst)
 "#;
     let group = r#"
+import sqlglot
 import sqlglot.expressions as exp
 
-def transform(ast, src, dst):
+def transform(sql: str, src: str, dst: str) -> str:
+    ast = sqlglot.parse_one(sql, dialect=dst)
     for t in ast.find_all(exp.Table):
         if t.name == "y":
             t.set("this", exp.to_identifier("z"))
+    return ast.sql(dialect=dst)
 "#;
     let svc = TranslationService::new_sqlglot(vec![global.to_string()]).expect("service");
     let out = svc
@@ -168,7 +206,7 @@ async fn script_syntax_error_surfaces() {
 async fn transform_raises_python_exception() {
     require_sqlglot();
     let script = r#"
-def transform(ast, src, dst):
+def transform(sql: str, src: str, dst: str) -> str:
     raise RuntimeError("boom")
 "#;
     let err = translate_trino("SELECT 1", vec![script.to_string()])
@@ -179,6 +217,27 @@ def transform(ast, src, dst):
     };
     assert!(
         msg.contains("transform() call failed") || msg.contains("boom"),
+        "unexpected message: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn transform_returning_non_string_errors() {
+    require_sqlglot();
+    // The contract requires a `str` back — a script returning `None` (the old
+    // mutate-in-place contract's implicit return) must fail loudly, not silently.
+    let script = r#"
+def transform(sql: str, src: str, dst: str):
+    pass
+"#;
+    let err = translate_trino("SELECT 1", vec![script.to_string()])
+        .await
+        .expect_err("expected non-str return to error");
+    let QueryFluxError::Translation(msg) = err else {
+        panic!("expected Translation error");
+    };
+    assert!(
+        msg.contains("must return a str"),
         "unexpected message: {msg}"
     );
 }

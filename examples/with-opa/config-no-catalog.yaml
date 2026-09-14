@@ -1,0 +1,68 @@
+# Same Trino + OPA stack as config.yaml but without catalogProvider — fail-closed when
+# QueryFlux cannot resolve table columns (e.g. Bob + SELECT * + column masks).
+#
+# cargo run -p queryflux -- --config examples/with-opa/config-no-catalog.yaml
+
+queryflux:
+  externalAddress: http://localhost:8080
+  frontends:
+    trinoHttp:
+      enabled: true
+      port: 8080
+  persistence:
+    type: postgres
+    url: postgres://queryflux:queryflux@127.0.0.1:5434/queryflux
+  adminApi:
+    port: 9000
+    username: admin
+    password: admin
+
+auth:
+  provider: static
+  required: true
+  staticUsers:
+    users:
+      alice:
+        password: alice
+        groups: [engineers]
+        roles: [admin]
+      bob:
+        password: bob
+        groups: [analysts]
+        roles: [analyst]
+
+clusters:
+  trino-1:
+    engine: trino
+    enabled: true
+    endpoint: http://127.0.0.1:8081
+    queryAuth:
+      type: impersonate
+
+clusterGroups:
+  trino-opa:
+    enabled: true
+    maxRunningQueries: 4
+    members: [trino-1]
+
+routers:
+  - type: protocolBased
+    trinoHttp: trino-opa
+
+routingFallback: trino-opa
+
+translation:
+  errorOnUnsupported: false
+
+accessControl:
+  defaultConnection: default
+  connections:
+    default:
+      opa:
+        url: http://127.0.0.1:8182
+        decisionPath: /v1/data/queryflux/access
+        timeoutMs: 2000
+      operations: [table.select]
+      onMissingSchema: deny
+      failOpen: false
+      cacheTtlMs: 0

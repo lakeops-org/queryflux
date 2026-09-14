@@ -22,9 +22,14 @@ pub struct QuerySummary {
     pub protocol: String,
     pub username: Option<String>,
     pub sql_preview: String,
+    /// Source-dialect SQL after access-control rewrite. Only present when `was_rewritten` is true.
+    #[serde(default)]
+    pub rewritten_sql: Option<String>,
     /// The SQL after dialect translation. Only present when `was_translated` is true.
     pub translated_sql: Option<String>,
     pub status: String,
+    #[serde(default)]
+    pub was_rewritten: bool,
     pub was_translated: bool,
     pub source_dialect: String,
     pub target_dialect: String,
@@ -91,8 +96,10 @@ pub struct DashboardStats {
     pub error_rate_last_hour: f64,
     /// Average execution time in milliseconds.
     pub avg_duration_ms_last_hour: f64,
-    /// Fraction of queries that were translated (0.0 – 1.0).
+    /// Fraction of queries that were dialect-translated (0.0 – 1.0).
     pub translation_rate_last_hour: f64,
+    /// Fraction of queries rewritten by access control (0.0 – 1.0).
+    pub rewrite_rate_last_hour: f64,
 }
 
 /// Per-group aggregated stats returned by `GET /admin/group-stats`.
@@ -113,6 +120,7 @@ pub struct GroupStatRow {
     /// Average time spent queued before execution, in milliseconds.
     pub avg_queue_ms: f64,
     pub translated_queries: i64,
+    pub rewritten_queries: i64,
     pub total_rows_returned: i64,
 }
 
@@ -133,6 +141,7 @@ pub struct EngineStatRow {
     /// Average time spent queued before execution, in milliseconds.
     pub avg_queue_ms: f64,
     pub translated_queries: i64,
+    pub rewritten_queries: i64,
     pub total_rows_returned: i64,
 }
 

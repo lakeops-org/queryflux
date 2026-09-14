@@ -1,16 +1,8 @@
 use async_trait::async_trait;
-use polyglot_sql::{
-    expressions::{Expression, Literal},
-    DialectType,
-};
-use queryflux_core::query::EngineType;
+use polyglot_sql::expressions::{Expression, Literal};
 use queryflux_core::sql_classify::{is_read_like_fallback, is_read_stmt, to_polyglot_dialect};
 
 use crate::context::{GuardContext, GuardLayer, GuardResult};
-
-fn engine_dialect(engine: &EngineType) -> DialectType {
-    to_polyglot_dialect(&engine.dialect())
-}
 
 /// Async so parsing (and any wait for a `polyglot_pool` worker) never blocks the
 /// calling task's Tokio worker thread — `check` is on the live request path for
@@ -23,8 +15,8 @@ async fn guard_statements<'a>(
         return cache.statements().map(std::borrow::Cow::Borrowed).ok_or(());
     }
 
-    let sql = ctx.translated_sql.to_string();
-    let dialect = engine_dialect(ctx.engine_type);
+    let sql = ctx.sql.to_string();
+    let dialect = to_polyglot_dialect(ctx.dialect);
     tokio::task::spawn_blocking(move || {
         queryflux_core::polyglot_pool::run(move || polyglot_sql::parse(&sql, dialect))
     })
@@ -72,7 +64,7 @@ impl Guard for ReadOnlyGuard {
                 GuardResult::allow()
             }
             Err(_) => {
-                if is_read_like_fallback(ctx.translated_sql) {
+                if is_read_like_fallback(ctx.sql) {
                     GuardResult::allow()
                 } else {
                     GuardResult::deny("write operations are not permitted", "READ_ONLY_VIOLATION")
@@ -127,7 +119,7 @@ impl Guard for RowLimitGuard {
             }
             Err(_) => {
                 // Fall back to string heuristic.
-                let upper = ctx.translated_sql.to_uppercase();
+                let upper = ctx.sql.to_uppercase();
                 if !upper.contains(" LIMIT ") {
                     return GuardResult::warn("query has no LIMIT clause; result set may be large");
                 }
@@ -208,7 +200,7 @@ impl Guard for RequirePredicateGuard {
             }
             Err(_) => {
                 // Fall back to string heuristic.
-                let upper = ctx.translated_sql.to_uppercase();
+                let upper = ctx.sql.to_uppercase();
                 if !upper.trim_start().starts_with("SELECT") {
                     return GuardResult::allow();
                 }
@@ -314,30 +306,42 @@ fn simple_glob_match(haystack: &str, pattern: &str) -> bool {
 mod tests {
     use super::*;
     use queryflux_core::{
-        query::{ClusterGroupName, EngineType},
+        query::{ClusterGroupName, EngineType, SqlDialect},
         tags::QueryTags,
     };
+    use std::collections::{BTreeMap, HashMap};
 
     struct TestCtx {
         sql: String,
-        translated_sql: String,
+        dialect: SqlDialect,
         engine_type: EngineType,
         cluster_group: ClusterGroupName,
         query_tags: QueryTags,
+        groups: Vec<String>,
+        roles: Vec<String>,
+        attributes: BTreeMap<String, serde_json::Value>,
+        session_extra: HashMap<String, String>,
     }
 
     impl TestCtx {
-        fn new(sql: &str, translated: &str) -> Self {
+        /// `translated` is accepted for call-site compatibility; guards now run on the
+        /// source SQL, so `sql` is what the context carries.
+        fn new(sql: &str, _translated: &str) -> Self {
             Self {
                 sql: sql.to_string(),
-                translated_sql: translated.to_string(),
+                dialect: EngineType::DuckDb.dialect(),
                 engine_type: EngineType::DuckDb,
                 cluster_group: ClusterGroupName("default".to_string()),
                 query_tags: QueryTags::new(),
+                groups: Vec::new(),
+                roles: Vec::new(),
+                attributes: BTreeMap::new(),
+                session_extra: HashMap::new(),
             }
         }
 
         fn with_engine(mut self, engine: EngineType) -> Self {
+            self.dialect = engine.dialect();
             self.engine_type = engine;
             self
         }
@@ -345,12 +349,17 @@ mod tests {
         fn ctx(&self) -> GuardContext<'_> {
             GuardContext {
                 sql: &self.sql,
-                translated_sql: &self.translated_sql,
+                dialect: &self.dialect,
                 engine_type: &self.engine_type,
                 cluster_group: &self.cluster_group,
                 user: None,
+                groups: &self.groups,
+                roles: &self.roles,
+                attributes: &self.attributes,
                 agent_context: None,
                 query_tags: &self.query_tags,
+                session_extra: &self.session_extra,
+                schema: None,
                 sql_parse: None,
             }
         }

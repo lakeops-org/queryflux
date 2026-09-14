@@ -1,20 +1,21 @@
 ---
-description: Guardrails — SQL-level safety controls for agentic and human queries, with per-group overrides, Python script guards, and full agentic audit trails.
+description: Guardrails — SQL-level safety controls for agentic and human queries, with per-group overrides, access control (`opa_access`), and full agentic audit trails.
 ---
 
 # Guardrails
 
 Guardrails are a configurable chain of safety checks that run on every query **before** it reaches a backend engine. They are designed primarily for agentic workloads — where an AI agent generates SQL dynamically — but apply equally to human clients.
 
-Each guard inspects the translated SQL (after dialect translation, before engine dispatch) and returns one of three verdicts:
+Most built-in guards inspect the **translated** SQL (after dialect translation, before engine dispatch). Access control (`opa_access`) is the exception: it runs **before** translation on the client's source SQL so row filters and masks can ride the existing translation pass. Every guard returns one of:
 
 | Verdict | Effect |
 |---------|--------|
 | `allow` | Query proceeds. |
 | `warn`  | Query proceeds; a warning is recorded in the audit log. |
+| `rewrite` | Query proceeds with modified SQL. Used by [access control](../access-control/overview) (`opa_access`) for row filters and column masks. |
 | `deny`  | Query is blocked. A machine-readable error code is returned so agents can react programmatically. |
 
-Every verdict is recorded in `guard_actions` on the query record, alongside a `was_guard_blocked` flag, making the full guard history queryable from Studio and the Admin API.
+Every verdict is recorded in `guard_actions` on the query record, alongside a `was_guard_blocked` flag. Studio's **Queries** page shows the full trail — built-in guards and `opa_access` rewrites together — plus rewritten SQL separately from dialect-translated SQL.
 
 ---
 
@@ -32,6 +33,20 @@ This lets you apply baseline safety globally (e.g. read-only for all agents) whi
 ---
 
 ## Built-in guards
+
+### `opa_access` (access control)
+
+When `accessControl` is configured, QueryFlux registers **`opa_access`** as the rewriting guard in this same chain. It is not listed under `guardrails:` in YAML — it is enabled by the `accessControl:` block and asks OPA whether the verified identity may see each table, then **rewrites** or **denies**.
+
+| Config | Guard name | When it runs | Studio |
+| --- | --- | --- | --- |
+| `accessControl:` | `opa_access` | Before dialect translation | Guard Actions (`rewrite` / `deny`) + **Rewritten SQL (access control)** panel |
+
+Access-control **policy** (Rego, filters, masks, dry-run) is documented under **[Access control](../access-control/overview)** — provider docs: **[OPA](../access-control/opa)**. Observability is the same `guard_actions` array as every other guard.
+
+When access control is on, the rewriting guard is `opa_access`.
+
+**Scope** mirrors guardrails' global + `groups` pattern, but lives under `accessControl:` (edited on Studio **Access Control**, not **Guardrails** or **Clusters**): global `enabled` plus optional `groups.<clusterGroup>.enabled` to skip OPA for sandbox groups or opt in only where needed. One OPA connection.
 
 ### `read_only`
 
@@ -120,39 +135,45 @@ Queries routed to the `analysts` group run: `read_only` → `row_limit(100000)`.
 
 ## Python script guards
 
-> **Note:** Python script guards are not yet executed at runtime. The guard kind is accepted in configuration and stored, but the script body is skipped during dispatch. Use built-in guards or HTTP webhook guards for production safety rules.
+For logic that can't be expressed as a built-in rule, a `python_script` guard runs a script you author against every query. The script must define a top-level `check(ctx)` function:
 
-For logic that can't be expressed as a built-in rule, Python script guards can be authored through the QueryFlux Studio **Guardrails** page. The script receives a `ctx` dict with `sql`, `translated_sql`, `engine_type`, `cluster_group`, `user`, and `agent_context` fields, and must return:
-
-```python
-# allow
-return {"action": "allow"}
-
-# warn
-return {"action": "warn", "reason": "large join detected"}
-
-# deny
-return {"action": "deny", "reason": "cross-region query blocked", "code": "CROSS_REGION"}
+```yaml
+guardrails:
+  global:
+    - kind: python_script
+      script: |
+        def check(ctx):
+            if "cross_region" in ctx["query_tags"]:
+                return {"action": "deny", "reason": "cross-region query blocked", "code": "CROSS_REGION"}
+            return {"action": "allow"}
+      timeout_ms: 500   # default 1000, capped at 30000
 ```
+
+`ctx` is a dict built from the **source** SQL (before dialect translation): `sql`, `dialect`, `engine_type`, `cluster_group`, `user`, `groups`, `roles`, `attributes`, `agent_context`, `query_tags`. `check(ctx)` must return `None` (allow) or a dict `{"action": "allow" | "warn" | "deny", "reason"?, "code"?, "metadata"?}`.
+
+The script runs off the async runtime in a blocking task; a script that exceeds `timeout_ms` is denied with `PYTHON_GUARD_TIMEOUT` (the task is aborted best-effort — native/FFI code already in flight can't be interrupted mid-call). A script error or a malformed return value denies with `PYTHON_GUARD_ERROR`. Studio-managed scripts are referenced by `script_id` rather than inlined; `script` (inline) takes precedence when both are set.
 
 ---
 
 ## HTTP webhook guards
 
-> **Note:** HTTP webhook guards are not yet executed at runtime. The guard kind is accepted in configuration, but the webhook is not called during dispatch.
-
-Delegate guard decisions to an external service:
+Delegate a guard decision to an external service:
 
 ```yaml
 guardrails:
   global:
     - kind: http_webhook
       url: "https://hooks.example.com/guard"
-      timeout_ms: 5000
-      fail_behavior: deny   # or: allow
+      timeout_ms: 5000   # default 1000, capped at 30000
+      retry_count: 2     # retries on 5xx only; default 0
+      fail_behavior: deny   # deny (default) | allow, when unreachable/erroring
+      headers:
+        Authorization: "Bearer ..."
 ```
 
-QueryFlux POSTs the query context as JSON and expects the same `{action, reason?, code?}` response shape. `fail_behavior` controls what happens if the webhook is unreachable or times out — `deny` (default) is the safer choice for production.
+QueryFlux `POST`s the same `ctx` payload described above as JSON and expects `{"action": "allow" | "warn" | "deny", "reason"?, "code"?, "metadata"?}` back. `fail_behavior` controls what happens after all attempts are exhausted (unreachable, timeout, non-2xx, or an unparseable body) — `deny` (default) is the safer choice for production. `retry_count` retries a timeout/connection error or a `5xx` response; a `4xx` response fails immediately without retrying.
+
+Both guard kinds are enforced identically whether configured via YAML (`guardrails.global` / `guardrails.groups`) or persisted through Studio's **Guardrails** page.
 
 ---
 
@@ -182,13 +203,19 @@ ORDER BY step_index;
 
 ## Configuring guardrails in Studio
 
-The **Guardrails** page in QueryFlux Studio provides a live editor for the guard chain. Changes are applied without a proxy restart. Built-in guards can be toggled and parameterized; Python script guards can be written and tested in the browser.
+The **Guardrails** page in QueryFlux Studio provides a live editor for the SQL-shape chain (built-ins such as `read_only` and `row_limit`). Changes are applied without a proxy restart.
+
+The **Access Control** page connects QueryFlux to OPA (URL, decision path, credentials) and sets **scope by cluster group** (global default + per-group inherit / enabled / disabled). Grants still live in the OPA bundle. What Studio *does* combine on the **Queries** page is the audit trail:
+
+- **Guard Actions** lists every guard, including `opa_access` with a **rewritten** badge and metadata (`tables`, `row_filtered`, `masked_columns`).
+- **Rewritten SQL (access control)** shows the source-dialect SQL after filters/masks.
+- **Translated SQL** shows dialect translation only (a query can be both rewritten and translated).
 
 ---
 
 ## Observability
 
-Guard decisions are recorded in `guard_actions` (JSONB array) on every `query_records` row. Each element has `guard`, `action`, `reason`, and `code` fields. The `was_guard_blocked` boolean column is indexed for fast filtering:
+Guard decisions are recorded in `guard_actions` (JSONB array) on every `query_records` row. Each element has `guard`, `action`, `reason`, `code`, and optional `metadata` (used by `opa_access` for which tables were filtered or masked). The `was_guard_blocked` boolean column is indexed for fast filtering. Access-control rewrites also set `was_rewritten` / `rewritten_sql` on the query record (distinct from `was_translated` / `translated_sql`).
 
 ```sql
 -- Recent blocked queries

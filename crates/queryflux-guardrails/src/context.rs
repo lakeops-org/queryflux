@@ -1,33 +1,53 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use queryflux_core::{
-    query::{ClusterGroupName, EngineType},
+    query::{ClusterGroupName, EngineType, SqlDialect},
+    schema_context::SchemaContext,
     session::AgentContext,
     sql_classify::SqlParseCache,
     tags::QueryTags,
 };
+use serde_json::Value;
 
 /// Which pipeline stage a guard runs at.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GuardLayer {
     /// L1 — runs on the NL question before any LLM call (Phase 4).
     Input,
-    /// L2 — runs on translated SQL before engine submission.
+    /// L2 — runs on the query before engine submission. As of the access-control work
+    /// this runs on the **source** SQL, before dialect translation.
     Plan,
     /// L3 — runs on returned rows / NL summary (Phase 4, MCP only).
     Output,
 }
 
 /// Everything a guard implementation can inspect.
+///
+/// `sql` / `sql_parse` / `dialect` all refer to the **source** SQL the client sent —
+/// the `Plan` layer runs before `maybe_translate`. `engine_type` is the eventual target
+/// engine (for guards that care which backend a query lands on).
 pub struct GuardContext<'a> {
     pub sql: &'a str,
-    pub translated_sql: &'a str,
+    /// Source SQL dialect — what `sql` / `sql_parse` are parsed as.
+    pub dialect: &'a SqlDialect,
     pub engine_type: &'a EngineType,
     pub cluster_group: &'a ClusterGroupName,
     pub user: Option<&'a str>,
+    /// Verified group memberships from `AuthContext`.
+    pub groups: &'a [String],
+    /// Verified roles from `AuthContext`.
+    pub roles: &'a [String],
+    /// Verified ABAC attributes from `AuthContext` (data-level policy input).
+    pub attributes: &'a BTreeMap<String, Value>,
     pub agent_context: Option<&'a AgentContext>,
     pub query_tags: &'a QueryTags,
-    /// Shared parse cache from dispatch. When set, guards must not re-parse SQL.
+    /// Client-declared session context (`SessionContext.extra`), for guards that forward
+    /// an allowlisted subset to an external policy engine. Never trusted for allow/deny.
+    pub session_extra: &'a HashMap<String, String>,
+    /// Resolved schema for the referenced tables, when a catalog is configured.
+    pub schema: Option<&'a SchemaContext>,
+    /// Shared parse cache from dispatch (source SQL + source dialect). When set, guards
+    /// must not re-parse SQL.
     pub sql_parse: Option<&'a SqlParseCache>,
 }
 
@@ -44,6 +64,13 @@ pub enum GuardResult {
     Deny {
         reason: String,
         code: Option<String>,
+    },
+    /// Query is permitted but the guard rewrote it. `sql` replaces the working SQL for the
+    /// rest of the pipeline. It is still source-dialect (row filters + rendered column
+    /// masks already spliced at the scan site); `maybe_translate` runs next.
+    Rewrite {
+        sql: String,
+        metadata: Option<HashMap<String, String>>,
     },
 }
 
@@ -65,9 +92,29 @@ impl GuardResult {
         }
     }
 
+    pub fn rewrite(sql: impl Into<String>) -> Self {
+        Self::Rewrite {
+            sql: sql.into(),
+            metadata: None,
+        }
+    }
+
     pub fn is_deny(&self) -> bool {
         matches!(self, Self::Deny { .. })
     }
+}
+
+/// Outcome of running a whole guard layer.
+#[derive(Debug, Clone)]
+pub enum GuardChainOutcome {
+    /// A guard denied the query. `code` is machine-readable.
+    Blocked {
+        reason: String,
+        code: Option<String>,
+    },
+    /// The query may proceed. `sql` is `Some` when a guard rewrote it (source dialect),
+    /// `None` when it is unchanged.
+    Proceed { sql: Option<String> },
 }
 
 #[cfg(test)]
@@ -79,5 +126,6 @@ mod tests {
         assert!(!GuardResult::allow().is_deny());
         assert!(!GuardResult::warn("x").is_deny());
         assert!(GuardResult::deny("x", "C").is_deny());
+        assert!(!GuardResult::rewrite("SELECT 1").is_deny());
     }
 }

@@ -1,0 +1,188 @@
+//! End-to-end tests for the OPA-backed data access-control guard, through a real
+//! Postgres-wire frontend backed by an in-process DuckDB instance and a tiny in-process
+//! OPA stub (a real HTTP server, not a mock of `PolicyDecisionProvider`).
+//!
+//! Run with: `cargo test -p queryflux-e2e-tests --test access_control_tests`
+
+use queryflux_e2e_tests::access_control::{build_guard, pg_connect, pg_run, start_opa_stub};
+use queryflux_e2e_tests::harness::ProtocolWireHarness;
+
+#[tokio::test]
+async fn denied_table_is_rejected_and_audited() {
+    let (opa_url, stub) = start_opa_stub().await;
+    stub.lock().unwrap().deny("secret");
+
+    let guard = build_guard(&opa_url);
+    let h = ProtocolWireHarness::new_with_access_control(Some(guard))
+        .await
+        .expect("harness");
+    let client = pg_connect(h.postgres_port).await;
+
+    let err = pg_run(&client, "SELECT * FROM secret")
+        .await
+        .expect_err("denied table must error");
+    assert!(
+        err.to_lowercase().contains("denied") || err.to_lowercase().contains("secret"),
+        "unexpected error: {err}"
+    );
+
+    let record = h
+        .wait_for_record(|r| r.sql_preview.contains("secret"))
+        .await
+        .expect("denied query should be recorded");
+    assert_eq!(format!("{:?}", record.status), "Denied");
+    assert!(record.was_guard_blocked);
+    assert!(
+        record
+            .guard_actions
+            .iter()
+            .any(|a| a.guard == "opa_access" && a.action == "deny"),
+        "expected an opa_access deny action, got: {:?}",
+        record.guard_actions
+    );
+}
+
+#[tokio::test]
+async fn allowed_table_with_row_filter_only_returns_matching_rows() {
+    let (opa_url, stub) = start_opa_stub().await;
+    stub.lock().unwrap().filter("orders", "amount > 100");
+
+    let guard = build_guard(&opa_url);
+    let h = ProtocolWireHarness::new_with_access_control(Some(guard))
+        .await
+        .expect("harness");
+    let client = pg_connect(h.postgres_port).await;
+
+    // Single-connection DuckDB pool (see `new_with_access_control`) — state persists
+    // across these statements.
+    pg_run(&client, "CREATE TABLE orders (id INTEGER, amount INTEGER)")
+        .await
+        .expect("create table");
+    pg_run(
+        &client,
+        "INSERT INTO orders VALUES (1, 50), (2, 150), (3, 200)",
+    )
+    .await
+    .expect("insert rows");
+
+    let rows = pg_run(&client, "SELECT id FROM orders ORDER BY id")
+        .await
+        .expect("select should succeed");
+    let ids: Vec<i32> = rows
+        .iter()
+        .map(|r| r[0].parse::<i32>().expect("id is an int"))
+        .collect();
+    assert_eq!(
+        ids,
+        vec![2, 3],
+        "row filter amount > 100 must exclude order 1 (amount=50)"
+    );
+
+    let record = h
+        .wait_for_record(|r| {
+            r.sql_preview
+                .to_lowercase()
+                .contains("select id from orders")
+        })
+        .await
+        .expect("allowed query should be recorded");
+    assert_eq!(format!("{:?}", record.status), "Success");
+    assert!(
+        record
+            .guard_actions
+            .iter()
+            .any(|a| a.guard == "opa_access" && a.action == "rewrite"),
+        "expected an opa_access rewrite action, got: {:?}",
+        record.guard_actions
+    );
+}
+
+/// A fixup script that monkey-patches the translated AST from a `Select` into a `Delete`
+/// referencing the same table — simulating a buggy operator-authored translation fixup
+/// script mutating the query after our own scan-site rewrite. Proves the post-rewrite
+/// invariant assert in `dispatch.rs` (Phase 4 step 4a) denies rather than silently letting
+/// a read become a write.
+const SELECT_TO_DELETE_FIXUP: &str = r#"
+import sqlglot
+import sqlglot.expressions as exp
+
+def transform(sql: str, src: str, dst: str) -> str:
+    # Only mangle SELECTs — leave CREATE TABLE / INSERT (used to seed the test table)
+    # completely alone, so the only thing this simulates is a fixup bug that corrupts
+    # a read query specifically.
+    ast = sqlglot.parse_one(sql, dialect=dst)
+    if not isinstance(ast, exp.Select):
+        return sql
+    tables = list(ast.find_all(exp.Table))
+    if not tables:
+        return sql
+    delete = exp.Delete(this=tables[0].copy())
+    return delete.sql(dialect=dst)
+"#;
+
+#[tokio::test]
+async fn fixup_script_turning_read_into_write_is_denied_by_invariant_assert() {
+    let (opa_url, stub) = start_opa_stub().await;
+    // Any row filter forces the access-control guard down the `Rewrite` path, which is
+    // what arms the post-translation invariant assert (see `dispatch.rs`).
+    stub.lock().unwrap().filter("orders", "amount > 0");
+
+    let guard = build_guard(&opa_url);
+    let h = ProtocolWireHarness::new_with_access_control_and_fixups(
+        Some(guard),
+        vec![SELECT_TO_DELETE_FIXUP.to_string()],
+    )
+    .await
+    .expect("harness");
+    let client = pg_connect(h.postgres_port).await;
+
+    pg_run(&client, "CREATE TABLE orders (id INTEGER, amount INTEGER)")
+        .await
+        .expect("create table");
+
+    let err = pg_run(&client, "SELECT id FROM orders")
+        .await
+        .expect_err("a fixup script turning the read into a write must be denied");
+    assert!(!err.is_empty());
+
+    let record = h
+        .wait_for_record(|r| {
+            r.sql_preview
+                .to_lowercase()
+                .contains("select id from orders")
+        })
+        .await
+        .expect("denied query should be recorded");
+    assert_eq!(format!("{:?}", record.status), "Denied");
+    assert!(record.was_guard_blocked);
+    assert!(
+        record
+            .error_message
+            .as_deref()
+            .unwrap_or_default()
+            .contains("invariant"),
+        "expected an invariant-assert denial reason, got: {:?}",
+        record.error_message
+    );
+}
+
+#[tokio::test]
+async fn opa_unreachable_fails_closed_by_default() {
+    // Point at a port nothing is listening on.
+    let guard = build_guard("http://127.0.0.1:1");
+    let h = ProtocolWireHarness::new_with_access_control(Some(guard))
+        .await
+        .expect("harness");
+    let client = pg_connect(h.postgres_port).await;
+
+    let err = pg_run(&client, "SELECT * FROM anything")
+        .await
+        .expect_err("unreachable OPA must deny by default (fail-closed)");
+    assert!(!err.is_empty());
+
+    let record = h
+        .wait_for_record(|r| r.sql_preview.contains("anything"))
+        .await
+        .expect("denied query should be recorded");
+    assert_eq!(format!("{:?}", record.status), "Denied");
+}

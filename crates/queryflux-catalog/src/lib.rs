@@ -2,9 +2,10 @@
 //! (Glue, Iceberg REST, Hive Metastore, ...) behind one `CatalogProvider` trait
 //! (`queryflux_core::catalog`), feeding schema-aware SQL translation.
 //!
-//! Implemented: `Glue` (direct AWS Glue Data Catalog access), `IcebergRest`
-//! (Iceberg REST Catalog protocol — Polaris, Tabular, etc.), `HiveMetastore`
-//! (raw Thrift protocol), and `Fallback` (composes two providers,
+//! Implemented: `Static` (inline table schemas from config), `Glue` (direct AWS
+//! Glue Data Catalog access), `IcebergRest` (Iceberg REST Catalog protocol —
+//! Polaris, Tabular, etc.), `HiveMetastore` (raw Thrift protocol), and `Fallback`
+//! (composes two providers,
 //! primary-then-secondary). A real integration that fails to build (bad
 //! credentials, unreachable endpoint) degrades to a no-op `NullCatalogProvider`
 //! with a startup warning rather than refusing to boot.
@@ -18,6 +19,7 @@ pub mod fallback;
 pub mod glue;
 pub mod hive_metastore;
 pub mod iceberg_rest;
+pub mod static_catalog;
 #[cfg(test)]
 pub(crate) mod test_support;
 
@@ -34,6 +36,7 @@ pub use fallback::FallbackCatalogProvider;
 pub use glue::GlueCatalogProvider;
 pub use hive_metastore::HiveMetastoreCatalogProvider;
 pub use iceberg_rest::IcebergRestCatalogProvider;
+pub use static_catalog::StaticCatalogProvider;
 
 /// A boxed, pinned future for the (necessarily recursive, thanks to `Fallback`)
 /// provider-building functions below — factored out so clippy's
@@ -131,6 +134,11 @@ pub fn try_build_catalog_provider(
                     ))),
                 }
             }
+
+            CatalogProviderConfig::Static { tables } => {
+                Ok(Arc::new(StaticCatalogProvider::new(tables.clone()))
+                    as Arc<dyn CatalogProvider>)
+            }
         }
     })
 }
@@ -175,6 +183,10 @@ pub fn build_catalog_provider(
                 Arc::new(FallbackCatalogProvider::new(primary, secondary))
                     as Arc<dyn CatalogProvider>
             }
+
+            CatalogProviderConfig::Static { tables } => {
+                Arc::new(StaticCatalogProvider::new(tables.clone())) as Arc<dyn CatalogProvider>
+            }
         }
     })
 }
@@ -187,6 +199,33 @@ mod tests {
     async fn null_config_yields_null_provider() {
         let provider = build_catalog_provider(&CatalogProviderConfig::Null).await;
         assert!(provider.is_null());
+    }
+
+    #[tokio::test]
+    async fn static_config_yields_schemas_for_configured_tables() {
+        use queryflux_core::config::{StaticColumnConfig, StaticTableEntry};
+        use std::collections::HashMap;
+
+        let mut tables = HashMap::new();
+        tables.insert(
+            "orders".to_string(),
+            StaticTableEntry {
+                catalog: String::new(),
+                database: String::new(),
+                columns: vec![StaticColumnConfig {
+                    name: "id".into(),
+                    data_type: "BIGINT".into(),
+                    nullable: false,
+                }],
+            },
+        );
+        let provider = build_catalog_provider(&CatalogProviderConfig::Static { tables }).await;
+        let schema = provider
+            .get_table_schema("", "", "orders")
+            .await
+            .unwrap()
+            .expect("orders schema");
+        assert_eq!(schema.columns[0].name, "id");
     }
 
     #[tokio::test]
