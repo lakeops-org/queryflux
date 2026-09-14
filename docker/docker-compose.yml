@@ -198,7 +198,7 @@ services:
         sed "s/FROM tpch\\.tiny\\./FROM tpch.$${TPCH_SCALE}./g" /test-data/init.sql > /tmp/init.run.sql
         exec trino --server http://trino:8080 --user loader --file /tmp/init.run.sql
     volumes:
-      - ./docker/fixtures/init.sql:/test-data/init.sql:ro
+      - ./docker/fixtures/init.docker-network.sql:/test-data/init.sql:ro
 
   # Register the Lakekeeper Iceberg external catalog in StarRocks.
   # Run separately: `docker compose run --rm -T starrocks-catalog-setup`
