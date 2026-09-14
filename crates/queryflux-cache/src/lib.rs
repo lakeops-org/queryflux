@@ -76,15 +76,18 @@ impl CacheKey {
         params: &[QueryParam],
     ) -> Self {
         let mut hasher = Xxh64::new(0);
-        hasher.update(sql.as_bytes());
-        hasher.update(group.as_bytes());
-        hasher.update(user.as_bytes());
-        if let Some(catalog) = &session.catalog {
-            hasher.update(catalog.as_bytes());
-        }
-        if let Some(db) = &session.database {
-            hasher.update(db.as_bytes());
-        }
+        // Version the hash input, keeping the persisted hex key and group/hex.arrow
+        // path layout intact (including cleanup of legacy entries). Old entries
+        // are not intentionally reused and can expire through normal cleanup.
+        hasher.update(b"queryflux:result-cache:v1\0");
+        hash_field(&mut hasher, b'S', sql.as_bytes());
+        hash_field(&mut hasher, b'G', group.as_bytes());
+        hash_field(&mut hasher, b'U', user.as_bytes());
+        hash_optional(&mut hasher, b'C', session.catalog.as_deref());
+        hash_optional(&mut hasher, b'D', session.database.as_deref());
+        // The list tag and u64 little-endian count frame the ordered parameters.
+        hasher.update(b"P");
+        hasher.update(&(params.len() as u64).to_le_bytes());
         for param in params {
             hash_param(&mut hasher, param);
         }
@@ -188,38 +191,234 @@ pub fn is_deterministic(sql: &str, dialect: &str) -> bool {
     queryflux_fingerprint::is_deterministic(sql, dialect)
 }
 
+// Encoding v1: one-byte field/type tags; lengths count bytes, not characters,
+// and are always u64 little-endian. Stream into XXH64 without a combined buffer.
+fn hash_bytes(hasher: &mut Xxh64, value: &[u8]) {
+    hasher.update(&(value.len() as u64).to_le_bytes());
+    hasher.update(value);
+}
+
+fn hash_field(hasher: &mut Xxh64, tag: u8, value: &[u8]) {
+    hasher.update(&[tag]);
+    hash_bytes(hasher, value);
+}
+
+// Optional fields carry a tag and a presence byte, then a length/value if present.
+fn hash_optional(hasher: &mut Xxh64, tag: u8, value: Option<&str>) {
+    hasher.update(&[tag, u8::from(value.is_some())]);
+    if let Some(value) = value {
+        hash_bytes(hasher, value.as_bytes());
+    }
+}
+
 fn hash_param(hasher: &mut Xxh64, param: &QueryParam) {
     match param {
-        QueryParam::Text(v) => {
-            hasher.update(b"T:");
-            hasher.update(v.as_bytes());
-        }
-        QueryParam::Numeric(v) => {
-            hasher.update(b"N:");
-            hasher.update(v.as_bytes());
-        }
-        QueryParam::Boolean(v) => {
-            hasher.update(if *v { b"B:1" } else { b"B:0" });
-        }
-        QueryParam::Date(v) => {
-            hasher.update(b"D:");
-            hasher.update(v.as_bytes());
-        }
-        QueryParam::Timestamp(v) => {
-            hasher.update(b"TS:");
-            hasher.update(v.as_bytes());
-        }
-        QueryParam::Time(v) => {
-            hasher.update(b"TM:");
-            hasher.update(v.as_bytes());
-        }
-        QueryParam::Null => hasher.update(b"NULL"),
+        QueryParam::Text(v) => hash_field(hasher, b't', v.as_bytes()),
+        QueryParam::Numeric(v) => hash_field(hasher, b'n', v.as_bytes()),
+        QueryParam::Boolean(v) => hash_field(hasher, b'b', &[u8::from(*v)]),
+        QueryParam::Date(v) => hash_field(hasher, b'd', v.as_bytes()),
+        QueryParam::Timestamp(v) => hash_field(hasher, b's', v.as_bytes()),
+        QueryParam::Time(v) => hash_field(hasher, b'm', v.as_bytes()),
+        QueryParam::Null => hash_field(hasher, b'0', &[]),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cache_key_text_parameter_boundaries() {
+        let session = SessionContext::default();
+        let sql = "SELECT ? AS first_value, ? AS second_value";
+        let a = CacheKey::new(
+            sql,
+            "grp",
+            &session,
+            "alice",
+            &[
+                QueryParam::Text("aT:b".into()),
+                QueryParam::Text("c".into()),
+            ],
+        );
+        let b = CacheKey::new(
+            sql,
+            "grp",
+            &session,
+            "alice",
+            &[
+                QueryParam::Text("a".into()),
+                QueryParam::Text("bT:c".into()),
+            ],
+        );
+        assert_ne!(
+            a.hex, b.hex,
+            "text parameter boundaries must affect the key"
+        );
+    }
+
+    #[test]
+    fn cache_key_adjacent_fields() {
+        // SQL/group, group/user, user/catalog, catalog/database, database/params.
+        let cases = [
+            (
+                ("SELECT ab", "c", "u", "c", "d", "x"),
+                ("SELECT a", "bc", "u", "c", "d", "x"),
+            ),
+            (
+                ("SELECT ?", "ab", "c", "c", "d", "x"),
+                ("SELECT ?", "a", "bc", "c", "d", "x"),
+            ),
+            (
+                ("SELECT ?", "g", "ab", "c", "d", "x"),
+                ("SELECT ?", "g", "a", "bc", "d", "x"),
+            ),
+            (
+                ("SELECT ?", "g", "u", "ab", "c", "x"),
+                ("SELECT ?", "g", "u", "a", "bc", "x"),
+            ),
+            (
+                ("SELECT ?", "g", "u", "c", "aT:b", "c"),
+                ("SELECT ?", "g", "u", "c", "a", "bT:c"),
+            ),
+        ];
+        let key =
+            |(sql, group, user, catalog, database, value): (&str, &str, &str, &str, &str, &str)| {
+                let session = SessionContext {
+                    catalog: Some(catalog.into()),
+                    database: Some(database.into()),
+                    ..Default::default()
+                };
+                CacheKey::new(
+                    sql,
+                    group,
+                    &session,
+                    user,
+                    &[QueryParam::Text(value.into())],
+                )
+                .hex
+            };
+        for (a, b) in cases {
+            assert_ne!(key(a), key(b), "field boundary: {a:?} vs {b:?}");
+        }
+    }
+
+    #[test]
+    fn cache_key_optional_presence() {
+        let mut keys = std::collections::HashSet::new();
+        for catalog in [None, Some(""), Some("雪T:")] {
+            for database in [None, Some(""), Some("雪T:")] {
+                let session = SessionContext {
+                    catalog: catalog.map(str::to_owned),
+                    database: database.map(str::to_owned),
+                    ..Default::default()
+                };
+                let key = CacheKey::new("SELECT 1", "grp", &session, "alice", &[]);
+                assert!(
+                    keys.insert(key.hex),
+                    "catalog={catalog:?}, database={database:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn cache_key_parameter_types_order_count_and_empty_values() {
+        use QueryParam::*;
+        let mut cases = vec![
+            vec![],
+            vec![Null],
+            vec![Null, Null],
+            vec![Boolean(false)],
+            vec![Boolean(true)],
+            vec![Text("".into()), Null],
+            vec![Null, Text("".into())],
+            vec![Text("".into()), Text("".into())],
+            vec![Text("a".into()), Text("b".into())],
+            vec![Text("b".into()), Text("a".into())],
+            vec![Text("aT:b".into())],
+        ];
+        for value in ["", "1", "NULL", "雪🦀T:N:B:D:TS:TM:NULL\0"] {
+            cases.extend([
+                vec![Text(value.into())],
+                vec![Numeric(value.into())],
+                vec![Date(value.into())],
+                vec![Timestamp(value.into())],
+                vec![Time(value.into())],
+            ]);
+        }
+        let session = SessionContext::default();
+        let mut keys = std::collections::HashSet::new();
+        for params in cases {
+            let key = CacheKey::new("SELECT ?", "grp", &session, "alice", &params);
+            assert!(keys.insert(key.hex.clone()), "params={params:?}");
+            assert_eq!(
+                key.hex,
+                CacheKey::new("SELECT ?", "grp", &session, "alice", &params).hex
+            );
+        }
+    }
+
+    #[test]
+    fn cache_key_all_string_parameter_boundaries() {
+        // Exercise every string variant with arbitrary UTF-8 and embedded legacy tags.
+        let variants: [fn(String) -> QueryParam; 5] = [
+            QueryParam::Text,
+            QueryParam::Numeric,
+            QueryParam::Date,
+            QueryParam::Timestamp,
+            QueryParam::Time,
+        ];
+        let session = SessionContext::default();
+        for variant in variants {
+            let a = [
+                variant("雪T:🦀".into()),
+                QueryParam::Text("N:NULL\0".into()),
+            ];
+            let b = [
+                variant("雪".into()),
+                QueryParam::Text("🦀T:N:NULL\0".into()),
+            ];
+            assert_ne!(
+                CacheKey::new("SELECT ?, ?", "組", &session, "利用者", &a).hex,
+                CacheKey::new("SELECT ?, ?", "組", &session, "利用者", &b).hex,
+            );
+        }
+    }
+
+    #[test]
+    fn cache_key_separates_legacy_encoding() {
+        let session = SessionContext {
+            catalog: Some("cat".into()),
+            database: Some("db".into()),
+            ..Default::default()
+        };
+        let cases = [
+            (
+                "SELECT 1",
+                SessionContext::default(),
+                vec![],
+                "SELECT 1grpalice",
+            ),
+            (
+                "SELECT ?, ?",
+                session,
+                vec![QueryParam::Text("aT:b".into()), QueryParam::Null],
+                "SELECT ?, ?grpalicecatdbT:aT:bNULL",
+            ),
+        ];
+        for (sql, session, params, legacy_bytes) in cases {
+            let mut legacy = Xxh64::new(0);
+            legacy.update(legacy_bytes.as_bytes());
+            let key = CacheKey::new(sql, "grp", &session, "alice", &params);
+            assert_ne!(key.hex, format!("{:016x}", legacy.digest()));
+            let entry = queryflux_persistence::cache_store::CacheEntryRef {
+                cache_key: key.hex.clone(),
+                group_name: key.group.clone(),
+            };
+            assert_eq!(key.storage_path(), entry.storage_path());
+        }
+    }
 
     #[test]
     fn cache_key_deterministic() {

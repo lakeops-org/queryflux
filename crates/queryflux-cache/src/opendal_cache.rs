@@ -400,6 +400,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn text_parameter_boundaries_do_not_replay_another_result() {
+        use queryflux_core::params::QueryParam;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = test_config(tmp.path().to_str().unwrap());
+        let store: Arc<dyn CacheStore> = Arc::new(InMemoryPersistence::new());
+        let cache = OpenDalResultCache::new(&cfg, store).unwrap();
+        let session = SessionContext::default();
+        let sql = "SELECT ? AS first_value, ? AS second_value";
+        let a = CacheKey::new(
+            sql,
+            "grp",
+            &session,
+            "alice",
+            &[
+                QueryParam::Text("aT:b".into()),
+                QueryParam::Text("c".into()),
+            ],
+        );
+        let b = CacheKey::new(
+            sql,
+            "grp",
+            &session,
+            "alice",
+            &[
+                QueryParam::Text("a".into()),
+                QueryParam::Text("bT:c".into()),
+            ],
+        );
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("first_value", DataType::Utf8, false),
+            Field::new("second_value", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["aT:b"])),
+                Arc::new(StringArray::from(vec!["c"])),
+            ],
+        )
+        .unwrap();
+        let mut writer = cache.writer(&a, 600).await.unwrap();
+        writer.write_schema(batch.schema().as_ref()).await.unwrap();
+        writer.write_batch(&batch).await.unwrap();
+        writer.finalize(true).await.unwrap();
+
+        let mut miss = CollectingSink::new();
+        assert!(cache
+            .try_stream_cached(&b, &mut miss)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(miss.schema.is_none());
+        assert!(miss.batches.is_empty());
+
+        let mut hit = CollectingSink::new();
+        let stats = cache
+            .try_stream_cached(&a, &mut hit)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stats.row_count, 1);
+        assert_eq!(hit.schema.as_ref(), Some(&batch.schema()));
+        assert_eq!(hit.batches, vec![batch]);
+    }
+
+    #[tokio::test]
     async fn miss_on_unknown_key() {
         let tmp = tempfile::tempdir().unwrap();
         let cfg = test_config(tmp.path().to_str().unwrap());
