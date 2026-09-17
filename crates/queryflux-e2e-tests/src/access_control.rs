@@ -374,16 +374,32 @@ impl CatalogProvider for MapCatalog {
     }
     async fn get_table_schema(
         &self,
-        _catalog: &str,
-        _database: &str,
+        catalog: &str,
+        database: &str,
         table: &str,
     ) -> QfResult<Option<TableSchema>> {
         let bare = table.rsplit('.').next().unwrap_or(table);
+        let name_matches =
+            |key: &str| -> bool { key == table || key.rsplit('.').next().unwrap_or(key) == bare };
+        let catalog_matches = |schema: &TableSchema| -> bool {
+            schema.catalog == catalog && schema.database == database
+        };
+
+        // Prefer an entry whose declared catalog/database agree with the request — see
+        // the identical disambiguation in `queryflux_catalog::StaticCatalogProvider`.
+        if let Some(schema) = self
+            .tables
+            .iter()
+            .find(|(key, schema)| name_matches(key) && catalog_matches(schema))
+            .map(|(_, schema)| schema)
+        {
+            return Ok(Some(schema.clone()));
+        }
         Ok(self
             .tables
-            .get(table)
-            .or_else(|| self.tables.get(bare))
-            .cloned())
+            .iter()
+            .find(|(key, _)| name_matches(key))
+            .map(|(_, schema)| schema.clone()))
     }
 }
 

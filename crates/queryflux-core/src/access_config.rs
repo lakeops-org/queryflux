@@ -14,13 +14,13 @@ pub enum OnMissingSchema {
 }
 
 /// The policy provider selection. A simple discriminator + one config field per provider —
-/// same pattern as `auth.provider` (`AuthProviderConfig`) + `auth.oidc`. OPA is the only
-/// provider in v1; a second provider adds a variant here and a sibling config field.
+/// same pattern as `auth.provider` (`AuthProviderConfig`) + `auth.oidc`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub enum ProviderKind {
     #[default]
     Opa,
+    Cerbos,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -47,6 +47,40 @@ pub struct ClientCredentials {
     pub client_id: String,
     pub client_secret: String,
     pub token_endpoint: String,
+}
+
+/// Cerbos PDP connection. Row filters / column masks arrive as policy `outputs` — see
+/// `queryflux_access_control::providers::cerbos::wire` for the exact `{"kind": ...}`
+/// contract policy authors must emit.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CerbosProviderConfig {
+    /// Base URL of the Cerbos PDP's HTTP API, e.g. `http://localhost:3592`.
+    pub url: String,
+    /// `POST` path for the check-resources call.
+    #[serde(default = "default_check_resources_path")]
+    pub check_resources_path: String,
+    #[serde(default = "default_timeout_ms")]
+    pub timeout_ms: u64,
+    /// Static bearer/API token, for Cerbos Hub/Cloud or a PDP fronted by one. Self-hosted
+    /// Cerbos typically needs none (secured by network policy instead).
+    #[serde(default)]
+    pub bearer_token: Option<String>,
+}
+
+impl Default for CerbosProviderConfig {
+    fn default() -> Self {
+        Self {
+            url: "http://localhost:3592".to_string(),
+            check_resources_path: default_check_resources_path(),
+            timeout_ms: default_timeout_ms(),
+            bearer_token: None,
+        }
+    }
+}
+
+fn default_check_resources_path() -> String {
+    "/api/check/resources".to_string()
 }
 
 fn default_decision_path() -> String {
@@ -90,9 +124,12 @@ impl Default for OpaProviderConfig {
 pub struct AccessConnectionConfig {
     #[serde(default)]
     pub provider: ProviderKind,
-    /// Required when `provider: opa` (the only provider today, and the default).
+    /// Required when `provider: opa` (the default).
     #[serde(default)]
     pub opa: Option<OpaProviderConfig>,
+    /// Required when `provider: cerbos`.
+    #[serde(default)]
+    pub cerbos: Option<CerbosProviderConfig>,
     /// Namespaced operations to evaluate. Others skip the stage entirely.
     #[serde(default = "default_operations")]
     pub operations: Vec<String>,
@@ -118,6 +155,7 @@ impl Default for AccessConnectionConfig {
         Self {
             provider: ProviderKind::Opa,
             opa: Some(OpaProviderConfig::default()),
+            cerbos: None,
             operations: default_operations(),
             on_missing_schema: OnMissingSchema::Evaluate,
             fail_open: false,
@@ -129,41 +167,84 @@ impl Default for AccessConnectionConfig {
 }
 
 impl AccessConnectionConfig {
-    /// The active provider's OPA config. `Err` if `provider: opa` (the default) but no
-    /// `opa:` block was given.
+    /// The active provider's OPA config. `Err` if `provider: opa` but no `opa:` block was
+    /// given, or if a different provider is configured.
     pub fn opa_config(&self) -> Result<&OpaProviderConfig, String> {
         match self.provider {
             ProviderKind::Opa => self
                 .opa
                 .as_ref()
                 .ok_or_else(|| "provider is \"opa\" but no opa: block was given".to_string()),
+            ProviderKind::Cerbos => Err("provider is \"cerbos\", not \"opa\"".to_string()),
+        }
+    }
+
+    /// The active provider's Cerbos config. `Err` if `provider: cerbos` but no `cerbos:`
+    /// block was given, or if a different provider is configured.
+    pub fn cerbos_config(&self) -> Result<&CerbosProviderConfig, String> {
+        match self.provider {
+            ProviderKind::Cerbos => self
+                .cerbos
+                .as_ref()
+                .ok_or_else(|| "provider is \"cerbos\" but no cerbos: block was given".to_string()),
+            ProviderKind::Opa => Err("provider is \"opa\", not \"cerbos\"".to_string()),
         }
     }
 
     pub fn validate(&self, name: &str) -> Result<(), String> {
-        let opa = self
-            .opa_config()
-            .map_err(|e| format!("accessControl.connections.{name}: {e}"))?;
-        let parsed = url::Url::parse(opa.url.trim()).map_err(|e| {
-            format!("accessControl.connections.{name}.opa.url is not a valid URL: {e}")
-        })?;
-        match parsed.scheme() {
-            "http" | "https" => {}
-            other => {
-                return Err(format!(
-                    "accessControl.connections.{name}.opa.url must be http or https, got {other}"
-                ))
+        match self.provider {
+            ProviderKind::Opa => {
+                let opa = self
+                    .opa_config()
+                    .map_err(|e| format!("accessControl.connections.{name}: {e}"))?;
+                let parsed = url::Url::parse(opa.url.trim()).map_err(|e| {
+                    format!("accessControl.connections.{name}.opa.url is not a valid URL: {e}")
+                })?;
+                match parsed.scheme() {
+                    "http" | "https" => {}
+                    other => {
+                        return Err(format!(
+                            "accessControl.connections.{name}.opa.url must be http or https, got {other}"
+                        ))
+                    }
+                }
+                if opa.decision_path.trim().is_empty() {
+                    return Err(format!(
+                        "accessControl.connections.{name}.opa.decisionPath must not be empty"
+                    ));
+                }
+                if !opa.decision_path.starts_with('/') {
+                    return Err(format!(
+                        "accessControl.connections.{name}.opa.decisionPath must start with '/'"
+                    ));
+                }
             }
-        }
-        if opa.decision_path.trim().is_empty() {
-            return Err(format!(
-                "accessControl.connections.{name}.opa.decisionPath must not be empty"
-            ));
-        }
-        if !opa.decision_path.starts_with('/') {
-            return Err(format!(
-                "accessControl.connections.{name}.opa.decisionPath must start with '/'"
-            ));
+            ProviderKind::Cerbos => {
+                let cerbos = self
+                    .cerbos_config()
+                    .map_err(|e| format!("accessControl.connections.{name}: {e}"))?;
+                let parsed = url::Url::parse(cerbos.url.trim()).map_err(|e| {
+                    format!("accessControl.connections.{name}.cerbos.url is not a valid URL: {e}")
+                })?;
+                match parsed.scheme() {
+                    "http" | "https" => {}
+                    other => {
+                        return Err(format!(
+                            "accessControl.connections.{name}.cerbos.url must be http or https, got {other}"
+                        ))
+                    }
+                }
+                if cerbos.check_resources_path.trim().is_empty() {
+                    return Err(format!(
+                        "accessControl.connections.{name}.cerbos.checkResourcesPath must not be empty"
+                    ));
+                }
+                if !cerbos.check_resources_path.starts_with('/') {
+                    return Err(format!(
+                        "accessControl.connections.{name}.cerbos.checkResourcesPath must start with '/'"
+                    ));
+                }
+            }
         }
         for op in &self.operations {
             if !op.contains('.') {
@@ -246,15 +327,17 @@ impl AccessControlConfig {
         let mut obj = v.clone();
         if let Some(conns) = obj.get_mut("connections").and_then(|c| c.as_object_mut()) {
             for conn in conns.values_mut() {
-                let Some(opa) = conn.get_mut("opa").and_then(|o| o.as_object_mut()) else {
-                    continue;
-                };
-                opa.remove("bearerTokenSet");
-                if let Some(cc) = opa
-                    .get_mut("clientCredentials")
-                    .and_then(|c| c.as_object_mut())
-                {
-                    cc.remove("clientSecretSet");
+                if let Some(opa) = conn.get_mut("opa").and_then(|o| o.as_object_mut()) {
+                    opa.remove("bearerTokenSet");
+                    if let Some(cc) = opa
+                        .get_mut("clientCredentials")
+                        .and_then(|c| c.as_object_mut())
+                    {
+                        cc.remove("clientSecretSet");
+                    }
+                }
+                if let Some(cerbos) = conn.get_mut("cerbos").and_then(|c| c.as_object_mut()) {
+                    cerbos.remove("bearerTokenSet");
                 }
             }
         }
@@ -354,6 +437,43 @@ mod tests {
         assert_eq!(prod.opa.as_ref().unwrap().url, "http://opa:8181");
         assert_eq!(prod.session_param_keys, vec!["customer"]);
         assert_eq!(cfg.connection_name_for_group("anything"), Some("prod"));
+    }
+
+    #[test]
+    fn from_admin_value_enabled_cerbos() {
+        let v = json!({
+            "enabled": true,
+            "defaultConnection": "prod",
+            "connections": {
+                "prod": {
+                    "provider": "cerbos",
+                    "cerbos": { "url": "http://cerbos:3592" }
+                }
+            }
+        });
+        let cfg = AccessControlConfig::from_admin_value(&v).unwrap().unwrap();
+        let prod = &cfg.connections["prod"];
+        assert_eq!(prod.provider, ProviderKind::Cerbos);
+        assert_eq!(prod.cerbos.as_ref().unwrap().url, "http://cerbos:3592");
+        assert_eq!(
+            prod.cerbos.as_ref().unwrap().check_resources_path,
+            "/api/check/resources"
+        );
+        // A cerbos connection must not be validated against the (absent) opa block.
+        assert!(prod.opa.is_none());
+    }
+
+    #[test]
+    fn cerbos_connection_without_cerbos_block_fails_validation() {
+        let v = json!({
+            "enabled": true,
+            "defaultConnection": "prod",
+            "connections": {
+                "prod": { "provider": "cerbos" }
+            }
+        });
+        let err = AccessControlConfig::from_admin_value(&v).unwrap_err();
+        assert!(err.contains("no cerbos: block"), "got: {err}");
     }
 
     #[test]

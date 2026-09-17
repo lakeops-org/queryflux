@@ -105,8 +105,10 @@ fn dialect_kwarg(dialect: &SqlDialect) -> String {
 }
 
 /// Extract every base table (and, when `schema` is populated, the columns attributed to
-/// each) that `sql` references. CTE-defined names are excluded. Best-effort: a parse
-/// failure yields `Ok(vec![])`.
+/// each) that `sql` references. CTE-defined names are excluded. A genuine parse failure
+/// yields `Err` — callers must not treat it the same as `Ok(vec![])` (a query that
+/// genuinely references no base tables), or a query the parser can't analyze silently
+/// skips access control instead of hitting the caller's `onMissingSchema` fail path.
 pub fn extract_resources(
     sql: &str,
     src_dialect: &SqlDialect,
@@ -196,8 +198,8 @@ def extract_resources(sql, dialect, schema_json):
     schema = json.loads(schema_json) if schema_json else {}
     try:
         tree = sqlglot.parse_one(sql, dialect=dialect or None)
-    except Exception:
-        return "[]"
+    except Exception as e:
+        return json.dumps({"error": str(e)})
 
     ctes = _cte_names(tree)
 
@@ -268,7 +270,7 @@ def extract_resources(sql, dialect, schema_json):
             "table": e["table"],
             "columns": cols,
         })
-    return json.dumps(out)
+    return json.dumps({"resources": out})
 
 
 def rewrite_table_scans(sql, dialect, schema_json, policies_json):
@@ -431,20 +433,32 @@ fn extract_resources_gil(
         .and_then(|f| f.call1((sql, dialect, schema_json)))
         .and_then(|v| v.extract())
         .map_err(|e| QueryFluxError::Translation(format!("extract_resources: {e}")))?;
-    let raw: Vec<RawResource> = serde_json::from_str(&json)
+    let raw: RawOutput = serde_json::from_str(&json)
         .map_err(|e| QueryFluxError::Translation(format!("extract_resources decode: {e}")))?;
-    Ok(raw
-        .into_iter()
-        .map(|r| ExtractedResource {
-            catalog: r.catalog,
-            schema: r.schema,
-            table: r.table,
-            columns: match r.columns {
-                Some(c) => Columns::Named(c),
-                None => Columns::All,
-            },
-        })
-        .collect())
+    match raw {
+        RawOutput::Ok { resources } => Ok(resources
+            .into_iter()
+            .map(|r| ExtractedResource {
+                catalog: r.catalog,
+                schema: r.schema,
+                table: r.table,
+                columns: match r.columns {
+                    Some(c) => Columns::Named(c),
+                    None => Columns::All,
+                },
+            })
+            .collect()),
+        RawOutput::Err { error } => Err(QueryFluxError::Translation(format!(
+            "extract_resources: could not parse SQL: {error}"
+        ))),
+    }
+}
+
+#[derive(serde::Deserialize)]
+#[serde(untagged)]
+enum RawOutput {
+    Ok { resources: Vec<RawResource> },
+    Err { error: String },
 }
 
 #[derive(serde::Deserialize)]
@@ -538,6 +552,23 @@ mod tests {
         .unwrap();
         let names: std::collections::HashSet<_> = refs.iter().map(|r| r.table.as_str()).collect();
         assert_eq!(names, ["orders", "customers"].into_iter().collect());
+    }
+
+    /// Regression: a genuine parse failure must surface as `Err`, never `Ok(vec![])` — the
+    /// caller (`OpaAccessGuard::check`) only takes its fail-closed `onMissingSchema: deny`
+    /// path on `Err`; conflating a parse failure with "no tables referenced" let an
+    /// unparseable query bypass access control entirely.
+    #[test]
+    fn extract_resources_parse_failure_is_err() {
+        let err = extract_resources(
+            "SELECT FROM FROM (((",
+            &SqlDialect::Trino,
+            &SchemaContext::default(),
+        );
+        assert!(
+            err.is_err(),
+            "a parse failure must be Err, not Ok(vec![]) — Ok(vec![]) must mean 'no tables'"
+        );
     }
 
     #[test]

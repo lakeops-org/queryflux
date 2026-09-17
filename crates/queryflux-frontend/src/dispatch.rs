@@ -28,12 +28,6 @@ use queryflux_engine_adapters::{
 use queryflux_guardrails::{GuardChain, GuardChainOutcome, GuardContext, GuardLayer};
 use queryflux_metrics::MetricsStore;
 
-/// Empty identity references for guard-context construction sites that do not (yet)
-/// carry a verified `AuthContext` — e.g. the cache-path guard check.
-static EMPTY_STRINGS: &[String] = &[];
-static EMPTY_ATTRS: std::sync::LazyLock<std::collections::BTreeMap<String, serde_json::Value>> =
-    std::sync::LazyLock::new(std::collections::BTreeMap::new);
-
 use tracing::{debug, info, warn};
 
 use crate::state::{AppState, QueryContext, QueryOutcome};
@@ -366,20 +360,17 @@ pub async fn dispatch_query(
     let engine_type = adapter_kind.engine_type();
     let original_sql = sql.clone();
     let attempt_translation = should_attempt_translation(&session, &protocol);
-    let schema_context = if attempt_translation {
-        state
-            .translation
-            .resolve_schema_context(
-                &sql,
-                &src_dialect,
-                &catalog,
-                session.catalog(),
-                session.database(),
-            )
-            .await
-    } else {
-        Default::default()
-    };
+    // Resolved unconditionally — independent of `attempt_translation`. That flag governs
+    // whether `maybe_translate` risks mis-rendering output SQL under a guessed dialect; it
+    // says nothing about whether access control has schema to work with. Coupling the two
+    // meant an MCP session with no declared dialect (translation always skipped there) also
+    // never got real catalog schema, so `onMissingSchema: deny` spuriously denied queries
+    // whose schema was perfectly resolvable. `resolve_schema_context` never fails and is a
+    // cheap no-op when no catalog is configured, so calling it here is always safe.
+    let schema_context = state
+        .translation
+        .resolve_schema_context(&sql, &src_dialect, &catalog, session.catalog(), session.database())
+        .await;
 
     // Access control: runs on the SOURCE SQL, before dialect translation — every guard
     // decision (including row filters / column masks) is intent-level and answerable from
@@ -435,24 +426,9 @@ pub async fn dispatch_query(
                         query_params: vec![],
                         agent_context: resolved_agent_ctx.clone(),
                     };
-                    state.record_query(
-                        &ctx,
-                        QueryOutcome {
-                            backend_query_id: None,
-                            status: QueryStatus::Denied,
-                            execution_ms: 0,
-                            rows: None,
-                            error: Some(reason.clone()),
-                            routing_trace: None,
-                            engine_stats: None,
-                            guard_actions: vec![action],
-                            was_guard_blocked: true,
-                            queue_duration_ms: 0,
-                            cache_hit: false,
-                        },
+                    return Err(
+                        deny_and_record(state, &mut slot, &ctx, reason, 0, vec![action]).await,
                     );
-                    slot.release().await;
-                    return Err(QueryFluxError::Unauthorized(reason));
                 }
             }
         } else {
@@ -533,24 +509,15 @@ pub async fn dispatch_query(
                 query_params: vec![],
                 agent_context: resolved_agent_ctx.clone(),
             };
-            state.record_query(
+            return Err(deny_and_record(
+                state,
+                &mut slot,
                 &ctx,
-                QueryOutcome {
-                    backend_query_id: None,
-                    status: QueryStatus::Denied,
-                    execution_ms: 0,
-                    rows: None,
-                    error: Some(reason.clone()),
-                    routing_trace: None,
-                    engine_stats: None,
-                    guard_actions: all_guard_actions.clone(),
-                    was_guard_blocked: true,
-                    queue_duration_ms: 0,
-                    cache_hit: false,
-                },
-            );
-            slot.release().await;
-            return Err(QueryFluxError::Unauthorized(reason));
+                reason,
+                0,
+                all_guard_actions.clone(),
+            )
+            .await);
         }
     }
 
@@ -584,6 +551,7 @@ pub async fn dispatch_query(
 
     let guard_ctx = GuardContext {
         sql: &engine_sql,
+        original_sql: Some(&original_sql),
         dialect: &tgt_dialect,
         engine_type: &engine_type,
         cluster_group: &group,
@@ -655,8 +623,6 @@ pub async fn dispatch_query(
         if matches!(outcome, GuardChainOutcome::Blocked { .. }) {
             guard_deny!(std::mem::take(&mut all_guard_actions));
         }
-        // NOTE (Phase 4): a `GuardChainOutcome::Proceed { sql: Some(_) }` rewrite is
-        // applied by the reworked pre-translation stage; no guard produces one here yet.
     }
 
     // Serialize guard actions for storage in ExecutingQuery (retrieved at poll time).
@@ -1594,20 +1560,19 @@ async fn setup_sync_query(
     let original_sql = sql.clone();
     let attempt_translation = should_attempt_translation(&session, &protocol);
 
-    let schema_context = if attempt_translation {
-        state
-            .translation
-            .resolve_schema_context(
-                &original_sql,
-                &src_dialect,
-                &catalog,
-                session.catalog(),
-                session.database(),
-            )
-            .await
-    } else {
-        Default::default()
-    };
+    // Resolved unconditionally — see the identical comment in `dispatch_query`: schema
+    // resolution for access control must not be gated on whether dialect translation
+    // itself is safe to attempt.
+    let schema_context = state
+        .translation
+        .resolve_schema_context(
+            &original_sql,
+            &src_dialect,
+            &catalog,
+            session.catalog(),
+            session.database(),
+        )
+        .await;
 
     // Access control: runs on the SOURCE SQL, before dialect translation (see the async
     // dispatch path for the full rationale). On deny: record the query, release the slot,
@@ -1663,24 +1628,15 @@ async fn setup_sync_query(
                         query_params: params,
                         agent_context: session.resolved_agent_context(),
                     };
-                    state.record_query(
+                    return Err(deny_and_record(
+                        state,
+                        &mut slot,
                         &ctx,
-                        QueryOutcome {
-                            backend_query_id: None,
-                            status: QueryStatus::Denied,
-                            execution_ms: start.elapsed().as_millis() as u64,
-                            rows: None,
-                            error: Some(reason.clone()),
-                            routing_trace: None,
-                            engine_stats: None,
-                            guard_actions: vec![action],
-                            was_guard_blocked: true,
-                            queue_duration_ms: 0,
-                            cache_hit: false,
-                        },
-                    );
-                    slot.release().await;
-                    return Err(QueryFluxError::Unauthorized(reason));
+                        reason,
+                        start.elapsed().as_millis() as u64,
+                        vec![action],
+                    )
+                    .await);
                 }
             }
         } else {
@@ -1799,24 +1755,15 @@ async fn setup_sync_query(
                 query_params: params,
                 agent_context: session.resolved_agent_context(),
             };
-            state.record_query(
+            return Err(deny_and_record(
+                state,
+                &mut slot,
                 &ctx,
-                QueryOutcome {
-                    backend_query_id: None,
-                    status: QueryStatus::Denied,
-                    execution_ms: start.elapsed().as_millis() as u64,
-                    rows: None,
-                    error: Some(reason.clone()),
-                    routing_trace: None,
-                    engine_stats: None,
-                    guard_actions: pre_guard_actions,
-                    was_guard_blocked: true,
-                    queue_duration_ms: 0,
-                    cache_hit: false,
-                },
-            );
-            slot.release().await;
-            return Err(QueryFluxError::Unauthorized(reason));
+                reason,
+                start.elapsed().as_millis() as u64,
+                pre_guard_actions,
+            )
+            .await);
         }
     }
 
@@ -2158,12 +2105,45 @@ async fn execute_native_to_sink(
     (outcome, sink.on_complete(&stats).await)
 }
 
+/// Record a `Denied` query outcome, release the cluster slot, and return the error to
+/// propagate — the "record + release + return" contract every access-control/invariant
+/// denial site must uphold. Defined once so a future `QueryOutcome` field only needs
+/// updating here, not independently at every call site.
+async fn deny_and_record(
+    state: &Arc<AppState>,
+    slot: &mut ClusterSlotGuard,
+    ctx: &QueryContext,
+    reason: String,
+    execution_ms: u64,
+    guard_actions: Vec<queryflux_persistence::GuardAction>,
+) -> QueryFluxError {
+    state.record_query(
+        ctx,
+        QueryOutcome {
+            backend_query_id: None,
+            status: QueryStatus::Denied,
+            execution_ms,
+            rows: None,
+            error: Some(reason.clone()),
+            routing_trace: None,
+            engine_stats: None,
+            guard_actions,
+            was_guard_blocked: true,
+            queue_duration_ms: 0,
+            cache_hit: false,
+        },
+    );
+    slot.release().await;
+    QueryFluxError::Unauthorized(reason)
+}
+
 async fn run_plan_guards(
     guard_chain: &Option<Arc<GuardChain>>,
     group_guard_chain: &Option<Arc<GuardChain>>,
     sql: &str,
     group: &ClusterGroupName,
     session: &SessionContext,
+    auth_ctx: &AuthContext,
     effective_tags: &queryflux_core::tags::QueryTags,
 ) -> std::result::Result<Vec<queryflux_persistence::GuardAction>, String> {
     let engine_type = queryflux_core::query::EngineType::Cache;
@@ -2174,13 +2154,14 @@ async fn run_plan_guards(
     );
     let guard_ctx = GuardContext {
         sql,
+        original_sql: None,
         dialect: &queryflux_core::query::SqlDialect::Generic,
         engine_type: &engine_type,
         cluster_group: group,
         user: session.user(),
-        groups: EMPTY_STRINGS,
-        roles: EMPTY_STRINGS,
-        attributes: &EMPTY_ATTRS,
+        groups: &auth_ctx.groups,
+        roles: &auth_ctx.roles,
+        attributes: &auth_ctx.attributes,
         agent_context: resolved_agent_ctx.as_ref(),
         query_tags: effective_tags,
         session_extra: &session.extra,
@@ -2225,13 +2206,15 @@ pub async fn execute_to_sink(
     sink: &mut impl ResultSink,
     auth_ctx: &AuthContext,
 ) -> Result<()> {
-    let (authorization, guard_chain, group_guard_chain, cache_cfg) = {
+    let (authorization, guard_chain, group_guard_chain, cache_cfg, access_control_guard, catalog) = {
         let live = state.live.read().await;
         (
             live.authorization.clone(),
             live.guard_chain.clone(),
             live.group_guard_chains.get(&group.0).cloned(),
             live.group_cache_settings.get(&group.0).cloned(),
+            live.access_control_guard.clone(),
+            live.catalog.clone(),
         )
     };
 
@@ -2266,26 +2249,75 @@ pub async fn execute_to_sink(
                 .unwrap_or_default();
             merge_tags(&group_defaults, &session.tags().clone())
         };
-        let guard_actions = match run_plan_guards(
-            &guard_chain,
-            &group_guard_chain,
-            &sql,
-            &group,
-            &session,
-            &effective_tags,
-        )
-        .await
-        {
-            Ok(actions) => actions,
-            Err(deny_reason) => return sink.on_error(&deny_reason).await,
+
+        // Access control must be re-validated here, not skipped just because this request
+        // happens to be servable from cache — a cache hit otherwise serves whatever was
+        // cached under this (sql, user, group) key regardless of whether the user's *current*
+        // policy still allows it. A `Rewritten` outcome means the query's row filters/masks
+        // may have changed since the entry was cached, so the cached bytes can no longer be
+        // trusted verbatim: the cache lookup below is skipped (forced miss) and execution
+        // falls through to `execute_to_sink_inner`, which re-runs access control for real and
+        // repopulates the cache with a result reflecting the current policy.
+        let mut skip_cache_lookup = false;
+        if let Some(guard) = &access_control_guard {
+            if guard.enabled_for_group(&group.0) {
+                use crate::access_control_guard::{run_access_control_stage, AccessStageOutcome};
+                let src_dialect = resolve_src_dialect(&session, &protocol);
+                let schema_context = state
+                    .translation
+                    .resolve_schema_context(&sql, &src_dialect, &catalog, session.catalog(), session.database())
+                    .await;
+                match run_access_control_stage(
+                    guard,
+                    &sql,
+                    &src_dialect,
+                    &queryflux_core::query::EngineType::Cache,
+                    &group,
+                    auth_ctx,
+                    &session,
+                    Some(&schema_context),
+                    &effective_tags,
+                )
+                .await
+                {
+                    AccessStageOutcome::Denied { reason, .. } => {
+                        return sink.on_error(&reason).await
+                    }
+                    AccessStageOutcome::Rewritten { .. } => skip_cache_lookup = true,
+                    AccessStageOutcome::Allowed { .. } => {}
+                }
+            }
+        }
+
+        let guard_actions = if skip_cache_lookup {
+            Vec::new()
+        } else {
+            match run_plan_guards(
+                &guard_chain,
+                &group_guard_chain,
+                &sql,
+                &group,
+                &session,
+                auth_ctx,
+                &effective_tags,
+            )
+            .await
+            {
+                Ok(actions) => actions,
+                Err(deny_reason) => return sink.on_error(&deny_reason).await,
+            }
         };
 
         let mut cache_sink_adapter = SinkCacheAdapter(sink);
-        match state
-            .result_cache
-            .try_stream_cached(key, &mut cache_sink_adapter)
-            .await
-        {
+        let cache_lookup = if skip_cache_lookup {
+            Ok(None)
+        } else {
+            state
+                .result_cache
+                .try_stream_cached(key, &mut cache_sink_adapter)
+                .await
+        };
+        match cache_lookup {
             Ok(Some(_stats)) => {
                 info!(cache_key = %key, rows = _stats.row_count, "Cache hit — serving from cache");
                 state.metrics.on_cache_hit(&group.0);
@@ -2457,6 +2489,7 @@ async fn execute_to_sink_inner(
         let ctx = &setup.ctx;
         let guard_ctx = GuardContext {
             sql: ctx.translated_sql.as_deref().unwrap_or(&setup.translated),
+            original_sql: Some(ctx.sql.as_str()),
             dialect: &ctx.tgt_dialect,
             engine_type: &ctx.engine_type,
             cluster_group: &ctx.group,

@@ -21,18 +21,19 @@ impl GuardChain {
 
     /// Run all guards for the given layer in order.
     ///
-    /// Returns `(actions, outcome)`. Stops at the first `Deny` (recording it first).
-    /// A `Rewrite` result is recorded and its SQL carried forward as
-    /// `GuardChainOutcome::Proceed { sql: Some(..) }`. If more than one guard rewrites,
-    /// the last wins — v1 places at most one rewriting guard (the access-control guard)
-    /// and always last, so downstream guards never see stale SQL.
+    /// Returns `(actions, outcome)`. Stops at the first `Deny` (recording it first). A
+    /// chain has no mechanism to carry a `Rewrite` result back to its caller — the only
+    /// guard that ever returns one (the access-control guard) runs outside any chain, on
+    /// pre-translation SQL, via its own dedicated call site — so a guard placed *in* a
+    /// chain that returns `Rewrite` is treated as a configuration/implementation error
+    /// (blocked, not silently dropped) rather than adding unused generality to carry a
+    /// rewrite that nothing here can actually produce today.
     pub async fn run(
         &self,
         ctx: &GuardContext<'_>,
         layer: GuardLayer,
     ) -> (Vec<GuardAction>, GuardChainOutcome) {
         let mut actions: Vec<GuardAction> = Vec::new();
-        let mut rewritten_sql: Option<String> = None;
 
         for guard in &self.guards {
             if guard.layer() != layer {
@@ -52,14 +53,23 @@ impl GuardChain {
                         },
                     );
                 }
-                GuardResult::Rewrite { sql, .. } => {
-                    rewritten_sql = Some(sql.clone());
+                GuardResult::Rewrite { .. } => {
+                    return (
+                        actions,
+                        GuardChainOutcome::Blocked {
+                            reason: format!(
+                                "guard {:?} returned Rewrite, which chained guards do not support",
+                                guard.name()
+                            ),
+                            code: Some("GUARD_REWRITE_UNSUPPORTED".to_string()),
+                        },
+                    );
                 }
                 GuardResult::Allow { .. } | GuardResult::Warn { .. } => {}
             }
         }
 
-        (actions, GuardChainOutcome::Proceed { sql: rewritten_sql })
+        (actions, GuardChainOutcome::Proceed)
     }
 }
 
@@ -130,6 +140,7 @@ mod tests {
         fn ctx(&self) -> GuardContext<'_> {
             GuardContext {
                 sql: &self.sql,
+                original_sql: None,
                 dialect: &self.dialect,
                 engine_type: &self.engine_type,
                 cluster_group: &self.cluster_group,
@@ -217,5 +228,29 @@ mod tests {
         assert_eq!(actions[1].guard, "blocker");
         assert_eq!(actions[1].action, "deny");
         assert!(is_blocked(&outcome));
+    }
+
+    /// Regression: a `GuardChain` has no mechanism to carry a `Rewrite` result back to
+    /// its caller, so a guard placed *in* a chain that returns one must be blocked with a
+    /// clear, machine-readable code — not silently dropped (which would let a supposed
+    /// rewrite never actually reach the query) and not given unused generality to carry a
+    /// rewrite that no chain-placed guard produces today.
+    #[tokio::test]
+    async fn run_blocks_a_chained_guard_that_returns_rewrite() {
+        let chain = GuardChain::new(vec![Box::new(TestGuard {
+            name: "rewriter",
+            layer: GuardLayer::Plan,
+            result: GuardResult::rewrite("SELECT 1"),
+        })]);
+        let tc = TestCtx::plan_select_fixture();
+        let (actions, outcome) = chain.run(&tc.ctx(), GuardLayer::Plan).await;
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].guard, "rewriter");
+        match outcome {
+            GuardChainOutcome::Blocked { code, .. } => {
+                assert_eq!(code, Some("GUARD_REWRITE_UNSUPPORTED".to_string()));
+            }
+            other => panic!("expected Blocked, got {other:?}"),
+        }
     }
 }

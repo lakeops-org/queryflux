@@ -45,6 +45,7 @@ const sidebars: SidebarsConfig = {
       items: [
         'access-control/overview',
         'access-control/opa',
+        'access-control/cerbos',
         {
           type: 'category',
           label: 'Use cases',

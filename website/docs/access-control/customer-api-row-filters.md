@@ -8,7 +8,7 @@ image: img/queryflux-hero-banner.png
 
 A backend API you expose to customers should **not** connect to QueryFlux as that customer, and it should **not** sprinkle `WHERE customer_id = …` in every handler. Authenticate the caller in **your** API, connect to QueryFlux as a **service account**, and let [OPA](opa.md) return the row filter for the customer you already resolved.
 
-This is the standard **actor vs subject** pattern: who is connected vs whose data this query is about.
+This is the standard **actor vs subject** pattern: who is connected vs whose data this query is about. This walkthrough uses OPA/Rego, but the pattern (session param → row-filter predicate, actor stays in `identity`, subject stays in `sessionParams`) is identical on [Cerbos](cerbos.md#delegation-actor-x-subject-y) — only the policy syntax (CEL, via `outputs`) differs.
 
 ```
 Customer (JWT / session)

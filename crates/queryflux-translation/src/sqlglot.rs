@@ -328,6 +328,13 @@ fn translate_with_schema(
 /// ```
 ///
 /// Scripts run in order, each receiving the previous script's returned SQL text.
+///
+/// Statement-kind preserving: a script's output is checked against its input with the
+/// same cheap, no-GIL classifier the access-control invariant check uses, and a script
+/// that turns a read into a non-read is rejected outright. This runs here — as a property
+/// of the function that actually executes untrusted script output — rather than being left
+/// to a caller's downstream sampling check, so every caller (present and future) is covered
+/// unconditionally, not just the ones that happen to also run access-control rewriting.
 fn run_fixup_scripts(
     py: Python<'_>,
     sql: &str,
@@ -335,9 +342,12 @@ fn run_fixup_scripts(
     tgt: &str,
     scripts: &[String],
 ) -> Result<String> {
+    let dialect = SqlDialect::Sqlglot(tgt.to_string());
     let mut current = sql.to_string();
 
     for (i, script) in scripts.iter().enumerate() {
+        let read_like_before = queryflux_core::sql_classify::is_read_like_sql(&current, &dialect);
+
         // Execute the script in its own globals dict so that top-level imports
         // and helper functions work correctly (same approach as PythonScriptRouter).
         let globals = PyDict::new(py);
@@ -375,9 +385,86 @@ fn run_fixup_scripts(
                 "translation script {i} transform() must return a str: {e}"
             ))
         })?;
+
+        let read_like_after = queryflux_core::sql_classify::is_read_like_sql(&current, &dialect);
+        if read_like_before && !read_like_after {
+            return Err(QueryFluxError::Translation(format!(
+                "translation script {i} changed the statement kind from read to non-read; rejected"
+            )));
+        }
     }
 
     Ok(current)
+}
+
+#[cfg(test)]
+mod fixup_script_tests {
+    use super::*;
+
+    /// Regression: a fixup script that turns a read into a write must be rejected by
+    /// `run_fixup_scripts` itself, unconditionally — not only when the caller also
+    /// happens to run access-control rewriting on top. This is the property that closes
+    /// the gap where most queries (no row filter/mask applied) skipped the invariant
+    /// check dispatch.rs runs downstream.
+    #[tokio::test]
+    async fn script_turning_read_into_write_is_rejected() {
+        let translator = SqlglotTranslator::new(
+            SqlDialect::Trino,
+            SqlDialect::Trino,
+            vec![r#"
+def transform(sql, src, dst):
+    return "DELETE FROM orders"
+"#
+            .to_string()],
+        );
+        let err = translator
+            .translate("SELECT * FROM orders", &SchemaContext::default())
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("read to non-read"),
+            "got: {err}"
+        );
+    }
+
+    /// A script that keeps the statement a read (even while rewriting it) is unaffected.
+    #[tokio::test]
+    async fn script_keeping_statement_a_read_is_allowed() {
+        let translator = SqlglotTranslator::new(
+            SqlDialect::Trino,
+            SqlDialect::Trino,
+            vec![r#"
+def transform(sql, src, dst):
+    return sql.replace("orders", "orders_v2")
+"#
+            .to_string()],
+        );
+        let out = translator
+            .translate("SELECT * FROM orders", &SchemaContext::default())
+            .await
+            .unwrap();
+        assert!(out.contains("orders_v2"), "got: {out}");
+    }
+
+    /// A write-to-write script (no read involved) is unaffected — only a read->non-read
+    /// transition is rejected.
+    #[tokio::test]
+    async fn script_on_a_write_statement_is_allowed() {
+        let translator = SqlglotTranslator::new(
+            SqlDialect::Trino,
+            SqlDialect::Trino,
+            vec![r#"
+def transform(sql, src, dst):
+    return sql.replace("orders", "orders_v2")
+"#
+            .to_string()],
+        );
+        let out = translator
+            .translate("DELETE FROM orders WHERE id = 1", &SchemaContext::default())
+            .await
+            .unwrap();
+        assert!(out.contains("orders_v2"), "got: {out}");
+    }
 }
 
 #[cfg(test)]
