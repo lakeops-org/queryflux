@@ -1143,9 +1143,11 @@ pub struct ClusterConfig {
     /// On timeout the proxy calls `StopQueryExecution`.
     #[serde(default)]
     pub max_wait_secs: Option<u64>,
-    /// Max bytes of a single query result QueryFlux buffers in memory
-    /// (`maxResultBufferBytes` in JSON/YAML). ClickHouse only; defaults to
-    /// 1 GiB when omitted. Other engines ignore this.
+    /// Max bytes of buffered query data (`maxResultBufferBytes` in JSON/YAML).
+    /// For ClickHouse this guards bytes consumed between decoded Arrow batches
+    /// while the complete result streams; DuckDB adapters use it for their
+    /// buffered result path.
+    /// Defaults to 1 GiB when omitted. Other engines ignore this.
     #[serde(default)]
     pub max_result_buffer_bytes: Option<u64>,
     /// ADBC driver name (e.g. `"snowflake"`, `"flightsql"`) — only meaningful when

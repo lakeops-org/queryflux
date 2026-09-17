@@ -79,6 +79,9 @@ pub const GROUP_DUCKDB: &str = "duckdb";
 /// Set when Lakekeeper port is reachable (Iceberg tables seeded by e2e tests via Trino).
 pub const GROUP_LAKEKEEPER: &str = "lakekeeper";
 pub const GROUP_CLICKHOUSE: &str = "clickhouse";
+/// Small enough that ClickHouse E2E tests can prove multi-batch results are not
+/// rejected based on total response size, while still allowing ordinary blocks.
+pub const CLICKHOUSE_TEST_RESULT_BUFFER_BYTES: usize = 1 << 18;
 
 pub struct TestHarness {
     pub port: u16,
@@ -237,8 +240,7 @@ impl TestHarness {
                         endpoint: ch_url,
                         auth: None,
                         tls_skip_verify: false,
-                        max_result_buffer_bytes:
-                            queryflux_engine_adapters::clickhouse::DEFAULT_MAX_RESULT_BUFFER_BYTES,
+                        max_result_buffer_bytes: CLICKHOUSE_TEST_RESULT_BUFFER_BYTES,
                     },
                 )
                 .map_err(|e| anyhow!("ClickHouse adapter: {e}"))?,
