@@ -1389,7 +1389,7 @@ mod tests {
         let first = decoder.next_batch(false).unwrap().unwrap();
         assert_eq!(first, batches[0]);
         assert!(
-            !decoder.ready.is_empty() || !decoder.pending.is_empty(),
+            !decoder.ready.is_empty(),
             "the remaining batches must not be decoded ahead of the consumer"
         );
 

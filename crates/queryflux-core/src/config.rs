@@ -1147,7 +1147,7 @@ pub struct ClusterConfig {
     /// For ClickHouse Arrow results, this guards bytes consumed between decoded
     /// batches while the complete result streams. ClickHouse control-plane TSV
     /// reads and DuckDB buffered results still cap the entire response.
-    /// Defaults to 1 GiB when omitted. Other engines ignore this.
+    /// ClickHouse and DuckDB default to 1 GiB when omitted; other adapters ignore this.
     #[serde(default)]
     pub max_result_buffer_bytes: Option<u64>,
     /// ADBC driver name (e.g. `"snowflake"`, `"flightsql"`) — only meaningful when
