@@ -1382,15 +1382,30 @@ mod tests {
                 .unwrap()
             })
             .collect();
-        let body = ipc_stream(&batches);
+        let mut body = Vec::new();
+        let (next_batch_start, next_batch_end) = {
+            let mut writer = StreamWriter::try_new(&mut body, &schema).unwrap();
+            writer.write(&batches[0]).unwrap();
+            let start = writer.get_ref().len();
+            writer.write(&batches[1]).unwrap();
+            let end = writer.get_ref().len();
+            for batch in &batches[2..] {
+                writer.write(batch).unwrap();
+            }
+            writer.finish().unwrap();
+            (start, end)
+        };
         let mut decoder = ClickHouseArrowDecoder::new(Some(TAG.to_string()), body.len());
         decoder.push_chunk(&body).unwrap();
 
         let first = decoder.next_batch(false).unwrap().unwrap();
         assert_eq!(first, batches[0]);
         assert!(
-            !decoder.ready.is_empty(),
-            "the remaining batches must not be decoded ahead of the consumer"
+            decoder
+                .ready
+                .as_slice()
+                .starts_with(&body[next_batch_start..next_batch_end]),
+            "the next batch must remain undecoded until the consumer receives the first"
         );
 
         let mut decoded = vec![first];
