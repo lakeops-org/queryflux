@@ -7,9 +7,10 @@
 //! format) pass through unchanged.
 //!
 //! Result bodies are decoded incrementally and delivered through a bounded
-//! channel, so frontend backpressure bounds adapter memory. ClickHouse can fail
-//! a query *after* sending HTTP 200 (it aborts the chunked encoding and appends
-//! an exception frame to the body). The decoder therefore holds back a small
+//! channel. The producer pauses decoding when the frontend is slower, limiting
+//! queued batches. ClickHouse can fail a query *after* sending HTTP 200: it
+//! aborts the chunked encoding and appends an exception frame to the body. The
+//! decoder therefore holds back a small
 //! chunk-boundary window and detects the `__exception__` marker — whose random
 //! tag is pre-announced in the `X-ClickHouse-Exception-Tag` response header —
 //! before those bytes reach the Arrow decoder. Batches decoded before a
@@ -27,7 +28,7 @@ use arrow::buffer::Buffer;
 use arrow::ipc::reader::StreamDecoder;
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
-use bytes::{Bytes, BytesMut};
+use bytes::BytesMut;
 use queryflux_core::catalog::{ColumnDef, TableSchema};
 use queryflux_core::config::{ClusterAuth, ClusterConfig};
 use queryflux_core::engine_registry::{
@@ -47,6 +48,9 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Number of decoded batches allowed to wait for a frontend consumer.
 const RESULT_STREAM_CHANNEL_CAPACITY: usize = 8;
+
+/// Limit raw bytes staged for decoding before yielding to frontend backpressure.
+const RESULT_STREAM_CHUNK_WINDOW_BYTES: usize = 64 * 1024;
 
 /// Cap on error-body text included in error messages.
 const MAX_ERROR_BODY: usize = 2000;
@@ -491,6 +495,7 @@ fn find_first(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 struct ClickHouseArrowDecoder {
     decoder: StreamDecoder,
     pending: BytesMut,
+    ready: Buffer,
     exception_tag: Option<String>,
     exception_open_markers: Vec<Vec<u8>>,
     exception_body: Option<Vec<u8>>,
@@ -513,6 +518,7 @@ impl ClickHouseArrowDecoder {
         Self {
             decoder: StreamDecoder::new(),
             pending: BytesMut::new(),
+            ready: Buffer::from(Vec::<u8>::new()),
             exception_tag,
             exception_open_markers,
             exception_body: None,
@@ -522,37 +528,91 @@ impl ClickHouseArrowDecoder {
         }
     }
 
-    fn push_chunk(&mut self, chunk: Bytes) -> Result<Vec<RecordBatch>> {
+    fn push_chunk(&mut self, chunk: &[u8]) -> Result<()> {
         if self.exception_body.is_some() {
-            self.append_exception_bytes(&chunk)?;
-            return Ok(Vec::new());
+            return self.append_exception_bytes(chunk);
         }
 
-        self.pending.extend_from_slice(&chunk);
+        self.pending.extend_from_slice(chunk);
         if let Some(at) = self.exception_open_offset() {
-            let arrow_bytes = self.pending.split_to(at).freeze();
-            let exception_bytes = self.pending.split_to(self.pending.len()).freeze();
-            let batches = self.decode_arrow_bytes(arrow_bytes)?;
+            let exception_bytes = self.pending.split_off(at);
             self.append_exception_bytes(&exception_bytes)?;
-            return Ok(batches);
         }
 
-        // Retain enough bytes to recognize either opening marker when it is
-        // split across two reqwest chunks. With no exception tag header there
-        // is no marker to recognize, so all bytes go directly to Arrow.
-        let holdback = self
-            .exception_open_markers
-            .iter()
-            .map(Vec::len)
-            .max()
-            .unwrap_or(0)
-            .saturating_sub(1);
-        let ready_len = self.pending.len().saturating_sub(holdback);
-        let ready = self.pending.split_to(ready_len).freeze();
-        self.decode_arrow_bytes(ready)
+        Ok(())
     }
 
-    fn finish(&mut self, transfer_error: Option<String>) -> Result<Vec<RecordBatch>> {
+    /// Decode at most one batch so the producer can await channel capacity
+    /// before decoding another batch from the same HTTP chunk.
+    fn next_batch(&mut self, flush_pending: bool) -> Result<Option<RecordBatch>> {
+        // Retain enough bytes to recognize either opening marker when it is
+        // split across transport windows. Once an exception was detected or
+        // the response ended, all remaining Arrow bytes are safe to decode.
+        if self.ready.is_empty() {
+            let holdback = if flush_pending || self.exception_body.is_some() {
+                0
+            } else {
+                self.exception_open_markers
+                    .iter()
+                    .map(Vec::len)
+                    .max()
+                    .unwrap_or(0)
+                    .saturating_sub(1)
+            };
+            let ready_len = self.pending.len().saturating_sub(holdback);
+            if ready_len == 0 {
+                return Ok(None);
+            }
+            self.ready = Buffer::from(self.pending.split_to(ready_len).freeze());
+        }
+
+        while !self.ready.is_empty() {
+            // Feed at most one byte beyond the remaining allowance. This lets
+            // a batch complete and reset the counter without first handing an
+            // arbitrarily large transport chunk to StreamDecoder's scratch
+            // buffer, while still detecting a frame that exceeds the guard.
+            let allowance = self
+                .max_buffered_bytes
+                .saturating_sub(self.buffered_bytes)
+                .saturating_add(1)
+                .max(1);
+            let mut window = self
+                .ready
+                .slice_with_length(0, self.ready.len().min(allowance));
+            let before = window.len();
+            let batch = self.decoder.decode(&mut window).map_err(|e| {
+                let stage = if self.decoder.schema().is_none() {
+                    "stream schema read"
+                } else {
+                    "decode"
+                };
+                QueryFluxError::Engine(format!("ClickHouse Arrow {stage} failed: {e}"))
+            })?;
+            let consumed = before - window.len();
+            self.ready.advance(consumed);
+            self.buffered_bytes = self.buffered_bytes.saturating_add(consumed);
+            if self.buffered_bytes > self.max_buffered_bytes {
+                return Err(QueryFluxError::Engine(format!(
+                    "ClickHouse Arrow decode window exceeded the {}-byte buffered-result cap; \
+                     reduce the server block size or raise maxResultBufferBytes",
+                    self.max_buffered_bytes
+                )));
+            }
+            if let Some(batch) = batch {
+                self.buffered_bytes = 0;
+                self.emitted_batch = true;
+                return Ok(Some(batch));
+            }
+            if consumed == 0 {
+                return Err(QueryFluxError::Engine(
+                    "ClickHouse Arrow decoder made no progress".to_string(),
+                ));
+            }
+        }
+        Ok(None)
+    }
+
+    fn finish(&mut self, transfer_error: Option<String>) -> Result<Option<RecordBatch>> {
         if let Some(body) = &self.exception_body {
             if let Some(tag) = &self.exception_tag {
                 if let Some(msg) = find_exception_frame(body, tag) {
@@ -578,8 +638,6 @@ impl ClickHouseArrowDecoder {
             )));
         }
 
-        let remaining = self.pending.split_to(self.pending.len()).freeze();
-        let mut batches = self.decode_arrow_bytes(remaining)?;
         self.decoder.finish().map_err(|e| {
             QueryFluxError::Engine(format!("ClickHouse Arrow stream ended unexpectedly: {e}"))
         })?;
@@ -589,11 +647,11 @@ impl ClickHouseArrowDecoder {
         // empty batch so dispatch frames it as a result set rather than an OK.
         if !self.emitted_batch {
             if let Some(schema) = self.decoder.schema() {
-                batches.push(RecordBatch::new_empty(schema));
                 self.emitted_batch = true;
+                return Ok(Some(RecordBatch::new_empty(schema)));
             }
         }
-        Ok(batches)
+        Ok(None)
     }
 
     fn exception_open_offset(&self) -> Option<usize> {
@@ -613,66 +671,19 @@ impl ClickHouseArrowDecoder {
         body.extend_from_slice(bytes);
         Ok(())
     }
-
-    fn decode_arrow_bytes(&mut self, bytes: Bytes) -> Result<Vec<RecordBatch>> {
-        let mut buffer = Buffer::from(bytes);
-        let mut batches = Vec::new();
-        while !buffer.is_empty() {
-            // Feed at most one byte beyond the remaining allowance. This lets
-            // a batch complete and reset the counter without first handing an
-            // arbitrarily large transport chunk to StreamDecoder's scratch
-            // buffer, while still detecting a frame that genuinely exceeds
-            // the configured guard.
-            let allowance = self
-                .max_buffered_bytes
-                .saturating_sub(self.buffered_bytes)
-                .saturating_add(1)
-                .max(1);
-            let mut window = buffer.slice_with_length(0, buffer.len().min(allowance));
-            let before = window.len();
-            let batch = self.decoder.decode(&mut window).map_err(|e| {
-                let stage = if self.decoder.schema().is_none() {
-                    "stream schema read"
-                } else {
-                    "decode"
-                };
-                QueryFluxError::Engine(format!("ClickHouse Arrow {stage} failed: {e}"))
-            })?;
-            let consumed = before - window.len();
-            buffer.advance(consumed);
-            self.buffered_bytes = self.buffered_bytes.saturating_add(consumed);
-            if self.buffered_bytes > self.max_buffered_bytes {
-                return Err(QueryFluxError::Engine(format!(
-                    "ClickHouse Arrow decode window exceeded the {}-byte buffered-result cap; \
-                     reduce the server block size or raise maxResultBufferBytes",
-                    self.max_buffered_bytes
-                )));
-            }
-            if let Some(batch) = batch {
-                self.buffered_bytes = 0;
-                self.emitted_batch = true;
-                batches.push(batch);
-            }
-            if consumed == 0 {
-                return Err(QueryFluxError::Engine(
-                    "ClickHouse Arrow decoder made no progress".to_string(),
-                ));
-            }
-        }
-        Ok(batches)
-    }
 }
 
-async fn send_batches(
+async fn send_decoded_batches(
+    decoder: &mut ClickHouseArrowDecoder,
     batch_tx: &tokio::sync::mpsc::Sender<Result<RecordBatch>>,
-    batches: Vec<RecordBatch>,
-) -> bool {
-    for batch in batches {
+    flush_pending: bool,
+) -> Result<bool> {
+    while let Some(batch) = decoder.next_batch(flush_pending)? {
         if batch_tx.send(Ok(batch)).await.is_err() {
-            return false;
+            return Ok(false);
         }
     }
-    true
+    Ok(true)
 }
 
 async fn stream_arrow_response(
@@ -682,6 +693,7 @@ async fn stream_arrow_response(
     batch_tx: &tokio::sync::mpsc::Sender<Result<RecordBatch>>,
 ) -> Result<()> {
     let mut decoder = ClickHouseArrowDecoder::new(exception_tag, max_buffered_bytes);
+    let window_bytes = max_buffered_bytes.clamp(1, RESULT_STREAM_CHUNK_WINDOW_BYTES);
     let transfer_error = loop {
         let next_chunk = tokio::select! {
             _ = batch_tx.closed() => return Ok(()),
@@ -689,17 +701,28 @@ async fn stream_arrow_response(
         };
         match next_chunk {
             Ok(Some(chunk)) => {
-                let batches = decoder.push_chunk(chunk)?;
-                if !send_batches(batch_tx, batches).await {
-                    return Ok(());
+                // Do not copy or decode a whole transport chunk before yielding
+                // to the consumer; a single chunk may contain many IPC batches.
+                for window in chunk.chunks(window_bytes) {
+                    decoder.push_chunk(window)?;
+                    if !send_decoded_batches(&mut decoder, batch_tx, false).await? {
+                        return Ok(());
+                    }
                 }
             }
             Ok(None) => break None,
             Err(error) => break Some(error.to_string()),
         }
     };
-    let batches = decoder.finish(transfer_error)?;
-    let _ = send_batches(batch_tx, batches).await;
+    if transfer_error.is_none()
+        && decoder.exception_body.is_none()
+        && !send_decoded_batches(&mut decoder, batch_tx, true).await?
+    {
+        return Ok(());
+    }
+    if let Some(batch) = decoder.finish(transfer_error)? {
+        let _ = batch_tx.send(Ok(batch)).await;
+    }
     Ok(())
 }
 
@@ -1250,10 +1273,25 @@ mod tests {
         let mut decoder = ClickHouseArrowDecoder::new(exception_tag.map(String::from), cap);
         let mut decoded = Vec::new();
         for chunk in body.chunks(chunk_size) {
-            decoded.extend(decoder.push_chunk(Bytes::copy_from_slice(chunk))?);
+            decoder.push_chunk(chunk)?;
+            collect_available(&mut decoder, false, &mut decoded)?;
         }
-        decoded.extend(decoder.finish(None)?);
+        collect_available(&mut decoder, true, &mut decoded)?;
+        if let Some(batch) = decoder.finish(None)? {
+            decoded.push(batch);
+        }
         Ok(decoded)
+    }
+
+    fn collect_available(
+        decoder: &mut ClickHouseArrowDecoder,
+        flush_pending: bool,
+        batches: &mut Vec<RecordBatch>,
+    ) -> Result<()> {
+        while let Some(batch) = decoder.next_batch(flush_pending)? {
+            batches.push(batch);
+        }
+        Ok(())
     }
 
     #[test]
@@ -1333,6 +1371,36 @@ mod tests {
     }
 
     #[test]
+    fn one_transport_chunk_yields_batches_one_at_a_time() {
+        let schema = Arc::new(Schema::new(vec![Field::new("n", DataType::Int64, false)]));
+        let batches: Vec<_> = (0..32)
+            .map(|n| {
+                RecordBatch::try_new(
+                    Arc::clone(&schema),
+                    vec![Arc::new(Int64Array::from(vec![n]))],
+                )
+                .unwrap()
+            })
+            .collect();
+        let body = ipc_stream(&batches);
+        let mut decoder = ClickHouseArrowDecoder::new(Some(TAG.to_string()), body.len());
+        decoder.push_chunk(&body).unwrap();
+
+        let first = decoder.next_batch(false).unwrap().unwrap();
+        assert_eq!(first, batches[0]);
+        assert!(
+            !decoder.ready.is_empty() || !decoder.pending.is_empty(),
+            "the remaining batches must not be decoded ahead of the consumer"
+        );
+
+        let mut decoded = vec![first];
+        collect_available(&mut decoder, false, &mut decoded).unwrap();
+        collect_available(&mut decoder, true, &mut decoded).unwrap();
+        assert!(decoder.finish(None).unwrap().is_none());
+        assert_eq!(decoded, batches);
+    }
+
+    #[test]
     fn oversized_arrow_decode_window_still_hits_buffer_guard() {
         let schema = Arc::new(Schema::new(vec![Field::new("n", DataType::Int64, false)]));
         let batch = RecordBatch::try_new(
@@ -1361,14 +1429,11 @@ mod tests {
         let open_marker_len = format!("\r\n__exception__\r\n{TAG}\r\n").len();
         for split in marker_at..marker_at + open_marker_len {
             let mut decoder = ClickHouseArrowDecoder::new(Some(TAG.to_string()), body.len());
-            let mut decoded = decoder
-                .push_chunk(Bytes::copy_from_slice(&body[..split]))
-                .unwrap();
-            decoded.extend(
-                decoder
-                    .push_chunk(Bytes::copy_from_slice(&body[split..]))
-                    .unwrap(),
-            );
+            let mut decoded = Vec::new();
+            decoder.push_chunk(&body[..split]).unwrap();
+            collect_available(&mut decoder, false, &mut decoded).unwrap();
+            decoder.push_chunk(&body[split..]).unwrap();
+            collect_available(&mut decoder, false, &mut decoded).unwrap();
             let err = decoder
                 .finish(Some("connection closed".to_string()))
                 .unwrap_err();
