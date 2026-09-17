@@ -242,7 +242,8 @@ impl ClickHouseAdapter {
                     key: "maxResultBufferBytes",
                     label: "Max result buffer (bytes)",
                     description: "Maximum bytes QueryFlux accepts between decoded Arrow result \
-                                  batches. The complete result streams without a total-size cap. \
+                                  batches; the complete Arrow result has no total-size cap. \
+                                  Control-plane TSV reads still cap the entire response. \
                                   Defaults to 1 GiB when omitted.",
                     field_type: FieldType::Number,
                     required: false,

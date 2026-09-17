@@ -90,22 +90,22 @@ async fn clickhouse_system_numbers() {
 }
 
 /// The harness sets a 256 KiB decode-buffer guard. On the pinned ClickHouse
-/// image this response is ~600 KiB in aggregate but arrives in 50,000-row
-/// (~200 KiB encoded) Arrow batches, so it succeeds only when the adapter
-/// applies the guard per decode window rather than to the complete response.
+/// image this response exceeds the guard in aggregate. Request 20,000-row
+/// blocks (at most 160 KiB of UInt64 values before Arrow IPC overhead) so
+/// individual decode windows remain below the guard.
 #[tokio::test]
 #[ignore = "requires ClickHouse — run with: make test-e2e"]
 async fn clickhouse_large_multi_batch_result_streams_past_total_buffer_guard() {
     require_group!(GROUP_CLICKHOUSE);
     const ROWS: usize = 150_000;
-    assert!(
-        ROWS * std::mem::size_of::<u64>() > CLICKHOUSE_TEST_RESULT_BUFFER_BYTES,
-        "fixture must exceed the configured aggregate byte guard"
-    );
+    const BLOCK_ROWS: usize = 20_000;
+    assert!(BLOCK_ROWS * std::mem::size_of::<u64>() < CLICKHOUSE_TEST_RESULT_BUFFER_BYTES);
 
     let r = client()
         .execute_on(
-            "SELECT number FROM system.numbers LIMIT 150000 SETTINGS max_block_size = 50000",
+            &format!(
+                "SELECT number FROM system.numbers LIMIT {ROWS} SETTINGS max_block_size = {BLOCK_ROWS}"
+            ),
             GROUP_CLICKHOUSE,
         )
         .await

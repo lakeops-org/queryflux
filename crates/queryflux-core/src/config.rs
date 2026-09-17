@@ -1144,9 +1144,9 @@ pub struct ClusterConfig {
     #[serde(default)]
     pub max_wait_secs: Option<u64>,
     /// Max bytes of buffered query data (`maxResultBufferBytes` in JSON/YAML).
-    /// For ClickHouse this guards bytes consumed between decoded Arrow batches
-    /// while the complete result streams; DuckDB adapters use it for their
-    /// buffered result path.
+    /// For ClickHouse Arrow results, this guards bytes consumed between decoded
+    /// batches while the complete result streams. ClickHouse control-plane TSV
+    /// reads and DuckDB buffered results still cap the entire response.
     /// Defaults to 1 GiB when omitted. Other engines ignore this.
     #[serde(default)]
     pub max_result_buffer_bytes: Option<u64>,
