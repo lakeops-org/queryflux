@@ -6,7 +6,7 @@ pub mod external;
 
 pub use chain::GuardChain;
 pub use config::{GuardChainConfig, GuardGroupConfig, GuardKind, GuardLayerConfig};
-pub use context::{GuardContext, GuardLayer, GuardResult};
+pub use context::{GuardChainOutcome, GuardContext, GuardLayer, GuardResult};
 
 use queryflux_persistence::GuardAction;
 
@@ -33,6 +33,13 @@ pub fn result_to_action(guard_name: &str, result: &GuardResult) -> GuardAction {
             reason: Some(reason.clone()),
             code: code.clone(),
             metadata: None,
+        },
+        GuardResult::Rewrite { metadata, .. } => GuardAction {
+            guard: guard_name.to_string(),
+            action: "rewrite".to_string(),
+            reason: None,
+            code: None,
+            metadata: metadata.clone(),
         },
     }
 }

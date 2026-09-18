@@ -42,6 +42,9 @@ pub struct QueryRecord {
     pub frontend_protocol: FrontendProtocol,
     pub source_dialect: SqlDialect,
     pub target_dialect: SqlDialect,
+    pub was_rewritten: bool,
+    /// Source-dialect SQL after access-control rewrite. Only set when `was_rewritten` is true.
+    pub rewritten_sql: Option<String>,
     pub was_translated: bool,
     /// The SQL after dialect translation. Only set when `was_translated` is true.
     pub translated_sql: Option<String>,

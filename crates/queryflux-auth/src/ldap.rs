@@ -162,6 +162,7 @@ impl AuthProvider for LdapAuthProvider {
                     roles: vec![],
                     raw_token: None,
                     raw_password: None,
+                    attributes: Default::default(),
                 });
             }
         };
@@ -199,6 +200,7 @@ impl AuthProvider for LdapAuthProvider {
             roles: vec![],
             raw_token: None,
             raw_password: Some(password.to_string()),
+            attributes: Default::default(),
         })
     }
 }

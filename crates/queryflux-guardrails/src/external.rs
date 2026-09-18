@@ -206,11 +206,20 @@ fn bounded_timeout(timeout_ms: Option<u64>) -> Duration {
 
 fn guard_payload(ctx: &GuardContext<'_>) -> serde_json::Value {
     json!({
-        "sql": ctx.sql,
-        "translated_sql": ctx.translated_sql,
+        // `sql` is always the original SQL the client sent. `translated_sql` is the SQL
+        // this particular guard call actually evaluated — identical to `sql` for the
+        // dedicated (pre-translation) access-control guard, and the final post-translation
+        // engine SQL for the generic Plan-layer guard chain. `dialect` is whatever `sql`
+        // in this call was parsed as (see `GuardContext::sql` doc for which one that is).
+        "sql": ctx.original_sql.unwrap_or(ctx.sql),
+        "translated_sql": ctx.sql,
+        "dialect": format!("{:?}", ctx.dialect),
         "engine_type": format!("{:?}", ctx.engine_type),
         "cluster_group": ctx.cluster_group.0,
         "user": ctx.user,
+        "groups": ctx.groups,
+        "roles": ctx.roles,
+        "attributes": ctx.attributes,
         "agent_context": ctx.agent_context,
         "query_tags": ctx.query_tags,
     })
@@ -259,9 +268,10 @@ fn run_python_guard(script: &str, payload: serde_json::Value) -> Result<GuardRes
 mod tests {
     use super::*;
     use queryflux_core::{
-        query::{ClusterGroupName, EngineType},
+        query::{ClusterGroupName, EngineType, SqlDialect},
         tags::QueryTags,
     };
+    use std::collections::{BTreeMap, HashMap};
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         net::TcpListener,
@@ -269,35 +279,77 @@ mod tests {
 
     struct TestCtx {
         sql: String,
-        translated_sql: String,
+        dialect: SqlDialect,
         engine_type: EngineType,
         cluster_group: ClusterGroupName,
         query_tags: QueryTags,
+        groups: Vec<String>,
+        roles: Vec<String>,
+        attributes: BTreeMap<String, serde_json::Value>,
+        session_extra: HashMap<String, String>,
     }
 
     impl TestCtx {
         fn new(sql: &str) -> Self {
             Self {
                 sql: sql.to_string(),
-                translated_sql: sql.to_string(),
+                dialect: EngineType::DuckDb.dialect(),
                 engine_type: EngineType::DuckDb,
                 cluster_group: ClusterGroupName("default".to_string()),
                 query_tags: QueryTags::new(),
+                groups: Vec::new(),
+                roles: Vec::new(),
+                attributes: BTreeMap::new(),
+                session_extra: HashMap::new(),
             }
         }
 
         fn ctx(&self) -> GuardContext<'_> {
             GuardContext {
                 sql: &self.sql,
-                translated_sql: &self.translated_sql,
+                original_sql: None,
+                dialect: &self.dialect,
                 engine_type: &self.engine_type,
                 cluster_group: &self.cluster_group,
                 user: Some("alice"),
+                groups: &self.groups,
+                roles: &self.roles,
+                attributes: &self.attributes,
                 agent_context: None,
                 query_tags: &self.query_tags,
+                session_extra: &self.session_extra,
+                schema: None,
                 sql_parse: None,
             }
         }
+    }
+
+    /// Regression: `guard_payload` must expose both the original client SQL (as `sql`,
+    /// for backward compatibility with scripts written against the pre-rewrite contract)
+    /// and the SQL this call actually evaluated (as `translated_sql`) — collapsing them
+    /// into one field silently broke any script reading `ctx['translated_sql']` and
+    /// removed the ability to inspect the client's literal original SQL.
+    #[test]
+    fn guard_payload_exposes_both_original_and_evaluated_sql() {
+        let tc = TestCtx::new("SELECT * FROM orders");
+        let mut ctx = tc.ctx();
+        let original = "SELECT * FROM orders".to_string();
+        ctx.sql = "SELECT * FROM orders_translated";
+        ctx.original_sql = Some(&original);
+
+        let payload = guard_payload(&ctx);
+        assert_eq!(payload["sql"], "SELECT * FROM orders");
+        assert_eq!(payload["translated_sql"], "SELECT * FROM orders_translated");
+    }
+
+    /// When no translation happened (original_sql is None), both fields fall back to the
+    /// same SQL rather than one going missing.
+    #[test]
+    fn guard_payload_falls_back_when_no_translation_occurred() {
+        let tc = TestCtx::new("SELECT 1");
+        let payload = guard_payload(&tc.ctx());
+        assert_eq!(payload["sql"], "SELECT 1");
+        assert_eq!(payload["translated_sql"], "SELECT 1");
     }
 
     #[tokio::test]

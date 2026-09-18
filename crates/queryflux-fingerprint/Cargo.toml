@@ -7,6 +7,6 @@ license.workspace = true
 [dependencies]
 queryflux-core = { workspace = true }
 xxhash-rust = { version = "0.8", features = ["xxh64"] }
-polyglot-sql = { version = "0.2.3", features = ["all-dialects"] }
+polyglot-sql = { workspace = true, features = ["all-dialects"] }
 regex = "1"
 tracing = { workspace = true }

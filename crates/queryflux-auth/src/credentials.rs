@@ -48,6 +48,13 @@ pub struct AuthContext {
     /// forwardable would be a real vulnerability, not just a missed optimization.
     #[serde(default, skip_serializing)]
     pub raw_password: Option<String>,
+    /// Verified ABAC attributes for data-level policy (e.g. `department`, `region`,
+    /// `data_classification`). Populated **only** from a verified credential — for OIDC,
+    /// from the JWT claim paths in `auth.oidc.attributeClaims`. Never from a backend
+    /// connection credential or client-declared session parameters. Empty for
+    /// `None`/`Static`/`Ldap` providers unless a future provider fills it.
+    #[serde(default)]
+    pub attributes: std::collections::BTreeMap<String, serde_json::Value>,
 }
 
 /// Reject poll/cancel/dequeue when the caller is not the query owner.

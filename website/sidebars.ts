@@ -40,6 +40,26 @@ const sidebars: SidebarsConfig = {
     },
     {
       type: 'category',
+      label: 'Access Control',
+      collapsed: false,
+      items: [
+        'access-control/overview',
+        'access-control/opa',
+        'access-control/cerbos',
+        {
+          type: 'category',
+          label: 'Use cases',
+          collapsed: false,
+          items: [
+            'access-control/customer-api-row-filters',
+            'access-control/internal-analysts',
+            'access-control/support-on-behalf-of',
+          ],
+        },
+      ],
+    },
+    {
+      type: 'category',
       label: 'Architecture',
       collapsed: true,
       items: [

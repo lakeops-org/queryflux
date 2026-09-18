@@ -1,0 +1,518 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>QueryFlux × OPA — access control demo (Keycloak OIDC)</title>
+  <style>
+    :root {
+      --bg: #161412;
+      --panel: #1f1c19;
+      --ink: #f3ece3;
+      --muted: #b7aaa0;
+      --line: #3a342e;
+      --allow: #8fbf7a;
+      --deny: #e07a6a;
+      --rewrite: #e2b15a;
+      --accent: #d4a574;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font: 15px/1.45 ui-sans-serif, system-ui, -apple-system, sans-serif;
+      background: var(--bg);
+      color: var(--ink);
+    }
+    header {
+      padding: 1.25rem 1.5rem 0.75rem;
+      border-bottom: 1px solid var(--line);
+    }
+    header h1 { margin: 0 0 0.35rem; font-size: 1.15rem; font-weight: 600; }
+    header p { margin: 0; color: var(--muted); max-width: 52rem; }
+    header a { color: var(--accent); }
+    main {
+      display: grid;
+      grid-template-columns: minmax(20rem, 1fr) minmax(22rem, 1.1fr);
+      gap: 0;
+      min-height: calc(100vh - 5.5rem);
+    }
+    @media (max-width: 880px) { main { grid-template-columns: 1fr; } }
+    section { padding: 1.25rem 1.5rem; }
+    .form { border-right: 1px solid var(--line); }
+    label { display: block; font-size: 0.75rem; letter-spacing: 0.04em; text-transform: uppercase; color: var(--muted); margin: 0.9rem 0 0.35rem; }
+    .identities { display: flex; flex-wrap: wrap; gap: 0.4rem; }
+    button.chip, button.primary, button.ghost {
+      border: 1px solid var(--line);
+      background: var(--panel);
+      color: var(--ink);
+      border-radius: 6px;
+      padding: 0.4rem 0.7rem;
+      cursor: pointer;
+      font: inherit;
+    }
+    button.chip[aria-pressed="true"] { border-color: var(--accent); color: var(--accent); }
+    button.primary { background: var(--accent); color: #1a1612; border-color: var(--accent); font-weight: 600; }
+    button.ghost { color: var(--muted); }
+    button:disabled { opacity: 0.55; cursor: wait; }
+    .actions { display: flex; flex-wrap: wrap; gap: 0.5rem; margin-top: 1rem; }
+    select, textarea, input {
+      width: 100%;
+      background: var(--bg);
+      color: var(--ink);
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 0.55rem 0.65rem;
+      font: 13px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace;
+    }
+    textarea { min-height: 7.5rem; resize: vertical; }
+    .custom { display: none; gap: 0.5rem; margin-top: 0.5rem; }
+    .custom.open { display: grid; grid-template-columns: 1fr 1fr 1fr; }
+    .status { font-size: 0.85rem; color: var(--muted); margin-top: 0.75rem; }
+    .badge {
+      display: inline-block;
+      padding: 0.15rem 0.5rem;
+      border-radius: 999px;
+      font-size: 0.75rem;
+      font-weight: 700;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+    }
+    .badge.allow { background: #24331f; color: var(--allow); }
+    .badge.deny { background: #3a221f; color: var(--deny); }
+    .badge.rewrite { background: #3a2f18; color: var(--rewrite); }
+    .badge.warn, .badge.error { background: #3a2f18; color: var(--rewrite); }
+    pre {
+      margin: 0.6rem 0 0;
+      padding: 0.85rem;
+      background: var(--bg);
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      overflow: auto;
+      font: 12.5px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace;
+      white-space: pre-wrap;
+    }
+    table.grid {
+      width: 100%;
+      border-collapse: collapse;
+      margin-top: 0.6rem;
+      font: 13px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace;
+    }
+    table.grid th, table.grid td {
+      text-align: left;
+      padding: 0.4rem 0.55rem;
+      border-bottom: 1px solid var(--line);
+      vertical-align: top;
+    }
+    table.grid th { color: var(--muted); font-weight: 600; }
+    .panel h2 { margin: 0 0 0.5rem; font-size: 0.95rem; }
+    .panel + .panel { margin-top: 1.25rem; }
+    .muted { color: var(--muted); }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>QueryFlux × OPA (Keycloak OIDC)</h1>
+    <p>
+      Iceberg tables in Lakekeeper (<code>lakekeeper.demo.customers</code> /
+      <code>payroll</code>) seeded by Compose. Identity comes from Keycloak — "Run
+      query" fetches a real OIDC token for the selected user via a password grant
+      and sends it as <code>Authorization: Bearer …</code>, same as
+      <code>demo.py</code>. QueryFlux resolves schema from the catalog for OPA
+      masks and filters. Dry-run and Ask OPA still take identity directly (no
+      token needed — they don't go through the authenticated query path).
+      Policy: <a href="/access.rego">access.rego</a>
+    </p>
+  </header>
+  <main>
+    <section class="form">
+      <label>Identity</label>
+      <div class="identities" id="identities">
+        <button type="button" class="chip" data-user="alice" data-password="alice" data-groups="engineers" data-roles="admin" aria-pressed="true">alice · engineers</button>
+        <button type="button" class="chip" data-user="bob" data-password="bob" data-groups="analysts" data-roles="analyst" aria-pressed="false">bob · analysts</button>
+        <button type="button" class="chip" data-custom="1" aria-pressed="false">custom</button>
+      </div>
+      <div class="custom" id="custom">
+        <input id="custom-user" placeholder="user" />
+        <input id="custom-password" placeholder="password" type="password" />
+        <input id="custom-groups" placeholder="groups (comma-separated)" />
+      </div>
+
+      <label>SQL preset</label>
+      <select id="preset">
+        <option value="SELECT name, region, ssn FROM lakekeeper.demo.customers ORDER BY id">customers (filter + mask for bob)</option>
+        <option value="SELECT name, salary FROM lakekeeper.demo.payroll ORDER BY id">payroll (denied for bob)</option>
+        <option value="SELECT c.name, c.ssn, p.salary FROM lakekeeper.demo.customers c JOIN lakekeeper.demo.payroll p ON c.name = p.name">join customers + payroll</option>
+        <option value="SELECT * FROM lakekeeper.demo.secrets">unknown table (deny)</option>
+      </select>
+
+      <label>SQL</label>
+      <textarea id="sql">SELECT name, region, ssn FROM lakekeeper.demo.customers ORDER BY id</textarea>
+
+      <div class="actions">
+        <button type="button" class="primary" id="run">Run query</button>
+        <button type="button" class="ghost" id="seed">Seed data</button>
+        <button type="button" class="ghost" id="dry-run">Dry-run</button>
+        <button type="button" class="ghost" id="ask-opa">Ask OPA</button>
+      </div>
+      <p class="status" id="hint">Start Compose + <code>docker compose --profile seed run --rm data-seed</code>, then QueryFlux on :8080. Seed reloads <code>seed.sql</code> rows. "Run query" and "Seed data" fetch a Keycloak token for the selected identity's password first.</p>
+    </section>
+    <section>
+      <div class="panel">
+        <h2>Result <span id="badge"></span></h2>
+        <p class="muted" id="summary">Pick alice or bob, seed once, then run a query.</p>
+        <div id="table-wrap"></div>
+        <pre id="out">(no result yet)</pre>
+      </div>
+      <div class="panel">
+        <h2>Loaded policy</h2>
+        <pre id="policy" class="muted">loading access.rego…</pre>
+      </div>
+    </section>
+  </main>
+  <script>
+    const ADMIN = "Basic " + btoa("admin:admin");
+    const state = { user: "alice", password: "alice", groups: ["engineers"], roles: ["admin"] };
+    const sqlEl = document.getElementById("sql");
+    const outEl = document.getElementById("out");
+    const tableWrap = document.getElementById("table-wrap");
+    document.getElementById("preset").addEventListener("change", (e) => {
+      sqlEl.value = e.target.value;
+    });
+
+    document.getElementById("identities").addEventListener("click", (e) => {
+      const btn = e.target.closest("button.chip");
+      if (!btn) return;
+      for (const b of document.querySelectorAll("button.chip")) b.setAttribute("aria-pressed", "false");
+      btn.setAttribute("aria-pressed", "true");
+      const custom = document.getElementById("custom");
+      if (btn.dataset.custom) {
+        custom.classList.add("open");
+        return;
+      }
+      custom.classList.remove("open");
+      state.user = btn.dataset.user;
+      state.password = btn.dataset.password || btn.dataset.user;
+      state.groups = btn.dataset.groups ? btn.dataset.groups.split(",") : [];
+      state.roles = btn.dataset.roles ? btn.dataset.roles.split(",") : [];
+    });
+
+    function identity() {
+      const custom = document.getElementById("custom");
+      if (custom.classList.contains("open")) {
+        const user = document.getElementById("custom-user").value.trim() || "custom";
+        const password = document.getElementById("custom-password").value || user;
+        const groups = document.getElementById("custom-groups").value.split(",").map((s) => s.trim()).filter(Boolean);
+        return { user, password, groups, roles: [] };
+      }
+      return { user: state.user, password: state.password, groups: state.groups, roles: state.roles };
+    }
+
+    // Keycloak password-grant token fetch, proxied same-origin via /keycloak/.
+    // Cached per user:password for the life of the page — plenty for a demo.
+    const tokenCache = {};
+    async function getToken(user, password) {
+      const key = user + ":" + password;
+      const cached = tokenCache[key];
+      if (cached && cached.expiry > Date.now()) return cached.token;
+      const res = await fetch("/keycloak/realms/queryflux/protocol/openid-connect/token", {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({
+          grant_type: "password",
+          client_id: "queryflux",
+          username: user,
+          password: password,
+        }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || !data.access_token) {
+        throw new Error(
+          "Keycloak token request failed: " + (data.error_description || data.error || res.status)
+        );
+      }
+      tokenCache[key] = {
+        token: data.access_token,
+        // Refresh a few seconds early rather than race an exact expiry.
+        expiry: Date.now() + Math.max((data.expires_in || 60) - 5, 5) * 1000,
+      };
+      return data.access_token;
+    }
+
+    function extractTables(sql) {
+      const names = [];
+      const re = /\b(?:from|join)\s+([a-zA-Z_][\w.]*)/gi;
+      let m;
+      while ((m = re.exec(sql))) {
+        const t = m[1];
+        if (!names.includes(t)) names.push(t);
+      }
+      return names;
+    }
+
+    function setBusy(busy) {
+      for (const id of ["run", "seed", "dry-run", "ask-opa"]) {
+        document.getElementById(id).disabled = busy;
+      }
+    }
+
+    function setResult(kind, summary, body, table) {
+      const badge = document.getElementById("badge");
+      badge.className = "badge " + (kind || "");
+      badge.textContent = kind || "";
+      document.getElementById("summary").textContent = summary;
+      tableWrap.innerHTML = "";
+      if (table && table.columns && table.columns.length) {
+        const tbl = document.createElement("table");
+        tbl.className = "grid";
+        const thead = document.createElement("thead");
+        const hr = document.createElement("tr");
+        for (const c of table.columns) {
+          const th = document.createElement("th");
+          th.textContent = c;
+          hr.appendChild(th);
+        }
+        thead.appendChild(hr);
+        tbl.appendChild(thead);
+        const tbody = document.createElement("tbody");
+        for (const row of table.rows || []) {
+          const tr = document.createElement("tr");
+          for (let i = 0; i < table.columns.length; i++) {
+            const td = document.createElement("td");
+            const v = row[i];
+            td.textContent = v == null ? "" : String(v);
+            tr.appendChild(td);
+          }
+          tbody.appendChild(tr);
+        }
+        tbl.appendChild(tbody);
+        tableWrap.appendChild(tbl);
+      }
+      if (body === undefined || body === null || body === "") {
+        outEl.style.display = table ? "none" : "block";
+        if (!table) outEl.textContent = "";
+        return;
+      }
+      outEl.style.display = "block";
+      outEl.textContent = typeof body === "string" ? body : JSON.stringify(body, null, 2);
+    }
+
+    function proxyUri(uri) {
+      if (!uri) return uri;
+      try {
+        const u = new URL(uri, window.location.origin);
+        return u.pathname + u.search;
+      } catch {
+        return uri;
+      }
+    }
+
+    function trinoError(body) {
+      const err = body && body.error;
+      if (!err) return null;
+      return (typeof err === "object" && (err.message || err.errorName)) || String(err);
+    }
+
+    function looksUnseeded(msg) {
+      const m = (msg || "").toLowerCase();
+      return m.includes("does not exist") || m.includes("not found") || m.includes("unknown table") || m.includes("catalog");
+    }
+
+    async function trinoQuery(user, password, sql) {
+      // OIDC identity: QueryFlux verifies the Bearer token itself and derives
+      // the user/groups from its claims — no X-Trino-User needed (contrast the
+      // static-auth with-opa demo, which passes it explicitly).
+      const token = await getToken(user, password);
+      const headers = {
+        Authorization: "Bearer " + token,
+        "X-Trino-Source": "opa-demo-ui",
+      };
+      let res = await fetch("/v1/statement", { method: "POST", headers, body: sql });
+      let body = await res.json().catch(() => ({ raw: true }));
+      const columns = [];
+      const rows = [];
+      for (let i = 0; i < 40; i++) {
+        const err = trinoError(body);
+        if (err) return { columns: null, rows: [], error: err, status: res.status, body };
+        if (Array.isArray(body.columns) && !columns.length) {
+          for (const c of body.columns) columns.push(c.name || c);
+        }
+        if (Array.isArray(body.data)) rows.push(...body.data);
+        const next = proxyUri(body.nextUri);
+        if (!next) break;
+        res = await fetch(next, { headers });
+        body = await res.json().catch(() => ({ raw: true }));
+      }
+      return { columns, rows, error: null, status: res.status, body };
+    }
+
+    function statementsFromSql(text) {
+      const out = [];
+      for (const chunk of text.split(";")) {
+        const stmt = chunk
+          .split("\n")
+          .map((ln) => ln.trim())
+          .filter((ln) => ln && !ln.startsWith("--"))
+          .join("\n")
+          .trim();
+        if (stmt) out.push(stmt);
+      }
+      return out;
+    }
+
+    async function seedData() {
+      const sql = await fetch("/seed.sql").then((r) => {
+        if (!r.ok) throw new Error("could not load seed.sql");
+        return r.text();
+      });
+      const stmts = statementsFromSql(sql);
+      for (const stmt of stmts) {
+        const result = await trinoQuery("alice", "alice", stmt);
+        if (result.error) throw new Error(result.error);
+      }
+      return stmts.length;
+    }
+
+    async function seed() {
+      setBusy(true);
+      try {
+        const n = await seedData();
+        setResult("allow", `Seeded ${n} statements as alice (lakekeeper.demo tables).`, null);
+        outEl.style.display = "none";
+      } catch (err) {
+        setResult("error", "Seed failed — is QueryFlux running with examples/with-opa-oidc/config.yaml?", String(err));
+      } finally {
+        setBusy(false);
+      }
+    }
+
+    async function runQuery() {
+      const id = identity();
+      const sql = sqlEl.value.trim();
+      if (!sql) {
+        setResult("error", "SQL is empty.", "");
+        return;
+      }
+      setBusy(true);
+      try {
+        let result = await trinoQuery(id.user, id.password, sql);
+        if (result.error && looksUnseeded(result.error)) {
+          await seedData();
+          result = await trinoQuery(id.user, id.password, sql);
+        }
+        if (result.error) {
+          const kind = /denied|access/i.test(result.error) ? "deny" : "error";
+          setResult(kind, result.error, result.body);
+          return;
+        }
+        const n = (result.rows || []).length;
+        setResult(
+          "allow",
+          `${n} row${n === 1 ? "" : "s"} as ${id.user}`,
+          null,
+          { columns: result.columns || [], rows: result.rows || [] }
+        );
+        outEl.style.display = "none";
+      } catch (err) {
+        setResult("error", "Could not reach QueryFlux SQL on :8080 (UI proxies /v1/).", String(err));
+      } finally {
+        setBusy(false);
+      }
+    }
+
+    async function dryRun() {
+      const id = identity();
+      const sql = sqlEl.value;
+      setBusy(true);
+      try {
+        const res = await fetch("/qf/admin/access-control/dry-run", {
+          method: "POST",
+          headers: {
+            Authorization: ADMIN,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            sql,
+            clusterGroup: "trino-opa",
+            dialect: "trino",
+            identity: { user: id.user, groups: id.groups, roles: id.roles },
+          }),
+        });
+        const text = await res.text();
+        let data;
+        try { data = JSON.parse(text); } catch { data = { raw: text }; }
+        if (!res.ok) {
+          setResult("error", `QueryFlux ${res.status} — is it running with examples/with-opa-oidc/config.yaml?`, data);
+          return;
+        }
+        const kind = data.outcome || "ok";
+        const summary =
+          kind === "rewrite"
+            ? `Allowed with rewrite for ${id.user}`
+            : kind === "deny"
+              ? (data.reason || "Denied")
+              : `Allowed for ${id.user}`;
+        setResult(kind, summary, data);
+      } catch (err) {
+        setResult("error", "Could not reach QueryFlux via the UI proxy (host :9000).", String(err));
+      } finally {
+        setBusy(false);
+      }
+    }
+
+    async function askOpa() {
+      const id = identity();
+      const tables = extractTables(sqlEl.value);
+      if (!tables.length) {
+        setResult("error", "Could not find a FROM/JOIN table in the SQL.", sqlEl.value);
+        return;
+      }
+      const payload = {
+        input: {
+          identity: { user: id.user, groups: id.groups, roles: id.roles, attributes: {} },
+          action: {
+            operation: "table.select",
+            resources: tables.map((table) => ({ table })),
+          },
+          context: {
+            clusterGroup: "trino-opa",
+            engine: "trino",
+            queryId: "demo-ui",
+            sessionParams: {},
+          },
+        },
+      };
+      setBusy(true);
+      try {
+        const res = await fetch("/opa/v1/data/queryflux/access", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        });
+        const data = await res.json();
+        const resources = (data.result && data.result.resources) || [];
+        const denied = resources.find((r) => !r.allow);
+        const rewrite = resources.some((r) => (r.rowFilters && r.rowFilters.length) || (r.columnMasks && r.columnMasks.length));
+        const kind = denied ? "deny" : rewrite ? "rewrite" : "allow";
+        const summary = denied
+          ? (denied.reason || `Denied ${denied.table}`)
+          : `OPA verdict for ${tables.join(", ")} as ${id.user}`;
+        setResult(kind, summary, data);
+      } catch (err) {
+        setResult("error", "Could not reach OPA.", String(err));
+      } finally {
+        setBusy(false);
+      }
+    }
+
+    document.getElementById("run").addEventListener("click", runQuery);
+    document.getElementById("seed").addEventListener("click", seed);
+    document.getElementById("dry-run").addEventListener("click", dryRun);
+    document.getElementById("ask-opa").addEventListener("click", askOpa);
+
+    fetch("/access.rego")
+      .then((r) => r.text())
+      .then((t) => { document.getElementById("policy").textContent = t; })
+      .catch(() => { document.getElementById("policy").textContent = "could not load access.rego"; });
+  </script>
+</body>
+</html>

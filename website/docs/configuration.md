@@ -86,6 +86,40 @@ clusters:
 
 `auth` controls who can authenticate to QueryFlux; `authorization` controls which cluster groups they can route to; `clusters[].queryAuth` controls which identity the query runs as on the backend engine — independent of the client's own credential. See **[Authentication & identity](./authentication)** for the full picture, a decision guide for `queryAuth` modes, and per-engine setup requirements.
 
+## Access control
+
+```yaml
+accessControl:
+  enabled: true                     # default for cluster groups; false = opt-in per group
+  defaultConnection: prod           # groups without an override use this connection
+  connections:
+    prod:
+      provider: opa
+      opa:
+        url: http://localhost:8181
+        decisionPath: /v1/data/queryflux/access
+        timeoutMs: 1000
+      operations: [table.select]
+      onMissingSchema: evaluate
+      failOpen: false
+      cacheTtlMs: 5000
+      sessionParamKeys: [customer_id, tenant_id]
+  groups:
+    sandbox:
+      enabled: false
+```
+
+When set, QueryFlux connects to **OPA** and asks whether the verified identity may read each referenced table, then optionally rewrites SQL with row filters and column masks **before** dialect translation. QueryFlux does not author the policy (Rego stays in OPA).
+
+- **`enabled`** — global default for cluster groups; `false` means opt-in only where `groups.<name>.enabled: true`.
+- **`connections`** — named policy-provider connections. No name is reserved.
+- **`defaultConnection`** — which connection a group uses when it has no explicit `groups.<name>.connection` override. **Unset means such a group gets no access control at all.**
+- **`groups.<name>.enabled`** — per cluster group: inherit (omit), force on, or skip OPA (`false`).
+- **`groups.<name>.connection`** — route this group to a different named connection instead of `defaultConnection` (network segmentation, blast-radius isolation, provider migration — see [Multiple connections](./access-control/overview#multiple-connections)).
+- **Studio** — the **Access Control** page can add/edit/remove any number of connections and set `defaultConnection` + per-group scope.
+
+Omit the block (or `{ "enabled": false }` with no `connections`, via the Admin API) to disconnect. Full reference: **[Access control](./access-control/overview)** and **[OPA provider](./access-control/opa)**.
+
 ## Admin API
 
 ```yaml

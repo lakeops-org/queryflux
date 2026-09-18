@@ -1,0 +1,55 @@
+# Demo policy for examples/with-cerbos. Validated against a real Cerbos PDP
+# (ghcr.io/cerbos/cerbos:latest) — see README.md for the exact curl calls.
+#
+# Every table QueryFlux's CerbosProvider sends is under the fixed resource kind
+# "table" (see crates/queryflux-access-control/src/providers/cerbos/wire.rs) —
+# one policy file governs every table generically, matching on R.attr.table the
+# way a single rego package matches on input.action.resources for OPA.
+#
+# Row filters / column masks have no native Cerbos concept — they're carried
+# through the generic `outputs` mechanism using a convention QueryFlux defines:
+# a rule emits `{"kind": "row_filter", "expression": ...}` or
+# `{"kind": "column_mask", "column": ..., "type": ...}` (or a *list* of either)
+# from `output.when.ruleActivated`.
+#
+# engineer (alice): customers + payroll, all rows, unmasked SSN
+# analyst  (bob):   customers only, region = 'EU', SSN SHOW_LAST_4; payroll denied
+
+apiVersion: api.cerbos.dev/v1
+resourcePolicy:
+  resource: table
+  version: default
+  rules:
+    - actions: ["table.select"]
+      roles: ["engineer"]
+      effect: EFFECT_ALLOW
+      condition:
+        match:
+          expr: R.attr.table in ["customers", "payroll"]
+
+    # One rule, one CEL expression, two outputs — QueryFlux's CerbosProvider
+    # expands a single `outputs[].val` that is itself a list into that many
+    # row filters/column masks (see `wire::PolicyOutputs`).
+    - actions: ["table.select"]
+      roles: ["analyst"]
+      effect: EFFECT_ALLOW
+      condition:
+        match:
+          expr: R.attr.table == "customers"
+      output:
+        when:
+          ruleActivated: >
+            [
+              {"kind": "row_filter", "expression": "region = 'EU'"},
+              {"kind": "column_mask", "column": "ssn", "type": "SHOW_LAST_4"}
+            ]
+
+    - actions: ["table.select"]
+      roles: ["analyst"]
+      effect: EFFECT_DENY
+      condition:
+        match:
+          expr: R.attr.table == "payroll"
+
+    # Everything else (no matching role, or a table this policy doesn't know
+    # about) falls through to Cerbos's own default: EFFECT_DENY.

@@ -25,7 +25,7 @@ use queryflux_engine_adapters::{
     wire_auth::{enrich_session_for_passthrough, resolve_stored_wire_auth},
     AdapterKind, AsyncAdapter, BackendQueryIdSlot, ConnectionFormat, SyncAdapter,
 };
-use queryflux_guardrails::{GuardChain, GuardContext, GuardLayer};
+use queryflux_guardrails::{GuardChain, GuardChainOutcome, GuardContext, GuardLayer};
 use queryflux_metrics::MetricsStore;
 
 use tracing::{debug, info, warn};
@@ -179,6 +179,7 @@ pub async fn dispatch_query(
         group_default_tags,
         guard_chain,
         group_guard_chain,
+        access_control_guard,
         cluster_cfg,
         adapters,
         max_queued_queries,
@@ -198,6 +199,7 @@ pub async fn dispatch_query(
                 .unwrap_or_default(),
             live.guard_chain.clone(),
             live.group_guard_chains.get(&group.0).cloned(),
+            live.access_control_guard.clone(),
             // cluster_cfg resolved after cluster selection below; captured here
             // so credential resolution uses the same config generation.
             live.cluster_configs.clone(),
@@ -224,6 +226,9 @@ pub async fn dispatch_query(
     }
 
     let effective_tags = merge_tags(&group_default_tags, &session.tags().clone());
+    // Computed here (before translation) so the access-control stage below and the
+    // guard chain further down share one resolution.
+    let resolved_agent_ctx = session.resolved_agent_context();
 
     // Admission fairness: don't take a slot that an older, actively-polling
     // queued query is waiting for. Only binds when capacity is scarce — with
@@ -359,21 +364,90 @@ pub async fn dispatch_query(
     let src_dialect = resolve_src_dialect(&session, &protocol);
     let engine_type = adapter_kind.engine_type();
     let original_sql = sql.clone();
-    let sql = if should_attempt_translation(&session, &protocol) {
-        let schema_context = state
-            .translation
-            .resolve_schema_context(
+    let attempt_translation = should_attempt_translation(&session, &protocol);
+    // Resolved unconditionally — independent of `attempt_translation`. That flag governs
+    // whether `maybe_translate` risks mis-rendering output SQL under a guessed dialect; it
+    // says nothing about whether access control has schema to work with. Coupling the two
+    // meant an MCP session with no declared dialect (translation always skipped there) also
+    // never got real catalog schema, so `onMissingSchema: deny` spuriously denied queries
+    // whose schema was perfectly resolvable. `resolve_schema_context` never fails and is a
+    // cheap no-op when no catalog is configured, so calling it here is always safe.
+    let schema_context = state
+        .translation
+        .resolve_schema_context(&sql, &src_dialect, &catalog, session.catalog(), session.database())
+        .await;
+
+    // Access control: runs on the SOURCE SQL, before dialect translation — every guard
+    // decision (including row filters / column masks) is intent-level and answerable from
+    // what the client actually sent. See `access_control_guard::run_access_control_stage`.
+    let mut all_guard_actions: Vec<queryflux_persistence::GuardAction> = Vec::new();
+    let mut access_control_rewrote = false;
+    let access_controlled_sql = if let Some(guard) = &access_control_guard {
+        if guard.enabled_for_group(&group.0) {
+            use crate::access_control_guard::{run_access_control_stage, AccessStageOutcome};
+            match run_access_control_stage(
+                guard,
                 &sql,
                 &src_dialect,
-                &catalog,
-                session.catalog(),
-                session.database(),
+                &engine_type,
+                &group,
+                auth_ctx,
+                &session,
+                Some(&schema_context),
+                &effective_tags,
             )
-            .await;
+            .await
+            {
+                AccessStageOutcome::Allowed { action } => {
+                    all_guard_actions.push(action);
+                    sql.clone()
+                }
+                AccessStageOutcome::Rewritten {
+                    sql: rewritten,
+                    action,
+                } => {
+                    all_guard_actions.push(action);
+                    access_control_rewrote = true;
+                    rewritten
+                }
+                AccessStageOutcome::Denied { reason, action, .. } => {
+                    let ctx = QueryContext {
+                        query_id: query_id.clone(),
+                        sql: original_sql.clone(),
+                        session: session.clone(),
+                        protocol: protocol.clone(),
+                        group: group.clone(),
+                        cluster: cluster_name.clone(),
+                        cluster_group_config_id,
+                        cluster_config_id,
+                        engine_type: engine_type.clone(),
+                        src_dialect: src_dialect.clone(),
+                        tgt_dialect: tgt_dialect.clone(),
+                        was_rewritten: false,
+                        rewritten_sql: None,
+                        was_translated: false,
+                        translated_sql: None,
+                        query_tags: effective_tags.clone(),
+                        query_params: vec![],
+                        agent_context: resolved_agent_ctx.clone(),
+                    };
+                    return Err(
+                        deny_and_record(state, &mut slot, &ctx, reason, 0, vec![action]).await,
+                    );
+                }
+            }
+        } else {
+            sql.clone()
+        }
+    } else {
+        sql.clone()
+    };
+
+    let engine_sql = if attempt_translation {
         match state
             .translation
             .maybe_translate(
-                &sql,
+                &access_controlled_sql,
                 &src_dialect,
                 &tgt_dialect,
                 &schema_context,
@@ -389,35 +463,111 @@ pub async fn dispatch_query(
             }
         }
     } else {
-        sql
+        access_controlled_sql.clone()
     };
-    let was_translated = sql != original_sql;
-    if was_translated {
-        info!(id = %query_id, src = ?src_dialect, tgt = ?tgt_dialect, "SQL translated");
+
+    // Invariant assert (NOT a second guard stage): access control already decided intent
+    // on the source SQL above. This is a narrow safety net over our own scan-site rewrite
+    // and `maybe_translate`, guarding against a bug in either turning a read into a write.
+    // Scoped to only run when access control actually rewrote the query, using the cheap
+    // Rust-native (no Python) classifier, so ordinary queries pay nothing extra.
+    if access_control_rewrote {
+        let src_read_like = queryflux_core::sql_classify::SqlParseCache::new(
+            original_sql.clone(),
+            src_dialect.clone(),
+        )
+        .is_read_like_async()
+        .await;
+        let final_read_like = queryflux_core::sql_classify::SqlParseCache::new(
+            engine_sql.clone(),
+            tgt_dialect.clone(),
+        )
+        .is_read_like_async()
+        .await;
+        if src_read_like && !final_read_like {
+            let reason = "access-control invariant violated: statement kind changed from read to non-read after rewrite/translation".to_string();
+            warn!(id = %query_id, "{reason}");
+            let pipeline = crate::sql_pipeline::SqlPipelineMeta::compute(
+                &access_controlled_sql,
+                &engine_sql,
+                access_control_rewrote,
+            );
+            let (was_rewritten, rewritten_sql, was_translated, translated_sql) =
+                crate::sql_pipeline::pipeline_fields(&pipeline);
+            let ctx = QueryContext {
+                query_id: query_id.clone(),
+                sql: original_sql.clone(),
+                session: session.clone(),
+                protocol: protocol.clone(),
+                group: group.clone(),
+                cluster: cluster_name.clone(),
+                cluster_group_config_id,
+                cluster_config_id,
+                engine_type: engine_type.clone(),
+                src_dialect: src_dialect.clone(),
+                tgt_dialect: tgt_dialect.clone(),
+                was_rewritten,
+                rewritten_sql,
+                was_translated,
+                translated_sql,
+                query_tags: effective_tags.clone(),
+                query_params: vec![],
+                agent_context: resolved_agent_ctx.clone(),
+            };
+            return Err(deny_and_record(
+                state,
+                &mut slot,
+                &ctx,
+                reason,
+                0,
+                all_guard_actions.clone(),
+            )
+            .await);
+        }
     }
 
     // Fallback interpolation for async adapters that don't support native params.
-    let (sql, effective_params) = if !params.is_empty() {
-        (interpolate_params(&sql, &params, &tgt_dialect)?, vec![])
+    let (engine_sql, effective_params) = if !params.is_empty() {
+        (
+            interpolate_params(&engine_sql, &params, &tgt_dialect)?,
+            vec![],
+        )
     } else {
-        (sql, params)
+        (engine_sql, params)
     };
+
+    let pipeline = crate::sql_pipeline::SqlPipelineMeta::compute(
+        &access_controlled_sql,
+        &engine_sql,
+        access_control_rewrote,
+    );
+    if pipeline.was_translated {
+        info!(id = %query_id, src = ?src_dialect, tgt = ?tgt_dialect, "SQL translated");
+    } else if pipeline.was_rewritten {
+        info!(id = %query_id, "SQL rewritten by access control");
+    }
+    let (was_rewritten, rewritten_sql, was_translated, translated_sql) =
+        crate::sql_pipeline::pipeline_fields(&pipeline);
 
     // Guard chain: runs after translation (SQL is final), before engine submission.
     // Global guards run first; per-group guards are appended after.
-    let resolved_agent_ctx = session.resolved_agent_context();
-    let mut all_guard_actions: Vec<queryflux_persistence::GuardAction> = Vec::new();
     let sql_parse =
-        queryflux_core::sql_classify::SqlParseCache::new(sql.clone(), tgt_dialect.clone());
+        queryflux_core::sql_classify::SqlParseCache::new(engine_sql.clone(), tgt_dialect.clone());
 
     let guard_ctx = GuardContext {
-        sql: &original_sql,
-        translated_sql: &sql,
+        sql: &engine_sql,
+        original_sql: Some(&original_sql),
+        dialect: &tgt_dialect,
         engine_type: &engine_type,
         cluster_group: &group,
         user: session.user(),
+        groups: &auth_ctx.groups,
+        roles: &auth_ctx.roles,
+        attributes: &auth_ctx.attributes,
         agent_context: resolved_agent_ctx.as_ref(),
         query_tags: &effective_tags,
+        session_extra: &session.extra,
+        schema: None,
         sql_parse: Some(&sql_parse),
     };
 
@@ -440,12 +590,10 @@ pub async fn dispatch_query(
                 engine_type: engine_type.clone(),
                 src_dialect: src_dialect.clone(),
                 tgt_dialect: tgt_dialect.clone(),
+                was_rewritten,
+                rewritten_sql: rewritten_sql.clone(),
                 was_translated,
-                translated_sql: if was_translated {
-                    Some(sql.clone())
-                } else {
-                    None
-                },
+                translated_sql: translated_sql.clone(),
                 query_tags: effective_tags.clone(),
                 query_params: vec![],
                 agent_context: resolved_agent_ctx.clone(),
@@ -471,18 +619,13 @@ pub async fn dispatch_query(
         }};
     }
 
-    if let Some(chain) = &guard_chain {
-        let (actions, was_blocked) = chain.run(&guard_ctx, GuardLayer::Plan).await;
+    for chain in [guard_chain.as_ref(), group_guard_chain.as_ref()]
+        .into_iter()
+        .flatten()
+    {
+        let (actions, outcome) = chain.run(&guard_ctx, GuardLayer::Plan).await;
         all_guard_actions.extend(actions);
-        if was_blocked {
-            guard_deny!(std::mem::take(&mut all_guard_actions));
-        }
-    }
-
-    if let Some(chain) = &group_guard_chain {
-        let (actions, was_blocked) = chain.run(&guard_ctx, GuardLayer::Plan).await;
-        all_guard_actions.extend(actions);
-        if was_blocked {
+        if matches!(outcome, GuardChainOutcome::Blocked { .. }) {
             guard_deny!(std::mem::take(&mut all_guard_actions));
         }
     }
@@ -506,7 +649,7 @@ pub async fn dispatch_query(
         AdapterKind::Async(adapter) => {
             let execution = match adapter
                 .submit_query(
-                    &sql,
+                    &engine_sql,
                     &session,
                     &credentials,
                     &effective_tags,
@@ -541,12 +684,11 @@ pub async fn dispatch_query(
             let now = Utc::now();
             let executing = ExecutingQuery {
                 id: query_id.clone(),
-                sql,
-                translated_sql: if was_translated {
-                    Some(original_sql)
-                } else {
-                    None
-                },
+                sql: engine_sql,
+                client_sql: Some(original_sql.clone()),
+                rewritten_sql: rewritten_sql.clone(),
+                was_dialect_translated: was_translated,
+                translated_sql: None,
                 cluster_group: group.clone(),
                 cluster_name: cluster_name.clone(),
                 cluster_group_config_id,
@@ -614,15 +756,12 @@ pub async fn dispatch_query(
                     // Disarm the RAII guard; finalize will call release_query_slot explicitly.
                     slot.disarm();
                     info!(id = %query_id, backend = %backend_query_id, cluster = %cluster_name, "Query completed on submit");
-                    let was_translated = executing.translated_sql.is_some();
                     let src_dialect = resolve_src_dialect(&session, &protocol);
-                    let ctx = QueryContext {
+                    let (original_sql, pipeline) =
+                        crate::sql_pipeline::pipeline_from_executing(&executing);
+                    let mut ctx = QueryContext {
                         query_id: executing.id.clone(),
-                        sql: executing
-                            .translated_sql
-                            .as_deref()
-                            .unwrap_or(&executing.sql)
-                            .to_string(),
+                        sql: original_sql,
                         session: session.clone(),
                         protocol,
                         group: executing.cluster_group.clone(),
@@ -632,16 +771,15 @@ pub async fn dispatch_query(
                         engine_type: adapter.engine_type(),
                         src_dialect,
                         tgt_dialect: adapter.translation_target_dialect(),
-                        was_translated,
-                        translated_sql: if was_translated {
-                            Some(executing.sql.clone())
-                        } else {
-                            None
-                        },
+                        was_rewritten: false,
+                        rewritten_sql: None,
+                        was_translated: false,
+                        translated_sql: None,
                         query_tags: executing.query_tags.clone(),
                         query_params: vec![],
                         agent_context: executing.agent_context.clone(),
                     };
+                    crate::sql_pipeline::apply_pipeline(&mut ctx, &pipeline);
                     finalize_async_terminal_on_submit(
                         state,
                         &executing,
@@ -1296,7 +1434,14 @@ async fn setup_sync_query(
 ) -> Result<SyncQuerySetup> {
     let query_id = ProxyQueryId::new();
 
-    let (cluster_manager, group_fixups, group_default_tags, wait_timeout_secs, catalog) = {
+    let (
+        cluster_manager,
+        group_fixups,
+        group_default_tags,
+        wait_timeout_secs,
+        catalog,
+        access_control_guard,
+    ) = {
         let live = state.live.read().await;
         let wait_timeout_secs = live
             .group_capacity_wait_timeout_secs
@@ -1315,6 +1460,7 @@ async fn setup_sync_query(
                 .unwrap_or_default(),
             wait_timeout_secs,
             live.catalog.clone(),
+            live.access_control_guard.clone(),
         )
     };
     let effective_tags: QueryTags = merge_tags(&group_default_tags, &session.tags().clone());
@@ -1409,26 +1555,104 @@ async fn setup_sync_query(
     let src_dialect = resolve_src_dialect(&session, &protocol);
     let engine_type = adapter.engine_type();
     let start = Instant::now();
+    let original_sql = sql.clone();
+    let attempt_translation = should_attempt_translation(&session, &protocol);
+
+    // Resolved unconditionally — see the identical comment in `dispatch_query`: schema
+    // resolution for access control must not be gated on whether dialect translation
+    // itself is safe to attempt.
+    let schema_context = state
+        .translation
+        .resolve_schema_context(
+            &original_sql,
+            &src_dialect,
+            &catalog,
+            session.catalog(),
+            session.database(),
+        )
+        .await;
+
+    // Access control: runs on the SOURCE SQL, before dialect translation (see the async
+    // dispatch path for the full rationale). On deny: record the query, release the slot,
+    // propagate. On rewrite: `access_controlled_sql` replaces `sql` for translation below.
+    let mut pre_guard_actions: Vec<queryflux_persistence::GuardAction> = Vec::new();
+    let mut access_control_rewrote = false;
+    let access_controlled_sql = if let Some(guard) = &access_control_guard {
+        if guard.enabled_for_group(&group.0) {
+            use crate::access_control_guard::{run_access_control_stage, AccessStageOutcome};
+            match run_access_control_stage(
+                guard,
+                &original_sql,
+                &src_dialect,
+                &engine_type,
+                &group,
+                auth_ctx,
+                &session,
+                Some(&schema_context),
+                &effective_tags,
+            )
+            .await
+            {
+                AccessStageOutcome::Allowed { action } => {
+                    pre_guard_actions.push(action);
+                    original_sql.clone()
+                }
+                AccessStageOutcome::Rewritten {
+                    sql: rewritten,
+                    action,
+                } => {
+                    pre_guard_actions.push(action);
+                    access_control_rewrote = true;
+                    rewritten
+                }
+                AccessStageOutcome::Denied { reason, action, .. } => {
+                    let ctx = QueryContext {
+                        query_id: query_id.clone(),
+                        sql: original_sql.clone(),
+                        session: session.clone(),
+                        protocol: protocol.clone(),
+                        group: group.clone(),
+                        cluster: cluster_name.clone(),
+                        cluster_group_config_id,
+                        cluster_config_id,
+                        engine_type: engine_type.clone(),
+                        src_dialect: src_dialect.clone(),
+                        tgt_dialect: tgt_dialect.clone(),
+                        was_rewritten: false,
+                        rewritten_sql: None,
+                        was_translated: false,
+                        translated_sql: None,
+                        query_tags: effective_tags,
+                        query_params: params,
+                        agent_context: session.resolved_agent_context(),
+                    };
+                    return Err(deny_and_record(
+                        state,
+                        &mut slot,
+                        &ctx,
+                        reason,
+                        start.elapsed().as_millis() as u64,
+                        vec![action],
+                    )
+                    .await);
+                }
+            }
+        } else {
+            original_sql.clone()
+        }
+    } else {
+        original_sql.clone()
+    };
 
     // Translate SQL. On failure: record the query, release the slot, propagate the error.
     // The caller (execute_to_sink) will notify the sink via on_error. Skipped entirely
     // (sqlglot never invoked) when should_attempt_translation is false — see its doc
     // comment for why MCP without a declared dialect takes this path.
-    let translated = if should_attempt_translation(&session, &protocol) {
-        let schema_context = state
-            .translation
-            .resolve_schema_context(
-                &sql,
-                &src_dialect,
-                &catalog,
-                session.catalog(),
-                session.database(),
-            )
-            .await;
+    let translated = if attempt_translation {
         match state
             .translation
             .maybe_translate(
-                &sql,
+                &access_controlled_sql,
                 &src_dialect,
                 &tgt_dialect,
                 &schema_context,
@@ -1442,7 +1666,7 @@ async fn setup_sync_query(
                 warn!(id = %query_id, "Translation error: {err_msg}");
                 let ctx = QueryContext {
                     query_id: query_id.clone(),
-                    sql: sql.clone(),
+                    sql: original_sql.clone(),
                     session: session.clone(),
                     protocol: protocol.clone(),
                     group: group.clone(),
@@ -1452,6 +1676,8 @@ async fn setup_sync_query(
                     engine_type: engine_type.clone(),
                     src_dialect: src_dialect.clone(),
                     tgt_dialect: tgt_dialect.clone(),
+                    was_rewritten: false,
+                    rewritten_sql: None,
                     was_translated: false,
                     translated_sql: None,
                     query_tags: effective_tags,
@@ -1479,10 +1705,65 @@ async fn setup_sync_query(
             }
         }
     } else {
-        sql.clone()
+        access_controlled_sql.clone()
     };
 
-    let was_translated = translated != sql;
+    // Invariant assert (NOT a second guard stage — see the async dispatch path for the
+    // full rationale). Scoped to only run when access control actually rewrote the query.
+    if access_control_rewrote {
+        let src_read_like = queryflux_core::sql_classify::SqlParseCache::new(
+            original_sql.clone(),
+            src_dialect.clone(),
+        )
+        .is_read_like_async()
+        .await;
+        let final_read_like = queryflux_core::sql_classify::SqlParseCache::new(
+            translated.clone(),
+            tgt_dialect.clone(),
+        )
+        .is_read_like_async()
+        .await;
+        if src_read_like && !final_read_like {
+            let reason = "access-control invariant violated: statement kind changed from read to non-read after rewrite/translation".to_string();
+            warn!(id = %query_id, "{reason}");
+            let pipeline = crate::sql_pipeline::SqlPipelineMeta::compute(
+                &access_controlled_sql,
+                &translated,
+                access_control_rewrote,
+            );
+            let (was_rewritten, rewritten_sql, was_translated, translated_sql) =
+                crate::sql_pipeline::pipeline_fields(&pipeline);
+            let ctx = QueryContext {
+                query_id: query_id.clone(),
+                sql: original_sql.clone(),
+                session: session.clone(),
+                protocol: protocol.clone(),
+                group: group.clone(),
+                cluster: cluster_name.clone(),
+                cluster_group_config_id,
+                cluster_config_id,
+                engine_type: engine_type.clone(),
+                src_dialect: src_dialect.clone(),
+                tgt_dialect: tgt_dialect.clone(),
+                was_rewritten,
+                rewritten_sql,
+                was_translated,
+                translated_sql,
+                query_tags: effective_tags,
+                query_params: params,
+                agent_context: session.resolved_agent_context(),
+            };
+            return Err(deny_and_record(
+                state,
+                &mut slot,
+                &ctx,
+                reason,
+                start.elapsed().as_millis() as u64,
+                pre_guard_actions,
+            )
+            .await);
+        }
+    }
 
     let credentials = match state
         .identity_resolver
@@ -1528,10 +1809,18 @@ async fn setup_sync_query(
         (translated, params)
     };
 
+    let pipeline = crate::sql_pipeline::SqlPipelineMeta::compute(
+        &access_controlled_sql,
+        &translated,
+        access_control_rewrote,
+    );
+    let (was_rewritten, rewritten_sql, was_translated, translated_sql) =
+        crate::sql_pipeline::pipeline_fields(&pipeline);
+
     let agent_context = session.resolved_agent_context();
     let ctx = QueryContext {
         query_id,
-        sql,
+        sql: original_sql,
         session,
         protocol,
         group,
@@ -1541,12 +1830,10 @@ async fn setup_sync_query(
         engine_type,
         src_dialect,
         tgt_dialect: tgt_dialect.clone(),
+        was_rewritten,
+        rewritten_sql,
         was_translated,
-        translated_sql: if was_translated {
-            Some(translated.clone())
-        } else {
-            None
-        },
+        translated_sql,
         query_tags: effective_tags,
         query_params: effective_params.clone(),
         agent_context,
@@ -1561,7 +1848,7 @@ async fn setup_sync_query(
         ctx,
         credentials,
         params: effective_params,
-        guard_actions: vec![],
+        guard_actions: pre_guard_actions,
         wire_auth,
     })
 }
@@ -1816,12 +2103,45 @@ async fn execute_native_to_sink(
     (outcome, sink.on_complete(&stats).await)
 }
 
+/// Record a `Denied` query outcome, release the cluster slot, and return the error to
+/// propagate — the "record + release + return" contract every access-control/invariant
+/// denial site must uphold. Defined once so a future `QueryOutcome` field only needs
+/// updating here, not independently at every call site.
+async fn deny_and_record(
+    state: &Arc<AppState>,
+    slot: &mut ClusterSlotGuard,
+    ctx: &QueryContext,
+    reason: String,
+    execution_ms: u64,
+    guard_actions: Vec<queryflux_persistence::GuardAction>,
+) -> QueryFluxError {
+    state.record_query(
+        ctx,
+        QueryOutcome {
+            backend_query_id: None,
+            status: QueryStatus::Denied,
+            execution_ms,
+            rows: None,
+            error: Some(reason.clone()),
+            routing_trace: None,
+            engine_stats: None,
+            guard_actions,
+            was_guard_blocked: true,
+            queue_duration_ms: 0,
+            cache_hit: false,
+        },
+    );
+    slot.release().await;
+    QueryFluxError::Unauthorized(reason)
+}
+
 async fn run_plan_guards(
     guard_chain: &Option<Arc<GuardChain>>,
     group_guard_chain: &Option<Arc<GuardChain>>,
     sql: &str,
     group: &ClusterGroupName,
     session: &SessionContext,
+    auth_ctx: &AuthContext,
     effective_tags: &queryflux_core::tags::QueryTags,
 ) -> std::result::Result<Vec<queryflux_persistence::GuardAction>, String> {
     let engine_type = queryflux_core::query::EngineType::Cache;
@@ -1832,12 +2152,18 @@ async fn run_plan_guards(
     );
     let guard_ctx = GuardContext {
         sql,
-        translated_sql: sql,
+        original_sql: None,
+        dialect: &queryflux_core::query::SqlDialect::Generic,
         engine_type: &engine_type,
         cluster_group: group,
         user: session.user(),
+        groups: &auth_ctx.groups,
+        roles: &auth_ctx.roles,
+        attributes: &auth_ctx.attributes,
         agent_context: resolved_agent_ctx.as_ref(),
         query_tags: effective_tags,
+        session_extra: &session.extra,
+        schema: None,
         sql_parse: Some(&sql_parse),
     };
 
@@ -1846,9 +2172,9 @@ async fn run_plan_guards(
         .into_iter()
         .flatten()
     {
-        let (actions, was_blocked) = chain.run(&guard_ctx, GuardLayer::Plan).await;
+        let (actions, outcome) = chain.run(&guard_ctx, GuardLayer::Plan).await;
         all_actions.extend(actions);
-        if was_blocked {
+        if matches!(outcome, GuardChainOutcome::Blocked { .. }) {
             return Err(all_actions
                 .iter()
                 .find(|a| a.action == "deny")
@@ -1878,13 +2204,15 @@ pub async fn execute_to_sink(
     sink: &mut impl ResultSink,
     auth_ctx: &AuthContext,
 ) -> Result<()> {
-    let (authorization, guard_chain, group_guard_chain, cache_cfg) = {
+    let (authorization, guard_chain, group_guard_chain, cache_cfg, access_control_guard, catalog) = {
         let live = state.live.read().await;
         (
             live.authorization.clone(),
             live.guard_chain.clone(),
             live.group_guard_chains.get(&group.0).cloned(),
             live.group_cache_settings.get(&group.0).cloned(),
+            live.access_control_guard.clone(),
+            live.catalog.clone(),
         )
     };
 
@@ -1919,26 +2247,75 @@ pub async fn execute_to_sink(
                 .unwrap_or_default();
             merge_tags(&group_defaults, &session.tags().clone())
         };
-        let guard_actions = match run_plan_guards(
-            &guard_chain,
-            &group_guard_chain,
-            &sql,
-            &group,
-            &session,
-            &effective_tags,
-        )
-        .await
-        {
-            Ok(actions) => actions,
-            Err(deny_reason) => return sink.on_error(&deny_reason).await,
+
+        // Access control must be re-validated here, not skipped just because this request
+        // happens to be servable from cache — a cache hit otherwise serves whatever was
+        // cached under this (sql, user, group) key regardless of whether the user's *current*
+        // policy still allows it. A `Rewritten` outcome means the query's row filters/masks
+        // may have changed since the entry was cached, so the cached bytes can no longer be
+        // trusted verbatim: the cache lookup below is skipped (forced miss) and execution
+        // falls through to `execute_to_sink_inner`, which re-runs access control for real and
+        // repopulates the cache with a result reflecting the current policy.
+        let mut skip_cache_lookup = false;
+        if let Some(guard) = &access_control_guard {
+            if guard.enabled_for_group(&group.0) {
+                use crate::access_control_guard::{run_access_control_stage, AccessStageOutcome};
+                let src_dialect = resolve_src_dialect(&session, &protocol);
+                let schema_context = state
+                    .translation
+                    .resolve_schema_context(&sql, &src_dialect, &catalog, session.catalog(), session.database())
+                    .await;
+                match run_access_control_stage(
+                    guard,
+                    &sql,
+                    &src_dialect,
+                    &queryflux_core::query::EngineType::Cache,
+                    &group,
+                    auth_ctx,
+                    &session,
+                    Some(&schema_context),
+                    &effective_tags,
+                )
+                .await
+                {
+                    AccessStageOutcome::Denied { reason, .. } => {
+                        return sink.on_error(&reason).await
+                    }
+                    AccessStageOutcome::Rewritten { .. } => skip_cache_lookup = true,
+                    AccessStageOutcome::Allowed { .. } => {}
+                }
+            }
+        }
+
+        let guard_actions = if skip_cache_lookup {
+            Vec::new()
+        } else {
+            match run_plan_guards(
+                &guard_chain,
+                &group_guard_chain,
+                &sql,
+                &group,
+                &session,
+                auth_ctx,
+                &effective_tags,
+            )
+            .await
+            {
+                Ok(actions) => actions,
+                Err(deny_reason) => return sink.on_error(&deny_reason).await,
+            }
         };
 
         let mut cache_sink_adapter = SinkCacheAdapter(sink);
-        match state
-            .result_cache
-            .try_stream_cached(key, &mut cache_sink_adapter)
-            .await
-        {
+        let cache_lookup = if skip_cache_lookup {
+            Ok(None)
+        } else {
+            state
+                .result_cache
+                .try_stream_cached(key, &mut cache_sink_adapter)
+                .await
+        };
+        match cache_lookup {
             Ok(Some(_stats)) => {
                 info!(cache_key = %key, rows = _stats.row_count, "Cache hit — serving from cache");
                 state.metrics.on_cache_hit(&group.0);
@@ -1955,6 +2332,8 @@ pub async fn execute_to_sink(
                     engine_type: queryflux_core::query::EngineType::Cache,
                     src_dialect: queryflux_core::query::SqlDialect::Generic,
                     tgt_dialect: queryflux_core::query::SqlDialect::Generic,
+                    was_rewritten: false,
+                    rewritten_sql: None,
                     was_translated: false,
                     translated_sql: None,
                     query_tags: effective_tags,
@@ -2107,25 +2486,33 @@ async fn execute_to_sink_inner(
     {
         let ctx = &setup.ctx;
         let guard_ctx = GuardContext {
-            sql: &ctx.sql,
-            translated_sql: ctx.translated_sql.as_deref().unwrap_or(&setup.translated),
+            sql: ctx.translated_sql.as_deref().unwrap_or(&setup.translated),
+            original_sql: Some(ctx.sql.as_str()),
+            dialect: &ctx.tgt_dialect,
             engine_type: &ctx.engine_type,
             cluster_group: &ctx.group,
             user: ctx.session.user(),
+            groups: &auth_ctx.groups,
+            roles: &auth_ctx.roles,
+            attributes: &auth_ctx.attributes,
             agent_context: ctx.agent_context.as_ref(),
             query_tags: &ctx.query_tags,
+            session_extra: &ctx.session.extra,
+            schema: None,
             sql_parse: Some(&setup.sql_parse),
         };
 
-        let mut all_actions: Vec<queryflux_persistence::GuardAction> = Vec::new();
+        // Start from the access-control action recorded pre-translation (see
+        // `setup_sync_query`) so the audit trail carries the whole pipeline.
+        let mut all_actions: Vec<queryflux_persistence::GuardAction> = setup.guard_actions.clone();
 
         for chain in [guard_chain.as_ref(), group_guard_chain.as_ref()]
             .into_iter()
             .flatten()
         {
-            let (actions, was_blocked) = chain.run(&guard_ctx, GuardLayer::Plan).await;
+            let (actions, outcome) = chain.run(&guard_ctx, GuardLayer::Plan).await;
             all_actions.extend(actions);
-            if was_blocked {
+            if matches!(outcome, GuardChainOutcome::Blocked { .. }) {
                 let deny_reason = all_actions
                     .iter()
                     .find(|a| a.action == "deny")
@@ -2152,8 +2539,8 @@ async fn execute_to_sink_inner(
             }
         }
 
-        // Attach non-blocking guard actions (allow/warn) to the setup context so they
-        // flow into record_query at the normal exit point below.
+        // Attach the combined (pre- + post-translation) guard actions to the setup
+        // context so they flow into record_query at the normal exit point below.
         setup.guard_actions = all_actions;
     }
 

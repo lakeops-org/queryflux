@@ -272,8 +272,9 @@ impl QueryHistoryStore for PostgresStore {
                       COALESCE(cg.name, qr.cluster_group) AS cluster_group,
                       COALESCE(cc.name, qr.cluster_name) AS cluster_name,
                       qr.cluster_group_id, qr.cluster_id,
-                      qr.engine_type, qr.frontend_protocol, qr.username, qr.sql_preview, qr.translated_sql,
-                      qr.status, qr.was_translated,
+                      qr.engine_type, qr.frontend_protocol, qr.username, qr.sql_preview,
+                      qr.rewritten_sql, qr.translated_sql,
+                      qr.status, qr.was_rewritten, qr.was_translated,
                       qr.source_dialect, qr.target_dialect, qr.queue_duration_ms, qr.execution_duration_ms,
                       qr.rows_returned, qr.error_message, qr.routing_trace, qr.created_at,
                       qr.engine_elapsed_time_ms, qr.cpu_time_ms, qr.processed_rows, qr.processed_bytes,
@@ -303,11 +304,12 @@ impl QueryHistoryStore for PostgresStore {
     }
 
     async fn get_dashboard_stats(&self) -> Result<DashboardStats> {
-        let row: (i64, i64, i64, f64) = sqlx::query_as(
+        let row: (i64, i64, i64, i64, f64) = sqlx::query_as(
             r#"SELECT
                 COUNT(*)::bigint,
                 COUNT(*) FILTER (WHERE status != 'Success')::bigint,
                 COUNT(*) FILTER (WHERE was_translated)::bigint,
+                COUNT(*) FILTER (WHERE was_rewritten)::bigint,
                 COALESCE(AVG(execution_duration_ms), 0)::float8
                FROM query_records
                WHERE created_at > NOW() - INTERVAL '1 hour'"#,
@@ -316,7 +318,7 @@ impl QueryHistoryStore for PostgresStore {
         .await
         .map_err(|e| QueryFluxError::Persistence(format!("get_dashboard_stats: {e}")))?;
 
-        let (total, failed, translated, avg_ms) = row;
+        let (total, failed, translated, rewritten, avg_ms) = row;
         Ok(DashboardStats {
             queries_last_hour: total,
             error_rate_last_hour: if total > 0 {
@@ -327,6 +329,11 @@ impl QueryHistoryStore for PostgresStore {
             avg_duration_ms_last_hour: avg_ms,
             translation_rate_last_hour: if total > 0 {
                 translated as f64 / total as f64
+            } else {
+                0.0
+            },
+            rewrite_rate_last_hour: if total > 0 {
+                rewritten as f64 / total as f64
             } else {
                 0.0
             },
@@ -346,6 +353,7 @@ impl QueryHistoryStore for PostgresStore {
                 COALESCE(MAX(execution_duration_ms), 0)::bigint                AS max_execution_ms,
                 COALESCE(AVG(queue_duration_ms), 0)::float8                    AS avg_queue_ms,
                 COUNT(*) FILTER (WHERE was_translated)::bigint                 AS translated_queries,
+                COUNT(*) FILTER (WHERE was_rewritten)::bigint                  AS rewritten_queries,
                 COALESCE(SUM(rows_returned), 0)::bigint                        AS total_rows_returned
                FROM query_records
                WHERE created_at > NOW() - ($1 * INTERVAL '1 hour')
@@ -375,6 +383,7 @@ impl QueryHistoryStore for PostgresStore {
                 COALESCE(MAX(qr.execution_duration_ms), 0)::bigint                AS max_execution_ms,
                 COALESCE(AVG(qr.queue_duration_ms), 0)::float8                      AS avg_queue_ms,
                 COUNT(*) FILTER (WHERE qr.was_translated)::bigint                   AS translated_queries,
+                COUNT(*) FILTER (WHERE qr.was_rewritten)::bigint                    AS rewritten_queries,
                 COALESCE(SUM(qr.rows_returned), 0)::bigint                         AS total_rows_returned
                FROM query_records qr
                LEFT JOIN cluster_group_configs cg ON cg.id = qr.cluster_group_id
@@ -458,8 +467,9 @@ impl QueryHistoryStore for PostgresStore {
                       COALESCE(cg.name, qr.cluster_group) AS cluster_group,
                       COALESCE(cc.name, qr.cluster_name)  AS cluster_name,
                       qr.cluster_group_id, qr.cluster_id,
-                      qr.engine_type, qr.frontend_protocol, qr.username, qr.sql_preview, qr.translated_sql,
-                      qr.status, qr.was_translated,
+                      qr.engine_type, qr.frontend_protocol, qr.username, qr.sql_preview,
+                      qr.rewritten_sql, qr.translated_sql,
+                      qr.status, qr.was_rewritten, qr.was_translated,
                       qr.source_dialect, qr.target_dialect, qr.queue_duration_ms, qr.execution_duration_ms,
                       qr.rows_returned, qr.error_message, qr.routing_trace, qr.created_at,
                       qr.engine_elapsed_time_ms, qr.cpu_time_ms, qr.processed_rows, qr.processed_bytes,
@@ -1712,18 +1722,18 @@ impl MetricsStore for PostgresStore {
         let insert_result = sqlx::query(
             r#"INSERT INTO query_records
                 (proxy_query_id, backend_query_id, cluster_group, cluster_name, engine_type,
-                 frontend_protocol, source_dialect, target_dialect, was_translated, username,
-                 catalog, db_name, sql_preview, translated_sql, status, routing_trace,
-                 queue_duration_ms, execution_duration_ms, rows_returned, error_message,
-                 created_at, engine_elapsed_time_ms, cpu_time_ms, processed_rows, processed_bytes,
-                 physical_input_bytes, peak_memory_bytes, spilled_bytes, total_splits,
-                 cluster_group_id, cluster_id, query_tags,
+                 frontend_protocol, source_dialect, target_dialect, was_rewritten, was_translated,
+                 username, catalog, db_name, sql_preview, rewritten_sql, translated_sql, status,
+                 routing_trace, queue_duration_ms, execution_duration_ms, rows_returned,
+                 error_message, created_at, engine_elapsed_time_ms, cpu_time_ms, processed_rows,
+                 processed_bytes, physical_input_bytes, peak_memory_bytes, spilled_bytes,
+                 total_splits, cluster_group_id, cluster_id, query_tags,
                  query_hash, query_parameterized_hash, translated_query_hash,
                  agent_id, conversation_id, step_index, tool_call_id, query_intent,
                  guard_actions, was_guard_blocked, cache_hit)
                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,
-                       $21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,
-                       $36,$37,$38,$39,$40,$41,$42,$43)
+                       $21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,$37,$38,
+                       $39,$40,$41,$42,$43,$44,$45)
                ON CONFLICT (proxy_query_id) DO NOTHING"#,
         )
         .bind(&r.proxy_query_id)
@@ -1734,11 +1744,13 @@ impl MetricsStore for PostgresStore {
         .bind(format!("{:?}", r.frontend_protocol))
         .bind(format!("{:?}", r.source_dialect))
         .bind(format!("{:?}", r.target_dialect))
+        .bind(r.was_rewritten)
         .bind(r.was_translated)
         .bind(&r.user)
         .bind(&r.catalog)
         .bind(&r.database)
         .bind(&r.sql_preview)
+        .bind(&r.rewritten_sql)
         .bind(&r.translated_sql)
         .bind(format!("{:?}", r.status))
         .bind(&r.routing_trace)
@@ -3026,6 +3038,8 @@ mod tests {
             frontend_protocol: FrontendProtocol::TrinoHttp,
             source_dialect: SqlDialect::Trino,
             target_dialect: SqlDialect::Generic,
+            was_rewritten: false,
+            rewritten_sql: None,
             was_translated: false,
             translated_sql: None,
             user: None,

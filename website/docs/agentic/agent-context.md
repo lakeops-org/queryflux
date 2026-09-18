@@ -130,6 +130,6 @@ Explicit headers and tool parameters still override both defaults — this only 
 | `mutation` | Agent is attempting a write (`INSERT`, `UPDATE`, `DELETE`, DDL). |
 | `unknown` | Intent could not be determined. |
 
-Intent is stored on the query record and visible in Studio. It can also inform guardrail logic — a Python script guard can read `ctx["agent_context"]["query_intent"]` and apply stricter rules to `schema_exploration` queries on large tables.
+Intent is stored on the query record and visible in Studio. It can also inform guardrail logic — a `python_script` guard can read `ctx["agent_context"]["query_intent"]` and apply stricter rules to `schema_exploration` queries on large tables (see [Guardrails § Python script guards](../architecture/guardrails#python-script-guards)) — alongside built-in guards and [access control](../access-control/overview) for agent-facing groups.
 
 Next: [Session replay and guardrails](session-replay) covers what gets persisted and how to reconstruct a full agent session from query history.

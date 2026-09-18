@@ -1,0 +1,82 @@
+# QueryFlux + OPA data access control demo.
+# Compose: Lakekeeper + MinIO + Trino + OPA. QueryFlux runs on the host from this branch.
+
+queryflux:
+  externalAddress: http://localhost:8080
+  frontends:
+    trinoHttp:
+      enabled: true
+      port: 8080
+  persistence:
+    type: postgres
+    url: postgres://queryflux:queryflux@127.0.0.1:5434/queryflux
+  adminApi:
+    port: 9000
+    username: admin
+    password: admin
+
+auth:
+  provider: static
+  required: true
+  staticUsers:
+    users:
+      alice:
+        password: alice
+        groups: [engineers]
+        roles: [admin]
+      bob:
+        password: bob
+        groups: [analysts]
+        roles: [analyst]
+
+# Lakekeeper REST catalog — schema resolution for OPA column masks and SELECT * rewrites.
+catalogProvider:
+  type: icebergRest
+  uri: http://127.0.0.1:8181/catalog
+  warehouse: demo
+  catalogName: lakekeeper
+  cache:
+    ttlSeconds: 60
+    maxEntries: 100
+
+clusters:
+  trino-1:
+    engine: trino
+    enabled: true
+    endpoint: http://127.0.0.1:8081
+    # Trino in this compose stack has no password authenticator — do not forward
+    # the client's Basic auth (alice/bob are QueryFlux-only). Inject X-Trino-User
+    # from the verified gateway identity instead.
+    queryAuth:
+      type: impersonate
+
+clusterGroups:
+  trino-opa:
+    enabled: true
+    maxRunningQueries: 4
+    members: [trino-1]
+
+routers:
+  - type: protocolBased
+    trinoHttp: trino-opa
+
+routingFallback: trino-opa
+
+translation:
+  errorOnUnsupported: false
+
+# cacheTtlMs: 0 so a Rego edit (OPA --watch) is visible on the next query.
+# `defaultConnection` names which entry under `connections` a group uses when it has no
+# explicit `groups.<name>.connection` override — see website/docs/access-control/opa.md.
+accessControl:
+  defaultConnection: default
+  connections:
+    default:
+      opa:
+        url: http://127.0.0.1:8182
+        decisionPath: /v1/data/queryflux/access
+        timeoutMs: 2000
+      operations: [table.select]
+      onMissingSchema: evaluate
+      failOpen: false
+      cacheTtlMs: 0

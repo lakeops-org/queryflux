@@ -36,6 +36,9 @@ pub struct LiveConfig {
     /// Per-group guard chains — appended after the global chain for queries routed
     /// to that group. Missing entry means no group-specific guards for that group.
     pub group_guard_chains: HashMap<String, Arc<GuardChain>>,
+    /// Data-level access-control guard (OPA row filtering / column masking / table-column
+    /// allow-deny), run on the source SQL before dialect translation. `None` disables it.
+    pub access_control_guard: Option<Arc<crate::access_control_guard::OpaAccessGuard>>,
     pub cluster_manager: Arc<dyn ClusterGroupManager>,
     /// cluster_name → adapter (one adapter per physical cluster, shared across groups).
     pub adapters: HashMap<String, AdapterKind>,
@@ -125,6 +128,8 @@ pub struct QueryContext {
     pub engine_type: EngineType,
     pub src_dialect: SqlDialect,
     pub tgt_dialect: SqlDialect,
+    pub was_rewritten: bool,
+    pub rewritten_sql: Option<String>,
     pub was_translated: bool,
     pub translated_sql: Option<String>,
     pub query_tags: QueryTags,
@@ -218,7 +223,7 @@ impl AppState {
     pub fn record_query(&self, ctx: &QueryContext, outcome: QueryOutcome) {
         // Capture what we need for rich fingerprinting before moving into the spawn.
         let original_sql = ctx.sql.to_owned();
-        let translated_sql_for_fp = ctx.translated_sql.clone();
+        let translated_sql_for_fp = ctx.translated_sql.clone().or(ctx.rewritten_sql.clone());
         let src_dialect = polyglot_dialect(&ctx.src_dialect);
         let tgt_dialect = polyglot_dialect(&ctx.tgt_dialect);
 
@@ -252,6 +257,8 @@ impl AppState {
             frontend_protocol: ctx.protocol.clone(),
             source_dialect: ctx.src_dialect.clone(),
             target_dialect: ctx.tgt_dialect.clone(),
+            was_rewritten: ctx.was_rewritten,
+            rewritten_sql: ctx.rewritten_sql.clone(),
             was_translated: ctx.was_translated,
             translated_sql: ctx.translated_sql.clone(),
             user: ctx.session.user().map(|s| s.to_string()),
@@ -313,7 +320,6 @@ impl AppState {
         tgt_dialect: SqlDialect,
         reason: &str,
     ) {
-        let was_translated = executing.translated_sql.is_some();
         let execution_ms = (Utc::now() - executing.creation_time)
             .num_milliseconds()
             .max(0) as u64;
@@ -326,13 +332,10 @@ impl AppState {
             ..Default::default()
         };
         let src_dialect = protocol.default_dialect();
-        let ctx = QueryContext {
+        let (original_sql, pipeline) = crate::sql_pipeline::pipeline_from_executing(executing);
+        let mut ctx = QueryContext {
             query_id: executing.id.clone(),
-            sql: executing
-                .translated_sql
-                .as_deref()
-                .unwrap_or(&executing.sql)
-                .to_string(),
+            sql: original_sql,
             session,
             protocol,
             group: executing.cluster_group.clone(),
@@ -342,16 +345,15 @@ impl AppState {
             engine_type,
             src_dialect,
             tgt_dialect,
-            was_translated,
-            translated_sql: if was_translated {
-                Some(executing.sql.clone())
-            } else {
-                None
-            },
+            was_rewritten: false,
+            rewritten_sql: None,
+            was_translated: false,
+            translated_sql: None,
             query_tags: executing.query_tags.clone(),
             query_params: vec![],
             agent_context: executing.agent_context.clone(),
         };
+        crate::sql_pipeline::apply_pipeline(&mut ctx, &pipeline);
         self.record_query(
             &ctx,
             QueryOutcome {
@@ -394,6 +396,8 @@ impl AppState {
             engine_type: EngineType::Undispatched,
             src_dialect: dialect.clone(),
             tgt_dialect: dialect,
+            was_rewritten: false,
+            rewritten_sql: None,
             was_translated: false,
             translated_sql: None,
             query_tags: session.tags.clone(),
@@ -468,6 +472,8 @@ impl AppState {
             engine_type: EngineType::Undispatched,
             src_dialect: dialect.clone(),
             tgt_dialect: SqlDialect::Generic,
+            was_rewritten: false,
+            rewritten_sql: None,
             was_translated: false,
             translated_sql: None,
             query_tags,
@@ -571,6 +577,9 @@ mod record_terminal_tests {
         let executing = ExecutingQuery {
             id: ProxyQueryId("q-exec-cancel".into()),
             sql: "SELECT 1".into(),
+            client_sql: None,
+            rewritten_sql: None,
+            was_dialect_translated: false,
             translated_sql: None,
             cluster_group: ClusterGroupName("default".into()),
             cluster_name: ClusterName("trino".into()),
@@ -667,6 +676,7 @@ pub mod test_fixtures {
             router_chain: RouterChain::new(vec![], group_name.clone()),
             guard_chain: None,
             group_guard_chains: HashMap::new(),
+            access_control_guard: None,
             cluster_manager: Arc::new(SimpleClusterGroupManager::new(groups)),
             adapters: HashMap::new(),
             health_check_targets: vec![],
