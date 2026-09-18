@@ -458,7 +458,8 @@ mod tests {
     use super::*;
     use axum::{routing::post, Json, Router};
     use queryflux_core::access_config::{
-        AccessConnectionConfig, AccessControlConfig, GroupOverride, OpaProviderConfig,
+        AccessConnectionConfig, AccessControlConfig, CerbosProviderConfig, GroupOverride,
+        OpaProviderConfig, ProviderKind,
     };
     use queryflux_core::query::SqlDialect;
     use queryflux_core::sql_classify::SqlParseCache;
@@ -562,6 +563,49 @@ mod tests {
         }
     }
 
+    /// Starts a tiny in-process Cerbos `CheckResources` stub that always allows `orders`
+    /// with a row-filter output tagged so a test can tell which endpoint answered.
+    async fn start_cerbos_stub(tag: &'static str) -> String {
+        async fn handler(
+            axum::extract::State(tag): axum::extract::State<&'static str>,
+            Json(_body): Json<serde_json::Value>,
+        ) -> Json<serde_json::Value> {
+            Json(serde_json::json!({
+                "results": [{
+                    "actions": {"table.select": "EFFECT_ALLOW"},
+                    "outputs": [{
+                        "src": "resource.table.default#row_filter",
+                        "val": {"kind": "row_filter", "expression": format!("source = '{tag}'")}
+                    }]
+                }]
+            }))
+        }
+        let app = Router::new()
+            .route("/api/check/resources", post(handler))
+            .with_state(tag);
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind stub");
+        let addr = listener.local_addr().expect("stub addr");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+        format!("http://{addr}")
+    }
+
+    fn cerbos_connection(url: &str) -> AccessConnectionConfig {
+        AccessConnectionConfig {
+            provider: ProviderKind::Cerbos,
+            opa: None,
+            cerbos: Some(CerbosProviderConfig {
+                url: url.to_string(),
+                check_resources_path: "/api/check/resources".to_string(),
+                timeout_ms: 2_000,
+                bearer_token: None,
+            }),
+            cache_ttl_ms: 0,
+            ..AccessConnectionConfig::default()
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn plan_ctx<'a>(
         sql: &'a str,
@@ -572,6 +616,7 @@ mod tests {
         query_tags: &'a QueryTags,
         session_extra: &'a HashMap<String, String>,
         sql_parse: &'a SqlParseCache,
+        roles: &'a [String],
     ) -> GuardContext<'a> {
         GuardContext {
             sql,
@@ -581,7 +626,7 @@ mod tests {
             cluster_group: group,
             user: Some("alice"),
             groups: &[],
-            roles: &[],
+            roles,
             attributes,
             agent_context: None,
             query_tags,
@@ -642,6 +687,7 @@ mod tests {
             &query_tags,
             &session_extra,
             &sql_parse,
+            &[],
         );
         match guard.check(&default_ctx).await {
             GuardResult::Rewrite { sql, .. } => {
@@ -660,6 +706,7 @@ mod tests {
             &query_tags,
             &session_extra,
             &sql_parse,
+            &[],
         );
         match guard.check(&eu_ctx).await {
             GuardResult::Rewrite { sql, .. } => {
@@ -711,6 +758,7 @@ mod tests {
             &query_tags,
             &session_extra,
             &sql_parse,
+            &[],
         );
         match guard.check(&ctx).await {
             GuardResult::Allow { .. } => {}
@@ -776,6 +824,7 @@ mod tests {
                 &query_tags,
                 &session_extra,
                 &sql_parse,
+                &[],
             );
             match (guard.check(&ctx).await, expect_rewrite) {
                 (GuardResult::Rewrite { .. }, true) => {}
@@ -785,6 +834,158 @@ mod tests {
                     group.0
                 ),
             }
+        }
+    }
+
+    /// End-to-end through the real guard path with `provider: cerbos` — proves the whole
+    /// chain (`OpaAccessGuard::check` -> `AccessController::evaluate` -> `CerbosProvider` ->
+    /// a real HTTP `CheckResources` call) round-trips a row filter carried through Cerbos's
+    /// `outputs` mechanism into an actual scan-site rewrite, not just that the wire-level
+    /// unit tests in `queryflux-access-control` parse the shape correctly in isolation.
+    #[tokio::test]
+    async fn cerbos_provider_rewrites_via_outputs_row_filter() {
+        let stub_url = start_cerbos_stub("cerbos-tag").await;
+        let cfg = AccessControlConfig {
+            enabled: true,
+            default_connection: Some("default".to_string()),
+            connections: HashMap::from([("default".to_string(), cerbos_connection(&stub_url))]),
+            groups: HashMap::new(),
+        };
+        let guard = OpaAccessGuard::try_from_config(&cfg).expect("build guard");
+
+        let dialect = SqlDialect::Postgres;
+        let engine_type = EngineType::Trino;
+        let sql = "SELECT id FROM orders";
+        let sql_parse = SqlParseCache::new(sql.to_string(), dialect.clone());
+        let attributes = BTreeMap::new();
+        let query_tags = QueryTags::new();
+        let session_extra = HashMap::new();
+        let group = ClusterGroupName("trino-prod".to_string());
+        let roles = vec!["analyst".to_string()];
+        let ctx = plan_ctx(
+            sql,
+            &dialect,
+            &engine_type,
+            &group,
+            &attributes,
+            &query_tags,
+            &session_extra,
+            &sql_parse,
+            &roles,
+        );
+
+        match guard.check(&ctx).await {
+            GuardResult::Rewrite { sql, .. } => {
+                assert!(sql.contains("source = 'cerbos-tag'"), "got: {sql}")
+            }
+            other => panic!("expected a rewrite from the cerbos connection, got {other:?}"),
+        }
+    }
+
+    /// Starts a Cerbos `CheckResources` stub that always returns a fixed, caller-supplied
+    /// response body — for scenarios where the exact per-resource shape (multiple
+    /// resources, mixed allow/deny, several output kinds) matters more than tagging which
+    /// endpoint answered.
+    async fn start_cerbos_stub_with_body(body: serde_json::Value) -> String {
+        async fn handler(
+            axum::extract::State(body): axum::extract::State<serde_json::Value>,
+            Json(_req): Json<serde_json::Value>,
+        ) -> Json<serde_json::Value> {
+            Json(body)
+        }
+        let app = Router::new()
+            .route("/api/check/resources", post(handler))
+            .with_state(body);
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind stub");
+        let addr = listener.local_addr().expect("stub addr");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+        format!("http://{addr}")
+    }
+
+    async fn check_via_cerbos(sql: &str, response_body: serde_json::Value) -> GuardResult {
+        let stub_url = start_cerbos_stub_with_body(response_body).await;
+        let cfg = AccessControlConfig {
+            enabled: true,
+            default_connection: Some("default".to_string()),
+            connections: HashMap::from([("default".to_string(), cerbos_connection(&stub_url))]),
+            groups: HashMap::new(),
+        };
+        let guard = OpaAccessGuard::try_from_config(&cfg).expect("build guard");
+
+        let dialect = SqlDialect::Postgres;
+        let engine_type = EngineType::Trino;
+        let sql_parse = SqlParseCache::new(sql.to_string(), dialect.clone());
+        let attributes = BTreeMap::new();
+        let query_tags = QueryTags::new();
+        let session_extra = HashMap::new();
+        let group = ClusterGroupName("trino-prod".to_string());
+        let roles = vec!["analyst".to_string()];
+        let ctx = plan_ctx(
+            sql,
+            &dialect,
+            &engine_type,
+            &group,
+            &attributes,
+            &query_tags,
+            &session_extra,
+            &sql_parse,
+            &roles,
+        );
+        guard.check(&ctx).await
+    }
+
+    /// Complex scenario: a join across two tables where Cerbos allows one and denies the
+    /// other in the *same* `CheckResources` response. The whole query must be denied
+    /// (`ACCESS_DENIED`), naming the actually-denied table — proves per-resource results
+    /// really do correlate to the right table through the real extraction + guard path,
+    /// not just in the isolated wire-mapping unit tests.
+    #[tokio::test]
+    async fn cerbos_denies_a_join_when_one_of_two_tables_is_denied() {
+        // `extract_resources` walks tables in appearance order: orders, then customers.
+        let sql = "SELECT a.id FROM orders a JOIN customers b ON a.cid = b.id";
+        let response = serde_json::json!({
+            "results": [
+                {"actions": {"table.select": "EFFECT_ALLOW"}, "outputs": []},
+                {"actions": {"table.select": "EFFECT_DENY"}, "outputs": []}
+            ]
+        });
+        match check_via_cerbos(sql, response).await {
+            GuardResult::Deny { reason, code } => {
+                assert_eq!(code, Some("ACCESS_DENIED".to_string()));
+                assert!(reason.contains("customers"), "got: {reason}");
+            }
+            other => panic!("expected a deny naming customers, got {other:?}"),
+        }
+    }
+
+    /// Complex scenario: Cerbos returns a row filter *and* a column mask for the same
+    /// table from one `CheckResources` call — the same combined-outputs shape a real
+    /// analyst-tier policy would emit (row-restricted + masked column together) — and the
+    /// guard must apply both in a single rewrite.
+    #[tokio::test]
+    async fn cerbos_applies_combined_row_filter_and_column_mask() {
+        let sql = "SELECT name, ssn FROM customers";
+        let response = serde_json::json!({
+            "results": [{
+                "actions": {"table.select": "EFFECT_ALLOW"},
+                "outputs": [{
+                    "src": "resource.table.default#analyst_policy",
+                    "val": [
+                        {"kind": "row_filter", "expression": "region = 'EU'"},
+                        {"kind": "column_mask", "column": "ssn", "type": "SHOW_LAST_4"}
+                    ]
+                }]
+            }]
+        });
+        match check_via_cerbos(sql, response).await {
+            GuardResult::Rewrite { sql, .. } => {
+                let lower = sql.to_lowercase();
+                assert!(lower.contains("region = 'eu'"), "got: {sql}");
+                assert!(lower.contains("substr"), "mask must be applied, got: {sql}");
+            }
+            other => panic!("expected a rewrite with filter + mask, got {other:?}"),
         }
     }
 }
