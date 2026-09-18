@@ -50,7 +50,11 @@ const sidebars: SidebarsConfig = {
           type: 'category',
           label: 'Use cases',
           collapsed: false,
-          items: ['access-control/customer-api-row-filters'],
+          items: [
+            'access-control/customer-api-row-filters',
+            'access-control/internal-analysts',
+            'access-control/support-on-behalf-of',
+          ],
         },
       ],
     },

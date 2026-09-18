@@ -6,7 +6,15 @@ image: img/queryflux-hero-banner.png
 ---
 # OPA provider
 
-[Open Policy Agent](https://www.openpolicyagent.org/) (OPA) is the access-control provider shipped with QueryFlux. Grants live in a Rego policy bundle you author and version outside QueryFlux; QueryFlux asks OPA on each query and enforces allow, deny, row filters, and column masks.
+<p class="provider-doc-hero">
+  <img src="/img/logos/opa.svg" alt="Open Policy Agent" class="provider-logo provider-logo--lg" />
+  <span>
+    <a href="https://www.openpolicyagent.org/">Open Policy Agent</a> (OPA) is the access-control
+    provider shipped with QueryFlux. Grants live in a Rego policy bundle you author and version
+    outside QueryFlux; QueryFlux asks OPA on each query and enforces allow, deny, row filters, and
+    column masks.
+  </span>
+</p>
 
 Read the [Access control overview](overview.md) first for the pipeline, identity model, and provider-agnostic config. This page covers the OPA wire contract, Rego shape, server auth, and the runnable demo.
 
@@ -71,7 +79,7 @@ No connection name is reserved. `provider: opa` without an `opa:` block on a con
 
 Scope — which **cluster groups** run access control, and which named connection each uses — is configured under `accessControl.groups` and edited on the **Access Control** page in Studio (not on the Clusters group form). See [Scope by cluster group](overview.md#scope-by-cluster-group) and [Multiple connections](overview.md#multiple-connections).
 
-Different rules per team on the **same** OPA: branch in Rego on `input.context.clusterGroup` and `input.identity.groups` — that's the common case, and it's one bundle to `opa test`. A genuinely different **OPA server** per team (network segmentation, blast-radius isolation, migrating one group to a new provider) is a second named `connections` entry plus `groups.<name>.connection`, not a separate QueryFlux instance.
+Different rules per team on the **same** OPA: branch in Rego on `input.context.clusterGroup` and `input.identity.groups` — that's the common case, and it's one bundle to `opa test`. A genuinely different **OPA server** per team (network segmentation, blast-radius isolation, migrating one group to a new OPA deployment) is a second named `connections` entry plus `groups.<name>.connection`, not a separate QueryFlux instance.
 
 ---
 

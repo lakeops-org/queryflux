@@ -23,7 +23,7 @@ When `accessControl` is omitted, nothing changes: no provider call, no rewrite g
 
 ## Product model (what QueryFlux configures)
 
-QueryFlux does **not** author policy. It **connects** to a policy provider — [OPA](opa.md) or [Cerbos](cerbos.md) — and enforces whatever that provider returns (allow, deny, row filters, column masks).
+QueryFlux does **not** author policy. It **connects** to a policy provider — <img src="/img/logos/opa.svg" alt="" class="provider-logo" />[OPA](opa.md) or <img src="/img/logos/cerbos.svg" alt="" class="provider-logo" />[Cerbos](cerbos.md) — and enforces whatever that provider returns (allow, deny, row filters, column masks).
 
 | Question | Answer |
 | --- | --- |
@@ -42,8 +42,8 @@ At query time: routing picks a **cluster group** → QueryFlux resolves `accessC
 | Pattern | Who connects | What you enforce |
 | --- | --- | --- |
 | **[Customer API — per-tenant row filters](customer-api-row-filters.md)** | Your backend as a **service account**; end-customer identity stays in your API | The provider turns an allowlisted session param (e.g. `customer=7`) into a row-filter predicate |
-| **Internal analysts** | Humans (OIDC / static users) as themselves | Group/role-based table grants, region filters, column masks — [`examples/with-opa/`](https://github.com/lakeops-org/queryflux/tree/main/examples/with-opa) / [OPA](opa.md), or [`examples/with-cerbos/`](https://github.com/lakeops-org/queryflux/tree/main/examples/with-cerbos) / [Cerbos](cerbos.md) |
-| **Support / on-behalf-of** | Support agent or portal service | Same as the customer API: **actor** in `identity`, **subject** in `sessionParams` |
+| **[Internal analysts](internal-analysts.md)** | Humans (OIDC / static users) as themselves | Group/role-based table grants, region filters, column masks — [`examples/with-opa/`](https://github.com/lakeops-org/queryflux/tree/main/examples/with-opa) / [OPA](opa.md), or [`examples/with-cerbos/`](https://github.com/lakeops-org/queryflux/tree/main/examples/with-cerbos) / [Cerbos](cerbos.md) |
+| **[Support — on behalf of an account](support-on-behalf-of.md)** | Support agent or desk service | **Actor** in `identity`, **account** in `sessionParams`; row filter + masked payment fields on billing tables |
 
 ---
 
@@ -53,8 +53,8 @@ QueryFlux ships two access-control providers. Both map to the same allow / deny 
 
 | Provider | Config key | Docs |
 | --- | --- | --- |
-| [Open Policy Agent (OPA)](opa.md) | `provider: opa` + `opa:` | [OPA](opa.md) |
-| [Cerbos](cerbos.md) | `provider: cerbos` + `cerbos:` | [Cerbos](cerbos.md) |
+| <img src="/img/logos/opa.svg" alt="" class="provider-logo" /> [Open Policy Agent (OPA)](opa.md) | `provider: opa` + `opa:` | [OPA](opa.md) |
+| <img src="/img/logos/cerbos.svg" alt="" class="provider-logo" /> [Cerbos](cerbos.md) | `provider: cerbos` + `cerbos:` | [Cerbos](cerbos.md) |
 
 A single connection uses exactly one provider — you cannot mix OPA and Cerbos on the same named connection. Different groups (or a migration in progress) can use different connections on different providers; see [Multiple connections](#multiple-connections).
 
@@ -180,7 +180,7 @@ A connection can apply fleet-wide via `defaultConnection`, but **not every clust
 
 Resolution for group `G` has **two independent gates**, both must pass: (1) `groups.G.enabled` if set, else global `enabled` (default `true`); (2) `groups.G.connection` if set, else `defaultConnection` — if neither names a connection, access control does not apply to `G` regardless of (1). If either gate fails, QueryFlux **skips** access control entirely for that group — no HTTP call, no `opa_access` rewrite.
 
-Configure scope on the **Access Control** page in Studio (or `accessControl.groups` in YAML). The **Clusters** page does not own this setting — group detail shows a read-only **Access control** badge (`OPA on` / `Skipped` / `Off`) and links here; editing stays on Access Control.
+Configure scope on the **Access Control** page in Studio (or `accessControl.groups` in YAML). The **Clusters** page does not own this setting — group detail shows a read-only **Access control** badge (`OPA on` / `Cerbos on` / `Skipped` / `Off`) and links here; editing stays on Access Control.
 
 ### Multiple connections
 
@@ -332,12 +332,12 @@ The **Access Control** page (`GET`/`PUT /admin/config/access-control`) persists 
 | Studio section | What it saves |
 | --- | --- |
 | **Provider** | Disconnect (no `connections`) turns access control off entirely; otherwise the listed connections stay loaded |
-| **Connections** | Add/edit/remove any number of named connections — each one's `opa.{url,decisionPath,timeoutMs}` or `cerbos.{url,checkResourcesPath,timeoutMs}`, bearer / OAuth credentials — and which one is `defaultConnection` |
+| **Connections** | Add/edit/remove any number of named connections — each picks `provider: opa` or `provider: cerbos` and the matching block (`opa.{url,decisionPath,timeoutMs}` + bearer/OAuth, or `cerbos.{url,checkResourcesPath,timeoutMs}` + optional bearer) — and which one is `defaultConnection` |
 | **Scope by cluster group** | Global **Enabled by default** + per-group **Inherit / Enabled / Disabled**, plus which connection each group uses (once more than one exists) |
 
 `operations`, `onMissingSchema`, cache, `failOpen`, and `sessionParamKeys` (per connection) are configured via **YAML or a direct `PUT /admin/config/access-control` body**, not exposed in the Studio form yet.
 
-QueryFlux does **not** edit policy (Rego or Cerbos YAML) in Studio. Secrets are never returned on GET — leave token fields blank to keep stored values (each connection's `opa.bearerToken` / `opa.clientCredentials.clientSecret` / `cerbos.bearerToken` round-trips independently).
+QueryFlux does **not** edit policy (Rego or Cerbos YAML) in Studio. Secrets are never returned on GET — leave token fields blank to keep stored values (each connection's `opa.bearerToken` / `opa.clientCredentials.clientSecret` / `cerbos.bearerToken` round-trips independently at the API level).
 
 YAML is the fallback until you save once via the Admin API; after that the database row wins.
 
