@@ -3072,6 +3072,7 @@ async fn access_control_dry_run_handler(
 
     let ctx = queryflux_guardrails::context::GuardContext {
         sql: &body.sql,
+        original_sql: None,
         dialect: &dialect,
         engine_type: &engine_type,
         cluster_group: &cluster_group,

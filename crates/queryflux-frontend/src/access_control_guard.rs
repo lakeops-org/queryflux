@@ -57,6 +57,7 @@ pub async fn run_access_control_stage(
         queryflux_core::sql_classify::SqlParseCache::new(sql.to_string(), src_dialect.clone());
     let ctx = GuardContext {
         sql,
+        original_sql: None,
         dialect: src_dialect,
         engine_type,
         cluster_group: group,
@@ -97,33 +98,24 @@ struct ConnectionRuntime {
 pub struct OpaAccessGuard {
     /// Keyed by connection name. No name is reserved or required to be present.
     connections: HashMap<String, ConnectionRuntime>,
-    global_enabled: bool,
-    group_enabled: HashMap<String, Option<bool>>,
-    /// Only groups with an explicit `groups.<name>.connection` override; absence falls back
-    /// to `default_connection`.
-    group_connection: HashMap<String, String>,
-    /// `accessControl.defaultConnection` — the connection a group without an explicit
-    /// override resolves to. `None` means such a group gets no access control at all.
-    default_connection: Option<String>,
+    /// The validated config this guard was built from — `enabled_for_group` /
+    /// `connection_name_for_group` delegate to it directly rather than re-deriving their
+    /// own copy of the same group-override-else-default resolution rule, so that rule
+    /// lives in exactly one place ([`queryflux_core::access_config::AccessControlConfig`]).
+    config: Arc<queryflux_core::access_config::AccessControlConfig>,
 }
 
 impl OpaAccessGuard {
     /// Whether access control is administratively enabled for `group`. Does **not** by
     /// itself mean access control runs for it — see [`Self::connection_name_for_group`].
     pub fn enabled_for_group(&self, group: &str) -> bool {
-        if let Some(enabled) = self.group_enabled.get(group).and_then(|enabled| *enabled) {
-            return enabled;
-        }
-        self.global_enabled
+        self.config.enabled_for_group(group)
     }
 
     /// The named connection `group` resolves to: its own override, else
     /// `default_connection`. `None` means access control does not apply to this group.
     pub fn connection_name_for_group<'a>(&'a self, group: &str) -> Option<&'a str> {
-        self.group_connection
-            .get(group)
-            .map(String::as_str)
-            .or(self.default_connection.as_deref())
+        self.config.connection_name_for_group(group)
     }
 
     fn connection_for_group(&self, group: &str) -> Option<&ConnectionRuntime> {
@@ -154,22 +146,9 @@ impl OpaAccessGuard {
                 },
             );
         }
-        let group_enabled = cfg
-            .groups
-            .iter()
-            .map(|(name, ov)| (name.clone(), ov.enabled))
-            .collect();
-        let group_connection = cfg
-            .groups
-            .iter()
-            .filter_map(|(name, ov)| ov.connection.clone().map(|c| (name.clone(), c)))
-            .collect();
         Ok(Arc::new(Self {
             connections,
-            global_enabled: cfg.enabled,
-            group_enabled,
-            group_connection,
-            default_connection: cfg.default_connection.clone(),
+            config: Arc::new(cfg.clone()),
         }))
     }
 }
@@ -534,6 +513,7 @@ mod tests {
     ) -> GuardContext<'a> {
         GuardContext {
             sql,
+            original_sql: None,
             dialect,
             engine_type,
             cluster_group: group,

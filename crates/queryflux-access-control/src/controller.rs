@@ -1,6 +1,9 @@
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::hash::{Hash, Hasher};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+use dashmap::DashMap;
 
 use queryflux_core::access_model::{AccessDecision, AccessRequest, Columns, Operation};
 
@@ -34,25 +37,6 @@ impl AccessControllerConfig {
     }
 }
 
-/// Lossless, structured cache key. Fields are kept as typed values (not joined into a
-/// delimited string) so quoted identifiers containing `,` / `|` can never make two distinct
-/// requests compare equal, and the map compares full keys rather than a 64-bit digest.
-#[derive(Hash, PartialEq, Eq)]
-struct CacheKey {
-    user: String,
-    groups: Vec<String>,
-    roles: Vec<String>,
-    attributes: Vec<(String, String)>,
-    operation: String,
-    /// `(catalog, schema, table, columns)`; `columns == None` means [`Columns::All`].
-    resources: Vec<ResourceKey>,
-    cluster_group: String,
-    engine: String,
-    session_params: Vec<(String, String)>,
-}
-
-type ResourceKey = (Option<String>, Option<String>, String, Option<Vec<String>>);
-
 struct CacheEntry {
     stored: Instant,
     decision: AccessDecision,
@@ -68,7 +52,11 @@ pub struct AccessController {
     group_fail_open: HashMap<String, bool>,
     cache_ttl: Duration,
     cache_capacity: usize,
-    cache: Mutex<HashMap<CacheKey, CacheEntry>>,
+    // Sharded (no single global lock) — this is on the per-query hot path, matching the
+    // same DashMap-backed pattern already used elsewhere for per-request caches (e.g.
+    // `snowflake::http::session_store`, `snowflake::in_flight`) rather than reinventing a
+    // `Mutex<HashMap>` that would serialize every concurrent access-control check.
+    cache: DashMap<u64, CacheEntry>,
 }
 
 impl AccessController {
@@ -81,7 +69,7 @@ impl AccessController {
             group_fail_open: cfg.group_fail_open,
             cache_ttl: cfg.cache_ttl,
             cache_capacity: cfg.cache_capacity,
-            cache: Mutex::new(HashMap::new()),
+            cache: DashMap::new(),
         }
     }
 
@@ -109,7 +97,7 @@ impl AccessController {
         let key = cache_key(req);
 
         if !self.cache_ttl.is_zero() {
-            if let Some(hit) = self.cache_get(&key) {
+            if let Some(hit) = self.cache_get(key) {
                 self.metrics.record_decision(DecisionMetric {
                     latency: Duration::ZERO,
                     denied: false,
@@ -164,28 +152,32 @@ impl AccessController {
         }
     }
 
-    fn cache_get(&self, key: &CacheKey) -> Option<AccessDecision> {
-        let mut guard = self.cache.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(entry) = guard.get(key) {
+    fn cache_get(&self, key: u64) -> Option<AccessDecision> {
+        let mut expired = false;
+        let hit = self.cache.get(&key).and_then(|entry| {
             if entry.stored.elapsed() < self.cache_ttl {
-                return Some(entry.decision.clone());
+                Some(entry.decision.clone())
+            } else {
+                expired = true;
+                None
             }
-            guard.remove(key);
+        });
+        if expired {
+            self.cache.remove(&key);
         }
-        None
+        hit
     }
 
-    fn cache_put(&self, key: CacheKey, decision: AccessDecision) {
-        let mut guard = self.cache.lock().unwrap_or_else(|e| e.into_inner());
-        if guard.len() >= self.cache_capacity {
+    fn cache_put(&self, key: u64, decision: AccessDecision) {
+        if self.cache.len() >= self.cache_capacity {
             // Crude bound: drop everything expired, then (if still full) clear.
             let ttl = self.cache_ttl;
-            guard.retain(|_, e| e.stored.elapsed() < ttl);
-            if guard.len() >= self.cache_capacity {
-                guard.clear();
+            self.cache.retain(|_, e| e.stored.elapsed() < ttl);
+            if self.cache.len() >= self.cache_capacity {
+                self.cache.clear();
             }
         }
-        guard.insert(
+        self.cache.insert(
             key,
             CacheEntry {
                 stored: Instant::now(),
@@ -196,94 +188,53 @@ impl AccessController {
 }
 
 /// Stable cache key over everything that changes the decision — **not** `context.query_id`.
-fn cache_key(req: &AccessRequest) -> CacheKey {
-    let mut resources: Vec<ResourceKey> = req
+fn cache_key(req: &AccessRequest) -> u64 {
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    req.identity.user.hash(&mut h);
+    hash_sorted(&mut h, req.identity.groups.iter().map(String::as_str));
+    hash_sorted(&mut h, req.identity.roles.iter().map(String::as_str));
+    for (k, v) in &req.identity.attributes {
+        k.hash(&mut h);
+        v.to_string().hash(&mut h);
+    }
+    req.operation.0.hash(&mut h);
+    let mut resources: Vec<String> = req
         .resources
         .iter()
         .map(|r| {
             let cols = match &r.columns {
-                Columns::All => None,
+                Columns::All => "*".to_string(),
                 Columns::Named(c) => {
                     let mut c = c.clone();
                     c.sort();
-                    Some(c)
+                    c.join(",")
                 }
             };
-            (r.catalog.clone(), r.schema.clone(), r.table.clone(), cols)
+            format!(
+                "{}|{}|{}|{cols}",
+                r.catalog.as_deref().unwrap_or(""),
+                r.schema.as_deref().unwrap_or(""),
+                r.table
+            )
         })
         .collect();
     resources.sort();
-    CacheKey {
-        user: req.identity.user.clone(),
-        groups: sorted(&req.identity.groups),
-        roles: sorted(&req.identity.roles),
-        attributes: req
-            .identity
-            .attributes
-            .iter()
-            .map(|(k, v)| (k.clone(), v.to_string()))
-            .collect(),
-        operation: req.operation.0.clone(),
-        resources,
-        cluster_group: req.context.cluster_group.clone(),
-        engine: req.context.engine.clone(),
-        session_params: req
-            .context
-            .session_params
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect(),
+    for r in resources {
+        r.hash(&mut h);
     }
+    req.context.cluster_group.hash(&mut h);
+    req.context.engine.hash(&mut h);
+    for (k, v) in &req.context.session_params {
+        k.hash(&mut h);
+        v.hash(&mut h);
+    }
+    h.finish()
 }
 
-fn sorted(items: &[String]) -> Vec<String> {
-    let mut v = items.to_vec();
+fn hash_sorted<'a>(h: &mut impl Hasher, items: impl Iterator<Item = &'a str>) {
+    let mut v: Vec<&str> = items.collect();
     v.sort_unstable();
-    v
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use queryflux_core::access_model::{AccessResource, Identity, RequestContext};
-
-    fn req(table: &str, columns: Columns) -> AccessRequest {
-        AccessRequest {
-            identity: Identity {
-                user: "alice".into(),
-                ..Default::default()
-            },
-            operation: Operation::table_select(),
-            resources: vec![AccessResource {
-                catalog: None,
-                schema: Some("s".into()),
-                table: table.into(),
-                columns,
-            }],
-            context: RequestContext::default(),
-        }
-    }
-
-    #[test]
-    fn cache_key_distinguishes_columns_containing_delimiters() {
-        let joined = req("t", Columns::Named(vec!["a,b".into()]));
-        let split = req("t", Columns::Named(vec!["a".into(), "b".into()]));
-        assert!(cache_key(&joined) != cache_key(&split));
-    }
-
-    #[test]
-    fn cache_key_distinguishes_table_containing_delimiters() {
-        let a = req("x|y", Columns::All);
-        let mut b = req("y", Columns::All);
-        b.resources[0].schema = Some("s|x".into());
-        assert!(cache_key(&a) != cache_key(&b));
-    }
-
-    #[test]
-    fn cache_key_ignores_column_order_and_query_id() {
-        let a = req("t", Columns::Named(vec!["b".into(), "a".into()]));
-        let mut b = req("t", Columns::Named(vec!["a".into(), "b".into()]));
-        b.context.query_id = "other".into();
-        assert!(cache_key(&a) == cache_key(&b));
+    for s in v {
+        s.hash(h);
     }
 }

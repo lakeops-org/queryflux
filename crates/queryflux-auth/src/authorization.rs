@@ -275,14 +275,15 @@ impl OpenFgaAuthorizationClient {
                 token_endpoint,
             }) => {
                 // Reuse cache only while `now + buffer < expires_at` (future `expires_at` must
-                // not use `elapsed()`, which subtracts the wrong way and can panic).
-                {
-                    let guard = self.token_cache.lock().await;
-                    if let Some((token, expires_at)) = guard.as_ref() {
-                        let now = std::time::Instant::now();
-                        if now + OPENFGA_TOKEN_REFRESH_BUFFER < *expires_at {
-                            return Some(token.clone());
-                        }
+                // not use `elapsed()`, which subtracts the wrong way and can panic). Held
+                // across the refresh itself (not released between the check and the
+                // exchange) so concurrent callers serialize on the refresh instead of each
+                // firing their own token-endpoint request when the cache is near expiry.
+                let mut guard = self.token_cache.lock().await;
+                if let Some((token, expires_at)) = guard.as_ref() {
+                    let now = std::time::Instant::now();
+                    if now + OPENFGA_TOKEN_REFRESH_BUFFER < *expires_at {
+                        return Some(token.clone());
                     }
                 }
 
@@ -308,7 +309,7 @@ impl OpenFgaAuthorizationClient {
 
                 let expires_at =
                     std::time::Instant::now() + std::time::Duration::from_secs(expires_in);
-                *self.token_cache.lock().await = Some((token.clone(), expires_at));
+                *guard = Some((token.clone(), expires_at));
                 Some(token)
             }
         }

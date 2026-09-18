@@ -162,6 +162,61 @@ pub(super) fn from_response(resp: OpaResponse, requested: &AccessRequest) -> Acc
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use queryflux_core::access_model::{AccessResource, Identity, Operation, RequestContext};
+
+    fn requested(tables: &[&str]) -> AccessRequest {
+        AccessRequest {
+            identity: Identity::default(),
+            operation: Operation::table_select(),
+            resources: tables
+                .iter()
+                .map(|t| AccessResource {
+                    catalog: None,
+                    schema: None,
+                    table: t.to_string(),
+                    columns: Columns::All,
+                })
+                .collect(),
+            context: RequestContext::default(),
+        }
+    }
+
+    /// Regression: a response that only decides some of the requested resources (e.g. a
+    /// policy bug that matches one table in a join but not another) must not let the
+    /// unmentioned table's vacuous absence read as "allowed" — `is_allowed()` is an
+    /// `all()` over whatever's present, so a missing entry has to become an explicit deny.
+    #[test]
+    fn missing_resource_in_response_is_denied_not_vacuously_allowed() {
+        let resp: OpaResponse = serde_json::from_str(
+            r#"{"result": {"resources": [{"table": "orders", "allow": true}]}}"#,
+        )
+        .unwrap();
+        let decision = from_response(resp, &requested(&["orders", "customers"]));
+        assert!(!decision.is_allowed());
+        assert_eq!(decision.first_denied().map(|(t, _)| t), Some("customers"));
+    }
+
+    #[test]
+    fn fully_decided_response_is_allowed() {
+        let resp: OpaResponse = serde_json::from_str(
+            r#"{"result": {"resources": [{"table": "orders", "allow": true}]}}"#,
+        )
+        .unwrap();
+        let decision = from_response(resp, &requested(&["orders"]));
+        assert!(decision.is_allowed());
+    }
+
+    #[test]
+    fn empty_result_is_deny_all() {
+        let resp: OpaResponse = serde_json::from_str(r#"{}"#).unwrap();
+        let decision = from_response(resp, &requested(&["orders"]));
+        assert!(!decision.is_allowed());
+    }
+}
+
 /// Whether a decision's `table` key refers to `res`. Policies echo the input's bare `table`
 /// or build `schema.table` / `catalog.schema.table`; match case-insensitively, as the
 /// rewrite does.

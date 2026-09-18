@@ -8,7 +8,10 @@ use queryflux_core::access_model::{AccessDecision, AccessRequest};
 pub enum PolicyError {
     Timeout,
     Transport(String),
-    Status(u16),
+    /// Non-2xx status, plus the response body (best-effort, truncated) — a policy engine's
+    /// error body is often the only clue for what was actually wrong with the request (e.g.
+    /// a field-level validation error), so it must not be discarded.
+    Status(u16, String),
     Body(String),
 }
 
@@ -17,7 +20,10 @@ impl std::fmt::Display for PolicyError {
         match self {
             PolicyError::Timeout => write!(f, "policy provider timed out"),
             PolicyError::Transport(e) => write!(f, "policy provider transport error: {e}"),
-            PolicyError::Status(s) => write!(f, "policy provider returned HTTP {s}"),
+            PolicyError::Status(s, body) if body.is_empty() => {
+                write!(f, "policy provider returned HTTP {s}")
+            }
+            PolicyError::Status(s, body) => write!(f, "policy provider returned HTTP {s}: {body}"),
             PolicyError::Body(e) => write!(f, "policy provider response unparseable: {e}"),
         }
     }

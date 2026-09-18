@@ -14,11 +14,12 @@ use serde_json::Value;
 pub enum GuardLayer {
     /// L1 — runs on the NL question before any LLM call (Phase 4).
     Input,
-    /// L2 — runs on the query before engine submission. The access-control guard (invoked
-    /// directly via `run_access_control_stage`, not through `GuardChain`) runs at this
-    /// layer on the **source** SQL, before dialect translation. `GuardChain`-based Plan
-    /// guards (built-in, webhook, script) are unchanged: they still run after translation,
-    /// on the final SQL that will actually reach the engine.
+    /// L2 — runs on the query before engine submission. The dedicated access-control
+    /// guard runs at this layer on the **source** SQL, before dialect translation; the
+    /// generic guard chain (Python/webhook guards) runs at this layer too but *after*
+    /// translation, on the final engine SQL — see [`GuardContext::sql`] /
+    /// [`GuardContext::original_sql`] for how to tell which SQL a given `check()` call
+    /// actually received.
     Plan,
     /// L3 — runs on returned rows / NL summary (Phase 4, MCP only).
     Output,
@@ -26,15 +27,19 @@ pub enum GuardLayer {
 
 /// Everything a guard implementation can inspect.
 ///
-/// `sql` / `sql_parse` / `dialect` reflect whichever SQL representation the caller built
-/// this context from — see [`GuardLayer::Plan`] for how that differs between the
-/// access-control guard (source SQL) and `GuardChain`-based Plan guards (translated SQL).
-/// `engine_type` is the eventual target engine (for guards that care which backend a query
-/// lands on).
+/// `sql` / `sql_parse` / `dialect` are whatever SQL this particular guard call actually
+/// evaluates — the pre-translation source SQL for the dedicated access-control guard,
+/// or the final post-translation engine SQL for the generic `Plan`-layer guard chain.
+/// `original_sql` carries the pre-translation client SQL when it differs from `sql`
+/// (i.e. for the post-translation guard-chain call); it is `None` when `sql` already
+/// *is* the original (no separate translated form exists yet at that call site).
+/// `engine_type` is the eventual target engine (for guards that care which backend a
+/// query lands on).
 pub struct GuardContext<'a> {
     pub sql: &'a str,
-    /// The dialect `sql` / `sql_parse` are parsed as (see [`GuardLayer::Plan`]: source
-    /// dialect for the access-control guard, target dialect for `GuardChain`-based guards).
+    /// The pre-translation client SQL, when `sql` is a post-translation rendering of it.
+    pub original_sql: Option<&'a str>,
+    /// Dialect `sql` / `sql_parse` are parsed as.
     pub dialect: &'a SqlDialect,
     pub engine_type: &'a EngineType,
     pub cluster_group: &'a ClusterGroupName,
@@ -73,7 +78,10 @@ pub enum GuardResult {
     },
     /// Query is permitted but the guard rewrote it. `sql` replaces the working SQL for the
     /// rest of the pipeline. It is still source-dialect (row filters + rendered column
-    /// masks already spliced at the scan site); `maybe_translate` runs next.
+    /// masks already spliced at the scan site); `maybe_translate` runs next. Only
+    /// meaningful for a guard invoked directly (the access-control guard, via
+    /// `run_access_control_stage`) — a `GuardChain` cannot carry this back to its caller
+    /// and treats it as an error (see `GuardChain::run`).
     Rewrite {
         sql: String,
         metadata: Option<HashMap<String, String>>,
@@ -118,9 +126,13 @@ pub enum GuardChainOutcome {
         reason: String,
         code: Option<String>,
     },
-    /// The query may proceed. `sql` is `Some` when a guard rewrote it (source dialect),
-    /// `None` when it is unchanged.
-    Proceed { sql: Option<String> },
+    /// The query may proceed unchanged. A `GuardChain` has no mechanism to carry a
+    /// `GuardResult::Rewrite` back to the caller — the one guard that ever returns
+    /// `Rewrite` (the access-control guard) runs outside any chain, on pre-translation
+    /// SQL, via its own dedicated call site (`access_control_guard::run_access_control_stage`).
+    /// A guard placed *in* a chain that returns `Rewrite` is treated as a
+    /// configuration/implementation error (see `GuardChain::run`), not silently ignored.
+    Proceed,
 }
 
 #[cfg(test)]

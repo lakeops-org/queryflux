@@ -4032,6 +4032,7 @@ mod tests {
         ) -> GuardContext<'a> {
             GuardContext {
                 sql: "SELECT 1",
+                original_sql: None,
                 dialect: &GENERIC_DIALECT,
                 engine_type: engine,
                 cluster_group: group,

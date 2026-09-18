@@ -9,6 +9,7 @@ repository.workspace = true
 queryflux-core = { workspace = true }
 async-trait = { workspace = true }
 reqwest = { workspace = true }
+dashmap = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }

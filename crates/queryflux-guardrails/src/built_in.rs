@@ -349,6 +349,7 @@ mod tests {
         fn ctx(&self) -> GuardContext<'_> {
             GuardContext {
                 sql: &self.sql,
+                original_sql: None,
                 dialect: &self.dialect,
                 engine_type: &self.engine_type,
                 cluster_group: &self.cluster_group,
