@@ -1206,4 +1206,47 @@ html[data-theme='light'] .footer__lakeops-logo {
   display: block;
 }
 
+/* Access-control provider logos (OPA / Cerbos) in docs */
+.provider-logo {
+  display: inline-block;
+  width: 1.35rem;
+  height: 1.35rem;
+  vertical-align: -0.3rem;
+  margin-right: 0.35rem;
+  object-fit: contain;
+}
+
+.provider-logo--lg {
+  width: 2.75rem;
+  height: 2.75rem;
+  vertical-align: middle;
+  margin-right: 0;
+}
+
+.provider-doc-hero {
+  display: flex;
+  align-items: flex-start;
+  gap: 1rem;
+  margin: 0 0 1.25rem;
+  padding: 1rem 1.15rem;
+  border: 1px solid var(--ifm-color-emphasis-200);
+  border-radius: 0.75rem;
+  background: rgba(124, 58, 237, 0.03);
+}
+
+.provider-doc-hero .provider-logo--lg {
+  flex-shrink: 0;
+  margin-top: 0.15rem;
+}
+
+.provider-doc-hero > span {
+  min-width: 0;
+  line-height: 1.55;
+}
+
+html[data-theme='dark'] .provider-doc-hero {
+  background: rgba(167, 139, 250, 0.06);
+  border-color: rgba(255, 255, 255, 0.1);
+}
+
 /* (mobile header rules consolidated above — no duplicate block here) */

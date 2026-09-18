@@ -6,9 +6,17 @@ image: img/queryflux-hero-banner.png
 ---
 # Cerbos provider
 
-[Cerbos](https://cerbos.dev) is an access-control provider QueryFlux can connect to instead of OPA. Grants live in Cerbos policy files (YAML, CEL conditions) you author and version outside QueryFlux; QueryFlux asks Cerbos on each query and enforces allow, deny, row filters, and column masks.
+<p class="provider-doc-hero">
+  <img src="/img/logos/cerbos.svg" alt="Cerbos" class="provider-logo provider-logo--lg" />
+  <span>
+    <a href="https://cerbos.dev">Cerbos</a> is an access-control provider QueryFlux can connect to.
+    Grants live in Cerbos policy files (YAML, CEL conditions) you author and version outside
+    QueryFlux; QueryFlux asks Cerbos on each query and enforces allow, deny, row filters, and
+    column masks.
+  </span>
+</p>
 
-Read the [Access control overview](overview.md) first for the pipeline, identity model, and provider-agnostic config. This page covers the Cerbos wire contract, policy shape, server auth, and the runnable demo. If you're coming from OPA, the [OPA provider](opa.md) page is the same shape of document for that provider — the two are close to interchangeable at the QueryFlux config level (`provider: opa` vs `provider: cerbos`), and this page calls out where Cerbos genuinely works differently.
+Read the [Access control overview](overview.md) first for the pipeline, identity model, and provider-agnostic config. This page covers the Cerbos wire contract, policy shape, server auth, and the runnable demo.
 
 ---
 
@@ -16,17 +24,17 @@ Read the [Access control overview](overview.md) first for the pipeline, identity
 
 Use Cerbos when you want:
 
-- A policy language built around **roles and resource attributes** (RBAC-first, with derived roles and ABAC conditions) rather than a general-purpose logic language.
-- Policies as plain YAML files with CEL conditions, instead of Rego.
+- A policy language built around **roles and resource attributes** (RBAC-first, with derived roles and ABAC conditions).
+- Policies as plain YAML files with CEL conditions.
 - The same PDP other services in your org already run for API/service authorization.
 
-Cerbos does **not** replace frontend authentication (`auth`) or cluster-group authorization (`authorization`). Like OPA, it answers the data-plane question: *given this verified identity and these tables, what may they see?*
+Cerbos does **not** replace frontend authentication (`auth`) or cluster-group authorization (`authorization`). It answers the data-plane question: *given this verified identity and these tables, what may they see?*
 
 ---
 
 ## Configuration
 
-QueryFlux **connects** to Cerbos; it does not store or edit Cerbos policy files. The config shape mirrors OPA's exactly, with a `cerbos:` block instead of `opa:`:
+QueryFlux **connects** to Cerbos; it does not store or edit Cerbos policy files. Configure a named connection with `provider: cerbos` and a `cerbos:` block:
 
 ```yaml
 accessControl:
@@ -34,7 +42,7 @@ accessControl:
   defaultConnection: prod
   connections:
     prod:
-      provider: cerbos               # required — cerbos is not the default
+      provider: cerbos
       cerbos:
         url: http://localhost:3592
         checkResourcesPath: /api/check/resources
@@ -55,19 +63,21 @@ accessControl:
 
 | Field | Default | Notes |
 | --- | --- | --- |
-| `connections.<name>.provider` | `opa` | Must be set to `cerbos` explicitly — OPA is the default when omitted. |
+| `connections.<name>.provider` | — | Set to `cerbos` for this connection. |
 | `connections.<name>.cerbos.url` | *(required)* | Base URL of the Cerbos PDP's HTTP API (`http` or `https`). Default Cerbos port is `3592`. |
 | `connections.<name>.cerbos.checkResourcesPath` | `/api/check/resources` | Cerbos's `CheckResources` REST path. Must start with `/`. |
 | `connections.<name>.cerbos.timeoutMs` | `1000` | HTTP timeout for the Cerbos call on this connection. |
 | `connections.<name>.cerbos.bearerToken` | — | Static bearer/API token, for Cerbos Hub/Cloud or a self-hosted PDP fronted by one. Plain self-hosted Cerbos typically needs none — it's usually secured by network policy instead. |
 
-No connection name is reserved. `provider: cerbos` without a `cerbos:` block on a connection fails validation at startup, and so does a `defaultConnection` or `groups.<name>.connection` that names a connection not defined under `connections`. Without `defaultConnection` set, a group with no explicit `groups.<name>.connection` override gets **no access control at all**. Shared knobs (`enabled`, `operations`, `failOpen`, `sessionParamKeys`, …) are documented in the [overview](overview.md#enabling-access-control) — they behave identically regardless of provider.
+No connection name is reserved. `provider: cerbos` without a `cerbos:` block on a connection fails validation at startup, and so does a `defaultConnection` or `groups.<name>.connection` that names a connection not defined under `connections`. Without `defaultConnection` set, a group with no explicit `groups.<name>.connection` override gets **no access control at all**. Shared knobs (`enabled`, `operations`, `failOpen`, `sessionParamKeys`, …) are documented in the [overview](overview.md#enabling-access-control).
 
-Cerbos has no OAuth2 client-credentials concept for the PDP itself (unlike OPA's optional `clientCredentials` block) — a static `bearerToken` is the only auth QueryFlux's `CerbosProvider` supports today.
+Cerbos PDP auth in QueryFlux is a static `bearerToken` only — there is no OAuth2 client-credentials option for the Cerbos connection.
 
 ### Scope (which groups call which connection)
 
-Scope works exactly as for OPA — see [Scope by cluster group](overview.md#scope-by-cluster-group) and [Multiple connections](overview.md#multiple-connections). Different rules per team on the **same** Cerbos PDP: branch in the policy on `R.attr` / roles / derived roles — one policy repository, testable offline. A genuinely different **Cerbos server** per team (network segmentation, blast-radius isolation, migrating one group from OPA) is a second named `connections` entry plus `groups.<name>.connection`.
+Scope — which **cluster groups** run access control, and which named connection each uses — is configured under `accessControl.groups` and edited on the **Access Control** page in Studio (not on the Clusters group form). See [Scope by cluster group](overview.md#scope-by-cluster-group) and [Multiple connections](overview.md#multiple-connections).
+
+Different rules per team on the **same** Cerbos PDP: branch in the policy on `R.attr` / roles / derived roles — one policy repository, testable offline. A genuinely different **Cerbos server** per team (network segmentation, blast-radius isolation, migrating one group to a new Cerbos deployment) is a second named `connections` entry plus `groups.<name>.connection`.
 
 ---
 
@@ -114,17 +124,17 @@ Content-Type: application/json
 | --- | --- |
 | `principal.id` / `.roles` | From the verified `AuthContext`. |
 | `principal.attr.groups` | `AuthContext.groups`, carried as a free-form attribute — Cerbos's own RBAC matches on `roles`, not `groups`; put group-based logic in a `condition` on `P.attr.groups` if you need it. |
-| `resources[].resource.kind` | Always the fixed string `"table"` — every table a query touches is sent under this one resource kind, so one Cerbos resource policy governs every table generically (matching on `R.attr.table`), the same way one rego package matches on `input.action.resources` for OPA. |
-| `resources[].resource.attr.columns` | Named list, or **omitted** meaning all columns (`SELECT *` or unresolved schema) — same semantics as OPA's wire format. |
+| `resources[].resource.kind` | Always the fixed string `"table"` — every table a query touches is sent under this one resource kind, so one Cerbos resource policy governs every table generically (matching on `R.attr.table`). |
+| `resources[].resource.attr.columns` | Named list, or **omitted** meaning all columns (`SELECT *` or unresolved schema). |
 | `resources[].actions` | Always a single-element array — QueryFlux evaluates one namespaced operation (e.g. `table.select`) per request. |
 
 :::info Cerbos requires non-empty `principal.roles`
-Cerbos's `CheckResources` API rejects an empty `roles` array as an **HTTP 400 validation error** — it is not evaluated as "no rule matches." `CerbosProvider` handles this itself: if `identity.roles` is empty, QueryFlux denies the query **locally**, without calling Cerbos at all, with the reason *"cerbos requires at least one principal role; none were resolved for this identity."* If you see that reason, your auth layer isn't populating `roles` for that user — add `roles:` under `auth.staticUsers.<user>` (or map your real IdP's role claim to it). This is a Cerbos-specific constraint; the OPA provider has no equivalent requirement.
+Cerbos's `CheckResources` API rejects an empty `roles` array as an **HTTP 400 validation error** — it is not evaluated as "no rule matches." `CerbosProvider` handles this itself: if `identity.roles` is empty, QueryFlux denies the query **locally**, without calling Cerbos at all, with the reason *"cerbos requires at least one principal role; none were resolved for this identity."* If you see that reason, your auth layer isn't populating `roles` for that user — add `roles:` under `auth.staticUsers.<user>` (or map your real IdP's role claim to it).
 :::
 
 ### Response
 
-Cerbos's own API contract guarantees exactly one `results` entry per requested resource, in the same order. `CerbosProvider` relies on that ordering to correlate resources back to tables — not on the echoed `resource.id` — so it isn't sensitive to duplicate or unusual table identifiers. If Cerbos ever returns a different number of results than requested (a provider-level anomaly), QueryFlux treats the whole decision as **deny-all**, the same fail-closed stance as an OPA response that omits a decision for one of several requested resources.
+Cerbos's own API contract guarantees exactly one `results` entry per requested resource, in the same order. `CerbosProvider` relies on that ordering to correlate resources back to tables — not on the echoed `resource.id` — so it isn't sensitive to duplicate or unusual table identifiers. If Cerbos ever returns a different number of results than requested (a provider-level anomaly), QueryFlux treats the whole decision as **deny-all**.
 
 ```json
 {
@@ -153,7 +163,7 @@ Cerbos's own API contract guarantees exactly one `results` entry per requested r
 
 ### The `outputs` contract for row filters and column masks
 
-Cerbos's `CheckResources` has **no native concept of a row filter or column mask** — it only returns allow/deny per action, plus a generic `outputs` array collected from whichever policy rules activated. This is not a Cerbos limitation to work around so much as an extension point: QueryFlux defines its own convention for what a rule's output must look like to be understood as a row filter or column mask, the same way OPA requires a specific rego decision-document shape (`{"result": {"resources": [...]}}`) that isn't a generic OPA thing either.
+Cerbos's `CheckResources` has **no native concept of a row filter or column mask** — it only returns allow/deny per action, plus a generic `outputs` array collected from whichever policy rules activated. QueryFlux defines a convention for what a rule's output must look like to be understood as a row filter or column mask.
 
 A rule contributes a row filter or column mask by returning a CEL value shaped like:
 
@@ -164,7 +174,7 @@ A rule contributes a row filter or column mask by returning a CEL value shaped l
 
 — or a **list** of either, from one rule's single `output.when.ruleActivated` CEL expression (shown combined in the response example above). Multiple activated rules on the same resource all contribute; their outputs accumulate rather than overwrite each other. Any output whose `val` doesn't match either shape (an unrelated audit message, say) is silently ignored — not an error.
 
-Field requirements for `column_mask` mirror OPA's [mask vocabulary](overview.md#mask-vocabulary) exactly: `column` and `type` always; `value` for `CONSTANT`; `expression` for `CUSTOM`.
+Field requirements for `column_mask` follow the [mask vocabulary](overview.md#mask-vocabulary): `column` and `type` always; `value` for `CONSTANT`; `expression` for `CUSTOM`.
 
 ### Column masks
 
@@ -177,7 +187,7 @@ output:
       {"kind": "column_mask", "column": "ssn", "type": "SHOW_LAST_4"}
 ```
 
-For `CUSTOM`, same rules as OPA: `expression` is required (its absence denies the query, `ACCESS_MASK_RENDER_FAILED`), spliced verbatim in the **client's source dialect**, referencing the **bare** column name:
+For `CUSTOM`, `expression` is required (its absence denies the query, `ACCESS_MASK_RENDER_FAILED`), spliced verbatim in the **client's source dialect**, referencing the **bare** column name:
 
 ```yaml
 output:
@@ -249,7 +259,7 @@ A full, validated demo policy (this exact file) lives at [`examples/with-cerbos/
 
 ## Delegation (actor X, subject Y)
 
-Same pattern as OPA (full walkthrough, API service account, SQL injection caveats: **[Customer API — per-tenant row filters](customer-api-row-filters)**), expressed in CEL instead of Rego:
+Full walkthrough (API service account, SQL injection caveats): **[Customer API — per-tenant row filters](customer-api-row-filters)**. In Cerbos / CEL:
 
 1. Authenticate X normally (`auth`).
 2. Put Y in session context under an allowlisted key, e.g. `customer_id`.
@@ -271,7 +281,7 @@ Same pattern as OPA (full walkthrough, API service account, SQL injection caveat
 
 **Do not** set `identity.user` to Y unless you intend true, audited impersonation. Keep the actor in identity for audit trails; put the subject in `sessionParams`.
 
-QueryFlux never substitutes `sessionParams` into SQL itself — only expressions returned by the provider (OPA or Cerbos) are spliced.
+QueryFlux never substitutes `sessionParams` into SQL itself — only expressions returned by Cerbos (via `outputs`) are spliced.
 
 :::warning
 Validate that X is allowed to access Y **before** or **inside** policy. An unauthenticated client must not be able to set `customer_id` arbitrarily and widen their own scope.
@@ -290,7 +300,7 @@ auth:
     attributeClaims: [department, clearance_level]
 ```
 
-`identity.attributes` is sent as-is in `principal.attr`, alongside `groups`. A Cerbos policy condition can then branch on `P.attr.department`, `P.attr.clearance_level`, etc. — the same values a Rego policy would read from `input.identity.attributes`. Static / LDAP / no-auth leave it empty.
+`identity.attributes` is sent as-is in `principal.attr`, alongside `groups`. A Cerbos policy condition can then branch on `P.attr.department`, `P.attr.clearance_level`, etc. Static / LDAP / no-auth leave it empty.
 
 ---
 
@@ -308,7 +318,7 @@ accessControl:
         bearerToken: "eyJ..."
 ```
 
-Each connection authenticates independently — a second named connection to a different Cerbos server (or an OPA server) uses its own bearer token, unrelated to `default`'s. Plain self-hosted Cerbos, secured by network policy instead of application-level auth, needs no `bearerToken` at all.
+Each connection authenticates independently — a second named connection to a different Cerbos server uses its own bearer token, unrelated to `default`'s. Plain self-hosted Cerbos, secured by network policy instead of application-level auth, needs no `bearerToken` at all.
 
 ---
 
@@ -328,7 +338,7 @@ Set `failOpen: true` (or per-group) only when availability must trump enforcemen
 
 ## Local demo
 
-A Compose stack with Lakekeeper, MinIO, Trino, and Cerbos lives under [`examples/with-cerbos/`](https://github.com/lakeops-org/queryflux/tree/main/examples/with-cerbos) — the same scenario as [`examples/with-opa/`](https://github.com/lakeops-org/queryflux/tree/main/examples/with-opa), only the provider differs:
+A Compose stack with Lakekeeper, MinIO, Trino, and Cerbos lives under [`examples/with-cerbos/`](https://github.com/lakeops-org/queryflux/tree/main/examples/with-cerbos):
 
 | User | Role | `customers` | `payroll` |
 | --- | --- | --- | --- |
@@ -349,7 +359,7 @@ cargo run -p queryflux -- --config examples/with-cerbos/config.yaml
 - QueryFlux Postgres: `postgresql://queryflux:queryflux@127.0.0.1:5434/queryflux` (query history + Studio config)
 - Admin dry-run: `POST http://localhost:9000/admin/access-control/dry-run` (Basic `admin` / `admin`)
 
-There is no bundled demo UI (unlike `with-opa`'s); `examples/with-cerbos/demo.py` covers the same ground, including two direct `CheckResources` calls that print Cerbos's raw response. See the example [README](https://github.com/lakeops-org/queryflux/blob/main/examples/with-cerbos/README.md) for ports, seeding, and curl recipes.
+`examples/with-cerbos/demo.py` covers the same ground, including two direct `CheckResources` calls that print Cerbos's raw response. See the example [README](https://github.com/lakeops-org/queryflux/blob/main/examples/with-cerbos/README.md) for ports, seeding, and curl recipes.
 
 ---
 
@@ -386,10 +396,10 @@ curl -s -X POST http://127.0.0.1:8184/api/check/resources \
 
 ## Observability
 
-- Guard action name: `opa_access` — a naming leftover from when OPA was the only provider; it's recorded under this name regardless of which provider (OPA or Cerbos) actually answered.
-- A provider-level error (timeout, HTTP failure, unparseable body) is logged with a `provider` field naming which one — `"opa"` or `"cerbos"`.
-- Decision cache hits skip the Cerbos round-trip within `cacheTtlMs`, same as OPA.
-- Provider timeouts and denials appear on the query record like other guard blocks.
+- Guard action name: `opa_access` (the access-control rewrite/deny guard in query history)
+- A provider-level error (timeout, HTTP failure, unparseable body) is logged with `provider: "cerbos"`
+- Decision cache hits skip the Cerbos round-trip within `cacheTtlMs`
+- Provider timeouts and denials appear on the query record like other guard blocks
 
 Studio shows rewritten SQL separately from dialect-translated SQL when both apply.
 
@@ -398,7 +408,6 @@ Studio shows rewritten SQL separately from dialect-translated SQL when both appl
 ## Related reading
 
 - [Access control overview](overview.md)
-- [OPA provider](opa.md) — the other supported provider; near-identical config shape
 - [Customer API row filters](customer-api-row-filters)
 - [Guardrails](../architecture/guardrails)
 - [Authentication & identity](../authentication)
