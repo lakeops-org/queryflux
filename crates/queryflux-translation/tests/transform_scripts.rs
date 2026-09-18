@@ -128,7 +128,10 @@ def transform(sql: str, src: str, dst: str) -> str:
     let out = translate_trino("SELECT 1", vec![script.to_string()])
         .await
         .expect("translate");
-    assert!(out.contains("42"), "expected string-only rewrite, got: {out}");
+    assert!(
+        out.contains("42"),
+        "expected string-only rewrite, got: {out}"
+    );
 }
 
 #[tokio::test]

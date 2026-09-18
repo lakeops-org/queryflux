@@ -209,7 +209,10 @@ accessControl:
             .expect("valid multi-connection access_control should load")
             .access_control
             .expect("accessControl block");
-        assert_eq!(cfg.connection_name_for_group("eu-group"), Some("eu-sandbox"));
+        assert_eq!(
+            cfg.connection_name_for_group("eu-group"),
+            Some("eu-sandbox")
+        );
         assert_eq!(cfg.connection_name_for_group("trino-prod"), Some("default"));
         assert!(cfg.enabled_for_group("trino-prod"));
         assert!(!cfg.enabled_for_group("sandbox"));
@@ -243,7 +246,10 @@ accessControl:
             .expect("valid access_control without a default connection should load")
             .access_control
             .expect("accessControl block");
-        assert_eq!(cfg.connection_name_for_group("eu-group"), Some("eu-sandbox"));
+        assert_eq!(
+            cfg.connection_name_for_group("eu-group"),
+            Some("eu-sandbox")
+        );
         // No `defaultConnection` and no per-group override — access control simply
         // doesn't apply to this group.
         assert_eq!(cfg.connection_name_for_group("trino-prod"), None);

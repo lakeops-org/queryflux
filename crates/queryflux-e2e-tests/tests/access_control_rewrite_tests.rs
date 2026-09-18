@@ -883,7 +883,11 @@ async fn three_way_join_applies_three_independent_policies() {
     )
     .await
     .expect("three-way join");
-    assert_eq!(rows.len(), 1, "expected exactly one surviving row, got {rows:?}");
+    assert_eq!(
+        rows.len(),
+        1,
+        "expected exactly one surviving row, got {rows:?}"
+    );
     assert_eq!(rows[0].get("cid").map(String::as_str), Some("1"));
     assert_eq!(rows[0].get("oid").map(String::as_str), Some("11"));
     assert_eq!(rows[0].get("salary").map(String::as_str), Some(""));
@@ -944,8 +948,14 @@ async fn group_by_masked_date_column_groups_on_the_masked_value() {
     .await
     .expect("group by masked date");
     assert_eq!(rows.len(), 2, "got {rows:?}");
-    assert!(rows[0][0].starts_with("2019") && rows[0][0].ends_with("01-01"), "{rows:?}");
-    assert!(rows[1][0].starts_with("2020") && rows[1][0].ends_with("01-01"), "{rows:?}");
+    assert!(
+        rows[0][0].starts_with("2019") && rows[0][0].ends_with("01-01"),
+        "{rows:?}"
+    );
+    assert!(
+        rows[1][0].starts_with("2020") && rows[1][0].ends_with("01-01"),
+        "{rows:?}"
+    );
     assert_eq!(rows[0][1], "1");
     assert_eq!(rows[1][1], "1");
 }
@@ -1057,9 +1067,12 @@ async fn order_by_limit_offset_paginates_the_filtered_set() {
 
     // EU orders in id order: 10, 11, 13 (12 is US, filtered out). OFFSET 1 LIMIT 1 must
     // land on 11, not on 12 (which would appear only if the filter were applied too late).
-    let rows = pg_run(&client, "SELECT id FROM orders ORDER BY id LIMIT 1 OFFSET 1")
-        .await
-        .expect("paginated select");
+    let rows = pg_run(
+        &client,
+        "SELECT id FROM orders ORDER BY id LIMIT 1 OFFSET 1",
+    )
+    .await
+    .expect("paginated select");
     assert_eq!(parse_ids(&rows), vec![11]);
 }
 

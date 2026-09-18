@@ -111,11 +111,7 @@ impl OpaAccessGuard {
     /// Whether access control is administratively enabled for `group`. Does **not** by
     /// itself mean access control runs for it — see [`Self::connection_name_for_group`].
     pub fn enabled_for_group(&self, group: &str) -> bool {
-        if let Some(enabled) = self
-            .group_enabled
-            .get(group)
-            .and_then(|enabled| *enabled)
-        {
+        if let Some(enabled) = self.group_enabled.get(group).and_then(|enabled| *enabled) {
             return enabled;
         }
         self.global_enabled
@@ -574,7 +570,10 @@ mod tests {
         };
         let guard = OpaAccessGuard::try_from_config(&cfg).expect("build guard");
 
-        assert_eq!(guard.connection_name_for_group("trino-prod"), Some("default"));
+        assert_eq!(
+            guard.connection_name_for_group("trino-prod"),
+            Some("default")
+        );
         assert_eq!(guard.connection_name_for_group("eu-group"), Some("eu"));
 
         let dialect = SqlDialect::Postgres;
