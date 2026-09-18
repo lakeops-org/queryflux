@@ -1873,9 +1873,11 @@ pub struct TranslationConfig {
     #[serde(default)]
     pub error_on_unsupported: bool,
     /// Python scripts run after every sqlglot translation.
-    /// Each script must define `def transform(ast, src: str, dst: str) -> None:`.
+    /// Each script must define `def transform(sql: str, src: str, dst: str) -> str:`.
     /// Top-level imports and helper functions are supported.
-    /// Scripts mutate `ast` in-place; `src`/`dst` carry the dialect names.
+    /// Scripts receive the SQL text and return the (possibly modified) SQL text;
+    /// `src`/`dst` carry the dialect names. A script that needs AST-level control
+    /// can `import sqlglot` (or any other parser) itself and return `.sql(dialect=dst)`.
     #[serde(default)]
     pub python_scripts: Vec<String>,
     /// Max time to spend on catalog lookup for schema-aware translation before
@@ -1971,6 +1973,35 @@ pub enum CatalogProviderConfig {
         primary: Box<CatalogProviderConfig>,
         secondary: Box<CatalogProviderConfig>,
     },
+    /// Table/column metadata declared inline in config — for local demos and
+    /// tests without Glue/HMS/Iceberg. Keys are bare table names (`customers`,
+    /// not `catalog.db.customers`).
+    Static {
+        #[serde(default)]
+        tables: StaticTableMap,
+    },
+}
+
+/// `catalogProvider.type: static` — map of bare table name → column list.
+pub type StaticTableMap = std::collections::HashMap<String, StaticTableEntry>;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StaticTableEntry {
+    #[serde(default)]
+    pub catalog: String,
+    #[serde(default)]
+    pub database: String,
+    pub columns: Vec<StaticColumnConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StaticColumnConfig {
+    pub name: String,
+    pub data_type: String,
+    #[serde(default = "default_true")]
+    pub nullable: bool,
 }
 
 /// Authentication for an `IcebergRest` catalog provider. Maps directly onto
@@ -3511,6 +3542,31 @@ cache:
                 assert_eq!(cache.max_entries, 10_000);
             }
             other => panic!("expected Glue with defaulted cache, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn static_tables_parse_with_camel_case_column_types() {
+        let yaml = r#"
+type: static
+tables:
+  customers:
+    columns:
+      - name: id
+        dataType: INTEGER
+      - name: ssn
+        dataType: VARCHAR
+        nullable: false
+"#;
+        let cfg: CatalogProviderConfig = serde_yaml::from_str(yaml).unwrap();
+        match cfg {
+            CatalogProviderConfig::Static { tables } => {
+                let customers = tables.get("customers").expect("customers table");
+                assert_eq!(customers.columns.len(), 2);
+                assert_eq!(customers.columns[0].data_type, "INTEGER");
+                assert!(!customers.columns[1].nullable);
+            }
+            other => panic!("expected Static, got {other:?}"),
         }
     }
 }

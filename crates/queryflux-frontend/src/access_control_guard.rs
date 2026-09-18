@@ -85,23 +85,92 @@ pub async fn run_access_control_stage(
     }
 }
 
-pub struct OpaAccessGuard {
+/// Everything `check()` needs that can vary **per connection** — a named entry under
+/// `accessControl.connections`. Every cluster group resolves to exactly one of these (see
+/// [`OpaAccessGuard::connection_for_group`]).
+struct ConnectionRuntime {
     controller: Arc<AccessController>,
     session_param_keys: Vec<String>,
     on_missing_schema: OnMissingSchema,
 }
 
+pub struct OpaAccessGuard {
+    /// Keyed by connection name. No name is reserved or required to be present.
+    connections: HashMap<String, ConnectionRuntime>,
+    global_enabled: bool,
+    group_enabled: HashMap<String, Option<bool>>,
+    /// Only groups with an explicit `groups.<name>.connection` override; absence falls back
+    /// to `default_connection`.
+    group_connection: HashMap<String, String>,
+    /// `accessControl.defaultConnection` — the connection a group without an explicit
+    /// override resolves to. `None` means such a group gets no access control at all.
+    default_connection: Option<String>,
+}
+
 impl OpaAccessGuard {
-    pub fn new(
-        controller: Arc<AccessController>,
-        session_param_keys: Vec<String>,
-        on_missing_schema: OnMissingSchema,
-    ) -> Self {
-        Self {
-            controller,
-            session_param_keys,
-            on_missing_schema,
+    /// Whether access control is administratively enabled for `group`. Does **not** by
+    /// itself mean access control runs for it — see [`Self::connection_name_for_group`].
+    pub fn enabled_for_group(&self, group: &str) -> bool {
+        if let Some(enabled) = self.group_enabled.get(group).and_then(|enabled| *enabled) {
+            return enabled;
         }
+        self.global_enabled
+    }
+
+    /// The named connection `group` resolves to: its own override, else
+    /// `default_connection`. `None` means access control does not apply to this group.
+    pub fn connection_name_for_group<'a>(&'a self, group: &str) -> Option<&'a str> {
+        self.group_connection
+            .get(group)
+            .map(String::as_str)
+            .or(self.default_connection.as_deref())
+    }
+
+    fn connection_for_group(&self, group: &str) -> Option<&ConnectionRuntime> {
+        self.connection_name_for_group(group)
+            .and_then(|name| self.connections.get(name))
+    }
+
+    /// Build the rewriting guard from validated `accessControl` config. One
+    /// [`AccessController`] (its own HTTP client, cache, fail-open policy) is built per named
+    /// connection.
+    pub fn try_from_config(
+        cfg: &queryflux_core::access_config::AccessControlConfig,
+    ) -> Result<Arc<Self>, String> {
+        let metrics: Arc<dyn queryflux_access_control::AccessMetricsSink> =
+            Arc::new(queryflux_access_control::NoopMetrics);
+        let mut controllers = queryflux_access_control::build_controllers(cfg, metrics)?;
+        let mut connections = HashMap::new();
+        for (name, conn_cfg) in &cfg.connections {
+            let controller = controllers.remove(name).ok_or_else(|| {
+                format!("internal error: no controller built for connection {name:?}")
+            })?;
+            connections.insert(
+                name.clone(),
+                ConnectionRuntime {
+                    controller: Arc::new(controller),
+                    session_param_keys: conn_cfg.session_param_keys.clone(),
+                    on_missing_schema: conn_cfg.on_missing_schema,
+                },
+            );
+        }
+        let group_enabled = cfg
+            .groups
+            .iter()
+            .map(|(name, ov)| (name.clone(), ov.enabled))
+            .collect();
+        let group_connection = cfg
+            .groups
+            .iter()
+            .filter_map(|(name, ov)| ov.connection.clone().map(|c| (name.clone(), c)))
+            .collect();
+        Ok(Arc::new(Self {
+            connections,
+            global_enabled: cfg.enabled,
+            group_enabled,
+            group_connection,
+            default_connection: cfg.default_connection.clone(),
+        }))
     }
 }
 
@@ -116,13 +185,19 @@ impl Guard for OpaAccessGuard {
     }
 
     async fn check(&self, ctx: &GuardContext<'_>) -> GuardResult {
+        // No connection resolves for this group (no explicit override and no
+        // `defaultConnection`) — access control simply does not apply here.
+        let Some(conn) = self.connection_for_group(&ctx.cluster_group.0) else {
+            return GuardResult::allow();
+        };
+
         let stmts = match ctx.sql_parse {
             Some(cache) => cache.statements_async().await.map(<[_]>::to_vec),
             None => None,
         };
         let operation = classify_operation(stmts.as_deref(), ctx.sql);
 
-        if !self.controller.evaluates(&operation) {
+        if !conn.controller.evaluates(&operation) {
             return GuardResult::allow();
         }
 
@@ -133,7 +208,7 @@ impl Guard for OpaAccessGuard {
         {
             Ok(r) => r,
             Err(e) => {
-                return match self.on_missing_schema {
+                return match conn.on_missing_schema {
                     OnMissingSchema::Deny => GuardResult::deny(
                         format!("access control: could not analyze query: {e}"),
                         "ACCESS_ANALYSIS_FAILED",
@@ -148,7 +223,7 @@ impl Guard for OpaAccessGuard {
             return GuardResult::allow();
         }
 
-        if self.on_missing_schema == OnMissingSchema::Deny
+        if conn.on_missing_schema == OnMissingSchema::Deny
             && extracted.iter().any(|r| matches!(r.columns, Columns::All))
         {
             return GuardResult::deny(
@@ -167,7 +242,7 @@ impl Guard for OpaAccessGuard {
             })
             .collect();
 
-        let session_params: BTreeMap<String, String> = self
+        let session_params: BTreeMap<String, String> = conn
             .session_param_keys
             .iter()
             .filter_map(|k| ctx.session_extra.get(k).map(|v| (k.clone(), v.clone())))
@@ -190,7 +265,7 @@ impl Guard for OpaAccessGuard {
             },
         };
 
-        let decision = self.controller.evaluate(&request).await;
+        let decision = conn.controller.evaluate(&request).await;
 
         if !decision.is_allowed() {
             let (table, reason) = decision.first_denied().unwrap_or(("", "access denied"));
@@ -333,8 +408,14 @@ fn engine_name(e: &EngineType) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::{routing::post, Json, Router};
+    use queryflux_core::access_config::{
+        AccessConnectionConfig, AccessControlConfig, GroupOverride, OpaProviderConfig,
+    };
     use queryflux_core::query::SqlDialect;
     use queryflux_core::sql_classify::SqlParseCache;
+    use queryflux_core::tags::QueryTags;
+    use tokio::net::TcpListener;
 
     async fn classify(sql: &str) -> Operation {
         let cache = SqlParseCache::new(sql.to_string(), SqlDialect::Postgres);
@@ -388,5 +469,203 @@ mod tests {
             classify("DESCRIBE orders").await.as_str(),
             "statement.other"
         );
+    }
+
+    /// Starts a tiny in-process OPA stub that always allows `orders` with a row filter
+    /// tagging which stub answered (`source = '<tag>'`), so a test can tell which HTTP
+    /// endpoint actually received the request.
+    async fn start_tagged_stub(tag: &'static str) -> String {
+        async fn handler(
+            axum::extract::State(tag): axum::extract::State<&'static str>,
+            Json(_body): Json<serde_json::Value>,
+        ) -> Json<serde_json::Value> {
+            Json(serde_json::json!({
+                "result": {
+                    "resources": [{
+                        "table": "orders",
+                        "allow": true,
+                        "rowFilters": [{ "expression": format!("source = '{tag}'") }],
+                    }]
+                }
+            }))
+        }
+        let app = Router::new()
+            .route("/v1/data/queryflux/access", post(handler))
+            .with_state(tag);
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind stub");
+        let addr = listener.local_addr().expect("stub addr");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+        format!("http://{addr}")
+    }
+
+    fn opa_connection(url: &str) -> AccessConnectionConfig {
+        AccessConnectionConfig {
+            opa: Some(OpaProviderConfig {
+                url: url.to_string(),
+                decision_path: "/v1/data/queryflux/access".to_string(),
+                timeout_ms: 2_000,
+                bearer_token: None,
+                client_credentials: None,
+            }),
+            cache_ttl_ms: 0,
+            ..AccessConnectionConfig::default()
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn plan_ctx<'a>(
+        sql: &'a str,
+        dialect: &'a SqlDialect,
+        engine_type: &'a EngineType,
+        group: &'a ClusterGroupName,
+        attributes: &'a BTreeMap<String, serde_json::Value>,
+        query_tags: &'a QueryTags,
+        session_extra: &'a HashMap<String, String>,
+        sql_parse: &'a SqlParseCache,
+    ) -> GuardContext<'a> {
+        GuardContext {
+            sql,
+            dialect,
+            engine_type,
+            cluster_group: group,
+            user: Some("alice"),
+            groups: &[],
+            roles: &[],
+            attributes,
+            agent_context: None,
+            query_tags,
+            session_extra,
+            schema: None,
+            sql_parse: Some(sql_parse),
+        }
+    }
+
+    /// Proves a cluster group actually reaches a *different* HTTP endpoint when
+    /// `groups.<name>.connection` names a non-default connection — not just that the
+    /// config resolves the right name in memory, but that the guard dispatches the real
+    /// request to the right server.
+    #[tokio::test]
+    async fn group_routes_to_its_configured_connection() {
+        let default_url = start_tagged_stub("default").await;
+        let eu_url = start_tagged_stub("eu").await;
+
+        let cfg = AccessControlConfig {
+            enabled: true,
+            default_connection: Some("default".to_string()),
+            connections: HashMap::from([
+                ("default".to_string(), opa_connection(&default_url)),
+                ("eu".to_string(), opa_connection(&eu_url)),
+            ]),
+            groups: HashMap::from([(
+                "eu-group".to_string(),
+                GroupOverride {
+                    enabled: None,
+                    fail_open: None,
+                    connection: Some("eu".to_string()),
+                },
+            )]),
+        };
+        let guard = OpaAccessGuard::try_from_config(&cfg).expect("build guard");
+
+        assert_eq!(
+            guard.connection_name_for_group("trino-prod"),
+            Some("default")
+        );
+        assert_eq!(guard.connection_name_for_group("eu-group"), Some("eu"));
+
+        let dialect = SqlDialect::Postgres;
+        let engine_type = EngineType::Trino;
+        let sql = "SELECT id FROM orders";
+        let sql_parse = SqlParseCache::new(sql.to_string(), dialect.clone());
+        let attributes = BTreeMap::new();
+        let query_tags = QueryTags::new();
+        let session_extra = HashMap::new();
+
+        let default_group = ClusterGroupName("trino-prod".to_string());
+        let default_ctx = plan_ctx(
+            sql,
+            &dialect,
+            &engine_type,
+            &default_group,
+            &attributes,
+            &query_tags,
+            &session_extra,
+            &sql_parse,
+        );
+        match guard.check(&default_ctx).await {
+            GuardResult::Rewrite { sql, .. } => {
+                assert!(sql.contains("source = 'default'"), "got: {sql}")
+            }
+            other => panic!("expected a rewrite from the default connection, got {other:?}"),
+        }
+
+        let eu_group = ClusterGroupName("eu-group".to_string());
+        let eu_ctx = plan_ctx(
+            sql,
+            &dialect,
+            &engine_type,
+            &eu_group,
+            &attributes,
+            &query_tags,
+            &session_extra,
+            &sql_parse,
+        );
+        match guard.check(&eu_ctx).await {
+            GuardResult::Rewrite { sql, .. } => {
+                assert!(sql.contains("source = 'eu'"), "got: {sql}")
+            }
+            other => panic!("expected a rewrite from the eu connection, got {other:?}"),
+        }
+    }
+
+    /// With no `defaultConnection` set, a group that doesn't explicitly opt into a named
+    /// connection gets no access control at all — `check()` allows without ever calling the
+    /// stub, distinct from an explicit allow decision.
+    #[tokio::test]
+    async fn group_with_no_resolvable_connection_is_allowed_without_a_call() {
+        let stub_url = start_tagged_stub("only").await;
+        let cfg = AccessControlConfig {
+            enabled: true,
+            default_connection: None,
+            connections: HashMap::from([("only".to_string(), opa_connection(&stub_url))]),
+            groups: HashMap::from([(
+                "opted-in".to_string(),
+                GroupOverride {
+                    enabled: None,
+                    fail_open: None,
+                    connection: Some("only".to_string()),
+                },
+            )]),
+        };
+        let guard = OpaAccessGuard::try_from_config(&cfg).expect("build guard");
+
+        assert_eq!(guard.connection_name_for_group("unrelated-group"), None);
+        assert_eq!(guard.connection_name_for_group("opted-in"), Some("only"));
+
+        let dialect = SqlDialect::Postgres;
+        let engine_type = EngineType::Trino;
+        let sql = "SELECT id FROM orders";
+        let sql_parse = SqlParseCache::new(sql.to_string(), dialect.clone());
+        let attributes = BTreeMap::new();
+        let query_tags = QueryTags::new();
+        let session_extra = HashMap::new();
+
+        let unrelated_group = ClusterGroupName("unrelated-group".to_string());
+        let ctx = plan_ctx(
+            sql,
+            &dialect,
+            &engine_type,
+            &unrelated_group,
+            &attributes,
+            &query_tags,
+            &session_extra,
+            &sql_parse,
+        );
+        match guard.check(&ctx).await {
+            GuardResult::Allow { .. } => {}
+            other => panic!("expected a plain allow (no connection resolved), got {other:?}"),
+        }
     }
 }

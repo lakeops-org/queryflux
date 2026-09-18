@@ -135,13 +135,14 @@ pub fn rewrite_table_scans(
 }
 
 fn schema_to_json(schema: &SchemaContext) -> String {
-    // { "table_name": ["col1", "col2", ...] }
-    let map: std::collections::BTreeMap<&String, Vec<&String>> = schema
-        .tables
-        .iter()
-        .map(|(t, cols)| (t, cols.keys().collect()))
-        .collect();
-    serde_json::to_string(&map).unwrap_or_else(|_| "{}".to_string())
+    // { "table_name": { "col1": "type1", ... } } — sqlglot's `qualify(schema=...)`
+    // requires this nesting (a dict of column -> type per table); handing it a
+    // flat list of column names raises `SchemaError: ... must match the schema's
+    // nesting level` internally, which `extract_resources` silently swallows and
+    // treats as "no schema", so column attribution never actually runs.
+    // `rewrite_table_scans`'s own `list(cols)` still works unchanged against this
+    // shape — `list()` on a dict yields its keys, the column names it wants.
+    serde_json::to_string(&schema.tables).unwrap_or_else(|_| "{}".to_string())
 }
 
 fn policies_to_json(policies: &[TablePolicy]) -> String {
@@ -208,9 +209,18 @@ def extract_resources(sql, dialect, schema_json):
         except Exception:
             qualified = None
 
+    # Build the table listing from whichever tree we'll also read column
+    # attribution from (`qualified` when we have one, else the raw `tree`).
+    # qualify() renormalizes identifier casing per-dialect (e.g. `Orders` ->
+    # `orders` on Trino, `orders` -> `ORDERS` on Snowflake) and can rewrite an
+    # unaliased table's synthesized alias too — keying the table listing off a
+    # *different* tree than the alias map risks the two keys never matching,
+    # which would silently attribute zero columns to a real, matched table.
+    src = qualified if qualified is not None else tree
+
     per_table = {}
     order = []
-    for t in tree.find_all(exp.Table):
+    for t in src.find_all(exp.Table):
         if not t.name:
             continue
         if not t.catalog and not t.db and t.name.lower() in ctes:
@@ -226,7 +236,6 @@ def extract_resources(sql, dialect, schema_json):
             }
             order.append(key)
 
-    src = qualified if qualified is not None else tree
     # star -> all columns
     for star in src.find_all(exp.Star):
         for e in per_table.values():
@@ -276,13 +285,85 @@ def rewrite_table_scans(sql, dialect, schema_json, policies_json):
         bare = key.rsplit(".", 1)[-1]
         by_name.setdefault(bare, p)
 
-    def col_list_for(policy_table, node):
-        # explicit schema columns win; else derive from the scan is impossible -> error
+    def _star_selects_this_scan(table_node):
+        p = table_node.parent
+        while p is not None:
+            if isinstance(p, exp.Select):
+                for e in p.expressions:
+                    if isinstance(e, exp.Star):
+                        return True
+                    if isinstance(e, exp.Column) and e.name == "*":
+                        return True
+                return False
+            p = p.parent
+        return False
+
+    def _enclosing_select(table_node):
+        p = table_node.parent
+        while p is not None:
+            if isinstance(p, exp.Select):
+                return p
+            p = p.parent
+        return None
+
+    def _in_select_scope(node, select):
+        p = node.parent
+        while p is not None:
+            if isinstance(p, exp.Select):
+                return p is select
+            p = p.parent
+        return False
+
+    def col_list_for(policy_table, node, masks):
+        # explicit schema columns win; else named references in the *enclosing*
+        # SELECT (plus every masked column) are enough for a projection.
+        # Unqualified names are taken only from that SELECT so a join's
+        # `IN (SELECT id FROM t)` still projects `id` on the inner scan.
+        # SELECT * still needs schema — we cannot invent the rest of the table.
         cand = [policy_table.lower(), policy_table.rsplit(".", 1)[-1].lower()]
         for tname, cols in schema.items():
             if tname.lower() in cand or tname.rsplit(".", 1)[-1].lower() in cand:
                 return list(cols)
-        return None
+        if _star_selects_this_scan(node):
+            return None
+        alias = (node.alias or node.name or "").lower()
+        names = []
+        seen = set()
+
+        def add(n):
+            if not n:
+                return
+            k = n.lower()
+            if k not in seen:
+                seen.add(k)
+                names.append(n)
+
+        for mcol in masks:
+            add(mcol)
+        scope = _enclosing_select(node)
+        src = scope if scope is not None else tree
+        sole_in_scope = False
+        if scope is not None:
+            tables_here = [
+                tbl
+                for tbl in scope.find_all(exp.Table)
+                if tbl.name
+                and not (not tbl.catalog and not tbl.db and tbl.name.lower() in ctes)
+                and _in_select_scope(tbl, scope)
+            ]
+            sole_in_scope = len(tables_here) == 1
+        for col in src.find_all(exp.Column):
+            if not col.name or col.name == "*":
+                continue
+            if scope is not None and not _in_select_scope(col, scope):
+                continue
+            tbl = (col.table or "").lower()
+            if tbl:
+                if tbl == alias or tbl in cand:
+                    add(col.name)
+            elif sole_in_scope:
+                add(col.name)
+        return names if names else None
 
     replaced = 0
     for t in list(tree.find_all(exp.Table)):
@@ -302,7 +383,7 @@ def rewrite_table_scans(sql, dialect, schema_json, policies_json):
 
         # projection
         if masks:
-            cols = col_list_for(policy["table"], t)
+            cols = col_list_for(policy["table"], t, masks)
             if not cols:
                 raise ValueError("cannot enumerate columns for masked table %r" % policy["table"])
             selects = []
@@ -473,6 +554,80 @@ mod tests {
         );
     }
 
+    fn named_columns(columns: &Columns) -> Vec<String> {
+        match columns {
+            Columns::Named(cols) => {
+                let mut cols = cols.clone();
+                cols.sort();
+                cols
+            }
+            Columns::All => panic!("expected an explicit column list, got Columns::All"),
+        }
+    }
+
+    #[test]
+    fn extract_resources_with_schema_attributes_columns() {
+        let schema = schema_with("orders", &["id", "amount", "region"]);
+        let refs = extract_resources(
+            "SELECT o.id, o.amount FROM orders o",
+            &SqlDialect::Trino,
+            &schema,
+        )
+        .unwrap();
+        assert_eq!(refs.len(), 1);
+        assert_eq!(
+            named_columns(&refs[0].columns),
+            vec!["amount".to_string(), "id".to_string()]
+        );
+    }
+
+    /// Regression: `qualify()` normalizes identifier casing per-dialect (e.g. `Orders`
+    /// -> `orders` on Trino). Column attribution used to key the table listing off the
+    /// pre-qualify tree and the alias map off the post-qualify tree, so any casing
+    /// difference between them silently dropped every column for that table down to an
+    /// empty list — even though a schema was provided and qualify() ran successfully.
+    #[test]
+    fn extract_resources_with_schema_attributes_columns_when_table_case_differs() {
+        let schema = schema_with("orders", &["id", "amount"]);
+        let refs = extract_resources(
+            "SELECT o.id, o.amount FROM Orders o",
+            &SqlDialect::Trino,
+            &schema,
+        )
+        .unwrap();
+        assert_eq!(refs.len(), 1);
+        assert_eq!(
+            named_columns(&refs[0].columns),
+            vec!["amount".to_string(), "id".to_string()]
+        );
+    }
+
+    /// Regression: Snowflake's default identifier folding uppercases both the table
+    /// name and any unquoted alias during qualify() — for perfectly ordinary,
+    /// all-lowercase source SQL, not just mixed-case edge cases. Column attribution
+    /// must survive it instead of silently reporting zero columns for every Snowflake
+    /// query that has a schema configured.
+    #[test]
+    fn extract_resources_with_schema_attributes_columns_on_snowflake() {
+        let schema = schema_with("orders", &["id", "amount"]);
+        let refs = extract_resources(
+            "SELECT o.id, o.amount FROM orders o",
+            &SqlDialect::Snowflake,
+            &schema,
+        )
+        .unwrap();
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].table.to_lowercase(), "orders");
+        // Snowflake folds unquoted identifiers to uppercase — columns included —
+        // so compare case-insensitively; the point of this test is that the
+        // column list isn't silently empty, not what case it comes back in.
+        let cols: Vec<String> = named_columns(&refs[0].columns)
+            .into_iter()
+            .map(|c| c.to_lowercase())
+            .collect();
+        assert_eq!(cols, vec!["amount".to_string(), "id".to_string()]);
+    }
+
     #[test]
     fn rewrite_row_filter_only_no_schema() {
         let out = rewrite_table_scans(
@@ -522,9 +677,54 @@ mod tests {
     }
 
     #[test]
-    fn rewrite_masked_table_without_schema_errors() {
+    fn rewrite_mask_named_columns_without_schema() {
+        let out = rewrite_table_scans(
+            "SELECT name, ssn FROM finance.transactions ORDER BY id",
+            &SqlDialect::Trino,
+            &SchemaContext::default(),
+            &[TablePolicy {
+                table: "finance.transactions".into(),
+                row_filters: vec!["region = 'EU'".into()],
+                masked_columns: vec![("ssn".into(), "NULL".into())],
+            }],
+        )
+        .unwrap();
+        let lower = out.to_lowercase();
+        assert!(lower.contains("null"), "got: {out}");
+        assert!(lower.contains("region = 'eu'"), "got: {out}");
+        assert!(
+            lower.contains("as ssn") || lower.contains("ssn"),
+            "masked column must stay addressable: {out}"
+        );
+    }
+
+    #[test]
+    fn rewrite_mask_in_subquery_projects_unqualified_id() {
+        let out = rewrite_table_scans(
+            "SELECT a.id, b.id FROM customers a \
+             JOIN customers b ON a.id < b.id \
+             WHERE a.id IN (SELECT id FROM customers)",
+            &SqlDialect::Trino,
+            &SchemaContext::default(),
+            &[TablePolicy {
+                table: "customers".into(),
+                row_filters: vec!["region = 'EU'".into()],
+                masked_columns: vec![("ssn".into(), "NULL".into())],
+            }],
+        )
+        .unwrap();
+        let lower = out.to_lowercase();
+        assert!(
+            lower.contains("in (select id from"),
+            "IN subquery must keep projecting id, got: {out}"
+        );
+        assert!(lower.contains("null"), "mask must still apply: {out}");
+    }
+
+    #[test]
+    fn rewrite_masked_star_without_schema_errors() {
         let err = rewrite_table_scans(
-            "SELECT ssn FROM finance.transactions",
+            "SELECT * FROM finance.transactions",
             &SqlDialect::Trino,
             &SchemaContext::default(),
             &[TablePolicy {

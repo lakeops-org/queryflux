@@ -9,6 +9,7 @@ Several stacks for **QueryFlux** + **Trino** (and optional add-ons). Run command
 | [`minimal/`](minimal-trino/) | Yes | Full Studio (query history, persisted clusters/groups/routing via API), production-like persistence |
 | [`minimal-inmemory/`](minimal-inmemory/) | No | Fastest local tryout; config only in `config.yaml`; no shared query history |
 | [`with-mcp/`](with-mcp/) | No | MCP frontend + embedded DuckDB — point an AI agent (Cursor, Claude Code, MCP Inspector, ...) at QueryFlux with zero external services |
+| [`with-opa/`](with-opa/) | No | OPA data access control (allow/deny, row filters, column masks) + Lakekeeper/Trino; QueryFlux from this branch on the host — see [docs](../website/docs/access-control/opa.md) |
 | [`with-prometheus-grafana/`](with-prometheus-grafana/) | Yes | Same workload as minimal + **Prometheus** + **Grafana** (repo [`grafana/`](../grafana/), local scrape config); **no Studio** |
 | [`full-stack/`](full-stack/) | Yes (host **5433**) | Trino + StarRocks + Iceberg/Lakekeeper + MinIO + TPCH loader |
 | [`full-stack-with-prometheus-grafana/`](full-stack-with-prometheus-grafana/) | Yes (host **5433**) | **`full-stack`** + **Prometheus** + **Grafana**; Grafana on **3001** |
@@ -68,6 +69,30 @@ docker compose up -d --wait
 | MCP endpoint (streamable HTTP) | http://localhost:8811/mcp |
 | Admin API | http://localhost:9000 |
 | Studio | http://localhost:3000 |
+
+---
+
+## With OPA (`with-opa/`)
+
+**Lakekeeper** + **MinIO** + **Trino** + **OPA** + **QueryFlux Postgres** (`:5434`) in Compose + **QueryFlux on the host** from this branch (the published image does not include `accessControl` yet). Postgres persistence enables query history and Studio **Access Control** saves. QueryFlux resolves Iceberg schema from Lakekeeper for OPA rewrites. Two static users: Alice sees every `customers` row; Bob is row-filtered to `EU` with SSN masked, and `payroll` is denied. Demo UI at **http://127.0.0.1:8183**. Details: [`with-opa/README.md`](with-opa/README.md).
+
+```bash
+cd examples/with-opa
+docker compose up -d --wait
+docker compose --profile seed run --rm data-seed
+# from repo root:
+cargo run -p queryflux -- --config examples/with-opa/config.yaml
+python3 examples/with-opa/demo.py
+```
+
+| Service | URL |
+|---------|-----|
+| Demo UI | http://127.0.0.1:8183 |
+| SQL (Trino HTTP via QueryFlux) | http://localhost:8080 |
+| Admin API + dry-run | http://localhost:9000 |
+| Trino (direct backend) | http://localhost:8081 |
+| Lakekeeper REST catalog | http://127.0.0.1:8181 |
+| OPA | http://127.0.0.1:8182 |
 
 ---
 

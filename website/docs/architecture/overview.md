@@ -18,6 +18,8 @@ This section describes how QueryFlux is put together: why it exists, how SQL is 
 | [Query tags](query-tags.md) | Attaching metadata to queries for routing, observability, and backend forwarding. |
 | [Query parameters](query-params.md) | Typed positional bindings — how `?` params flow from frontend to native engine APIs. |
 | [Observability](observability.md) | Prometheus metrics, Grafana dashboard, QueryFlux Studio, and the Admin REST API. |
+| [Guardrails](guardrails.md) | SQL-shape safety checks (read-only, LIMIT, Python guards). |
+| [Access control](../access-control/overview.md) | Table/column allow-deny, row filters, masks, and [customer API](../access-control/customer-api-row-filters.md) use case via [OPA](../access-control/opa.md). |
 | [Frontends](frontends/overview.md) | Protocol listeners — Trino HTTP, PostgreSQL wire, MySQL wire, Flight SQL, and more. Shared dispatch, session model, and per-protocol details. |
 | [Extending QueryFlux](adding-support/overview.md) | **[Backend](adding-support/backend.md)** (Rust + Studio) and **[Frontend](adding-support/frontend.md)** (new protocols). |
 | [Auth / authz design](auth-authz-design.md) | Authentication and authorization design notes. |

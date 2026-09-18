@@ -67,19 +67,25 @@ clusterGroups:
 translation:
   errorOnUnsupported: false
   # Optional Python scripts run after every sqlglot translation.
-  # Each script must define: def transform(ast, src, dst) -> None
-  # `ast` is a sqlglot AST to mutate in-place, `src`/`dst` are dialect names.
-  # Import sqlglot.expressions as needed (for example: `import sqlglot.expressions as exp`).
+  # Each script must define: def transform(sql, src, dst) -> str
+  # `sql` is the translated SQL text, `src`/`dst` are dialect names; return the
+  # (possibly modified) SQL text. Scripts are given plain text, not a live AST,
+  # so QueryFlux never binds you to a specific SQL library — parse `sql` with
+  # sqlglot (or anything else) yourself if you need AST-level control.
   # pythonScripts:
   #   - |
+  #     import sqlglot
   #     import sqlglot.expressions as exp
   #
-  #     def transform(ast, src, dst) -> None:
+  #     def transform(sql, src, dst) -> str:
   #         # Athena has no catalog layer — strip catalog from 3-part table references.
   #         # hive.my_db.my_table  →  my_db.my_table
-  #         if dst == "athena":
-  #             for table in ast.find_all(exp.Table):
-  #                 table.set("catalog", None)
+  #         if dst != "athena":
+  #             return sql
+  #         ast = sqlglot.parse_one(sql, dialect=dst)
+  #         for table in ast.find_all(exp.Table):
+  #             table.set("catalog", None)
+  #         return ast.sql(dialect=dst)
   # Max time to spend on catalog lookup (see `catalogProvider` below) before
   # falling back to dialect-only translation. Default 1500ms.
   # schemaResolutionTimeoutMs: 1500
@@ -164,19 +170,36 @@ routingFallback: duckdb-local
 
 # Data-level access control (row filtering, column masking, table/column allow-deny).
 # Runs on the source SQL before dialect translation, as a guard in the same pipeline
-# stage as `guardrails` above. Omit this section to disable entirely.
+# stage as `guardrails` above. Omit this section to disable entirely. See
+# website/docs/access-control/overview.md and access-control/opa.md.
 # accessControl:
-#   provider: opa                     # the only provider today, and the default
-#   opa:
-#     url: http://localhost:8181
-#     decisionPath: /v1/data/queryflux/access
-#     timeoutMs: 1000
-#     # bearerToken: "..."
-#     # clientCredentials: { clientId: ..., clientSecret: ..., tokenEndpoint: ... }
-#   operations: [table.select]        # add table.insert/update/delete to cover writes
-#   onMissingSchema: evaluate          # evaluate (send all-columns) | deny
-#   failOpen: false                    # provider timeout/error denies by default
-#   cacheTtlMs: 5000                   # decision cache; 0 disables
-#   sessionParamKeys: [customer_id]    # SessionContext.extra keys forwarded as context only
+#   enabled: true                      # global default; per-group `enabled` override below
+#   # `defaultConnection` names which entry under `connections` a cluster group uses when it
+#   # has no explicit `groups.<name>.connection` override. No connection name is reserved —
+#   # if you omit `defaultConnection`, a group with no explicit override gets NO access
+#   # control at all (nothing to route it to). Most deployments name one connection here and
+#   # never touch `groups.<name>.connection`; add another connection only when a group
+#   # genuinely needs a different endpoint (network segmentation, blast-radius isolation, a
+#   # per-team OPA during a provider migration) — for "different rules per team on the same
+#   # OPA", branch in Rego on input.context.clusterGroup instead of adding a connection.
+#   defaultConnection: prod
+#   connections:
+#     prod:
+#       provider: opa                  # the only provider today, and the default
+#       opa:
+#         url: http://localhost:8181
+#         decisionPath: /v1/data/queryflux/access
+#         timeoutMs: 1000
+#         # bearerToken: "..."
+#         # clientCredentials: { clientId: ..., clientSecret: ..., tokenEndpoint: ... }
+#       operations: [table.select]     # add table.insert/update/delete to cover writes
+#       onMissingSchema: evaluate      # evaluate (send all-columns) | deny
+#       failOpen: false                # provider timeout/error denies by default
+#       cacheTtlMs: 5000               # decision cache; 0 disables
+#       sessionParamKeys: [customer_id]  # SessionContext.extra keys forwarded as context only
+#     # eu-sandbox:                    # optional: a second connection for a segmented group
+#     #   opa: { url: https://eu-opa.internal, decisionPath: /v1/data/queryflux/access }
 #   groups:
-#     trino-prod: { failOpen: false }
+#     trino-prod: { failOpen: false }  # inherits `defaultConnection` (prod)
+#     sandbox: { enabled: false }      # skip access control entirely for this cluster group
+#     # eu-group: { connection: eu-sandbox }   # route this group to the "eu-sandbox" connection instead

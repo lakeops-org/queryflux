@@ -26,6 +26,7 @@ use queryflux_cluster_manager::{
 };
 use queryflux_core::config::SnowflakeHttpFrontendConfig;
 use queryflux_core::{
+    catalog::{CatalogProvider, NullCatalogProvider},
     error::Result as QfResult,
     query::{ClusterGroupName, ClusterName, EngineType},
 };
@@ -851,7 +852,7 @@ impl ProtocolWireHarness {
     pub async fn new_with_guard_chain(
         guard_chain: Option<Arc<queryflux_guardrails::GuardChain>>,
     ) -> Result<Self> {
-        Self::build(guard_chain, None, 2).await
+        Self::build(guard_chain, None, 2, None, vec![], None).await
     }
 
     /// Same as `new()`, but installs `access_control_guard` as the pre-translation
@@ -862,13 +863,55 @@ impl ProtocolWireHarness {
     pub async fn new_with_access_control(
         access_control_guard: Option<Arc<queryflux_frontend::access_control_guard::OpaAccessGuard>>,
     ) -> Result<Self> {
-        Self::build(None, access_control_guard, 1).await
+        Self::build(None, access_control_guard, 1, None, vec![], None).await
+    }
+
+    /// Same as `new_with_access_control`, but installs a real catalog so scan-site
+    /// column masking can enumerate columns (`SELECT *`, masked tables) and enables
+    /// sqlglot so rewritten Postgres SQL is transpiled to DuckDB.
+    pub async fn new_with_access_control_and_catalog(
+        access_control_guard: Option<Arc<queryflux_frontend::access_control_guard::OpaAccessGuard>>,
+        catalog: Arc<dyn CatalogProvider>,
+    ) -> Result<Self> {
+        let translation = Arc::new(TranslationService::new_sqlglot(vec![])?);
+        Self::build(
+            None,
+            access_control_guard,
+            1,
+            Some(translation),
+            vec![],
+            Some(catalog),
+        )
+        .await
+    }
+
+    /// Same as `new_with_access_control`, but also installs a real (sqlglot-backed)
+    /// `TranslationService` with `group_fixups` registered for the DuckDB test group.
+    /// Lets a test simulate a buggy fixup script mutating the translated SQL, to prove
+    /// the post-rewrite invariant assert in `dispatch.rs` catches it end-to-end.
+    pub async fn new_with_access_control_and_fixups(
+        access_control_guard: Option<Arc<queryflux_frontend::access_control_guard::OpaAccessGuard>>,
+        group_fixups: Vec<String>,
+    ) -> Result<Self> {
+        let translation = Arc::new(TranslationService::new_sqlglot(vec![])?);
+        Self::build(
+            None,
+            access_control_guard,
+            1,
+            Some(translation),
+            group_fixups,
+            None,
+        )
+        .await
     }
 
     async fn build(
         guard_chain: Option<Arc<queryflux_guardrails::GuardChain>>,
         access_control_guard: Option<Arc<queryflux_frontend::access_control_guard::OpaAccessGuard>>,
         pool_size: usize,
+        translation_override: Option<Arc<TranslationService>>,
+        group_fixups: Vec<String>,
+        catalog: Option<Arc<dyn CatalogProvider>>,
     ) -> Result<Self> {
         let _ = tracing_subscriber::fmt()
             .with_env_filter("error")
@@ -921,8 +964,15 @@ impl ProtocolWireHarness {
         });
 
         let cluster_manager = Arc::new(SimpleClusterGroupManager::new(group_states));
-        let translation = Arc::new(TranslationService::disabled());
+        let translation =
+            translation_override.unwrap_or_else(|| Arc::new(TranslationService::disabled()));
         let router_chain = RouterChain::new(vec![router], group.clone());
+
+        let group_translation_scripts = if group_fixups.is_empty() {
+            HashMap::new()
+        } else {
+            HashMap::from([(GROUP_DUCKDB.to_string(), group_fixups)])
+        };
 
         let live_config = LiveConfig {
             router_chain,
@@ -937,7 +987,7 @@ impl ProtocolWireHarness {
             cluster_configs: HashMap::new(),
             group_members: HashMap::from([(GROUP_DUCKDB.to_string(), vec![cluster.0.clone()])]),
             group_order: vec![GROUP_DUCKDB.to_string()],
-            group_translation_scripts: HashMap::new(),
+            group_translation_scripts,
             group_default_tags: HashMap::new(),
             group_max_queued_queries: HashMap::new(),
             group_capacity_wait_timeout_secs: HashMap::new(),
@@ -945,7 +995,7 @@ impl ProtocolWireHarness {
             auth_provider: Arc::new(NoneAuthProvider::new(false)) as Arc<dyn AuthProvider>,
             authorization: Arc::new(AllowAllAuthorization::default())
                 as Arc<dyn AuthorizationChecker>,
-            catalog: Arc::new(queryflux_core::catalog::NullCatalogProvider),
+            catalog: catalog.unwrap_or_else(|| Arc::new(NullCatalogProvider)),
         };
 
         let records: Arc<Mutex<Vec<QueryRecord>>> = Arc::new(Mutex::new(Vec::new()));

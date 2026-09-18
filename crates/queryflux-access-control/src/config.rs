@@ -3,6 +3,6 @@
 //! dependency cycle); this module re-exports them and adds the runtime builders.
 
 pub use queryflux_core::access_config::{
-    AccessControlConfig, ClientCredentials, GroupOverride, OnMissingSchema, OpaProviderConfig,
-    ProviderKind,
+    AccessConnectionConfig, AccessControlConfig, ClientCredentials, GroupOverride, OnMissingSchema,
+    OpaProviderConfig, ProviderKind,
 };

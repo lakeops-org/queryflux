@@ -1,0 +1,231 @@
+# OPA + Lakekeeper/MinIO + Trino for the QueryFlux data-access-control demo.
+#
+# QueryFlux runs on the host from this branch (ghcr.io ... :latest does not
+# include accessControl yet). See README.md.
+#
+#   docker compose up -d --wait
+#   docker compose --profile seed run --rm data-seed   # if tables are missing
+#
+# OPA:         http://127.0.0.1:8182  (8182 avoids Lakekeeper :8181)
+# Lakekeeper:  http://127.0.0.1:8181
+# Trino:       http://127.0.0.1:8081  (QueryFlux backend; SQL via QueryFlux :8080)
+# Demo UI:     http://127.0.0.1:8183
+# QueryFlux PG: postgresql://queryflux:queryflux@127.0.0.1:5434/queryflux (host :5434)
+
+name: queryflux-example-with-opa
+
+services:
+  queryflux-db:
+    image: postgres:16-alpine
+    ports:
+      - "127.0.0.1:5434:5432"
+    environment:
+      POSTGRES_DB: queryflux
+      POSTGRES_USER: queryflux
+      POSTGRES_PASSWORD: queryflux
+    volumes:
+      - queryflux-pg:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U queryflux -d queryflux"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  opa:
+    image: openpolicyagent/opa:1.10.1
+    command:
+      - run
+      - --server
+      - --addr=0.0.0.0:8181
+      - --watch
+      - --log-level=info
+      - /policies
+    ports:
+      - "127.0.0.1:8182:8181"
+    volumes:
+      - ./policy:/policies:ro
+    healthcheck:
+      test: ["CMD", "opa", "version"]
+      interval: 2s
+      timeout: 2s
+      retries: 10
+      start_period: 2s
+    restart: unless-stopped
+
+  trino:
+    image: trinodb/trino:latest
+    environment:
+      - CATALOG_MANAGEMENT=dynamic
+    ports:
+      - "127.0.0.1:8081:8080"
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8080/v1/info"]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+      start_period: 30s
+    restart: unless-stopped
+
+  lakekeeper-db:
+    image: postgres:17
+    environment:
+      - POSTGRES_PASSWORD=postgres
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -p 5432 -d postgres"]
+      interval: 2s
+      timeout: 10s
+      retries: 10
+      start_period: 10s
+
+  minio:
+    image: minio/minio
+    environment:
+      - MINIO_ROOT_USER=minio-root-user
+      - MINIO_ROOT_PASSWORD=minio-root-password
+    command: ["server", "--console-address", ":9001", "/data"]
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 2s
+      timeout: 10s
+      retries: 20
+      start_period: 15s
+
+  createbuckets:
+    image: minio/minio
+    depends_on:
+      minio:
+        condition: service_healthy
+    restart: on-failure
+    entrypoint: >
+      /bin/sh -c "
+      /usr/bin/mc alias set local http://minio:9000 minio-root-user minio-root-password;
+      /usr/bin/mc mb --ignore-existing local/warehouse;
+      exit 0;
+      "
+
+  migrate:
+    image: quay.io/lakekeeper/catalog:latest-main
+    pull_policy: always
+    environment:
+      - LAKEKEEPER__PG_ENCRYPTION_KEY=dev-key-not-secure
+      - LAKEKEEPER__PG_DATABASE_URL_READ=postgresql://postgres:postgres@lakekeeper-db:5432/postgres
+      - LAKEKEEPER__PG_DATABASE_URL_WRITE=postgresql://postgres:postgres@lakekeeper-db:5432/postgres
+    restart: "no"
+    command: ["migrate"]
+    depends_on:
+      lakekeeper-db:
+        condition: service_healthy
+
+  lakekeeper:
+    image: quay.io/lakekeeper/catalog:latest-main
+    pull_policy: always
+    environment:
+      - LAKEKEEPER__PG_ENCRYPTION_KEY=dev-key-not-secure
+      - LAKEKEEPER__PG_DATABASE_URL_READ=postgresql://postgres:postgres@lakekeeper-db:5432/postgres
+      - LAKEKEEPER__PG_DATABASE_URL_WRITE=postgresql://postgres:postgres@lakekeeper-db:5432/postgres
+    command: ["serve"]
+    ports:
+      - "127.0.0.1:8181:8181"
+    healthcheck:
+      test: ["CMD", "/home/nonroot/lakekeeper", "healthcheck"]
+      interval: 2s
+      timeout: 10s
+      retries: 30
+      start_period: 10s
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      lakekeeper-db:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      createbuckets:
+        condition: service_completed_successfully
+
+  bootstrap:
+    image: curlimages/curl
+    depends_on:
+      lakekeeper:
+        condition: service_healthy
+    restart: "no"
+    entrypoint: /bin/sh
+    command:
+      - -c
+      - >
+        curl -sf -X POST http://lakekeeper:8181/management/v1/bootstrap
+        -H 'Content-Type: application/json'
+        --data '{"accept-terms-of-use": true}';
+        exit 0
+
+  initialwarehouse:
+    image: curlimages/curl
+    depends_on:
+      lakekeeper:
+        condition: service_healthy
+      bootstrap:
+        condition: service_completed_successfully
+    restart: "no"
+    entrypoint: /bin/sh
+    command:
+      - -c
+      - >
+        curl -sf -X POST http://lakekeeper:8181/management/v1/warehouse
+        -H 'Content-Type: application/json'
+        --data @/config/create-warehouse.json;
+        exit 0
+    volumes:
+      - ../../docker/fixtures/create-warehouse.json:/config/create-warehouse.json:ro
+
+  sentinel:
+    image: alpine
+    command: ["tail", "-f", "/dev/null"]
+    depends_on:
+      lakekeeper:
+        condition: service_healthy
+      initialwarehouse:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "true"]
+      interval: 1s
+      retries: 1
+      start_period: 0s
+
+  data-seed:
+    image: trinodb/trino:476
+    profiles: ["seed"]
+    restart: "no"
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - exec trino --server http://trino:8080 --user loader --file /seed/init-catalog.sql
+    volumes:
+      - ./init-catalog.sql:/seed/init-catalog.sql:ro
+    depends_on:
+      trino:
+        condition: service_healthy
+      sentinel:
+        condition: service_healthy
+
+  ui:
+    image: nginx:1.27-alpine
+    ports:
+      - "127.0.0.1:8183:80"
+    volumes:
+      - ./ui/index.html:/usr/share/nginx/html/index.html:ro
+      - ./ui/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./policy/access.rego:/usr/share/nginx/html/access.rego:ro
+      - ./seed.sql:/usr/share/nginx/html/seed.sql:ro
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      opa:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1/"]
+      interval: 5s
+      timeout: 3s
+      retries: 8
+    restart: unless-stopped
+
+volumes:
+  queryflux-pg:

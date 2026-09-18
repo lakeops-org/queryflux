@@ -9,6 +9,8 @@ image: img/queryflux-hero-banner.png
 
 QueryFlux Studio is the built-in web management UI. It connects to the **Admin REST API** (default port `9000`) and lets you monitor clusters, browse query history, manage routing rules, cluster groups, and security settings.
 
+On **Queries**, Studio shows the combined [guardrail](./architecture/guardrails) trail — including [access control](./access-control/overview) (`opa_access` rewrites and denials) — so SQL-shape guards and OPA filters/masks appear on the same query record.
+
 ## Accessing Studio
 
 Studio is a Next.js application served on port `3000` (Docker images) or via `pnpm dev` locally. It talks to the Admin API through a same-origin proxy — no CORS configuration required.
@@ -111,9 +113,45 @@ curl -u admin:admin -X POST http://localhost:9000/admin/auth/change-password \
 
 The full OpenAPI spec is available at `http://localhost:9000/openapi.json` and a Swagger UI at `http://localhost:9000/docs`.
 
+## Queries: guardrails and access control
+
+Open a query on the **Queries** page. Studio uses one audit trail for every guard that ran:
+
+| Surface | Meaning |
+| --- | --- |
+| **Guard Actions** | Ordered verdicts (`allow` / `warn` / `rewrite` / `deny`). `opa_access` appears here with rewrite metadata (`tables`, `row_filtered`, `masked_columns`) alongside built-in guards such as `read_only`. |
+| **rewritten** badge | Access-control SQL change (row filters / column masks) in the source dialect. |
+| **translated** badge | Dialect translation only. A query can have both. |
+| **Rewritten SQL (access control)** | SQL after `opa_access`, before sqlglot. |
+| **Translated SQL** | SQL after dialect translation. |
+
+The **Guardrails** sidebar page edits the SQL-shape chain (built-ins such as `read_only` and `row_limit`). The **Access Control** page connects QueryFlux to OPA (URL and credentials). Policy (Rego) stays in the OPA bundle. See **[Guardrails](./architecture/guardrails)** and **[Access control](./access-control/overview)**.
+
+## Access Control page
+
+**Access Control** maps to `GET`/`PUT /admin/config/access-control`. This is the **only** Studio surface for access control — QueryFlux does **not** edit Rego; policy stays in the OPA bundle.
+
+| What you configure | Where in Studio |
+| --- | --- |
+| Disconnect access control entirely | **Provider** → *None — access control off* |
+| Add / edit / remove a named connection | **Connections** — each has its own URL, decision path, timeout, auth |
+| Which connection is the fallback | **Connections** → **Default connection** |
+| Default on/off for all groups | **Scope by cluster group** → *Enabled by default for all cluster groups* |
+| Per-group inherit / enabled / disabled, and which connection | **Scope by cluster group** table |
+
+Operations, cache, `sessionParamKeys`, fail-open, and `onMissingSchema` (per connection) are **YAML / direct Admin API only** — not exposed in the Studio connection form yet.
+
+Studio can define any number of named connections — no name is reserved. Scope controls *which cluster groups call which connection*, not *which Rego package* — different rules per group usually belong in OPA (`input.context.clusterGroup`), not a second connection; reach for one only for network segmentation, blast-radius isolation, or a provider migration. **Without a default connection set, a group with no explicit override gets no access control at all** — see [Multiple connections](./access-control/overview#multiple-connections).
+
+Saving requires **`persistence.type: postgres`** (same as Catalog / Guardrails). Config is stored in `proxy_settings` and hot-reloads without restart. Bearer tokens are never shown after save — leave the field blank to keep the stored secret. YAML `accessControl:` is the bootstrap fallback until the first Studio save.
+
+The **Clusters** / **Engines** group editor does **not** change OPA scope — it shows a read-only **Access control** badge (`OPA on` / `Skipped` / `Off`) and links to **Access Control**. After save, confirm on **Queries** that `opa_access` rewrite/deny appears for a test query routed to an **enabled** group.
+
+Try the local demo: [`examples/with-opa/`](https://github.com/lakeops-org/queryflux/tree/main/examples/with-opa) (Postgres on host `:5434`).
+
 ## Managing clusters
 
-The **Clusters** page lists runtime cluster state (health, running queries, capacity) and lets you add or edit persisted cluster configs when Postgres persistence is enabled.
+The **Clusters** page lists runtime cluster state (health, running queries, capacity) and lets you add or edit persisted cluster configs when Postgres persistence is enabled. It does not toggle OPA scope — use **Access Control** for that.
 
 In **distributed mode**, the **running** count shown reflects backend ground truth from the reconcile sweep (for example Snowflake warehouse `running`, BigQuery in-flight jobs). **Capacity** / admission limits use QueryFlux fleet-wide leases separately — a warehouse can report many running queries while QueryFlux only holds a few admission slots.
 
@@ -152,4 +190,4 @@ For production deployments:
 
 - Set `QUERYFLUX_ADMIN_USER` and `QUERYFLUX_ADMIN_PASSWORD` to non-default values in your deployment environment, **or** change the password via the UI immediately after first boot.
 - Run Studio behind a reverse proxy (nginx, Caddy, …) with TLS — the Admin API cookie is `SameSite=Strict` but is not `Secure`-flagged by default.
-- The Admin API/Studio UI login does not yet support OIDC/SSO — it uses HTTP Basic authentication only. Note that QueryFlux's *query-path* authentication already supports OIDC providers (see [Auth & Authorization Design](./architecture/auth-authz-design.md)); this limitation applies only to the Studio management interface. Future releases will add pluggable auth providers for Studio as well.
+- The Admin API/Studio UI login uses HTTP Basic authentication only (no OIDC/SSO for the management UI). QueryFlux's *query-path* authentication already supports OIDC providers (see [Auth & Authorization Design](./architecture/auth-authz-design.md)).

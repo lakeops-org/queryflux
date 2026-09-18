@@ -4,129 +4,13 @@
 //!
 //! Run with: `cargo test -p queryflux-e2e-tests --test access_control_tests`
 
-use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex};
-
-use axum::{extract::State, routing::post, Json, Router};
-use queryflux_access_control::{build_controller, AccessControlConfig, NoopMetrics};
-use queryflux_core::access_config::{OnMissingSchema, OpaProviderConfig, ProviderKind};
+use queryflux_e2e_tests::access_control::{build_guard, pg_connect, pg_run, start_opa_stub};
 use queryflux_e2e_tests::harness::ProtocolWireHarness;
-use queryflux_frontend::access_control_guard::OpaAccessGuard;
-use serde_json::{json, Value};
-use tokio::net::TcpListener;
-use tokio_postgres::SimpleQueryMessage;
-
-/// Shared, mutable decision table the stub OPA server consults per request.
-#[derive(Default)]
-struct StubState {
-    deny_tables: HashSet<String>,
-    row_filters: HashMap<String, String>,
-}
-
-async fn opa_handler(
-    State(state): State<Arc<Mutex<StubState>>>,
-    Json(body): Json<Value>,
-) -> Json<Value> {
-    let resources = body["input"]["action"]["resources"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default();
-    let st = state.lock().unwrap();
-    let mut out = Vec::new();
-    for r in resources {
-        let table = r["table"].as_str().unwrap_or("").to_string();
-        let mut entry = json!({ "table": table, "allow": true });
-        if st.deny_tables.contains(&table) {
-            entry["allow"] = json!(false);
-            entry["reason"] = json!("denied by stub policy");
-        } else if let Some(filter) = st.row_filters.get(&table) {
-            entry["rowFilters"] = json!([{ "expression": filter }]);
-        }
-        out.push(entry);
-    }
-    Json(json!({ "result": { "resources": out } }))
-}
-
-/// Start the stub OPA server and return its base URL + a handle to mutate decisions.
-async fn start_opa_stub() -> (String, Arc<Mutex<StubState>>) {
-    let state = Arc::new(Mutex::new(StubState::default()));
-    let app = Router::new()
-        .route("/v1/data/queryflux/access", post(opa_handler))
-        .with_state(state.clone());
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind opa stub");
-    let addr = listener.local_addr().expect("stub addr");
-    tokio::spawn(async move {
-        axum::serve(listener, app).await.ok();
-    });
-    (format!("http://{addr}"), state)
-}
-
-/// Build a real `OpaAccessGuard` pointed at the stub, evaluating every SELECT.
-fn build_guard(opa_url: &str) -> Arc<OpaAccessGuard> {
-    let cfg = AccessControlConfig {
-        provider: ProviderKind::Opa,
-        opa: Some(OpaProviderConfig {
-            url: opa_url.to_string(),
-            decision_path: "/v1/data/queryflux/access".to_string(),
-            timeout_ms: 2_000,
-            bearer_token: None,
-            client_credentials: None,
-        }),
-        operations: vec!["table.select".to_string()],
-        on_missing_schema: OnMissingSchema::Evaluate,
-        fail_open: false,
-        cache_ttl_ms: 0, // disable caching so every test query hits the stub fresh
-        cache_capacity: 100,
-        session_param_keys: vec![],
-        groups: HashMap::new(),
-    };
-    let controller =
-        build_controller(&cfg, Arc::new(NoopMetrics)).expect("build access controller");
-    Arc::new(OpaAccessGuard::new(
-        Arc::new(controller),
-        cfg.session_param_keys.clone(),
-        cfg.on_missing_schema,
-    ))
-}
-
-async fn pg_connect(port: u16) -> tokio_postgres::Client {
-    let url = format!("postgresql://testuser@127.0.0.1:{port}/postgres");
-    let (client, connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls)
-        .await
-        .expect("postgres wire connect");
-    tokio::spawn(async move {
-        let _ = connection.await;
-    });
-    client
-}
-
-async fn pg_run(client: &tokio_postgres::Client, sql: &str) -> Result<Vec<Vec<String>>, String> {
-    let messages = client
-        .simple_query(sql)
-        .await
-        .map_err(|e| format!("{e:?}"))?;
-    let mut rows = Vec::new();
-    for msg in messages {
-        if let SimpleQueryMessage::Row(row) = msg {
-            let mut vals = Vec::new();
-            for i in 0..row.len() {
-                vals.push(row.get(i).unwrap_or("").to_string());
-            }
-            rows.push(vals);
-        }
-    }
-    Ok(rows)
-}
 
 #[tokio::test]
 async fn denied_table_is_rejected_and_audited() {
     let (opa_url, stub) = start_opa_stub().await;
-    stub.lock()
-        .unwrap()
-        .deny_tables
-        .insert("secret".to_string());
+    stub.lock().unwrap().deny("secret");
 
     let guard = build_guard(&opa_url);
     let h = ProtocolWireHarness::new_with_access_control(Some(guard))
@@ -161,10 +45,7 @@ async fn denied_table_is_rejected_and_audited() {
 #[tokio::test]
 async fn allowed_table_with_row_filter_only_returns_matching_rows() {
     let (opa_url, stub) = start_opa_stub().await;
-    stub.lock()
-        .unwrap()
-        .row_filters
-        .insert("orders".to_string(), "amount > 100".to_string());
+    stub.lock().unwrap().filter("orders", "amount > 100");
 
     let guard = build_guard(&opa_url);
     let h = ProtocolWireHarness::new_with_access_control(Some(guard))
@@ -213,6 +94,75 @@ async fn allowed_table_with_row_filter_only_returns_matching_rows() {
             .any(|a| a.guard == "opa_access" && a.action == "rewrite"),
         "expected an opa_access rewrite action, got: {:?}",
         record.guard_actions
+    );
+}
+
+/// A fixup script that monkey-patches the translated AST from a `Select` into a `Delete`
+/// referencing the same table — simulating a buggy operator-authored translation fixup
+/// script mutating the query after our own scan-site rewrite. Proves the post-rewrite
+/// invariant assert in `dispatch.rs` (Phase 4 step 4a) denies rather than silently letting
+/// a read become a write.
+const SELECT_TO_DELETE_FIXUP: &str = r#"
+import sqlglot
+import sqlglot.expressions as exp
+
+def transform(sql: str, src: str, dst: str) -> str:
+    # Only mangle SELECTs — leave CREATE TABLE / INSERT (used to seed the test table)
+    # completely alone, so the only thing this simulates is a fixup bug that corrupts
+    # a read query specifically.
+    ast = sqlglot.parse_one(sql, dialect=dst)
+    if not isinstance(ast, exp.Select):
+        return sql
+    tables = list(ast.find_all(exp.Table))
+    if not tables:
+        return sql
+    delete = exp.Delete(this=tables[0].copy())
+    return delete.sql(dialect=dst)
+"#;
+
+#[tokio::test]
+async fn fixup_script_turning_read_into_write_is_denied_by_invariant_assert() {
+    let (opa_url, stub) = start_opa_stub().await;
+    // Any row filter forces the access-control guard down the `Rewrite` path, which is
+    // what arms the post-translation invariant assert (see `dispatch.rs`).
+    stub.lock().unwrap().filter("orders", "amount > 0");
+
+    let guard = build_guard(&opa_url);
+    let h = ProtocolWireHarness::new_with_access_control_and_fixups(
+        Some(guard),
+        vec![SELECT_TO_DELETE_FIXUP.to_string()],
+    )
+    .await
+    .expect("harness");
+    let client = pg_connect(h.postgres_port).await;
+
+    pg_run(&client, "CREATE TABLE orders (id INTEGER, amount INTEGER)")
+        .await
+        .expect("create table");
+
+    let err = pg_run(&client, "SELECT id FROM orders")
+        .await
+        .expect_err("a fixup script turning the read into a write must be denied");
+    assert!(!err.is_empty());
+
+    let record = h
+        .wait_for_record(|r| {
+            r.sql_preview
+                .to_lowercase()
+                .contains("select id from orders")
+        })
+        .await
+        .expect("denied query should be recorded");
+    assert_eq!(format!("{:?}", record.status), "Denied");
+    assert!(record.was_guard_blocked);
+    assert!(
+        record
+            .error_message
+            .as_deref()
+            .unwrap_or_default()
+            .contains("invariant"),
+        "expected an invariant-assert denial reason, got: {:?}",
+        record.error_message
     );
 }
 
