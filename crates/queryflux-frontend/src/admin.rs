@@ -3064,7 +3064,10 @@ mod tests {
         assert_eq!(req.dialect, "postgres");
         assert_eq!(req.identity.roles, vec!["reader"]);
         assert_eq!(
-            req.identity.attributes.get("department").and_then(|v| v.as_str()),
+            req.identity
+                .attributes
+                .get("department")
+                .and_then(|v| v.as_str()),
             Some("finance")
         );
     }

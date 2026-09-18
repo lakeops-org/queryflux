@@ -3507,7 +3507,9 @@ fn make_http_webhook_guard(
 /// (`ProxyConfig::validate_startup_security`), any residual build failure here (e.g. the
 /// OPA client couldn't be constructed) aborts startup rather than silently disabling
 /// enforcement the operator explicitly configured.
-fn build_access_control_guard(config: &queryflux_core::config::ProxyConfig) -> Option<Arc<OpaAccessGuard>> {
+fn build_access_control_guard(
+    config: &queryflux_core::config::ProxyConfig,
+) -> Option<Arc<OpaAccessGuard>> {
     let cfg = config.access_control.as_ref()?;
     // No metrics wiring yet for this decision path — a follow-up can bridge
     // `AccessMetricsSink` to `queryflux_metrics::MetricsStore`.

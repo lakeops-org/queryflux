@@ -13,8 +13,8 @@ use queryflux_access_control::{
 use queryflux_core::access_config::OnMissingSchema;
 use queryflux_core::access_model::AccessRequest;
 use queryflux_core::query::EngineType;
-use queryflux_core::schema_context::SchemaContext;
 use queryflux_core::query::{ClusterGroupName, SqlDialect};
+use queryflux_core::schema_context::SchemaContext;
 use queryflux_core::session::SessionContext;
 use queryflux_core::tags::QueryTags;
 use queryflux_guardrails::built_in::Guard;
@@ -53,7 +53,8 @@ pub async fn run_access_control_stage(
     schema: Option<&SchemaContext>,
     tags: &QueryTags,
 ) -> AccessStageOutcome {
-    let parse = queryflux_core::sql_classify::SqlParseCache::new(sql.to_string(), src_dialect.clone());
+    let parse =
+        queryflux_core::sql_classify::SqlParseCache::new(sql.to_string(), src_dialect.clone());
     let ctx = GuardContext {
         sql,
         dialect: src_dialect,
@@ -128,19 +129,19 @@ impl Guard for OpaAccessGuard {
         let empty_schema = SchemaContext::default();
         let schema = ctx.schema.unwrap_or(&empty_schema);
 
-        let extracted =
-            match queryflux_translation::extract_resources(ctx.sql, ctx.dialect, schema) {
-                Ok(r) => r,
-                Err(e) => {
-                    return match self.on_missing_schema {
-                        OnMissingSchema::Deny => GuardResult::deny(
-                            format!("access control: could not analyze query: {e}"),
-                            "ACCESS_ANALYSIS_FAILED",
-                        ),
-                        OnMissingSchema::Evaluate => GuardResult::allow(),
-                    }
+        let extracted = match queryflux_translation::extract_resources(ctx.sql, ctx.dialect, schema)
+        {
+            Ok(r) => r,
+            Err(e) => {
+                return match self.on_missing_schema {
+                    OnMissingSchema::Deny => GuardResult::deny(
+                        format!("access control: could not analyze query: {e}"),
+                        "ACCESS_ANALYSIS_FAILED",
+                    ),
+                    OnMissingSchema::Evaluate => GuardResult::allow(),
                 }
-            };
+            }
+        };
 
         if extracted.is_empty() {
             // No base tables (e.g. `SELECT 1`) — nothing to decide.
@@ -267,7 +268,11 @@ impl Guard for OpaAccessGuard {
             "masked_columns".to_string(),
             policies
                 .iter()
-                .flat_map(|p| p.masked_columns.iter().map(|(c, _)| format!("{}.{c}", p.table)))
+                .flat_map(|p| {
+                    p.masked_columns
+                        .iter()
+                        .map(|(c, _)| format!("{}.{c}", p.table))
+                })
                 .collect::<Vec<_>>()
                 .join(","),
         );
@@ -339,7 +344,10 @@ mod tests {
 
     #[tokio::test]
     async fn select_classifies_as_table_select() {
-        assert_eq!(classify("SELECT * FROM orders").await, Operation::table_select());
+        assert_eq!(
+            classify("SELECT * FROM orders").await,
+            Operation::table_select()
+        );
         assert_eq!(
             classify("WITH x AS (SELECT 1) SELECT * FROM x").await,
             Operation::table_select()
@@ -376,6 +384,9 @@ mod tests {
     #[tokio::test]
     async fn show_and_describe_are_not_table_select() {
         assert_eq!(classify("SHOW TABLES").await.as_str(), "statement.other");
-        assert_eq!(classify("DESCRIBE orders").await.as_str(), "statement.other");
+        assert_eq!(
+            classify("DESCRIBE orders").await.as_str(),
+            "statement.other"
+        );
     }
 }

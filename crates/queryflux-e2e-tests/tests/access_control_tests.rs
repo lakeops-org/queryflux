@@ -123,7 +123,10 @@ async fn pg_run(client: &tokio_postgres::Client, sql: &str) -> Result<Vec<Vec<St
 #[tokio::test]
 async fn denied_table_is_rejected_and_audited() {
     let (opa_url, stub) = start_opa_stub().await;
-    stub.lock().unwrap().deny_tables.insert("secret".to_string());
+    stub.lock()
+        .unwrap()
+        .deny_tables
+        .insert("secret".to_string());
 
     let guard = build_guard(&opa_url);
     let h = ProtocolWireHarness::new_with_access_control(Some(guard))
@@ -195,7 +198,11 @@ async fn allowed_table_with_row_filter_only_returns_matching_rows() {
     );
 
     let record = h
-        .wait_for_record(|r| r.sql_preview.to_lowercase().contains("select id from orders"))
+        .wait_for_record(|r| {
+            r.sql_preview
+                .to_lowercase()
+                .contains("select id from orders")
+        })
         .await
         .expect("allowed query should be recorded");
     assert_eq!(format!("{:?}", record.status), "Success");

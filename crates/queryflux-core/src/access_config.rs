@@ -108,10 +108,9 @@ impl AccessControlConfig {
     /// `opa:` block was given.
     pub fn opa_config(&self) -> Result<&OpaProviderConfig, String> {
         match self.provider {
-            ProviderKind::Opa => self
-                .opa
-                .as_ref()
-                .ok_or_else(|| "access_control.provider is \"opa\" but no opa: block was given".to_string()),
+            ProviderKind::Opa => self.opa.as_ref().ok_or_else(|| {
+                "access_control.provider is \"opa\" but no opa: block was given".to_string()
+            }),
         }
     }
 
