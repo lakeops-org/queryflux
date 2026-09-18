@@ -14,8 +14,11 @@ use serde_json::Value;
 pub enum GuardLayer {
     /// L1 — runs on the NL question before any LLM call (Phase 4).
     Input,
-    /// L2 — runs on the query before engine submission. As of the access-control work
-    /// this runs on the **source** SQL, before dialect translation.
+    /// L2 — runs on the query before engine submission. The access-control guard (invoked
+    /// directly via `run_access_control_stage`, not through `GuardChain`) runs at this
+    /// layer on the **source** SQL, before dialect translation. `GuardChain`-based Plan
+    /// guards (built-in, webhook, script) are unchanged: they still run after translation,
+    /// on the final SQL that will actually reach the engine.
     Plan,
     /// L3 — runs on returned rows / NL summary (Phase 4, MCP only).
     Output,
@@ -23,12 +26,15 @@ pub enum GuardLayer {
 
 /// Everything a guard implementation can inspect.
 ///
-/// `sql` / `sql_parse` / `dialect` all refer to the **source** SQL the client sent —
-/// the `Plan` layer runs before `maybe_translate`. `engine_type` is the eventual target
-/// engine (for guards that care which backend a query lands on).
+/// `sql` / `sql_parse` / `dialect` reflect whichever SQL representation the caller built
+/// this context from — see [`GuardLayer::Plan`] for how that differs between the
+/// access-control guard (source SQL) and `GuardChain`-based Plan guards (translated SQL).
+/// `engine_type` is the eventual target engine (for guards that care which backend a query
+/// lands on).
 pub struct GuardContext<'a> {
     pub sql: &'a str,
-    /// Source SQL dialect — what `sql` / `sql_parse` are parsed as.
+    /// The dialect `sql` / `sql_parse` are parsed as (see [`GuardLayer::Plan`]: source
+    /// dialect for the access-control guard, target dialect for `GuardChain`-based guards).
     pub dialect: &'a SqlDialect,
     pub engine_type: &'a EngineType,
     pub cluster_group: &'a ClusterGroupName,
@@ -46,8 +52,8 @@ pub struct GuardContext<'a> {
     pub session_extra: &'a HashMap<String, String>,
     /// Resolved schema for the referenced tables, when a catalog is configured.
     pub schema: Option<&'a SchemaContext>,
-    /// Shared parse cache from dispatch (source SQL + source dialect). When set, guards
-    /// must not re-parse SQL.
+    /// Shared parse cache from dispatch, built from `sql` + `dialect` above. When set,
+    /// guards must not re-parse SQL.
     pub sql_parse: Option<&'a SqlParseCache>,
 }
 
