@@ -422,11 +422,18 @@ mod tests {
     #[test]
     fn render_mask_named_types() {
         let d = SqlDialect::Trino;
-        assert_eq!(render_mask(&cm("s", MaskType::Null), "s", &d).unwrap(), "NULL");
+        assert_eq!(
+            render_mask(&cm("s", MaskType::Null), "s", &d).unwrap(),
+            "NULL"
+        );
         let mut redact = cm("s", MaskType::Redact);
-        assert!(render_mask(&redact, "s", &d).unwrap().contains("regexp_replace"));
+        assert!(render_mask(&redact, "s", &d)
+            .unwrap()
+            .contains("regexp_replace"));
         redact.mask_type = MaskType::ShowLast4;
-        assert!(render_mask(&redact, "s", &d).unwrap().contains("substr(s, -4)"));
+        assert!(render_mask(&redact, "s", &d)
+            .unwrap()
+            .contains("substr(s, -4)"));
         let mut cst = cm("s", MaskType::Constant);
         cst.value = Some("X'Y".to_string());
         assert_eq!(render_mask(&cst, "s", &d).unwrap(), "'X''Y'");
@@ -448,8 +455,7 @@ mod tests {
             &SchemaContext::default(),
         )
         .unwrap();
-        let names: std::collections::HashSet<_> =
-            refs.iter().map(|r| r.table.as_str()).collect();
+        let names: std::collections::HashSet<_> = refs.iter().map(|r| r.table.as_str()).collect();
         assert_eq!(names, ["orders", "customers"].into_iter().collect());
     }
 
@@ -461,7 +467,10 @@ mod tests {
             &SchemaContext::default(),
         )
         .unwrap();
-        assert_eq!(refs.iter().map(|r| r.table.as_str()).collect::<Vec<_>>(), vec!["base"]);
+        assert_eq!(
+            refs.iter().map(|r| r.table.as_str()).collect::<Vec<_>>(),
+            vec!["base"]
+        );
     }
 
     #[test]
@@ -478,7 +487,10 @@ mod tests {
         )
         .unwrap();
         assert!(out.contains("region = 'US'"), "got: {out}");
-        assert!(out.contains("SELECT * FROM finance.transactions"), "got: {out}");
+        assert!(
+            out.contains("SELECT * FROM finance.transactions"),
+            "got: {out}"
+        );
     }
 
     #[test]
