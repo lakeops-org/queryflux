@@ -421,10 +421,7 @@ def transform(sql, src, dst):
             .translate("SELECT * FROM orders", &SchemaContext::default())
             .await
             .unwrap_err();
-        assert!(
-            err.to_string().contains("read to non-read"),
-            "got: {err}"
-        );
+        assert!(err.to_string().contains("read to non-read"), "got: {err}");
     }
 
     /// A script that keeps the statement a read (even while rewriting it) is unaffected.

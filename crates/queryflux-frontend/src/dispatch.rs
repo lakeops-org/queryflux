@@ -2282,7 +2282,13 @@ pub async fn execute_to_sink(
                 let src_dialect = resolve_src_dialect(&session, &protocol);
                 let schema_context = state
                     .translation
-                    .resolve_schema_context(&sql, &src_dialect, &catalog, session.catalog(), session.database())
+                    .resolve_schema_context(
+                        &sql,
+                        &src_dialect,
+                        &catalog,
+                        session.catalog(),
+                        session.database(),
+                    )
                     .await;
                 match run_access_control_stage(
                     guard,
