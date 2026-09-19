@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-pub use queryflux_core::schema_context::SchemaContext;
+pub use queryflux_core::schema_context::{ColumnMap, SchemaContext};
 use queryflux_core::{catalog::CatalogProvider, error::Result, query::SqlDialect};
 pub use sqlglot::{extract_table_refs_async, SqlglotTranslator, TableRef};
 
@@ -197,7 +197,7 @@ impl TranslationService {
 
         let mut tables_map = HashMap::new();
         for schema in schemas {
-            let cols = schema
+            let cols: ColumnMap = schema
                 .columns
                 .iter()
                 .map(|c| (c.name.clone(), c.data_type.clone()))

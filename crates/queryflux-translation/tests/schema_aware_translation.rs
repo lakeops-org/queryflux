@@ -15,7 +15,7 @@ use queryflux_core::catalog::{CatalogProvider, ColumnDef, TableSchema};
 use queryflux_core::error::Result;
 use queryflux_core::query::SqlDialect;
 use queryflux_translation::{
-    SchemaContext, SqlglotTranslator, TranslationService, TranslatorTrait,
+    ColumnMap, SchemaContext, SqlglotTranslator, TranslationService, TranslatorTrait,
 };
 
 fn require_sqlglot() {
@@ -72,7 +72,7 @@ async fn schema_aware_translation_qualifies_columns_dialect_only_does_not() {
     let mut tables = HashMap::new();
     tables.insert(
         "t".to_string(),
-        HashMap::from([("x".to_string(), "INT".to_string())]),
+        ColumnMap::from([("x".to_string(), "INT".to_string())]),
     );
     let schema = SchemaContext {
         catalog: None,

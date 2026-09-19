@@ -5292,6 +5292,7 @@ dependencies = [
  "async-trait",
  "bytes",
  "chrono",
+ "indexmap 2.13.0",
  "polyglot-sql 0.3.2",
  "serde",
  "serde_json",

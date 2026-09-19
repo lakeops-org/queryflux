@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -35,6 +34,25 @@ impl AccessControllerConfig {
     }
 }
 
+/// Lossless, structured cache key. Fields are kept as typed values (not joined into a
+/// delimited string) so quoted identifiers containing `,` / `|` can never make two distinct
+/// requests compare equal, and the map compares full keys rather than a 64-bit digest.
+#[derive(Hash, PartialEq, Eq)]
+struct CacheKey {
+    user: String,
+    groups: Vec<String>,
+    roles: Vec<String>,
+    attributes: Vec<(String, String)>,
+    operation: String,
+    /// `(catalog, schema, table, columns)`; `columns == None` means [`Columns::All`].
+    resources: Vec<ResourceKey>,
+    cluster_group: String,
+    engine: String,
+    session_params: Vec<(String, String)>,
+}
+
+type ResourceKey = (Option<String>, Option<String>, String, Option<Vec<String>>);
+
 struct CacheEntry {
     stored: Instant,
     decision: AccessDecision,
@@ -50,7 +68,7 @@ pub struct AccessController {
     group_fail_open: HashMap<String, bool>,
     cache_ttl: Duration,
     cache_capacity: usize,
-    cache: Mutex<HashMap<u64, CacheEntry>>,
+    cache: Mutex<HashMap<CacheKey, CacheEntry>>,
 }
 
 impl AccessController {
@@ -91,7 +109,7 @@ impl AccessController {
         let key = cache_key(req);
 
         if !self.cache_ttl.is_zero() {
-            if let Some(hit) = self.cache_get(key) {
+            if let Some(hit) = self.cache_get(&key) {
                 self.metrics.record_decision(DecisionMetric {
                     latency: Duration::ZERO,
                     denied: false,
@@ -146,18 +164,18 @@ impl AccessController {
         }
     }
 
-    fn cache_get(&self, key: u64) -> Option<AccessDecision> {
+    fn cache_get(&self, key: &CacheKey) -> Option<AccessDecision> {
         let mut guard = self.cache.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(entry) = guard.get(&key) {
+        if let Some(entry) = guard.get(key) {
             if entry.stored.elapsed() < self.cache_ttl {
                 return Some(entry.decision.clone());
             }
-            guard.remove(&key);
+            guard.remove(key);
         }
         None
     }
 
-    fn cache_put(&self, key: u64, decision: AccessDecision) {
+    fn cache_put(&self, key: CacheKey, decision: AccessDecision) {
         let mut guard = self.cache.lock().unwrap_or_else(|e| e.into_inner());
         if guard.len() >= self.cache_capacity {
             // Crude bound: drop everything expired, then (if still full) clear.
@@ -178,53 +196,94 @@ impl AccessController {
 }
 
 /// Stable cache key over everything that changes the decision — **not** `context.query_id`.
-fn cache_key(req: &AccessRequest) -> u64 {
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    req.identity.user.hash(&mut h);
-    hash_sorted(&mut h, req.identity.groups.iter().map(String::as_str));
-    hash_sorted(&mut h, req.identity.roles.iter().map(String::as_str));
-    for (k, v) in &req.identity.attributes {
-        k.hash(&mut h);
-        v.to_string().hash(&mut h);
-    }
-    req.operation.0.hash(&mut h);
-    let mut resources: Vec<String> = req
+fn cache_key(req: &AccessRequest) -> CacheKey {
+    let mut resources: Vec<ResourceKey> = req
         .resources
         .iter()
         .map(|r| {
             let cols = match &r.columns {
-                Columns::All => "*".to_string(),
+                Columns::All => None,
                 Columns::Named(c) => {
                     let mut c = c.clone();
                     c.sort();
-                    c.join(",")
+                    Some(c)
                 }
             };
-            format!(
-                "{}|{}|{}|{cols}",
-                r.catalog.as_deref().unwrap_or(""),
-                r.schema.as_deref().unwrap_or(""),
-                r.table
-            )
+            (r.catalog.clone(), r.schema.clone(), r.table.clone(), cols)
         })
         .collect();
     resources.sort();
-    for r in resources {
-        r.hash(&mut h);
+    CacheKey {
+        user: req.identity.user.clone(),
+        groups: sorted(&req.identity.groups),
+        roles: sorted(&req.identity.roles),
+        attributes: req
+            .identity
+            .attributes
+            .iter()
+            .map(|(k, v)| (k.clone(), v.to_string()))
+            .collect(),
+        operation: req.operation.0.clone(),
+        resources,
+        cluster_group: req.context.cluster_group.clone(),
+        engine: req.context.engine.clone(),
+        session_params: req
+            .context
+            .session_params
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect(),
     }
-    req.context.cluster_group.hash(&mut h);
-    req.context.engine.hash(&mut h);
-    for (k, v) in &req.context.session_params {
-        k.hash(&mut h);
-        v.hash(&mut h);
-    }
-    h.finish()
 }
 
-fn hash_sorted<'a>(h: &mut impl Hasher, items: impl Iterator<Item = &'a str>) {
-    let mut v: Vec<&str> = items.collect();
+fn sorted(items: &[String]) -> Vec<String> {
+    let mut v = items.to_vec();
     v.sort_unstable();
-    for s in v {
-        s.hash(h);
+    v
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use queryflux_core::access_model::{AccessResource, Identity, RequestContext};
+
+    fn req(table: &str, columns: Columns) -> AccessRequest {
+        AccessRequest {
+            identity: Identity {
+                user: "alice".into(),
+                ..Default::default()
+            },
+            operation: Operation::table_select(),
+            resources: vec![AccessResource {
+                catalog: None,
+                schema: Some("s".into()),
+                table: table.into(),
+                columns,
+            }],
+            context: RequestContext::default(),
+        }
+    }
+
+    #[test]
+    fn cache_key_distinguishes_columns_containing_delimiters() {
+        let joined = req("t", Columns::Named(vec!["a,b".into()]));
+        let split = req("t", Columns::Named(vec!["a".into(), "b".into()]));
+        assert!(cache_key(&joined) != cache_key(&split));
+    }
+
+    #[test]
+    fn cache_key_distinguishes_table_containing_delimiters() {
+        let a = req("x|y", Columns::All);
+        let mut b = req("y", Columns::All);
+        b.resources[0].schema = Some("s|x".into());
+        assert!(cache_key(&a) != cache_key(&b));
+    }
+
+    #[test]
+    fn cache_key_ignores_column_order_and_query_id() {
+        let a = req("t", Columns::Named(vec!["b".into(), "a".into()]));
+        let mut b = req("t", Columns::Named(vec!["a".into(), "b".into()]));
+        b.context.query_id = "other".into();
+        assert!(cache_key(&a) == cache_key(&b));
     }
 }

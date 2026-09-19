@@ -8,13 +8,21 @@
 
 use std::collections::HashMap;
 
+use indexmap::IndexMap;
+
+/// `column name → SQL type string`, in the table's declared column order.
+pub type ColumnMap = IndexMap<String, String>;
+
 /// Schema context: table name → { column name → SQL type string }.
+///
+/// Columns keep the catalog's declared order — the access-control rewrite builds a positional
+/// projection from them, so `SELECT *` over a masked table must match the base table.
 #[derive(Debug, Default, Clone)]
 pub struct SchemaContext {
     pub catalog: Option<String>,
     pub database: Option<String>,
     /// `table_name → { col_name → type_string }`
-    pub tables: HashMap<String, HashMap<String, String>>,
+    pub tables: HashMap<String, ColumnMap>,
 }
 
 impl SchemaContext {

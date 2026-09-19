@@ -67,6 +67,8 @@ impl OpaProvider {
             ])
             .send()
             .await
+            .ok()?
+            .error_for_status()
             .ok()?;
         let body: serde_json::Value = resp.json().await.ok()?;
         let token = body.get("access_token")?.as_str()?.to_string();

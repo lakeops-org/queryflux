@@ -268,13 +268,32 @@ def rewrite_table_scans(sql, dialect, schema_json, policies_json):
     tree = sqlglot.parse_one(sql, dialect=dialect or None)
     ctes = _cte_names(tree)
 
-    # index policies by matchable name (bare + qualified, lowercased)
-    by_name = {}
+    # Index policies (lowercased). A qualified policy is only reachable by an unqualified scan
+    # through `qualified_by_bare`; an explicitly qualified scan never resolves to another
+    # schema's policy.
+    exact = {}
+    qualified_by_bare = {}
     for p in policies:
         key = p["table"].lower()
-        by_name[key] = p
-        bare = key.rsplit(".", 1)[-1]
-        by_name.setdefault(bare, p)
+        exact[key] = p
+        if "." in key:
+            qualified_by_bare.setdefault(key.rsplit(".", 1)[-1], []).append(p)
+
+    def find_policy(t):
+        name = t.name.lower()
+        if t.db:
+            # explicit schema: exact `schema.table`, else a policy written for the bare name
+            return exact.get(_qualified(t).lower()) or exact.get(name)
+        if name in exact:
+            return exact[name]
+        cands = qualified_by_bare.get(name, [])
+        if len(cands) > 1:
+            # cannot tell which schema the scan resolves to -> fail closed
+            raise ValueError(
+                "ambiguous policy for unqualified table %r: %s"
+                % (t.name, ", ".join(sorted(c["table"] for c in cands)))
+            )
+        return cands[0] if cands else None
 
     def col_list_for(policy_table, node):
         # explicit schema columns win; else derive from the scan is impossible -> error
@@ -290,8 +309,7 @@ def rewrite_table_scans(sql, dialect, schema_json, policies_json):
             continue
         if not t.catalog and not t.db and t.name.lower() in ctes:
             continue
-        qn = _qualified(t).lower()
-        policy = by_name.get(qn) or by_name.get(t.name.lower())
+        policy = find_policy(t)
         if policy is None:
             continue
 
@@ -393,6 +411,7 @@ fn rewrite_table_scans_gil(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use queryflux_core::schema_context::ColumnMap;
     use std::collections::HashMap;
 
     fn cm(col: &str, ty: MaskType) -> ColumnMask {
@@ -410,7 +429,7 @@ mod tests {
             table.to_string(),
             cols.iter()
                 .map(|c| (c.to_string(), "varchar".to_string()))
-                .collect(),
+                .collect::<ColumnMap>(),
         );
         SchemaContext {
             catalog: None,
@@ -550,5 +569,87 @@ mod tests {
         )
         .unwrap();
         assert!(!out.contains("x = 1"), "CTE must not be rewritten: {out}");
+    }
+
+    fn row_filter_policy(table: &str, filter: &str) -> TablePolicy {
+        TablePolicy {
+            table: table.into(),
+            row_filters: vec![filter.into()],
+            masked_columns: vec![],
+        }
+    }
+
+    #[test]
+    fn rewrite_qualified_policy_skips_same_named_table_in_other_schema() {
+        let out = rewrite_table_scans(
+            "SELECT id FROM hr.transactions",
+            &SqlDialect::Trino,
+            &SchemaContext::default(),
+            &[row_filter_policy("finance.transactions", "region = 'US'")],
+        )
+        .unwrap();
+        assert!(
+            !out.contains("region"),
+            "wrong schema must not match: {out}"
+        );
+    }
+
+    #[test]
+    fn rewrite_qualified_policy_applies_to_unqualified_scan() {
+        let out = rewrite_table_scans(
+            "SELECT id FROM transactions",
+            &SqlDialect::Trino,
+            &SchemaContext::default(),
+            &[row_filter_policy("finance.transactions", "region = 'US'")],
+        )
+        .unwrap();
+        assert!(out.contains("region = 'US'"), "got: {out}");
+    }
+
+    #[test]
+    fn rewrite_bare_policy_applies_to_qualified_scan() {
+        let out = rewrite_table_scans(
+            "SELECT id FROM finance.transactions",
+            &SqlDialect::Trino,
+            &SchemaContext::default(),
+            &[row_filter_policy("transactions", "region = 'US'")],
+        )
+        .unwrap();
+        assert!(out.contains("region = 'US'"), "got: {out}");
+    }
+
+    #[test]
+    fn rewrite_ambiguous_unqualified_scan_errors() {
+        let err = rewrite_table_scans(
+            "SELECT id FROM transactions",
+            &SqlDialect::Trino,
+            &SchemaContext::default(),
+            &[
+                row_filter_policy("finance.transactions", "a = 1"),
+                row_filter_policy("hr.transactions", "b = 2"),
+            ],
+        );
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn rewrite_masked_projection_keeps_schema_column_order() {
+        let cols = ["zeta", "id", "ssn", "alpha", "region", "beta"];
+        let schema = schema_with("transactions", &cols);
+        let out = rewrite_table_scans(
+            "SELECT * FROM finance.transactions",
+            &SqlDialect::Trino,
+            &schema,
+            &[TablePolicy {
+                table: "finance.transactions".into(),
+                row_filters: vec![],
+                masked_columns: vec![("ssn".into(), "NULL".into())],
+            }],
+        )
+        .unwrap();
+        assert!(
+            out.contains("zeta, id, NULL AS ssn, alpha, region, beta"),
+            "columns must follow schema order: {out}"
+        );
     }
 }
