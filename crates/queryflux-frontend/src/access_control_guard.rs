@@ -21,7 +21,9 @@ use queryflux_guardrails::built_in::Guard;
 use queryflux_guardrails::context::{GuardContext, GuardLayer, GuardResult};
 use queryflux_guardrails::result_to_action;
 use queryflux_persistence::GuardAction;
-use queryflux_translation::{render_mask, rewrite_table_scans, ExtractedResource, TablePolicy};
+use queryflux_translation::{
+    apply_write_filters, render_mask, rewrite_table_scans, ExtractedResource, TablePolicy,
+};
 
 use queryflux_auth::AuthContext;
 
@@ -286,6 +288,9 @@ impl Guard for OpaAccessGuard {
             )
         };
 
+        // Row filters for the write target: the policy's own decision for the statement's
+        // operation, kept apart from any `table.select` filters on the tables it reads.
+        let mut write_scope: Option<(String, Vec<String>)> = None;
         if check_write {
             let decision = conn
                 .controller
@@ -294,86 +299,124 @@ impl Guard for OpaAccessGuard {
             if !decision.is_allowed() {
                 return deny_first(&decision);
             }
-            // Filters and masks are spliced at read sites; a write target has none, so
-            // honoring them isn't possible. Deny rather than silently skip a restriction
-            // the policy meant to apply.
-            if decision.has_rewrite() {
+            if decision.has_ucast_filter() {
+                return GuardResult::deny(
+                    "access control: structured (ucast) row filters are not implemented",
+                    "ACCESS_UCAST_UNIMPLEMENTED",
+                );
+            }
+            // A mask changes what a read returns; there is nothing to mask on a write.
+            if decision.column_masks().next().is_some() {
                 return GuardResult::deny(
                     format!(
-                        "access control: the policy returned row filters/column masks for {}, \
-                         which are only supported for table.select",
+                        "access control: the policy returned column masks for {}, which apply \
+                         to reads only",
                         operation.as_str()
                     ),
                     "ACCESS_REWRITE_UNSUPPORTED_FOR_WRITE",
                 );
             }
-        }
-
-        if !check_reads {
-            return GuardResult::allow();
-        }
-
-        let decision = conn
-            .controller
-            .evaluate(&build_request(Operation::table_select(), &reads))
-            .await;
-
-        if !decision.is_allowed() {
-            return deny_first(&decision);
-        }
-
-        if decision.has_ucast_filter() {
-            return GuardResult::deny(
-                "access control: structured (ucast) row filters are not implemented",
-                "ACCESS_UCAST_UNIMPLEMENTED",
-            );
-        }
-
-        if !decision.has_rewrite() {
-            return GuardResult::allow();
-        }
-
-        // Group filters + masks by table into TablePolicy.
-        let mut by_table: HashMap<String, TablePolicy> = HashMap::new();
-        for (table, expr) in decision.row_filters() {
-            by_table
-                .entry(table.to_string())
-                .or_insert_with(|| TablePolicy {
-                    table: table.to_string(),
-                    row_filters: Vec::new(),
-                    masked_columns: Vec::new(),
-                })
-                .row_filters
-                .push(expr.to_string());
-        }
-        for (table, mask) in decision.column_masks() {
-            let rendered = match render_mask(mask, &mask.column, ctx.dialect) {
-                Ok(s) => s,
-                Err(e) => {
+            let filters: Vec<String> = decision
+                .row_filters()
+                .map(|(_, expr)| expr.to_string())
+                .collect();
+            if !filters.is_empty() {
+                // UPDATE/DELETE are scoped by ANDing the filter into their WHERE, and MERGE by
+                // ANDing it into each WHEN MATCHED / WHEN NOT MATCHED BY SOURCE clause's
+                // condition (queryflux-translation's apply_write_filters). INSERT and TRUNCATE
+                // have no existing row for a filter to restrict — INSERT only ever creates new
+                // rows (the right restriction there is a WITH CHECK-style value constraint, not
+                // a row filter) and TRUNCATE has no predicate in any SQL dialect — so deny
+                // rather than silently skip a restriction the policy meant to apply.
+                if matches!(
+                    operation.as_str(),
+                    "table.update" | "table.delete" | "table.merge"
+                ) {
+                    write_scope = Some((targets[0].table.clone(), filters));
+                } else {
                     return GuardResult::deny(
-                        format!("access control: {e}"),
-                        "ACCESS_MASK_RENDER_FAILED",
-                    )
+                        format!(
+                            "access control: the policy returned row filters for {}, which are \
+                             only supported for table.select, table.update, table.delete and \
+                             table.merge",
+                            operation.as_str()
+                        ),
+                        "ACCESS_REWRITE_UNSUPPORTED_FOR_WRITE",
+                    );
                 }
-            };
-            by_table
-                .entry(table.to_string())
-                .or_insert_with(|| TablePolicy {
-                    table: table.to_string(),
-                    row_filters: Vec::new(),
-                    masked_columns: Vec::new(),
-                })
-                .masked_columns
-                .push((mask.column.clone(), rendered));
+            }
         }
 
-        let policies: Vec<TablePolicy> = by_table.into_values().collect();
+        if !check_reads && write_scope.is_none() {
+            return GuardResult::allow();
+        }
+
+        // Filters + masks for the tables the statement reads, grouped by table.
+        let mut policies: Vec<TablePolicy> = Vec::new();
+        if check_reads {
+            let decision = conn
+                .controller
+                .evaluate(&build_request(Operation::table_select(), &reads))
+                .await;
+
+            if !decision.is_allowed() {
+                return deny_first(&decision);
+            }
+
+            if decision.has_ucast_filter() {
+                return GuardResult::deny(
+                    "access control: structured (ucast) row filters are not implemented",
+                    "ACCESS_UCAST_UNIMPLEMENTED",
+                );
+            }
+
+            let mut by_table: HashMap<String, TablePolicy> = HashMap::new();
+            for (table, expr) in decision.row_filters() {
+                by_table
+                    .entry(table.to_string())
+                    .or_insert_with(|| TablePolicy {
+                        table: table.to_string(),
+                        row_filters: Vec::new(),
+                        masked_columns: Vec::new(),
+                    })
+                    .row_filters
+                    .push(expr.to_string());
+            }
+            for (table, mask) in decision.column_masks() {
+                let rendered = match render_mask(mask, &mask.column, ctx.dialect) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        return GuardResult::deny(
+                            format!("access control: {e}"),
+                            "ACCESS_MASK_RENDER_FAILED",
+                        )
+                    }
+                };
+                by_table
+                    .entry(table.to_string())
+                    .or_insert_with(|| TablePolicy {
+                        table: table.to_string(),
+                        row_filters: Vec::new(),
+                        masked_columns: Vec::new(),
+                    })
+                    .masked_columns
+                    .push((mask.column.clone(), rendered));
+            }
+            policies = by_table.into_values().collect();
+        }
+
+        if policies.is_empty() && write_scope.is_none() {
+            return GuardResult::allow();
+        }
+
+        let write_table = write_scope.as_ref().map(|(table, _)| table.clone());
         let mut meta = HashMap::new();
         meta.insert(
             "tables".to_string(),
             policies
                 .iter()
                 .map(|p| p.table.clone())
+                .chain(write_table.clone())
                 .collect::<Vec<_>>()
                 .join(","),
         );
@@ -383,6 +426,7 @@ impl Guard for OpaAccessGuard {
                 .iter()
                 .filter(|p| !p.row_filters.is_empty())
                 .map(|p| p.table.clone())
+                .chain(write_table)
                 .collect::<Vec<_>>()
                 .join(","),
         );
@@ -399,7 +443,14 @@ impl Guard for OpaAccessGuard {
                 .join(","),
         );
 
-        match rewrite_table_scans(ctx.sql, ctx.dialect, schema, &policies) {
+        let rewritten =
+            rewrite_table_scans(ctx.sql, ctx.dialect, schema, &policies).and_then(|sql| {
+                match &write_scope {
+                    Some((_, filters)) => apply_write_filters(&sql, ctx.dialect, filters),
+                    None => Ok(sql),
+                }
+            });
+        match rewritten {
             Ok(sql) => GuardResult::Rewrite {
                 sql,
                 metadata: Some(meta),

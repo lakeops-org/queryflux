@@ -68,9 +68,29 @@ pub struct StubState {
     pub by_user: HashMap<String, HashMap<String, TableVerdict>>,
     /// Every `input` body the stub has received, in order.
     pub requests: Vec<Value>,
+    /// `(operation, table) → filter`, returned for that operation only and taking
+    /// precedence over [`Self::row_filters`] — lets a test give reads and writes of the same
+    /// table different filters.
+    pub op_row_filters: HashMap<(String, String), String>,
 }
 
 impl StubState {
+    pub fn filter_for(
+        &mut self,
+        operation: impl Into<String>,
+        table: impl Into<String>,
+        expr: impl Into<String>,
+    ) {
+        self.op_row_filters
+            .insert((operation.into(), table.into()), expr.into());
+    }
+
+    /// Drop every filter so a test can read the table's real contents.
+    pub fn clear_filters(&mut self) {
+        self.row_filters.clear();
+        self.op_row_filters.clear();
+    }
+
     /// The recorded `input.action` objects whose `operation` is `op`.
     pub fn actions_for(&self, op: &str) -> Vec<Value> {
         self.requests
@@ -167,7 +187,13 @@ async fn opa_handler(
             entry["reason"] = json!("denied by stub policy");
         } else {
             let mut filters: Vec<Value> = Vec::new();
-            if let Some(expr) = lookup_map(&st.row_filters, &table) {
+            let operation = body["input"]["action"]["operation"]
+                .as_str()
+                .unwrap_or("")
+                .to_string();
+            if let Some(expr) = st.op_row_filters.get(&(operation, table.clone())) {
+                filters.push(json!({ "expression": expr }));
+            } else if let Some(expr) = lookup_map(&st.row_filters, &table) {
                 filters.push(json!({ "expression": expr }));
             }
             if let Some(extra) = lookup_map(&st.extra_row_filters, &table) {

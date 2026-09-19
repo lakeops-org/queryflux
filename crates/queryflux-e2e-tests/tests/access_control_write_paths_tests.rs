@@ -215,25 +215,25 @@ async fn enabled_write_operation_allows_or_denies_the_target_table() {
     assert!(err.contains("orders"), "unexpected error: {err}");
 }
 
-/// A filter/mask returned for a write target cannot be spliced at a read site, so it is
-/// denied with a clear reason instead of emitting invalid SQL or silently dropping it.
+/// `INSERT` has no `WHERE` a row filter could scope, so a filter returned for its target is
+/// denied with a clear reason instead of emitting invalid SQL or being silently dropped.
 #[tokio::test]
-async fn row_filter_on_a_write_target_fails_closed() {
+async fn row_filter_on_an_insert_target_fails_closed() {
     let (opa_url, stub) = start_opa_stub().await;
     let h = harness_with(build_guard_with_operations(
         &opa_url,
-        &["table.select", "table.delete"],
+        &["table.select", "table.insert"],
     ))
     .await;
     let client = pg_connect(h.postgres_port).await;
     seed_orders(&client).await;
     stub.lock().unwrap().filter("orders", "amount > 100");
 
-    let err = pg_run(&client, "DELETE FROM orders WHERE id = 10")
+    let err = pg_run(&client, "INSERT INTO orders VALUES (99, 1, 10, 'EU')")
         .await
-        .expect_err("a filter on a write target must fail closed");
+        .expect_err("a filter on an INSERT target must fail closed");
     assert!(
-        err.contains("only supported for table.select"),
+        err.contains("only supported for table.select, table.update, table.delete and table.merge"),
         "unexpected error: {err}"
     );
     // Reads go through the policy too — drop the filter to see every row.
@@ -241,6 +241,6 @@ async fn row_filter_on_a_write_target_fails_closed() {
     assert_eq!(
         count(&client, "orders").await,
         "4",
-        "nothing may have been deleted"
+        "nothing may have been inserted"
     );
 }
