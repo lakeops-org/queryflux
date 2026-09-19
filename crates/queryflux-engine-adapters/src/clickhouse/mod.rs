@@ -46,8 +46,9 @@ use crate::{AdapterKind, BackendQueryIdSlot, SyncExecution};
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(10);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Number of decoded batches allowed to wait for a frontend consumer.
-const RESULT_STREAM_CHANNEL_CAPACITY: usize = 8;
+/// Keep at most one decoded batch waiting for a frontend consumer so large
+/// batches cannot multiply the configured per-batch decode-window bound.
+const RESULT_STREAM_CHANNEL_CAPACITY: usize = 1;
 
 /// Limit raw bytes staged for decoding before yielding to frontend backpressure.
 const RESULT_STREAM_CHUNK_WINDOW_BYTES: usize = 64 * 1024;

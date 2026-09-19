@@ -134,9 +134,9 @@ async fn clickhouse_syntax_error_returns_error() {
 /// surface the server's exception text — proving `find_exception_frame`
 /// parses the real server's `__exception__` framing, not just fixtures.
 ///
-/// The throw fires in the second output block (100_000 > one 65_536-row
-/// block), after the server has flushed the first block and committed to
-/// HTTP 200 — verified against 26.3.17.56 (the CI image) and 26.8. The
+/// The throw fires after five complete 20,000-row output blocks. By then the
+/// server has flushed results and committed to HTTP 200 — verified against
+/// 26.3.17.56 (the CI image) and 26.8. The
 /// `mid-stream` assertion keeps the row count honest: if the failure ever
 /// arrives before streaming starts it degrades to a plain HTTP error and
 /// this test fails, instead of silently passing without exercising the
@@ -145,10 +145,15 @@ async fn clickhouse_syntax_error_returns_error() {
 #[ignore = "requires ClickHouse — run with: make test-e2e"]
 async fn clickhouse_mid_stream_failure_surfaces_exception_message() {
     require_group!(GROUP_CLICKHOUSE);
+    const BLOCK_ROWS: usize = 20_000;
+    assert!(BLOCK_ROWS * std::mem::size_of::<u64>() < CLICKHOUSE_TEST_RESULT_BUFFER_BYTES);
+
     let r = client()
         .execute_on(
-            "SELECT throwIf(number = 100000) FROM system.numbers LIMIT 200000 \
-             SETTINGS max_block_size = 65536",
+            &format!(
+                "SELECT throwIf(number = 100000) FROM system.numbers LIMIT 200000 \
+                 SETTINGS max_block_size = {BLOCK_ROWS}"
+            ),
             GROUP_CLICKHOUSE,
         )
         .await
