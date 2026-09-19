@@ -126,7 +126,7 @@ Content-Type: application/json
 | `principal.attr.groups` | `AuthContext.groups`, carried as a free-form attribute — Cerbos's own RBAC matches on `roles`, not `groups`; put group-based logic in a `condition` on `P.attr.groups` if you need it. |
 | `resources[].resource.kind` | Always the fixed string `"table"` — every table a query touches is sent under this one resource kind, so one Cerbos resource policy governs every table generically (matching on `R.attr.table`). |
 | `resources[].resource.attr.columns` | Named list, or **omitted** meaning all columns (`SELECT *` or unresolved schema). |
-| `resources[].actions` | Always a single-element array — QueryFlux evaluates one namespaced operation (e.g. `table.select`) per request. |
+| `resources[].actions` | Always a single-element array — QueryFlux evaluates one namespaced operation (e.g. `table.select`) per request. A statement that reads tables and also writes one makes one request per operation. Your Cerbos policy must define each operation you enable in `operations` (`table.insert`, `table.update`, …) — an action with no matching rule is `EFFECT_NO_MATCH`, which denies. |
 
 :::info Cerbos requires non-empty `principal.roles`
 Cerbos's `CheckResources` API rejects an empty `roles` array as an **HTTP 400 validation error** — it is not evaluated as "no rule matches." `CerbosProvider` handles this itself: if `identity.roles` is empty, QueryFlux denies the query **locally**, without calling Cerbos at all, with the reason *"cerbos requires at least one principal role; none were resolved for this identity."* If you see that reason, your auth layer isn't populating `roles` for that user — add `roles:` under `auth.staticUsers.<user>` (or map your real IdP's role claim to it).

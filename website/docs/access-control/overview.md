@@ -137,7 +137,7 @@ accessControl:
         url: http://localhost:8181
         decisionPath: /v1/data/queryflux/access
         timeoutMs: 1000
-      operations: [table.select]        # also: table.insert, table.update, table.delete
+      operations: [table.select]        # also: table.insert, table.update, table.delete, table.merge, table.truncate
       onMissingSchema: evaluate         # evaluate | deny
       failOpen: false                   # provider error → deny by default
       cacheTtlMs: 5000                  # 0 disables the decision cache
@@ -155,7 +155,7 @@ accessControl:
 | `enabled` | Global default: run access control for a cluster group unless `groups.<name>.enabled` overrides. Default: `true` when `accessControl` is set. Set `false` to opt in only where groups explicitly set `enabled: true`. |
 | `defaultConnection` | Named entry under `connections` that a group uses when it has no explicit `groups.<name>.connection` override. **Unset means such a group gets no access control at all** — there's nothing to route it to. Must reference a key under `connections` when set. |
 | `connections` | Map of named policy-provider connections. No name is reserved — see [Multiple connections](#multiple-connections). |
-| `connections.<name>.operations` | Namespaced ops the connection evaluates; others skip the stage. Default: `[table.select]`. See [What policies apply to](#what-policies-apply-to). |
+| `connections.<name>.operations` | Namespaced ops the connection evaluates; others skip the stage. One of `table.select`, `table.insert`, `table.update`, `table.delete`, `table.merge`, `table.truncate` — anything else fails validation. Default: `[table.select]`. See [What policies apply to](#what-policies-apply-to). |
 | `connections.<name>.onMissingSchema` | When columns can't be resolved (`SELECT *` without catalog): `evaluate` still calls the provider with "all columns"; `deny` fails closed. |
 | `connections.<name>.failOpen` | Provider timeout/transport error → allow (`true`) or deny (`false`, default) for groups on this connection. |
 | `connections.<name>.cacheTtlMs` / `cacheCapacity` | TTL cache of identical decisions on this connection; `0` disables. |
@@ -220,9 +220,21 @@ Studio's **Access Control** page can add, edit, and remove any number of named c
 
 Policies govern **reads**. Any table a statement *reads* is evaluated as `table.select` (deny, row filter, column mask) — including reads inside a write: `INSERT … SELECT`, `CREATE TABLE … AS SELECT`, `CREATE VIEW … AS SELECT`, `MERGE … USING`, and subqueries in `UPDATE`/`DELETE`. **This embedded-read guarantee requires `table.select` to be listed in the connection's `operations`** — a connection configured with only `operations: [table.insert]`, say, checks the `INSERT` target but does not evaluate the `SELECT` feeding it, so a protected table's rows could be copied out through it. A protected table cannot be copied out through a write statement as long as `table.select` is enabled.
 
-The **write itself** is not authorized by default. The target of an `INSERT`/`UPDATE`/`DELETE` is only sent to the provider when its operation (`table.insert`, `table.update`, `table.delete`) is listed in `operations`, and then only allow/deny applies: a row filter or column mask returned for a write target is denied (`ACCESS_REWRITE_UNSUPPORTED_FOR_WRITE`) rather than applied. `CREATE`/`DROP`/`ALTER`, grants, roles, and session statements are not evaluated **as a write target** — `CREATE TABLE … AS SELECT` and `CREATE VIEW … AS SELECT` are the exception in the other direction: the `CREATE` target itself is skipped, but the `SELECT` feeding it is still evaluated as a read (per the embedded-read guarantee above) whenever `table.select` is enabled.
+The **write target** is a second, separate provider call, made only when the statement's own operation is listed in `operations`:
 
-Statements that only name a table without reading it (`DESCRIBE`, `DROP TABLE`) are not treated as reads.
+| Statement | Operation | Resource sent | `columns` sent |
+| --- | --- | --- | --- |
+| `INSERT INTO t (a, b) …` | `table.insert` | `t` | the column list (`null` without one = every column) |
+| `UPDATE t SET a = …` | `table.update` | `t` | the `SET` columns — not columns the `WHERE` reads |
+| `DELETE FROM t …` | `table.delete` | `t` | `null` (whole row) |
+| `MERGE INTO t USING s …` | `table.merge` | `t` | `null` |
+| `TRUNCATE TABLE t, u` | `table.truncate` | `t` and `u` | `null` |
+
+So `UPDATE orders SET amount = 0 WHERE id IN (SELECT id FROM customers)` makes two calls: `table.update` for `orders` (columns `["amount"]`) and `table.select` for `customers`. A statement with no reads (`DELETE`, `TRUNCATE`, `INSERT … VALUES`) makes one.
+
+Only allow/deny applies to a write target. A row filter or column mask returned for one is denied (`ACCESS_REWRITE_UNSUPPORTED_FOR_WRITE`) rather than applied — a write has no read site to splice it into. Writes are **not authorized by default**: with the default `operations: [table.select]` no write target is sent to the provider. `operations` is validated at startup; an entry that isn't one of the six above is rejected, since a typo would silently switch that protection off.
+
+Not evaluated at all: `CREATE`/`DROP`/`ALTER` (including the table a `CTAS` or `CREATE VIEW` creates), grants, roles, and session statements. Statements that only name a table without reading it (`DESCRIBE`, `DROP TABLE`) are not treated as reads.
 
 ---
 

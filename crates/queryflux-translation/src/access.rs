@@ -224,23 +224,40 @@ def _qualified(t):
     return (db + "." + t.name) if db else t.name
 
 
-def _write_target(tree):
-    """(write-target Table node or None, whether the statement embeds reads).
+def _write_targets(tree):
+    """([write-target Table nodes], whether the statement embeds reads).
 
-    `INSERT INTO t ...`, `UPDATE t ...`, `DELETE FROM t ...`, `MERGE INTO t ...` and
-    `CREATE TABLE/VIEW t AS <query>` write to `t`; every *other* table they mention is
-    read. Statements that only name a table without reading it (`DESCRIBE`, `DROP`,
-    `ALTER`, ...) embed no reads.
+    `INSERT INTO t ...`, `UPDATE t ...`, `DELETE FROM t ...`, `MERGE INTO t ...`,
+    `TRUNCATE TABLE t, u` and `CREATE TABLE/VIEW t AS <query>` write to the named table(s);
+    every *other* table they mention is read. Statements that only name a table without
+    reading it (`DESCRIBE`, `DROP`, `ALTER`, ...) embed no reads.
     """
+    if isinstance(tree, exp.TruncateTable):
+        return [t for t in tree.expressions if isinstance(t, exp.Table)], False
     if isinstance(tree, (exp.Insert, exp.Update, exp.Delete, exp.Merge)):
         node = tree.this
     elif isinstance(tree, exp.Create) and isinstance(tree.args.get("expression"), exp.Query):
         node = tree.this
     else:
-        return None, isinstance(tree, exp.Query)
+        return [], isinstance(tree, exp.Query)
     if isinstance(node, exp.Schema):
         node = node.this
-    return (node if isinstance(node, exp.Table) else None), True
+    return ([node] if isinstance(node, exp.Table) else []), True
+
+
+def _written_columns(tree):
+    """Columns an INSERT column list / UPDATE ... SET names, sorted; None = the whole row
+    (DELETE, MERGE, TRUNCATE, or an INSERT without a column list)."""
+    cols = None
+    if isinstance(tree, exp.Insert) and isinstance(tree.this, exp.Schema):
+        cols = {c.name for c in tree.this.expressions if getattr(c, "name", None)}
+    elif isinstance(tree, exp.Update):
+        cols = {
+            e.this.name
+            for e in tree.expressions
+            if isinstance(e, exp.EQ) and isinstance(e.this, exp.Column)
+        }
+    return sorted(cols) if cols else None
 
 
 def extract_resources(sql, dialect, schema_json):
@@ -271,7 +288,9 @@ def extract_resources(sql, dialect, schema_json):
     # which would silently attribute zero columns to a real, matched table.
     src = qualified if qualified is not None else tree
 
-    target, embeds_reads = _write_target(src)
+    targets, embeds_reads = _write_targets(src)
+    target_ids = {id(t) for t in targets}
+    written = _written_columns(src)
 
     # A write target and a read of the same table (`INSERT INTO t SELECT ... FROM t`) are
     # tracked as separate entries: the read must still be policy-checked.
@@ -282,7 +301,7 @@ def extract_resources(sql, dialect, schema_json):
             continue
         if not t.catalog and not t.db and t.name.lower() in ctes:
             continue
-        is_target = t is target
+        is_target = id(t) in target_ids
         key = _table_key(t) + (is_target,)
         if key not in per_table:
             per_table[key] = {
@@ -320,7 +339,8 @@ def extract_resources(sql, dialect, schema_json):
     out = []
     for key in order:
         e = per_table[key]
-        cols = None if e["all"] else sorted(e["columns"])
+        # A write target reports what the statement writes, not what its WHERE reads.
+        cols = written if e["target"] else (None if e["all"] else sorted(e["columns"]))
         out.append({
             "catalog": e["catalog"],
             "schema": e["schema"],
@@ -338,7 +358,8 @@ def rewrite_table_scans(sql, dialect, schema_json, policies_json):
     ctes = _cte_names(tree)
     # The write target is not a scan site: swapping it for a filtered subquery would
     # produce invalid SQL (`UPDATE (SELECT ...) AS t ...`) and would not restrict anything.
-    target, _ = _write_target(tree)
+    targets, _ = _write_targets(tree)
+    target_ids = {id(t) for t in targets}
 
     # Index policies (lowercased). A qualified policy is only reachable by an unqualified scan
     # through `qualified_by_bare`; an explicitly qualified scan never resolves to another
@@ -455,7 +476,7 @@ def rewrite_table_scans(sql, dialect, schema_json, policies_json):
 
     replaced = 0
     for t in list(tree.find_all(exp.Table)):
-        if t is target or not t.name:
+        if id(t) in target_ids or not t.name:
             continue
         if not t.catalog and not t.db and t.name.lower() in ctes:
             continue
@@ -766,6 +787,79 @@ mod tests {
             assert_eq!((r, t), (names(reads), names(targets)), "{sql}");
             assert!(embeds, "{sql} should embed reads");
         }
+    }
+
+    /// `(table, columns)` of every write target in `sql`; `None` columns means the whole row.
+    fn targets_with_columns(
+        sql: &str,
+        schema: &SchemaContext,
+    ) -> Vec<(String, Option<Vec<String>>)> {
+        let st = extract_resources(sql, &SqlDialect::Trino, schema).unwrap();
+        let mut out: Vec<_> = st
+            .resources
+            .iter()
+            .filter(|r| r.is_write_target)
+            .map(|r| {
+                let cols = match &r.columns {
+                    Columns::Named(c) => Some(c.clone()),
+                    Columns::All => None,
+                };
+                (r.table.clone(), cols)
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    fn cols(xs: &[&str]) -> Option<Vec<String>> {
+        Some(names(xs))
+    }
+
+    /// A write target carries the columns the statement writes — an `INSERT` column list or
+    /// the `UPDATE … SET` columns — so a policy can restrict writes per column. Columns the
+    /// `WHERE` merely reads are not written. Whole-row writes report all columns.
+    #[test]
+    fn extract_resources_reports_the_columns_a_write_targets() {
+        let none = SchemaContext::default();
+        let with_schema = schema_with("orders", &["id", "amount", "region"]);
+        for schema in [&none, &with_schema] {
+            for (sql, table, expected) in [
+                ("INSERT INTO orders (region, id) VALUES ('EU', 1)", "orders", cols(&["id", "region"])),
+                ("INSERT INTO orders VALUES (1, 2, 'EU')", "orders", None),
+                (
+                    "UPDATE orders SET region = 'EU', amount = 1 WHERE id = 3",
+                    "orders",
+                    cols(&["amount", "region"]),
+                ),
+                ("DELETE FROM orders WHERE id = 1", "orders", None),
+                (
+                    "MERGE INTO orders USING s ON orders.id = s.id WHEN MATCHED THEN UPDATE SET amount = s.amount",
+                    "orders",
+                    None,
+                ),
+            ] {
+                assert_eq!(
+                    targets_with_columns(sql, schema),
+                    vec![(table.to_string(), expected)],
+                    "{sql}"
+                );
+            }
+        }
+    }
+
+    /// `TRUNCATE` is a write to every table it names and reads nothing.
+    #[test]
+    fn extract_resources_truncate_targets_every_named_table() {
+        let sql = "TRUNCATE TABLE orders, customers";
+        assert_eq!(
+            targets_with_columns(sql, &SchemaContext::default()),
+            vec![
+                ("customers".to_string(), None),
+                ("orders".to_string(), None)
+            ]
+        );
+        let (reads, _, embeds) = split_statement(sql);
+        assert!(reads.is_empty() && !embeds, "{reads:?} {embeds}");
     }
 
     /// Statements that merely name a table do not read it and must not be treated as reads.

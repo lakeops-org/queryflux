@@ -2,14 +2,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-/// Operation names the guard can currently classify and enforce. `operations` is an
-/// allowlist, so anything outside this set would silently never match.
-pub const SUPPORTED_OPERATIONS: &[&str] = &[
-    "table.select",
-    "table.insert",
-    "table.update",
-    "table.delete",
-];
+use crate::access_model::Operation;
 
 /// What to do when the query's referenced table columns can't be resolved from the catalog.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -303,10 +296,11 @@ impl AccessConnectionConfig {
         // `operations` is an allowlist: an entry that names no real operation (say
         // `table.selet`) would silently skip that protection, so unknown names are rejected.
         for op in &self.operations {
-            if !SUPPORTED_OPERATIONS.contains(&op.as_str()) {
+            if !Operation::SUPPORTED.contains(&op.as_str()) {
                 return Err(format!(
-                    "accessControl.connections.{name}.operations entry {op:?} is not supported (supported: {})",
-                    SUPPORTED_OPERATIONS.join(", ")
+                    "accessControl.connections.{name}.operations entry {op:?} is not a supported \
+                     operation (supported: {})",
+                    Operation::SUPPORTED.join(", ")
                 ));
             }
         }
@@ -673,6 +667,22 @@ mod tests {
         assert!(cfg.connection_for_group("trino-prod").is_none());
     }
 
+    /// A typo in `operations` would silently disable enforcement for that operation.
+    #[test]
+    fn validate_rejects_unsupported_operations() {
+        let conn = |ops: &[&str]| AccessConnectionConfig {
+            operations: ops.iter().map(|o| o.to_string()).collect(),
+            ..AccessConnectionConfig::default()
+        };
+        for ok in Operation::SUPPORTED {
+            assert!(conn(&[ok]).validate("c").is_ok(), "{ok} should be accepted");
+        }
+        for bad in ["table.selct", "statement.other", "select", "table.create"] {
+            let err = conn(&[bad]).validate("c").unwrap_err();
+            assert!(err.contains(bad) && err.contains("table.select"), "{err}");
+        }
+    }
+
     #[test]
     fn validate_rejects_group_referencing_unknown_connection() {
         let mut cfg = AccessControlConfig::default();
@@ -786,6 +796,7 @@ mod tests {
         for ok in [
             &["table.select"][..],
             &["table.select", "table.delete"],
+            &["table.merge", "table.truncate"],
             &[],
         ] {
             assert!(
@@ -793,7 +804,12 @@ mod tests {
                 "{ok:?}"
             );
         }
-        for bad in ["table.selet", "statement.other", "select", "table.merge"] {
+        for bad in [
+            "table.selet",
+            "statement.other",
+            "select",
+            "table.frobnicate",
+        ] {
             let err = connection_with(None, &[bad])
                 .validate("default")
                 .unwrap_err();

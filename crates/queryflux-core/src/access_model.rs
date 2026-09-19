@@ -30,6 +30,18 @@ pub struct Identity {
 pub struct Operation(pub String);
 
 impl Operation {
+    /// Operations the guard classifies and can evaluate. Anything else in a connection's
+    /// `operations` list is a typo that would silently switch enforcement off, so config
+    /// validation rejects it.
+    pub const SUPPORTED: &'static [&'static str] = &[
+        "table.select",
+        "table.insert",
+        "table.update",
+        "table.delete",
+        "table.merge",
+        "table.truncate",
+    ];
+
     pub fn table_select() -> Self {
         Self("table.select".to_string())
     }

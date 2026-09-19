@@ -8,8 +8,8 @@
 
 use queryflux_core::access_model::MaskType;
 use queryflux_e2e_tests::access_control::{
-    build_guard, build_guard_with, customers_schema, mask, orders_schema, payroll_schema,
-    pg_connect, pg_run, seed_customers, seed_orders, start_opa_stub, GuardOpts, MapCatalog,
+    build_guard, build_guard_with_operations, customers_schema, mask, orders_schema,
+    payroll_schema, pg_connect, pg_run, seed_customers, seed_orders, start_opa_stub, MapCatalog,
 };
 use queryflux_e2e_tests::harness::ProtocolWireHarness;
 use std::sync::Arc;
@@ -194,23 +194,14 @@ async fn write_target_is_not_checked_by_default() {
         .expect("INSERT target is not evaluated when table.insert is not enabled");
 }
 
-fn guard_with_ops(
-    opa_url: &str,
-    ops: &[&str],
-) -> Arc<queryflux_frontend::access_control_guard::OpaAccessGuard> {
-    build_guard_with(
-        opa_url,
-        GuardOpts {
-            operations: ops.iter().map(|o| o.to_string()).collect(),
-            ..GuardOpts::default()
-        },
-    )
-}
-
 #[tokio::test]
 async fn enabled_write_operation_allows_or_denies_the_target_table() {
     let (opa_url, stub) = start_opa_stub().await;
-    let h = harness_with(guard_with_ops(&opa_url, &["table.select", "table.delete"])).await;
+    let h = harness_with(build_guard_with_operations(
+        &opa_url,
+        &["table.select", "table.delete"],
+    ))
+    .await;
     let client = pg_connect(h.postgres_port).await;
     seed_orders(&client).await;
 
@@ -229,7 +220,11 @@ async fn enabled_write_operation_allows_or_denies_the_target_table() {
 #[tokio::test]
 async fn row_filter_on_a_write_target_fails_closed() {
     let (opa_url, stub) = start_opa_stub().await;
-    let h = harness_with(guard_with_ops(&opa_url, &["table.select", "table.delete"])).await;
+    let h = harness_with(build_guard_with_operations(
+        &opa_url,
+        &["table.select", "table.delete"],
+    ))
+    .await;
     let client = pg_connect(h.postgres_port).await;
     seed_orders(&client).await;
     stub.lock().unwrap().filter("orders", "amount > 100");

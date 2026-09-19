@@ -129,7 +129,7 @@ Content-Type: application/json
 | Field | Notes |
 | --- | --- |
 | `identity.*` | Verified `AuthContext` only. |
-| `action.operation` | e.g. `table.select`. |
+| `action.operation` | `table.select` for tables the statement reads; for a write target, its own operation (`table.insert`, `table.update`, `table.delete`, `table.merge`, `table.truncate`) when enabled in `operations`. A statement with both reads and a write target makes one request for each. |
 | `action.resources[].table` | Bare or as QueryFlux extracted it; often schema-qualified in practice. |
 | `action.resources[].columns` | Named list, or **omitted / null** meaning all columns (`SELECT *` or unresolved schema). |
 | `context.sessionParams` | Only keys listed in `sessionParamKeys`. |

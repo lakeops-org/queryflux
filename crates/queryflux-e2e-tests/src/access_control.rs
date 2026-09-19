@@ -66,9 +66,20 @@ pub struct StubState {
     pub empty_result: bool,
     /// Full per-user override: `user → table → verdict`. Wins over the maps above.
     pub by_user: HashMap<String, HashMap<String, TableVerdict>>,
+    /// Every `input` body the stub has received, in order.
+    pub requests: Vec<Value>,
 }
 
 impl StubState {
+    /// The recorded `input.action` objects whose `operation` is `op`.
+    pub fn actions_for(&self, op: &str) -> Vec<Value> {
+        self.requests
+            .iter()
+            .map(|r| r["input"]["action"].clone())
+            .filter(|a| a["operation"] == op)
+            .collect()
+    }
+
     pub fn deny(&mut self, table: impl Into<String>) {
         self.deny_tables.insert(table.into());
     }
@@ -133,7 +144,8 @@ async fn opa_handler(
         .as_str()
         .unwrap_or("")
         .to_string();
-    let st = state.lock().unwrap();
+    let mut st = state.lock().unwrap();
+    st.requests.push(body.clone());
     if st.empty_result {
         return Json(json!({ "result": {} }));
     }
@@ -239,6 +251,17 @@ impl Default for GuardOpts {
 /// Build a real `OpaAccessGuard` pointed at the stub, evaluating every SELECT.
 pub fn build_guard(opa_url: &str) -> Arc<OpaAccessGuard> {
     build_guard_with(opa_url, GuardOpts::default())
+}
+
+/// Like [`build_guard`], evaluating exactly the given namespaced operations.
+pub fn build_guard_with_operations(opa_url: &str, operations: &[&str]) -> Arc<OpaAccessGuard> {
+    build_guard_with(
+        opa_url,
+        GuardOpts {
+            operations: operations.iter().map(|o| o.to_string()).collect(),
+            ..GuardOpts::default()
+        },
+    )
 }
 
 pub fn build_guard_with(opa_url: &str, opts: GuardOpts) -> Arc<OpaAccessGuard> {

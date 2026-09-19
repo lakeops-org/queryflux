@@ -415,7 +415,7 @@ impl Guard for OpaAccessGuard {
 /// Classify the query's namespaced operation from its first parsed statement.
 ///
 /// Deliberately narrow: only true DQL maps to `table.select` and only DML writes map to
-/// `table.insert/update/delete`. Everything else — DDL, `Expression::Command` (BEGIN/COMMIT/
+/// `table.insert/update/delete/merge/truncate`. Everything else — DDL, `Expression::Command` (BEGIN/COMMIT/
 /// CREATE/ALTER/DROP/anything the parser doesn't model precisely — see
 /// `sql_classify::is_read_stmt`'s doc comment), `SHOW`, `DESCRIBE` — maps to `statement.other`,
 /// which is never in the default `operations` allowlist, so the stage is skipped for it
@@ -441,6 +441,10 @@ fn classify_operation(stmts: Option<&[Expression]>, sql: &str) -> Operation {
         Some(Expression::Insert(_)) => Operation("table.insert".to_string()),
         Some(Expression::Update(_)) => Operation("table.update".to_string()),
         Some(Expression::Delete(_)) => Operation("table.delete".to_string()),
+        Some(Expression::Merge(_)) => Operation("table.merge".to_string()),
+        Some(Expression::Truncate(_) | Expression::TruncateTable(_)) => {
+            Operation("table.truncate".to_string())
+        }
         Some(_) => Operation("statement.other".to_string()),
         None if queryflux_core::sql_classify::is_read_like_fallback(sql) => {
             Operation::table_select()
@@ -497,6 +501,16 @@ mod tests {
         assert_eq!(
             classify("DELETE FROM orders WHERE id = 1").await.as_str(),
             "table.delete"
+        );
+        assert_eq!(
+            classify("MERGE INTO t USING s ON t.id = s.id WHEN MATCHED THEN DELETE")
+                .await
+                .as_str(),
+            "table.merge"
+        );
+        assert_eq!(
+            classify("TRUNCATE TABLE orders").await.as_str(),
+            "table.truncate"
         );
     }
 
