@@ -65,7 +65,9 @@ Credentials are extracted from the `/session/v1/login-request` body:
 
 - `LOGIN_NAME` — username
 - `PASSWORD` — password
-- `SESSION_PARAMETERS.DATABASE` / `SESSION_PARAMETERS.SCHEMA` — optional database/schema hints (also accepted as `databaseName`/`schemaName` query parameters)
+- `DATABASE_NAME` / `SCHEMA_NAME` — optional database/schema hints
+
+Optional role and warehouse hints come from the login URL's `roleName` and `warehouse` query parameters.
 
 The credentials are authenticated against the configured `auth_provider`. A session token (UUID) is issued on success and must be passed in every subsequent request as `Authorization: Snowflake Token="<token>"`.
 
@@ -91,12 +93,19 @@ Results are returned in **`jsonv2` format** — a JSON array of rows where every
 
 | Field | Source |
 |-------|--------|
-| `user` | `LOGIN_NAME` from login request body |
-| `database` | `databaseName` query param → `SESSION_PARAMETERS.DATABASE` → `SESSION_PARAMETERS.SCHEMA` (first non-empty value) |
+| `user` | User resolved by the auth provider from the login credentials |
+| `catalog` | Snowflake database (`DATABASE_NAME`); remains unset when omitted |
+| `database` | Snowflake schema (`SCHEMA_NAME`); unset when omitted or empty |
 | `tags` | Not populated |
-| `extra` | Empty |
+| `extra["snowflake.role"]` | Login URL's `roleName` query parameter |
+| `extra["snowflake.warehouse"]` | Login URL's `warehouse` query parameter |
+| `extra["snowflake.schema"]` | `SCHEMA_NAME` from the login request body |
+
+Snowflake's `database.schema.table` maps to QueryFlux's `catalog.database.table` at login and for subsequent queries. The three `extra` keys above are populated before login routing only when the corresponding option is present and non-empty. Values are preserved exactly, without trimming, case normalization, or default values, so routing rules can inspect role, warehouse, and schema when selecting the session's cluster group.
 
 Routing (group selection) happens at **login time**, not at query time. The cluster group is stored in the session and reused for all queries in that session. Changing the database after login (e.g. via `USE DATABASE`) does not re-route.
+
+`USE DATABASE` (or bare `USE <database>`) changes the catalog and clears the schema override. QueryFlux does not resolve backend default schemas such as `PUBLIC`; clients can explicitly select a schema with `USE SCHEMA <schema>` or `USE SCHEMA <database>.<schema>`. Subsequent queries use the updated namespace, while retaining the session's role and warehouse.
 
 ### SQL REST API v2
 
@@ -148,7 +157,6 @@ curl -X POST http://localhost:8443/api/v2/statements \
 | Async query execution (`asyncExec: true`) | Not supported. `query-monitoring-request` returns an empty polling response so the connector stops polling. All queries run synchronously. |
 | Query cancel (`DELETE /queries/v1/{id}`, `DELETE /api/v2/statements/{handle}`) | No-op — synchronous execution cannot be interrupted mid-flight via HTTP. Returns a success response. |
 | SQL REST API v2 polling (`GET /api/v2/statements/{handle}`) | Stub — returns HTTP 404 with "already complete" message. |
-| `schema` as a routing hint | The request body's top-level `database` field populates both `SessionContext.database` and `SessionContext.catalog` (Snowflake's database maps onto our `catalog.database.table` model as the catalog) — `schema` is captured into `extra["snowflake.schema"]` but not mapped onto a dedicated field yet, so it isn't available for `protocolBased` routing on its own. |
 | Query tags | Not extracted for either sub-protocol. The `tags` router type cannot be used with Snowflake frontends. |
 | Multiple statements per request | Not supported. Only the first statement in the request body is executed. |
 | Transactions (`BEGIN` / `COMMIT` / `ROLLBACK`) | No transaction state is maintained. These statements are forwarded to the backend as-is. |

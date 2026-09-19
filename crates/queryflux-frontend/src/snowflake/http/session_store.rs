@@ -139,19 +139,23 @@ impl SnowflakeSessionStore {
         token
     }
 
-    /// Update the tracked database for `token` (e.g. from a `USE DATABASE` statement).
-    /// No-op if the token is unknown (session expired/removed concurrently).
-    pub fn set_database(&self, token: &str, database: Option<String>) {
-        if let Some(mut entry) = self.sessions.get_mut(token) {
+    /// Update the namespace under one lock and return the values for the wire response.
+    /// An omitted database retains the current database (`USE SCHEMA schema`).
+    /// An omitted schema clears the override (`USE DATABASE db`), matching login's
+    /// unspecified-schema state; this store does not resolve backend defaults like PUBLIC.
+    pub fn set_namespace(
+        &self,
+        token: &str,
+        database: Option<String>,
+        schema: Option<String>,
+    ) -> Option<(Option<String>, Option<String>)> {
+        let mut entry = self.sessions.get_mut(token)?;
+        if database.is_some() {
             entry.database = database;
         }
-    }
+        entry.schema = schema;
 
-    /// Update the tracked schema for `token` (e.g. from a `USE SCHEMA` statement).
-    pub fn set_schema(&self, token: &str, schema: Option<String>) {
-        if let Some(mut entry) = self.sessions.get_mut(token) {
-            entry.schema = schema;
-        }
+        Some((entry.database.clone(), entry.schema.clone()))
     }
 
     /// Update the tracked role for `token` (e.g. from a `USE ROLE` statement).
@@ -446,8 +450,7 @@ mod tests {
         );
         store.set_role(&token, Some("SYSADMIN".into()));
         store.set_warehouse(&token, Some("ETL_WH".into()));
-        store.set_schema(&token, Some("PUBLIC".into()));
-        store.set_database(&token, Some("PROD".into()));
+        store.set_namespace(&token, Some("PROD".into()), Some("PUBLIC".into()));
         let (_, session) = store.validate_session(&token).unwrap();
         assert_eq!(session.role.as_deref(), Some("SYSADMIN"));
         assert_eq!(session.warehouse.as_deref(), Some("ETL_WH"));
@@ -461,5 +464,8 @@ mod tests {
         // Must not panic when the session was already removed/expired concurrently.
         store.set_role("no-such-token", Some("X".into()));
         store.set_warehouse("no-such-token", Some("X".into()));
+        assert!(store
+            .set_namespace("no-such-token", Some("X".into()), None)
+            .is_none());
     }
 }

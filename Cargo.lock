@@ -5383,6 +5383,7 @@ dependencies = [
  "dashmap",
  "flate2",
  "futures",
+ "polyglot-sql 0.3.2",
  "prost 0.14.3",
  "queryflux-auth",
  "queryflux-cache",
