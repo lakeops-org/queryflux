@@ -107,9 +107,11 @@ Content-Type: application/json
       "operation": "table.select",
       "resources": [
         {
+          "kind": "table",
           "catalog": "lakekeeper",
           "schema": "demo",
           "table": "customers",
+          "name": "customers",
           "columns": ["name", "region", "ssn"]
         }
       ]
@@ -129,8 +131,10 @@ Content-Type: application/json
 | Field | Notes |
 | --- | --- |
 | `identity.*` | Verified `AuthContext` only. |
-| `action.operation` | `table.select` for tables the statement reads; for a write target, its own operation (`table.insert`, `table.update`, `table.delete`, `table.merge`, `table.truncate`) when enabled in `operations`. A statement with both reads and a write target makes one request for each. |
-| `action.resources[].table` | Bare or as QueryFlux extracted it; often schema-qualified in practice. |
+| `action.operation` | `table.select` for tables the statement reads; for a write or DDL target, its own operation (`table.insert`/`update`/`delete`/`merge`/`truncate`/`create`/`drop`/`alter`, `view.create`/`drop`/`alter`, `schema.create`/`drop`, `catalog.create`/`drop`) when enabled in `operations`. A statement with both reads and a target makes one request for each; `CREATE OR REPLACE` also makes the matching `*.drop` request. |
+| `action.resources[].kind` | `table` for everything a query reads; DDL can also target a `view`, `schema` or `catalog` (`CREATE DATABASE` is reported as a catalog). |
+| `action.resources[].name` | The object's own name — table/view, schema, or catalog. Present for every kind. |
+| `action.resources[].table` | Bare or as QueryFlux extracted it; often schema-qualified in practice. **Omitted** for `schema` and `catalog` resources (use `schema` / `catalog` and `name`). |
 | `action.resources[].columns` | Named list, or **omitted / null** meaning all columns (`SELECT *` or unresolved schema). |
 | `context.sessionParams` | Only keys listed in `sessionParamKeys`. |
 
@@ -159,7 +163,7 @@ OPA must return a `result` object with a non-empty `resources` array. A missing 
 
 | Field | Required | Notes |
 | --- | --- | --- |
-| `table` | yes | Echo the resource table key the rewrite matcher uses. |
+| `table` / `name` | yes (one of them) | Echo the resource's `table` (table resources) or `name` (any kind) — QueryFlux matches decisions back on it. `name` wins if both are sent. An echo that matches no requested resource counts as a missing decision, which denies. |
 | `allow` | yes | `false` denies the whole query if any resource is denied. |
 | `reason` | no | Surfaced on deny / audit. |
 | `rowFilters` | no | Each entry needs `expression` (source-dialect boolean SQL). |

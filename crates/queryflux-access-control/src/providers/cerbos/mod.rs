@@ -102,7 +102,7 @@ mod tests {
     use super::*;
     use axum::{extract::State, http::HeaderMap, routing::post, Json, Router};
     use queryflux_core::access_model::{
-        AccessResource, Columns, Identity, Operation, RequestContext,
+        AccessResource, Columns, Identity, Operation, RequestContext, ResourceKind,
     };
     use std::sync::{Arc, Mutex};
     use tokio::net::TcpListener;
@@ -116,6 +116,7 @@ mod tests {
             },
             operation: Operation::table_select(),
             resources: vec![AccessResource {
+                kind: ResourceKind::Table,
                 catalog: None,
                 schema: None,
                 table: table.to_string(),

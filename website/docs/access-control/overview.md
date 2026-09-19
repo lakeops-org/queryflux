@@ -137,7 +137,7 @@ accessControl:
         url: http://localhost:8181
         decisionPath: /v1/data/queryflux/access
         timeoutMs: 1000
-      operations: [table.select]        # also: table.insert, table.update, table.delete, table.merge, table.truncate
+      operations: [table.select]        # also: table.insert/update/delete/merge/truncate/create/drop/alter, view.*, schema.*, catalog.*
       onMissingSchema: evaluate         # evaluate | deny
       failOpen: false                   # provider error → deny by default
       cacheTtlMs: 5000                  # 0 disables the decision cache
@@ -155,7 +155,7 @@ accessControl:
 | `enabled` | Global default: run access control for a cluster group unless `groups.<name>.enabled` overrides. Default: `true` when `accessControl` is set. Set `false` to opt in only where groups explicitly set `enabled: true`. |
 | `defaultConnection` | Named entry under `connections` that a group uses when it has no explicit `groups.<name>.connection` override. **Unset means such a group gets no access control at all** — there's nothing to route it to. Must reference a key under `connections` when set. |
 | `connections` | Map of named policy-provider connections. No name is reserved — see [Multiple connections](#multiple-connections). |
-| `connections.<name>.operations` | Namespaced ops the connection evaluates; others skip the stage. One of `table.select`, `table.insert`, `table.update`, `table.delete`, `table.merge`, `table.truncate` — anything else fails validation. Default: `[table.select]`. See [What policies apply to](#what-policies-apply-to). |
+| `connections.<name>.operations` | Namespaced ops the connection evaluates; others skip the stage. One of the [operations listed here](#what-policies-apply-to) (`table.*`, `view.*`, `schema.*`, `catalog.*`) — anything else fails validation. Default: `[table.select]`. See [What policies apply to](#what-policies-apply-to). |
 | `connections.<name>.onMissingSchema` | When columns can't be resolved (`SELECT *` without catalog): `evaluate` still calls the provider with "all columns"; `deny` fails closed. |
 | `connections.<name>.failOpen` | Provider timeout/transport error → allow (`true`) or deny (`false`, default) for groups on this connection. |
 | `connections.<name>.cacheTtlMs` / `cacheCapacity` | TTL cache of identical decisions on this connection; `0` disables. |
@@ -229,6 +229,12 @@ The **write target** is a second, separate provider call, made only when the sta
 | `DELETE FROM t …` | `table.delete` | `t` | `null` (whole row) |
 | `MERGE INTO t USING s …` | `table.merge` | `t` | `null` |
 | `TRUNCATE TABLE t, u` | `table.truncate` | `t` and `u` | `null` |
+| `CREATE TABLE t (a INT, b INT)` / `CREATE TABLE t AS …` | `table.create` | `t` | the defined columns (`null` for `AS <query>`) |
+| `DROP TABLE t, u` | `table.drop` | `t` and `u` | `null` |
+| `ALTER TABLE t …` (including `RENAME`) | `table.alter` | `t` | `null` |
+| `CREATE VIEW v AS …` / `DROP VIEW v` / `ALTER VIEW v …` | `view.create` / `view.drop` / `view.alter` | `v`, kind `view` | `null` |
+| `CREATE SCHEMA s` / `DROP SCHEMA s` | `schema.create` / `schema.drop` | `s`, kind `schema` (no `table`) | `null` |
+| `CREATE DATABASE d` / `DROP DATABASE d` | `catalog.create` / `catalog.drop` | `d`, kind `catalog` | `null` |
 
 So `UPDATE orders SET amount = 0 WHERE id IN (SELECT id FROM customers)` makes two calls: `table.update` for `orders` (columns `["amount"]`) and `table.select` for `customers`. A statement with no reads (`DELETE`, `TRUNCATE`, `INSERT … VALUES`) makes one.
 
@@ -236,9 +242,11 @@ So `UPDATE orders SET amount = 0 WHERE id IN (SELECT id FROM customers)` makes t
 
 Two limits. Scoping controls which rows a write may **target**, not what it may write (`USING` without `WITH CHECK`): a caller can `UPDATE … SET region = 'US'` on their own rows and move them out of scope. To prevent that, deny `table.update` for that column — write targets carry the columns they set. And `INSERT` and `TRUNCATE` have no `WHERE` limiting which rows the write touches — nor does `MERGE`'s `WHEN NOT MATCHED` branch, which inserts a row rather than modifying one — so a row filter returned for one of these is denied (`ACCESS_REWRITE_UNSUPPORTED_FOR_WRITE`) rather than silently skipped. A column mask returned for any write is denied too: a mask changes what a read returns, and a write returns nothing.
 
-Writes are **not authorized by default**: with the default `operations: [table.select]` no write target is sent to the provider, so neither allow/deny nor scoping applies to it. `operations` is validated at startup; an entry that isn't one of the six above is rejected, since a typo would silently switch that protection off.
+Writes are **not authorized by default**: with the default `operations: [table.select]` no write target is sent to the provider, so neither allow/deny nor scoping applies to it. `operations` is validated at startup; an entry that isn't a supported operation is rejected, since a typo would silently switch that protection off.
 
-Not evaluated at all: `CREATE`/`DROP`/`ALTER` (including the table a `CTAS` or `CREATE VIEW` creates), grants, roles, and session statements. Statements that only name a table without reading it (`DESCRIBE`, `DROP TABLE`) are not treated as reads.
+Every resource is sent with its `kind` (`table`, `view`, `schema`, `catalog`) and its `name`; a schema or catalog has no `table`. Reads inside DDL are still `table.select`: `CREATE VIEW v AS SELECT … FROM secret` and `CREATE TABLE t AS SELECT … FROM secret` check `v`/`t` under the create operation **and** `secret` as a read, and denying either stops the statement. `CREATE OR REPLACE` destroys the existing object, so it also makes the matching `*.drop` request. As with any non-`UPDATE`/`DELETE` write, a row filter or column mask returned for a DDL target is denied rather than applied.
+
+**Not evaluated** (no operation exists for them yet): `GRANT`/`REVOKE` and role management, session statements (`SET`, `USE`), `CALL` and functions/procedures, indexes, sequences and other object types, `COPY`, and metadata statements (`SHOW`, `DESCRIBE`). Statements that only name a table without reading it (`DESCRIBE`, `DROP TABLE`) are not treated as reads. `CREATE VIEW` stores the caller's filtered definition for everyone who later queries the view, so scope view creation with `view.create` accordingly.
 
 ---
 

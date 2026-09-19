@@ -6,7 +6,7 @@
 //! filter/mask expressions to the target engine.
 
 use pyo3::prelude::*;
-use queryflux_core::access_model::{ColumnMask, Columns, MaskType};
+use queryflux_core::access_model::{ColumnMask, Columns, MaskType, ResourceKind};
 use queryflux_core::error::{QueryFluxError, Result};
 use queryflux_core::query::SqlDialect;
 use queryflux_core::schema_context::SchemaContext;
@@ -16,9 +16,10 @@ use queryflux_core::schema_context::SchemaContext;
 pub struct ExtractedResource {
     pub catalog: Option<String>,
     pub schema: Option<String>,
+    pub kind: ResourceKind,
     pub table: String,
     pub columns: Columns,
-    /// The table the statement writes to (`INSERT INTO t`, `UPDATE t`, `CREATE TABLE t AS`,
+    /// The object the statement writes to (`INSERT INTO t`, `UPDATE t`, `CREATE TABLE t AS`,
     /// ...). Every other extracted table is read.
     pub is_write_target: bool,
 }
@@ -31,6 +32,8 @@ pub struct ExtractedStatement {
     /// `INSERT`/`UPDATE`/`DELETE`/`MERGE`/`CREATE ... AS <query>`, false for statements that
     /// merely name a table (`DESCRIBE`, `DROP`, `ALTER`, ...).
     pub embeds_reads: bool,
+    /// `CREATE OR REPLACE`: also destroys the existing object, so it needs the matching drop.
+    pub replaces: bool,
 }
 
 /// Per-table policy for [`rewrite_table_scans`].
@@ -255,25 +258,47 @@ def _qualified(t):
     return (db + "." + t.name) if db else t.name
 
 
-def _write_targets(tree):
-    """([write-target Table nodes], whether the statement embeds reads).
+_KINDS = {"TABLE": "table", "VIEW": "view", "SCHEMA": "schema", "DATABASE": "catalog"}
 
-    `INSERT INTO t ...`, `UPDATE t ...`, `DELETE FROM t ...`, `MERGE INTO t ...`,
-    `TRUNCATE TABLE t, u` and `CREATE TABLE/VIEW t AS <query>` write to the named table(s);
-    every *other* table they mention is read. Statements that only name a table without
-    reading it (`DESCRIBE`, `DROP`, `ALTER`, ...) embed no reads.
-    """
-    if isinstance(tree, exp.TruncateTable):
-        return [t for t in tree.expressions if isinstance(t, exp.Table)], False
-    if isinstance(tree, (exp.Insert, exp.Update, exp.Delete, exp.Merge)):
-        node = tree.this
-    elif isinstance(tree, exp.Create) and isinstance(tree.args.get("expression"), exp.Query):
-        node = tree.this
-    else:
-        return [], isinstance(tree, exp.Query)
+
+def _unwrap(node):
     if isinstance(node, exp.Schema):
         node = node.this
-    return ([node] if isinstance(node, exp.Table) else []), True
+    return node if isinstance(node, exp.Table) else None
+
+
+def _write_targets(tree):
+    """([(Table node, kind)], embeds_reads, replaces).
+
+    The object(s) a statement writes to, with their kind (`table`/`view`/`schema`/`catalog`):
+    INSERT/UPDATE/DELETE/MERGE/TRUNCATE and CREATE/DROP/ALTER of a table, view, schema or
+    database (a database is reported as a catalog). Every *other* table a statement mentions
+    is read. `embeds_reads` is true for queries and for statements that contain one
+    (`INSERT … SELECT`, `CREATE … AS <query>`); `replaces` is true for `CREATE OR REPLACE`.
+    Statements that only name an object without reading it (`DESCRIBE`, ...) embed no reads.
+    """
+    if isinstance(tree, exp.TruncateTable):
+        return [(t, "table") for t in tree.expressions if isinstance(t, exp.Table)], False, False
+    if isinstance(tree, (exp.Insert, exp.Update, exp.Delete, exp.Merge)):
+        node = _unwrap(tree.this)
+        return ([(node, "table")] if node is not None else []), True, False
+    kind = _KINDS.get(str(tree.args.get("kind") or "").upper())
+    if isinstance(tree, exp.Create):
+        node = _unwrap(tree.this)
+        targets = [(node, kind)] if kind and node is not None else []
+        return (
+            targets,
+            isinstance(tree.args.get("expression"), exp.Query),
+            bool(tree.args.get("replace")),
+        )
+    if isinstance(tree, exp.Drop):
+        nodes = [n for n in tree.args.get("tables", []) if isinstance(n, exp.Table)]
+        return ([(n, kind) for n in nodes] if kind else []), False, False
+    if isinstance(tree, exp.Alter):
+        node = _unwrap(tree.this)
+        ok = kind in ("table", "view") and node is not None
+        return ([(node, kind)] if ok else []), False, False
+    return [], isinstance(tree, exp.Query), False
 
 
 def _set_assignment_columns(expressions):
@@ -287,8 +312,9 @@ def _set_assignment_columns(expressions):
 
 
 def _written_columns(tree):
-    """Columns an INSERT column list / UPDATE ... SET names, sorted; None = the whole row
-    (DELETE, MERGE, TRUNCATE, or an INSERT without a column list)."""
+    """Columns an INSERT column list / UPDATE ... SET / CREATE TABLE (...) names, sorted;
+    None = the whole row (DELETE, MERGE, TRUNCATE, an INSERT without a column list, or any
+    statement that names no columns)."""
     cols = None
     if isinstance(tree, exp.Insert):
         if isinstance(tree.this, exp.Schema):
@@ -303,7 +329,39 @@ def _written_columns(tree):
             cols |= _set_assignment_columns(conflict.expressions)
     elif isinstance(tree, exp.Update):
         cols = _set_assignment_columns(tree.expressions)
+    elif isinstance(tree, exp.Create) and isinstance(tree.this, exp.Schema):
+        cols = {c.name for c in tree.this.expressions if isinstance(c, exp.ColumnDef)}
     return sorted(cols) if cols else None
+
+
+def _target_entry(node, kind, written):
+    parts = [p for p in (node.catalog, node.db, node.name) if p]
+    if kind == "schema":
+        return {
+            "catalog": parts[-2] if len(parts) > 1 else None,
+            "schema": parts[-1] if parts else None,
+            "table": "",
+            "columns": None,
+            "target": True,
+            "kind": kind,
+        }
+    if kind == "catalog":
+        return {
+            "catalog": parts[-1] if parts else None,
+            "schema": None,
+            "table": "",
+            "columns": None,
+            "target": True,
+            "kind": kind,
+        }
+    return {
+        "catalog": node.catalog or None,
+        "schema": node.db or None,
+        "table": node.name,
+        "columns": written,
+        "target": True,
+        "kind": kind,
+    }
 
 
 def extract_resources(sql, dialect, schema_json):
@@ -334,21 +392,20 @@ def extract_resources(sql, dialect, schema_json):
     # which would silently attribute zero columns to a real, matched table.
     src = qualified if qualified is not None else tree
 
-    targets, embeds_reads = _write_targets(src)
-    target_ids = {id(t) for t in targets}
+    targets, embeds_reads, replaces = _write_targets(src)
+    target_ids = {id(n) for n, _ in targets}
     written = _written_columns(src)
 
-    # A write target and a read of the same table (`INSERT INTO t SELECT ... FROM t`) are
-    # tracked as separate entries: the read must still be policy-checked.
+    # Write targets are reported separately below, so a read of the same table
+    # (`INSERT INTO t SELECT ... FROM t`) stays its own entry and is still policy-checked.
     per_table = {}
     order = []
     for t in src.find_all(exp.Table):
-        if not t.name:
+        if id(t) in target_ids or not t.name:
             continue
         if not t.catalog and not t.db and t.name.lower() in ctes:
             continue
-        is_target = id(t) in target_ids
-        key = _table_key(t) + (is_target,)
+        key = _table_key(t)
         if key not in per_table:
             per_table[key] = {
                 "catalog": t.catalog or None,
@@ -356,7 +413,6 @@ def extract_resources(sql, dialect, schema_json):
                 "table": t.name,
                 "columns": set(),
                 "all": False,
-                "target": is_target,
             }
             order.append(key)
 
@@ -374,7 +430,7 @@ def extract_resources(sql, dialect, schema_json):
         for col in qualified.find_all(exp.Column):
             tbl = col.table
             if tbl and tbl in alias_to_table:
-                k = alias_to_table[tbl] + (False,)
+                k = alias_to_table[tbl]
                 if k in per_table:
                     per_table[k]["columns"].add(col.name)
     else:
@@ -385,16 +441,18 @@ def extract_resources(sql, dialect, schema_json):
     out = []
     for key in order:
         e = per_table[key]
-        # A write target reports what the statement writes, not what its WHERE reads.
-        cols = written if e["target"] else (None if e["all"] else sorted(e["columns"]))
         out.append({
             "catalog": e["catalog"],
             "schema": e["schema"],
             "table": e["table"],
-            "columns": cols,
-            "target": e["target"],
+            "columns": None if e["all"] else sorted(e["columns"]),
+            "target": False,
+            "kind": "table",
         })
-    return json.dumps({"resources": out, "embeds_reads": embeds_reads})
+    # A write target reports what the statement writes, not what its WHERE reads.
+    for node, kind in targets:
+        out.append(_target_entry(node, kind, written))
+    return json.dumps({"resources": out, "embeds_reads": embeds_reads, "replaces": replaces})
 
 
 def apply_write_filters(sql, dialect, filters_json):
@@ -404,10 +462,10 @@ def apply_write_filters(sql, dialect, filters_json):
         raise ValueError(
             "row filters can only scope UPDATE, DELETE and MERGE, got %s" % type(tree).__name__
         )
-    targets, _ = _write_targets(tree)
+    targets, _, _ = _write_targets(tree)
     if len(targets) != 1:
         raise ValueError("cannot identify the statement's write target")
-    ref = targets[0].alias or targets[0].name
+    ref = targets[0][0].alias or targets[0][0].name
 
     conditions = []
     for f in filters:
@@ -443,8 +501,8 @@ def rewrite_table_scans(sql, dialect, schema_json, policies_json):
     ctes = _cte_names(tree)
     # The write target is not a scan site: swapping it for a filtered subquery would
     # produce invalid SQL (`UPDATE (SELECT ...) AS t ...`) and would not restrict anything.
-    targets, _ = _write_targets(tree)
-    target_ids = {id(t) for t in targets}
+    targets, _, _ = _write_targets(tree)
+    target_ids = {id(n) for n, _ in targets}
 
     # Index policies (lowercased). A qualified policy is only reachable by an unqualified scan
     # through `qualified_by_bare`; an explicitly qualified scan never resolves to another
@@ -630,12 +688,14 @@ fn extract_resources_gil(
         RawOutput::Ok {
             resources,
             embeds_reads,
+            replaces,
         } => Ok(ExtractedStatement {
             resources: resources
                 .into_iter()
                 .map(|r| ExtractedResource {
                     catalog: r.catalog,
                     schema: r.schema,
+                    kind: r.kind,
                     table: r.table,
                     columns: match r.columns {
                         Some(c) => Columns::Named(c),
@@ -645,6 +705,7 @@ fn extract_resources_gil(
                 })
                 .collect(),
             embeds_reads,
+            replaces,
         }),
         RawOutput::Err { error } => Err(QueryFluxError::Translation(format!(
             "extract_resources: could not parse SQL: {error}"
@@ -658,6 +719,7 @@ enum RawOutput {
     Ok {
         resources: Vec<RawResource>,
         embeds_reads: bool,
+        replaces: bool,
     },
     Err {
         error: String,
@@ -671,6 +733,7 @@ struct RawResource {
     table: String,
     columns: Option<Vec<String>>,
     target: bool,
+    kind: ResourceKind,
 }
 
 fn rewrite_table_scans_gil(
@@ -1129,6 +1192,157 @@ mod tests {
             "merge into orders as t using src as s on t.id = s.id \
              when matched and s.flag = 1 and t.region = 'eu' then delete"
         );
+    }
+
+    /// `(kind, catalog, schema, table)` of every write target in `sql`, sorted.
+    fn ddl_targets(
+        dialect: SqlDialect,
+        sql: &str,
+    ) -> Vec<(&'static str, Option<String>, Option<String>, String)> {
+        let st = extract_resources(sql, &dialect, &SchemaContext::default()).unwrap();
+        let mut out: Vec<_> = st
+            .resources
+            .iter()
+            .filter(|r| r.is_write_target)
+            .map(|r| {
+                (
+                    r.kind.as_str(),
+                    r.catalog.clone(),
+                    r.schema.clone(),
+                    r.table.clone(),
+                )
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// DDL targets carry their kind and identify the object by the right name parts —
+    /// schemas by `catalog.schema`, catalogs by name, tables/views by `catalog.schema.name`.
+    #[test]
+    fn extract_resources_ddl_targets_by_kind() {
+        use SqlDialect::{Postgres, Trino};
+        let t = |k: &'static str, c: Option<&str>, s: Option<&str>, n: &str| {
+            (k, c.map(String::from), s.map(String::from), n.to_string())
+        };
+        for (dialect, sql, expected) in [
+            (
+                Postgres,
+                "CREATE TABLE s.t (id INT)",
+                vec![t("table", None, Some("s"), "t")],
+            ),
+            (
+                Postgres,
+                "CREATE TABLE t AS SELECT 1",
+                vec![t("table", None, None, "t")],
+            ),
+            (
+                Postgres,
+                "DROP TABLE a, s.b",
+                vec![
+                    t("table", None, None, "a"),
+                    t("table", None, Some("s"), "b"),
+                ],
+            ),
+            (
+                Postgres,
+                "ALTER TABLE s.t ADD COLUMN c INT",
+                vec![t("table", None, Some("s"), "t")],
+            ),
+            (
+                Postgres,
+                "CREATE VIEW v AS SELECT 1",
+                vec![t("view", None, None, "v")],
+            ),
+            (
+                Postgres,
+                "DROP VIEW s.v",
+                vec![t("view", None, Some("s"), "v")],
+            ),
+            (
+                Postgres,
+                "ALTER VIEW v RENAME TO w",
+                vec![t("view", None, None, "v")],
+            ),
+            (
+                Postgres,
+                "CREATE SCHEMA analytics",
+                vec![t("schema", None, Some("analytics"), "")],
+            ),
+            (
+                Trino,
+                "CREATE SCHEMA cat.analytics",
+                vec![t("schema", Some("cat"), Some("analytics"), "")],
+            ),
+            (
+                Trino,
+                "DROP SCHEMA cat.analytics CASCADE",
+                vec![t("schema", Some("cat"), Some("analytics"), "")],
+            ),
+            (
+                Postgres,
+                "CREATE DATABASE d",
+                vec![t("catalog", Some("d"), None, "")],
+            ),
+            (
+                Postgres,
+                "DROP DATABASE d",
+                vec![t("catalog", Some("d"), None, "")],
+            ),
+        ] {
+            assert_eq!(ddl_targets(dialect, sql), expected, "{sql}");
+        }
+    }
+
+    /// Only a `CREATE … AS <query>` reads anything; `CREATE OR REPLACE` is flagged so the
+    /// caller can also require the matching drop.
+    #[test]
+    fn extract_resources_ddl_reads_and_replace_flag() {
+        let st =
+            |sql| extract_resources(sql, &SqlDialect::Postgres, &SchemaContext::default()).unwrap();
+        let ctas = st("CREATE TABLE copy AS SELECT * FROM secret");
+        assert!(ctas.embeds_reads && !ctas.replaces);
+        assert_eq!(
+            ctas.resources
+                .iter()
+                .filter(|r| !r.is_write_target)
+                .map(|r| r.table.as_str())
+                .collect::<Vec<_>>(),
+            vec!["secret"]
+        );
+        for sql in [
+            "CREATE TABLE t (id INT)",
+            "DROP TABLE t",
+            "ALTER TABLE t ADD COLUMN c INT",
+            "CREATE SCHEMA s",
+        ] {
+            let s = st(sql);
+            assert!(!s.embeds_reads && !s.replaces, "{sql}");
+            assert!(s.resources.iter().all(|r| r.is_write_target), "{sql}");
+        }
+        assert!(st("CREATE OR REPLACE TABLE t AS SELECT 1").replaces);
+        assert!(st("CREATE OR REPLACE VIEW v AS SELECT 1").replaces);
+        assert!(!st("CREATE VIEW v AS SELECT 1").replaces);
+    }
+
+    /// `CREATE TABLE t (a INT, b TEXT)` names the columns it defines.
+    #[test]
+    fn extract_resources_create_table_reports_defined_columns() {
+        let cols = |sql: &str| {
+            extract_resources(sql, &SqlDialect::Postgres, &SchemaContext::default())
+                .unwrap()
+                .resources
+                .into_iter()
+                .find(|r| r.is_write_target)
+                .map(|r| r.columns)
+                .unwrap()
+        };
+        assert_eq!(
+            cols("CREATE TABLE t (b TEXT, a INT, PRIMARY KEY (a))"),
+            Columns::Named(names(&["a", "b"]))
+        );
+        assert_eq!(cols("CREATE TABLE t AS SELECT 1"), Columns::All);
+        assert_eq!(cols("DROP TABLE t"), Columns::All);
     }
 
     /// Statements that merely name a table do not read it and must not be treated as reads.

@@ -677,7 +677,13 @@ mod tests {
         for ok in Operation::SUPPORTED {
             assert!(conn(&[ok]).validate("c").is_ok(), "{ok} should be accepted");
         }
-        for bad in ["table.selct", "statement.other", "select", "table.create"] {
+        for bad in [
+            "table.selct",
+            "statement.other",
+            "select",
+            "function.execute",
+            "table.grant",
+        ] {
             let err = conn(&[bad]).validate("c").unwrap_err();
             assert!(err.contains(bad) && err.contains("table.select"), "{err}");
         }

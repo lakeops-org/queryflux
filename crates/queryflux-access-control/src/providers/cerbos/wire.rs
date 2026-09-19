@@ -21,10 +21,11 @@
 //!       {"kind": "column_mask", "column": "ssn", "type": "SHOW_LAST_4"}
 //! ```
 //!
-//! Every resource is sent under the fixed `kind: "table"` — one Cerbos resource policy
-//! governs every table generically, matching on `R.attr.catalog` / `R.attr.schema` /
-//! `R.attr.table` the way a single rego package already matches on `input.action.resources`
-//! for OPA. `columns` is `null` for "all columns" (schema unresolved / `SELECT *`), mirroring
+//! Each resource is sent under its own `kind` — `table` for everything a query reads, plus
+//! `view`, `schema` and `catalog` for DDL — so one Cerbos resource policy per kind governs it
+//! generically, matching on `R.attr.catalog` / `R.attr.schema` / `R.attr.table` the way a
+//! single rego package already matches on `input.action.resources` for OPA. A kind you enable
+//! operations for needs its own resource policy (an action with no matching rule denies). `columns` is `null` for "all columns" (schema unresolved / `SELECT *`), mirroring
 //! the OPA wire format exactly.
 
 use std::collections::BTreeMap;
@@ -36,9 +37,6 @@ use serde_json::Value;
 use queryflux_core::access_model::{
     AccessDecision, AccessRequest, ColumnMask, Columns, ResourceDecision, RowFilter,
 };
-
-/// Every table is sent as this fixed Cerbos resource `kind` — see the module doc.
-const RESOURCE_KIND: &str = "table";
 
 // ---- request ----
 
@@ -103,6 +101,7 @@ pub(super) struct ResourceAttr<'a> {
     pub catalog: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub schema: Option<&'a str>,
+    /// Empty for `schema`/`catalog` resources.
     pub table: &'a str,
     /// `null` = all columns (schema unresolved / `SELECT *`).
     pub columns: Option<&'a [String]>,
@@ -135,8 +134,8 @@ pub(super) fn to_request<'a>(
             .iter()
             .map(|r| ResourceEntry {
                 resource: CerbosResource {
-                    id: &r.table,
-                    kind: RESOURCE_KIND,
+                    id: r.name(),
+                    kind: r.kind.as_str(),
                     attr: ResourceAttr {
                         catalog: r.catalog.as_deref(),
                         schema: r.schema.as_deref(),
@@ -271,20 +270,20 @@ pub(super) fn from_response(
             // author asked for a restriction QueryFlux couldn't apply — the resource must
             // not read as allowed-and-unrestricted just because parsing failed.
             if let Some(reason) = malformed {
+                let name = req_resource.qualified_name();
                 return ResourceDecision {
-                    table: req_resource.table.clone(),
-                    allow: false,
                     reason: Some(format!(
-                        "policy output for {} could not be applied: {reason}",
-                        req_resource.table
+                        "policy output for {name} could not be applied: {reason}"
                     )),
+                    table: name,
+                    allow: false,
                     row_filters: Vec::new(),
                     column_masks: Vec::new(),
                 };
             }
 
             ResourceDecision {
-                table: req_resource.table.clone(),
+                table: req_resource.qualified_name(),
                 allow,
                 reason: None,
                 row_filters,
@@ -300,7 +299,7 @@ pub(super) fn from_response(
 mod tests {
     use super::*;
     use queryflux_core::access_model::{
-        AccessResource, Identity, MaskType, Operation, RequestContext,
+        AccessResource, Identity, MaskType, Operation, RequestContext, ResourceKind,
     };
 
     fn requested(tables: &[&str]) -> AccessRequest {
@@ -310,6 +309,7 @@ mod tests {
             resources: tables
                 .iter()
                 .map(|t| AccessResource {
+                    kind: ResourceKind::Table,
                     catalog: None,
                     schema: None,
                     table: t.to_string(),
@@ -611,15 +611,59 @@ mod tests {
     }
 
     #[test]
-    fn to_request_sends_fixed_kind_and_columns_null_for_all() {
+    fn to_request_sends_table_kind_and_columns_null_for_all() {
         let req = requested(&["orders"]);
         let wire_req = to_request("req-1", &req);
         assert_eq!(wire_req.resources.len(), 1);
-        assert_eq!(wire_req.resources[0].resource.kind, RESOURCE_KIND);
+        assert_eq!(wire_req.resources[0].resource.kind, "table");
         assert_eq!(wire_req.resources[0].resource.id, "orders");
         assert!(wire_req.resources[0].resource.attr.columns.is_none());
         assert_eq!(wire_req.resources[0].actions, ["table.select"]);
         assert_eq!(wire_req.request_id, "req-1");
+    }
+
+    /// DDL targets are sent under their own Cerbos resource kind, identified by their name.
+    #[test]
+    fn to_request_sends_each_resources_own_kind_and_name() {
+        let mut req = requested(&["ignored"]);
+        req.operation = Operation("schema.drop".to_string());
+        req.resources = vec![AccessResource {
+            kind: ResourceKind::Schema,
+            catalog: Some("prod".to_string()),
+            schema: Some("analytics".to_string()),
+            table: String::new(),
+            columns: Columns::All,
+        }];
+        let wire_req = to_request("req-1", &req);
+        let r = &wire_req.resources[0];
+        assert_eq!((r.resource.kind, r.resource.id), ("schema", "analytics"));
+        assert_eq!(r.resource.attr.catalog, Some("prod"));
+        assert_eq!(r.actions, ["schema.drop"]);
+    }
+
+    /// Regression: a schema/catalog resource's `table` is always empty, so a decision's
+    /// `table` field (used in audit/error messages, e.g. "access denied for {table}: ...")
+    /// must come from `qualified_name()`, not the raw (blank) `table`.
+    #[test]
+    fn denied_schema_resource_reports_its_qualified_name_not_a_blank_table() {
+        let mut req = requested(&["ignored"]);
+        req.operation = Operation("schema.drop".to_string());
+        req.resources = vec![AccessResource {
+            kind: ResourceKind::Schema,
+            catalog: Some("prod".to_string()),
+            schema: Some("analytics".to_string()),
+            table: String::new(),
+            columns: Columns::All,
+        }];
+        let resp: CheckResourcesResponse = serde_json::from_str(
+            r#"{"results": [{"actions": {"schema.drop": "EFFECT_DENY"}, "outputs": []}]}"#,
+        )
+        .unwrap();
+        let decision = from_response(resp, &req);
+        assert_eq!(
+            decision.first_denied().map(|(t, _)| t),
+            Some("prod.analytics")
+        );
     }
 
     #[test]

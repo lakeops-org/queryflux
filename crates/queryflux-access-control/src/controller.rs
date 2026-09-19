@@ -285,7 +285,9 @@ mod tests {
 
     use async_trait::async_trait;
 
-    use queryflux_core::access_model::{AccessResource, Columns, Identity, RequestContext};
+    use queryflux_core::access_model::{
+        AccessResource, Columns, Identity, RequestContext, ResourceKind,
+    };
 
     use super::*;
     use crate::provider::PolicyError;
@@ -331,6 +333,7 @@ mod tests {
             },
             operation: Operation::table_select(),
             resources: vec![AccessResource {
+                kind: ResourceKind::Table,
                 catalog: None,
                 schema: None,
                 table: "orders".to_string(),
@@ -390,6 +393,7 @@ mod tests {
 
         let mut a = base_request();
         a.resources = vec![AccessResource {
+            kind: ResourceKind::Table,
             catalog: None,
             schema: Some("s|t".to_string()),
             table: "u".to_string(),
@@ -399,6 +403,7 @@ mod tests {
 
         let mut b = base_request();
         b.resources = vec![AccessResource {
+            kind: ResourceKind::Table,
             catalog: None,
             schema: Some("s".to_string()),
             table: "t|u".to_string(),

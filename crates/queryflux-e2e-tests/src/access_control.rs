@@ -72,9 +72,16 @@ pub struct StubState {
     /// precedence over [`Self::row_filters`] — lets a test give reads and writes of the same
     /// table different filters.
     pub op_row_filters: HashMap<(String, String), String>,
+    /// `(operation, name)` pairs denied for that operation only — lets a test allow a
+    /// `CREATE` but deny the `DROP` a `CREATE OR REPLACE` also needs.
+    pub op_denied: HashSet<(String, String)>,
 }
 
 impl StubState {
+    pub fn deny_for(&mut self, operation: impl Into<String>, name: impl Into<String>) {
+        self.op_denied.insert((operation.into(), name.into()));
+    }
+
     pub fn filter_for(
         &mut self,
         operation: impl Into<String>,
@@ -170,8 +177,17 @@ async fn opa_handler(
         return Json(json!({ "result": {} }));
     }
     let mut out = Vec::new();
+    let operation = body["input"]["action"]["operation"]
+        .as_str()
+        .unwrap_or("")
+        .to_string();
     for r in resources {
-        let table = r["table"].as_str().unwrap_or("").to_string();
+        // `name` is the object's own name for every kind (a schema has no `table`).
+        let table = r["name"]
+            .as_str()
+            .or_else(|| r["table"].as_str())
+            .unwrap_or("")
+            .to_string();
         if let Some(verdict) = st
             .by_user
             .get(&user)
@@ -182,16 +198,14 @@ async fn opa_handler(
         }
 
         let mut entry = json!({ "table": table, "allow": true });
-        if contains_table(&st.deny_tables, &table) {
+        if contains_table(&st.deny_tables, &table)
+            || st.op_denied.contains(&(operation.clone(), table.clone()))
+        {
             entry["allow"] = json!(false);
             entry["reason"] = json!("denied by stub policy");
         } else {
             let mut filters: Vec<Value> = Vec::new();
-            let operation = body["input"]["action"]["operation"]
-                .as_str()
-                .unwrap_or("")
-                .to_string();
-            if let Some(expr) = st.op_row_filters.get(&(operation, table.clone())) {
+            if let Some(expr) = st.op_row_filters.get(&(operation.clone(), table.clone())) {
                 filters.push(json!({ "expression": expr }));
             } else if let Some(expr) = lookup_map(&st.row_filters, &table) {
                 filters.push(json!({ "expression": expr }));

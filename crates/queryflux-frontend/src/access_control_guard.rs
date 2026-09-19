@@ -203,8 +203,12 @@ impl Guard for OpaAccessGuard {
         // whether the statement's own operation is. Its write target is evaluated separately
         // under the statement's own operation, only when that is enabled.
         let evaluates_reads = conn.controller.evaluates(&Operation::table_select());
-        let evaluates_write = !operation.is_read() && conn.controller.evaluates(&operation);
-        if !evaluates_reads && !evaluates_write {
+        // Whether the statement replaces an object is only known after extraction, so the
+        // early gate assumes it might.
+        let may_write = write_operations(&operation, true)
+            .iter()
+            .any(|o| conn.controller.evaluates(o));
+        if !evaluates_reads && !may_write {
             return GuardResult::allow();
         }
 
@@ -233,7 +237,11 @@ impl Guard for OpaAccessGuard {
             .partition(|r| r.is_write_target);
         let check_reads =
             evaluates_reads && !reads.is_empty() && (operation.is_read() || embeds_reads);
-        let check_write = evaluates_write && !targets.is_empty();
+        let write_ops: Vec<Operation> = write_operations(&operation, statement.replaces)
+            .into_iter()
+            .filter(|o| conn.controller.evaluates(o))
+            .collect();
+        let check_write = !write_ops.is_empty() && !targets.is_empty();
         if !check_reads && !check_write {
             // No base tables (e.g. `SELECT 1`), or nothing this connection evaluates.
             return GuardResult::allow();
@@ -266,6 +274,7 @@ impl Guard for OpaAccessGuard {
             resources: tables
                 .iter()
                 .map(|r| AccessResource {
+                    kind: r.kind,
                     catalog: r.catalog.clone(),
                     schema: r.schema.clone(),
                     table: r.table.clone(),
@@ -292,57 +301,57 @@ impl Guard for OpaAccessGuard {
         // operation, kept apart from any `table.select` filters on the tables it reads.
         let mut write_scope: Option<(String, Vec<String>)> = None;
         if check_write {
-            let decision = conn
-                .controller
-                .evaluate(&build_request(operation.clone(), &targets))
-                .await;
-            if !decision.is_allowed() {
-                return deny_first(&decision);
-            }
-            if decision.has_ucast_filter() {
-                return GuardResult::deny(
-                    "access control: structured (ucast) row filters are not implemented",
-                    "ACCESS_UCAST_UNIMPLEMENTED",
-                );
-            }
-            // A mask changes what a read returns; there is nothing to mask on a write.
-            if decision.column_masks().next().is_some() {
-                return GuardResult::deny(
-                    format!(
-                        "access control: the policy returned column masks for {}, which apply \
-                         to reads only",
-                        operation.as_str()
-                    ),
-                    "ACCESS_REWRITE_UNSUPPORTED_FOR_WRITE",
-                );
-            }
-            let filters: Vec<String> = decision
-                .row_filters()
-                .map(|(_, expr)| expr.to_string())
-                .collect();
-            if !filters.is_empty() {
-                // UPDATE/DELETE are scoped by ANDing the filter into their WHERE, and MERGE by
-                // ANDing it into each WHEN MATCHED / WHEN NOT MATCHED BY SOURCE clause's
-                // condition (queryflux-translation's apply_write_filters). INSERT and TRUNCATE
-                // have no existing row for a filter to restrict — INSERT only ever creates new
-                // rows (the right restriction there is a WITH CHECK-style value constraint, not
-                // a row filter) and TRUNCATE has no predicate in any SQL dialect — so deny
-                // rather than silently skip a restriction the policy meant to apply.
-                if matches!(
-                    operation.as_str(),
-                    "table.update" | "table.delete" | "table.merge"
-                ) {
-                    write_scope = Some((targets[0].table.clone(), filters));
-                } else {
+            for write_op in &write_ops {
+                let decision = conn
+                    .controller
+                    .evaluate(&build_request(write_op.clone(), &targets))
+                    .await;
+                if !decision.is_allowed() {
+                    return deny_first(&decision);
+                }
+                if decision.has_ucast_filter() {
+                    return GuardResult::deny(
+                        "access control: structured (ucast) row filters are not implemented",
+                        "ACCESS_UCAST_UNIMPLEMENTED",
+                    );
+                }
+                // A mask changes what a read returns; there is nothing to mask on a write.
+                if decision.column_masks().next().is_some() {
                     return GuardResult::deny(
                         format!(
-                            "access control: the policy returned row filters for {}, which are \
-                             only supported for table.select, table.update, table.delete and \
-                             table.merge",
-                            operation.as_str()
+                            "access control: the policy returned column masks for {}, which \
+                             apply to reads only",
+                            write_op.as_str()
                         ),
                         "ACCESS_REWRITE_UNSUPPORTED_FOR_WRITE",
                     );
+                }
+                let filters: Vec<String> = decision
+                    .row_filters()
+                    .map(|(_, expr)| expr.to_string())
+                    .collect();
+                if !filters.is_empty() {
+                    // UPDATE/DELETE are scoped by ANDing the filter into their WHERE, and MERGE
+                    // by ANDing it into each WHEN MATCHED / WHEN NOT MATCHED BY SOURCE clause's
+                    // condition (queryflux-translation's apply_write_filters). Every other write
+                    // (INSERT, TRUNCATE, DDL) has no existing row for a filter to restrict, so
+                    // deny rather than silently skip a restriction the policy meant to apply.
+                    if matches!(
+                        write_op.as_str(),
+                        "table.update" | "table.delete" | "table.merge"
+                    ) {
+                        write_scope = Some((targets[0].table.clone(), filters));
+                    } else {
+                        return GuardResult::deny(
+                            format!(
+                                "access control: the policy returned row filters for {}, which \
+                                 are only supported for table.select, table.update, \
+                                 table.delete and table.merge",
+                                write_op.as_str()
+                            ),
+                            "ACCESS_REWRITE_UNSUPPORTED_FOR_WRITE",
+                        );
+                    }
                 }
             }
         }
@@ -493,6 +502,18 @@ fn classify_operation(stmts: Option<&[Expression]>, sql: &str) -> Operation {
         Some(Expression::Update(_)) => Operation("table.update".to_string()),
         Some(Expression::Delete(_)) => Operation("table.delete".to_string()),
         Some(Expression::Merge(_)) => Operation("table.merge".to_string()),
+        Some(Expression::CreateTable(_)) => Operation("table.create".to_string()),
+        Some(Expression::DropTable(_)) => Operation("table.drop".to_string()),
+        Some(Expression::AlterTable(_)) => Operation("table.alter".to_string()),
+        Some(Expression::CreateView(_)) => Operation("view.create".to_string()),
+        Some(Expression::DropView(_)) => Operation("view.drop".to_string()),
+        Some(Expression::AlterView(_)) => Operation("view.alter".to_string()),
+        Some(Expression::CreateSchema(_)) => Operation("schema.create".to_string()),
+        Some(Expression::DropSchema(_) | Expression::DropNamespace(_)) => {
+            Operation("schema.drop".to_string())
+        }
+        Some(Expression::CreateDatabase(_)) => Operation("catalog.create".to_string()),
+        Some(Expression::DropDatabase(_)) => Operation("catalog.drop".to_string()),
         Some(Expression::Truncate(_) | Expression::TruncateTable(_)) => {
             Operation("table.truncate".to_string())
         }
@@ -502,6 +523,20 @@ fn classify_operation(stmts: Option<&[Expression]>, sql: &str) -> Operation {
         }
         None => Operation("statement.other".to_string()),
     }
+}
+
+/// The operations a statement's write targets are evaluated under: its own, plus — for a
+/// `CREATE OR REPLACE` — the matching drop, since replacing destroys the existing object.
+/// Reads have none (their tables are evaluated as `table.select`).
+fn write_operations(operation: &Operation, replaces: bool) -> Vec<Operation> {
+    if operation.is_read() {
+        return Vec::new();
+    }
+    let mut ops = vec![operation.clone()];
+    if replaces {
+        ops.extend(operation.drop_counterpart());
+    }
+    ops
 }
 
 fn engine_name(e: &EngineType) -> String {
@@ -573,7 +608,49 @@ mod tests {
     async fn ddl_is_not_table_select() {
         let op = classify("CREATE TABLE orders (id INTEGER, amount INTEGER)").await;
         assert_ne!(op, Operation::table_select());
-        assert_eq!(op.as_str(), "statement.other");
+        assert_eq!(op.as_str(), "table.create");
+    }
+
+    #[tokio::test]
+    async fn ddl_classifies_by_object_and_verb() {
+        for (sql, expected) in [
+            ("CREATE TABLE t (id INT)", "table.create"),
+            ("CREATE TABLE t AS SELECT 1", "table.create"),
+            ("DROP TABLE t", "table.drop"),
+            ("ALTER TABLE t ADD COLUMN c INT", "table.alter"),
+            ("CREATE VIEW v AS SELECT 1", "view.create"),
+            ("DROP VIEW v", "view.drop"),
+            ("ALTER VIEW v RENAME TO w", "view.alter"),
+            ("CREATE SCHEMA s", "schema.create"),
+            ("DROP SCHEMA s", "schema.drop"),
+            ("CREATE DATABASE d", "catalog.create"),
+            ("DROP DATABASE d", "catalog.drop"),
+            // Not modeled: stays unevaluated rather than guessed at.
+            ("CREATE INDEX i ON t (a)", "statement.other"),
+            ("GRANT SELECT ON t TO r", "statement.other"),
+            ("SET search_path = s", "statement.other"),
+        ] {
+            assert_eq!(classify(sql).await.as_str(), expected, "{sql}");
+        }
+    }
+
+    #[test]
+    fn create_or_replace_also_needs_the_drop() {
+        let create = Operation("table.create".to_string());
+        let names = |ops: Vec<Operation>| {
+            ops.iter()
+                .map(|o| o.as_str().to_string())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(names(write_operations(&create, false)), ["table.create"]);
+        assert_eq!(
+            names(write_operations(&create, true)),
+            ["table.create", "table.drop"]
+        );
+        // Only creates have a drop counterpart; reads have no write operations at all.
+        let insert = Operation("table.insert".to_string());
+        assert_eq!(names(write_operations(&insert, true)), ["table.insert"]);
+        assert!(write_operations(&Operation::table_select(), true).is_empty());
     }
 
     #[tokio::test]
