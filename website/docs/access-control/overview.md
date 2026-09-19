@@ -151,7 +151,7 @@ accessControl:
 | `enabled` | Global default: run access control for a cluster group unless `groups.<name>.enabled` overrides. Default: `true` when `accessControl` is set. Set `false` to opt in only where groups explicitly set `enabled: true`. |
 | `defaultConnection` | Named entry under `connections` that a group uses when it has no explicit `groups.<name>.connection` override. **Unset means such a group gets no access control at all** — there's nothing to route it to. Must reference a key under `connections` when set. |
 | `connections` | Map of named policy-provider connections. No name is reserved — see [Multiple connections](#multiple-connections). |
-| `connections.<name>.operations` | Only these namespaced ops hit that connection's provider; others skip the stage. Default: `[table.select]`. |
+| `connections.<name>.operations` | Namespaced ops the connection evaluates; others skip the stage. Default: `[table.select]`. See [What policies apply to](#what-policies-apply-to). |
 | `connections.<name>.onMissingSchema` | When columns can't be resolved (`SELECT *` without catalog): `evaluate` still calls the provider with "all columns"; `deny` fails closed. |
 | `connections.<name>.failOpen` | Provider timeout/transport error → allow (`true`) or deny (`false`, default) for groups on this connection. |
 | `connections.<name>.cacheTtlMs` / `cacheCapacity` | TTL cache of identical decisions on this connection; `0` disables. |
@@ -205,6 +205,16 @@ accessControl:
 Each connection is a full [`OpaProviderConfig`](opa.md) (its own URL, timeout, credentials, `operations`, `onMissingSchema`, cache, `sessionParamKeys`); a group resolves to at most one. Config validation rejects a `groups.<name>.connection` or `defaultConnection` that isn't defined under `connections`. Connection names are arbitrary — `"default"` is not special, just a common label.
 
 Studio's **Access Control** page can add, edit, and remove any number of named connections, and set which one is `defaultConnection`.
+
+---
+
+## What policies apply to
+
+Policies govern **reads**. Any table a statement *reads* is evaluated as `table.select` (deny, row filter, column mask) — including reads inside a write: `INSERT … SELECT`, `CREATE TABLE … AS SELECT`, `CREATE VIEW … AS SELECT`, `MERGE … USING`, and subqueries in `UPDATE`/`DELETE`. A protected table cannot be copied out through a write statement.
+
+The **write itself** is not authorized by default. The target of an `INSERT`/`UPDATE`/`DELETE` is only sent to the provider when its operation (`table.insert`, `table.update`, `table.delete`) is listed in `operations`, and then only allow/deny applies: a row filter or column mask returned for a write target is denied (`ACCESS_REWRITE_UNSUPPORTED_FOR_WRITE`) rather than applied. `CREATE`/`DROP`/`ALTER`, grants, roles, and session statements are not evaluated at all.
+
+Statements that only name a table without reading it (`DESCRIBE`, `DROP TABLE`) are not treated as reads.
 
 ---
 

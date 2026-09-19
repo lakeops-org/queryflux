@@ -221,6 +221,8 @@ pub struct GuardOpts {
     pub on_missing_schema: OnMissingSchema,
     pub fail_open: bool,
     pub session_param_keys: Vec<String>,
+    /// Namespaced operations the connection evaluates (default: `table.select` only).
+    pub operations: Vec<String>,
 }
 
 impl Default for GuardOpts {
@@ -229,6 +231,7 @@ impl Default for GuardOpts {
             on_missing_schema: OnMissingSchema::Evaluate,
             fail_open: false,
             session_param_keys: vec![],
+            operations: vec!["table.select".to_string()],
         }
     }
 }
@@ -247,7 +250,7 @@ pub fn build_guard_with(opa_url: &str, opts: GuardOpts) -> Arc<OpaAccessGuard> {
             bearer_token: None,
             client_credentials: None,
         }),
-        operations: vec!["table.select".to_string()],
+        operations: opts.operations,
         on_missing_schema: opts.on_missing_schema,
         fail_open: opts.fail_open,
         cache_ttl_ms: 0,

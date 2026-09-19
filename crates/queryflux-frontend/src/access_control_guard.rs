@@ -11,7 +11,7 @@ use queryflux_access_control::{
     AccessController, AccessResource, Columns, Identity, Operation, RequestContext,
 };
 use queryflux_core::access_config::OnMissingSchema;
-use queryflux_core::access_model::AccessRequest;
+use queryflux_core::access_model::{AccessDecision, AccessRequest};
 use queryflux_core::query::EngineType;
 use queryflux_core::query::{ClusterGroupName, SqlDialect};
 use queryflux_core::schema_context::SchemaContext;
@@ -21,7 +21,7 @@ use queryflux_guardrails::built_in::Guard;
 use queryflux_guardrails::context::{GuardContext, GuardLayer, GuardResult};
 use queryflux_guardrails::result_to_action;
 use queryflux_persistence::GuardAction;
-use queryflux_translation::{render_mask, rewrite_table_scans, TablePolicy};
+use queryflux_translation::{render_mask, rewrite_table_scans, ExtractedResource, TablePolicy};
 
 use queryflux_auth::AuthContext;
 
@@ -182,14 +182,21 @@ impl Guard for OpaAccessGuard {
         };
         let operation = classify_operation(stmts.as_deref(), ctx.sql);
 
-        if !conn.controller.evaluates(&operation) {
+        // A non-SELECT statement can still *read* policied tables (`INSERT … SELECT`,
+        // `CREATE TABLE … AS`, `UPDATE … WHERE x IN (SELECT …)`), so those reads are
+        // evaluated as `table.select` whenever that operation is enabled — independent of
+        // whether the statement's own operation is. Its write target is evaluated separately
+        // under the statement's own operation, only when that is enabled.
+        let evaluates_reads = conn.controller.evaluates(&Operation::table_select());
+        let evaluates_write = !operation.is_read() && conn.controller.evaluates(&operation);
+        if !evaluates_reads && !evaluates_write {
             return GuardResult::allow();
         }
 
         let empty_schema = SchemaContext::default();
         let schema = ctx.schema.unwrap_or(&empty_schema);
 
-        let extracted = match queryflux_translation::extract_resources(ctx.sql, ctx.dialect, schema)
+        let statement = match queryflux_translation::extract_resources(ctx.sql, ctx.dialect, schema)
         {
             Ok(r) => r,
             // A query that can't be analyzed has no resources to put in a request, so it can't
@@ -204,13 +211,22 @@ impl Guard for OpaAccessGuard {
             }
         };
 
-        if extracted.is_empty() {
-            // No base tables (e.g. `SELECT 1`) — nothing to decide.
+        let embeds_reads = statement.embeds_reads;
+        let (targets, reads): (Vec<_>, Vec<_>) = statement
+            .resources
+            .into_iter()
+            .partition(|r| r.is_write_target);
+        let check_reads =
+            evaluates_reads && !reads.is_empty() && (operation.is_read() || embeds_reads);
+        let check_write = evaluates_write && !targets.is_empty();
+        if !check_reads && !check_write {
+            // No base tables (e.g. `SELECT 1`), or nothing this connection evaluates.
             return GuardResult::allow();
         }
 
-        if conn.on_missing_schema == OnMissingSchema::Deny
-            && extracted.iter().any(|r| matches!(r.columns, Columns::All))
+        if check_reads
+            && conn.on_missing_schema == OnMissingSchema::Deny
+            && reads.iter().any(|r| matches!(r.columns, Columns::All))
         {
             return GuardResult::deny(
                 "access control: table columns could not be resolved (onMissingSchema=deny)",
@@ -218,23 +234,13 @@ impl Guard for OpaAccessGuard {
             );
         }
 
-        let resources: Vec<AccessResource> = extracted
-            .iter()
-            .map(|r| AccessResource {
-                catalog: r.catalog.clone(),
-                schema: r.schema.clone(),
-                table: r.table.clone(),
-                columns: r.columns.clone(),
-            })
-            .collect();
-
         let session_params: BTreeMap<String, String> = conn
             .session_param_keys
             .iter()
             .filter_map(|k| ctx.session_extra.get(k).map(|v| (k.clone(), v.clone())))
             .collect();
 
-        let request = AccessRequest {
+        let build_request = |operation: Operation, tables: &[ExtractedResource]| AccessRequest {
             identity: Identity {
                 user: ctx.user.unwrap_or("anonymous").to_string(),
                 groups: ctx.groups.to_vec(),
@@ -242,23 +248,65 @@ impl Guard for OpaAccessGuard {
                 attributes: ctx.attributes.clone(),
             },
             operation,
-            resources,
+            resources: tables
+                .iter()
+                .map(|r| AccessResource {
+                    catalog: r.catalog.clone(),
+                    schema: r.schema.clone(),
+                    table: r.table.clone(),
+                    columns: r.columns.clone(),
+                })
+                .collect(),
             context: RequestContext {
                 cluster_group: ctx.cluster_group.0.clone(),
                 engine: engine_name(ctx.engine_type).to_string(),
                 query_id: String::new(),
-                session_params,
+                session_params: session_params.clone(),
             },
         };
 
-        let decision = conn.controller.evaluate(&request).await;
-
-        if !decision.is_allowed() {
+        let deny_first = |decision: &AccessDecision| {
             let (table, reason) = decision.first_denied().unwrap_or(("", "access denied"));
-            return GuardResult::deny(
+            GuardResult::deny(
                 format!("access denied for {table}: {reason}"),
                 "ACCESS_DENIED",
-            );
+            )
+        };
+
+        if check_write {
+            let decision = conn
+                .controller
+                .evaluate(&build_request(operation.clone(), &targets))
+                .await;
+            if !decision.is_allowed() {
+                return deny_first(&decision);
+            }
+            // Filters and masks are spliced at read sites; a write target has none, so
+            // honoring them isn't possible. Deny rather than silently skip a restriction
+            // the policy meant to apply.
+            if decision.has_rewrite() {
+                return GuardResult::deny(
+                    format!(
+                        "access control: the policy returned row filters/column masks for {}, \
+                         which are only supported for table.select",
+                        operation.as_str()
+                    ),
+                    "ACCESS_REWRITE_UNSUPPORTED_FOR_WRITE",
+                );
+            }
+        }
+
+        if !check_reads {
+            return GuardResult::allow();
+        }
+
+        let decision = conn
+            .controller
+            .evaluate(&build_request(Operation::table_select(), &reads))
+            .await;
+
+        if !decision.is_allowed() {
+            return deny_first(&decision);
         }
 
         if decision.has_ucast_filter() {
@@ -359,7 +407,8 @@ impl Guard for OpaAccessGuard {
 /// `sql_classify::is_read_stmt`'s doc comment), `SHOW`, `DESCRIBE` — maps to `statement.other`,
 /// which is never in the default `operations` allowlist, so the stage is skipped for it
 /// rather than mistakenly treating (say) a `CREATE TABLE orders (...)` as a read of `orders`
-/// eligible for row-filter rewriting.
+/// eligible for row-filter rewriting. Reads *inside* such a statement (`INSERT … SELECT`,
+/// `CREATE TABLE … AS`, …) are still policy-checked — see `check`.
 ///
 /// When `polyglot-sql` couldn't parse the statement at all, fall back to the same string
 /// heuristic the built-in guards use (`is_read_like_fallback`) rather than defaulting to
