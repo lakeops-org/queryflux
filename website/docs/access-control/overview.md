@@ -1,7 +1,7 @@
 ---
 sidebar_label: Overview
 title: Access Control Overview
-description: Data-level access control in QueryFlux — table allow/deny, row filters, and column masks via OPA.
+description: Data-level access control in QueryFlux — table allow/deny, row filters, and column masks via a pluggable policy provider (OPA or Cerbos).
 image: img/queryflux-hero-banner.png
 ---
 # Access control
@@ -23,15 +23,15 @@ When `accessControl` is omitted, nothing changes: no provider call, no rewrite g
 
 ## Product model (what QueryFlux configures)
 
-QueryFlux does **not** author policy. It **connects** to OPA and enforces whatever Rego returns (allow, deny, row filters, column masks).
+QueryFlux does **not** author policy. It **connects** to a policy provider — <img src="/img/logos/opa.svg" alt="" class="provider-logo" />[OPA](opa.md) or <img src="/img/logos/cerbos.svg" alt="" class="provider-logo" />[Cerbos](cerbos.md) — and enforces whatever that provider returns (allow, deny, row filters, column masks).
 
 | Question | Answer |
 | --- | --- |
-| Where does policy live? | In the **OPA bundle** (Rego). Not in QueryFlux YAML, not in Studio. |
-| What does Studio configure? | Any number of named OPA connections (URL, decision path, auth), which one is the **default**, and **scope** (which cluster groups call which connection). |
+| Where does policy live? | In the **provider's own store** — a Rego bundle for OPA, Cerbos policy files for Cerbos. Not in QueryFlux YAML, not in Studio. |
+| What does Studio configure? | Any number of named provider connections (URL, credentials, and provider-specific fields), which one is the **default**, and **scope** (which cluster groups call which connection). |
 | Where is scope edited? | The **Access Control** page — same pattern as `guardrails.global` + `guardrails.groups`, not on the Clusters / group form. |
-| Different rules for different teams? | Prefer branching in Rego on `input.context.clusterGroup` / identity — it's one bundle, one deploy, testable with `opa test`. Reach for a second **connection** (below) only when the constraint is the connection itself: network segmentation, blast-radius isolation, or a per-team OPA during a migration. |
-| Multiple access-control engines on one query? | **No** — one `opa_access` decision per query, from exactly one resolved connection. |
+| Different rules for different teams? | Prefer branching in the policy itself (Rego: on `input.context.clusterGroup` / identity; Cerbos: on `R.attr`/roles) — it's one bundle, one deploy, testable offline. Reach for a second **connection** (below) only when the constraint is the connection itself: network segmentation, blast-radius isolation, or a per-team provider during a migration. |
+| Multiple access-control engines on one query? | **No** — one decision per query, from exactly one resolved connection. The guard action recorded is always named `opa_access` regardless of which provider answered (a naming leftover from when OPA was the only provider). A provider-level error is logged with a `provider` field (`"opa"` or `"cerbos"`) naming which one actually failed. |
 
 At query time: routing picks a **cluster group** → QueryFlux resolves `accessControl.enabled` + `accessControl.groups.<name>.enabled`, and which **connection** the group uses (`groups.<name>.connection`, else `accessControl.defaultConnection`) → if enabled **and** a connection resolves, one call to that connection's provider → rewrite or deny → then guardrails / translation / engine. No name is reserved: with no `defaultConnection` set, a group with no explicit override gets no access control at all.
 
@@ -41,19 +41,22 @@ At query time: routing picks a **cluster group** → QueryFlux resolves `accessC
 
 | Pattern | Who connects | What you enforce |
 | --- | --- | --- |
-| **[Customer API — per-tenant row filters](customer-api-row-filters.md)** | Your backend as a **service account**; end-customer identity stays in your API | OPA turns an allowlisted session param (e.g. `customer=7`) into a row-filter predicate |
-| **Internal analysts** | Humans (OIDC / static users) as themselves | Group-based table grants, region filters, column masks — [`examples/with-opa/`](https://github.com/lakeops-org/queryflux/tree/main/examples/with-opa) and [OPA](opa.md) |
-| **Support / on-behalf-of** | Support agent or portal service | Same as the customer API: **actor** in `identity`, **subject** in `sessionParams` |
+| **[Customer API — per-tenant row filters](customer-api-row-filters.md)** | Your backend as a **service account**; end-customer identity stays in your API | The provider turns an allowlisted session param (e.g. `customer=7`) into a row-filter predicate |
+| **[Internal analysts](internal-analysts.md)** | Humans (OIDC / static users) as themselves | Group/role-based table grants, region filters, column masks — [`examples/with-opa/`](https://github.com/lakeops-org/queryflux/tree/main/examples/with-opa) / [OPA](opa.md), or [`examples/with-cerbos/`](https://github.com/lakeops-org/queryflux/tree/main/examples/with-cerbos) / [Cerbos](cerbos.md) |
+| **[Support — on behalf of an account](support-on-behalf-of.md)** | Support agent or desk service | **Actor** in `identity`, **account** in `sessionParams`; row filter + masked payment fields on billing tables |
 
 ---
 
 ## Provider
 
-OPA is the access-control provider. QueryFlux maps its allow / deny / row-filter / column-mask decisions to SQL rewrites.
+QueryFlux ships two access-control providers. Both map to the same allow / deny / row-filter / column-mask model — QueryFlux's SQL-rewrite logic doesn't know or care which one answered.
 
 | Provider | Config key | Docs |
 | --- | --- | --- |
-| [Open Policy Agent (OPA)](opa.md) | `provider: opa` + `opa:` | [OPA](opa.md) |
+| <img src="/img/logos/opa.svg" alt="" class="provider-logo" /> [Open Policy Agent (OPA)](opa.md) | `provider: opa` + `opa:` | [OPA](opa.md) |
+| <img src="/img/logos/cerbos.svg" alt="" class="provider-logo" /> [Cerbos](cerbos.md) | `provider: cerbos` + `cerbos:` | [Cerbos](cerbos.md) |
+
+A single connection uses exactly one provider — you cannot mix OPA and Cerbos on the same named connection. Different groups (or a migration in progress) can use different connections on different providers; see [Multiple connections](#multiple-connections).
 
 ---
 
@@ -84,7 +87,8 @@ Client SQL (source dialect)
 └───────────┬───────────┘
             ▼
 ┌───────────────────────┐
-│  OPA                  │  ← allow / deny / filters + masks
+│  Policy provider      │  ← allow / deny / filters + masks
+│  (OPA or Cerbos)      │
 └───────────┬───────────┘
             ▼
 ┌───────────────────────┐
@@ -114,13 +118,13 @@ Only the client's **verified** identity is sent as `identity` — the same `Auth
 
 **Delegation pattern** ("connected as user X, fetch data for customer Y"): keep X in `identity`; put Y in an allowlisted session param; the provider decides whether X may act for Y and returns an explicit row-filter expression. QueryFlux does not auto-inject `customer_id = Y` unless the provider returns that filter.
 
-Worked example (API service account + `customer=7`): **[Customer API — per-tenant row filters](customer-api-row-filters)**. Identity construction: [Authentication](../authentication). Rego sketch: [OPA](opa.md#delegation-actor-x-subject-y).
+Worked example (API service account + `customer=7`): **[Customer API — per-tenant row filters](customer-api-row-filters)**. Identity construction: [Authentication](../authentication). Rego sketch: [OPA](opa.md#delegation-actor-x-subject-y); the same pattern in CEL: [Cerbos](cerbos.md#delegation-actor-x-subject-y).
 
 ---
 
 ## Enabling access control
 
-Minimal skeleton — one connection, used by every cluster group via `defaultConnection`:
+Minimal skeleton — one connection, used by every cluster group via `defaultConnection`. This example uses OPA; swap `opa:` for `cerbos:` and `provider: cerbos` for a Cerbos connection — see [Cerbos](cerbos.md#configuration) for its fields:
 
 ```yaml
 accessControl:
@@ -128,14 +132,14 @@ accessControl:
   defaultConnection: prod           # connection groups fall back to; no name is reserved
   connections:
     prod:
-      provider: opa
+      provider: opa                     # or: cerbos
       opa:
         url: http://localhost:8181
         decisionPath: /v1/data/queryflux/access
         timeoutMs: 1000
       operations: [table.select]        # also: table.insert, table.update, table.delete
       onMissingSchema: evaluate         # evaluate | deny
-      failOpen: false                   # OPA error → deny by default
+      failOpen: false                   # provider error → deny by default
       cacheTtlMs: 5000                  # 0 disables the decision cache
       sessionParamKeys: [customer_id, tenant_id]
   groups:
@@ -143,7 +147,7 @@ accessControl:
       enabled: true                 # omit to inherit | true | false
       failOpen: false
     sandbox:
-      enabled: false                # skip OPA for this group
+      enabled: false                # skip access control for this group
 ```
 
 | Setting | Meaning |
@@ -156,11 +160,11 @@ accessControl:
 | `connections.<name>.failOpen` | Provider timeout/transport error → allow (`true`) or deny (`false`, default) for groups on this connection. |
 | `connections.<name>.cacheTtlMs` / `cacheCapacity` | TTL cache of identical decisions on this connection; `0` disables. |
 | `connections.<name>.sessionParamKeys` | Which `SessionContext.extra` keys become `context.sessionParams` for this connection. |
-| `groups.<name>.enabled` | Per cluster group: inherit global default (omit), force on (`true`), or skip OPA (`false`). |
+| `groups.<name>.enabled` | Per cluster group: inherit global default (omit), force on (`true`), or skip access control (`false`). |
 | `groups.<name>.failOpen` | Override fail-open for one cluster group, regardless of which connection it uses. |
 | `groups.<name>.connection` | Which named connection this group uses. Omit to inherit `defaultConnection`. Must reference a key under `connections` when set. |
 
-Full OPA wire format, Rego package shape, and auth to the OPA server: **[OPA provider](opa.md)**.
+Full wire format, policy shape, and server auth for each provider: **[OPA](opa.md)** · **[Cerbos](cerbos.md)**.
 
 ### Scope by cluster group
 
@@ -169,24 +173,24 @@ A connection can apply fleet-wide via `defaultConnection`, but **not every clust
 | Pattern | Config |
 | --- | --- |
 | **Most groups on, sandbox off** | `enabled: true` + `groups.sandbox.enabled: false` |
-| **Opt-in only** | `enabled: false` + `groups.analytics.enabled: true` for each group that should call OPA |
+| **Opt-in only** | `enabled: false` + `groups.analytics.enabled: true` for each group that should call the provider |
 | **Per-group fail-open** | `groups.<name>.failOpen` overrides that connection's `failOpen` when it errors |
 | **A group on a different connection** | `groups.<name>.connection: <name>` — see [Multiple connections](#multiple-connections) |
 | **No fleet-wide default at all** | Omit `defaultConnection`; only groups with an explicit `groups.<name>.connection` get access control |
 
 Resolution for group `G` has **two independent gates**, both must pass: (1) `groups.G.enabled` if set, else global `enabled` (default `true`); (2) `groups.G.connection` if set, else `defaultConnection` — if neither names a connection, access control does not apply to `G` regardless of (1). If either gate fails, QueryFlux **skips** access control entirely for that group — no HTTP call, no `opa_access` rewrite.
 
-Configure scope on the **Access Control** page in Studio (or `accessControl.groups` in YAML). The **Clusters** page does not own this setting — group detail shows a read-only **Access control** badge (`OPA on` / `Skipped` / `Off`) and links here; editing stays on Access Control.
+Configure scope on the **Access Control** page in Studio (or `accessControl.groups` in YAML). The **Clusters** page does not own this setting — group detail shows a read-only **Access control** badge (`OPA on` / `Cerbos on` / `Skipped` / `Off`) and links here; editing stays on Access Control.
 
 ### Multiple connections
 
 Most deployments need only one connection, named as `defaultConnection`. A named connection is its own HTTP endpoint, decision cache, and fail-open policy — reach for a second one when the constraint is genuinely the **connection**, not the policy:
 
-- **Network segmentation** — a cluster group in a separate VPC/tenant boundary that can't reach the fleet's OPA.
-- **Blast-radius isolation** — a bad bundle push to one team's OPA shouldn't require coordinating a deploy with every other team.
-- **Provider migration** — moving one group at a time to a different `PolicyDecisionProvider` (once a second one ships).
+- **Network segmentation** — a cluster group in a separate VPC/tenant boundary that can't reach the fleet's policy server.
+- **Blast-radius isolation** — a bad bundle push to one team's server shouldn't require coordinating a deploy with every other team.
+- **Provider migration** — moving one group at a time from OPA to Cerbos (or the reverse): the old group's connection keeps `provider: opa`, the new one gets `provider: cerbos`, and you cut over group by group by changing `groups.<name>.connection`.
 
-For everything else — "analysts see different columns than engineers," "the EU group has a stricter row filter" — branch in Rego on `input.context.clusterGroup` / `input.identity.groups` instead of adding a connection; it's one bundle, one deploy, one thing to `opa test`.
+For everything else — "analysts see different columns than engineers," "the EU group has a stricter row filter" — branch in the policy itself instead of adding a connection: on `input.context.clusterGroup` / `input.identity.groups` in Rego (one bundle, one deploy, one thing to `opa test`), or on `R.attr`/roles in Cerbos.
 
 ```yaml
 accessControl:
@@ -197,12 +201,16 @@ accessControl:
       opa: { url: http://opa.internal:8181, decisionPath: /v1/data/queryflux/access }
     eu-sandbox:
       opa: { url: https://eu-opa.internal, decisionPath: /v1/data/queryflux/access }
+    eu-cerbos-pilot:
+      provider: cerbos
+      cerbos: { url: http://cerbos.internal:3592 }
   groups:
-    trino-prod: {}                        # → "prod" (the default)
-    eu-group: { connection: eu-sandbox }  # → "eu-sandbox"
+    trino-prod: {}                              # → "prod" (the default)
+    eu-group: { connection: eu-sandbox }         # → "eu-sandbox"
+    eu-pilot-group: { connection: eu-cerbos-pilot } # → "eu-cerbos-pilot" (Cerbos)
 ```
 
-Each connection is a full [`OpaProviderConfig`](opa.md) (its own URL, timeout, credentials, `operations`, `onMissingSchema`, cache, `sessionParamKeys`); a group resolves to at most one. Config validation rejects a `groups.<name>.connection` or `defaultConnection` that isn't defined under `connections`. Connection names are arbitrary — `"default"` is not special, just a common label.
+Each connection is a full [`OpaProviderConfig`](opa.md) or [`CerbosProviderConfig`](cerbos.md) (its own URL, timeout, credentials, `operations`, `onMissingSchema`, cache, `sessionParamKeys`); a group resolves to at most one. Config validation rejects a `groups.<name>.connection` or `defaultConnection` that isn't defined under `connections`. Connection names are arbitrary — `"default"` is not special, just a common label.
 
 Studio's **Access Control** page can add, edit, and remove any number of named connections, and set which one is `defaultConnection`.
 
@@ -238,15 +246,15 @@ The outer query still projects `name` and `ssn`; the mask and filter live inside
 
 ### Row filters
 
-OPA returns `rowFilters[].expression` — a **boolean** SQL fragment in the **source dialect** (the dialect the client wrote). QueryFlux splices each expression into the inner `WHERE` (AND-combined if there are several).
+The provider's decision carries `rowFilters[].expression` — a **boolean** SQL fragment in the **source dialect** (the dialect the client wrote). For OPA this is a direct field in the decision document; for Cerbos it's carried through a rule's `outputs` (see [Cerbos](cerbos.md#wire-format)). Either way, QueryFlux splices each expression into the inner `WHERE` (AND-combined if there are several).
 
-Same safety rule as CUSTOM masks: QueryFlux does **not** sanitize the expression. Literals you inject (e.g. from `sessionParams`) must be validated in Rego.
+Same safety rule as CUSTOM masks: QueryFlux does **not** sanitize the expression. Literals you inject (e.g. from `sessionParams`) must be validated in the policy.
 
 ### Mask vocabulary
 
-OPA returns `columnMasks[]` with `column` + `type`. QueryFlux renders each mask to a **source-dialect** SQL expression, then substitutes that expression for the column in the scan-site projection (aliased back to the original column name so the rest of the query is unchanged).
+The decision carries `columnMasks[]` with `column` + `type` — a direct field for OPA, carried through `outputs` for Cerbos. QueryFlux renders each mask to a **source-dialect** SQL expression, then substitutes that expression for the column in the scan-site projection (aliased back to the original column name so the rest of the query is unchanged).
 
-| Mask type | OPA fields | What QueryFlux renders |
+| Mask type | Fields | What QueryFlux renders |
 | --- | --- | --- |
 | `NULL` | `column`, `type` | `NULL` |
 | `CONSTANT` | `column`, `type`, `value` | Quoted literal from `value` (quotes escaped) |
@@ -292,15 +300,15 @@ Rego sketch:
 
 #### `HASH` vs `CUSTOM` for hashing
 
-`HASH` is best-effort (`sha256` / `to_hex(sha256(...))` / `sha2` depending on dialect). For a heterogeneous fleet where you need identical semantics, prefer **`CUSTOM`** with an expression you control (or branch in Rego on `input.context.engine`).
+`HASH` is best-effort (`sha256` / `to_hex(sha256(...))` / `sha2` depending on dialect). For a heterogeneous fleet where you need identical semantics, prefer **`CUSTOM`** with an expression you control (or branch on `input.context.engine` in Rego / `R.attr`/context in Cerbos).
 
-Full OPA wire examples: **[OPA provider](opa.md#column-masks)**.
+Full wire-level examples: **[OPA](opa.md#column-masks)** · **[Cerbos](cerbos.md#column-masks)**.
 
 ---
 
 ## Auditing and Studio (same trail as guardrails)
 
-Access control is **not a second product** — it is the rewriting guard in the [guardrail chain](../architecture/guardrails). Policy lives in OPA; enforcement and audit reuse the same `guard_actions` path as built-in guards such as `read_only`.
+Access control is **not a second product** — it is the rewriting guard in the [guardrail chain](../architecture/guardrails). Policy lives in the provider (OPA or Cerbos); enforcement and audit reuse the same `guard_actions` path as built-in guards such as `read_only`.
 
 Every decision — allow, deny, or rewrite — is recorded as `guard: "opa_access"` on the query record. Denied queries get `status: Denied` and the provider's reason.
 
@@ -311,25 +319,25 @@ QueryFlux Studio already combines both on **Queries**:
 | **Guard Actions** | `opa_access` with `rewrite` or `deny`, plus metadata: `tables`, `row_filtered`, `masked_columns` — next to any other guards that ran. |
 | **Rewritten SQL (access control)** | Source-dialect SQL after row filters / column masks (`was_rewritten`, `rewritten_sql`). |
 | **Translated SQL** | Dialect translation only (`was_translated`, `translated_sql`). |
-| Query list badges | Separate **rewritten** (amber) and **translated** (violet) chips so an OPA rewrite is not mistaken for sqlglot. |
+| Query list badges | Separate **rewritten** (amber) and **translated** (violet) chips so an access-control rewrite is not mistaken for sqlglot. |
 
-A query can be both: OPA rewrites first, then sqlglot translates. The **Guardrails** page edits the SQL-shape chain. The **Access Control** page only **connects** QueryFlux to OPA (URL, decision path, credentials) — grants stay in the OPA Rego bundle. Use `POST /admin/access-control/dry-run` to preview a policy change without executing.
+A query can be both: access control rewrites first, then sqlglot translates. The **Guardrails** page edits the SQL-shape chain. The **Access Control** page only **connects** QueryFlux to the provider (URL, credentials) — grants stay in the provider's own policy store. Use `POST /admin/access-control/dry-run` to preview a policy change without executing.
 
 ---
 
 ## Configuring in Studio
 
-The **Access Control** page (`GET`/`PUT /admin/config/access-control`) persists to Postgres (`proxy_settings` table, key `access_control_config`) and hot-reloads the proxy. Requires **`persistence.type: postgres`** (same as Catalog, Guardrails, and cluster saves). The [`examples/with-opa/`](https://github.com/lakeops-org/queryflux/tree/main/examples/with-opa) demo includes a Postgres service on host port **5434** for this.
+The **Access Control** page (`GET`/`PUT /admin/config/access-control`) persists to Postgres (`proxy_settings` table, key `access_control_config`) and hot-reloads the proxy. Requires **`persistence.type: postgres`** (same as Catalog, Guardrails, and cluster saves). The [`examples/with-opa/`](https://github.com/lakeops-org/queryflux/tree/main/examples/with-opa) and [`examples/with-cerbos/`](https://github.com/lakeops-org/queryflux/tree/main/examples/with-cerbos) demos each include a Postgres service on host port **5434** for this.
 
 | Studio section | What it saves |
 | --- | --- |
-| **Provider** | Disconnect (no `connections`) turns `opa_access` off entirely; otherwise the listed connections stay loaded |
-| **Connections** | Add/edit/remove any number of named connections — each one's `opa.{url,decisionPath,timeoutMs}`, bearer / OAuth credentials — and which one is `defaultConnection` |
+| **Provider** | Disconnect (no `connections`) turns access control off entirely; otherwise the listed connections stay loaded |
+| **Connections** | Add/edit/remove any number of named connections — each picks `provider: opa` or `provider: cerbos` and the matching block (`opa.{url,decisionPath,timeoutMs}` + bearer/OAuth, or `cerbos.{url,checkResourcesPath,timeoutMs}` + optional bearer) — and which one is `defaultConnection` |
 | **Scope by cluster group** | Global **Enabled by default** + per-group **Inherit / Enabled / Disabled**, plus which connection each group uses (once more than one exists) |
 
 `operations`, `onMissingSchema`, cache, `failOpen`, and `sessionParamKeys` (per connection) are configured via **YAML or a direct `PUT /admin/config/access-control` body**, not exposed in the Studio form yet.
 
-QueryFlux does **not** edit Rego in Studio. Secrets are never returned on GET — leave token fields blank to keep stored values (each connection's `opa.bearerToken` / `opa.clientCredentials.clientSecret` round-trips independently).
+QueryFlux does **not** edit policy (Rego or Cerbos YAML) in Studio. Secrets are never returned on GET — leave token fields blank to keep stored values (each connection's `opa.bearerToken` / `opa.clientCredentials.clientSecret` / `cerbos.bearerToken` round-trips independently at the API level).
 
 YAML is the fallback until you save once via the Admin API; after that the database row wins.
 
@@ -344,6 +352,8 @@ If access control is **disabled for the request's `clusterGroup`**, or the group
 Column masks need a column list for scan-site rewrite. Dry-run resolves that from the live catalog when configured; you can also pass an explicit `schema` map (`table → { column → type }`). Named-column queries (not `SELECT *`) can still rewrite from columns mentioned in the SQL.
 
 Dry-run sends an **empty** `session.extra` map, so `sessionParamKeys` never populate `sessionParams`. Identity-only policies work; [customer-API filters](customer-api-row-filters.md#dry-run-limitation) cannot be previewed via dry-run.
+
+Against a **Cerbos** connection, the dry-run's `identity.roles` must be non-empty — Cerbos rejects an empty `principal.roles` outright (see [Cerbos — fail-closed defaults](cerbos.md#fail-closed-defaults)). An OPA connection has no such requirement.
 
 ---
 
@@ -360,7 +370,8 @@ Column masks on `SELECT *` need a column list. Configure a [catalog integration]
 - **One rewriting access-control guard per query** — `opa_access` only, from exactly one resolved connection.
 - **`operations`, `onMissingSchema`, cache, `failOpen`, and `sessionParamKeys`** (per connection) are YAML/Admin-API only — not exposed in the Studio connection form yet.
 - **Scope is not editable on the cluster group form** — enable/disable/connection per group is only under `accessControl.groups` / the Access Control page (Clusters shows a read-only badge).
-- **Session params are not auto-filters** — OPA must return explicit `rowFilters`; QueryFlux never substitutes `sessionParams` into SQL itself.
+- **Session params are not auto-filters** — the provider must return an explicit `rowFilters` entry; QueryFlux never substitutes `sessionParams` into SQL itself.
+- **Cerbos requires non-empty `principal.roles`** — an identity with no roles resolved is denied locally by `CerbosProvider` without calling Cerbos at all. Not a constraint on OPA connections.
 - **Trino `X-Trino-Session`** is not split into extra keys — use a header whose name matches `sessionParamKeys` (see [Customer API row filters](customer-api-row-filters)).
 - **Dry-run** does not accept session params.
 
@@ -369,6 +380,7 @@ Column masks on `SELECT *` need a column list. Configure a [catalog integration]
 ## Related reading
 
 - [OPA provider](opa.md) — wire format, Rego, demo (`examples/with-opa/`)
+- [Cerbos provider](cerbos.md) — wire format, policy YAML, demo (`examples/with-cerbos/`)
 - [Customer API row filters](customer-api-row-filters) — service account + `sessionParamKeys`
 - [Guardrails](../architecture/guardrails) — SQL-shape safety; access control is one more guard, pre-translation
 - [Authentication & identity](../authentication) — how `AuthContext` is built

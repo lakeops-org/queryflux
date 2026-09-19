@@ -1,4 +1,5 @@
-//! Provider implementations. OPA is the only one shipped in v1; Cerbos / Cedar / etc.
-//! would each be a new submodule + a [`crate::config::ProviderConfig`] variant.
+//! Provider implementations. Each is a submodule plus a [`crate::config::ProviderKind`]
+//! variant + a sibling config field on [`crate::config::AccessConnectionConfig`].
 
+pub mod cerbos;
 pub mod opa;

@@ -2768,25 +2768,32 @@ fn redact_access_control_secrets(v: &mut serde_json::Value) {
         return;
     };
     for conn in conns.values_mut() {
-        let Some(opa) = conn.get_mut("opa").and_then(|o| o.as_object_mut()) else {
-            continue;
-        };
-        let token_set = opa
-            .get("bearerToken")
-            .and_then(|t| t.as_str())
-            .is_some_and(|s| !s.is_empty());
-        opa.insert("bearerTokenSet".into(), serde_json::json!(token_set));
-        opa.remove("bearerToken");
-        if let Some(cc) = opa
-            .get_mut("clientCredentials")
-            .and_then(|c| c.as_object_mut())
-        {
-            let secret_set = cc
-                .get("clientSecret")
-                .and_then(|s| s.as_str())
+        if let Some(opa) = conn.get_mut("opa").and_then(|o| o.as_object_mut()) {
+            let token_set = opa
+                .get("bearerToken")
+                .and_then(|t| t.as_str())
                 .is_some_and(|s| !s.is_empty());
-            cc.insert("clientSecretSet".into(), serde_json::json!(secret_set));
-            cc.remove("clientSecret");
+            opa.insert("bearerTokenSet".into(), serde_json::json!(token_set));
+            opa.remove("bearerToken");
+            if let Some(cc) = opa
+                .get_mut("clientCredentials")
+                .and_then(|c| c.as_object_mut())
+            {
+                let secret_set = cc
+                    .get("clientSecret")
+                    .and_then(|s| s.as_str())
+                    .is_some_and(|s| !s.is_empty());
+                cc.insert("clientSecretSet".into(), serde_json::json!(secret_set));
+                cc.remove("clientSecret");
+            }
+        }
+        if let Some(cerbos) = conn.get_mut("cerbos").and_then(|c| c.as_object_mut()) {
+            let token_set = cerbos
+                .get("bearerToken")
+                .and_then(|t| t.as_str())
+                .is_some_and(|s| !s.is_empty());
+            cerbos.insert("bearerTokenSet".into(), serde_json::json!(token_set));
+            cerbos.remove("bearerToken");
         }
     }
 }
@@ -2806,37 +2813,46 @@ fn merge_access_control_secrets(incoming: &mut serde_json::Value, previous: &ser
         return;
     };
     for (name, conn) in conns.iter_mut() {
-        let Some(prev_opa) = prev_conns.get(name).and_then(|c| c.get("opa")) else {
-            continue;
-        };
-        let Some(opa) = conn.get_mut("opa").and_then(|o| o.as_object_mut()) else {
-            continue;
-        };
-        let incoming_token_empty = opa
-            .get("bearerToken")
-            .and_then(|t| t.as_str())
-            .is_none_or(|s| s.is_empty());
-        if incoming_token_empty {
-            if let Some(prev) = prev_opa.get("bearerToken") {
-                opa.insert("bearerToken".into(), prev.clone());
+        if let Some(prev_opa) = prev_conns.get(name).and_then(|c| c.get("opa")) {
+            if let Some(opa) = conn.get_mut("opa").and_then(|o| o.as_object_mut()) {
+                let incoming_token_empty = opa
+                    .get("bearerToken")
+                    .and_then(|t| t.as_str())
+                    .is_none_or(|s| s.is_empty());
+                if incoming_token_empty {
+                    if let Some(prev) = prev_opa.get("bearerToken") {
+                        opa.insert("bearerToken".into(), prev.clone());
+                    }
+                }
+                if let Some(prev_cc) = prev_opa.get("clientCredentials") {
+                    if let Some(cc) = opa
+                        .get_mut("clientCredentials")
+                        .and_then(|c| c.as_object_mut())
+                    {
+                        let incoming_secret_empty = cc
+                            .get("clientSecret")
+                            .and_then(|s| s.as_str())
+                            .is_none_or(|s| s.is_empty());
+                        if incoming_secret_empty {
+                            if let Some(prev) = prev_cc.get("clientSecret") {
+                                cc.insert("clientSecret".into(), prev.clone());
+                            }
+                        }
+                    }
+                }
             }
         }
-        let Some(prev_cc) = prev_opa.get("clientCredentials") else {
-            continue;
-        };
-        let Some(cc) = opa
-            .get_mut("clientCredentials")
-            .and_then(|c| c.as_object_mut())
-        else {
-            continue;
-        };
-        let incoming_secret_empty = cc
-            .get("clientSecret")
-            .and_then(|s| s.as_str())
-            .is_none_or(|s| s.is_empty());
-        if incoming_secret_empty {
-            if let Some(prev) = prev_cc.get("clientSecret") {
-                cc.insert("clientSecret".into(), prev.clone());
+        if let Some(prev_cerbos) = prev_conns.get(name).and_then(|c| c.get("cerbos")) {
+            if let Some(cerbos) = conn.get_mut("cerbos").and_then(|c| c.as_object_mut()) {
+                let incoming_token_empty = cerbos
+                    .get("bearerToken")
+                    .and_then(|t| t.as_str())
+                    .is_none_or(|s| s.is_empty());
+                if incoming_token_empty {
+                    if let Some(prev) = prev_cerbos.get("bearerToken") {
+                        cerbos.insert("bearerToken".into(), prev.clone());
+                    }
+                }
             }
         }
     }
@@ -3520,6 +3536,52 @@ mod tests {
         assert_eq!(cc.get("clientSecret"), None);
         assert_eq!(cc["clientSecretSet"], true);
         assert_eq!(cc["clientId"], "qf");
+    }
+
+    #[test]
+    fn redact_access_control_secrets_strips_cerbos_token() {
+        let mut v = json!({
+            "enabled": true,
+            "connections": {
+                "default": {
+                    "provider": "cerbos",
+                    "cerbos": {
+                        "url": "http://cerbos:3592",
+                        "bearerToken": "sekrit"
+                    }
+                }
+            }
+        });
+        super::redact_access_control_secrets(&mut v);
+        let cerbos = v["connections"]["default"]["cerbos"].as_object().unwrap();
+        assert_eq!(cerbos.get("bearerToken"), None);
+        assert_eq!(cerbos["bearerTokenSet"], true);
+    }
+
+    #[test]
+    fn merge_access_control_secrets_keeps_previous_cerbos_token_when_blank() {
+        let previous = json!({
+            "connections": {
+                "default": {
+                    "provider": "cerbos",
+                    "cerbos": { "bearerToken": "keep-me" }
+                }
+            }
+        });
+        let mut incoming = json!({
+            "enabled": true,
+            "connections": {
+                "default": {
+                    "provider": "cerbos",
+                    "cerbos": { "url": "http://cerbos:3592", "bearerToken": "" }
+                }
+            }
+        });
+        super::merge_access_control_secrets(&mut incoming, &previous);
+        assert_eq!(
+            incoming["connections"]["default"]["cerbos"]["bearerToken"],
+            "keep-me"
+        );
     }
 
     #[test]
