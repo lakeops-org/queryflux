@@ -70,6 +70,13 @@ fn resolve_src_dialect(session: &SessionContext, protocol: &FrontendProtocol) ->
 /// calling `maybe_translate` entirely: no dialect is passed to sqlglot, and no configured
 /// fixup scripts run either, since those need a real dialect to parse under too. The SQL
 /// passes through completely unmodified.
+/// Whether the table schema should be looked up for this query: translation needs it, and so
+/// does access control (without it every table reads as "all columns"), which must not depend
+/// on whether a source dialect was declared.
+fn should_resolve_schema(attempt_translation: bool, access_control_enabled: bool) -> bool {
+    attempt_translation || access_control_enabled
+}
+
 fn should_attempt_translation(session: &SessionContext, protocol: &FrontendProtocol) -> bool {
     !matches!(protocol, FrontendProtocol::Mcp) || session.extra.contains_key("dialect")
 }
@@ -371,20 +378,21 @@ pub async fn dispatch_query(
     let engine_type = adapter_kind.engine_type();
     let original_sql = sql.clone();
     let attempt_translation = should_attempt_translation(&session, &protocol);
-    let schema_context = if attempt_translation {
-        state
-            .translation
-            .resolve_schema_context(
-                &sql,
-                &src_dialect,
-                &catalog,
-                session.catalog(),
-                session.database(),
-            )
-            .await
-    } else {
-        Default::default()
-    };
+    let schema_context =
+        if should_resolve_schema(attempt_translation, access_control_guard.is_some()) {
+            state
+                .translation
+                .resolve_schema_context(
+                    &sql,
+                    &src_dialect,
+                    &catalog,
+                    session.catalog(),
+                    session.database(),
+                )
+                .await
+        } else {
+            Default::default()
+        };
 
     // Access control: runs on the SOURCE SQL, before dialect translation — every guard
     // decision (including row filters / column masks) is intent-level and answerable from
@@ -1509,20 +1517,21 @@ async fn setup_sync_query(
     let start = Instant::now();
     let attempt_translation = should_attempt_translation(&session, &protocol);
 
-    let schema_context = if attempt_translation {
-        state
-            .translation
-            .resolve_schema_context(
-                &sql,
-                &src_dialect,
-                &catalog,
-                session.catalog(),
-                session.database(),
-            )
-            .await
-    } else {
-        Default::default()
-    };
+    let schema_context =
+        if should_resolve_schema(attempt_translation, access_control_guard.is_some()) {
+            state
+                .translation
+                .resolve_schema_context(
+                    &sql,
+                    &src_dialect,
+                    &catalog,
+                    session.catalog(),
+                    session.database(),
+                )
+                .await
+        } else {
+            Default::default()
+        };
 
     // Access control: runs on the SOURCE SQL, before dialect translation (see the async
     // dispatch path for the full rationale). On deny: record the query, release the slot,
@@ -2728,7 +2737,7 @@ mod resolve_src_dialect_tests {
 
 #[cfg(test)]
 mod should_attempt_translation_tests {
-    use super::should_attempt_translation;
+    use super::{should_attempt_translation, should_resolve_schema};
     use queryflux_core::query::FrontendProtocol;
     use queryflux_core::session::SessionContext;
 
@@ -2739,6 +2748,23 @@ mod should_attempt_translation_tests {
             &session,
             &FrontendProtocol::Mcp
         ));
+    }
+
+    /// MCP with no declared dialect skips translation, but access control still needs the schema.
+    #[test]
+    fn schema_is_resolved_for_access_control_even_without_translation() {
+        let session = SessionContext::default();
+        let translates = should_attempt_translation(&session, &FrontendProtocol::Mcp);
+        assert!(!translates);
+        assert!(
+            should_resolve_schema(translates, true),
+            "access control needs the schema"
+        );
+        assert!(
+            !should_resolve_schema(translates, false),
+            "nothing needs it"
+        );
+        assert!(should_resolve_schema(true, false), "translation needs it");
     }
 
     #[test]

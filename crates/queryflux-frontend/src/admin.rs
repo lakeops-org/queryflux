@@ -2749,7 +2749,22 @@ struct AccessControlDryRunRequest {
     /// `"duckdb"`). Defaults to `"trino"`.
     #[serde(default = "default_dry_run_dialect")]
     dialect: String,
+    /// Engine the query is headed to, as it appears in `context.engine` (for example
+    /// `"trino"`, `"duckDb"`, `"starRocks"`). Defaults to `"trino"`.
+    #[serde(default)]
+    engine: Option<String>,
     identity: DryRunIdentity,
+}
+
+/// `engine` as sent in a dry-run request → the engine the policy sees. Absent means Trino.
+fn parse_dry_run_engine(
+    name: Option<&str>,
+) -> std::result::Result<queryflux_core::query::EngineType, String> {
+    match name {
+        None => Ok(queryflux_core::query::EngineType::Trino),
+        Some(name) => serde_json::from_value(serde_json::Value::String(name.to_string()))
+            .map_err(|_| format!("unknown engine {name:?}")),
+    }
 }
 
 fn default_dry_run_group() -> String {
@@ -2772,11 +2787,17 @@ struct DryRunIdentity {
 }
 
 /// Preview the access-control decision for a query without acquiring a slot or executing
-/// anything, and without touching the decision cache.
+/// anything.
 ///
 /// Runs the same `OpaAccessGuard` the live query path uses, on the SQL exactly as given
 /// (source dialect — this does not run dialect translation, so the rewritten SQL shown is
-/// what the guard produces before `maybe_translate`, not final target-engine SQL).
+/// what the guard produces before `maybe_translate`, not final target-engine SQL). The table
+/// schema is resolved through the configured catalog like a live query, and `engine` sets the
+/// `context.engine` the policy sees (default `trino`).
+///
+/// It goes through the same decision cache as live queries: a repeated dry run can return an
+/// answer up to `cacheTtlMs` old, and an allowed decision it computes can be reused by an
+/// identical live request. Set `cacheTtlMs: 0` while editing policy to always see a fresh one.
 #[utoipa::path(
     post,
     path = "/admin/access-control/dry-run",
@@ -2801,11 +2822,21 @@ async fn access_control_dry_run_handler(
 
     let dialect = queryflux_core::query::SqlDialect::Sqlglot(body.dialect.clone());
     let cluster_group = queryflux_core::query::ClusterGroupName(body.cluster_group.clone());
-    let engine_type = queryflux_core::query::EngineType::Trino; // informational only — see doc comment
+    let engine_type = match parse_dry_run_engine(body.engine.as_deref()) {
+        Ok(engine) => engine,
+        Err(e) => return (StatusCode::BAD_REQUEST, e).into_response(),
+    };
     let query_tags = queryflux_core::tags::QueryTags::new();
     let session_extra = std::collections::HashMap::new();
     let sql_parse =
         queryflux_core::sql_classify::SqlParseCache::new(body.sql.clone(), dialect.clone());
+
+    let catalog = state.live.read().await.catalog.clone();
+    let schema_ctx = state
+        .app
+        .translation
+        .resolve_schema_context(&body.sql, &dialect, &catalog, None, None)
+        .await;
 
     let ctx = queryflux_guardrails::context::GuardContext {
         sql: &body.sql,
@@ -2819,7 +2850,7 @@ async fn access_control_dry_run_handler(
         agent_context: None,
         query_tags: &query_tags,
         session_extra: &session_extra,
-        schema: None,
+        schema: Some(&schema_ctx),
         sql_parse: Some(&sql_parse),
     };
 
@@ -3040,11 +3071,36 @@ mod tests {
         .expect("minimal dry-run body should deserialize");
         assert_eq!(req.sql, "SELECT * FROM orders");
         assert_eq!(req.dialect, "trino");
+        assert_eq!(req.engine, None);
         assert_eq!(req.cluster_group, "dry-run");
         assert_eq!(req.identity.user, "alice");
         assert_eq!(req.identity.groups, vec!["analysts"]);
         assert!(req.identity.roles.is_empty());
         assert!(req.identity.attributes.is_empty());
+    }
+
+    /// The engine reaches the policy as `context.engine`, so it must be settable — and an
+    /// unknown name must be rejected rather than silently treated as Trino.
+    #[test]
+    fn dry_run_engine_is_parsed_and_defaults_to_trino() {
+        use queryflux_core::query::EngineType;
+        assert_eq!(super::parse_dry_run_engine(None), Ok(EngineType::Trino));
+        assert_eq!(
+            super::parse_dry_run_engine(Some("duckDb")),
+            Ok(EngineType::DuckDb)
+        );
+        assert_eq!(
+            super::parse_dry_run_engine(Some("starRocks")),
+            Ok(EngineType::StarRocks)
+        );
+        assert!(super::parse_dry_run_engine(Some("mystery"))
+            .unwrap_err()
+            .contains("mystery"));
+        let req: AccessControlDryRunRequest = serde_json::from_value(json!({
+            "sql": "SELECT 1", "engine": "duckDb", "identity": { "user": "u" }
+        }))
+        .unwrap();
+        assert_eq!(req.engine.as_deref(), Some("duckDb"));
     }
 
     #[test]

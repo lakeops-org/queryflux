@@ -236,3 +236,33 @@ async fn opa_unreachable_fails_closed_by_default() {
         .expect("denied query should be recorded");
     assert_eq!(format!("{:?}", record.status), "Denied");
 }
+
+/// A query the analyzer can't parse has no resources to put in a request, so it can't be
+/// judged at all. Even under the default `onMissingSchema: evaluate` it must be denied —
+/// allowing it would let anything the parser can't read skip access control entirely. A valid
+/// query that simply references no table (`SELECT 1`) is unaffected.
+#[tokio::test]
+async fn unanalyzable_query_is_denied_even_when_on_missing_schema_is_evaluate() {
+    let (opa_url, _stub) = start_opa_stub().await;
+    let guard = build_guard(&opa_url); // default: onMissingSchema = evaluate
+    let h = ProtocolWireHarness::new_with_access_control(Some(guard))
+        .await
+        .expect("harness");
+    let client = pg_connect(h.postgres_port).await;
+
+    let err = pg_run(&client, "SELECT * FROM orders WHERE (((")
+        .await
+        .expect_err("an unanalyzable query must be denied");
+    assert!(err.contains("could not analyze"), "unexpected error: {err}");
+
+    let record = h
+        .wait_for_record(|r| r.sql_preview.contains("WHERE ((("))
+        .await
+        .expect("denied query should be recorded");
+    assert_eq!(format!("{:?}", record.status), "Denied");
+    assert!(record.was_guard_blocked);
+
+    pg_run(&client, "SELECT 1")
+        .await
+        .expect("a table-less query is still allowed");
+}

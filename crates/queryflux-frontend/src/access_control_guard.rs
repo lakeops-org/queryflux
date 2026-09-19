@@ -132,14 +132,15 @@ impl Guard for OpaAccessGuard {
         let extracted = match queryflux_translation::extract_resources(ctx.sql, ctx.dialect, schema)
         {
             Ok(r) => r,
+            // A query that can't be analyzed has no resources to put in a request, so it can't
+            // be judged at all. `onMissingSchema` is about unresolved *columns* of tables that
+            // were found — not about failing to find them — so this denies in both modes;
+            // allowing it would let anything the parser can't read skip access control.
             Err(e) => {
-                return match self.on_missing_schema {
-                    OnMissingSchema::Deny => GuardResult::deny(
-                        format!("access control: could not analyze query: {e}"),
-                        "ACCESS_ANALYSIS_FAILED",
-                    ),
-                    OnMissingSchema::Evaluate => GuardResult::allow(),
-                }
+                return GuardResult::deny(
+                    format!("access control: could not analyze query: {e}"),
+                    "ACCESS_ANALYSIS_FAILED",
+                )
             }
         };
 

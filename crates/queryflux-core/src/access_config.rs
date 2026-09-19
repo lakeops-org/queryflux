@@ -55,6 +55,14 @@ fn default_decision_path() -> String {
 fn default_timeout_ms() -> u64 {
     1_000
 }
+/// Operations the guard classifies and can evaluate.
+pub const SUPPORTED_OPERATIONS: &[&str] = &[
+    "table.select",
+    "table.insert",
+    "table.update",
+    "table.delete",
+];
+
 fn default_operations() -> Vec<String> {
     vec!["table.select".to_string()]
 }
@@ -132,13 +140,102 @@ impl AccessControlConfig {
         if !opa.decision_path.starts_with('/') {
             return Err("access_control.opa.decisionPath must start with '/'".into());
         }
+        // The client secret is POSTed to the token endpoint, so it must not travel in clear text.
+        // A loopback host never leaves the machine, which keeps local demos workable.
+        if let Some(credentials) = &opa.client_credentials {
+            let token_endpoint = url::Url::parse(credentials.token_endpoint.trim()).map_err(|e| {
+                format!("access_control.opa.clientCredentials.tokenEndpoint is not a valid URL: {e}")
+            })?;
+            let loopback = match token_endpoint.host() {
+                Some(url::Host::Domain(d)) => d.eq_ignore_ascii_case("localhost"),
+                Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+                Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+                None => false,
+            };
+            let secure = token_endpoint.scheme() == "https"
+                || (token_endpoint.scheme() == "http" && loopback);
+            if !secure {
+                return Err(
+                    "access_control.opa.clientCredentials.tokenEndpoint must use https \
+                     (plain http is only allowed for a loopback host)"
+                        .into(),
+                );
+            }
+        }
+        // `operations` is an allowlist: an entry that names no real operation (say
+        // `table.selet`) would silently skip that protection, so unknown names are rejected.
         for op in &self.operations {
-            if !op.contains('.') {
+            if !SUPPORTED_OPERATIONS.contains(&op.as_str()) {
                 return Err(format!(
-                    "access_control.operations entry {op:?} must be namespaced (e.g. table.select)"
+                    "access_control.operations entry {op:?} is not supported (supported: {})",
+                    SUPPORTED_OPERATIONS.join(", ")
                 ));
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config_with(token_endpoint: Option<&str>, operations: &[&str]) -> AccessControlConfig {
+        let mut opa = serde_json::json!({ "url": "https://opa.example.com" });
+        if let Some(t) = token_endpoint {
+            opa["clientCredentials"] = serde_json::json!({
+                "clientId": "id", "clientSecret": "secret", "tokenEndpoint": t
+            });
+        }
+        serde_json::from_value(serde_json::json!({ "opa": opa, "operations": operations }))
+            .expect("valid access-control config")
+    }
+
+    /// The client secret is POSTed to the token endpoint, so it must travel over TLS. A
+    /// loopback host never leaves the machine and stays allowed for local setups.
+    #[test]
+    fn token_endpoint_must_be_https_unless_loopback() {
+        let ok = |t: &str| config_with(Some(t), &["table.select"]).validate();
+        for allowed in [
+            "https://idp.example.com/oauth/token",
+            "http://localhost/token",
+            "http://LOCALHOST:8080/token",
+            "http://127.0.0.1:8080/token",
+            "http://[::1]:8080/token",
+        ] {
+            assert!(ok(allowed).is_ok(), "{allowed} should be accepted");
+        }
+        for rejected in [
+            "http://idp.example.com/oauth/token",
+            "http://10.0.0.5/token",
+            "http://localhost.evil.example/token",
+            "ftp://idp.example.com/token",
+            "not a url",
+        ] {
+            let err = ok(rejected).unwrap_err();
+            assert!(err.contains("tokenEndpoint"), "{rejected}: {err}");
+        }
+        // No client credentials → nothing to check.
+        assert!(config_with(None, &["table.select"]).validate().is_ok());
+    }
+
+    /// `operations` is an allowlist: a typo would silently skip the protection it meant to
+    /// apply, so unknown names — including the classifier's internal `statement.other` — fail.
+    #[test]
+    fn operations_must_be_supported_names() {
+        for ok in [
+            &["table.select"][..],
+            &["table.select", "table.delete"],
+            &[],
+        ] {
+            assert!(config_with(None, ok).validate().is_ok(), "{ok:?}");
+        }
+        for bad in ["table.selet", "statement.other", "select", "table.merge"] {
+            let err = config_with(None, &[bad]).validate().unwrap_err();
+            assert!(
+                err.contains(bad) && err.contains("table.select"),
+                "{bad}: {err}"
+            );
+        }
     }
 }
