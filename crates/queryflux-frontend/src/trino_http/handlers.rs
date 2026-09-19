@@ -1651,6 +1651,7 @@ mod cancel_executing_statement_tests {
             router_chain: RouterChain::new(vec![], group_name.clone()),
             guard_chain: None,
             group_guard_chains: HashMap::new(),
+            access_control_guard: None,
             cluster_manager: Arc::new(SimpleClusterGroupManager::new(groups)),
             adapters,
             health_check_targets: vec![],

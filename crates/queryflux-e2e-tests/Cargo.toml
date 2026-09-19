@@ -21,6 +21,7 @@ queryflux-metrics = { workspace = true }
 queryflux-routing = { workspace = true }
 queryflux-auth = { workspace = true }
 queryflux-guardrails = { workspace = true }
+queryflux-access-control = { workspace = true }
 
 # Async runtime
 tokio = { workspace = true }

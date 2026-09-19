@@ -193,10 +193,9 @@ def _qualified(t):
 
 def extract_resources(sql, dialect, schema_json):
     schema = json.loads(schema_json) if schema_json else {}
-    try:
-        tree = sqlglot.parse_one(sql, dialect=dialect or None)
-    except Exception:
-        return "[]"
+    # A parse failure must surface as an error, never as "no tables": the backend engine may
+    # accept SQL that sqlglot rejects, so an empty result here would let it through unchecked.
+    tree = sqlglot.parse_one(sql, dialect=dialect or None)
 
     ctes = _cte_names(tree)
 
@@ -490,6 +489,17 @@ mod tests {
             refs.iter().map(|r| r.table.as_str()).collect::<Vec<_>>(),
             vec!["base"]
         );
+    }
+
+    #[test]
+    fn extract_resources_errors_on_unparseable_sql() {
+        // A parse failure must not look like "no tables" — that would be an allow.
+        for sql in ["SELECT * FROM orders WHERE (((", "SELECT FROM FROM ((("] {
+            assert!(
+                extract_resources(sql, &SqlDialect::Trino, &SchemaContext::default()).is_err(),
+                "expected an error for {sql:?}"
+            );
+        }
     }
 
     #[test]

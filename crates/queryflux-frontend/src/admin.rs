@@ -136,6 +136,7 @@ pub struct ClusterStateDto {
         put_routing_config_handler,
         get_guardrails_config_handler,
         put_guardrails_config_handler,
+        access_control_dry_run_handler,
         get_catalog_config_handler,
         put_catalog_config_handler,
         test_catalog_config_handler,
@@ -147,6 +148,8 @@ pub struct ClusterStateDto {
     components(schemas(
         ClusterStateDto,
         ClusterUpdateRequest,
+        AccessControlDryRunRequest,
+        DryRunIdentity,
         QuerySummary,
         RunningQueryDto,
         DashboardStats,
@@ -743,6 +746,10 @@ impl AdminFrontend {
             .route(
                 "/admin/config/guardrails",
                 get(get_guardrails_config_handler).put(put_guardrails_config_handler),
+            )
+            .route(
+                "/admin/access-control/dry-run",
+                post(access_control_dry_run_handler),
             )
             .route(
                 "/admin/config/catalog",
@@ -2726,6 +2733,149 @@ async fn put_guardrails_config_handler(
 }
 
 // ---------------------------------------------------------------------------
+// Access control (OPA row filtering / column masking / table-column allow-deny) dry-run
+// ---------------------------------------------------------------------------
+
+/// Request body for the access-control dry-run endpoint.
+#[derive(Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+struct AccessControlDryRunRequest {
+    sql: String,
+    /// Cluster group name — carried through as `context.clusterGroup` for the policy
+    /// engine; not used to resolve a real cluster (this endpoint never dispatches).
+    #[serde(default = "default_dry_run_group")]
+    cluster_group: String,
+    /// sqlglot dialect name the SQL should be parsed as (e.g. `"trino"`, `"postgres"`,
+    /// `"duckdb"`). Defaults to `"trino"`.
+    #[serde(default = "default_dry_run_dialect")]
+    dialect: String,
+    /// Engine the query is headed to, as it appears in `context.engine` (for example
+    /// `"trino"`, `"duckDb"`, `"starRocks"`). Defaults to `"trino"`.
+    #[serde(default)]
+    engine: Option<String>,
+    identity: DryRunIdentity,
+}
+
+/// `engine` as sent in a dry-run request → the engine the policy sees. Absent means Trino.
+fn parse_dry_run_engine(
+    name: Option<&str>,
+) -> std::result::Result<queryflux_core::query::EngineType, String> {
+    match name {
+        None => Ok(queryflux_core::query::EngineType::Trino),
+        Some(name) => serde_json::from_value(serde_json::Value::String(name.to_string()))
+            .map_err(|_| format!("unknown engine {name:?}")),
+    }
+}
+
+fn default_dry_run_group() -> String {
+    "dry-run".to_string()
+}
+fn default_dry_run_dialect() -> String {
+    "trino".to_string()
+}
+
+#[derive(Deserialize, Default, ToSchema)]
+struct DryRunIdentity {
+    #[serde(default)]
+    user: String,
+    #[serde(default)]
+    groups: Vec<String>,
+    #[serde(default)]
+    roles: Vec<String>,
+    #[serde(default)]
+    attributes: std::collections::BTreeMap<String, serde_json::Value>,
+}
+
+/// Preview the access-control decision for a query without acquiring a slot or executing
+/// anything.
+///
+/// Runs the same `OpaAccessGuard` the live query path uses, on the SQL exactly as given
+/// (source dialect — this does not run dialect translation, so the rewritten SQL shown is
+/// what the guard produces before `maybe_translate`, not final target-engine SQL). The table
+/// schema is resolved through the configured catalog like a live query, and `engine` sets the
+/// `context.engine` the policy sees (default `trino`).
+///
+/// It goes through the same decision cache as live queries: a repeated dry run can return an
+/// answer up to `cacheTtlMs` old, and an allowed decision it computes can be reused by an
+/// identical live request. Set `cacheTtlMs: 0` while editing policy to always see a fresh one.
+#[utoipa::path(
+    post,
+    path = "/admin/access-control/dry-run",
+    tag = "config",
+    responses(
+        (status = 200, description = "Decision computed", body = str),
+        (status = 400, description = "Invalid request body", body = str),
+        (status = 503, description = "No access_control provider configured", body = str),
+    )
+)]
+async fn access_control_dry_run_handler(
+    State(state): State<Arc<AdminState>>,
+    Json(body): Json<AccessControlDryRunRequest>,
+) -> impl IntoResponse {
+    let Some(guard) = state.live.read().await.access_control_guard.clone() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "no access_control provider is configured",
+        )
+            .into_response();
+    };
+
+    let dialect = queryflux_core::query::SqlDialect::Sqlglot(body.dialect.clone());
+    let cluster_group = queryflux_core::query::ClusterGroupName(body.cluster_group.clone());
+    let engine_type = match parse_dry_run_engine(body.engine.as_deref()) {
+        Ok(engine) => engine,
+        Err(e) => return (StatusCode::BAD_REQUEST, e).into_response(),
+    };
+    let query_tags = queryflux_core::tags::QueryTags::new();
+    let session_extra = std::collections::HashMap::new();
+    let sql_parse =
+        queryflux_core::sql_classify::SqlParseCache::new(body.sql.clone(), dialect.clone());
+
+    let catalog = state.live.read().await.catalog.clone();
+    let schema_ctx = state
+        .app
+        .translation
+        .resolve_schema_context(&body.sql, &dialect, &catalog, None, None)
+        .await;
+
+    let ctx = queryflux_guardrails::context::GuardContext {
+        sql: &body.sql,
+        dialect: &dialect,
+        engine_type: &engine_type,
+        cluster_group: &cluster_group,
+        user: Some(body.identity.user.as_str()),
+        groups: &body.identity.groups,
+        roles: &body.identity.roles,
+        attributes: &body.identity.attributes,
+        agent_context: None,
+        query_tags: &query_tags,
+        session_extra: &session_extra,
+        schema: Some(&schema_ctx),
+        sql_parse: Some(&sql_parse),
+    };
+
+    let result = {
+        use queryflux_guardrails::built_in::Guard as _;
+        guard.check(&ctx).await
+    };
+    let response = match result {
+        queryflux_guardrails::context::GuardResult::Deny { reason, code } => {
+            serde_json::json!({ "outcome": "deny", "reason": reason, "code": code })
+        }
+        queryflux_guardrails::context::GuardResult::Rewrite { sql, metadata } => {
+            serde_json::json!({ "outcome": "rewrite", "rewrittenSql": sql, "metadata": metadata })
+        }
+        queryflux_guardrails::context::GuardResult::Allow { metadata } => {
+            serde_json::json!({ "outcome": "allow", "metadata": metadata })
+        }
+        queryflux_guardrails::context::GuardResult::Warn { reason } => {
+            serde_json::json!({ "outcome": "warn", "reason": reason })
+        }
+    };
+    Json(response).into_response()
+}
+
+// ---------------------------------------------------------------------------
 // Catalog provider config (schema-aware translation source)
 // ---------------------------------------------------------------------------
 
@@ -2855,8 +3005,8 @@ async fn invalidate_group_cache_handler(
 #[cfg(test)]
 mod tests {
     use super::{
-        collect_running_queries, delete_queued_if_exists, sql_preview, GuardrailsConfigDto,
-        SecurityConfigDto,
+        collect_running_queries, delete_queued_if_exists, sql_preview, AccessControlDryRunRequest,
+        GuardrailsConfigDto, SecurityConfigDto,
     };
     use chrono::Utc;
     use queryflux_core::config::{
@@ -2910,6 +3060,72 @@ mod tests {
     #[test]
     fn sql_preview_collapses_whitespace() {
         assert_eq!(sql_preview("SELECT   1\nFROM  t"), "SELECT 1 FROM t");
+    }
+
+    #[test]
+    fn access_control_dry_run_request_defaults() {
+        let req: AccessControlDryRunRequest = serde_json::from_value(json!({
+            "sql": "SELECT * FROM orders",
+            "identity": { "user": "alice", "groups": ["analysts"] }
+        }))
+        .expect("minimal dry-run body should deserialize");
+        assert_eq!(req.sql, "SELECT * FROM orders");
+        assert_eq!(req.dialect, "trino");
+        assert_eq!(req.engine, None);
+        assert_eq!(req.cluster_group, "dry-run");
+        assert_eq!(req.identity.user, "alice");
+        assert_eq!(req.identity.groups, vec!["analysts"]);
+        assert!(req.identity.roles.is_empty());
+        assert!(req.identity.attributes.is_empty());
+    }
+
+    /// The engine reaches the policy as `context.engine`, so it must be settable — and an
+    /// unknown name must be rejected rather than silently treated as Trino.
+    #[test]
+    fn dry_run_engine_is_parsed_and_defaults_to_trino() {
+        use queryflux_core::query::EngineType;
+        assert_eq!(super::parse_dry_run_engine(None), Ok(EngineType::Trino));
+        assert_eq!(
+            super::parse_dry_run_engine(Some("duckDb")),
+            Ok(EngineType::DuckDb)
+        );
+        assert_eq!(
+            super::parse_dry_run_engine(Some("starRocks")),
+            Ok(EngineType::StarRocks)
+        );
+        assert!(super::parse_dry_run_engine(Some("mystery"))
+            .unwrap_err()
+            .contains("mystery"));
+        let req: AccessControlDryRunRequest = serde_json::from_value(json!({
+            "sql": "SELECT 1", "engine": "duckDb", "identity": { "user": "u" }
+        }))
+        .unwrap();
+        assert_eq!(req.engine.as_deref(), Some("duckDb"));
+    }
+
+    #[test]
+    fn access_control_dry_run_request_honors_overrides() {
+        let req: AccessControlDryRunRequest = serde_json::from_value(json!({
+            "sql": "SELECT 1",
+            "clusterGroup": "trino-prod",
+            "dialect": "postgres",
+            "identity": {
+                "user": "svc",
+                "roles": ["reader"],
+                "attributes": { "department": "finance" }
+            }
+        }))
+        .expect("dry-run body with overrides should deserialize");
+        assert_eq!(req.cluster_group, "trino-prod");
+        assert_eq!(req.dialect, "postgres");
+        assert_eq!(req.identity.roles, vec!["reader"]);
+        assert_eq!(
+            req.identity
+                .attributes
+                .get("department")
+                .and_then(|v| v.as_str()),
+            Some("finance")
+        );
     }
 
     #[tokio::test]

@@ -12,6 +12,7 @@ use queryflux_cluster_manager::{
 use queryflux_config::{yaml::YamlFileConfigProvider, ConfigProvider};
 use queryflux_core::query::{ClusterGroupName, ClusterName, EngineType};
 use queryflux_frontend::{
+    access_control_guard::OpaAccessGuard,
     admin::{
         build_frontends_status, AdminFrontend, RoutingConfigDto as AdminRoutingConfigDto,
         SecurityConfigDto as AdminSecurityConfigDto, TestCatalogProviderFn, TestClusterFn,
@@ -956,6 +957,11 @@ async fn main() -> Result<()> {
     let guard_script_bodies =
         load_guard_script_bodies(backend.as_deref().map(|b| b as &dyn AdminStore)).await;
 
+    // --- Build the data access-control guard (OPA row filtering / column masking /
+    // table-column allow-deny), if configured. Runs on the source SQL, before
+    // dialect translation — see `queryflux_frontend::access_control_guard`.
+    let access_control_guard = build_access_control_guard(&config);
+
     // --- Build guard chains: DB-stored config (UI-managed) takes precedence over YAML ---
     // When a persisted config exists in Postgres it is authoritative, even if it
     // resolves to an empty chain (the user may have intentionally cleared guards).
@@ -1031,6 +1037,7 @@ async fn main() -> Result<()> {
         router_chain,
         guard_chain,
         group_guard_chains,
+        access_control_guard,
         cluster_manager,
         adapters,
         health_check_targets,
@@ -1770,6 +1777,7 @@ async fn main() -> Result<()> {
                         authorization: l.authorization.clone(),
                         guard_chain: l.guard_chain.clone(),
                         group_guard_chains: l.group_guard_chains.clone(),
+                        access_control_guard: l.access_control_guard.clone(),
                         catalog: l.catalog.clone(),
                     }
                 };
@@ -3056,6 +3064,9 @@ async fn build_live_config(
         router_chain,
         guard_chain: None,
         group_guard_chains: HashMap::new(),
+        // Placeholder — `reload_live_config` immediately carries forward the previous
+        // value, same as `guard_chain`/`group_guard_chains` above.
+        access_control_guard: None,
         cluster_manager,
         adapters: cache.adapters.clone(),
         health_check_targets,
@@ -3091,6 +3102,7 @@ struct PreservedLive {
     authorization: Arc<dyn queryflux_auth::AuthorizationChecker>,
     guard_chain: Option<Arc<GuardChain>>,
     group_guard_chains: HashMap<String, Arc<GuardChain>>,
+    access_control_guard: Option<Arc<OpaAccessGuard>>,
     catalog: Arc<dyn queryflux_core::catalog::CatalogProvider>,
 }
 
@@ -3181,6 +3193,9 @@ async fn reload_live_config(
     live.authorization = prev.authorization.clone();
     live.guard_chain = prev.guard_chain.clone();
     live.group_guard_chains = prev.group_guard_chains.clone();
+    // Access control is YAML-only in this pass (no admin/DB-managed override yet, unlike
+    // guardrails above) — always carried forward from the previous generation.
+    live.access_control_guard = prev.access_control_guard.clone();
     live.catalog = prev.catalog.clone();
 
     // Guardrails from DB (UI-managed) override carried-over chains. An admin
@@ -3485,6 +3500,28 @@ fn make_http_webhook_guard(
             })
         }
     }
+}
+
+/// Build the data access-control guard from `access_control:` config. Returns `None` when
+/// the section is absent. Since the config was already validated at startup
+/// (`ProxyConfig::validate_startup_security`), any residual build failure here (e.g. the
+/// OPA client couldn't be constructed) aborts startup rather than silently disabling
+/// enforcement the operator explicitly configured.
+fn build_access_control_guard(
+    config: &queryflux_core::config::ProxyConfig,
+) -> Option<Arc<OpaAccessGuard>> {
+    let cfg = config.access_control.as_ref()?;
+    // No metrics wiring yet for this decision path — a follow-up can bridge
+    // `AccessMetricsSink` to `queryflux_metrics::MetricsStore`.
+    let metrics: Arc<dyn queryflux_access_control::AccessMetricsSink> =
+        Arc::new(queryflux_access_control::NoopMetrics);
+    let controller = queryflux_access_control::build_controller(cfg, metrics)
+        .unwrap_or_else(|e| panic!("access_control config failed to build (should have been caught by startup validation): {e}"));
+    Some(Arc::new(OpaAccessGuard::new(
+        Arc::new(controller),
+        cfg.session_param_keys.clone(),
+        cfg.on_missing_schema,
+    )))
 }
 
 /// Build YAML guard specs into a `GuardChain`. Returns `None` when the list is empty

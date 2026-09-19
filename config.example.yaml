@@ -161,3 +161,22 @@ routers:
   #   targetGroup: duckdb-local
 
 routingFallback: duckdb-local
+
+# Data-level access control (row filtering, column masking, table/column allow-deny).
+# Runs on the source SQL before dialect translation, as a guard in the same pipeline
+# stage as `guardrails` above. Omit this section to disable entirely.
+# accessControl:
+#   provider: opa                     # the only provider today, and the default
+#   opa:
+#     url: http://localhost:8181
+#     decisionPath: /v1/data/queryflux/access
+#     timeoutMs: 1000
+#     # bearerToken: "..."
+#     # clientCredentials: { clientId: ..., clientSecret: ..., tokenEndpoint: ... }
+#   operations: [table.select]        # add table.insert/update/delete to cover writes
+#   onMissingSchema: evaluate          # evaluate (send all-columns) | deny
+#   failOpen: false                    # provider timeout/error denies by default
+#   cacheTtlMs: 5000                   # decision cache; 0 disables
+#   sessionParamKeys: [customer_id]    # SessionContext.extra keys forwarded as context only
+#   groups:
+#     trino-prod: { failOpen: false }

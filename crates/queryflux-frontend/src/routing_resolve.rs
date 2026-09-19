@@ -96,6 +96,7 @@ mod tests {
             router_chain: RouterChain::new(vec![], default.clone()),
             guard_chain: None,
             group_guard_chains: HashMap::new(),
+            access_control_guard: None,
             cluster_manager: Arc::new(SimpleClusterGroupManager::new(groups)),
             adapters: HashMap::new(),
             health_check_targets: vec![],
