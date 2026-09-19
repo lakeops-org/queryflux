@@ -221,6 +221,8 @@ pub struct GuardOpts {
     pub on_missing_schema: OnMissingSchema,
     pub fail_open: bool,
     pub session_param_keys: Vec<String>,
+    /// Namespaced operations the connection evaluates (default: `table.select` only).
+    pub operations: Vec<String>,
 }
 
 impl Default for GuardOpts {
@@ -229,6 +231,7 @@ impl Default for GuardOpts {
             on_missing_schema: OnMissingSchema::Evaluate,
             fail_open: false,
             session_param_keys: vec![],
+            operations: vec!["table.select".to_string()],
         }
     }
 }
@@ -247,7 +250,7 @@ pub fn build_guard_with(opa_url: &str, opts: GuardOpts) -> Arc<OpaAccessGuard> {
             bearer_token: None,
             client_credentials: None,
         }),
-        operations: vec!["table.select".to_string()],
+        operations: opts.operations,
         on_missing_schema: opts.on_missing_schema,
         fail_open: opts.fail_open,
         cache_ttl_ms: 0,
@@ -374,16 +377,32 @@ impl CatalogProvider for MapCatalog {
     }
     async fn get_table_schema(
         &self,
-        _catalog: &str,
-        _database: &str,
+        catalog: &str,
+        database: &str,
         table: &str,
     ) -> QfResult<Option<TableSchema>> {
         let bare = table.rsplit('.').next().unwrap_or(table);
+        let name_matches =
+            |key: &str| -> bool { key == table || key.rsplit('.').next().unwrap_or(key) == bare };
+        let catalog_matches = |schema: &TableSchema| -> bool {
+            schema.catalog == catalog && schema.database == database
+        };
+
+        // Prefer an entry whose declared catalog/database agree with the request — see
+        // the identical disambiguation in `queryflux_catalog::StaticCatalogProvider`.
+        if let Some(schema) = self
+            .tables
+            .iter()
+            .find(|(key, schema)| name_matches(key) && catalog_matches(schema))
+            .map(|(_, schema)| schema)
+        {
+            return Ok(Some(schema.clone()));
+        }
         Ok(self
             .tables
-            .get(table)
-            .or_else(|| self.tables.get(bare))
-            .cloned())
+            .iter()
+            .find(|(key, _)| name_matches(key))
+            .map(|(_, schema)| schema.clone()))
     }
 }
 

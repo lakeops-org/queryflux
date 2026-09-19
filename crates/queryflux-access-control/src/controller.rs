@@ -1,7 +1,9 @@
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+use dashmap::DashMap;
 
 use queryflux_core::access_model::{AccessDecision, AccessRequest, Columns, Operation};
 
@@ -50,7 +52,11 @@ pub struct AccessController {
     group_fail_open: HashMap<String, bool>,
     cache_ttl: Duration,
     cache_capacity: usize,
-    cache: Mutex<HashMap<u64, CacheEntry>>,
+    // Sharded (no single global lock) — this is on the per-query hot path, matching the
+    // same DashMap-backed pattern already used elsewhere for per-request caches (e.g.
+    // `snowflake::http::session_store`, `snowflake::in_flight`) rather than reinventing a
+    // `Mutex<HashMap>` that would serialize every concurrent access-control check.
+    cache: DashMap<u64, CacheEntry>,
 }
 
 impl AccessController {
@@ -63,7 +69,7 @@ impl AccessController {
             group_fail_open: cfg.group_fail_open,
             cache_ttl: cfg.cache_ttl,
             cache_capacity: cfg.cache_capacity,
-            cache: Mutex::new(HashMap::new()),
+            cache: DashMap::new(),
         }
     }
 
@@ -147,27 +153,31 @@ impl AccessController {
     }
 
     fn cache_get(&self, key: u64) -> Option<AccessDecision> {
-        let mut guard = self.cache.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(entry) = guard.get(&key) {
+        let mut expired = false;
+        let hit = self.cache.get(&key).and_then(|entry| {
             if entry.stored.elapsed() < self.cache_ttl {
-                return Some(entry.decision.clone());
+                Some(entry.decision.clone())
+            } else {
+                expired = true;
+                None
             }
-            guard.remove(&key);
+        });
+        if expired {
+            self.cache.remove(&key);
         }
-        None
+        hit
     }
 
     fn cache_put(&self, key: u64, decision: AccessDecision) {
-        let mut guard = self.cache.lock().unwrap_or_else(|e| e.into_inner());
-        if guard.len() >= self.cache_capacity {
+        if self.cache.len() >= self.cache_capacity {
             // Crude bound: drop everything expired, then (if still full) clear.
             let ttl = self.cache_ttl;
-            guard.retain(|_, e| e.stored.elapsed() < ttl);
-            if guard.len() >= self.cache_capacity {
-                guard.clear();
+            self.cache.retain(|_, e| e.stored.elapsed() < ttl);
+            if self.cache.len() >= self.cache_capacity {
+                self.cache.clear();
             }
         }
-        guard.insert(
+        self.cache.insert(
             key,
             CacheEntry {
                 stored: Instant::now(),

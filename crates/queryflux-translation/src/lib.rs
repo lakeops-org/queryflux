@@ -2,8 +2,8 @@ pub mod access;
 pub mod sqlglot;
 
 pub use access::{
-    extract_resources, render_mask, rewrite_table_scans, ExtractedResource, MaskRenderError,
-    TablePolicy,
+    extract_resources, render_mask, rewrite_table_scans, ExtractedResource, ExtractedStatement,
+    MaskRenderError, TablePolicy,
 };
 
 use std::collections::HashMap;

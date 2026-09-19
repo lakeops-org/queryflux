@@ -49,12 +49,17 @@ impl OpaProvider {
             return Some(t.clone());
         }
         let cc = self.client_credentials.as_ref()?;
-        {
-            let guard = self.token_cache.lock().await;
-            if let Some((tok, exp)) = guard.as_ref() {
-                if Instant::now() + TOKEN_REFRESH_BUFFER < *exp {
-                    return Some(tok.clone());
-                }
+
+        // Held across the refresh itself (not just the check), including the `.await` on
+        // the token-endpoint POST — `tokio::sync::Mutex` is designed to be held over an
+        // await point. This serializes concurrent refreshes instead of every in-flight
+        // query independently firing its own token request when the cache is near expiry:
+        // the first caller in refreshes, everyone else blocks briefly and then observes
+        // the freshly cached token instead of duplicating the HTTP call.
+        let mut guard = self.token_cache.lock().await;
+        if let Some((tok, exp)) = guard.as_ref() {
+            if Instant::now() + TOKEN_REFRESH_BUFFER < *exp {
+                return Some(tok.clone());
             }
         }
         let resp = self
@@ -75,7 +80,7 @@ impl OpaProvider {
             .and_then(|v| v.as_u64())
             .unwrap_or(300);
         let exp = Instant::now() + Duration::from_secs(expires_in);
-        *self.token_cache.lock().await = Some((token.clone(), exp));
+        *guard = Some((token.clone(), exp));
         Some(token)
     }
 }
@@ -103,7 +108,8 @@ impl PolicyDecisionProvider for OpaProvider {
 
         let status = resp.status();
         if !status.is_success() {
-            return Err(PolicyError::Status(status.as_u16()));
+            let body = resp.text().await.unwrap_or_default();
+            return Err(PolicyError::Status(status.as_u16(), body));
         }
 
         let parsed: wire::OpaResponse = resp

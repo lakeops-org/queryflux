@@ -18,6 +18,19 @@ pub struct ExtractedResource {
     pub schema: Option<String>,
     pub table: String,
     pub columns: Columns,
+    /// The table the statement writes to (`INSERT INTO t`, `UPDATE t`, `CREATE TABLE t AS`,
+    /// ...). Every other extracted table is read.
+    pub is_write_target: bool,
+}
+
+/// The tables a statement touches, split into reads and the write target.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExtractedStatement {
+    pub resources: Vec<ExtractedResource>,
+    /// Whether the statement embeds reads of other tables — true for queries and for
+    /// `INSERT`/`UPDATE`/`DELETE`/`MERGE`/`CREATE ... AS <query>`, false for statements that
+    /// merely name a table (`DESCRIBE`, `DROP`, `ALTER`, ...).
+    pub embeds_reads: bool,
 }
 
 /// Per-table policy for [`rewrite_table_scans`].
@@ -105,13 +118,15 @@ fn dialect_kwarg(dialect: &SqlDialect) -> String {
 }
 
 /// Extract every base table (and, when `schema` is populated, the columns attributed to
-/// each) that `sql` references. CTE-defined names are excluded. Best-effort: a parse
-/// failure yields `Ok(vec![])`.
+/// each) that `sql` references. CTE-defined names are excluded. A genuine parse failure
+/// yields `Err` — callers must not treat it the same as an `Ok` with no resources (a
+/// query that genuinely references no base tables), or a query the parser can't analyze silently
+/// skips access control instead of hitting the caller's `onMissingSchema` fail path.
 pub fn extract_resources(
     sql: &str,
     src_dialect: &SqlDialect,
     schema: &SchemaContext,
-) -> Result<Vec<ExtractedResource>> {
+) -> Result<ExtractedStatement> {
     let dialect = dialect_kwarg(src_dialect);
     let schema_json = schema_to_json(schema);
     Python::attach(|py| extract_resources_gil(py, sql, &dialect, &schema_json))
@@ -192,12 +207,31 @@ def _qualified(t):
     return (db + "." + t.name) if db else t.name
 
 
+def _write_target(tree):
+    """(write-target Table node or None, whether the statement embeds reads).
+
+    `INSERT INTO t ...`, `UPDATE t ...`, `DELETE FROM t ...`, `MERGE INTO t ...` and
+    `CREATE TABLE/VIEW t AS <query>` write to `t`; every *other* table they mention is
+    read. Statements that only name a table without reading it (`DESCRIBE`, `DROP`,
+    `ALTER`, ...) embed no reads.
+    """
+    if isinstance(tree, (exp.Insert, exp.Update, exp.Delete, exp.Merge)):
+        node = tree.this
+    elif isinstance(tree, exp.Create) and isinstance(tree.args.get("expression"), exp.Query):
+        node = tree.this
+    else:
+        return None, isinstance(tree, exp.Query)
+    if isinstance(node, exp.Schema):
+        node = node.this
+    return (node if isinstance(node, exp.Table) else None), True
+
+
 def extract_resources(sql, dialect, schema_json):
     schema = json.loads(schema_json) if schema_json else {}
     try:
         tree = sqlglot.parse_one(sql, dialect=dialect or None)
-    except Exception:
-        return "[]"
+    except Exception as e:
+        return json.dumps({"error": str(e)})
 
     ctes = _cte_names(tree)
 
@@ -218,6 +252,10 @@ def extract_resources(sql, dialect, schema_json):
     # which would silently attribute zero columns to a real, matched table.
     src = qualified if qualified is not None else tree
 
+    target, embeds_reads = _write_target(src)
+
+    # A write target and a read of the same table (`INSERT INTO t SELECT ... FROM t`) are
+    # tracked as separate entries: the read must still be policy-checked.
     per_table = {}
     order = []
     for t in src.find_all(exp.Table):
@@ -225,7 +263,8 @@ def extract_resources(sql, dialect, schema_json):
             continue
         if not t.catalog and not t.db and t.name.lower() in ctes:
             continue
-        key = _table_key(t)
+        is_target = t is target
+        key = _table_key(t) + (is_target,)
         if key not in per_table:
             per_table[key] = {
                 "catalog": t.catalog or None,
@@ -233,6 +272,7 @@ def extract_resources(sql, dialect, schema_json):
                 "table": t.name,
                 "columns": set(),
                 "all": False,
+                "target": is_target,
             }
             order.append(key)
 
@@ -250,7 +290,7 @@ def extract_resources(sql, dialect, schema_json):
         for col in qualified.find_all(exp.Column):
             tbl = col.table
             if tbl and tbl in alias_to_table:
-                k = alias_to_table[tbl]
+                k = alias_to_table[tbl] + (False,)
                 if k in per_table:
                     per_table[k]["columns"].add(col.name)
     else:
@@ -267,8 +307,9 @@ def extract_resources(sql, dialect, schema_json):
             "schema": e["schema"],
             "table": e["table"],
             "columns": cols,
+            "target": e["target"],
         })
-    return json.dumps(out)
+    return json.dumps({"resources": out, "embeds_reads": embeds_reads})
 
 
 def rewrite_table_scans(sql, dialect, schema_json, policies_json):
@@ -276,6 +317,9 @@ def rewrite_table_scans(sql, dialect, schema_json, policies_json):
     policies = json.loads(policies_json)
     tree = sqlglot.parse_one(sql, dialect=dialect or None)
     ctes = _cte_names(tree)
+    # The write target is not a scan site: swapping it for a filtered subquery would
+    # produce invalid SQL (`UPDATE (SELECT ...) AS t ...`) and would not restrict anything.
+    target, _ = _write_target(tree)
 
     # index policies by matchable name (bare + qualified, lowercased)
     by_name = {}
@@ -367,7 +411,7 @@ def rewrite_table_scans(sql, dialect, schema_json, policies_json):
 
     replaced = 0
     for t in list(tree.find_all(exp.Table)):
-        if not t.name:
+        if t is target or not t.name:
             continue
         if not t.catalog and not t.db and t.name.lower() in ctes:
             continue
@@ -424,27 +468,51 @@ fn extract_resources_gil(
     sql: &str,
     dialect: &str,
     schema_json: &str,
-) -> Result<Vec<ExtractedResource>> {
+) -> Result<ExtractedStatement> {
     let module = load_module(py)?;
     let json: String = module
         .getattr("extract_resources")
         .and_then(|f| f.call1((sql, dialect, schema_json)))
         .and_then(|v| v.extract())
         .map_err(|e| QueryFluxError::Translation(format!("extract_resources: {e}")))?;
-    let raw: Vec<RawResource> = serde_json::from_str(&json)
+    let raw: RawOutput = serde_json::from_str(&json)
         .map_err(|e| QueryFluxError::Translation(format!("extract_resources decode: {e}")))?;
-    Ok(raw
-        .into_iter()
-        .map(|r| ExtractedResource {
-            catalog: r.catalog,
-            schema: r.schema,
-            table: r.table,
-            columns: match r.columns {
-                Some(c) => Columns::Named(c),
-                None => Columns::All,
-            },
-        })
-        .collect())
+    match raw {
+        RawOutput::Ok {
+            resources,
+            embeds_reads,
+        } => Ok(ExtractedStatement {
+            resources: resources
+                .into_iter()
+                .map(|r| ExtractedResource {
+                    catalog: r.catalog,
+                    schema: r.schema,
+                    table: r.table,
+                    columns: match r.columns {
+                        Some(c) => Columns::Named(c),
+                        None => Columns::All,
+                    },
+                    is_write_target: r.target,
+                })
+                .collect(),
+            embeds_reads,
+        }),
+        RawOutput::Err { error } => Err(QueryFluxError::Translation(format!(
+            "extract_resources: could not parse SQL: {error}"
+        ))),
+    }
+}
+
+#[derive(serde::Deserialize)]
+#[serde(untagged)]
+enum RawOutput {
+    Ok {
+        resources: Vec<RawResource>,
+        embeds_reads: bool,
+    },
+    Err {
+        error: String,
+    },
 }
 
 #[derive(serde::Deserialize)]
@@ -453,6 +521,7 @@ struct RawResource {
     schema: Option<String>,
     table: String,
     columns: Option<Vec<String>>,
+    target: bool,
 }
 
 fn rewrite_table_scans_gil(
@@ -535,9 +604,27 @@ mod tests {
             &SqlDialect::Trino,
             &SchemaContext::default(),
         )
-        .unwrap();
+        .unwrap()
+        .resources;
         let names: std::collections::HashSet<_> = refs.iter().map(|r| r.table.as_str()).collect();
         assert_eq!(names, ["orders", "customers"].into_iter().collect());
+    }
+
+    /// Regression: a genuine parse failure must surface as `Err`, never `Ok(vec![])` — the
+    /// caller (`OpaAccessGuard::check`) only takes its fail-closed `onMissingSchema: deny`
+    /// path on `Err`; conflating a parse failure with "no tables referenced" let an
+    /// unparseable query bypass access control entirely.
+    #[test]
+    fn extract_resources_parse_failure_is_err() {
+        let err = extract_resources(
+            "SELECT FROM FROM (((",
+            &SqlDialect::Trino,
+            &SchemaContext::default(),
+        );
+        assert!(
+            err.is_err(),
+            "a parse failure must be Err, not Ok(vec![]) — Ok(vec![]) must mean 'no tables'"
+        );
     }
 
     #[test]
@@ -547,11 +634,124 @@ mod tests {
             &SqlDialect::Trino,
             &SchemaContext::default(),
         )
-        .unwrap();
+        .unwrap()
+        .resources;
         assert_eq!(
             refs.iter().map(|r| r.table.as_str()).collect::<Vec<_>>(),
             vec!["base"]
         );
+    }
+
+    /// `(reads, write targets, embeds_reads)` for `sql`, table names sorted.
+    fn split_statement(sql: &str) -> (Vec<String>, Vec<String>, bool) {
+        let st = extract_resources(sql, &SqlDialect::Trino, &SchemaContext::default()).unwrap();
+        let pick = |target: bool| {
+            let mut names: Vec<String> = st
+                .resources
+                .iter()
+                .filter(|r| r.is_write_target == target)
+                .map(|r| r.table.clone())
+                .collect();
+            names.sort();
+            names
+        };
+        (pick(false), pick(true), st.embeds_reads)
+    }
+
+    fn names(xs: &[&str]) -> Vec<String> {
+        xs.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// The reads inside a write statement must be reported as reads — otherwise a protected
+    /// table can be copied out via `INSERT … SELECT` / `CREATE TABLE … AS`.
+    #[test]
+    fn extract_resources_separates_reads_from_the_write_target() {
+        for (sql, reads, targets) in [
+            (
+                "INSERT INTO mine (id) SELECT id FROM secret",
+                &["secret"][..],
+                &["mine"][..],
+            ),
+            (
+                "CREATE TABLE copy AS SELECT * FROM secret",
+                &["secret"],
+                &["copy"],
+            ),
+            ("CREATE VIEW v AS SELECT * FROM secret", &["secret"], &["v"]),
+            (
+                "UPDATE t SET x = 1 WHERE id IN (SELECT id FROM secret)",
+                &["secret"],
+                &["t"],
+            ),
+            ("DELETE FROM t WHERE x = 1", &[], &["t"]),
+            ("INSERT INTO t VALUES (1)", &[], &["t"]),
+            (
+                "MERGE INTO t USING s ON t.id = s.id WHEN MATCHED THEN UPDATE SET x = s.x",
+                &["s"],
+                &["t"],
+            ),
+            // A read of the target table itself is still a read.
+            ("INSERT INTO t SELECT * FROM t", &["t"], &["t"]),
+            ("SELECT * FROM orders", &["orders"], &[]),
+        ] {
+            let (r, t, embeds) = split_statement(sql);
+            assert_eq!((r, t), (names(reads), names(targets)), "{sql}");
+            assert!(embeds, "{sql} should embed reads");
+        }
+    }
+
+    /// Statements that merely name a table do not read it and must not be treated as reads.
+    #[test]
+    fn extract_resources_ddl_and_describe_embed_no_reads() {
+        for sql in [
+            "DESCRIBE orders",
+            "DROP TABLE orders",
+            "ALTER TABLE orders ADD COLUMN c INTEGER",
+            "CREATE TABLE orders (id INTEGER)",
+        ] {
+            let (_, _, embeds) = split_statement(sql);
+            assert!(!embeds, "{sql} must not embed reads");
+        }
+    }
+
+    fn policy(table: &str) -> TablePolicy {
+        TablePolicy {
+            table: table.to_string(),
+            row_filters: vec!["x = 1".to_string()],
+            masked_columns: Vec::new(),
+        }
+    }
+
+    /// The write target is not a scan site: replacing it with a filtered subquery would
+    /// emit invalid SQL (`INSERT INTO (SELECT …)`), while the tables it reads still get the
+    /// filter.
+    #[test]
+    fn rewrite_leaves_the_write_target_and_filters_the_reads() {
+        let out = rewrite_table_scans(
+            "INSERT INTO mine SELECT id FROM customers",
+            &SqlDialect::Trino,
+            &SchemaContext::default(),
+            &[policy("mine"), policy("customers")],
+        )
+        .unwrap()
+        .to_lowercase();
+        assert!(
+            out.starts_with("insert into mine"),
+            "target rewritten: {out}"
+        );
+        assert!(out.contains("from (select"), "read not filtered: {out}");
+        assert!(out.contains("x = 1"), "filter missing: {out}");
+
+        let out = rewrite_table_scans(
+            "UPDATE t SET a = 1 WHERE id IN (SELECT id FROM secret)",
+            &SqlDialect::Trino,
+            &SchemaContext::default(),
+            &[policy("t"), policy("secret")],
+        )
+        .unwrap()
+        .to_lowercase();
+        assert!(out.starts_with("update t set"), "target rewritten: {out}");
+        assert!(out.contains("x = 1"), "subquery read not filtered: {out}");
     }
 
     fn named_columns(columns: &Columns) -> Vec<String> {
@@ -573,7 +773,8 @@ mod tests {
             &SqlDialect::Trino,
             &schema,
         )
-        .unwrap();
+        .unwrap()
+        .resources;
         assert_eq!(refs.len(), 1);
         assert_eq!(
             named_columns(&refs[0].columns),
@@ -594,7 +795,8 @@ mod tests {
             &SqlDialect::Trino,
             &schema,
         )
-        .unwrap();
+        .unwrap()
+        .resources;
         assert_eq!(refs.len(), 1);
         assert_eq!(
             named_columns(&refs[0].columns),
@@ -615,7 +817,8 @@ mod tests {
             &SqlDialect::Snowflake,
             &schema,
         )
-        .unwrap();
+        .unwrap()
+        .resources;
         assert_eq!(refs.len(), 1);
         assert_eq!(refs[0].table.to_lowercase(), "orders");
         // Snowflake folds unquoted identifiers to uppercase — columns included —
