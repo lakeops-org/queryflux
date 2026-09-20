@@ -948,14 +948,11 @@ async fn group_by_masked_date_column_groups_on_the_masked_value() {
     .await
     .expect("group by masked date");
     assert_eq!(rows.len(), 2, "got {rows:?}");
-    assert!(
-        rows[0][0].starts_with("2019") && rows[0][0].ends_with("01-01"),
-        "{rows:?}"
-    );
-    assert!(
-        rows[1][0].starts_with("2020") && rows[1][0].ends_with("01-01"),
-        "{rows:?}"
-    );
+    // The truncated value is January 1st of the year. Its *type* is up to the engine —
+    // DuckDB returns a DATE from `date_trunc('year', <date>)` in 1.4 but a TIMESTAMP (with a
+    // `T00:00:00` suffix) from 1.5 on — so match the date part and not what follows it.
+    assert!(rows[0][0].starts_with("2019-01-01"), "{rows:?}");
+    assert!(rows[1][0].starts_with("2020-01-01"), "{rows:?}");
     assert_eq!(rows[0][1], "1");
     assert_eq!(rows[1][1], "1");
 }
