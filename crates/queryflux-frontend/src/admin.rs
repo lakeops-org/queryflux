@@ -2948,8 +2948,8 @@ struct AccessControlDryRunRequest {
     #[serde(default)]
     engine: Option<String>,
     identity: DryRunIdentity,
-    /// Optional table → { column → type } map used to apply column masks.
-    /// When omitted, resolved from the live catalog (same as a real query).
+    /// Optional table → { column → type } map used to apply column masks. Columns are taken
+    /// in name order. When omitted, resolved from the live catalog (same as a real query).
     #[serde(default)]
     schema: Option<HashMap<String, HashMap<String, String>>>,
 }
@@ -3051,7 +3051,16 @@ async fn access_control_dry_run_handler(
         SchemaContext {
             catalog: None,
             database: None,
-            tables,
+            // A JSON object read into a `HashMap` has no stable order, so sort columns by
+            // name to keep the rewrite (and the decision-cache key) deterministic.
+            tables: tables
+                .into_iter()
+                .map(|(table, cols)| {
+                    let mut cols: Vec<_> = cols.into_iter().collect();
+                    cols.sort();
+                    (table, cols.into_iter().collect())
+                })
+                .collect(),
         }
     } else {
         state

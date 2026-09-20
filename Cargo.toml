@@ -30,7 +30,7 @@ repository = "https://github.com/lakeops-org/queryflux"
 
 [workspace.dependencies]
 # Ordered maps (schema column order must survive to the masked-projection rewrite)
-indexmap = "2"
+indexmap = { version = "2", features = ["serde"] }
 # Async runtime
 tokio = { version = "1.50", features = ["full"] }
 tokio-stream = "0.1.18"
