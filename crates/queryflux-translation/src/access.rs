@@ -311,7 +311,13 @@ def rewrite_table_scans(sql, dialect, schema_json, policies_json):
                     if isinstance(e, exp.Star):
                         return True
                     if isinstance(e, exp.Column) and e.name == "*":
-                        return True
+                        # `a.*` expands only `a`; other scans in the same SELECT are not starred.
+                        qualifier = (e.table or "").lower()
+                        if not qualifier or qualifier in (
+                            (table_node.alias or "").lower(),
+                            (table_node.name or "").lower(),
+                        ):
+                            return True
                 return False
             p = p.parent
         return False
@@ -763,6 +769,45 @@ mod tests {
             }],
         );
         assert!(err.is_err());
+    }
+
+    /// `a.*` expands only `a`. With no schema, a masked table that is joined but not starred
+    /// can still be rewritten from its named references; one that *is* starred (by alias or
+    /// by name) can't, and must be refused rather than leak the unmasked column.
+    #[test]
+    fn rewrite_qualified_star_only_applies_to_its_own_scan() {
+        let policy = || {
+            vec![TablePolicy {
+                table: "finance.transactions".into(),
+                row_filters: vec![],
+                masked_columns: vec![("ssn".into(), "NULL".into())],
+            }]
+        };
+        let run = |sql: &str| {
+            rewrite_table_scans(
+                sql,
+                &SqlDialect::Trino,
+                &SchemaContext::default(),
+                &policy(),
+            )
+        };
+
+        let out = run("SELECT a.* FROM other a JOIN finance.transactions b ON a.id = b.id")
+            .expect("a.* does not star the masked table");
+        assert!(
+            out.to_lowercase().contains("null"),
+            "mask must apply: {out}"
+        );
+
+        for starred in [
+            "SELECT b.* FROM other a JOIN finance.transactions b ON a.id = b.id",
+            "SELECT t.* FROM finance.transactions t",
+            "SELECT transactions.* FROM finance.transactions",
+            "SELECT a.*, b.* FROM other a JOIN finance.transactions b ON a.id = b.id",
+            "SELECT * FROM other a JOIN finance.transactions b ON a.id = b.id",
+        ] {
+            assert!(run(starred).is_err(), "must fail closed: {starred}");
+        }
     }
 
     #[test]

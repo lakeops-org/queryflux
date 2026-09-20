@@ -111,7 +111,7 @@ def transform(sql: str, src: str, dst: str) -> str:
         .expect("translate");
     let lower = out.to_lowercase();
     assert!(
-        lower.contains("c") && !lower.contains(" from a") && !lower.contains("from a"),
+        lower.contains("from c") && !lower.contains("from a") && !lower.contains("from b"),
         "expected a->b->c, got: {out}"
     );
 }

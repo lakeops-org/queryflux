@@ -296,7 +296,9 @@
       let body = await res.json().catch(() => ({ raw: true }));
       const columns = [];
       const rows = [];
-      for (let i = 0; i < 40; i++) {
+      const MAX_PAGES = 40;
+      let finished = false;
+      for (let i = 0; i < MAX_PAGES; i++) {
         const err = trinoError(body);
         if (err) return { columns: null, rows: [], error: err, status: res.status, body };
         if (Array.isArray(body.columns) && !columns.length) {
@@ -304,9 +306,23 @@
         }
         if (Array.isArray(body.data)) rows.push(...body.data);
         const next = proxyUri(body.nextUri);
-        if (!next) break;
+        if (!next) {
+          finished = true;
+          break;
+        }
         res = await fetch(next, { headers });
         body = await res.json().catch(() => ({ raw: true }));
+      }
+      if (!finished) {
+        // Still more pages: showing what we have as if it were the whole result would let a
+        // truncated answer pass for a complete one (e.g. hide rows a policy should have hidden).
+        return {
+          columns: null,
+          rows: [],
+          error: `result not complete after ${MAX_PAGES} pages; narrow the query`,
+          status: res.status,
+          body,
+        };
       }
       return { columns, rows, error: null, status: res.status, body };
     }

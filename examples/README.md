@@ -9,7 +9,7 @@ Several stacks for **QueryFlux** + **Trino** (and optional add-ons). Run command
 | [`minimal/`](minimal-trino/) | Yes | Full Studio (query history, persisted clusters/groups/routing via API), production-like persistence |
 | [`minimal-inmemory/`](minimal-inmemory/) | No | Fastest local tryout; config only in `config.yaml`; no shared query history |
 | [`with-mcp/`](with-mcp/) | No | MCP frontend + embedded DuckDB — point an AI agent (Cursor, Claude Code, MCP Inspector, ...) at QueryFlux with zero external services |
-| [`with-opa/`](with-opa/) | No | OPA data access control (allow/deny, row filters, column masks) + Lakekeeper/Trino; QueryFlux from this branch on the host — see [docs](../website/docs/access-control/opa.md) |
+| [`with-opa/`](with-opa/) | Yes (host **5434**) | OPA data access control (allow/deny, row filters, column masks) + Lakekeeper/Trino; QueryFlux from this branch on the host — see [docs](../website/docs/access-control/opa.md) |
 | [`with-prometheus-grafana/`](with-prometheus-grafana/) | Yes | Same workload as minimal + **Prometheus** + **Grafana** (repo [`grafana/`](../grafana/), local scrape config); **no Studio** |
 | [`full-stack/`](full-stack/) | Yes (host **5433**) | Trino + StarRocks + Iceberg/Lakekeeper + MinIO + TPCH loader |
 | [`full-stack-with-prometheus-grafana/`](full-stack-with-prometheus-grafana/) | Yes (host **5433**) | **`full-stack`** + **Prometheus** + **Grafana**; Grafana on **3001** |

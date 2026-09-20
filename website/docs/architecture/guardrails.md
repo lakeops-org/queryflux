@@ -46,7 +46,7 @@ Access-control **policy** (Rego, filters, masks, dry-run) is documented under **
 
 When access control is on, the rewriting guard is `opa_access`.
 
-**Scope** mirrors guardrails' global + `groups` pattern, but lives under `accessControl:` (edited on Studio **Access Control**, not **Guardrails** or **Clusters**): global `enabled` plus optional `groups.<clusterGroup>.enabled` to skip OPA for sandbox groups or opt in only where needed. One OPA connection.
+**Scope** mirrors guardrails' global + `groups` pattern, but lives under `accessControl:` (edited on Studio **Access Control**, not **Guardrails** or **Clusters**): global `enabled` plus optional `groups.<clusterGroup>.enabled` to skip OPA for sandbox groups or opt in only where needed. Policy providers are configured as named `connections` (each with its own OPA endpoint, operations, cache and fail-open setting): a group uses its own `groups.<clusterGroup>.connection` if set, otherwise `defaultConnection`, and a group that resolves to no connection gets no access control.
 
 ### `read_only`
 

@@ -960,7 +960,7 @@ async fn main() -> Result<()> {
     // --- Build the data access-control guard (OPA row filtering / column masking /
     // table-column allow-deny), if configured. Runs on the source SQL, before
     // dialect translation — see `queryflux_frontend::access_control_guard`.
-    let access_control_guard = build_access_control_guard(&config);
+    let access_control_guard = build_access_control_guard(&config, backend.as_deref()).await?;
 
     // --- Build guard chains: DB-stored config (UI-managed) takes precedence over YAML ---
     // When a persisted config exists in Postgres it is authoritative, even if it
@@ -3226,8 +3226,8 @@ async fn reload_live_config(
     live.authorization = prev.authorization.clone();
     live.guard_chain = prev.guard_chain.clone();
     live.group_guard_chains = prev.group_guard_chains.clone();
-    // Access control is YAML at startup; Studio/admin PUT `access_control_config`
-    // overrides it on reload (same contract as catalog / guardrails).
+    // Startup already applied any stored `access_control_config` over the YAML; reload
+    // re-reads it below and overrides on success (same contract as catalog / guardrails).
     live.access_control_guard = prev.access_control_guard.clone();
     live.catalog = prev.catalog.clone();
 
@@ -3554,20 +3554,44 @@ fn make_http_webhook_guard(
     }
 }
 
-/// Build the data access-control guard from `access_control:` config. Returns `None` when
-/// the section is absent. Since the config was already validated at startup
-/// (`ProxyConfig::validate_startup_security`), any residual build failure here (e.g. the
-/// OPA client couldn't be constructed) aborts startup rather than silently disabling
-/// enforcement the operator explicitly configured.
-fn build_access_control_guard(
+/// Build the data access-control guard at startup.
+///
+/// A persisted `access_control_config` (Studio / admin API) is authoritative when present —
+/// the same contract reload and guardrails follow — so a restart doesn't leave the stored
+/// policy inactive behind a missing or weaker YAML section. Without one, the `access_control:`
+/// YAML section is used, and `None` when that is absent too.
+///
+/// Anything that stops a stored policy from being read or built aborts startup: serving
+/// queries with a weaker policy than the operator saved would be a silent bypass. The YAML
+/// was already validated by `ProxyConfig::validate_startup_security`, so a residual build
+/// failure there aborts too rather than quietly disabling enforcement.
+async fn build_access_control_guard(
     config: &queryflux_core::config::ProxyConfig,
-) -> Option<Arc<OpaAccessGuard>> {
-    let cfg = config.access_control.as_ref()?;
-    Some(OpaAccessGuard::try_from_config(cfg).unwrap_or_else(|e| {
-        panic!(
-            "access_control config failed to build (should have been caught by startup validation): {e}"
-        )
-    }))
+    backend: Option<&dyn BackendStore>,
+) -> Result<Option<Arc<OpaAccessGuard>>> {
+    if let Some(store) = backend {
+        match store.get_proxy_setting("access_control_config").await {
+            Ok(Some(v)) => {
+                return apply_stored_access_control(&v).map_err(|e| {
+                    anyhow::anyhow!(
+                        "stored access_control_config could not be applied; refusing to start \
+                         with a weaker policy: {e}"
+                    )
+                });
+            }
+            Ok(None) => {}
+            Err(e) => anyhow::bail!(
+                "could not read stored access_control_config; refusing to start with a \
+                 possibly weaker policy: {e}"
+            ),
+        }
+    }
+    let Some(cfg) = config.access_control.as_ref() else {
+        return Ok(None);
+    };
+    OpaAccessGuard::try_from_config(cfg)
+        .map(Some)
+        .map_err(|e| anyhow::anyhow!("access_control config failed to build: {e}"))
 }
 
 fn apply_stored_access_control(

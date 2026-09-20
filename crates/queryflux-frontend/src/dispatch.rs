@@ -567,6 +567,14 @@ pub async fn dispatch_query(
         }
     }
 
+    // Computed before parameter interpolation: filling in `?` placeholders is not dialect
+    // translation, so it must not flip `was_translated` (nor land literals in `translated_sql`).
+    let pipeline = crate::sql_pipeline::SqlPipelineMeta::compute(
+        &access_controlled_sql,
+        &engine_sql,
+        access_control_rewrote,
+    );
+
     // Fallback interpolation for async adapters that don't support native params.
     let (engine_sql, effective_params) = if !params.is_empty() {
         (
@@ -577,11 +585,6 @@ pub async fn dispatch_query(
         (engine_sql, params)
     };
 
-    let pipeline = crate::sql_pipeline::SqlPipelineMeta::compute(
-        &access_controlled_sql,
-        &engine_sql,
-        access_control_rewrote,
-    );
     if pipeline.was_translated {
         info!(id = %query_id, src = ?src_dialect, tgt = ?tgt_dialect, "SQL translated");
     } else if pipeline.was_rewritten {
@@ -1858,6 +1861,14 @@ async fn setup_sync_query(
     let wire_auth: Option<StoredWireAuth> =
         resolve_stored_wire_auth(&credentials, &session, cluster_sets_http_auth);
 
+    // Computed before parameter interpolation: filling in `?` placeholders is not dialect
+    // translation, so it must not flip `was_translated` (nor land literals in `translated_sql`).
+    let pipeline = crate::sql_pipeline::SqlPipelineMeta::compute(
+        &access_controlled_sql,
+        &translated,
+        access_control_rewrote,
+    );
+
     // Fallback interpolation: when the adapter does not support native params,
     // substitute `?` placeholders with typed literals now so the adapter receives
     // a fully-resolved SQL string and empty params.
@@ -1871,11 +1882,6 @@ async fn setup_sync_query(
         (translated, params)
     };
 
-    let pipeline = crate::sql_pipeline::SqlPipelineMeta::compute(
-        &access_controlled_sql,
-        &translated,
-        access_control_rewrote,
-    );
     let (was_rewritten, rewritten_sql, was_translated, translated_sql) =
         crate::sql_pipeline::pipeline_fields(&pipeline);
 

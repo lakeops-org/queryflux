@@ -225,8 +225,12 @@ pub struct GroupOverride {
 }
 
 /// Top-level `accessControl:` config section.
+/// Unknown keys are rejected on purpose. Access control used to be one flat block
+/// (`opa`, `operations`, `failOpen`, `cacheTtlMs`, …); those keys now live under
+/// `connections.<name>`. Ignoring them would leave `connections` empty — which resolves to
+/// *no* access control — so an un-migrated config would silently stop enforcing anything.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AccessControlConfig {
     /// Default for cluster groups without an explicit `groups.<name>.enabled` override.
     #[serde(default = "default_enabled")]
@@ -261,19 +265,12 @@ impl Default for AccessControlConfig {
 impl AccessControlConfig {
     /// Parse a Studio / Admin API blob.
     ///
-    /// JSON `null`, or any body with no (or an empty) `connections` map, turns access
+    /// JSON `null`, or a well-formed body with an empty `connections` map, turns access
     /// control off entirely — with nothing under `connections`, no group could ever resolve
     /// a connection anyway. Any other object is deserialized as [`AccessControlConfig`] and
-    /// validated.
+    /// validated; unknown keys (notably the legacy flat layout) are an error, never "off".
     pub fn from_admin_value(v: &serde_json::Value) -> Result<Option<Self>, String> {
         if v.is_null() {
-            return Ok(None);
-        }
-        let has_connections = v
-            .get("connections")
-            .and_then(|c| c.as_object())
-            .is_some_and(|o| !o.is_empty());
-        if !has_connections {
             return Ok(None);
         }
         let mut obj = v.clone();
@@ -291,8 +288,24 @@ impl AccessControlConfig {
                 }
             }
         }
-        let cfg: Self = serde_json::from_value(obj)
-            .map_err(|e| format!("invalid accessControl config: {e}"))?;
+        // Parse before deciding it is "off": a body with no `connections` is only a no-op when
+        // it really is empty, not when it carries the legacy flat keys `deny_unknown_fields`
+        // is there to catch.
+        let cfg: Self = serde_json::from_value(obj).map_err(|e| {
+            let msg = e.to_string();
+            if msg.contains("unknown field") {
+                format!(
+                    "invalid accessControl config: {msg} (the flat opa/operations/failOpen \
+                     layout was replaced by named connections: move those settings under \
+                     `connections.<name>` and set `defaultConnection`)"
+                )
+            } else {
+                format!("invalid accessControl config: {msg}")
+            }
+        })?;
+        if cfg.connections.is_empty() {
+            return Ok(None);
+        }
         cfg.validate()?;
         Ok(Some(cfg))
     }
@@ -608,5 +621,44 @@ mod tests {
         };
         let err = cfg.validate().unwrap_err();
         assert!(err.contains("does-not-exist"), "unexpected error: {err}");
+    }
+
+    /// The flat layout (`opa`, `operations`, `failOpen`, …) predates named connections.
+    /// It must fail to load — silently parsing it to "no connections" would switch access
+    /// control off for a deployment that thinks it is protected.
+    #[test]
+    fn legacy_flat_config_is_rejected_not_ignored() {
+        let legacy_yaml = r#"
+enabled: true
+opa:
+  url: http://opa:8181
+operations: [table.select]
+failOpen: false
+"#;
+        let err = serde_yaml::from_str::<AccessControlConfig>(legacy_yaml)
+            .expect_err("legacy flat YAML must not deserialize")
+            .to_string();
+        assert!(err.contains("unknown field"), "{err}");
+
+        let legacy_json = json!({
+            "enabled": true,
+            "opa": { "url": "http://opa:8181" },
+            "operations": ["table.select"]
+        });
+        let err = AccessControlConfig::from_admin_value(&legacy_json).unwrap_err();
+        assert!(
+            err.contains("unknown field") && err.contains("connections.<name>"),
+            "{err}"
+        );
+
+        // Not a blanket rejection: the current shape and the explicit "off" forms still load.
+        assert!(AccessControlConfig::from_admin_value(&json!({}))
+            .unwrap()
+            .is_none());
+        assert!(AccessControlConfig::from_admin_value(
+            &json!({ "enabled": true, "connections": {} })
+        )
+        .unwrap()
+        .is_none());
     }
 }

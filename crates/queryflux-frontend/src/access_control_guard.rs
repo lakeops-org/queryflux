@@ -185,6 +185,12 @@ impl Guard for OpaAccessGuard {
     }
 
     async fn check(&self, ctx: &GuardContext<'_>) -> GuardResult {
+        // Administratively disabled (globally or for this group): never call the provider,
+        // whatever the caller did before reaching us.
+        if !self.enabled_for_group(&ctx.cluster_group.0) {
+            return GuardResult::allow();
+        }
+
         // No connection resolves for this group (no explicit override and no
         // `defaultConnection`) — access control simply does not apply here.
         let Some(conn) = self.connection_for_group(&ctx.cluster_group.0) else {
@@ -667,6 +673,76 @@ mod tests {
         match guard.check(&ctx).await {
             GuardResult::Allow { .. } => {}
             other => panic!("expected a plain allow (no connection resolved), got {other:?}"),
+        }
+    }
+
+    /// `enabled: false` (globally, or for one group) must stop `check()` before it talks to
+    /// the provider, even though a connection resolves — a disabled group must never receive
+    /// a rewrite or a denial.
+    #[tokio::test]
+    async fn disabled_group_is_allowed_without_a_call() {
+        let stub_url = start_tagged_stub("stub").await;
+        let group_off = || GroupOverride {
+            enabled: Some(false),
+            fail_open: None,
+            connection: None,
+        };
+        let group_on = || GroupOverride {
+            enabled: Some(true),
+            fail_open: None,
+            connection: None,
+        };
+        let connections = || HashMap::from([("default".to_string(), opa_connection(&stub_url))]);
+
+        // Enabled globally, off for `off-group`.
+        let per_group = AccessControlConfig {
+            enabled: true,
+            default_connection: Some("default".to_string()),
+            connections: connections(),
+            groups: HashMap::from([("off-group".to_string(), group_off())]),
+        };
+        // Off globally, on for `on-group`.
+        let globally_off = AccessControlConfig {
+            enabled: false,
+            default_connection: Some("default".to_string()),
+            connections: connections(),
+            groups: HashMap::from([("on-group".to_string(), group_on())]),
+        };
+
+        let dialect = SqlDialect::Postgres;
+        let engine_type = EngineType::Trino;
+        let sql = "SELECT id FROM orders";
+        let sql_parse = SqlParseCache::new(sql.to_string(), dialect.clone());
+        let attributes = BTreeMap::new();
+        let query_tags = QueryTags::new();
+        let session_extra = HashMap::new();
+
+        for (cfg, group, expect_rewrite) in [
+            (&per_group, "off-group", false),
+            (&per_group, "other-group", true),
+            (&globally_off, "any-group", false),
+            (&globally_off, "on-group", true),
+        ] {
+            let guard = OpaAccessGuard::try_from_config(cfg).expect("build guard");
+            let group = ClusterGroupName(group.to_string());
+            let ctx = plan_ctx(
+                sql,
+                &dialect,
+                &engine_type,
+                &group,
+                &attributes,
+                &query_tags,
+                &session_extra,
+                &sql_parse,
+            );
+            match (guard.check(&ctx).await, expect_rewrite) {
+                (GuardResult::Rewrite { .. }, true) => {}
+                (GuardResult::Allow { .. }, false) => {}
+                (other, _) => panic!(
+                    "group {:?}: expected rewrite={expect_rewrite}, got {other:?}",
+                    group.0
+                ),
+            }
         }
     }
 }
