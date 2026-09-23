@@ -82,14 +82,14 @@ Humans authenticate; access control points at one named connection. Pick OPA or 
 auth:
   provider: static          # or oidc — map groups/roles from the IdP
   required: true
-  static:
+  staticUsers:
     users:
-      - username: alice
-        passwordHash: "..."
+      alice:
+        password: "YOUR_PASSWORD_HERE"
         groups: [engineers]
         roles: [engineer]
-      - username: bob
-        passwordHash: "..."
+      bob:
+        password: "YOUR_PASSWORD_HERE"
         groups: [analysts]
         roles: [analyst]
 

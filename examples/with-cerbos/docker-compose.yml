@@ -47,7 +47,9 @@ services:
     restart: unless-stopped
 
   trino:
-    image: trinodb/trino:latest
+    # Pinned to match data-seed's client below — CATALOG_MANAGEMENT=dynamic syntax can
+    # change incompatibly between Trino releases, so client and server must stay in sync.
+    image: trinodb/trino:476
     environment:
       - CATALOG_MANAGEMENT=dynamic
     ports:
@@ -64,6 +66,8 @@ services:
     image: postgres:17
     environment:
       - POSTGRES_PASSWORD=postgres
+    volumes:
+      - lakekeeper-db:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres -p 5432 -d postgres"]
       interval: 2s
@@ -72,11 +76,13 @@ services:
       start_period: 10s
 
   minio:
-    image: minio/minio
+    image: quay.io/minio/minio
     environment:
       - MINIO_ROOT_USER=minio-root-user
       - MINIO_ROOT_PASSWORD=minio-root-password
     command: ["server", "--console-address", ":9001", "/data"]
+    volumes:
+      - minio-data:/data
     healthcheck:
       test: ["CMD", "mc", "ready", "local"]
       interval: 2s
@@ -85,7 +91,7 @@ services:
       start_period: 15s
 
   createbuckets:
-    image: minio/minio
+    image: quay.io/minio/minio
     depends_on:
       minio:
         condition: service_healthy
@@ -146,10 +152,11 @@ services:
     command:
       - -c
       - >
-        curl -sf -X POST http://lakekeeper:8181/management/v1/bootstrap
+        status=$(curl -s -o /tmp/resp -w '%{http_code}' -X POST http://lakekeeper:8181/management/v1/bootstrap
         -H 'Content-Type: application/json'
-        --data '{"accept-terms-of-use": true}';
-        exit 0
+        --data '{"accept-terms-of-use": true}');
+        case "$status" in 2??|409) exit 0 ;; esac;
+        cat /tmp/resp >&2; echo "bootstrap failed with HTTP $status" >&2; exit 1
 
   initialwarehouse:
     image: curlimages/curl
@@ -163,10 +170,11 @@ services:
     command:
       - -c
       - >
-        curl -sf -X POST http://lakekeeper:8181/management/v1/warehouse
+        status=$(curl -s -o /tmp/resp -w '%{http_code}' -X POST http://lakekeeper:8181/management/v1/warehouse
         -H 'Content-Type: application/json'
-        --data @/config/create-warehouse.json;
-        exit 0
+        --data @/config/create-warehouse.json);
+        case "$status" in 2??|409) exit 0 ;; esac;
+        cat /tmp/resp >&2; echo "warehouse creation failed with HTTP $status" >&2; exit 1
     volumes:
       - ../../docker/fixtures/create-warehouse.json:/config/create-warehouse.json:ro
 
@@ -201,3 +209,5 @@ services:
 
 volumes:
   queryflux-pg:
+  lakekeeper-db:
+  minio-data:

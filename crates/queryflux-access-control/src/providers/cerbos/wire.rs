@@ -29,7 +29,8 @@
 
 use std::collections::BTreeMap;
 
-use serde::{Deserialize, Serialize};
+use serde::ser::SerializeMap;
+use serde::{Deserialize, Serialize, Serializer};
 use serde_json::Value;
 
 use queryflux_core::access_model::{
@@ -55,11 +56,32 @@ pub(super) struct CerbosPrincipal<'a> {
     pub attr: PrincipalAttr<'a>,
 }
 
-#[derive(Serialize)]
+/// `groups` is a dedicated field (Cerbos policies match `P.attr.groups` directly), but
+/// `attributes` is an operator-configured, arbitrary-keyed map (`auth.oidc.attributeClaims`
+/// can name any JWT claim, including one literally called `groups`) — flattening it
+/// alongside the `groups` field with `#[serde(flatten)]` would then emit the `"groups"` key
+/// twice, which Cerbos's protojson decoder rejects outright (every request from that
+/// principal fails as a provider error, not a policy decision). Serialized by hand instead
+/// so a same-named attribute is dropped rather than colliding.
 pub(super) struct PrincipalAttr<'a> {
     pub groups: &'a [String],
-    #[serde(flatten)]
     pub attributes: &'a BTreeMap<String, Value>,
+}
+
+impl<'a> Serialize for PrincipalAttr<'a> {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut map = serializer.serialize_map(Some(1 + self.attributes.len()))?;
+        map.serialize_entry("groups", self.groups)?;
+        for (key, value) in self.attributes {
+            if key != "groups" {
+                map.serialize_entry(key, value)?;
+            }
+        }
+        map.end()
+    }
 }
 
 #[derive(Serialize)]
@@ -84,6 +106,13 @@ pub(super) struct ResourceAttr<'a> {
     pub table: &'a str,
     /// `null` = all columns (schema unresolved / `SELECT *`).
     pub columns: Option<&'a [String]>,
+    /// The allowlisted subset of `SessionContext.extra` named by
+    /// `accessControl.connections.<name>.sessionParamKeys` — policies read it as
+    /// `R.attr.sessionParams.<key>` (see the delegation pattern in the module/website
+    /// docs). Never trusted for allow/deny by QueryFlux itself; only usable to *build* a
+    /// filter expression the policy returns.
+    #[serde(rename = "sessionParams", skip_serializing_if = "BTreeMap::is_empty")]
+    pub session_params: &'a BTreeMap<String, String>,
 }
 
 pub(super) fn to_request<'a>(
@@ -116,6 +145,7 @@ pub(super) fn to_request<'a>(
                             Columns::All => None,
                             Columns::Named(c) => Some(c.as_slice()),
                         },
+                        session_params: &req.context.session_params,
                     },
                 },
                 actions: [action],
@@ -147,8 +177,13 @@ pub(super) struct CerbosOutput {
 }
 
 /// The `val` shape QueryFlux's own policies must emit to contribute a row filter or
-/// column mask — see the module doc. An output whose `val` doesn't match either shape
-/// (e.g. an unrelated audit-message output) is silently skipped, not an error.
+/// column mask — see the module doc. One activated rule contributes exactly one
+/// `outputs[]` entry, but its `val` may itself be a *list* of `{"kind": ...}` objects — a
+/// single rule masking several columns (or combining a row filter with column masks) in
+/// one CEL expression, rather than needing a separate rule per output; both a bare object
+/// and a list of objects are accepted (see [`parse_recognized_output`]). An output with no
+/// recognized `kind` (e.g. an unrelated audit-message output) is skipped, not an error; one
+/// *with* a recognized `kind` that fails to parse is.
 #[derive(Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum PolicyOutput {
@@ -161,23 +196,19 @@ enum PolicyOutput {
     },
 }
 
-/// One activated rule contributes exactly one `outputs[]` entry, but its `val` may itself
-/// be a *list* of `{"kind": ...}` objects — a single rule masking several columns (or
-/// combining a row filter with column masks) in one CEL expression, rather than needing a
-/// separate rule per output. Both a bare object and a list of objects are accepted.
-#[derive(Deserialize)]
-#[serde(untagged)]
-enum PolicyOutputs {
-    One(PolicyOutput),
-    Many(Vec<PolicyOutput>),
-}
-
-impl PolicyOutputs {
-    fn into_vec(self) -> Vec<PolicyOutput> {
-        match self {
-            PolicyOutputs::One(o) => vec![o],
-            PolicyOutputs::Many(v) => v,
-        }
+/// Classifies one item from an `outputs[].val` — a bare object, or one element of a list —
+/// as ours (`Some`/`Err`) or not (`None`). Recognized by `"kind"` *before* attempting to
+/// deserialize the rest of the shape: an unrelated output legitimately has no `kind`, or a
+/// `kind` this provider doesn't define, and must be skipped, not treated as a parse
+/// failure. A `kind` of `row_filter`/`column_mask` that *does* fail to parse (missing
+/// field, wrong type — e.g. a policy typo like `"type": "SHOW_LAST4"`) is a QueryFlux
+/// output that's ours to apply, and reports as an error rather than silently vanishing.
+fn parse_recognized_output(val: &Value) -> Result<Option<PolicyOutput>, String> {
+    match val.get("kind").and_then(Value::as_str) {
+        Some(kind @ ("row_filter" | "column_mask")) => serde_json::from_value(val.clone())
+            .map(Some)
+            .map_err(|e| format!("malformed {kind} output: {e}")),
+        _ => Ok(None),
     }
 }
 
@@ -212,23 +243,44 @@ pub(super) fn from_response(
 
             let mut row_filters = Vec::new();
             let mut column_masks = Vec::new();
-            for output in result.outputs {
-                let Ok(parsed) = serde_json::from_value::<PolicyOutputs>(output.val) else {
-                    // Not a row-filter/column-mask output (e.g. an unrelated audit
-                    // message) — not this provider's concern.
-                    continue;
+            let mut malformed: Option<String> = None;
+            'outputs: for output in result.outputs {
+                let items: Vec<Value> = match output.val {
+                    Value::Array(items) => items,
+                    other => vec![other],
                 };
-                for item in parsed.into_vec() {
-                    match item {
-                        PolicyOutput::RowFilter { expression } => {
+                for item in items {
+                    match parse_recognized_output(&item) {
+                        Ok(None) => {}
+                        Ok(Some(PolicyOutput::RowFilter { expression })) => {
                             row_filters.push(RowFilter {
                                 expression: Some(expression),
                                 ucast: None,
                             });
                         }
-                        PolicyOutput::ColumnMask { mask } => column_masks.push(mask),
+                        Ok(Some(PolicyOutput::ColumnMask { mask })) => column_masks.push(mask),
+                        Err(reason) => {
+                            malformed = Some(reason);
+                            break 'outputs;
+                        }
                     }
                 }
+            }
+
+            // A recognized-but-malformed row_filter/column_mask output means the policy
+            // author asked for a restriction QueryFlux couldn't apply — the resource must
+            // not read as allowed-and-unrestricted just because parsing failed.
+            if let Some(reason) = malformed {
+                return ResourceDecision {
+                    table: req_resource.table.clone(),
+                    allow: false,
+                    reason: Some(format!(
+                        "policy output for {} could not be applied: {reason}",
+                        req_resource.table
+                    )),
+                    row_filters: Vec::new(),
+                    column_masks: Vec::new(),
+                };
             }
 
             ResourceDecision {
@@ -327,6 +379,71 @@ mod tests {
         assert_eq!(masks[0].0, "orders");
         assert_eq!(masks[0].1.column, "ssn");
         assert_eq!(masks[0].1.mask_type, MaskType::ShowLast4);
+    }
+
+    /// Regression: a `column_mask` output with a typo'd `type` (e.g. `SHOW_LAST4` instead
+    /// of `SHOW_LAST_4`) is *ours* — its `kind` says so — and must deny the resource rather
+    /// than silently running with the column unmasked.
+    #[test]
+    fn malformed_column_mask_denies_rather_than_dropping_the_mask() {
+        let resp: CheckResourcesResponse = serde_json::from_str(
+            r#"{"results": [{"actions": {"table.select": "EFFECT_ALLOW"}, "outputs": [
+                {"src": "r#rule", "val": {"kind": "column_mask", "column": "ssn", "type": "SHOW_LAST4"}}
+            ]}]}"#,
+        )
+        .unwrap();
+        let decision = from_response(resp, &requested(&["orders"]));
+        assert!(!decision.is_allowed());
+        let (table, reason) = decision.first_denied().unwrap();
+        assert_eq!(table, "orders");
+        assert!(reason.contains("malformed"), "got: {reason}");
+    }
+
+    /// Same regression for `row_filter`: a non-string `expression` (e.g. a CEL condition
+    /// that evaluated to a number) must deny, not vanish along with the restriction.
+    #[test]
+    fn malformed_row_filter_denies_rather_than_dropping_the_filter() {
+        let resp: CheckResourcesResponse = serde_json::from_str(
+            r#"{"results": [{"actions": {"table.select": "EFFECT_ALLOW"}, "outputs": [
+                {"src": "r#rule", "val": {"kind": "row_filter", "expression": 1}}
+            ]}]}"#,
+        )
+        .unwrap();
+        let decision = from_response(resp, &requested(&["orders"]));
+        assert!(!decision.is_allowed());
+    }
+
+    /// An output with no recognized `kind` at all (some other feature's output) is still
+    /// skipped, not treated as a denial — only *our* kinds are held to this standard.
+    #[test]
+    fn output_with_unrecognized_kind_is_still_skipped() {
+        let resp: CheckResourcesResponse = serde_json::from_str(
+            r#"{"results": [{"actions": {"table.select": "EFFECT_ALLOW"}, "outputs": [
+                {"src": "r#rule", "val": {"kind": "audit_note", "message": "checked"}}
+            ]}]}"#,
+        )
+        .unwrap();
+        let decision = from_response(resp, &requested(&["orders"]));
+        assert!(decision.is_allowed());
+        assert!(!decision.has_rewrite());
+    }
+
+    /// A list `val` with one valid row_filter and one malformed column_mask must not let
+    /// the valid entry's absence-of-error paper over the malformed one — the resource is
+    /// still denied, even though the row filter alone parsed fine.
+    #[test]
+    fn one_malformed_item_in_a_list_denies_even_if_a_sibling_item_is_valid() {
+        let resp: CheckResourcesResponse = serde_json::from_str(
+            r#"{"results": [{"actions": {"table.select": "EFFECT_ALLOW"}, "outputs": [
+                {"src": "r#rule", "val": [
+                    {"kind": "row_filter", "expression": "region = 'EU'"},
+                    {"kind": "column_mask", "column": "ssn", "type": "NOT_A_REAL_TYPE"}
+                ]}
+            ]}]}"#,
+        )
+        .unwrap();
+        let decision = from_response(resp, &requested(&["orders"]));
+        assert!(!decision.is_allowed());
     }
 
     #[test]
@@ -526,5 +643,65 @@ mod tests {
         assert_eq!(wire_req.principal.id, "bob");
         assert_eq!(wire_req.principal.roles, ["analyst".to_string()]);
         assert_eq!(wire_req.principal.attr.groups, ["analysts".to_string()]);
+    }
+
+    /// Regression: the delegation pattern documented on the Cerbos provider page
+    /// (`R.attr.sessionParams.customer_id`) requires the allowlisted session params to
+    /// actually reach the resource `attr` on the wire — without this, `sessionParamKeys`
+    /// silently does nothing for Cerbos even though the same config key works for OPA.
+    #[test]
+    fn to_request_forwards_session_params_into_resource_attr() {
+        let mut req = requested(&["orders"]);
+        req.context
+            .session_params
+            .insert("customer_id".to_string(), "cust-42".to_string());
+        let wire_req = to_request("req-1", &req);
+        let value = serde_json::to_value(&wire_req.resources[0].resource.attr).unwrap();
+        assert_eq!(value["sessionParams"]["customer_id"], "cust-42");
+    }
+
+    /// No session params configured → the key is omitted entirely rather than sent as an
+    /// empty object on every request.
+    #[test]
+    fn to_request_omits_session_params_when_empty() {
+        let req = requested(&["orders"]);
+        let wire_req = to_request("req-1", &req);
+        let value = serde_json::to_value(&wire_req.resources[0].resource.attr).unwrap();
+        assert!(value.get("sessionParams").is_none());
+    }
+
+    /// Regression: `auth.oidc.attributeClaims` is operator-configured and can name any JWT
+    /// claim, including one literally called `groups`. Flattening `attributes` alongside
+    /// the dedicated `groups` field would then serialize the `"groups"` key twice — valid
+    /// JSON, but Cerbos's protojson decoder rejects duplicate object keys outright, turning
+    /// every request from that principal into a provider error instead of a policy
+    /// decision. The struct's own `groups` field must win; the colliding attribute is
+    /// dropped rather than emitted a second time.
+    #[test]
+    fn principal_attr_does_not_duplicate_the_groups_key_when_an_attribute_is_named_groups() {
+        let mut req = requested(&["orders"]);
+        req.identity.groups = vec!["analysts".to_string()];
+        req.identity
+            .attributes
+            .insert("groups".to_string(), serde_json::json!(["from-claim"]));
+        req.identity
+            .attributes
+            .insert("region".to_string(), serde_json::json!("eu"));
+        let wire_req = to_request("req-1", &req);
+
+        let value = serde_json::to_value(&wire_req.principal.attr).unwrap();
+        let obj = value.as_object().unwrap();
+        assert_eq!(obj.get("groups"), Some(&serde_json::json!(["analysts"])));
+        assert_eq!(obj.get("region"), Some(&serde_json::json!("eu")));
+
+        // `serde_json::Value` collapses duplicate keys on the way in, so also check the
+        // exact byte stream for a second `"groups":` occurrence, which is what Cerbos's
+        // decoder actually receives and rejects.
+        let raw = serde_json::to_string(&wire_req.principal.attr).unwrap();
+        assert_eq!(
+            raw.matches("\"groups\":").count(),
+            1,
+            "the wire payload must contain \"groups\" exactly once, got: {raw}"
+        );
     }
 }

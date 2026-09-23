@@ -199,12 +199,15 @@ control live; saves go to `proxy_settings` in that same database.
 ## Stop
 
 ```bash
-docker compose down          # keep data for next time
-docker compose down -v       # also wipe Iceberg data + QueryFlux history
+docker compose down          # keep Lakekeeper metadata, MinIO objects, and QueryFlux history
+docker compose down -v       # also wipe them
 ```
 
-Re-run `docker compose --profile seed run --rm data-seed` after a fresh
-(volume-wiped) stack to recreate the demo tables.
+Trino itself has no persistent storage — its dynamically-registered catalog
+does not survive `down` either way, so re-run
+`docker compose --profile seed run --rm data-seed` after **any** restart
+(`down`/`up` or `down -v`/`up`) to re-register the catalog and, on a
+volume-wiped stack, recreate the demo tables.
 
 ## Ports
 

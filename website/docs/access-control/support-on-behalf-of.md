@@ -87,18 +87,18 @@ Do **not** set `identity.user` to `acct_9f3a`. Keep the actor as the agent so au
 auth:
   provider: static
   required: true
-  static:
+  staticUsers:
     users:
-      - username: sam
-        passwordHash: "..."
+      sam:
+        password: "YOUR_PASSWORD_HERE"
         groups: [support]
         roles: [support]
-      - username: morgan
-        passwordHash: "..."
+      morgan:
+        password: "YOUR_PASSWORD_HERE"
         groups: [support_leads]
         roles: [support_lead]
-      - username: support-desk
-        passwordHash: "..."
+      support-desk:
+        password: "YOUR_PASSWORD_HERE"
         groups: [support]
         roles: [support]
 

@@ -1,5 +1,9 @@
--- Bootstrap Lakekeeper Iceberg tables for the OPA demo (Trino inside Compose).
+-- Bootstrap Lakekeeper Iceberg tables for the Cerbos demo (Trino inside Compose).
 -- S3 endpoint targets MinIO on the Docker network.
+--
+-- Safe to re-run: never drops a table, and only inserts fixture rows that aren't
+-- already present (by id) — running this because ONE demo table is missing must not
+-- wipe rows a user added to, or changed in, the OTHER table.
 
 DROP CATALOG IF EXISTS lakekeeper;
 
@@ -19,26 +23,34 @@ WITH (
 
 CREATE SCHEMA IF NOT EXISTS lakekeeper.demo;
 
-DROP TABLE IF EXISTS lakekeeper.demo.customers;
-CREATE TABLE lakekeeper.demo.customers (
+CREATE TABLE IF NOT EXISTS lakekeeper.demo.customers (
   id INTEGER,
   name VARCHAR,
   region VARCHAR,
   ssn VARCHAR
 );
 
-INSERT INTO lakekeeper.demo.customers VALUES
+INSERT INTO lakekeeper.demo.customers
+SELECT * FROM (VALUES
   (1, 'Ana', 'EU', '111-22-3333'),
   (2, 'Ben', 'US', '444-55-6666'),
-  (3, 'Cam', 'EU', '777-88-9999');
+  (3, 'Cam', 'EU', '777-88-9999')
+) AS fixture(id, name, region, ssn)
+WHERE NOT EXISTS (
+  SELECT 1 FROM lakekeeper.demo.customers c WHERE c.id = fixture.id
+);
 
-DROP TABLE IF EXISTS lakekeeper.demo.payroll;
-CREATE TABLE lakekeeper.demo.payroll (
+CREATE TABLE IF NOT EXISTS lakekeeper.demo.payroll (
   id INTEGER,
   name VARCHAR,
   salary INTEGER
 );
 
-INSERT INTO lakekeeper.demo.payroll VALUES
+INSERT INTO lakekeeper.demo.payroll
+SELECT * FROM (VALUES
   (1, 'Ana', 120000),
-  (2, 'Ben', 95000);
+  (2, 'Ben', 95000)
+) AS fixture(id, name, salary)
+WHERE NOT EXISTS (
+  SELECT 1 FROM lakekeeper.demo.payroll p WHERE p.id = fixture.id
+);

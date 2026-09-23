@@ -266,6 +266,28 @@ impl AccessConnectionConfig {
                         ))
                     }
                 }
+                // Same reasoning as opa.clientCredentials.tokenEndpoint above: a bearer
+                // token is sent as `Authorization: Bearer …` on every call, so it must not
+                // cross the network in plaintext. Self-hosted Cerbos with no token is
+                // unaffected (nothing secret travels on the connection).
+                let has_token = cerbos
+                    .bearer_token
+                    .as_deref()
+                    .is_some_and(|t| !t.is_empty());
+                if has_token && parsed.scheme() == "http" {
+                    let loopback = match parsed.host() {
+                        Some(url::Host::Domain(d)) => d.eq_ignore_ascii_case("localhost"),
+                        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+                        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+                        None => false,
+                    };
+                    if !loopback {
+                        return Err(format!(
+                            "accessControl.connections.{name}.cerbos.url must use https when \
+                             bearerToken is set (plain http is only allowed for a loopback host)"
+                        ));
+                    }
+                }
                 if cerbos.check_resources_path.trim().is_empty() {
                     return Err(format!(
                         "accessControl.connections.{name}.cerbos.checkResourcesPath must not be empty"
@@ -708,6 +730,53 @@ mod tests {
         assert!(connection_with(None, &["table.select"])
             .validate("default")
             .is_ok());
+    }
+
+    fn cerbos_connection_with(url: &str, bearer_token: Option<&str>) -> AccessConnectionConfig {
+        let mut cerbos = json!({ "url": url });
+        if let Some(t) = bearer_token {
+            cerbos["bearerToken"] = json!(t);
+        }
+        serde_json::from_value(json!({ "provider": "cerbos", "cerbos": cerbos }))
+            .expect("valid connection config")
+    }
+
+    /// A bearer token is sent as `Authorization: Bearer …` on every `CheckResources` call,
+    /// so it must not cross the network in plaintext — same reasoning as the OPA
+    /// client-credentials token endpoint above. A loopback host stays allowed (local
+    /// stubs/dev), and self-hosted Cerbos with no token at all is unaffected.
+    #[test]
+    fn cerbos_url_must_be_https_when_bearer_token_is_set_unless_loopback() {
+        let check = |url: &str| cerbos_connection_with(url, Some("secret")).validate("default");
+        for allowed in [
+            "https://cerbos.example.com:3592",
+            "http://localhost:3592",
+            "http://LOCALHOST:3592",
+            "http://127.0.0.1:3592",
+            "http://[::1]:3592",
+        ] {
+            assert!(check(allowed).is_ok(), "{allowed} should be accepted");
+        }
+        for rejected in [
+            "http://cerbos.example.com:3592",
+            "http://10.0.0.5:3592",
+            "http://cerbos.internal:3592",
+        ] {
+            let err = check(rejected).unwrap_err();
+            assert!(
+                err.contains("bearerToken") && err.contains("https"),
+                "{rejected}: {err}"
+            );
+        }
+        // No bearer token → nothing secret travels on the connection, plain http is fine.
+        assert!(cerbos_connection_with("http://cerbos.internal:3592", None)
+            .validate("default")
+            .is_ok());
+        assert!(
+            cerbos_connection_with("http://cerbos.internal:3592", Some(""))
+                .validate("default")
+                .is_ok()
+        );
     }
 
     /// `operations` is an allowlist: a typo would silently skip the protection it meant to
