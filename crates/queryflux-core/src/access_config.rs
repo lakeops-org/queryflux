@@ -227,6 +227,29 @@ impl AccessConnectionConfig {
                         "accessControl.connections.{name}.opa.decisionPath must start with '/'"
                     ));
                 }
+                // The client secret is POSTed to the token endpoint, so it must travel over
+                // TLS. A loopback host never leaves the machine, which keeps local dev and
+                // test stubs working.
+                if let Some(cc) = &opa.client_credentials {
+                    let endpoint = url::Url::parse(cc.token_endpoint.trim()).map_err(|e| {
+                        format!(
+                            "accessControl.connections.{name}.opa.clientCredentials.tokenEndpoint is not a valid URL: {e}"
+                        )
+                    })?;
+                    let loopback = match endpoint.host() {
+                        Some(url::Host::Domain(d)) => d.eq_ignore_ascii_case("localhost"),
+                        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+                        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+                        None => false,
+                    };
+                    if !(endpoint.scheme() == "https" || (endpoint.scheme() == "http" && loopback))
+                    {
+                        return Err(format!(
+                            "accessControl.connections.{name}.opa.clientCredentials.tokenEndpoint must use https \
+                             (plain http is only allowed for a loopback host)"
+                        ));
+                    }
+                }
             }
             ProviderKind::Cerbos => {
                 let cerbos = self
@@ -253,27 +276,6 @@ impl AccessConnectionConfig {
                         "accessControl.connections.{name}.cerbos.checkResourcesPath must start with '/'"
                     ));
                 }
-            }
-        }
-        // The client secret is POSTed to the token endpoint, so it must travel over TLS. A
-        // loopback host never leaves the machine, which keeps local dev and test stubs working.
-        if let Some(cc) = &opa.client_credentials {
-            let endpoint = url::Url::parse(cc.token_endpoint.trim()).map_err(|e| {
-                format!(
-                    "accessControl.connections.{name}.opa.clientCredentials.tokenEndpoint is not a valid URL: {e}"
-                )
-            })?;
-            let loopback = match endpoint.host() {
-                Some(url::Host::Domain(d)) => d.eq_ignore_ascii_case("localhost"),
-                Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
-                Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
-                None => false,
-            };
-            if !(endpoint.scheme() == "https" || (endpoint.scheme() == "http" && loopback)) {
-                return Err(format!(
-                    "accessControl.connections.{name}.opa.clientCredentials.tokenEndpoint must use https \
-                     (plain http is only allowed for a loopback host)"
-                ));
             }
         }
         // `operations` is an allowlist: an entry that names no real operation (say
