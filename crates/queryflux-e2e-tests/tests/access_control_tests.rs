@@ -121,10 +121,12 @@ def transform(sql: str, src: str, dst: str) -> str:
 "#;
 
 #[tokio::test]
-async fn fixup_script_turning_read_into_write_is_denied_by_invariant_assert() {
+async fn fixup_script_turning_read_into_write_is_rejected() {
     let (opa_url, stub) = start_opa_stub().await;
-    // Any row filter forces the access-control guard down the `Rewrite` path, which is
-    // what arms the post-translation invariant assert (see `dispatch.rs`).
+    // A row filter is configured too, but it no longer changes what arms this rejection:
+    // `run_fixup_scripts` now rejects any read-to-write statement-kind change
+    // unconditionally, inside dialect translation, whether or not access control also
+    // rewrote the query. See `queryflux_translation::run_fixup_scripts`.
     stub.lock().unwrap().filter("orders", "amount > 0");
 
     let guard = build_guard(&opa_url);
@@ -142,7 +144,7 @@ async fn fixup_script_turning_read_into_write_is_denied_by_invariant_assert() {
 
     let err = pg_run(&client, "SELECT id FROM orders")
         .await
-        .expect_err("a fixup script turning the read into a write must be denied");
+        .expect_err("a fixup script turning the read into a write must be rejected");
     assert!(!err.is_empty());
 
     let record = h
@@ -152,16 +154,19 @@ async fn fixup_script_turning_read_into_write_is_denied_by_invariant_assert() {
                 .contains("select id from orders")
         })
         .await
-        .expect("denied query should be recorded");
-    assert_eq!(format!("{:?}", record.status), "Denied");
-    assert!(record.was_guard_blocked);
+        .expect("rejected query should be recorded");
+    // This is a translation-layer rejection (fixup scripts run inside `maybe_translate`),
+    // not an access-control denial — hence `Failed`/no guard block, unlike the
+    // access-control-guard denials asserted elsewhere in this file.
+    assert_eq!(format!("{:?}", record.status), "Failed");
+    assert!(!record.was_guard_blocked);
     assert!(
         record
             .error_message
             .as_deref()
             .unwrap_or_default()
-            .contains("invariant"),
-        "expected an invariant-assert denial reason, got: {:?}",
+            .contains("changed the statement kind"),
+        "expected a statement-kind-change rejection reason, got: {:?}",
         record.error_message
     );
 }
