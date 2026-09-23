@@ -155,8 +155,8 @@ services:
         status=$(curl -s -o /tmp/resp -w '%{http_code}' -X POST http://lakekeeper:8181/management/v1/bootstrap
         -H 'Content-Type: application/json'
         --data '{"accept-terms-of-use": true}');
-        case "$status" in 2??|409) exit 0 ;; esac;
-        cat /tmp/resp >&2; echo "bootstrap failed with HTTP $status" >&2; exit 1
+        case "$$status" in 2??|409) exit 0 ;; esac;
+        cat /tmp/resp >&2; echo "bootstrap failed with HTTP $$status" >&2; exit 1
 
   initialwarehouse:
     image: curlimages/curl
@@ -173,8 +173,8 @@ services:
         status=$(curl -s -o /tmp/resp -w '%{http_code}' -X POST http://lakekeeper:8181/management/v1/warehouse
         -H 'Content-Type: application/json'
         --data @/config/create-warehouse.json);
-        case "$status" in 2??|409) exit 0 ;; esac;
-        cat /tmp/resp >&2; echo "warehouse creation failed with HTTP $status" >&2; exit 1
+        case "$$status" in 2??|409) exit 0 ;; esac;
+        cat /tmp/resp >&2; echo "warehouse creation failed with HTTP $$status" >&2; exit 1
     volumes:
       - ../../docker/fixtures/create-warehouse.json:/config/create-warehouse.json:ro
 
