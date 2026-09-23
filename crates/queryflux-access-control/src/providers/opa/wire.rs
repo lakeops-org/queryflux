@@ -162,6 +162,27 @@ pub(super) fn from_response(resp: OpaResponse, requested: &AccessRequest) -> Acc
     }
 }
 
+/// Whether a decision's `table` key refers to `res`. Policies echo the input's bare `table`
+/// or build `schema.table` / `catalog.schema.table`; match case-insensitively, as the
+/// rewrite does.
+fn decision_covers(decision_table: &str, res: &AccessResource) -> bool {
+    let d = decision_table.to_lowercase();
+    let table = res.table.to_lowercase();
+    if d == table {
+        return true;
+    }
+    let Some(schema) = res.schema.as_deref().map(str::to_lowercase) else {
+        return false;
+    };
+    let qualified = format!("{schema}.{table}");
+    if d == qualified {
+        return true;
+    }
+    res.catalog
+        .as_deref()
+        .is_some_and(|c| d == format!("{}.{qualified}", c.to_lowercase()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -215,33 +236,6 @@ mod tests {
         let decision = from_response(resp, &requested(&["orders"]));
         assert!(!decision.is_allowed());
     }
-}
-
-/// Whether a decision's `table` key refers to `res`. Policies echo the input's bare `table`
-/// or build `schema.table` / `catalog.schema.table`; match case-insensitively, as the
-/// rewrite does.
-fn decision_covers(decision_table: &str, res: &AccessResource) -> bool {
-    let d = decision_table.to_lowercase();
-    let table = res.table.to_lowercase();
-    if d == table {
-        return true;
-    }
-    let Some(schema) = res.schema.as_deref().map(str::to_lowercase) else {
-        return false;
-    };
-    let qualified = format!("{schema}.{table}");
-    if d == qualified {
-        return true;
-    }
-    res.catalog
-        .as_deref()
-        .is_some_and(|c| d == format!("{}.{qualified}", c.to_lowercase()))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use queryflux_core::access_model::{AccessResource, Identity, Operation, RequestContext};
 
     fn request(tables: &[(&str, &str)]) -> AccessRequest {
         AccessRequest {
