@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -55,8 +54,12 @@ pub struct AccessController {
     // Sharded (no single global lock) — this is on the per-query hot path, matching the
     // same DashMap-backed pattern already used elsewhere for per-request caches (e.g.
     // `snowflake::http::session_store`, `snowflake::in_flight`) rather than reinventing a
-    // `Mutex<HashMap>` that would serialize every concurrent access-control check.
-    cache: DashMap<u64, CacheEntry>,
+    // `Mutex<HashMap>` that would serialize every concurrent access-control check. Keyed on
+    // the full typed `CacheKey`, not a bare digest — a `DashMap<u64, _>` has no fallback
+    // `Eq` check the way a keyed-by-value map does, so a hash collision between two
+    // different requests would serve one request's cached row filters/masks/allow decision
+    // to the other.
+    cache: DashMap<CacheKey, CacheEntry>,
 }
 
 impl AccessController {
@@ -97,7 +100,7 @@ impl AccessController {
         let key = cache_key(req);
 
         if !self.cache_ttl.is_zero() {
-            if let Some(hit) = self.cache_get(key) {
+            if let Some(hit) = self.cache_get(&key) {
                 self.metrics.record_decision(DecisionMetric {
                     latency: Duration::ZERO,
                     denied: false,
@@ -152,9 +155,9 @@ impl AccessController {
         }
     }
 
-    fn cache_get(&self, key: u64) -> Option<AccessDecision> {
+    fn cache_get(&self, key: &CacheKey) -> Option<AccessDecision> {
         let mut expired = false;
-        let hit = self.cache.get(&key).and_then(|entry| {
+        let hit = self.cache.get(key).and_then(|entry| {
             if entry.stored.elapsed() < self.cache_ttl {
                 Some(entry.decision.clone())
             } else {
@@ -163,12 +166,12 @@ impl AccessController {
             }
         });
         if expired {
-            self.cache.remove(&key);
+            self.cache.remove(key);
         }
         hit
     }
 
-    fn cache_put(&self, key: u64, decision: AccessDecision) {
+    fn cache_put(&self, key: CacheKey, decision: AccessDecision) {
         if self.cache.len() >= self.cache_capacity {
             // Crude bound: drop everything expired, then (if still full) clear.
             let ttl = self.cache_ttl;
@@ -187,54 +190,266 @@ impl AccessController {
     }
 }
 
-/// Stable cache key over everything that changes the decision — **not** `context.query_id`.
-fn cache_key(req: &AccessRequest) -> u64 {
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    req.identity.user.hash(&mut h);
-    hash_sorted(&mut h, req.identity.groups.iter().map(String::as_str));
-    hash_sorted(&mut h, req.identity.roles.iter().map(String::as_str));
-    for (k, v) in &req.identity.attributes {
-        k.hash(&mut h);
-        v.to_string().hash(&mut h);
-    }
-    req.operation.0.hash(&mut h);
-    let mut resources: Vec<String> = req
+/// A resource's structured cache-key form — a delimiter-joined string (the previous
+/// approach) can collide: `schema = "s|t", table = "u"` would hash the same as
+/// `schema = "s", table = "t|u"`, and a named column `"a,b"` the same as columns `"a"` and
+/// `"b"` joined. Keeping fields separate and typed avoids that regardless of what
+/// characters an identifier or column name contains.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct CacheResourceKey {
+    catalog: Option<String>,
+    schema: Option<String>,
+    table: String,
+    /// `None` = "all columns" (`Columns::All`); `Some(cols)` is sorted.
+    columns: Option<Vec<String>>,
+}
+
+/// Stable, exact cache key over everything that changes the decision — **not**
+/// `context.query_id`. A typed, `Eq`-checked key (not a bare digest): `DashMap` only
+/// short-circuits false *misses* via the hash, it still compares keys for a hit, so two
+/// different requests whose fields happened to hash equally are correctly kept apart
+/// instead of one serving the other's cached decision.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct CacheKey {
+    user: String,
+    /// Sorted — membership, not order, is what a policy can act on.
+    groups: Vec<String>,
+    roles: Vec<String>,
+    /// `BTreeMap` iteration is already key-sorted; `Value` isn't `Eq`/`Hash`, so each is
+    /// captured by its JSON text (same fidelity `to_string()` gave the old digest).
+    attributes: Vec<(String, String)>,
+    operation: String,
+    resources: Vec<CacheResourceKey>,
+    cluster_group: String,
+    engine: String,
+    session_params: Vec<(String, String)>,
+}
+
+fn cache_key(req: &AccessRequest) -> CacheKey {
+    let mut groups = req.identity.groups.clone();
+    groups.sort();
+    let mut roles = req.identity.roles.clone();
+    roles.sort();
+    let attributes = req
+        .identity
+        .attributes
+        .iter()
+        .map(|(k, v)| (k.clone(), v.to_string()))
+        .collect();
+
+    let mut resources: Vec<CacheResourceKey> = req
         .resources
         .iter()
-        .map(|r| {
-            let cols = match &r.columns {
-                Columns::All => "*".to_string(),
+        .map(|r| CacheResourceKey {
+            catalog: r.catalog.clone(),
+            schema: r.schema.clone(),
+            table: r.table.clone(),
+            columns: match &r.columns {
+                Columns::All => None,
                 Columns::Named(c) => {
                     let mut c = c.clone();
                     c.sort();
-                    c.join(",")
+                    Some(c)
                 }
-            };
-            format!(
-                "{}|{}|{}|{cols}",
-                r.catalog.as_deref().unwrap_or(""),
-                r.schema.as_deref().unwrap_or(""),
-                r.table
-            )
+            },
         })
         .collect();
-    resources.sort();
-    for r in resources {
-        r.hash(&mut h);
+    resources.sort_by(|a, b| {
+        (&a.catalog, &a.schema, &a.table, &a.columns)
+            .cmp(&(&b.catalog, &b.schema, &b.table, &b.columns))
+    });
+
+    let session_params = req
+        .context
+        .session_params
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+
+    CacheKey {
+        user: req.identity.user.clone(),
+        groups,
+        roles,
+        attributes,
+        operation: req.operation.0.clone(),
+        resources,
+        cluster_group: req.context.cluster_group.clone(),
+        engine: req.context.engine.clone(),
+        session_params,
     }
-    req.context.cluster_group.hash(&mut h);
-    req.context.engine.hash(&mut h);
-    for (k, v) in &req.context.session_params {
-        k.hash(&mut h);
-        v.hash(&mut h);
-    }
-    h.finish()
 }
 
-fn hash_sorted<'a>(h: &mut impl Hasher, items: impl Iterator<Item = &'a str>) {
-    let mut v: Vec<&str> = items.collect();
-    v.sort_unstable();
-    for s in v {
-        s.hash(h);
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use async_trait::async_trait;
+
+    use queryflux_core::access_model::{AccessResource, Columns, Identity, RequestContext};
+
+    use super::*;
+    use crate::provider::PolicyError;
+
+    /// Always allows (so the decision is cache-eligible) and counts how many times the
+    /// provider was actually called — a cache hit must not increment it, and two requests
+    /// that collide under a hash-only key incorrectly would look like just one call too.
+    #[derive(Default)]
+    struct CountingProvider {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl PolicyDecisionProvider for CountingProvider {
+        async fn evaluate(&self, _req: &AccessRequest) -> Result<AccessDecision, PolicyError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(AccessDecision::allow_all())
+        }
+        fn name(&self) -> &'static str {
+            "counting"
+        }
+    }
+
+    fn controller(provider: Arc<CountingProvider>) -> AccessController {
+        AccessController::new(AccessControllerConfig {
+            provider,
+            metrics: Arc::new(NoopMetrics),
+            operations: vec![Operation::table_select()],
+            fail_open_default: false,
+            group_fail_open: HashMap::new(),
+            cache_ttl: Duration::from_secs(60),
+            cache_capacity: 10_000,
+        })
+    }
+
+    fn base_request() -> AccessRequest {
+        AccessRequest {
+            identity: Identity {
+                user: "alice".to_string(),
+                groups: vec![],
+                roles: vec![],
+                attributes: Default::default(),
+            },
+            operation: Operation::table_select(),
+            resources: vec![AccessResource {
+                catalog: None,
+                schema: None,
+                table: "orders".to_string(),
+                columns: Columns::All,
+            }],
+            context: RequestContext {
+                cluster_group: "default".to_string(),
+                engine: "trino".to_string(),
+                query_id: "q1".to_string(),
+                session_params: Default::default(),
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn identical_requests_share_one_cache_entry() {
+        let provider = Arc::new(CountingProvider::default());
+        let ctl = controller(provider.clone());
+        let mut req = base_request();
+        ctl.evaluate(&req).await;
+        req.context.query_id = "q2".to_string(); // excluded from the key on purpose
+        ctl.evaluate(&req).await;
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// Regression: `hash_sorted`'s old digest fed each group/role string into the hasher
+    /// with no boundary between the two lists, so groups=["a","b"] roles=[] produced the
+    /// identical hash input as groups=["a"] roles=["b"]. A typed key must tell them apart.
+    #[tokio::test]
+    async fn group_role_boundary_does_not_collide() {
+        let provider = Arc::new(CountingProvider::default());
+        let ctl = controller(provider.clone());
+
+        let mut a = base_request();
+        a.identity.groups = vec!["a".to_string(), "b".to_string()];
+        a.identity.roles = vec![];
+        ctl.evaluate(&a).await;
+
+        let mut b = base_request();
+        b.identity.groups = vec!["a".to_string()];
+        b.identity.roles = vec!["b".to_string()];
+        ctl.evaluate(&b).await;
+
+        assert_eq!(
+            provider.calls.load(Ordering::SeqCst),
+            2,
+            "distinct group/role split must not share a[b's] cache entry"
+        );
+    }
+
+    /// Regression: joining `catalog|schema|table` with `|` let a `|`-containing schema
+    /// name collide with a differently-split qualified name across the same delimiter.
+    #[tokio::test]
+    async fn resource_identifiers_containing_the_old_delimiter_do_not_collide() {
+        let provider = Arc::new(CountingProvider::default());
+        let ctl = controller(provider.clone());
+
+        let mut a = base_request();
+        a.resources = vec![AccessResource {
+            catalog: None,
+            schema: Some("s|t".to_string()),
+            table: "u".to_string(),
+            columns: Columns::All,
+        }];
+        ctl.evaluate(&a).await;
+
+        let mut b = base_request();
+        b.resources = vec![AccessResource {
+            catalog: None,
+            schema: Some("s".to_string()),
+            table: "t|u".to_string(),
+            columns: Columns::All,
+        }];
+        ctl.evaluate(&b).await;
+
+        assert_eq!(
+            provider.calls.load(Ordering::SeqCst),
+            2,
+            "a `|` inside an identifier must not fake a different schema/table split"
+        );
+    }
+
+    /// Regression: joining named columns with `,` let a single column called `"a,b"`
+    /// collide with the two columns `"a"` and `"b"`.
+    #[tokio::test]
+    async fn column_name_containing_the_old_delimiter_does_not_collide_with_split_columns() {
+        let provider = Arc::new(CountingProvider::default());
+        let ctl = controller(provider.clone());
+
+        let mut a = base_request();
+        a.resources[0].columns = Columns::Named(vec!["a,b".to_string()]);
+        ctl.evaluate(&a).await;
+
+        let mut b = base_request();
+        b.resources[0].columns = Columns::Named(vec!["a".to_string(), "b".to_string()]);
+        ctl.evaluate(&b).await;
+
+        assert_eq!(
+            provider.calls.load(Ordering::SeqCst),
+            2,
+            "a `,` inside a column name must not fake a second, split column"
+        );
+    }
+
+    /// Column order within a request must not matter — `["b", "a"]` and `["a", "b"]` name
+    /// the same set of masked/visible columns and must share a cache entry.
+    #[tokio::test]
+    async fn column_order_does_not_affect_the_key() {
+        let provider = Arc::new(CountingProvider::default());
+        let ctl = controller(provider.clone());
+
+        let mut a = base_request();
+        a.resources[0].columns = Columns::Named(vec!["b".to_string(), "a".to_string()]);
+        ctl.evaluate(&a).await;
+
+        let mut b = base_request();
+        b.resources[0].columns = Columns::Named(vec!["a".to_string(), "b".to_string()]);
+        ctl.evaluate(&b).await;
+
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
     }
 }

@@ -221,3 +221,45 @@ async fn unanalyzable_query_is_denied_even_when_on_missing_schema_is_evaluate() 
         .await
         .expect("a table-less query is still allowed");
 }
+
+/// PostgreSQL's simple-query protocol allows a semicolon-separated batch in a single
+/// message, and the wire frontend forwards it unsplit. `classify_operation` and
+/// `extract_resources` each only look at the first statement, so a batch like
+/// `SELECT 1; DELETE FROM orders` must not be let through on the strength of its harmless
+/// first statement — the whole batch must be rejected, and none of it must reach the engine.
+#[tokio::test]
+async fn multi_statement_batch_is_rejected_not_judged_by_its_first_statement() {
+    let (opa_url, stub) = start_opa_stub().await;
+    stub.lock().unwrap().filter("orders", "amount > 0");
+
+    let guard = build_guard(&opa_url);
+    let h = ProtocolWireHarness::new_with_access_control(Some(guard))
+        .await
+        .expect("harness");
+    let client = pg_connect(h.postgres_port).await;
+
+    pg_run(&client, "CREATE TABLE orders (id INTEGER, amount INTEGER)")
+        .await
+        .expect("create table");
+    pg_run(&client, "INSERT INTO orders VALUES (1, 50), (2, 150)")
+        .await
+        .expect("insert rows");
+
+    let err = pg_run(&client, "SELECT 1; DELETE FROM orders")
+        .await
+        .expect_err("a multi-statement batch must be rejected");
+    assert!(err.contains("multi-statement"), "unexpected error: {err}");
+
+    // The DELETE must never have reached the engine, whatever the error path looked like.
+    let rows = pg_run(&client, "SELECT id FROM orders ORDER BY id")
+        .await
+        .expect("select should succeed");
+    assert_eq!(rows.len(), 2, "DELETE must not have executed: {rows:?}");
+
+    let record = h
+        .wait_for_record(|r| r.sql_preview.to_lowercase().contains("delete from orders"))
+        .await
+        .expect("rejected query should be recorded");
+    assert_eq!(format!("{:?}", record.status), "Denied");
+    assert!(record.was_guard_blocked);
+}

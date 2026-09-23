@@ -55,7 +55,7 @@ queryflux --install-deps   # or: python3 -m venv .venv && .venv/bin/pip install 
 
 # 3. QueryFlux from this branch — verifies Keycloak JWTs, Postgres on :5434,
 #    catalogProvider at Lakekeeper :8181
-cargo run -p queryflux -- --config examples/with-opa-oidc/config.yaml
+cargo run -p queryflux -- --config examples/with-opa-oidc/config-no-catalog.yaml
 ```
 
 Open **http://127.0.0.1:8183**. **Run query** fetches a real Keycloak token

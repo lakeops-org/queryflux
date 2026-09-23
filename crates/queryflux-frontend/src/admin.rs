@@ -2795,6 +2795,17 @@ fn redact_access_control_secrets(v: &mut serde_json::Value) {
 /// `opa.clientCredentials.clientSecret` from the same-named connection in `previous` — so a
 /// GET (which never returns secrets) round-tripped through a PUT doesn't blank them out.
 /// A connection present only in `incoming` (newly added) has nothing to merge from.
+/// A retained secret is only ever POSTed to the endpoint it was originally set for. Compare
+/// as strings (missing == absent, not equal to `""`) so an actual endpoint change — the only
+/// thing that matters here — is never masked by a JSON-shape difference.
+fn same_endpoint(
+    incoming: &serde_json::Map<String, serde_json::Value>,
+    prev: &serde_json::Value,
+    key: &str,
+) -> bool {
+    incoming.get(key).and_then(|v| v.as_str()) == prev.get(key).and_then(|v| v.as_str())
+}
+
 fn merge_access_control_secrets(incoming: &mut serde_json::Value, previous: &serde_json::Value) {
     let Some(prev_conns) = previous.get("connections").and_then(|c| c.as_object()) else {
         return;
@@ -2816,7 +2827,10 @@ fn merge_access_control_secrets(incoming: &mut serde_json::Value, previous: &ser
             .get("bearerToken")
             .and_then(|t| t.as_str())
             .is_none_or(|s| s.is_empty());
-        if incoming_token_empty {
+        // The bearer token authenticates `opa.url` specifically — carrying it over to a
+        // caller-supplied URL would send this deployment's secret to wherever they named,
+        // not to the server it was ever meant for.
+        if incoming_token_empty && same_endpoint(opa, prev_opa, "url") {
             if let Some(prev) = prev_opa.get("bearerToken") {
                 opa.insert("bearerToken".into(), prev.clone());
             }
@@ -2834,7 +2848,8 @@ fn merge_access_control_secrets(incoming: &mut serde_json::Value, previous: &ser
             .get("clientSecret")
             .and_then(|s| s.as_str())
             .is_none_or(|s| s.is_empty());
-        if incoming_secret_empty {
+        // Same reasoning for the OAuth2 client secret and its token endpoint.
+        if incoming_secret_empty && same_endpoint(cc, prev_cc, "tokenEndpoint") {
             if let Some(prev) = prev_cc.get("clientSecret") {
                 cc.insert("clientSecret".into(), prev.clone());
             }
@@ -3580,13 +3595,17 @@ mod tests {
     }
 
     #[test]
-    fn merge_access_control_secrets_keeps_previous_when_blank() {
+    fn merge_access_control_secrets_keeps_previous_when_blank_and_endpoint_unchanged() {
         let previous = json!({
             "connections": {
                 "default": {
                     "opa": {
+                        "url": "http://opa:8181",
                         "bearerToken": "keep-me",
-                        "clientCredentials": { "clientSecret": "keep-secret" }
+                        "clientCredentials": {
+                            "tokenEndpoint": "https://idp/token",
+                            "clientSecret": "keep-secret"
+                        }
                     }
                 }
             }
@@ -3614,15 +3633,66 @@ mod tests {
         );
     }
 
+    /// Regression: a retained secret is only ever POSTed to the endpoint it was set for.
+    /// Blanking the secret field while *also* redirecting `opa.url` /
+    /// `clientCredentials.tokenEndpoint` to a caller-controlled server must not carry the
+    /// old secret along to it — that would exfiltrate a deployment's OPA bearer token / OAuth2
+    /// client secret to wherever the caller named.
+    #[test]
+    fn merge_access_control_secrets_drops_secret_when_its_endpoint_changed() {
+        let previous = json!({
+            "connections": {
+                "default": {
+                    "opa": {
+                        "url": "http://opa:8181",
+                        "bearerToken": "keep-me",
+                        "clientCredentials": {
+                            "tokenEndpoint": "https://idp/token",
+                            "clientSecret": "keep-secret"
+                        }
+                    }
+                }
+            }
+        });
+        let mut incoming = json!({
+            "enabled": true,
+            "connections": {
+                "default": {
+                    "opa": {
+                        "url": "https://attacker.example/collect",
+                        "bearerToken": "",
+                        "clientCredentials": {
+                            "clientId": "qf",
+                            "clientSecret": "",
+                            "tokenEndpoint": "https://attacker.example/token"
+                        }
+                    }
+                }
+            }
+        });
+        super::merge_access_control_secrets(&mut incoming, &previous);
+        assert_eq!(
+            incoming["connections"]["default"]["opa"]["bearerToken"], "",
+            "bearerToken must not follow opa.url to a different endpoint"
+        );
+        assert_eq!(
+            incoming["connections"]["default"]["opa"]["clientCredentials"]["clientSecret"], "",
+            "clientSecret must not follow tokenEndpoint to a different endpoint"
+        );
+    }
+
     #[test]
     fn merge_access_control_secrets_leaves_new_connection_alone() {
         // A brand-new connection (not present in `previous`) has nothing to merge from;
         // its blank secret fields must be left as-is rather than panicking.
-        let previous =
-            json!({ "connections": { "default": { "opa": { "bearerToken": "keep-me" } } } });
+        let previous = json!({
+            "connections": {
+                "default": { "opa": { "url": "https://opa", "bearerToken": "keep-me" } }
+            }
+        });
         let mut incoming = json!({
             "connections": {
-                "default": { "opa": { "bearerToken": "" } },
+                "default": { "opa": { "url": "https://opa", "bearerToken": "" } },
                 "eu": { "opa": { "url": "https://eu-opa", "bearerToken": "" } }
             }
         });

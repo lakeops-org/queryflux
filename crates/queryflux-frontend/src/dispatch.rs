@@ -2255,6 +2255,13 @@ pub async fn execute_to_sink(
             )
         })
         .map(|_| queryflux_cache::CacheKey::new(&sql, &group.0, &session, &auth_ctx.user, &params));
+    // Set inside the `cache_key` block below when access control rewrites the query (row
+    // filters/masks may since have changed for this user/group, so a cached entry can't be
+    // trusted). Read again after that block, by the cache-write path: a rewritten query's
+    // result must not be cached under this (sql, group, session, user, params) key either —
+    // writing it would let a *later*, un-rewritten evaluation of the same key incorrectly
+    // read back a filtered/masked result as if it were the complete one.
+    let mut access_control_rewrote_for_cache = false;
 
     if let Some(ref key) = cache_key {
         let effective_tags = {
@@ -2306,7 +2313,10 @@ pub async fn execute_to_sink(
                     AccessStageOutcome::Denied { reason, .. } => {
                         return sink.on_error(&reason).await
                     }
-                    AccessStageOutcome::Rewritten { .. } => skip_cache_lookup = true,
+                    AccessStageOutcome::Rewritten { .. } => {
+                        skip_cache_lookup = true;
+                        access_control_rewrote_for_cache = true;
+                    }
                     AccessStageOutcome::Allowed { .. } => {}
                 }
             }
@@ -2402,7 +2412,9 @@ pub async fn execute_to_sink(
     }
 
     // --- Cache miss path: wrap sink in TeeResultSink if caching is applicable ---
-    let cache_writer = if let (Some(ref key), Some(ref cfg)) = (&cache_key, &effective_cache) {
+    let cache_writer = if access_control_rewrote_for_cache {
+        None
+    } else if let (Some(ref key), Some(ref cfg)) = (&cache_key, &effective_cache) {
         match state.result_cache.writer(key, cfg.ttl_secs).await {
             Ok(w) => Some(w),
             Err(e) => {

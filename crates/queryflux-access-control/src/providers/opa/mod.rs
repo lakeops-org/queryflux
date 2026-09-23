@@ -22,10 +22,24 @@ pub struct OpaProvider {
     http: reqwest::Client,
     bearer_token: Option<String>,
     client_credentials: Option<ClientCredentials>,
-    token_cache: Mutex<Option<(String, Instant)>>,
+    token_cache: Mutex<Option<TokenCacheEntry>>,
 }
 
 const TOKEN_REFRESH_BUFFER: Duration = Duration::from_secs(30);
+/// How long a failed token fetch is remembered before the next caller is allowed to retry
+/// it. Without this, every caller queued behind the refresh lock during an IdP outage would
+/// each attempt (and wait out) its own failing request in turn, so total latency for the
+/// Nth waiter grows with N instead of staying bounded by one request's timeout.
+const TOKEN_FAILURE_COOLDOWN: Duration = Duration::from_secs(5);
+/// `PolicyError::Status`'s body is client-visible (forwarded as the denial reason), so it's
+/// bounded the same way request/response logging elsewhere is.
+const ERROR_BODY_LIMIT: usize = 4096;
+
+enum TokenCacheEntry {
+    Valid(String, Instant),
+    /// The last fetch failed; retry after this instant instead of before it.
+    FailedUntil(Instant),
+}
 
 impl OpaProvider {
     pub fn new(cfg: &OpaProviderConfig) -> Result<Self, String> {
@@ -57,33 +71,52 @@ impl OpaProvider {
         // the first caller in refreshes, everyone else blocks briefly and then observes
         // the freshly cached token instead of duplicating the HTTP call.
         let mut guard = self.token_cache.lock().await;
-        if let Some((tok, exp)) = guard.as_ref() {
-            if Instant::now() + TOKEN_REFRESH_BUFFER < *exp {
+        let now = Instant::now();
+        match guard.as_ref() {
+            Some(TokenCacheEntry::Valid(tok, exp)) if now + TOKEN_REFRESH_BUFFER < *exp => {
                 return Some(tok.clone());
             }
+            // A prior fetch failed recently: fail fast instead of repeating the same
+            // request every waiter had to queue behind — see `TOKEN_FAILURE_COOLDOWN`.
+            Some(TokenCacheEntry::FailedUntil(until)) if now < *until => return None,
+            _ => {}
         }
-        let resp = self
-            .http
-            .post(&cc.token_endpoint)
-            .form(&[
-                ("grant_type", "client_credentials"),
-                ("client_id", &cc.client_id),
-                ("client_secret", &cc.client_secret),
-            ])
-            .send()
-            .await
-            .ok()?
-            .error_for_status()
-            .ok()?;
-        let body: serde_json::Value = resp.json().await.ok()?;
-        let token = body.get("access_token")?.as_str()?.to_string();
-        let expires_in = body
-            .get("expires_in")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(300);
-        let exp = Instant::now() + Duration::from_secs(expires_in);
-        *guard = Some((token.clone(), exp));
-        Some(token)
+        // Bounded the same as the policy request itself (plus reqwest's own connect
+        // timeout inside that), so a slow or hung token endpoint can't make `evaluate()`'s
+        // total latency an unbounded multiple of `self.timeout` before fail-open engages.
+        let fetch = async {
+            let resp = self
+                .http
+                .post(&cc.token_endpoint)
+                .timeout(self.timeout)
+                .form(&[
+                    ("grant_type", "client_credentials"),
+                    ("client_id", &cc.client_id),
+                    ("client_secret", &cc.client_secret),
+                ])
+                .send()
+                .await
+                .ok()?
+                .error_for_status()
+                .ok()?;
+            let body: serde_json::Value = resp.json().await.ok()?;
+            let token = body.get("access_token")?.as_str()?.to_string();
+            let expires_in = body
+                .get("expires_in")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(300);
+            Some((token, Duration::from_secs(expires_in)))
+        };
+        match fetch.await {
+            Some((token, ttl)) => {
+                *guard = Some(TokenCacheEntry::Valid(token.clone(), now + ttl));
+                Some(token)
+            }
+            None => {
+                *guard = Some(TokenCacheEntry::FailedUntil(now + TOKEN_FAILURE_COOLDOWN));
+                None
+            }
+        }
     }
 }
 
@@ -110,7 +143,7 @@ impl PolicyDecisionProvider for OpaProvider {
 
         let status = resp.status();
         if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
+            let body = truncate_error_body(resp.text().await.unwrap_or_default());
             return Err(PolicyError::Status(status.as_u16(), body));
         }
 
@@ -124,5 +157,49 @@ impl PolicyDecisionProvider for OpaProvider {
 
     fn name(&self) -> &'static str {
         "opa"
+    }
+}
+
+/// Bounds a provider error body before it becomes a client-visible denial reason.
+/// Truncates on a UTF-8 char boundary — `String::truncate` panics otherwise, and a
+/// provider's error body is untrusted, arbitrary text.
+fn truncate_error_body(mut body: String) -> String {
+    if body.len() <= ERROR_BODY_LIMIT {
+        return body;
+    }
+    let mut cut = ERROR_BODY_LIMIT;
+    while !body.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    body.truncate(cut);
+    body.push_str("... (truncated)");
+    body
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn truncate_error_body_leaves_short_bodies_untouched() {
+        let short = "policy denied: missing role".to_string();
+        assert_eq!(truncate_error_body(short.clone()), short);
+    }
+
+    #[test]
+    fn truncate_error_body_bounds_long_bodies() {
+        let long = "x".repeat(ERROR_BODY_LIMIT + 500);
+        let out = truncate_error_body(long);
+        assert!(out.len() <= ERROR_BODY_LIMIT + "... (truncated)".len());
+        assert!(out.ends_with("... (truncated)"));
+    }
+
+    /// A multi-byte character must never land the cut mid-codepoint (`String::truncate`
+    /// panics on that), even when the limit itself falls inside one.
+    #[test]
+    fn truncate_error_body_respects_utf8_boundaries() {
+        let long = "é".repeat(ERROR_BODY_LIMIT); // each "é" is 2 bytes, so this crosses the limit
+        let out = truncate_error_body(long);
+        assert!(out.ends_with("... (truncated)"));
     }
 }

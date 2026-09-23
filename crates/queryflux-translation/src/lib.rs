@@ -81,6 +81,14 @@ impl TranslationService {
     /// Verifies sqlglot is importable at startup.
     pub fn new_sqlglot(python_scripts: Vec<String>) -> Result<Self> {
         SqlglotTranslator::check_available()?;
+        // YAML is operator-authored and read once at startup, so — unlike the DB-persisted
+        // per-group scripts in `queryflux::validate_group_translation_scripts`, which are
+        // filtered rather than fatal — a script that fails the current contract aborts
+        // startup here, consistent with this codebase's fail-startup-on-bad-explicit-config
+        // convention elsewhere (e.g. access-control YAML validation).
+        for script in &python_scripts {
+            sqlglot::validate_fixup_script(script)?;
+        }
         Ok(Self {
             enabled: true,
             python_scripts,

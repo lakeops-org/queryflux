@@ -59,11 +59,10 @@ Do **not** set `identity.user` to `7`. Keep the actor as `api-service-a` so audi
 auth:
   provider: static
   required: true
-  static:
+  staticUsers:
     users:
-      - username: api-service-a
-        # bcrypt hash of the service password
-        passwordHash: "..."
+      api-service-a:
+        password: "YOUR_SERVICE_PASSWORD_HERE"
         groups: [customer_portal]
 
 accessControl:

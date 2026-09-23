@@ -238,12 +238,27 @@ impl AuthorizationChecker for SimpleAuthorizationPolicy {
 /// Refresh OAuth token this long before `expires_at` so we do not send requests with a token
 /// about to expire.
 const OPENFGA_TOKEN_REFRESH_BUFFER: std::time::Duration = std::time::Duration::from_secs(30);
+/// How long a failed token fetch is remembered before the next caller is allowed to retry
+/// it — see the identical rationale on `OpaProvider::TOKEN_FAILURE_COOLDOWN`. Without this,
+/// every caller queued behind the refresh lock during an IdP outage would each attempt (and
+/// wait out) its own failing request in turn.
+const OPENFGA_TOKEN_FAILURE_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(5);
+/// Bounds the token-endpoint request so it can't make authorization checks stall far longer
+/// than the 10s the main HTTP client is built with — kept as an explicit, named budget
+/// rather than relying on the client's own default.
+const OPENFGA_TOKEN_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+enum OpenFgaTokenCacheEntry {
+    Valid(String, std::time::Instant),
+    /// The last fetch failed; retry after this instant instead of before it.
+    FailedUntil(std::time::Instant),
+}
 
 pub struct OpenFgaAuthorizationClient {
     config: OpenFgaConfig,
     http_client: reqwest::Client,
-    /// Cached OAuth token for client_credentials flow: (token, expires_at).
-    token_cache: tokio::sync::Mutex<Option<(String, std::time::Instant)>>,
+    /// Cached OAuth token for client_credentials flow.
+    token_cache: tokio::sync::Mutex<Option<OpenFgaTokenCacheEntry>>,
     operators: OperatorPolicy,
 }
 
@@ -280,37 +295,58 @@ impl OpenFgaAuthorizationClient {
                 // exchange) so concurrent callers serialize on the refresh instead of each
                 // firing their own token-endpoint request when the cache is near expiry.
                 let mut guard = self.token_cache.lock().await;
-                if let Some((token, expires_at)) = guard.as_ref() {
-                    let now = std::time::Instant::now();
-                    if now + OPENFGA_TOKEN_REFRESH_BUFFER < *expires_at {
+                let now = std::time::Instant::now();
+                match guard.as_ref() {
+                    Some(OpenFgaTokenCacheEntry::Valid(token, expires_at))
+                        if now + OPENFGA_TOKEN_REFRESH_BUFFER < *expires_at =>
+                    {
                         return Some(token.clone());
                     }
+                    // A prior fetch failed recently: fail fast instead of repeating the same
+                    // request every waiter had to queue behind.
+                    Some(OpenFgaTokenCacheEntry::FailedUntil(until)) if now < *until => {
+                        return None;
+                    }
+                    _ => {}
                 }
 
                 // Exchange client credentials for a token.
-                let resp = self
-                    .http_client
-                    .post(token_endpoint)
-                    .form(&[
-                        ("grant_type", "client_credentials"),
-                        ("client_id", client_id),
-                        ("client_secret", client_secret),
-                    ])
-                    .send()
-                    .await
-                    .ok()?;
+                let fetch = async {
+                    let resp = self
+                        .http_client
+                        .post(token_endpoint)
+                        .timeout(OPENFGA_TOKEN_FETCH_TIMEOUT)
+                        .form(&[
+                            ("grant_type", "client_credentials"),
+                            ("client_id", client_id),
+                            ("client_secret", client_secret),
+                        ])
+                        .send()
+                        .await
+                        .ok()?
+                        .error_for_status()
+                        .ok()?;
 
-                let body: serde_json::Value = resp.json().await.ok()?;
-                let token = body.get("access_token")?.as_str()?.to_string();
-                let expires_in = body
-                    .get("expires_in")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(300);
-
-                let expires_at =
-                    std::time::Instant::now() + std::time::Duration::from_secs(expires_in);
-                *guard = Some((token.clone(), expires_at));
-                Some(token)
+                    let body: serde_json::Value = resp.json().await.ok()?;
+                    let token = body.get("access_token")?.as_str()?.to_string();
+                    let expires_in = body
+                        .get("expires_in")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(300);
+                    Some((token, std::time::Duration::from_secs(expires_in)))
+                };
+                match fetch.await {
+                    Some((token, ttl)) => {
+                        *guard = Some(OpenFgaTokenCacheEntry::Valid(token.clone(), now + ttl));
+                        Some(token)
+                    }
+                    None => {
+                        *guard = Some(OpenFgaTokenCacheEntry::FailedUntil(
+                            now + OPENFGA_TOKEN_FAILURE_COOLDOWN,
+                        ));
+                        None
+                    }
+                }
             }
         }
     }

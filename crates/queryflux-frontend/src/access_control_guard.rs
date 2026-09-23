@@ -180,6 +180,19 @@ impl Guard for OpaAccessGuard {
             Some(cache) => cache.statements_async().await.map(<[_]>::to_vec),
             None => None,
         };
+        // `classify_operation` and `extract_resources` each only look at the first parsed
+        // statement — a batch such as `SELECT 1; DELETE FROM orders` (the PostgreSQL simple
+        // query protocol allows a semicolon-separated batch in one message, and the wire
+        // frontend forwards it unsplit) would classify as the harmless first statement and
+        // extract no tables from it, so nothing here would evaluate the DELETE at all, and
+        // the whole batch would reach the engine unchecked. Deny outright instead of
+        // silently only judging the first statement.
+        if stmts.as_ref().is_some_and(|s| s.len() > 1) {
+            return GuardResult::deny(
+                "access control: multi-statement queries are not supported",
+                "ACCESS_MULTI_STATEMENT",
+            );
+        }
         let operation = classify_operation(stmts.as_deref(), ctx.sql);
 
         // A non-SELECT statement can still *read* policied tables (`INSERT … SELECT`,

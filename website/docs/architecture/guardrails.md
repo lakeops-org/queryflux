@@ -165,7 +165,7 @@ guardrails:
     - kind: http_webhook
       url: "https://hooks.example.com/guard"
       timeout_ms: 5000   # default 1000, capped at 30000
-      retry_count: 2     # retries on 5xx only; default 0
+      retry_count: 2     # retries timeouts, connection errors, and 5xx; default 0
       fail_behavior: deny   # deny (default) | allow, when unreachable/erroring
       headers:
         Authorization: "Bearer ..."

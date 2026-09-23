@@ -160,6 +160,25 @@ impl SqlglotTranslator {
     }
 }
 
+/// Smoke-tests a fixup script against the current string-in/string-out contract
+/// (`def transform(sql: str, src: str, dst: str) -> str`) by running it once against a
+/// trivial, harmless probe query. Call before trusting a script from a source that can
+/// predate this contract — persisted scripts written against the old, breaking
+/// `def transform(ast, src, dst) -> None` (in-place AST mutation) shape now fail every
+/// live query it runs on instead of silently misbehaving, but that's still a query-time
+/// failure an operator would rather see at load time.
+pub fn validate_fixup_script(script: &str) -> Result<()> {
+    Python::attach(|py| run_fixup_scripts(py, "SELECT 1", "trino", "trino", &[script.to_string()]))
+        .map(|_| ())
+        .map_err(|e| {
+            QueryFluxError::Translation(format!(
+                "fixup script failed validation against the current transform(sql: str, src: \
+                 str, dst: str) -> str contract (a script written for the old \
+                 transform(ast, src, dst) -> None contract must be migrated): {e}"
+            ))
+        })
+}
+
 #[async_trait]
 impl TranslatorTrait for SqlglotTranslator {
     fn source_dialect(&self) -> &SqlDialect {
@@ -400,6 +419,44 @@ fn run_fixup_scripts(
 #[cfg(test)]
 mod fixup_script_tests {
     use super::*;
+
+    #[test]
+    fn validate_fixup_script_accepts_the_current_contract() {
+        validate_fixup_script(
+            r#"
+def transform(sql, src, dst):
+    return sql
+"#,
+        )
+        .expect("string-in/string-out script must validate");
+    }
+
+    /// The pre-this-PR contract mutated an AST in place and returned nothing
+    /// (`def transform(ast, src, dst) -> None`) — a persisted script written against it
+    /// must fail validation with an actionable message, not silently misbehave the first
+    /// time a live query hits it.
+    #[test]
+    fn validate_fixup_script_rejects_the_legacy_ast_mutating_contract() {
+        let err = validate_fixup_script(
+            r#"
+def transform(ast, src, dst):
+    for t in ast.find_all_tables():
+        pass
+"#,
+        )
+        .expect_err("legacy AST-mutating script must fail validation");
+        assert!(err.to_string().contains("must be migrated"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_fixup_script_rejects_a_missing_transform_function() {
+        let err = validate_fixup_script(
+            "x = 1
+",
+        )
+        .expect_err("must fail without transform()");
+        assert!(err.to_string().contains("must be migrated"), "got: {err}");
+    }
 
     /// Regression: a fixup script that turns a read into a write must be rejected by
     /// `run_fixup_scripts` itself, unconditionally — not only when the caller also

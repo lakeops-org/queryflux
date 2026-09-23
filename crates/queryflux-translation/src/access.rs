@@ -87,7 +87,24 @@ pub fn render_mask(
                 .ok_or_else(|| MaskRenderError::MissingConstantValue(mask.column.clone()))?;
             format!("'{}'", v.replace('\'', "''"))
         }
-        MaskType::Redact => format!("regexp_replace({c}, '[A-Za-z0-9]', 'x')"),
+        MaskType::Redact => match src {
+            // Trino/Athena's 3-arg `regexp_replace` already replaces every match; a 4th
+            // positional argument there is a capture-group index, not a flag, so adding one
+            // would either change behavior or be invalid.
+            SqlDialect::Trino | SqlDialect::Athena => {
+                format!("regexp_replace({c}, '[A-Za-z0-9]', 'x')")
+            }
+            // Postgres and DuckDB's 3-arg form replaces only the *first* match — silently
+            // leaving most of a "redacted" value unmasked is exactly the data exposure this
+            // mask exists to prevent, so the `g` (global) flag is required here.
+            SqlDialect::Postgres | SqlDialect::DuckDb => {
+                format!("regexp_replace({c}, '[A-Za-z0-9]', 'x', 'g')")
+            }
+            // Other dialects' regexp_replace global-vs-first-match semantics haven't been
+            // verified; falls back to the (possibly first-match-only) form rather than
+            // guessing at a flags syntax that could produce invalid SQL.
+            _ => format!("regexp_replace({c}, '[A-Za-z0-9]', 'x')"),
+        },
         MaskType::ShowLast4 => {
             format!("CASE WHEN {c} IS NULL THEN NULL ELSE '****' || substr({c}, -4) END")
         }
@@ -622,6 +639,30 @@ mod tests {
         };
         assert_eq!(render_mask(&cust, "s", &d).unwrap(), "upper(s)");
         assert!(render_mask(&cm("s", MaskType::Custom), "s", &d).is_err());
+    }
+    /// REDACT must replace *every* alphanumeric — Postgres/DuckDB's 3-arg `regexp_replace`
+    /// replaces only the first match, so those two dialects need the `g` flag; Trino's
+    /// 3-arg form already replaces every match, and a 4th positional argument there is a
+    /// capture-group index, not a flag, so it must be left alone.
+    #[test]
+    fn render_mask_redact_is_global_where_it_needs_to_be() {
+        let redact = cm("s", MaskType::Redact);
+        assert_eq!(
+            render_mask(&redact, "s", &SqlDialect::Postgres).unwrap(),
+            "regexp_replace(s, '[A-Za-z0-9]', 'x', 'g')"
+        );
+        assert_eq!(
+            render_mask(&redact, "s", &SqlDialect::DuckDb).unwrap(),
+            "regexp_replace(s, '[A-Za-z0-9]', 'x', 'g')"
+        );
+        assert_eq!(
+            render_mask(&redact, "s", &SqlDialect::Trino).unwrap(),
+            "regexp_replace(s, '[A-Za-z0-9]', 'x')"
+        );
+        assert_eq!(
+            render_mask(&redact, "s", &SqlDialect::Athena).unwrap(),
+            "regexp_replace(s, '[A-Za-z0-9]', 'x')"
+        );
     }
 
     #[test]

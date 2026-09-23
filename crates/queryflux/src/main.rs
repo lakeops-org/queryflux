@@ -945,12 +945,14 @@ async fn main() -> Result<()> {
     let cluster_configs = config.clusters.clone();
 
     let group_translation_scripts: HashMap<String, Vec<String>> = if let Some(pg) = &backend {
-        pg.load_group_translation_bodies()
+        let loaded = pg
+            .load_group_translation_bodies()
             .await
             .unwrap_or_else(|e| {
                 tracing::warn!("Failed to load group translation scripts from Postgres: {e}");
                 HashMap::new()
-            })
+            });
+        validate_group_translation_scripts(loaded)
     } else {
         HashMap::new()
     };
@@ -3205,6 +3207,7 @@ async fn reload_live_config(
             tracing::warn!(error = %e, "reload: load_group_translation_bodies failed");
             HashMap::new()
         });
+    let group_translation_scripts = validate_group_translation_scripts(group_translation_scripts);
     let guard_script_bodies = load_guard_script_bodies(Some(pg.as_ref() as &dyn AdminStore)).await;
 
     let mut live = build_live_config(
@@ -3437,6 +3440,41 @@ fn build_authorization(
             Arc::new(OpenFgaAuthorizationClient::new(openfga_cfg).with_operators(operators))
         }
     })
+}
+
+/// Drops any persisted translation fixup script that fails
+/// [`queryflux_translation::sqlglot::validate_fixup_script`] — most commonly one written
+/// against the pre-this-PR `transform(ast, src, dst) -> None` contract rather than the
+/// current `transform(sql: str, src: str, dst: str) -> str`. Scripts are user/admin-editable
+/// (Studio), so a stale one must not block the whole proxy from starting or reloading;
+/// dropping just that script (with a loud warning naming the group and index) means the
+/// group's other fixups and translation still work, instead of every query for that group
+/// failing at translation time on first use.
+fn validate_group_translation_scripts(
+    scripts: HashMap<String, Vec<String>>,
+) -> HashMap<String, Vec<String>> {
+    scripts
+        .into_iter()
+        .map(|(group, group_scripts)| {
+            let valid = group_scripts
+                .into_iter()
+                .enumerate()
+                .filter_map(|(i, script)| {
+                    match queryflux_translation::sqlglot::validate_fixup_script(&script) {
+                        Ok(()) => Some(script),
+                        Err(e) => {
+                            tracing::error!(
+                                group = %group, index = i,
+                                "translation fixup script failed validation and will not run: {e}"
+                            );
+                            None
+                        }
+                    }
+                })
+                .collect();
+            (group, valid)
+        })
+        .collect()
 }
 
 async fn load_guard_script_bodies(store: Option<&dyn AdminStore>) -> HashMap<i64, String> {
@@ -3869,6 +3907,29 @@ fn in_memory_metrics(
 
 #[cfg(test)]
 mod tests {
+    mod group_translation_scripts {
+        use std::collections::HashMap;
+
+        use super::super::validate_group_translation_scripts;
+
+        #[test]
+        fn drops_only_the_group_whose_script_fails_validation() {
+            let scripts = HashMap::from([
+                (
+                    "good-group".to_string(),
+                    vec!["def transform(sql, src, dst):\n    return sql\n".to_string()],
+                ),
+                (
+                    "legacy-group".to_string(),
+                    vec!["def transform(ast, src, dst):\n    return None\n".to_string()],
+                ),
+            ]);
+            let valid = validate_group_translation_scripts(scripts);
+            assert_eq!(valid.get("good-group").map(Vec::len), Some(1));
+            assert_eq!(valid.get("legacy-group").map(Vec::len), Some(0));
+        }
+    }
+
     mod frontend_tasks {
         use std::time::Duration;
 

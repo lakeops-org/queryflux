@@ -1,7 +1,7 @@
 //! OPA wire format: `{"input": {...}}` request, `{"result": {...}}` response, and the
 //! mapping to/from `queryflux_core::access_model`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -124,63 +124,91 @@ pub(super) struct WireResourceDecision {
 /// Map an OPA `{"result": {...}}` body to a neutral [`AccessDecision`].
 ///
 /// A missing `result` (OPA returns `{}` for "undefined") is treated as **deny-all** — the
-/// policy must explicitly produce a per-resource verdict. A non-empty response that does not
-/// cover every requested resource is completed with an explicit deny for each omitted one,
-/// so a partial verdict can never read as "allowed" for a table the policy never judged.
+/// policy must explicitly produce a per-resource verdict. A response that does not cover
+/// every requested resource gets an explicit deny for each omitted one, so a partial verdict
+/// can never read as "allowed" for a table the policy never judged.
+///
+/// One [`ResourceDecision`] is produced per *requested* resource (not per response entry):
+/// its `table` is always the request's own canonical [`AccessResource::qualified_name`],
+/// never whatever string the policy echoed. Policies commonly reply with the bare `table`
+/// from the input rather than round-tripping `schema`/`catalog`; comparing those bare
+/// strings directly downstream (e.g. when matching a row filter to a scan site) would let a
+/// decision meant for one schema's table apply to a same-named table in another schema. A
+/// bare reply is accepted only when that bare name is unambiguous — the *only* requested
+/// resource with that name — otherwise which schema it meant can't be known, and the
+/// resource is treated as undecided (denied) rather than guessed at.
 pub(super) fn from_response(resp: OpaResponse, requested: &AccessRequest) -> AccessDecision {
-    match resp.result {
-        Some(result) if !result.resources.is_empty() => {
-            let mut resources: Vec<ResourceDecision> = result
+    let Some(result) = resp.result.filter(|r| !r.resources.is_empty()) else {
+        return AccessDecision::deny_all(format!(
+            "policy returned no decision for {} resource(s)",
+            requested.resources.len()
+        ));
+    };
+
+    let mut bare_counts: HashMap<String, usize> = HashMap::new();
+    for res in &requested.resources {
+        *bare_counts.entry(res.table.to_lowercase()).or_insert(0) += 1;
+    }
+
+    let resources = requested
+        .resources
+        .iter()
+        .map(|res| {
+            match result
                 .resources
-                .into_iter()
-                .map(|r| ResourceDecision {
-                    table: r.table,
-                    allow: r.allow,
-                    reason: r.reason,
-                    row_filters: r.row_filters,
-                    column_masks: r.column_masks,
-                })
-                .collect();
-            for res in &requested.resources {
-                if !resources.iter().any(|d| decision_covers(&d.table, res)) {
+                .iter()
+                .find(|d| decision_covers(&d.table, res, &bare_counts))
+            {
+                Some(d) => ResourceDecision {
+                    table: res.qualified_name(),
+                    allow: d.allow,
+                    reason: d.reason.clone(),
+                    row_filters: d.row_filters.clone(),
+                    column_masks: d.column_masks.clone(),
+                },
+                None => {
                     let name = res.qualified_name();
-                    resources.push(ResourceDecision {
+                    ResourceDecision {
                         reason: Some(format!("policy returned no decision for {name}")),
                         table: name,
                         allow: false,
                         row_filters: Vec::new(),
                         column_masks: Vec::new(),
-                    });
+                    }
                 }
             }
-            AccessDecision { resources }
-        }
-        _ => AccessDecision::deny_all(format!(
-            "policy returned no decision for {} resource(s)",
-            requested.resources.len()
-        )),
-    }
+        })
+        .collect();
+    AccessDecision { resources }
 }
 
 /// Whether a decision's `table` key refers to `res`. Policies echo the input's bare `table`
 /// or build `schema.table` / `catalog.schema.table`; match case-insensitively, as the
-/// rewrite does.
-fn decision_covers(decision_table: &str, res: &AccessResource) -> bool {
+/// rewrite does. `bare_counts` maps a lowercased bare table name to how many resources in
+/// the *request* share it — a bare decision only resolves an unqualified `res`, or a
+/// qualified one when its bare name is unique in the request (see [`from_response`]).
+fn decision_covers(
+    decision_table: &str,
+    res: &AccessResource,
+    bare_counts: &HashMap<String, usize>,
+) -> bool {
     let d = decision_table.to_lowercase();
     let table = res.table.to_lowercase();
-    if d == table {
-        return true;
-    }
     let Some(schema) = res.schema.as_deref().map(str::to_lowercase) else {
-        return false;
+        return d == table;
     };
     let qualified = format!("{schema}.{table}");
     if d == qualified {
         return true;
     }
-    res.catalog
+    if res
+        .catalog
         .as_deref()
         .is_some_and(|c| d == format!("{}.{qualified}", c.to_lowercase()))
+    {
+        return true;
+    }
+    d == table && bare_counts.get(&table).copied() == Some(1)
 }
 
 #[cfg(test)]
@@ -302,5 +330,54 @@ mod tests {
         let req = request(&[("s", "orders")]);
         assert!(!from_response(OpaResponse { result: None }, &req).is_allowed());
         assert!(!from_response(response(&[]), &req).is_allowed());
+    }
+
+    /// A `table` in the response is always normalized to the request's own qualified name,
+    /// never left as whatever the policy echoed — downstream code (grouping row filters and
+    /// masks into per-table policies) keys off this string, and matching it must be exact.
+    #[test]
+    fn decision_table_is_normalized_to_the_requested_qualified_name() {
+        let d = from_response(response(&[("orders", true)]), &request(&[("s", "orders")]));
+        assert_eq!(d.resources[0].table, "s.orders");
+    }
+
+    /// Regression: a bare-name response entry must not resolve to *every* same-named table
+    /// across different schemas — that would apply one schema's row filters/masks (or its
+    /// allow/deny) to another schema's table entirely. A single bare `orders` decision must
+    /// not cover both `sales.orders` and `hr.orders`; since it can't be known which one the
+    /// policy meant, both are treated as undecided (denied), not both allowed.
+    #[test]
+    fn ambiguous_bare_decision_does_not_cover_either_same_named_table() {
+        let d = from_response(
+            response(&[("orders", true)]),
+            &request(&[("sales", "orders"), ("hr", "orders")]),
+        );
+        assert!(!d.is_allowed());
+        assert_eq!(d.resources.len(), 2);
+        for r in &d.resources {
+            assert!(
+                !r.allow,
+                "{r:?} must not be allowed by the ambiguous bare decision"
+            );
+        }
+    }
+
+    /// A qualified response entry is unambiguous even when its bare name collides with
+    /// another requested table's — only the ambiguous *bare* form needs uniqueness.
+    #[test]
+    fn qualified_decision_still_resolves_its_own_table_despite_a_same_named_sibling() {
+        let d = from_response(
+            response(&[("sales.orders", true), ("hr.orders", false)]),
+            &request(&[("sales", "orders"), ("hr", "orders")]),
+        );
+        assert!(!d.is_allowed());
+        let sales = d
+            .resources
+            .iter()
+            .find(|r| r.table == "sales.orders")
+            .unwrap();
+        let hr = d.resources.iter().find(|r| r.table == "hr.orders").unwrap();
+        assert!(sales.allow);
+        assert!(!hr.allow);
     }
 }

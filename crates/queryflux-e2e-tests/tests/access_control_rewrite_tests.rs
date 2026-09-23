@@ -161,12 +161,12 @@ async fn redact_mask_replaces_alphanumerics() {
     let rows = pg_run(&client, "SELECT ssn FROM customers WHERE id = 1")
         .await
         .expect("select");
-    // Named REDACT renders as regexp_replace without a global flag; Postgres/DuckDB
-    // then replace only the first alphanumeric. The result must still not be the raw SSN.
-    assert_ne!(rows[0][0], "111-22-3333");
-    assert!(
-        rows[0][0].contains('x'),
-        "REDACT must replace at least one alphanumeric with x, got {:?}",
+    // Postgres-wire client -> DuckDB backend: `render_mask` sees the source (Postgres)
+    // dialect and must use the `g` flag so every alphanumeric is replaced, not just the
+    // first — a partially-redacted SSN is still a data exposure.
+    assert_eq!(
+        rows[0][0], "xxx-xx-xxxx",
+        "REDACT must replace every alphanumeric, got {:?}",
         rows[0][0]
     );
 }
