@@ -198,7 +198,17 @@ mod tests {
     /// panics on that), even when the limit itself falls inside one.
     #[test]
     fn truncate_error_body_respects_utf8_boundaries() {
-        let long = "é".repeat(ERROR_BODY_LIMIT); // each "é" is 2 bytes, so this crosses the limit
+        // A one-byte ASCII prefix before the repeated 2-byte "é" shifts every character's
+        // start to an odd byte offset — since `ERROR_BODY_LIMIT` is even, byte
+        // `ERROR_BODY_LIMIT` then falls strictly inside a character rather than between
+        // two, which `"é".repeat(ERROR_BODY_LIMIT)` alone would not: with no prefix, every
+        // character starts at an even offset, so the cut always lands cleanly between
+        // characters and the boundary-seeking loop never actually runs.
+        let long = format!("x{}", "é".repeat(ERROR_BODY_LIMIT));
+        assert!(
+            !long.is_char_boundary(ERROR_BODY_LIMIT),
+            "test setup must land mid-character at the limit, or this test proves nothing"
+        );
         let out = truncate_error_body(long);
         assert!(out.ends_with("... (truncated)"));
     }
