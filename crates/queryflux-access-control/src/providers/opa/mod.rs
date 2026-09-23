@@ -113,7 +113,14 @@ impl OpaProvider {
                 Some(token)
             }
             None => {
-                *guard = Some(TokenCacheEntry::FailedUntil(now + TOKEN_FAILURE_COOLDOWN));
+                // A fresh `Instant`, not `now` from before the fetch: the fetch itself can
+                // take up to `self.timeout`, so a cooldown measured from `now` could already
+                // be expired (or nearly so) the moment it's stored — especially once
+                // `self.timeout` approaches `TOKEN_FAILURE_COOLDOWN` — defeating the point of
+                // caching the failure at all.
+                *guard = Some(TokenCacheEntry::FailedUntil(
+                    Instant::now() + TOKEN_FAILURE_COOLDOWN,
+                ));
                 None
             }
         }

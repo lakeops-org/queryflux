@@ -341,8 +341,12 @@ impl OpenFgaAuthorizationClient {
                         Some(token)
                     }
                     None => {
+                        // A fresh `Instant`, not `now` from before the fetch: the fetch
+                        // itself can take up to `OPENFGA_TOKEN_FETCH_TIMEOUT`, so a cooldown
+                        // measured from `now` could already be expired (or nearly so) the
+                        // moment it's stored, defeating the point of caching the failure.
                         *guard = Some(OpenFgaTokenCacheEntry::FailedUntil(
-                            now + OPENFGA_TOKEN_FAILURE_COOLDOWN,
+                            std::time::Instant::now() + OPENFGA_TOKEN_FAILURE_COOLDOWN,
                         ));
                         None
                     }

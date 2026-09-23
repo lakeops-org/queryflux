@@ -2297,6 +2297,17 @@ pub async fn execute_to_sink(
                         session.database(),
                     )
                     .await;
+                // Routing (and so the real target engine/adapter) isn't resolved yet at
+                // this point — this check runs before cluster-slot acquisition on purpose,
+                // so a genuine cache hit can skip it entirely. `EngineType::Cache` is
+                // therefore a stand-in, not the engine the query would actually run on; a
+                // policy that branches on `context.engine` could disagree with what
+                // `setup_sync_query`'s real-engine check below would decide. A `Denied`
+                // here must not be treated as final the way it would be from a real,
+                // engine-accurate evaluation — falling through (as `Rewritten` already
+                // does) reaches that real check, which denies it for real if it's actually
+                // denied; the alternative, returning an error straight from this synthetic
+                // context, could wrongly deny a query the real engine's policy would allow.
                 match run_access_control_stage(
                     guard,
                     &sql,
@@ -2310,10 +2321,7 @@ pub async fn execute_to_sink(
                 )
                 .await
                 {
-                    AccessStageOutcome::Denied { reason, .. } => {
-                        return sink.on_error(&reason).await
-                    }
-                    AccessStageOutcome::Rewritten { .. } => {
+                    AccessStageOutcome::Denied { .. } | AccessStageOutcome::Rewritten { .. } => {
                         skip_cache_lookup = true;
                         access_control_rewrote_for_cache = true;
                     }
