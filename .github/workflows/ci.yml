@@ -84,6 +84,15 @@ jobs:
     needs: [gate, fmt]
     runs-on: ubuntu-latest
     timeout-minutes: 120
+    # Expensive job (up to 120min, spins up Docker + Postgres/Trino/StarRocks/ClickHouse) —
+    # gated behind a maintainer's approval via the `ci-approval` environment's required
+    # reviewers, so it doesn't burn CI minutes on every PR push before anyone has looked at
+    # it. fmt/helm above stay ungated so those fast, cheap checks still run immediately.
+    # `can_admins_bypass` is on for this environment, so a maintainer's own push (including
+    # merging to main) generally proceeds without a manual click; an external/untrusted
+    # contributor's PR pauses here until one of the configured reviewers approves it from
+    # the run's "Review pending deployments" button.
+    environment: ci-approval
     # Faster CI dev builds: no debuginfo, mold linker (see corrode compile-times tips).
     env:
       CARGO_INCREMENTAL: "0"
