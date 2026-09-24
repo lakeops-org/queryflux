@@ -120,7 +120,6 @@ jobs:
       (needs.approval-gate-push.result == 'success' || needs.approval-gate-push.result == 'skipped')
     runs-on: ubuntu-latest
     timeout-minutes: 120
-    environment: ci-approval
     # Faster CI dev builds: no debuginfo, mold linker (see corrode compile-times tips).
     env:
       CARGO_INCREMENTAL: "0"
