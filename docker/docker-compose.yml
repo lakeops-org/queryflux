@@ -85,17 +85,18 @@ services:
     image: cgr.dev/chainguard/minio-client:latest-dev
     depends_on:
       # Not `service_healthy`: the minimal chainguard/minio image isn't guaranteed to bundle
-      # `mc` (a separate image) for a healthcheck to exec. `restart: on-failure` below already
-      # retries `mc alias set` (and so absorbs minio's own startup race) the same way it
-      # already retries any other transient failure here.
+      # `mc` (a separate image) for a healthcheck to exec. `restart: on-failure` below retries
+      # against minio the same way it already retries any other transient failure here — but
+      # only because the trailing `exit 0` a prior version of this script had is gone: that
+      # unconditionally masked `mc mb`'s exit code, so a real "minio isn't listening yet"
+      # connection failure looked like success and never triggered a retry at all.
       minio:
         condition: service_started
     restart: on-failure
     entrypoint: >
       /bin/sh -c "
-      /usr/bin/mc alias set local http://minio:9000 minio-root-user minio-root-password;
-      /usr/bin/mc mb --ignore-existing local/warehouse;
-      exit 0;
+      /usr/bin/mc alias set local http://minio:9000 minio-root-user minio-root-password &&
+      /usr/bin/mc mb --ignore-existing local/warehouse
       "
 
   migrate:
