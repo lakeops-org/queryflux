@@ -29,11 +29,15 @@ on:
 # One active run per PR: a new push cancels the previous in-progress run for the same PR.
 # All main pushes share one group too (github.ref is constant across them), so they still
 # run one at a time — but never cancelled: a squash-merge's run should always run to
-# completion (queuing behind an earlier one if necessary) rather than losing CI coverage
-# for a commit because another merge landed right behind it.
+# completion rather than losing CI coverage for a commit because another merge landed right
+# behind it. `queue: max` (vs. the default `single`) matters here too: with the default, a
+# second push arriving while one push run is already queued would bump that queued run out
+# in favor of the newest one, silently dropping CI for that commit even though nothing was
+# "cancelled" in the visible sense — `max` keeps every pending main run queued instead.
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  queue: ${{ github.event_name == 'pull_request' && 'single' || 'max' }}
 
 env:
   RUST_TOOLCHAIN_VERSION: "1.91.1"
