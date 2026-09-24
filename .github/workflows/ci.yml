@@ -26,10 +26,14 @@ on:
       - '.github/PULL_REQUEST_TEMPLATE/**'
       - 'LICENSE*'
 
-# One active run per PR or branch: a new push cancels any in-progress run for the same target.
+# One active run per PR: a new push cancels the previous in-progress run for the same PR.
+# All main pushes share one group too (github.ref is constant across them), so they still
+# run one at a time — but never cancelled: a squash-merge's run should always run to
+# completion (queuing behind an earlier one if necessary) rather than losing CI coverage
+# for a commit because another merge landed right behind it.
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   RUST_TOOLCHAIN_VERSION: "1.91.1"
