@@ -249,7 +249,19 @@ jobs:
       - name: Start e2e Docker stack (Trino + StarRocks + ClickHouse + sentinel)
         if: github.event_name == 'push' || steps.paths.outputs.e2e == 'true'
         run: |
-          docker compose -f docker/docker-compose.test.yml --project-directory . up -d --wait --wait-timeout 300 trino starrocks clickhouse sentinel
+          # `docker compose up` occasionally fails on a transient registry error — e.g. quay.io
+          # returning 401 "unauthorized" for an anonymous pull once a shared runner IP hits its
+          # rate limit, not because the (public) image is actually gone. `up -d --wait` is safe
+          # to retry: already-healthy services are left alone, only what didn't come up gets
+          # retried.
+          for attempt in 1 2 3; do
+            if docker compose -f docker/docker-compose.test.yml --project-directory . up -d --wait --wait-timeout 300 trino starrocks clickhouse sentinel; then
+              exit 0
+            fi
+            echo "::warning::e2e stack failed to start (attempt ${attempt}/3)"
+            [ "$attempt" -lt 3 ] && sleep 30
+          done
+          exit 1
 
       - name: E2E tests (queryflux-e2e-tests)
         if: github.event_name == 'push' || steps.paths.outputs.e2e == 'true'
