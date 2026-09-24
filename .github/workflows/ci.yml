@@ -112,8 +112,11 @@ jobs:
     needs: [gate, fmt, approval-gate-pr, approval-gate-push]
     # Exactly one of the two gate jobs above actually runs (the other is skipped by its own
     # `if:`) — proceed once whichever one ran has succeeded, and neither has failed.
+    # `!cancelled()`, not `always()`: this must still respect a cancelled run (e.g. a new
+    # push superseding this one via `concurrency: cancel-in-progress`) — `always()` would
+    # start this 120min job regardless.
     if: |
-      always() &&
+      !cancelled() &&
       needs.gate.result == 'success' &&
       needs.fmt.result == 'success' &&
       (needs.approval-gate-pr.result == 'success' || needs.approval-gate-pr.result == 'skipped') &&
