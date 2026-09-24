@@ -245,18 +245,33 @@ def _write_targets(tree):
     return ([node] if isinstance(node, exp.Table) else []), True
 
 
+def _set_assignment_columns(expressions):
+    """Column names assigned by a list of `col = expr` nodes (an UPDATE's SET list, or an
+    ON CONFLICT/ON DUPLICATE KEY DO UPDATE SET list)."""
+    return {
+        e.this.name
+        for e in expressions or []
+        if isinstance(e, exp.EQ) and isinstance(e.this, exp.Column)
+    }
+
+
 def _written_columns(tree):
     """Columns an INSERT column list / UPDATE ... SET names, sorted; None = the whole row
     (DELETE, MERGE, TRUNCATE, or an INSERT without a column list)."""
     cols = None
-    if isinstance(tree, exp.Insert) and isinstance(tree.this, exp.Schema):
-        cols = {c.name for c in tree.this.expressions if getattr(c, "name", None)}
+    if isinstance(tree, exp.Insert):
+        if isinstance(tree.this, exp.Schema):
+            cols = {c.name for c in tree.this.expressions if getattr(c, "name", None)}
+        # `INSERT ... ON CONFLICT DO UPDATE SET ...` (or MySQL's `ON DUPLICATE KEY UPDATE`,
+        # parsed into the same `conflict` arg) can write columns the insert column list
+        # never named — those are also write-target columns a policy must see. A whole-row
+        # insert (`cols` still None here) already covers them; only a named column list
+        # needs extending.
+        conflict = tree.args.get("conflict")
+        if conflict is not None and cols is not None:
+            cols |= _set_assignment_columns(conflict.expressions)
     elif isinstance(tree, exp.Update):
-        cols = {
-            e.this.name
-            for e in tree.expressions
-            if isinstance(e, exp.EQ) and isinstance(e.this, exp.Column)
-        }
+        cols = _set_assignment_columns(tree.expressions)
     return sorted(cols) if cols else None
 
 
@@ -845,6 +860,65 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Regression: `INSERT ... ON CONFLICT DO UPDATE SET` can write columns the insert
+    /// column list never named. A column policy must see those too, or it could allow the
+    /// insert columns while the statement also silently modifies an unauthorized one on
+    /// conflict. A whole-row insert already reports every column, so the conflict clause
+    /// adds nothing there; `DO NOTHING` has no SET list to contribute at all.
+    #[test]
+    fn extract_resources_includes_on_conflict_update_columns() {
+        let schema = SchemaContext::default();
+        for (sql, expected) in [
+            (
+                "INSERT INTO orders (id) VALUES (1) ON CONFLICT (id) DO UPDATE SET amount = 2",
+                cols(&["amount", "id"]),
+            ),
+            (
+                "INSERT INTO orders (id, region) VALUES (1, 'EU')                  ON CONFLICT (id) DO UPDATE SET amount = 2, region = 'US'",
+                cols(&["amount", "id", "region"]),
+            ),
+            (
+                "INSERT INTO orders VALUES (1, 2, 'EU') ON CONFLICT (id) DO UPDATE SET amount = 2",
+                None,
+            ),
+            (
+                "INSERT INTO orders (id) VALUES (1) ON CONFLICT (id) DO NOTHING",
+                cols(&["id"]),
+            ),
+        ] {
+            assert_eq!(
+                targets_with_columns(sql, &schema),
+                vec![("orders".to_string(), expected)],
+                "{sql}"
+            );
+        }
+    }
+
+    /// Same coverage for MySQL's `ON DUPLICATE KEY UPDATE`, sqlglot's other spelling of the
+    /// same `conflict` node.
+    #[test]
+    fn extract_resources_includes_on_duplicate_key_update_columns() {
+        let schema = SchemaContext::default();
+        let st = extract_resources(
+            "INSERT INTO orders (id) VALUES (1) ON DUPLICATE KEY UPDATE amount = 2",
+            &SqlDialect::MySql,
+            &schema,
+        )
+        .unwrap();
+        let target = st
+            .resources
+            .iter()
+            .find(|r| r.is_write_target)
+            .expect("write target");
+        assert_eq!(
+            match &target.columns {
+                Columns::Named(c) => Some(c.clone()),
+                Columns::All => None,
+            },
+            cols(&["amount", "id"])
+        );
     }
 
     /// `TRUNCATE` is a write to every table it names and reads nothing.
