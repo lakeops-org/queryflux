@@ -99,8 +99,13 @@ services:
     networks:
       - test_net
 
+  # MinIO discontinued anonymous pulls of quay.io/minio/minio (and Docker Hub's minio/minio)
+  # around 2025 — every anonymous registry token now comes back with an empty pull scope, a
+  # hard access change, not a rate limit. Chainguard mirrors the same MinIO releases and stays
+  # anonymously pullable; `-dev` (not the minimal default tag) is required for `createbuckets`,
+  # which needs a shell to chain `mc alias set` + `mc mb` in one entrypoint.
   minio:
-    image: quay.io/minio/minio
+    image: cgr.dev/chainguard/minio:latest-dev
     environment:
       - MINIO_ROOT_USER=minio-root-user
       - MINIO_ROOT_PASSWORD=minio-root-password
@@ -108,20 +113,18 @@ services:
     ports:
       - "19000:9000"
       - "19001:9001"
-    healthcheck:
-      test: ["CMD", "mc", "ready", "local"]
-      interval: 2s
-      timeout: 10s
-      retries: 20
-      start_period: 15s
     networks:
       - test_net
 
   createbuckets:
-    image: quay.io/minio/minio
+    image: cgr.dev/chainguard/minio-client:latest-dev
     depends_on:
+      # Not `service_healthy`: the minimal chainguard/minio image isn't guaranteed to bundle
+      # `mc` (a separate image) for a healthcheck to exec. `restart: on-failure` below already
+      # retries `mc alias set` (and so absorbs minio's own startup race) the same way it
+      # already retries any other transient failure here.
       minio:
-        condition: service_healthy
+        condition: service_started
     restart: on-failure
     entrypoint: >
       /bin/sh -c "
@@ -166,8 +169,10 @@ services:
         condition: service_completed_successfully
       db:
         condition: service_healthy
+      # Not `service_healthy` (minio has no healthcheck — see its own comment above);
+      # `createbuckets` completing successfully already implies minio was reachable.
       minio:
-        condition: service_healthy
+        condition: service_started
       createbuckets:
         condition: service_completed_successfully
     networks:
