@@ -163,6 +163,12 @@ pub(super) fn from_response(resp: OpaResponse, requested: &AccessRequest) -> Acc
     };
 
     let mut bare_counts: HashMap<String, usize> = HashMap::new();
+    // A `name` echo is exact (no schema/catalog to reconstruct), but two *different*
+    // requested resources can still share the same bare name — two `orders` tables in
+    // different schemas, or two `analytics` schemas in different catalogs — so it needs the
+    // same ambiguity guard `bare_counts` gives the `table` echo, keyed by (kind, name)
+    // since a table and a schema can coincidentally share a leaf name too.
+    let mut name_counts: HashMap<(&'static str, String), usize> = HashMap::new();
     for res in &requested.resources {
         // Schema/catalog resources have no `table` (it's `""`); an empty-string key would
         // let two unrelated schema/catalog resources in one request falsely look "unique"
@@ -171,6 +177,9 @@ pub(super) fn from_response(resp: OpaResponse, requested: &AccessRequest) -> Acc
         if !res.table.is_empty() {
             *bare_counts.entry(res.table.to_lowercase()).or_insert(0) += 1;
         }
+        *name_counts
+            .entry((res.kind.as_str(), res.name().to_lowercase()))
+            .or_insert(0) += 1;
     }
 
     let resources = requested
@@ -180,7 +189,7 @@ pub(super) fn from_response(resp: OpaResponse, requested: &AccessRequest) -> Acc
             match result
                 .resources
                 .iter()
-                .find(|d| decision_covers(d, res, &bare_counts))
+                .find(|d| decision_covers(d, res, &bare_counts, &name_counts))
             {
                 Some(d) => ResourceDecision {
                     table: res.qualified_name(),
@@ -206,24 +215,32 @@ pub(super) fn from_response(resp: OpaResponse, requested: &AccessRequest) -> Acc
 }
 
 /// Whether a decision refers to `res`. A `name` echo (any kind) matches case-insensitively
-/// against [`AccessResource::name`] — exact, no fuzzy resolution needed, since `name` is
-/// already the object's own unqualified leaf. Falling back to a `table` echo (table/view
-/// resources only — schema/catalog resources have no `table` to fall back to): policies
-/// commonly reply with the bare `table` from the input rather than round-tripping
-/// `schema`/`catalog`; comparing those bare strings directly downstream (e.g. when matching
-/// a row filter to a scan site) would let a decision meant for one schema's table apply to a
-/// same-named table in another schema. A bare reply is accepted only when that bare name is
-/// unambiguous — the *only* requested resource with that name — otherwise which schema it
-/// meant can't be known, and the resource is treated as undecided (denied) rather than
-/// guessed at. `bare_counts` maps a lowercased bare table name to how many resources in the
-/// *request* share it (see [`from_response`]).
+/// against [`AccessResource::name`] — but, just like the `table` echo below, only when that
+/// (kind, name) is unambiguous in the request: two different tables (or two schemas, two
+/// catalogs, …) can share a bare name, and a `name` echo doesn't carry enough to tell them
+/// apart either. Falling back to a `table` echo (table/view resources only — schema/catalog
+/// resources have no `table` to fall back to): policies commonly reply with the bare `table`
+/// from the input rather than round-tripping `schema`/`catalog`; comparing those bare
+/// strings directly downstream (e.g. when matching a row filter to a scan site) would let a
+/// decision meant for one schema's table apply to a same-named table in another schema. A
+/// bare reply is accepted only when that bare name is unambiguous — the *only* requested
+/// resource with that name — otherwise which schema it meant can't be known, and the
+/// resource is treated as undecided (denied) rather than guessed at. `bare_counts` and
+/// `name_counts` map a lowercased bare table name / (kind, name) pair to how many resources
+/// in the *request* share it (see [`from_response`]).
 fn decision_covers(
     decision: &WireResourceDecision,
     res: &AccessResource,
     bare_counts: &HashMap<String, usize>,
+    name_counts: &HashMap<(&'static str, String), usize>,
 ) -> bool {
     if let Some(name) = decision.name.as_deref() {
-        if name.eq_ignore_ascii_case(res.name()) {
+        if name.eq_ignore_ascii_case(res.name())
+            && name_counts
+                .get(&(res.kind.as_str(), res.name().to_lowercase()))
+                .copied()
+                == Some(1)
+        {
             return true;
         }
     }
@@ -468,6 +485,45 @@ mod tests {
             assert!(
                 !r.allow,
                 "{r:?} must not be allowed by the ambiguous bare decision"
+            );
+        }
+    }
+
+    /// Same regression as `ambiguous_bare_decision_does_not_cover_either_same_named_table`,
+    /// but for a `name` echo: two schema resources in different catalogs share the bare
+    /// name `analytics`, so a single `{"name": "analytics", ...}` decision must not resolve
+    /// to either of them.
+    #[test]
+    fn ambiguous_name_decision_does_not_cover_either_same_named_schema() {
+        let mut req = requested(&[]);
+        req.operation = Operation("schema.drop".to_string());
+        req.resources = vec![
+            AccessResource {
+                kind: ResourceKind::Schema,
+                catalog: Some("prod".to_string()),
+                schema: Some("analytics".to_string()),
+                table: String::new(),
+                columns: Columns::All,
+            },
+            AccessResource {
+                kind: ResourceKind::Schema,
+                catalog: Some("staging".to_string()),
+                schema: Some("analytics".to_string()),
+                table: String::new(),
+                columns: Columns::All,
+            },
+        ];
+        let resp: OpaResponse = serde_json::from_str(
+            r#"{"result": {"resources": [{"name": "analytics", "allow": true}]}}"#,
+        )
+        .unwrap();
+        let d = from_response(resp, &req);
+        assert!(!d.is_allowed());
+        assert_eq!(d.resources.len(), 2);
+        for r in &d.resources {
+            assert!(
+                !r.allow,
+                "{r:?} must not be allowed by the ambiguous name decision"
             );
         }
     }

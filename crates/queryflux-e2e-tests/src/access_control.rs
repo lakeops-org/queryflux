@@ -197,7 +197,7 @@ async fn opa_handler(
             continue;
         }
 
-        let mut entry = json!({ "table": table, "allow": true });
+        let mut entry = json!({ "table": table, "name": table, "allow": true });
         if contains_table(&st.deny_tables, &table)
             || st.op_denied.contains(&(operation.clone(), table.clone()))
         {
@@ -232,7 +232,7 @@ async fn opa_handler(
 }
 
 fn verdict_json(table: &str, v: &TableVerdict) -> Value {
-    let mut entry = json!({ "table": table, "allow": v.allow });
+    let mut entry = json!({ "table": table, "name": table, "allow": v.allow });
     if let Some(reason) = &v.reason {
         entry["reason"] = json!(reason);
     }
