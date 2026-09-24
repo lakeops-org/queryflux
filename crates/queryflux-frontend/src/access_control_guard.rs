@@ -241,6 +241,23 @@ impl Guard for OpaAccessGuard {
             .into_iter()
             .filter(|o| conn.controller.evaluates(o))
             .collect();
+        // `classify_operation` (a lightweight, independent classifier) and `extract_resources`
+        // (sqlglot-based) are expected to agree on every operation `Operation::SUPPORTED`
+        // allows enabling: whenever the former says this statement is one of those write
+        // kinds, the latter should have found its target. If they ever disagree — a future
+        // operation added to one classifier and not the other, a dialect-specific parse gap —
+        // this must fail closed, the same as an outright parse failure above: an enabled
+        // write operation silently proceeding unauthorized (because its target was empty, not
+        // because it isn't tracked at all) would be a worse bug than a false-positive deny.
+        if !write_ops.is_empty() && targets.is_empty() {
+            return GuardResult::deny(
+                format!(
+                    "access control: could not identify the target of {}",
+                    operation.as_str()
+                ),
+                "ACCESS_ANALYSIS_FAILED",
+            );
+        }
         let check_write = !write_ops.is_empty() && !targets.is_empty();
         if !check_reads && !check_write {
             // No base tables (e.g. `SELECT 1`), or nothing this connection evaluates.
