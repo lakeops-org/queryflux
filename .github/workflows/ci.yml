@@ -78,20 +78,48 @@ jobs:
       - uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4.3.1
       - run: make helm-check
 
+  # The `rust` job below is expensive (up to 120min: compile, clippy, unit, Postgres, and a
+  # Docker-based e2e stack) — a PR needs a maintainer's approval before it runs, so it
+  # doesn't burn CI minutes on every push before anyone has looked at the PR. A push to
+  # main (already reviewed via the PR that merged it) does not need that approval.
+  #
+  # This is two tiny, mutually-exclusive gate jobs — one per trigger type, each `if:`-
+  # skipped for the other — rather than a conditional `environment:` expression on `rust`
+  # itself: GitHub Actions doesn't clearly document what an empty/null environment-name
+  # expression does, so `environment:` here is only ever a fixed, always-present string.
+  # `rust`'s own `if:` (below) then requires each of these to be either `success` or
+  # `skipped`, never `failure`.
+  approval-gate-pr:
+    name: CI approval (PR)
+    needs: gate
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    environment: ci-approval
+    steps:
+      - run: echo "Approved — starting the Rust job."
+
+  approval-gate-push:
+    name: CI approval (push)
+    needs: gate
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "Push event — no approval gate."
+
   # One compile: clippy (--all-targets) then unit + Postgres + optional E2E reuse the same target dir.
   rust:
     name: Rust (clippy, unit & E2E)
-    needs: [gate, fmt]
+    needs: [gate, fmt, approval-gate-pr, approval-gate-push]
+    # Exactly one of the two gate jobs above actually runs (the other is skipped by its own
+    # `if:`) — proceed once whichever one ran has succeeded, and neither has failed.
+    if: |
+      always() &&
+      needs.gate.result == 'success' &&
+      needs.fmt.result == 'success' &&
+      (needs.approval-gate-pr.result == 'success' || needs.approval-gate-pr.result == 'skipped') &&
+      (needs.approval-gate-push.result == 'success' || needs.approval-gate-push.result == 'skipped')
     runs-on: ubuntu-latest
     timeout-minutes: 120
-    # Expensive job (up to 120min, spins up Docker + Postgres/Trino/StarRocks/ClickHouse) —
-    # gated behind a maintainer's approval via the `ci-approval` environment's required
-    # reviewers, so it doesn't burn CI minutes on every PR push before anyone has looked at
-    # it. fmt/helm above stay ungated so those fast, cheap checks still run immediately.
-    # `can_admins_bypass` is on for this environment, so a maintainer's own push (including
-    # merging to main) generally proceeds without a manual click; an external/untrusted
-    # contributor's PR pauses here until one of the configured reviewers approves it from
-    # the run's "Review pending deployments" button.
     environment: ci-approval
     # Faster CI dev builds: no debuginfo, mold linker (see corrode compile-times tips).
     env:
