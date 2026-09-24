@@ -124,7 +124,7 @@ Content-Type: application/json
 | --- | --- |
 | `principal.id` / `.roles` | From the verified `AuthContext`. |
 | `principal.attr.groups` | `AuthContext.groups`, carried as a free-form attribute — Cerbos's own RBAC matches on `roles`, not `groups`; put group-based logic in a `condition` on `P.attr.groups` if you need it. |
-| `resources[].resource.kind` | `"table"` for every table a query reads; a DDL target uses `"view"`, `"schema"` or `"catalog"` instead. One Cerbos resource policy per kind governs it generically (matching on `R.attr.catalog` / `R.attr.schema` / `R.attr.table`; `table` is empty for schema/catalog resources). |
+| `resources[].resource.kind` | `"table"` for every table a query reads, and for a table DDL target (`CREATE`/`ALTER`/`DROP TABLE`); a `view`, `schema` or `catalog` DDL target uses that resource kind instead. One Cerbos resource policy per kind governs it generically (matching on `R.attr.catalog` / `R.attr.schema` / `R.attr.table`; `table` is empty for schema/catalog resources). |
 | `resources[].resource.attr.columns` | Named list, or **omitted** meaning all columns (`SELECT *` or unresolved schema). |
 | `resources[].actions` | Always a single-element array — QueryFlux evaluates one namespaced operation (e.g. `table.select`) per request. A statement that reads tables and also writes one makes one request per operation. Your Cerbos policy must define each operation you enable in `operations` (`table.insert`, `table.update`, …) — an action with no matching rule is `EFFECT_NO_MATCH`, which denies. Each resource is sent under its own Cerbos `kind` — `table`, and for DDL `view`, `schema` or `catalog` (`id` is the object's name) — so enabling `schema.drop` needs a `schema` resource policy. |
 
