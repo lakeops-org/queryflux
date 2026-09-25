@@ -204,6 +204,20 @@ services:
       sentinel:
         condition: service_healthy
 
+# lakekeeper-db and rustfs-data are named volumes, so this demo's Iceberg data
+# and Lakekeeper catalog metadata persist across `docker compose down` (no -v)
+# and are only wiped by `docker compose down -v`. This is the only example with
+# that persistence — docker/docker-compose.yml and the other examples/ demos
+# don't declare a volume for lakekeeper-db, so their catalog metadata doesn't
+# survive a restart the same way and this note doesn't apply to them.
+#
+# If you have a volume set from before the MinIO -> RustFS migration, the
+# persisted warehouse config in lakekeeper-db still points at the old `minio`
+# service/credentials, which won't resolve against the renamed `rustfs`
+# service. There's no supported way to migrate those objects/credentials in
+# place; since this is disposable demo data, run `docker compose down -v` to
+# reset both volumes and let `createbuckets` + `initialwarehouse` recreate a
+# fresh warehouse against RustFS.
 volumes:
   queryflux-pg:
   lakekeeper-db:
