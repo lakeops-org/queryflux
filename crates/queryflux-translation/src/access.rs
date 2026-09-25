@@ -292,7 +292,17 @@ def _write_targets(tree):
             bool(tree.args.get("replace")),
         )
     if isinstance(tree, exp.Drop):
+        # Older sqlglot releases (e.g. 30.17.x, still >=30.0.3) put a single-object DROP's
+        # target in `tree.this` rather than the `tables` list — `DROP TABLE t`, `DROP
+        # PROCEDURE p`, etc. all parsed that way. Newer releases moved it to `tables`
+        # (also how a genuine multi-table `DROP TABLE a, b` is represented in either
+        # release). Falling back to `.this` when `tables` is empty covers both shapes
+        # instead of pinning extraction to one specific sqlglot release's internals.
         nodes = [n for n in tree.args.get("tables", []) if isinstance(n, exp.Table)]
+        if not nodes:
+            node = _unwrap(tree.this)
+            if node is not None:
+                nodes = [node]
         return ([(n, kind) for n in nodes] if kind else []), False, False
     if isinstance(tree, exp.Alter):
         node = _unwrap(tree.this)
