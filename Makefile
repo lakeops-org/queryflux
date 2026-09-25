@@ -36,7 +36,7 @@ setup:
 	.venv/bin/pip install -r requirements.txt
 	@echo "Python env ready. Run: export PYO3_PYTHON=$$(pwd)/.venv/bin/python3"
 
-## Start all services (Trino, StarRocks, Lakekeeper + MinIO, Postgres, observability),
+## Start all services (Trino, StarRocks, Lakekeeper + RustFS, Postgres, observability),
 ## load TPC-H data into Iceberg, then run QueryFlux locally.
 env:
 	test -f .venv/bin/python3 || (echo "Run 'make setup' first" && exit 1)
@@ -125,7 +125,7 @@ test-e2e:
 	STARROCKS_URL=mysql://root@localhost:9030 \
 	CLICKHOUSE_URL=http://localhost:18123 \
 	LAKEKEEPER_URL=http://localhost:18181 \
-	MINIO_ENDPOINT=localhost:19000 \
+	RUSTFS_ENDPOINT=localhost:19000 \
 	$(CARGO) test -p queryflux-e2e-tests --manifest-path Cargo.toml -- --test-threads=1 --include-ignored --nocapture
 
 ## Remove build artifacts and Docker volumes

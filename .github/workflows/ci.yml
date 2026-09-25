@@ -271,7 +271,7 @@ jobs:
           STARROCKS_URL: mysql://root@localhost:9030
           CLICKHOUSE_URL: http://localhost:18123
           LAKEKEEPER_URL: http://localhost:18181
-          MINIO_ENDPOINT: localhost:19000
+          RUSTFS_ENDPOINT: localhost:19000
         run: |
           cargo test -p queryflux-e2e-tests --manifest-path Cargo.toml -- --test-threads=1 --include-ignored
 

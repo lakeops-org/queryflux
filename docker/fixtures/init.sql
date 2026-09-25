@@ -9,12 +9,12 @@
 -- another schema when env `TPCH_SCALE` is set (see docker-compose *.yml).
 --
 -- Common scales (Trino): `tiny` (~15k orders, default), `sf1` (~1.5M orders),
--- `sf10`, `sf100`, … Larger scales mean much longer load time, more MinIO
+-- `sf10`, `sf100`, … Larger scales mean much longer load time, more RustFS
 -- space, and slower E2E tests (raise timeouts if needed).
 -- Example:  TPCH_SCALE=sf1  make dev   or   TPCH_SCALE=sf1  make test-e2e
 --
 -- All-in-Docker stacks (Trino only inside Compose): use init.docker-network.sql
--- so the Iceberg warehouse S3 endpoint is http://minio:9000.
+-- so the Iceberg warehouse S3 endpoint is http://rustfs:9000.
 
 DROP CATALOG IF EXISTS lakekeeper;
 
@@ -31,8 +31,8 @@ WITH (
     -- - the host process running DuckDB (used by QueryFlux tests)
     "s3.endpoint" = 'http://host.docker.internal:19000',
     "fs.native-s3.enabled" = 'true',
-    "s3.aws-access-key" = 'minio-root-user',
-    "s3.aws-secret-key" = 'minio-root-password'
+    "s3.aws-access-key" = 'rustfs-root-user',
+    "s3.aws-secret-key" = 'rustfs-root-password'
 );
 
 CREATE SCHEMA IF NOT EXISTS lakekeeper.tpch;

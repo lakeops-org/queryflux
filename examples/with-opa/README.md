@@ -5,7 +5,7 @@ Local walkthrough of table allow/deny, row filters, and column masks from
 **[Access control](../../website/docs/access-control/overview.md)** ·
 **[OPA provider](../../website/docs/access-control/opa.md)**.
 
-Compose runs **Lakekeeper**, **MinIO**, **Trino**, and **OPA**; QueryFlux runs
+Compose runs **Lakekeeper**, **RustFS**, **Trino**, and **OPA**; QueryFlux runs
 **on the host from this branch** (the published `ghcr.io/lakeops-org/queryflux:latest`
 image does not include `accessControl` yet).
 
@@ -130,7 +130,7 @@ saves go to `proxy_settings` in this database.
 docker compose -f examples/with-opa/docker-compose.yml down
 ```
 
-Iceberg data persists in the Compose MinIO volume until `docker compose down -v`
+Iceberg data persists in the Compose RustFS volume until `docker compose down -v`
 (or you remove volumes). QueryFlux history and Studio config persist in the
 `queryflux-pg` volume until you remove it. Re-run `data-seed` after a fresh stack
 to recreate tables.

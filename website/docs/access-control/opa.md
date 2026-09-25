@@ -372,7 +372,7 @@ Set `failOpen: true` (or per-group) only when availability must trump enforcemen
 
 ## Local demo
 
-A Compose stack with Lakekeeper, MinIO, Trino, OPA, and a small UI lives under [`examples/with-opa/`](https://github.com/lakeops-org/queryflux/tree/main/examples/with-opa):
+A Compose stack with Lakekeeper, RustFS, Trino, OPA, and a small UI lives under [`examples/with-opa/`](https://github.com/lakeops-org/queryflux/tree/main/examples/with-opa):
 
 | User | Groups | `customers` | `payroll` |
 | --- | --- | --- | --- |

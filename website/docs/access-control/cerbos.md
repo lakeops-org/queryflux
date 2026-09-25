@@ -338,7 +338,7 @@ Set `failOpen: true` (or per-group) only when availability must trump enforcemen
 
 ## Local demo
 
-A Compose stack with Lakekeeper, MinIO, Trino, and Cerbos lives under [`examples/with-cerbos/`](https://github.com/lakeops-org/queryflux/tree/main/examples/with-cerbos):
+A Compose stack with Lakekeeper, RustFS, Trino, and Cerbos lives under [`examples/with-cerbos/`](https://github.com/lakeops-org/queryflux/tree/main/examples/with-cerbos):
 
 | User | Role | `customers` | `payroll` |
 | --- | --- | --- | --- |

@@ -1,5 +1,5 @@
 -- Bootstrap Lakekeeper Iceberg tables for the Cerbos demo (Trino inside Compose).
--- S3 endpoint targets MinIO on the Docker network.
+-- S3 endpoint targets RustFS on the Docker network.
 --
 -- Safe to re-run: never drops a table, and only inserts fixture rows that aren't
 -- already present (by id) — running this because ONE demo table is missing must not
@@ -15,10 +15,10 @@ WITH (
     "iceberg.rest-catalog.security" = 'NONE',
     "s3.region" = 'local',
     "s3.path-style-access" = 'true',
-    "s3.endpoint" = 'http://minio:9000',
+    "s3.endpoint" = 'http://rustfs:9000',
     "fs.native-s3.enabled" = 'true',
-    "s3.aws-access-key" = 'minio-root-user',
-    "s3.aws-secret-key" = 'minio-root-password'
+    "s3.aws-access-key" = 'rustfs-root-user',
+    "s3.aws-secret-key" = 'rustfs-root-password'
 );
 
 CREATE SCHEMA IF NOT EXISTS lakekeeper.demo;

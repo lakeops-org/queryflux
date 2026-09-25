@@ -6,7 +6,7 @@ PROPERTIES (
   "iceberg.catalog.warehouse" = "demo",
   "aws.s3.region" = "local",
   "aws.s3.enable_path_style_access" = "true",
-  "aws.s3.endpoint" = "http://minio:9000",
-  "aws.s3.access_key" = "minio-root-user",
-  "aws.s3.secret_key" = "minio-root-password"
+  "aws.s3.endpoint" = "http://rustfs:9000",
+  "aws.s3.access_key" = "rustfs-root-user",
+  "aws.s3.secret_key" = "rustfs-root-password"
 );

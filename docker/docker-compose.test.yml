@@ -1,7 +1,7 @@
 # Lean compose file for E2E tests.
 #
 # Engines: Trino, StarRocks, ClickHouse.
-# Iceberg stack: Postgres (Lakekeeper backend), MinIO, Lakekeeper.
+# Iceberg stack: Postgres (Lakekeeper backend), RustFS, Lakekeeper.
 #
 # Usage:
 #   docker compose -f docker-compose.test.yml up -d --wait
@@ -83,7 +83,7 @@ services:
       - test_net
 
   # ---------------------------------------------------------------------------
-  # Iceberg catalog stack (Lakekeeper + MinIO + Postgres)
+  # Iceberg catalog stack (Lakekeeper + RustFS + Postgres)
   # ---------------------------------------------------------------------------
 
   db:
@@ -99,39 +99,32 @@ services:
     networks:
       - test_net
 
-  # MinIO discontinued anonymous pulls of quay.io/minio/minio (and Docker Hub's minio/minio)
-  # around 2025 — every anonymous registry token now comes back with an empty pull scope, a
-  # hard access change, not a rate limit. Chainguard mirrors the same MinIO releases and stays
-  # anonymously pullable; `-dev` (not the minimal default tag) is required for `createbuckets`,
-  # which needs a shell to chain `mc alias set` + `mc mb` in one entrypoint.
-  minio:
-    image: cgr.dev/chainguard/minio:latest-dev
+  rustfs:
+    image: rustfs/rustfs:1.0.0
     environment:
-      - MINIO_ROOT_USER=minio-root-user
-      - MINIO_ROOT_PASSWORD=minio-root-password
-    command: ["server", "--console-address", ":9001", "/data"]
+      - RUSTFS_ACCESS_KEY=rustfs-root-user
+      - RUSTFS_SECRET_KEY=rustfs-root-password
     ports:
       - "19000:9000"
       - "19001:9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/health/ready"]
+      interval: 2s
+      timeout: 10s
+      retries: 20
+      start_period: 15s
     networks:
       - test_net
 
   createbuckets:
-    image: cgr.dev/chainguard/minio-client:latest-dev
+    image: curlimages/curl
     depends_on:
-      # Not `service_healthy`: the minimal chainguard/minio image isn't guaranteed to bundle
-      # `mc` (a separate image) for a healthcheck to exec. `restart: on-failure` below retries
-      # against minio the same way it already retries any other transient failure here — but
-      # only because the trailing `exit 0` a prior version of this script had is gone: that
-      # unconditionally masked `mc mb`'s exit code, so a real "minio isn't listening yet"
-      # connection failure looked like success and never triggered a retry at all.
-      minio:
-        condition: service_started
+      rustfs:
+        condition: service_healthy
     restart: on-failure
     entrypoint: >
       /bin/sh -c "
-      /usr/bin/mc alias set local http://minio:9000 minio-root-user minio-root-password &&
-      /usr/bin/mc mb --ignore-existing local/warehouse
+      curl -fsS --aws-sigv4 aws:amz:us-east-1:s3 -u rustfs-root-user:rustfs-root-password -X PUT http://rustfs:9000/warehouse
       "
     networks:
       - test_net
@@ -170,10 +163,8 @@ services:
         condition: service_completed_successfully
       db:
         condition: service_healthy
-      # Not `service_healthy` (minio has no healthcheck — see its own comment above);
-      # `createbuckets` completing successfully already implies minio was reachable.
-      minio:
-        condition: service_started
+      rustfs:
+        condition: service_healthy
       createbuckets:
         condition: service_completed_successfully
     networks:

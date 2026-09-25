@@ -69,10 +69,10 @@ WITH (
     "iceberg.rest-catalog.security" = 'NONE',
     "s3.region" = 'local',
     "s3.path-style-access" = 'true',
-    "s3.endpoint" = 'http://minio:9000',
+    "s3.endpoint" = 'http://rustfs:9000',
     "fs.native-s3.enabled" = 'true',
-    "s3.aws-access-key" = 'minio-root-user',
-    "s3.aws-secret-key" = 'minio-root-password'
+    "s3.aws-access-key" = 'rustfs-root-user',
+    "s3.aws-secret-key" = 'rustfs-root-password'
 )"#,
         "CREATE SCHEMA IF NOT EXISTS lakekeeper.e2e",
         "DROP TABLE IF EXISTS lakekeeper.e2e.lineitem",

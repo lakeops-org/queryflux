@@ -22,7 +22,7 @@ another of exercising that same file.
 ## Architecture
 
 ```
-you ── SQL ──▶ QueryFlux (:8080) ── SQL ──▶ Trino (:8081) ── Iceberg ──▶ Lakekeeper (:8181) + MinIO
+you ── SQL ──▶ QueryFlux (:8080) ── SQL ──▶ Trino (:8081) ── Iceberg ──▶ Lakekeeper (:8181) + RustFS
                     │
                     │  "can bob select from customers, and with what
                     │   row filter / column mask?"
@@ -37,7 +37,7 @@ QueryFlux asks Cerbos **before** running the query, rewrites the SQL with
 whatever row filter / column mask Cerbos returned, and only then sends it to
 Trino. QueryFlux itself runs **on the host, from this branch** — the
 published `ghcr.io/lakeops-org/queryflux:latest` image doesn't yet include
-the Cerbos provider. Everything else (Lakekeeper, MinIO, Trino, Cerbos, and
+the Cerbos provider. Everything else (Lakekeeper, RustFS, Trino, Cerbos, and
 QueryFlux's own Postgres) runs in Docker Compose.
 
 ## Run it
@@ -199,7 +199,7 @@ control live; saves go to `proxy_settings` in that same database.
 ## Stop
 
 ```bash
-docker compose down          # keep Lakekeeper metadata, MinIO objects, and QueryFlux history
+docker compose down          # keep Lakekeeper metadata, RustFS objects, and QueryFlux history
 docker compose down -v       # also wipe them
 ```
 

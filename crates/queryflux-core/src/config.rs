@@ -2046,8 +2046,8 @@ pub enum IcebergRestAuthConfig {
 ///     bucket: my-cache
 ///     endpoint: http://localhost:19000
 ///     region: us-east-1
-///     access_key_id: minio-root-user
-///     secret_access_key: minio-root-password
+///     access_key_id: rustfs-root-user
+///     secret_access_key: rustfs-root-password
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

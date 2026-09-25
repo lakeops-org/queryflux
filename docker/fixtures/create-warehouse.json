@@ -5,16 +5,16 @@
     "type": "s3",
     "bucket": "warehouse",
     "key-prefix": "test",
-    "endpoint": "http://minio:9000",
+    "endpoint": "http://rustfs:9000",
     "region": "local",
     "path-style-access": true,
-    "flavor": "minio",
+    "flavor": "s3-compat",
     "sts-enabled": false
   },
   "storage-credential": {
     "type": "s3",
     "credential-type": "access-key",
-    "aws-access-key-id": "minio-root-user",
-    "aws-secret-access-key": "minio-root-password"
+    "aws-access-key-id": "rustfs-root-user",
+    "aws-secret-access-key": "rustfs-root-password"
   }
 }

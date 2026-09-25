@@ -100,7 +100,7 @@ Details: **[`examples/with-prometheus-grafana/README.md`](https://github.com/lak
 
 ## Example: full stack (Trino + StarRocks + Iceberg)
 
-**Best for:** multi-engine demos — **Trino**, **StarRocks**, **Lakekeeper**, **MinIO**, **QueryFlux**, **Studio**; optional TPCH load into Iceberg.
+**Best for:** multi-engine demos — **Trino**, **StarRocks**, **Lakekeeper**, **RustFS**, **QueryFlux**, **Studio**; optional TPCH load into Iceberg.
 
 ```bash
 cd queryflux/examples/full-stack
@@ -115,7 +115,7 @@ docker compose --profile loader run --rm -T starrocks-catalog-setup
 | MySQL wire (e.g. StarRocks via QueryFlux) | `mysql` client to **localhost:3306** |
 | Studio | http://localhost:3000 (login **admin** / **admin**) |
 | Trino (direct) | http://localhost:8081 |
-| MinIO console | http://localhost:19001 |
+| RustFS console | http://localhost:19001 |
 | Lakekeeper REST | http://localhost:8181 |
 | QueryFlux Postgres | **localhost:5433** |
 

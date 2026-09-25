@@ -13,7 +13,7 @@ Several stacks for **QueryFlux** + **Trino** (and optional add-ons). Run command
 | [`with-opa-oidc/`](with-opa-oidc/) | No | Same OPA demo as `with-opa/`, identity from **Keycloak (OIDC)** instead of a static user list; LDAP config shape documented too |
 | [`with-keycloak-oidc/`](with-keycloak-oidc/) | Yes | OIDC authentication with Keycloak as the identity provider — no access control, just auth |
 | [`with-prometheus-grafana/`](with-prometheus-grafana/) | Yes | Same workload as minimal + **Prometheus** + **Grafana** (repo [`grafana/`](../grafana/), local scrape config); **no Studio** |
-| [`full-stack/`](full-stack/) | Yes (host **5433**) | Trino + StarRocks + Iceberg/Lakekeeper + MinIO + TPCH loader |
+| [`full-stack/`](full-stack/) | Yes (host **5433**) | Trino + StarRocks + Iceberg/Lakekeeper + RustFS + TPCH loader |
 | [`full-stack-with-prometheus-grafana/`](full-stack-with-prometheus-grafana/) | Yes (host **5433**) | **`full-stack`** + **Prometheus** + **Grafana**; Grafana on **3001** |
 
 `minimal/` and `minimal-inmemory/` use the **same host ports** (8080, 8081, 3000, 9000); **`minimal/`** also maps Postgres to **`localhost:5433`**. **`with-prometheus-grafana`** also uses **3000 for Grafana** (not Studio) — run it alone or change the published Grafana port.
@@ -76,7 +76,7 @@ docker compose up -d --wait
 
 ## With OPA (`with-opa/`)
 
-**Lakekeeper** + **MinIO** + **Trino** + **OPA** + **QueryFlux Postgres** (`:5434`) in Compose + **QueryFlux on the host** from this branch (the published image does not include `accessControl` yet). Postgres persistence enables query history and Studio **Access Control** saves. QueryFlux resolves Iceberg schema from Lakekeeper for OPA rewrites. Two static users: Alice sees every `customers` row; Bob is row-filtered to `EU` with SSN masked, and `payroll` is denied. Demo UI at **http://127.0.0.1:8183**. Details: [`with-opa/README.md`](with-opa/README.md).
+**Lakekeeper** + **RustFS** + **Trino** + **OPA** + **QueryFlux Postgres** (`:5434`) in Compose + **QueryFlux on the host** from this branch (the published image does not include `accessControl` yet). Postgres persistence enables query history and Studio **Access Control** saves. QueryFlux resolves Iceberg schema from Lakekeeper for OPA rewrites. Two static users: Alice sees every `customers` row; Bob is row-filtered to `EU` with SSN masked, and `payroll` is denied. Demo UI at **http://127.0.0.1:8183**. Details: [`with-opa/README.md`](with-opa/README.md).
 
 ```bash
 cd examples/with-opa
@@ -174,7 +174,7 @@ docker compose up -d --wait
 
 ## Full stack (`full-stack/`)
 
-Same idea as [`docker/docker-compose.yml`](../docker/docker-compose.yml): **Trino**, **StarRocks**, **Lakekeeper**, **MinIO**, **QueryFlux**, **Studio**. Optional loader brings TPCH into Iceberg via Trino.
+Same idea as [`docker/docker-compose.yml`](../docker/docker-compose.yml): **Trino**, **StarRocks**, **Lakekeeper**, **RustFS**, **QueryFlux**, **Studio**. Optional loader brings TPCH into Iceberg via Trino.
 
 ```bash
 cd examples/full-stack
@@ -183,7 +183,7 @@ docker compose --profile loader run --rm -T data-loader
 docker compose --profile loader run --rm -T starrocks-catalog-setup
 ```
 
-The loader uses [`docker/fixtures/init.docker-network.sql`](../docker/fixtures/init.docker-network.sql) so object storage is `http://minio:9000` inside the compose network (unlike `docker/fixtures/init.sql`, which targets `host.docker.internal:19000` for hybrid host/DuckDB setups).
+The loader uses [`docker/fixtures/init.docker-network.sql`](../docker/fixtures/init.docker-network.sql) so object storage is `http://rustfs:9000` inside the compose network (unlike `docker/fixtures/init.sql`, which targets `host.docker.internal:19000` for hybrid host/DuckDB setups).
 
 | Service | URL |
 |---------|-----|
@@ -192,7 +192,7 @@ The loader uses [`docker/fixtures/init.docker-network.sql`](../docker/fixtures/i
 | Node.js sample (same MySQL wire) | [`node-starrocks-via-queryflux/`](node-starrocks-via-queryflux/) — `npm install && npm start` |
 | Studio | http://localhost:3000 |
 | Trino (direct) | http://localhost:8081 |
-| MinIO console | http://localhost:19001 |
+| RustFS console | http://localhost:19001 |
 | Lakekeeper REST | http://localhost:8181 |
 
 QueryFlux Postgres is exposed on **localhost:5433** (same as the main dev compose convention).
@@ -219,7 +219,7 @@ docker compose --profile loader run --rm -T starrocks-catalog-setup
 | Admin + `/metrics` | http://localhost:9000 |
 | Prometheus | http://localhost:9090 |
 | Grafana | http://localhost:3001 |
-| MinIO console | http://localhost:19001 |
+| RustFS console | http://localhost:19001 |
 | Lakekeeper REST | http://localhost:8181 |
 
 ---

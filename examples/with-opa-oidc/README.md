@@ -9,7 +9,7 @@ byte-for-byte identical — only `auth:` differs. Full docs:
 **[OPA provider](../../website/docs/access-control/opa.md)** ·
 **[Authentication](../../website/docs/authentication.md)**.
 
-Compose runs **Keycloak**, **Lakekeeper**, **MinIO**, **Trino**, and **OPA**;
+Compose runs **Keycloak**, **Lakekeeper**, **RustFS**, **Trino**, and **OPA**;
 QueryFlux runs **on the host from this branch** (the published
 `ghcr.io/lakeops-org/queryflux:latest` image does not include `accessControl`
 yet).
@@ -214,7 +214,7 @@ etc.
 docker compose -f examples/with-opa-oidc/docker-compose.yml down
 ```
 
-Iceberg data persists in the Compose MinIO volume until `docker compose down
+Iceberg data persists in the Compose RustFS volume until `docker compose down
 -v` (or you remove volumes). QueryFlux history and Studio config persist in
 the `queryflux-pg` volume until you remove it. Re-run `data-seed` after a
 fresh stack to recreate tables.
