@@ -47,6 +47,58 @@ pub enum StrategyConfig {
     },
 }
 
+/// Optional per-member circuit breaker for a cluster group. When omitted, query
+/// outcomes do not affect cluster selection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct CircuitBreakerConfig {
+    /// Rolling window over completed backend requests.
+    pub window_secs: u64,
+    /// Minimum number of requests before rates can open the breaker.
+    pub min_requests: usize,
+    /// Percentage of transient backend failures (including timeouts) that opens it.
+    pub failure_rate_percent: u8,
+    /// Percentage of backend timeouts that opens it independently.
+    pub timeout_rate_percent: u8,
+    /// Delay before the first half-open health probe.
+    pub initial_backoff_secs: u64,
+    /// Maximum delay after repeated failed half-open probes.
+    pub max_backoff_secs: u64,
+}
+
+impl Default for CircuitBreakerConfig {
+    fn default() -> Self {
+        Self {
+            window_secs: 60,
+            min_requests: 10,
+            failure_rate_percent: 50,
+            timeout_rate_percent: 25,
+            initial_backoff_secs: 30,
+            max_backoff_secs: 300,
+        }
+    }
+}
+
+impl CircuitBreakerConfig {
+    pub fn validate(&self) -> std::result::Result<(), &'static str> {
+        if self.window_secs == 0 || self.min_requests == 0 {
+            return Err("circuitBreaker windowSecs and minRequests must be positive");
+        }
+        if self.min_requests > 10_000 {
+            return Err("circuitBreaker minRequests must not exceed 10000");
+        }
+        if !(1..=100).contains(&self.failure_rate_percent)
+            || !(1..=100).contains(&self.timeout_rate_percent)
+        {
+            return Err("circuitBreaker rate percentages must be between 1 and 100");
+        }
+        if self.initial_backoff_secs == 0 || self.max_backoff_secs < self.initial_backoff_secs {
+            return Err("circuitBreaker maxBackoffSecs must be at least initialBackoffSecs, and both must be positive");
+        }
+        Ok(())
+    }
+}
+
 /// Root configuration for a QueryFlux deployment.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1063,6 +1115,9 @@ pub struct ClusterGroupConfig {
     /// Defaults to `RoundRobin` when omitted.
     #[serde(default)]
     pub strategy: Option<StrategyConfig>,
+    /// Per-cluster query-failure breaker; omitted to preserve existing routing.
+    #[serde(default)]
+    pub circuit_breaker: Option<CircuitBreakerConfig>,
     pub max_running_queries: u64,
     #[serde(default)]
     pub max_queued_queries: Option<u64>,
@@ -2102,10 +2157,31 @@ fn default_cache_ttl() -> u64 {
 mod tests {
     use super::{
         query_auth_supported, AuthConfig, AuthProviderConfig, AuthorizationConfig,
-        AuthorizationProviderConfig, ClusterAuth, EngineConfig, GuardKindConfig, GuardSpecConfig,
-        LdapConfig, OidcConfig, OpenFgaConfig, PersistenceConfig, PostgresPersistenceConfig,
-        ProxyConfig, QueryAuthConfig, RouterConfig, StrategyConfig, TokenExchangeConfig,
+        AuthorizationProviderConfig, CircuitBreakerConfig, ClusterAuth, EngineConfig,
+        GuardKindConfig, GuardSpecConfig, LdapConfig, OidcConfig, OpenFgaConfig, PersistenceConfig,
+        PostgresPersistenceConfig, ProxyConfig, QueryAuthConfig, RouterConfig, StrategyConfig,
+        TokenExchangeConfig,
     };
+
+    #[test]
+    fn circuit_breaker_defaults_and_limits() {
+        let config: CircuitBreakerConfig = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(config, CircuitBreakerConfig::default());
+        assert!(config.validate().is_ok());
+        assert_eq!(serde_json::to_value(&config).unwrap()["minRequests"], 10);
+        assert!(CircuitBreakerConfig {
+            min_requests: 10_001,
+            ..config.clone()
+        }
+        .validate()
+        .is_err());
+        assert!(CircuitBreakerConfig {
+            failure_rate_percent: 0,
+            ..config
+        }
+        .validate()
+        .is_err());
+    }
 
     fn token_exchange_mode() -> QueryAuthConfig {
         QueryAuthConfig::TokenExchange(TokenExchangeConfig {

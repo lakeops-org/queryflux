@@ -20,6 +20,9 @@ pub struct PrometheusMetrics {
     rewritten_total: CounterVec,
     /// queryflux_running_queries{cluster_group, cluster_name}
     running_queries: prometheus::GaugeVec,
+    /// queryflux_circuit_breaker_state{cluster_group,cluster_name}: 0 closed,
+    /// 1 open, 2 half-open. Absent when circuit breaking is disabled.
+    circuit_breaker_state: prometheus::GaugeVec,
     /// queryflux_queued_queries{cluster_group}
     queued_queries: prometheus::GaugeVec,
     /// queryflux_query_tags_total{tag_key, tag_value, cluster_group}
@@ -105,6 +108,14 @@ impl PrometheusMetrics {
             Opts::new(
                 "queryflux_running_queries",
                 "Current number of queries executing on each cluster",
+            ),
+            &["cluster_group", "cluster_name"],
+        )?;
+
+        let circuit_breaker_state = prometheus::GaugeVec::new(
+            Opts::new(
+                "queryflux_circuit_breaker_state",
+                "Cluster breaker state: 0 closed, 1 open, 2 half-open",
             ),
             &["cluster_group", "cluster_name"],
         )?;
@@ -197,6 +208,7 @@ impl PrometheusMetrics {
         registry.register(Box::new(translated_total.clone()))?;
         registry.register(Box::new(rewritten_total.clone()))?;
         registry.register(Box::new(running_queries.clone()))?;
+        registry.register(Box::new(circuit_breaker_state.clone()))?;
         registry.register(Box::new(queued_queries.clone()))?;
         registry.register(Box::new(query_tags_total.clone()))?;
         registry.register(Box::new(coordination_failures_total.clone()))?;
@@ -216,6 +228,7 @@ impl PrometheusMetrics {
             translated_total,
             rewritten_total,
             running_queries,
+            circuit_breaker_state,
             queued_queries,
             query_tags_total,
             coordination_failures_total,
@@ -241,6 +254,17 @@ impl PrometheusMetrics {
             .encode(&metric_families, &mut buffer)
             .unwrap_or_default();
         String::from_utf8(buffer).unwrap_or_default()
+    }
+
+    pub fn set_circuit_breaker_state(&self, group: &str, cluster: &str, state: Option<u8>) {
+        let labels = [group, cluster];
+        if let Some(state) = state {
+            self.circuit_breaker_state
+                .with_label_values(&labels)
+                .set(f64::from(state));
+        } else {
+            let _ = self.circuit_breaker_state.remove_label_values(&labels);
+        }
     }
 }
 
@@ -378,6 +402,15 @@ impl MetricsStore for PrometheusMetrics {
 mod tests {
     use super::*;
     use queryflux_persistence::MetricsStore;
+
+    #[test]
+    fn circuit_state_gauge_tracks_transitions_and_disabled_policy() {
+        let metrics = PrometheusMetrics::new().expect("prometheus init");
+        metrics.set_circuit_breaker_state("analytics", "trino-a", Some(1));
+        assert!(metrics.gather_text().contains("queryflux_circuit_breaker_state{cluster_group=\"analytics\",cluster_name=\"trino-a\"} 1"));
+        metrics.set_circuit_breaker_state("analytics", "trino-a", None);
+        assert!(!metrics.gather_text().contains("cluster_name=\"trino-a\""));
+    }
 
     #[test]
     fn config_reload_failure_increments_counter() {

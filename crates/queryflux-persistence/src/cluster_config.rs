@@ -86,6 +86,10 @@ pub struct ClusterGroupConfigRecord {
     /// Serialised `StrategyConfig`. `null` means RoundRobin (the default).
     #[schema(value_type = Option<Object>)]
     pub strategy: Option<serde_json::Value>,
+    /// Optional per-member circuit breaker policy for this group.
+    #[serde(default)]
+    #[schema(value_type = Option<Object>)]
+    pub circuit_breaker: Option<serde_json::Value>,
     pub allow_groups: Vec<String>,
     pub allow_users: Vec<String>,
     /// Ordered `user_scripts.id` values run as post-sqlglot translation fixups for this group.
@@ -115,6 +119,10 @@ pub struct UpsertClusterGroupConfig {
     pub max_queued_queries: Option<i64>,
     /// `null` = RoundRobin. Set to `{"type":"leastLoaded"}` etc. for other strategies.
     pub strategy: Option<serde_json::Value>,
+    /// Omit or set to null to leave circuit breaking disabled.
+    #[serde(default)]
+    #[schema(value_type = Option<Object>)]
+    pub circuit_breaker: Option<serde_json::Value>,
     #[serde(default)]
     pub allow_groups: Vec<String>,
     #[serde(default)]
@@ -254,6 +262,16 @@ impl UpsertClusterConfig {
 }
 
 impl UpsertClusterGroupConfig {
+    pub fn validate_circuit_breaker(&self) -> Result<(), String> {
+        if let Some(value) = &self.circuit_breaker {
+            let config: queryflux_core::config::CircuitBreakerConfig =
+                serde_json::from_value(value.clone())
+                    .map_err(|e| format!("invalid circuitBreaker: {e}"))?;
+            config.validate().map_err(str::to_owned)?;
+        }
+        Ok(())
+    }
+
     pub fn from_core(cfg: &ClusterGroupConfig) -> Self {
         let strategy = cfg
             .strategy
@@ -268,12 +286,18 @@ impl UpsertClusterGroupConfig {
             .as_ref()
             .and_then(|c| serde_json::to_value(c).ok());
 
+        let circuit_breaker = cfg
+            .circuit_breaker
+            .as_ref()
+            .and_then(|c| serde_json::to_value(c).ok());
+
         Self {
             enabled: cfg.enabled,
             members: cfg.members.clone(),
             max_running_queries: cfg.max_running_queries as i64,
             max_queued_queries: cfg.max_queued_queries.map(|v| v as i64),
             strategy,
+            circuit_breaker,
             allow_groups: cfg.authorization.allow_groups.clone(),
             allow_users: cfg.authorization.allow_users.clone(),
             translation_script_ids: Vec::new(),
@@ -301,6 +325,11 @@ impl ClusterGroupConfigRecord {
             .as_ref()
             .and_then(|v| serde_json::from_value::<StrategyConfig>(v.clone()).ok());
 
+        let circuit_breaker = self
+            .circuit_breaker
+            .as_ref()
+            .and_then(|v| serde_json::from_value(v.clone()).ok());
+
         let default_tags =
             serde_json::from_value::<queryflux_core::tags::QueryTags>(self.default_tags.clone())
                 .unwrap_or_else(|e| {
@@ -322,6 +351,7 @@ impl ClusterGroupConfigRecord {
             enabled: self.enabled,
             members: self.members.clone(),
             strategy,
+            circuit_breaker,
             max_running_queries: self.max_running_queries as u64,
             max_queued_queries: self.max_queued_queries.map(|v| v as u64),
             // Not persisted in Postgres yet; YAML LiveConfig path supplies the value.
@@ -363,6 +393,7 @@ mod tests {
             max_running_queries: 10,
             max_queued_queries: None,
             strategy: None,
+            circuit_breaker: None,
             allow_groups: vec![],
             allow_users: vec![],
             translation_script_ids: vec![],
@@ -378,6 +409,7 @@ mod tests {
             enabled: true,
             members: vec!["c1".to_string()],
             strategy: None,
+            circuit_breaker: None,
             max_running_queries: 10,
             max_queued_queries: None,
             capacity_wait_timeout_secs: None,
@@ -388,6 +420,17 @@ mod tests {
             default_tags: tags,
             cache: None,
         }
+    }
+
+    #[test]
+    fn circuit_breaker_round_trips_through_persisted_group() {
+        let mut group = make_core_group(QueryTags::default());
+        group.circuit_breaker = Some(queryflux_core::config::CircuitBreakerConfig::default());
+        let upsert = UpsertClusterGroupConfig::from_core(&group);
+        assert!(upsert.validate_circuit_breaker().is_ok());
+        let mut record = make_record(default_tags_value());
+        record.circuit_breaker = upsert.circuit_breaker;
+        assert_eq!(record.to_core().circuit_breaker, group.circuit_breaker);
     }
 
     // --- to_core: JSONB → QueryTags ---

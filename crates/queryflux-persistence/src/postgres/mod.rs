@@ -49,6 +49,7 @@ SELECT
     g.max_running_queries,
     g.max_queued_queries,
     g.strategy,
+    g.circuit_breaker,
     g.allow_groups,
     g.allow_users,
     g.translation_script_ids,
@@ -742,6 +743,8 @@ impl ClusterConfigStore for PostgresStore {
         name: &str,
         cfg: &UpsertClusterGroupConfig,
     ) -> Result<ClusterGroupConfigRecord> {
+        cfg.validate_circuit_breaker()
+            .map_err(QueryFluxError::Config)?;
         let mut tx =
             self.admin_pool.begin().await.map_err(|e| {
                 QueryFluxError::Persistence(format!("upsert_group_config begin: {e}"))
@@ -792,14 +795,15 @@ impl ClusterConfigStore for PostgresStore {
 
         sqlx::query(
             r#"INSERT INTO cluster_group_configs
-                   (name, enabled, members, max_running_queries, max_queued_queries, strategy, allow_groups, allow_users, translation_script_ids, default_tags, cache)
-               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+                   (name, enabled, members, max_running_queries, max_queued_queries, strategy, circuit_breaker, allow_groups, allow_users, translation_script_ids, default_tags, cache)
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
                ON CONFLICT (name) DO UPDATE SET
                    enabled                = EXCLUDED.enabled,
                    members                = EXCLUDED.members,
                    max_running_queries    = EXCLUDED.max_running_queries,
                    max_queued_queries     = EXCLUDED.max_queued_queries,
                    strategy               = EXCLUDED.strategy,
+                   circuit_breaker        = EXCLUDED.circuit_breaker,
                    allow_groups           = EXCLUDED.allow_groups,
                    allow_users            = EXCLUDED.allow_users,
                    translation_script_ids = EXCLUDED.translation_script_ids,
@@ -813,6 +817,7 @@ impl ClusterConfigStore for PostgresStore {
         .bind(cfg.max_running_queries)
         .bind(cfg.max_queued_queries)
         .bind(&cfg.strategy)
+        .bind(&cfg.circuit_breaker)
         .bind(&cfg.allow_groups)
         .bind(&cfg.allow_users)
         .bind(&cfg.translation_script_ids)
@@ -840,6 +845,8 @@ impl ClusterConfigStore for PostgresStore {
         name: &str,
         cfg: &UpsertClusterGroupConfig,
     ) -> Result<bool> {
+        cfg.validate_circuit_breaker()
+            .map_err(QueryFluxError::Config)?;
         let mut tx = self.admin_pool.begin().await.map_err(|e| {
             QueryFluxError::Persistence(format!("insert_group_config_if_missing begin: {e}"))
         })?;
@@ -906,8 +913,8 @@ impl ClusterConfigStore for PostgresStore {
 
         let inserted: Option<(i64,)> = sqlx::query_as(
             r#"INSERT INTO cluster_group_configs
-                   (name, enabled, members, max_running_queries, max_queued_queries, strategy, allow_groups, allow_users, translation_script_ids, default_tags, cache)
-               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+                   (name, enabled, members, max_running_queries, max_queued_queries, strategy, circuit_breaker, allow_groups, allow_users, translation_script_ids, default_tags, cache)
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
                ON CONFLICT (name) DO NOTHING
                RETURNING id"#,
         )
@@ -917,6 +924,7 @@ impl ClusterConfigStore for PostgresStore {
         .bind(cfg.max_running_queries)
         .bind(cfg.max_queued_queries)
         .bind(&cfg.strategy)
+        .bind(&cfg.circuit_breaker)
         .bind(&cfg.allow_groups)
         .bind(&cfg.allow_users)
         .bind(&cfg.translation_script_ids)

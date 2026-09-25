@@ -539,6 +539,8 @@ impl ClusterConfigStore for InMemoryPersistence {
         name: &str,
         cfg: &UpsertClusterGroupConfig,
     ) -> Result<ClusterGroupConfigRecord> {
+        cfg.validate_circuit_breaker()
+            .map_err(queryflux_core::error::QueryFluxError::Config)?;
         for m in &cfg.members {
             if !self.cluster_configs.contains_key(m) {
                 return Err(queryflux_core::error::QueryFluxError::Persistence(format!(
@@ -574,6 +576,7 @@ impl ClusterConfigStore for InMemoryPersistence {
             max_running_queries: cfg.max_running_queries,
             max_queued_queries: cfg.max_queued_queries,
             strategy: cfg.strategy.clone(),
+            circuit_breaker: cfg.circuit_breaker.clone(),
             allow_groups: cfg.allow_groups.clone(),
             allow_users: cfg.allow_users.clone(),
             translation_script_ids: cfg.translation_script_ids.clone(),
@@ -591,6 +594,8 @@ impl ClusterConfigStore for InMemoryPersistence {
         name: &str,
         cfg: &UpsertClusterGroupConfig,
     ) -> Result<bool> {
+        cfg.validate_circuit_breaker()
+            .map_err(queryflux_core::error::QueryFluxError::Config)?;
         let now = Utc::now();
         match self.group_configs.entry(name.to_string()) {
             dashmap::mapref::entry::Entry::Occupied(_) => Ok(false),
@@ -624,6 +629,7 @@ impl ClusterConfigStore for InMemoryPersistence {
                     max_running_queries: cfg.max_running_queries,
                     max_queued_queries: cfg.max_queued_queries,
                     strategy: cfg.strategy.clone(),
+                    circuit_breaker: cfg.circuit_breaker.clone(),
                     allow_groups: cfg.allow_groups.clone(),
                     allow_users: cfg.allow_users.clone(),
                     translation_script_ids: cfg.translation_script_ids.clone(),
@@ -1187,6 +1193,7 @@ mod tests {
             max_running_queries: 10,
             max_queued_queries: None,
             strategy: None,
+            circuit_breaker: None,
             allow_groups: vec![],
             allow_users: vec![],
             translation_script_ids: vec![],

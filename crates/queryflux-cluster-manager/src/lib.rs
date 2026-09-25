@@ -1,3 +1,4 @@
+pub mod circuit_breaker;
 pub mod cluster_state;
 pub mod simple;
 pub mod strategy;
@@ -8,6 +9,7 @@ use queryflux_core::{
     query::{ClusterGroupName, ClusterName},
 };
 
+use circuit_breaker::BackendOutcome;
 use cluster_state::ClusterStateSnapshot;
 
 /// Manages all cluster groups: picks the best cluster for a new query,
@@ -20,6 +22,14 @@ pub trait ClusterGroupManager: Send + Sync {
 
     /// Signal that a query has finished on a cluster (success, failure, or cancel).
     async fn release_cluster(&self, group: &ClusterGroupName, cluster: &ClusterName) -> Result<()>;
+
+    /// Report a completed backend request. Caller-side errors must not be sent here.
+    fn record_backend_outcome(
+        &self,
+        group: &ClusterGroupName,
+        cluster: &ClusterName,
+        outcome: BackendOutcome,
+    );
 
     /// Get a snapshot of live state for a specific cluster.
     async fn cluster_state(
