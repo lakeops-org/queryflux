@@ -5246,6 +5246,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "opendal 0.53.3",
+ "polyglot-sql",
  "queryflux-core",
  "queryflux-fingerprint",
  "queryflux-persistence",
