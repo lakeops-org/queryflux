@@ -8,7 +8,7 @@ use bytes::Bytes;
 use chrono::Utc;
 use futures::StreamExt;
 use queryflux_auth::{AuthContext, QueryCredentials};
-use queryflux_cluster_manager::ClusterGroupManager;
+use queryflux_cluster_manager::{circuit_breaker::BackendOutcome, ClusterGroupManager};
 use queryflux_core::native_result::NativeResultChunk;
 use queryflux_core::params::{interpolate_params, QueryParams};
 use queryflux_core::tags::{merge_tags, QueryTags};
@@ -73,6 +73,45 @@ fn should_resolve_schema(attempt_translation: bool, access_control_enabled: bool
 
 fn should_attempt_translation(session: &SessionContext, protocol: &FrontendProtocol) -> bool {
     !matches!(protocol, FrontendProtocol::Mcp) || session.extra.contains_key("dialect")
+}
+
+/// Only connection/availability failures count against a cluster. A SQL error
+/// means the backend answered and must not open its circuit.
+pub(crate) fn backend_error_outcome(error: &QueryFluxError) -> BackendOutcome {
+    let text = error.to_string().to_ascii_lowercase();
+    if text.contains("timed out") || text.contains("timeout") || text.contains("deadline exceeded")
+    {
+        BackendOutcome::Timeout
+    } else if error.is_transient() {
+        BackendOutcome::Failure
+    } else {
+        BackendOutcome::Success
+    }
+}
+
+#[cfg(test)]
+mod circuit_breaker_tests {
+    use super::*;
+
+    #[test]
+    fn only_backend_availability_errors_count_as_failures() {
+        assert_eq!(
+            backend_error_outcome(&QueryFluxError::Engine("connection refused".into())),
+            BackendOutcome::Failure
+        );
+        assert_eq!(
+            backend_error_outcome(&QueryFluxError::Engine("request timed out".into())),
+            BackendOutcome::Timeout
+        );
+        assert_eq!(
+            backend_error_outcome(&QueryFluxError::Engine("syntax error".into())),
+            BackendOutcome::Success
+        );
+        assert_eq!(
+            backend_error_outcome(&QueryFluxError::Unauthorized("denied".into())),
+            BackendOutcome::Success
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -671,8 +710,12 @@ pub async fn dispatch_query(
                 )
                 .await
             {
-                Ok(e) => e,
+                Ok(e) => {
+                    slot.record_backend_outcome(BackendOutcome::Success);
+                    e
+                }
                 Err(e) => {
+                    slot.record_backend_outcome(backend_error_outcome(&e));
                     slot.release().await;
                     warn!(id = %query_id, "Submit error: {e}");
                     return Err(e);
@@ -930,7 +973,7 @@ async fn should_yield_to_older_queued(
     let free = match cluster_manager.all_cluster_states().await {
         Ok(snaps) => snaps
             .iter()
-            .filter(|s| s.group_name.0 == group.0 && s.enabled && s.is_healthy)
+            .filter(|s| s.group_name.0 == group.0 && s.can_accept_query)
             .map(|s| s.max_running_queries.saturating_sub(s.running_queries))
             .sum::<u64>(),
         // Can't tell — don't block admission on a read failure.
@@ -1106,6 +1149,11 @@ impl ClusterSlotGuard {
     /// paths (poll, cancel, zombie eviction) become responsible for the release.
     fn disarm(&mut self) {
         self.released = true;
+    }
+
+    fn record_backend_outcome(&self, outcome: BackendOutcome) {
+        self.cluster_manager
+            .record_backend_outcome(&self.group, &self.cluster, outcome);
     }
 
     /// Release the slot on the normal path. Idempotent — safe to call twice.
@@ -1904,6 +1952,7 @@ async fn execute_stream(
     {
         Ok(e) => e,
         Err(e) => {
+            setup.slot.record_backend_outcome(backend_error_outcome(&e));
             let msg = e.to_string();
             warn!(
                 id = %setup.ctx.query_id,
@@ -1936,6 +1985,10 @@ async fn execute_stream(
     while let Some(result) = stream.next().await {
         match result {
             Err(e) => {
+                let error = QueryFluxError::Engine(e.to_string());
+                setup
+                    .slot
+                    .record_backend_outcome(backend_error_outcome(&error));
                 let msg = e.to_string();
                 let outcome = SyncOutcome {
                     status: QueryStatus::Failed,
@@ -2002,6 +2055,8 @@ async fn execute_stream(
         engine_stats,
     };
 
+    setup.slot.record_backend_outcome(BackendOutcome::Success);
+
     (outcome, sink.on_complete(&stats).await)
 }
 
@@ -2051,6 +2106,7 @@ async fn execute_native_to_sink(
     {
         Ok(e) => e,
         Err(e) => {
+            setup.slot.record_backend_outcome(backend_error_outcome(&e));
             let msg = e.to_string();
             warn!(
                 id = %setup.ctx.query_id,
@@ -2075,6 +2131,10 @@ async fn execute_native_to_sink(
     while let Some(result) = stream.next().await {
         match result {
             Err(e) => {
+                let error = QueryFluxError::Engine(e.to_string());
+                setup
+                    .slot
+                    .record_backend_outcome(backend_error_outcome(&error));
                 let msg = e.to_string();
                 let outcome = SyncOutcome {
                     status: QueryStatus::Failed,
@@ -2118,6 +2178,8 @@ async fn execute_native_to_sink(
         elapsed_ms,
         engine_stats,
     };
+
+    setup.slot.record_backend_outcome(BackendOutcome::Success);
 
     (outcome, sink.on_complete(&stats).await)
 }

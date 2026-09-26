@@ -23,7 +23,7 @@ QueryFlux separates **where a query should go logically** (cluster **group**) fr
    Implementation: `queryflux_routing::chain::RouterChain` (`route`, `route_with_trace`).
 
 2. **Cluster selection (member selection)**  
-   `ClusterGroupManager::acquire_cluster(group)` considers only clusters in that group that are **enabled**, **healthy**, and **under** `max_running_queries`. It then uses the group’s **strategy** to pick one member and increments that cluster’s running count.  
+   `ClusterGroupManager::acquire_cluster(group)` considers only clusters in that group that are **enabled**, **healthy**, **not circuit-open** (when configured), and **under** `max_running_queries`. It then uses the group’s **strategy** to pick one member and increments that cluster’s running count.
    If **no** member is eligible (e.g. all at capacity or unhealthy), `acquire_cluster` returns **`None`** → the query is **queued** (Trino HTTP async path) or **retried with backoff** (sync `execute_to_sink` path).  
    Implementation: `queryflux_cluster_manager::simple::SimpleClusterGroupManager`.
 
@@ -174,7 +174,29 @@ Configured as `strategy: { type: ... }` on a group. Implemented in `strategy.rs`
 | `weighted` | Distributes by configured weights (deterministic pseudo-random from load). |
 | `pythonScript` | Embedded or file-backed Python `select_cluster(candidates)` returning a member cluster name or `None`. See [Python script strategy](#python-script-strategy-pythonscript) below. |
 
-Eligible candidates are always **healthy**, **enabled**, and **not at capacity** before the strategy runs.
+Eligible candidates are always **healthy**, **enabled**, **not circuit-open**, and **not at capacity** before the strategy runs.
+
+## Per-cluster circuit breaker
+
+Circuit breaking is opt-in on a cluster group. The same policy is applied independently to each member cluster:
+
+```yaml
+clusterGroups:
+  analytics:
+    members: [trino-a, trino-b]
+    maxRunningQueries: 100
+    circuitBreaker:
+      windowSecs: 60
+      minRequests: 10
+      failureRatePercent: 50
+      timeoutRatePercent: 25
+      initialBackoffSecs: 30
+      maxBackoffSecs: 300
+```
+
+Completed backend requests contribute to a rolling window. Transient connection/availability errors and timeouts count as failures; SQL and authorization errors do not. Once the minimum sample count and either rate threshold are reached, the member is excluded from new queries. Existing queries are not cancelled. After the backoff, the next periodic health check is the sole half-open probe: success closes the circuit; failure reopens it with an exponentially longer delay, up to `maxBackoffSecs`. The health loop runs every 30 seconds, so a probe may occur later than the configured backoff. Breaker state is local to each QueryFlux process, not shared across replicas.
+
+The admin cluster-state response includes `breaker_state` (`closed`, `open`, or `halfOpen`) and `can_accept_query`. Prometheus exposes `queryflux_circuit_breaker_state{cluster_group,cluster_name}` as 0, 1, or 2 respectively. Omitting `circuitBreaker` preserves the previous health/capacity-only selection behavior.
 
 ## Python script strategy (`pythonScript`)
 

@@ -669,6 +669,11 @@ async fn main() -> Result<()> {
             tracing::info!(group = %group_name, "Cluster group disabled — skipping");
             continue;
         }
+        if let Some(breaker) = &group_config.circuit_breaker {
+            breaker
+                .validate()
+                .map_err(|e| anyhow::anyhow!("group '{group_name}': {e}"))?;
+        }
         let group_key = ClusterGroupName(group_name.clone());
         let mut states: Vec<Arc<ClusterState>> = Vec::new();
         let mut seen_members: HashSet<&str> = HashSet::new();
@@ -706,16 +711,19 @@ async fn main() -> Result<()> {
                 .unwrap_or(group_config.max_running_queries);
             let cluster_cid = cluster_ids_by_name.get(member_name).copied();
             let group_cid = group_ids_by_name.get(group_name.as_str()).copied();
-            let state = Arc::new(ClusterState::new(
-                ClusterName(member_name.clone()),
-                group_key.clone(),
-                cluster_cid,
-                group_cid,
-                engine_type,
-                cluster_cfg.endpoint.clone(),
-                max_q,
-                cluster_cfg.enabled,
-            ));
+            let state = Arc::new(
+                ClusterState::new(
+                    ClusterName(member_name.clone()),
+                    group_key.clone(),
+                    cluster_cid,
+                    group_cid,
+                    engine_type,
+                    cluster_cfg.endpoint.clone(),
+                    max_q,
+                    cluster_cfg.enabled,
+                )
+                .with_circuit_breaker(group_config.circuit_breaker.clone(), None),
+            );
             states.push(state);
         }
 
@@ -1121,7 +1129,12 @@ async fn main() -> Result<()> {
         cluster_states: live_config
             .health_check_targets
             .iter()
-            .map(|(_, s)| (s.cluster_name.0.clone(), s.clone()))
+            .map(|(_, s)| {
+                (
+                    (s.group_name.0.clone(), s.cluster_name.0.clone()),
+                    s.clone(),
+                )
+            })
             .collect(),
         routing_fallback: config.routing_fallback.clone(),
         routers_cfg: config.routers.clone(),
@@ -1438,6 +1451,16 @@ async fn main() -> Result<()> {
                 };
                 let mut records = Vec::with_capacity(snapshots.len());
                 for snap in snapshots {
+                    let breaker_state = snap.breaker_state.map(|state| match state {
+                        queryflux_cluster_manager::circuit_breaker::CircuitState::Closed => 0,
+                        queryflux_cluster_manager::circuit_breaker::CircuitState::Open => 1,
+                        queryflux_cluster_manager::circuit_breaker::CircuitState::HalfOpen => 2,
+                    });
+                    prometheus.set_circuit_breaker_state(
+                        &snap.group_name.0,
+                        &snap.cluster_name.0,
+                        breaker_state,
+                    );
                     let global_running = if let Some(db) = &distributed_backend {
                         let store = db.clone() as Arc<dyn queryflux_persistence::CapacityStore>;
                         store
@@ -2000,11 +2023,21 @@ async fn main() -> Result<()> {
                 };
                 for (adapter, cstate) in &targets {
                     let cluster_name = &cstate.cluster_name.0;
+                    let breaker_probe = cstate.begin_breaker_probe();
                     let healthy = if let Some(custom_sql) = custom_health.get(cluster_name) {
                         adapter.execute_custom_health_check(custom_sql).await
                     } else {
                         adapter.health_check().await
                     };
+                    if breaker_probe {
+                        let state = cstate.finish_breaker_probe(healthy);
+                        tracing::info!(
+                            cluster = %cluster_name,
+                            group = %cstate.group_name.0,
+                            breaker_state = ?state,
+                            "Circuit breaker health probe completed"
+                        );
+                    }
                     if !healthy {
                         tracing::warn!(
                             cluster = %cluster_name,
@@ -2396,10 +2429,10 @@ fn max_running_queries_u64_from_db(cluster: &str, v: Option<i64>) -> Result<Opti
 struct AdapterReloadCache {
     adapters: HashMap<String, queryflux_engine_adapters::AdapterKind>,
     config_json: HashMap<String, String>,
-    /// Previous-generation cluster states keyed by cluster name.
+    /// Previous-generation cluster states keyed by (group, cluster).
     /// Preserved across reloads so that health status and running-query counters
     /// are not reset to their initial values every time the config is reloaded.
-    cluster_states: HashMap<String, Arc<ClusterState>>,
+    cluster_states: HashMap<(String, String), Arc<ClusterState>>,
     /// Last-known routing from DB (or YAML at startup). Used when `load_routing_config` returns
     /// `Ok(None)` so periodic reload does not wipe routing.
     routing_fallback: String,
@@ -2423,7 +2456,9 @@ fn health_targets_from_groups(
     for (states, _) in group_states.values() {
         for state in states {
             let name = state.cluster_name.0.clone();
-            if seen.insert(name.clone()) {
+            // The same backend may be a member of several groups, each with an
+            // independent breaker that needs its own half-open probe.
+            if seen.insert((state.group_name.0.clone(), name.clone())) {
                 if let Some(adapter) = adapters.get(&name) {
                     out.push((adapter.clone(), state.clone()));
                 }
@@ -2744,6 +2779,11 @@ async fn build_live_config(
         if !group_config.enabled {
             continue;
         }
+        if let Some(breaker) = &group_config.circuit_breaker {
+            breaker
+                .validate()
+                .map_err(|e| anyhow::anyhow!("group '{group_name}': {e}"))?;
+        }
         let group_key = ClusterGroupName(group_name.clone());
         let mut states: Vec<Arc<ClusterState>> = Vec::new();
         let mut seen_members: HashSet<&str> = HashSet::new();
@@ -2812,17 +2852,28 @@ async fn build_live_config(
                 .map(String::as_str)
                 == Some(cfg_json.as_str());
 
-            let state = Arc::new(ClusterState::new(
-                ClusterName(member_name.clone()),
-                group_key.clone(),
-                cluster_cid,
-                group_cid,
-                engine_type,
-                endpoint,
-                max_q,
-                record.enabled,
-            ));
-            if let Some(prev) = cache.cluster_states.get(member_name.as_str()) {
+            let previous = cache
+                .cluster_states
+                .get(&(group_name.clone(), member_name.clone()));
+            let previous_breaker = if config_unchanged {
+                previous.map(Arc::as_ref)
+            } else {
+                None
+            };
+            let state = Arc::new(
+                ClusterState::new(
+                    ClusterName(member_name.clone()),
+                    group_key.clone(),
+                    cluster_cid,
+                    group_cid,
+                    engine_type,
+                    endpoint,
+                    max_q,
+                    record.enabled,
+                )
+                .with_circuit_breaker(group_config.circuit_breaker.clone(), previous_breaker),
+            );
+            if let Some(prev) = previous {
                 let snap = prev.snapshot();
                 state.set_healthy(snap.is_healthy);
                 if config_unchanged {
@@ -2870,7 +2921,12 @@ async fn build_live_config(
     let health_check_targets = health_targets_from_groups(&group_states, &cache.adapters);
     cache.cluster_states = health_check_targets
         .iter()
-        .map(|(_, s)| (s.cluster_name.0.clone(), s.clone()))
+        .map(|(_, s)| {
+            (
+                (s.group_name.0.clone(), s.cluster_name.0.clone()),
+                s.clone(),
+            )
+        })
         .collect();
     let cluster_manager = Arc::new(SimpleClusterGroupManager::new(group_states));
 
