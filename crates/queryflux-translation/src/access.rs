@@ -6,7 +6,7 @@
 //! filter/mask expressions to the target engine.
 
 use pyo3::prelude::*;
-use queryflux_core::access_model::{ColumnMask, Columns, MaskType, ResourceKind};
+use queryflux_core::access_model::{ColumnMask, Columns, GrantDetail, MaskType, ResourceKind};
 use queryflux_core::error::{QueryFluxError, Result};
 use queryflux_core::query::SqlDialect;
 use queryflux_core::schema_context::SchemaContext;
@@ -22,6 +22,8 @@ pub struct ExtractedResource {
     /// The object the statement writes to (`INSERT INTO t`, `UPDATE t`, `CREATE TABLE t AS`,
     /// ...). Every other extracted table is read.
     pub is_write_target: bool,
+    /// The value a `SET` assigns to a session setting.
+    pub value: Option<String>,
 }
 
 /// The tables a statement touches, split into reads and the write target.
@@ -34,6 +36,15 @@ pub struct ExtractedStatement {
     pub embeds_reads: bool,
     /// `CREATE OR REPLACE`: also destroys the existing object, so it needs the matching drop.
     pub replaces: bool,
+    /// The operation the write targets are evaluated under, for statements the caller's own
+    /// parser doesn't classify (`COPY … FROM`, `SELECT … INTO`, GRANT, SET/USE, roles, CALL,
+    /// function/procedure DDL). `None` when the statement's ordinary classification applies.
+    pub write_operation: Option<String>,
+    /// What a `GRANT`/`REVOKE` (or role grant) hands out.
+    pub grant: Option<GrantDetail>,
+    /// A data-modifying statement nested inside a query (`WITH d AS (DELETE …) SELECT …`). Its
+    /// target can't be attributed as a write, so callers should refuse the statement.
+    pub nested_writes: bool,
 }
 
 /// Per-table policy for [`rewrite_table_scans`].
@@ -232,6 +243,7 @@ fn policies_to_json(policies: &[TablePolicy]) -> String {
 /// policies all arrive as data arguments.
 const ACCESS_PY: &str = r#"
 import json
+import re
 import sqlglot
 from sqlglot import expressions as exp
 from sqlglot.optimizer.qualify import qualify
@@ -258,11 +270,20 @@ def _qualified(t):
     return (db + "." + t.name) if db else t.name
 
 
-_KINDS = {"TABLE": "table", "VIEW": "view", "SCHEMA": "schema", "DATABASE": "catalog"}
+_KINDS = {
+    "TABLE": "table",
+    "VIEW": "view",
+    "SCHEMA": "schema",
+    "DATABASE": "catalog",
+    "FUNCTION": "function",
+    "PROCEDURE": "procedure",
+}
 
 
 def _unwrap(node):
     if isinstance(node, exp.Schema):
+        node = node.this
+    if isinstance(node, exp.UserDefinedFunction):
         node = node.this
     return node if isinstance(node, exp.Table) else None
 
@@ -279,6 +300,16 @@ def _write_targets(tree):
     """
     if isinstance(tree, exp.TruncateTable):
         return [(t, "table") for t in tree.expressions if isinstance(t, exp.Table)], False, False
+    if isinstance(tree, exp.Select) and tree.args.get("into") is not None:
+        node = _unwrap(tree.args["into"].this)
+        return ([(node, "table")] if node is not None else []), True, False
+    if isinstance(tree, exp.Copy):
+        # `COPY t FROM …` loads t; `COPY t|(query) TO …` and Snowflake's `COPY INTO @stage FROM
+        # t` only read. A Snowflake stage (`@stage`) is a location, not a catalog table.
+        node = _unwrap(tree.this) if tree.args.get("kind") else None
+        if node is not None and not node.name.startswith("@"):
+            return [(node, "table")], False, False
+        return [], True, False
     if isinstance(tree, (exp.Insert, exp.Update, exp.Delete, exp.Merge)):
         node = _unwrap(tree.this)
         return ([(node, "table")] if node is not None else []), True, False
@@ -326,17 +357,18 @@ def _written_columns(tree):
     None = the whole row (DELETE, MERGE, TRUNCATE, an INSERT without a column list, or any
     statement that names no columns)."""
     cols = None
-    if isinstance(tree, exp.Insert):
+    if isinstance(tree, (exp.Insert, exp.Copy)):
         if isinstance(tree.this, exp.Schema):
             cols = {c.name for c in tree.this.expressions if getattr(c, "name", None)}
-        # `INSERT ... ON CONFLICT DO UPDATE SET ...` (or MySQL's `ON DUPLICATE KEY UPDATE`,
-        # parsed into the same `conflict` arg) can write columns the insert column list
-        # never named — those are also write-target columns a policy must see. A whole-row
-        # insert (`cols` still None here) already covers them; only a named column list
-        # needs extending.
-        conflict = tree.args.get("conflict")
-        if conflict is not None and cols is not None:
-            cols |= _set_assignment_columns(conflict.expressions)
+        if isinstance(tree, exp.Insert):
+            # `INSERT ... ON CONFLICT DO UPDATE SET ...` (or MySQL's `ON DUPLICATE KEY UPDATE`,
+            # parsed into the same `conflict` arg) can write columns the insert column list
+            # never named — those are also write-target columns a policy must see. A
+            # whole-row insert (`cols` still None here) already covers them; only a named
+            # column list needs extending. `COPY` has no such clause.
+            conflict = tree.args.get("conflict")
+            if conflict is not None and cols is not None:
+                cols |= _set_assignment_columns(conflict.expressions)
     elif isinstance(tree, exp.Update):
         cols = _set_assignment_columns(tree.expressions)
     elif isinstance(tree, exp.Create) and isinstance(tree.this, exp.Schema):
@@ -344,34 +376,186 @@ def _written_columns(tree):
     return sorted(cols) if cols else None
 
 
-def _target_entry(node, kind, written):
-    parts = [p for p in (node.catalog, node.db, node.name) if p]
+def _entry(kind, parts, columns=None, value=None):
+    """A write-target / administrative resource. `parts` is the dotted name, outermost first:
+    a schema is `[catalog?, schema]`, a catalog `[catalog]`, everything else
+    `[catalog?, schema?, name]` (a role or session setting is just `[name]`)."""
+    parts = [p for p in parts if p]
+    entry = {"columns": columns, "target": True, "kind": kind, "value": value}
     if kind == "schema":
-        return {
-            "catalog": parts[-2] if len(parts) > 1 else None,
-            "schema": parts[-1] if parts else None,
-            "table": "",
-            "columns": None,
-            "target": True,
-            "kind": kind,
-        }
-    if kind == "catalog":
-        return {
-            "catalog": parts[-1] if parts else None,
-            "schema": None,
-            "table": "",
-            "columns": None,
-            "target": True,
-            "kind": kind,
-        }
-    return {
-        "catalog": node.catalog or None,
-        "schema": node.db or None,
-        "table": node.name,
-        "columns": written,
-        "target": True,
-        "kind": kind,
-    }
+        entry.update(
+            catalog=parts[-2] if len(parts) > 1 else None,
+            schema=parts[-1] if parts else None,
+            table="",
+            columns=None,
+        )
+    elif kind == "catalog":
+        entry.update(catalog=parts[-1] if parts else None, schema=None, table="", columns=None)
+    else:
+        entry.update(
+            catalog=parts[-3] if len(parts) > 2 else None,
+            schema=parts[-2] if len(parts) > 1 else None,
+            table=parts[-1] if parts else "",
+        )
+    return entry
+
+
+def _target_entry(node, kind, written):
+    return _entry(kind, [node.catalog, node.db, node.name], written)
+
+
+def _write_operation(tree, targets):
+    """The operation for statements the caller's parser doesn't classify."""
+    if isinstance(tree, (exp.Create, exp.Drop)):
+        kind = _KINDS.get(str(tree.args.get("kind") or "").upper())
+        if kind in ("function", "procedure"):
+            return "%s.%s" % (kind, "create" if isinstance(tree, exp.Create) else "drop")
+    elif isinstance(tree, exp.Select) and tree.args.get("into") is not None:
+        return "table.create"
+    elif isinstance(tree, exp.Copy) and targets:
+        return "table.insert"
+    return None
+
+
+def _nested_writes(tree):
+    """A DML statement buried in a query (`WITH d AS (DELETE …) SELECT …`). The DML inside a
+    MERGE's WHEN clauses is part of that statement, not nested."""
+    for n in tree.find_all(exp.Insert, exp.Update, exp.Delete, exp.Merge):
+        if n is not tree and n.find_ancestor(exp.When) is None:
+            return True
+    return False
+
+
+_NAME = r'(?:"[^"]+"|`[^`]+`|\[[^\]]+\]|[A-Za-z_@#$][\w$@#]*)'
+_QNAME = _NAME + r"(?:\s*\.\s*" + _NAME + r")*"
+
+
+def _parts(q):
+    return [p.strip('"`[]') for p in re.findall(_NAME, q)]
+
+
+def _admin(operation, resources, grant=None):
+    return {"operation": operation, "resources": resources, "grant": grant}
+
+
+def _grant_statement(tree):
+    op = "grant.grant" if isinstance(tree, exp.Grant) else "grant.revoke"
+    kinds = {"TABLE": "table", "VIEW": "view", "SCHEMA": "schema", "DATABASE": "catalog",
+             "FUNCTION": "function", "PROCEDURE": "procedure"}
+    kind = kinds.get(str(tree.args.get("kind") or "TABLE").upper())
+    node = _unwrap(tree.args.get("securable"))
+    if kind is None or node is None:
+        # An unmodelled securable (e.g. GRANT ... ON SEQUENCE, ON ALL TABLES IN SCHEMA):
+        # still report the operation with no resources rather than nothing at all, so the
+        # caller's own "an enabled write operation with no identified target" check denies
+        # it — silently returning None here would let the whole statement fall through
+        # unclassified and unauthorized instead.
+        return _admin(op, [])
+    privileges, columns = set(), set()
+    for p in tree.args.get("privileges") or []:
+        privileges.add(str(p.name).upper())
+        columns.update(c.name for c in (p.expressions or []) if getattr(c, "name", None))
+    grantees = []
+    for pr in tree.args.get("principals") or []:
+        k = pr.args.get("kind")
+        grantees.append("%s:%s" % (str(k).lower(), pr.name) if k else pr.name)
+    return _admin(
+        op,
+        [_target_entry(node, kind, sorted(columns) or None)],
+        {
+            "privileges": sorted(privileges),
+            "grantees": grantees,
+            "with_grant_option": bool(tree.args.get("grant_option")),
+        },
+    )
+
+
+def _set_entry(item, dialect):
+    lhs, rhs = item.this, None
+    if isinstance(lhs, exp.EQ):
+        lhs, rhs = lhs.this, lhs.expression
+    name = (lhs.name if lhs is not None else "") or (lhs.sql(dialect=dialect) if lhs is not None else item.sql(dialect=dialect))
+    value = None
+    if rhs is not None:
+        value = rhs.name if isinstance(rhs, exp.Literal) and rhs.is_string else rhs.sql(dialect=dialect)
+    return _entry("session", [name], value=value)
+
+
+def _command_statement(sql):
+    """Statements sqlglot leaves as an opaque Command: role management, SET ROLE / multi-value
+    SET / RESET, and CALL. Anything else (CREATE INDEX, EXPLAIN, ...) is not ours."""
+    s = sql.strip().rstrip(";").strip()
+    names = _NAME + r"(?:\s*,\s*" + _NAME + r")*"
+
+    m = re.match(r"(?is)create\s+(?:or\s+replace\s+)?role\s+(?:if\s+not\s+exists\s+)?(%s)" % _QNAME, s)
+    if m:
+        return _admin("role.create", [_entry("role", _parts(m.group(1)))])
+    m = re.match(r"(?is)drop\s+role\s+(?:if\s+exists\s+)?(%s)" % names, s)
+    if m:
+        return _admin("role.drop", [_entry("role", [n]) for n in _parts(m.group(1))])
+    m = re.match(r"(?is)(grant|revoke)\s+(?!.*\son\s)(?:role\s+)?(%s)\s+(?:to|from)\s+(?:(?:user|role|group)\s+)?(%s)" % (names, names), s)
+    if m:
+        verb = "grant" if m.group(1).lower() == "grant" else "revoke"
+        return _admin(
+            "role." + verb,
+            [_entry("role", [n]) for n in _parts(m.group(2))],
+            {"privileges": [], "grantees": _parts(m.group(3)),
+             "with_grant_option": bool(re.search(r"(?i)\bwith\s+admin\s+option\b", s))},
+        )
+    m = re.match(r"(?is)set\s+(?:(?:session|local)\s+)?role\s+(%s)" % _NAME, s)
+    if m:
+        return _admin("role.set", [_entry("role", _parts(m.group(1)))])
+    # `RESET ALL` resets every session setting, not one named "ALL" — modelling it as
+    # session.set on a resource literally called "ALL" would let a policy that denies
+    # session.set on a specific setting (e.g. search_path) be bypassed by resetting
+    # everything at once under a name no real policy would think to guard. Left
+    # unrecognized (like any other statement this function doesn't model) rather than
+    # authorized under a name that doesn't actually describe what it does.
+    m = re.match(r"(?is)reset\s+(?!all\b)(%s)" % _NAME, s)
+    if m:
+        return _admin("session.set", [_entry("session", _parts(m.group(1)))])
+    m = re.match(r"(?is)set\s+(?:(?:session|local|global)\s+)?(%s)\s*(?:=|\s+to\s+)\s*(.+)$" % _NAME, s)
+    if m:
+        return _admin("session.set", [_entry("session", _parts(m.group(1)), value=m.group(2).strip())])
+    m = re.match(r"(?is)call\s+(%s)\s*\(" % _QNAME, s)
+    if m:
+        return _admin("procedure.call", [_entry("procedure", _parts(m.group(1)))])
+    # A GRANT/REVOKE form sqlglot couldn't parse into a Grant/Revoke node at all (e.g.
+    # `... ON ALL TABLES IN SCHEMA ...`, `REVOKE ADMIN OPTION FOR ...`) and none of the
+    # role-specific patterns above matched either: still report the operation with no
+    # resources, the same reasoning as _grant_statement's own unmodelled-securable case —
+    # an enabled grant.grant/grant.revoke with no identified target denies instead of this
+    # statement going completely unclassified and unauthorized.
+    m = re.match(r"(?is)(grant|revoke)\b", s)
+    if m:
+        return _admin("grant.grant" if m.group(1).lower() == "grant" else "grant.revoke", [])
+    return None
+
+
+def _admin_statement(tree, sql, dialect):
+    """(operation, resources, grant) for statements that read no tables and name administrative
+    objects: GRANT/REVOKE, SET/USE/ALTER SESSION, roles, CALL. None for everything else."""
+    if isinstance(tree, (exp.Grant, exp.Revoke)):
+        return _grant_statement(tree)
+    if isinstance(tree, exp.Set):
+        return _admin("session.set", [_set_entry(i, dialect) for i in tree.expressions])
+    if isinstance(tree, exp.Alter) and str(tree.args.get("kind") or "").upper() == "SESSION":
+        items = [i for a in tree.args.get("actions") or [] for i in a.expressions if isinstance(i, exp.SetItem)]
+        return _admin("session.set", [_set_entry(i, dialect) for i in items]) if items else None
+    if isinstance(tree, exp.Use):
+        kind = str(tree.args.get("kind") or "").upper()
+        node = _unwrap(tree.this)
+        if node is None:
+            return None
+        parts = [node.catalog, node.db, node.name]
+        if kind in ("", "SCHEMA", "DATABASE", "CATALOG"):
+            return _admin("session.use", [_entry("catalog" if kind in ("DATABASE", "CATALOG") else "schema", parts)])
+        if kind == "ROLE":
+            return _admin("role.set", [_entry("role", [node.name])])
+        return _admin("session.set", [_entry("session", [kind.lower()], value=node.name)])
+    if isinstance(tree, exp.Command):
+        return _command_statement(sql)
+    return None
 
 
 def extract_resources(sql, dialect, schema_json):
@@ -382,6 +566,17 @@ def extract_resources(sql, dialect, schema_json):
         tree = sqlglot.parse_one(sql, dialect=dialect or None)
     except Exception as e:
         return json.dumps({"error": str(e)})
+
+    admin = _admin_statement(tree, sql, dialect)
+    if admin is not None:
+        return json.dumps({
+            "resources": admin["resources"],
+            "embeds_reads": False,
+            "replaces": False,
+            "write_operation": admin["operation"],
+            "grant": admin["grant"],
+            "nested_writes": False,
+        })
 
     ctes = _cte_names(tree)
 
@@ -404,14 +599,16 @@ def extract_resources(sql, dialect, schema_json):
 
     targets, embeds_reads, replaces = _write_targets(src)
     target_ids = {id(n) for n, _ in targets}
-    written = _written_columns(src)
+    # Read the written columns from the statement as parsed: qualify() (run when a catalog is
+    # configured) can rewrite a column list away, e.g. `COPY t (a, b) FROM …`.
+    written = _written_columns(tree)
 
     # Write targets are reported separately below, so a read of the same table
     # (`INSERT INTO t SELECT ... FROM t`) stays its own entry and is still policy-checked.
     per_table = {}
     order = []
     for t in src.find_all(exp.Table):
-        if id(t) in target_ids or not t.name:
+        if id(t) in target_ids or not t.name or t.name.startswith("@"):
             continue
         if not t.catalog and not t.db and t.name.lower() in ctes:
             continue
@@ -462,7 +659,14 @@ def extract_resources(sql, dialect, schema_json):
     # A write target reports what the statement writes, not what its WHERE reads.
     for node, kind in targets:
         out.append(_target_entry(node, kind, written))
-    return json.dumps({"resources": out, "embeds_reads": embeds_reads, "replaces": replaces})
+    return json.dumps({
+        "resources": out,
+        "embeds_reads": embeds_reads,
+        "replaces": replaces,
+        "write_operation": _write_operation(src, targets),
+        "grant": None,
+        "nested_writes": _nested_writes(src),
+    })
 
 
 def apply_write_filters(sql, dialect, filters_json):
@@ -699,6 +903,9 @@ fn extract_resources_gil(
             resources,
             embeds_reads,
             replaces,
+            write_operation,
+            grant,
+            nested_writes,
         } => Ok(ExtractedStatement {
             resources: resources
                 .into_iter()
@@ -712,10 +919,18 @@ fn extract_resources_gil(
                         None => Columns::All,
                     },
                     is_write_target: r.target,
+                    value: r.value,
                 })
                 .collect(),
             embeds_reads,
             replaces,
+            write_operation,
+            grant: grant.map(|g| GrantDetail {
+                privileges: g.privileges,
+                grantees: g.grantees,
+                with_grant_option: g.with_grant_option,
+            }),
+            nested_writes,
         }),
         RawOutput::Err { error } => Err(QueryFluxError::Translation(format!(
             "extract_resources: could not parse SQL: {error}"
@@ -730,6 +945,12 @@ enum RawOutput {
         resources: Vec<RawResource>,
         embeds_reads: bool,
         replaces: bool,
+        #[serde(default)]
+        write_operation: Option<String>,
+        #[serde(default)]
+        grant: Option<RawGrant>,
+        #[serde(default)]
+        nested_writes: bool,
     },
     Err {
         error: String,
@@ -744,6 +965,15 @@ struct RawResource {
     columns: Option<Vec<String>>,
     target: bool,
     kind: ResourceKind,
+    #[serde(default)]
+    value: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct RawGrant {
+    privileges: Vec<String>,
+    grantees: Vec<String>,
+    with_grant_option: bool,
 }
 
 fn rewrite_table_scans_gil(
@@ -1353,6 +1583,354 @@ mod tests {
         );
         assert_eq!(cols("CREATE TABLE t AS SELECT 1"), Columns::All);
         assert_eq!(cols("DROP TABLE t"), Columns::All);
+    }
+
+    type AdminResource = (&'static str, String, Option<String>);
+
+    /// `(kind, name, value)` of every write target/administrative resource in `sql`.
+    fn admin(dialect: SqlDialect, sql: &str) -> (Option<String>, Vec<AdminResource>) {
+        let st = extract_resources(sql, &dialect, &SchemaContext::default()).unwrap();
+        let res = st
+            .resources
+            .iter()
+            .filter(|r| r.is_write_target)
+            .map(|r| (r.kind.as_str(), r.table.clone(), r.value.clone()))
+            .collect();
+        (st.write_operation, res)
+    }
+
+    fn triple(kind: &'static str, name: &str, value: Option<&str>) -> AdminResource {
+        (kind, name.to_string(), value.map(String::from))
+    }
+
+    /// `COPY … TO` reads what it exports; `COPY … FROM` writes the table it loads. A Snowflake
+    /// stage (`@stage`) is a location, not a catalog table.
+    #[test]
+    fn extract_resources_copy_directions() {
+        use SqlDialect::{Postgres, Snowflake};
+        for (dialect, sql, reads) in [
+            (
+                Postgres,
+                "COPY (SELECT * FROM customers) TO '/tmp/x.csv'",
+                vec!["customers"],
+            ),
+            (
+                Postgres,
+                "COPY customers TO '/tmp/x.csv'",
+                vec!["customers"],
+            ),
+            (
+                Snowflake,
+                "COPY INTO @stage FROM customers",
+                vec!["customers"],
+            ),
+        ] {
+            let st = extract_resources(sql, &dialect, &SchemaContext::default()).unwrap();
+            let r: Vec<_> = st
+                .resources
+                .iter()
+                .filter(|r| !r.is_write_target)
+                .map(|r| r.table.as_str())
+                .collect();
+            assert_eq!(r, reads, "{sql}");
+            assert!(st.embeds_reads && st.write_operation.is_none(), "{sql}");
+            assert!(
+                st.resources.iter().all(|r| !r.is_write_target),
+                "an export has no catalog target: {sql}"
+            );
+        }
+        for (dialect, sql) in [
+            (Postgres, "COPY customers (a, b) FROM '/tmp/x.csv'"),
+            (Snowflake, "COPY INTO customers FROM @stage"),
+        ] {
+            let st = extract_resources(sql, &dialect, &SchemaContext::default()).unwrap();
+            assert_eq!(st.write_operation.as_deref(), Some("table.insert"), "{sql}");
+            assert!(
+                !st.embeds_reads && st.resources.iter().all(|r| r.is_write_target),
+                "{sql}"
+            );
+            assert_eq!(st.resources[0].table, "customers");
+        }
+        let cols = extract_resources(
+            "COPY customers (b, a) FROM '/x'",
+            &Postgres,
+            &SchemaContext::default(),
+        )
+        .unwrap()
+        .resources[0]
+            .columns
+            .clone();
+        assert_eq!(cols, Columns::Named(names(&["a", "b"])));
+    }
+
+    /// `SELECT … INTO t` reads its source and creates `t`.
+    #[test]
+    fn extract_resources_select_into_creates_its_target() {
+        let st = extract_resources(
+            "SELECT * INTO newt FROM customers",
+            &SqlDialect::Postgres,
+            &SchemaContext::default(),
+        )
+        .unwrap();
+        assert_eq!(st.write_operation.as_deref(), Some("table.create"));
+        let (reads, targets, embeds) = split_statement("SELECT * INTO newt FROM customers");
+        assert_eq!(
+            (reads, targets, embeds),
+            (names(&["customers"]), names(&["newt"]), true)
+        );
+    }
+
+    /// A write hidden in a CTE of a query can't be attributed, so it is flagged; the DML inside
+    /// a MERGE's WHEN clauses is part of that statement and is not.
+    #[test]
+    fn extract_resources_flags_writes_nested_in_a_query() {
+        let nested = |sql: &str| {
+            extract_resources(sql, &SqlDialect::Postgres, &SchemaContext::default())
+                .unwrap()
+                .nested_writes
+        };
+        assert!(nested(
+            "WITH d AS (DELETE FROM orders RETURNING *) SELECT * FROM d"
+        ));
+        assert!(!nested("SELECT * FROM orders"));
+        assert!(!nested("DELETE FROM orders WHERE id = 1"));
+        assert!(!nested("INSERT INTO t SELECT * FROM s"));
+        assert!(!nested(
+            "MERGE INTO t USING s ON t.id = s.id WHEN MATCHED THEN UPDATE SET x = 1 WHEN NOT MATCHED THEN INSERT (id) VALUES (s.id)"
+        ));
+    }
+
+    #[test]
+    fn extract_resources_function_and_procedure_ddl() {
+        use SqlDialect::Postgres;
+        assert_eq!(
+            admin(
+                Postgres,
+                "CREATE FUNCTION s.f(a int) RETURNS int AS 'select 1' LANGUAGE sql"
+            ),
+            (
+                Some("function.create".into()),
+                vec![triple("function", "f", None)]
+            )
+        );
+        assert_eq!(
+            admin(Postgres, "DROP FUNCTION f"),
+            (
+                Some("function.drop".into()),
+                vec![triple("function", "f", None)]
+            )
+        );
+        assert_eq!(
+            admin(Postgres, "CREATE PROCEDURE p() AS 'select 1'"),
+            (
+                Some("procedure.create".into()),
+                vec![triple("procedure", "p", None)]
+            )
+        );
+        assert_eq!(
+            admin(Postgres, "DROP PROCEDURE s.p"),
+            (
+                Some("procedure.drop".into()),
+                vec![triple("procedure", "p", None)]
+            )
+        );
+    }
+
+    #[test]
+    fn extract_resources_grant_and_revoke() {
+        let st = extract_resources(
+            "GRANT SELECT (a), INSERT ON TABLE s.t TO alice, ROLE bob WITH GRANT OPTION",
+            &SqlDialect::Postgres,
+            &SchemaContext::default(),
+        )
+        .unwrap();
+        assert_eq!(st.write_operation.as_deref(), Some("grant.grant"));
+        let r = &st.resources[0];
+        assert_eq!(
+            (r.kind.as_str(), r.schema.as_deref(), r.table.as_str()),
+            ("table", Some("s"), "t")
+        );
+        assert_eq!(r.columns, Columns::Named(names(&["a"])));
+        assert_eq!(
+            st.grant,
+            Some(GrantDetail {
+                privileges: names(&["INSERT", "SELECT"]),
+                grantees: names(&["alice", "role:bob"]),
+                with_grant_option: true,
+            })
+        );
+        assert_eq!(
+            admin(SqlDialect::Postgres, "GRANT ALL ON SCHEMA s TO r"),
+            (Some("grant.grant".into()), vec![triple("schema", "", None)])
+        );
+        assert_eq!(
+            admin(SqlDialect::Postgres, "REVOKE SELECT ON t FROM alice")
+                .0
+                .as_deref(),
+            Some("grant.revoke")
+        );
+    }
+
+    /// Regression: a GRANT/REVOKE whose securable this doesn't model (`ON SEQUENCE`, `ON ALL
+    /// TABLES IN SCHEMA`, `ADMIN OPTION FOR`, ...) must still report `grant.grant`/
+    /// `grant.revoke` with an empty resource list — not `None` — so the guard's own
+    /// "an enabled write operation with no identified target" check denies it. Returning
+    /// `None` would let the whole statement fall through unclassified, and unauthorized.
+    #[test]
+    fn extract_resources_unmodelled_grant_reports_the_operation_with_no_resources() {
+        for (dialect, sql, op) in [
+            (
+                SqlDialect::Postgres,
+                "GRANT USAGE ON SEQUENCE q TO a",
+                "grant.grant",
+            ),
+            (
+                SqlDialect::Postgres,
+                "GRANT SELECT ON ALL TABLES IN SCHEMA s TO alice",
+                "grant.grant",
+            ),
+            (
+                SqlDialect::Postgres,
+                "REVOKE ADMIN OPTION FOR r FROM u",
+                "grant.revoke",
+            ),
+        ] {
+            let (write_operation, resources) = admin(dialect, sql);
+            assert_eq!(write_operation.as_deref(), Some(op), "{sql}");
+            assert!(resources.is_empty(), "{sql}: {resources:?}");
+        }
+    }
+
+    #[test]
+    fn extract_resources_role_statements() {
+        use SqlDialect::Postgres;
+        assert_eq!(
+            admin(Postgres, "CREATE ROLE r"),
+            (Some("role.create".into()), vec![triple("role", "r", None)])
+        );
+        assert_eq!(
+            admin(Postgres, "DROP ROLE a, b"),
+            (
+                Some("role.drop".into()),
+                vec![triple("role", "a", None), triple("role", "b", None)]
+            )
+        );
+        let st = extract_resources(
+            "GRANT admin TO alice, bob",
+            &Postgres,
+            &SchemaContext::default(),
+        )
+        .unwrap();
+        assert_eq!(st.write_operation.as_deref(), Some("role.grant"));
+        assert_eq!(st.resources[0].table, "admin");
+        assert_eq!(st.grant.unwrap().grantees, names(&["alice", "bob"]));
+        assert_eq!(
+            admin(Postgres, "REVOKE admin FROM alice").0.as_deref(),
+            Some("role.revoke")
+        );
+        assert_eq!(
+            admin(Postgres, "SET ROLE analyst"),
+            (
+                Some("role.set".into()),
+                vec![triple("role", "analyst", None)]
+            )
+        );
+        assert_eq!(
+            admin(SqlDialect::Snowflake, "USE ROLE r"),
+            (Some("role.set".into()), vec![triple("role", "r", None)])
+        );
+    }
+
+    #[test]
+    fn extract_resources_session_statements() {
+        use SqlDialect::{DuckDb, Postgres, Snowflake, Trino};
+        assert_eq!(
+            admin(Postgres, "SET SESSION x = 1"),
+            (
+                Some("session.set".into()),
+                vec![triple("session", "x", Some("1"))]
+            )
+        );
+        // Multi-value SET is an opaque command to sqlglot; it is still recognised.
+        assert_eq!(
+            admin(Postgres, "SET search_path = analytics, public"),
+            (
+                Some("session.set".into()),
+                vec![triple("session", "search_path", Some("analytics, public"))]
+            )
+        );
+        assert_eq!(
+            admin(Trino, "SET SESSION query_max_memory = '1GB'"),
+            (
+                Some("session.set".into()),
+                vec![triple("session", "query_max_memory", Some("1GB"))]
+            )
+        );
+        assert_eq!(
+            admin(Postgres, "RESET search_path"),
+            (
+                Some("session.set".into()),
+                vec![triple("session", "search_path", None)]
+            )
+        );
+        // `RESET ALL` resets every setting, not one named "ALL" — must not be authorized
+        // as session.set on a resource a policy denying a specific setting would never
+        // match, which would let it bypass that denial by resetting everything at once.
+        assert_eq!(admin(Postgres, "RESET ALL"), (None, vec![]));
+        assert_eq!(
+            admin(Snowflake, "ALTER SESSION SET x = 1"),
+            (
+                Some("session.set".into()),
+                vec![triple("session", "x", Some("1"))]
+            )
+        );
+        assert_eq!(
+            admin(Snowflake, "USE WAREHOUSE w"),
+            (
+                Some("session.set".into()),
+                vec![triple("session", "warehouse", Some("w"))]
+            )
+        );
+        // USE names the schema/catalog that bare table names now resolve against.
+        let st = extract_resources("USE cat.analytics", &Trino, &SchemaContext::default()).unwrap();
+        assert_eq!(st.write_operation.as_deref(), Some("session.use"));
+        let r = &st.resources[0];
+        assert_eq!(
+            (r.kind.as_str(), r.catalog.as_deref(), r.schema.as_deref()),
+            ("schema", Some("cat"), Some("analytics"))
+        );
+        assert_eq!(
+            admin(DuckDb, "USE analytics").0.as_deref(),
+            Some("session.use")
+        );
+    }
+
+    #[test]
+    fn extract_resources_call() {
+        let st = extract_resources(
+            "CALL system.runtime.kill_query('id')",
+            &SqlDialect::Trino,
+            &SchemaContext::default(),
+        )
+        .unwrap();
+        assert_eq!(st.write_operation.as_deref(), Some("procedure.call"));
+        let r = &st.resources[0];
+        assert_eq!(
+            (
+                r.kind.as_str(),
+                r.catalog.as_deref(),
+                r.schema.as_deref(),
+                r.table.as_str()
+            ),
+            ("procedure", Some("system"), Some("runtime"), "kill_query")
+        );
+        assert_eq!(
+            admin(SqlDialect::Postgres, "CALL proc(1)"),
+            (
+                Some("procedure.call".into()),
+                vec![triple("procedure", "proc", None)]
+            )
+        );
     }
 
     /// Statements that merely name a table do not read it and must not be treated as reads.

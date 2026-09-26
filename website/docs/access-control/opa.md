@@ -132,9 +132,11 @@ Content-Type: application/json
 | --- | --- |
 | `identity.*` | Verified `AuthContext` only. |
 | `action.operation` | `table.select` for tables the statement reads; for a write or DDL target, its own operation (`table.insert`/`update`/`delete`/`merge`/`truncate`/`create`/`drop`/`alter`, `view.create`/`drop`/`alter`, `schema.create`/`drop`, `catalog.create`/`drop`) when enabled in `operations`. A statement with both reads and a target makes one request for each; `CREATE OR REPLACE` also makes the matching `*.drop` request. |
-| `action.resources[].kind` | `table` for everything a query reads; DDL can also target a `view`, `schema` or `catalog` (`CREATE DATABASE` is reported as a catalog). |
+| `action.resources[].kind` | `table` for everything a query reads; other statements can target a `view`, `schema`, `catalog` (`CREATE DATABASE` is reported as a catalog), `role`, `function`, `procedure` or `session` setting. |
+| `action.resources[].value` | Only for `session` resources: the value a `SET` assigns. |
+| `action.grant` | Only for `grant.grant`/`grant.revoke` and `role.grant`/`role.revoke`: `{privileges, grantees, withGrantOption}`. |
 | `action.resources[].name` | The object's own name — table/view, schema, or catalog. Present for every kind. |
-| `action.resources[].table` | Bare or as QueryFlux extracted it; often schema-qualified in practice. **Omitted** for `schema` and `catalog` resources (use `schema` / `catalog` and `name`). |
+| `action.resources[].table` | Bare or as QueryFlux extracted it; often schema-qualified in practice. **Omitted** for every kind except `table` and `view` (use `name`; a schema is `schema`, a catalog is `catalog`). |
 | `action.resources[].columns` | Named list, or **omitted / null** meaning all columns (`SELECT *` or unresolved schema). |
 | `context.sessionParams` | Only keys listed in `sessionParamKeys`. |
 

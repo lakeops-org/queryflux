@@ -11,7 +11,7 @@ use queryflux_access_control::{
     AccessController, AccessResource, Columns, Identity, Operation, RequestContext,
 };
 use queryflux_core::access_config::OnMissingSchema;
-use queryflux_core::access_model::{AccessDecision, AccessRequest};
+use queryflux_core::access_model::{AccessDecision, AccessRequest, GrantDetail};
 use queryflux_core::query::EngineType;
 use queryflux_core::query::{ClusterGroupName, SqlDialect};
 use queryflux_core::schema_context::SchemaContext;
@@ -178,6 +178,42 @@ impl Guard for OpaAccessGuard {
             return GuardResult::allow();
         };
 
+        // `EXPLAIN [ANALYZE] <statement>` is opaque to the SQL parser but reveals (and, with
+        // ANALYZE, runs) the statement it wraps, so it is checked — and rewritten — as that
+        // statement.
+        match explain_split(ctx.sql) {
+            ExplainSplit::NotExplain => {}
+            ExplainSplit::Inner(offset) => {
+                let inner = &ctx.sql[offset..];
+                let cache = queryflux_core::sql_classify::SqlParseCache::new(
+                    inner.to_string(),
+                    ctx.dialect.clone(),
+                );
+                let inner_ctx = GuardContext {
+                    sql: inner,
+                    sql_parse: Some(&cache),
+                    ..*ctx
+                };
+                return match self.check(&inner_ctx).await {
+                    GuardResult::Rewrite { sql, metadata } => GuardResult::Rewrite {
+                        sql: format!("{}{}", &ctx.sql[..offset], sql),
+                        metadata,
+                    },
+                    other => other,
+                };
+            }
+            ExplainSplit::Unrecognized => {
+                return if evaluates_anything(&conn.controller) {
+                    GuardResult::deny(
+                        "access control: could not analyze the EXPLAIN statement",
+                        "ACCESS_ANALYSIS_FAILED",
+                    )
+                } else {
+                    GuardResult::allow()
+                };
+            }
+        }
+
         let stmts = match ctx.sql_parse {
             Some(cache) => cache.statements_async().await.map(<[_]>::to_vec),
             None => None,
@@ -203,12 +239,10 @@ impl Guard for OpaAccessGuard {
         // whether the statement's own operation is. Its write target is evaluated separately
         // under the statement's own operation, only when that is enabled.
         let evaluates_reads = conn.controller.evaluates(&Operation::table_select());
-        // Whether the statement replaces an object is only known after extraction, so the
-        // early gate assumes it might.
-        let may_write = write_operations(&operation, true)
-            .iter()
-            .any(|o| conn.controller.evaluates(o));
-        if !evaluates_reads && !may_write {
+        // Which operation a statement's targets belong to isn't always known until it is
+        // extracted (GRANT, SET, COPY, … are classified there), so the early gate only asks
+        // whether this connection evaluates anything at all.
+        if !evaluates_anything(&conn.controller) {
             return GuardResult::allow();
         }
 
@@ -230,6 +264,19 @@ impl Guard for OpaAccessGuard {
             }
         };
 
+        if statement.nested_writes {
+            return GuardResult::deny(
+                "access control: a data-modifying statement nested inside a query is not \
+                 supported",
+                "ACCESS_UNSUPPORTED_STATEMENT",
+            );
+        }
+        let statement_op = statement
+            .write_operation
+            .as_deref()
+            .map(|o| Operation(o.to_string()))
+            .unwrap_or_else(|| operation.clone());
+        let grant = statement.grant.clone();
         let embeds_reads = statement.embeds_reads;
         let (targets, reads): (Vec<_>, Vec<_>) = statement
             .resources
@@ -237,7 +284,7 @@ impl Guard for OpaAccessGuard {
             .partition(|r| r.is_write_target);
         let check_reads =
             evaluates_reads && !reads.is_empty() && (operation.is_read() || embeds_reads);
-        let write_ops: Vec<Operation> = write_operations(&operation, statement.replaces)
+        let write_ops: Vec<Operation> = write_operations(&statement_op, statement.replaces)
             .into_iter()
             .filter(|o| conn.controller.evaluates(o))
             .collect();
@@ -253,7 +300,7 @@ impl Guard for OpaAccessGuard {
             return GuardResult::deny(
                 format!(
                     "access control: could not identify the target of {}",
-                    operation.as_str()
+                    statement_op.as_str()
                 ),
                 "ACCESS_ANALYSIS_FAILED",
             );
@@ -280,31 +327,36 @@ impl Guard for OpaAccessGuard {
             .filter_map(|k| ctx.session_extra.get(k).map(|v| (k.clone(), v.clone())))
             .collect();
 
-        let build_request = |operation: Operation, tables: &[ExtractedResource]| AccessRequest {
-            identity: Identity {
-                user: ctx.user.unwrap_or("anonymous").to_string(),
-                groups: ctx.groups.to_vec(),
-                roles: ctx.roles.to_vec(),
-                attributes: ctx.attributes.clone(),
-            },
-            operation,
-            resources: tables
-                .iter()
-                .map(|r| AccessResource {
-                    kind: r.kind,
-                    catalog: r.catalog.clone(),
-                    schema: r.schema.clone(),
-                    table: r.table.clone(),
-                    columns: r.columns.clone(),
-                })
-                .collect(),
-            context: RequestContext {
-                cluster_group: ctx.cluster_group.0.clone(),
-                engine: engine_name(ctx.engine_type).to_string(),
-                query_id: String::new(),
-                session_params: session_params.clone(),
-            },
-        };
+        let build_request =
+            |operation: Operation, tables: &[ExtractedResource], grant: Option<GrantDetail>| {
+                AccessRequest {
+                    grant,
+                    identity: Identity {
+                        user: ctx.user.unwrap_or("anonymous").to_string(),
+                        groups: ctx.groups.to_vec(),
+                        roles: ctx.roles.to_vec(),
+                        attributes: ctx.attributes.clone(),
+                    },
+                    operation,
+                    resources: tables
+                        .iter()
+                        .map(|r| AccessResource {
+                            kind: r.kind,
+                            value: r.value.clone(),
+                            catalog: r.catalog.clone(),
+                            schema: r.schema.clone(),
+                            table: r.table.clone(),
+                            columns: r.columns.clone(),
+                        })
+                        .collect(),
+                    context: RequestContext {
+                        cluster_group: ctx.cluster_group.0.clone(),
+                        engine: engine_name(ctx.engine_type).to_string(),
+                        query_id: String::new(),
+                        session_params: session_params.clone(),
+                    },
+                }
+            };
 
         let deny_first = |decision: &AccessDecision| {
             let (table, reason) = decision.first_denied().unwrap_or(("", "access denied"));
@@ -321,7 +373,7 @@ impl Guard for OpaAccessGuard {
             for write_op in &write_ops {
                 let decision = conn
                     .controller
-                    .evaluate(&build_request(write_op.clone(), &targets))
+                    .evaluate(&build_request(write_op.clone(), &targets, grant.clone()))
                     .await;
                 if !decision.is_allowed() {
                     return deny_first(&decision);
@@ -382,7 +434,7 @@ impl Guard for OpaAccessGuard {
         if check_reads {
             let decision = conn
                 .controller
-                .evaluate(&build_request(Operation::table_select(), &reads))
+                .evaluate(&build_request(Operation::table_select(), &reads, None))
                 .await;
 
             if !decision.is_allowed() {
@@ -542,6 +594,94 @@ fn classify_operation(stmts: Option<&[Expression]>, sql: &str) -> Operation {
     }
 }
 
+/// Whether the connection evaluates any operation at all.
+fn evaluates_anything(controller: &AccessController) -> bool {
+    Operation::SUPPORTED
+        .iter()
+        .any(|o| controller.evaluates(&Operation((*o).to_string())))
+}
+
+/// How an `EXPLAIN` statement wraps the statement it explains.
+#[derive(Debug, PartialEq, Eq)]
+enum ExplainSplit {
+    NotExplain,
+    /// Byte offset where the explained statement starts.
+    Inner(usize),
+    /// Starts with `EXPLAIN` but the wrapped statement can't be located.
+    Unrecognized,
+}
+
+const STATEMENT_STARTERS: &[&str] = &[
+    "select", "with", "insert", "update", "delete", "merge", "create", "values", "table", "copy",
+    "call",
+];
+const EXPLAIN_MODIFIERS: &[&str] = &[
+    "analyze",
+    "analyse",
+    "verbose",
+    "plan",
+    "for",
+    "ast",
+    "syntax",
+    "pipeline",
+    "estimate",
+    "extended",
+    "formatted",
+    "logical",
+    "distributed",
+    "io",
+    "validate",
+    "local",
+];
+
+fn word_at(s: &str) -> &str {
+    let end = s
+        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .unwrap_or(s.len());
+    &s[..end]
+}
+
+/// Locate the statement inside `EXPLAIN [ANALYZE|VERBOSE|PLAN FOR|(options)…] <statement>`.
+fn explain_split(sql: &str) -> ExplainSplit {
+    // Not just whitespace: a leading `/* ... */` or `-- ...` comment before `EXPLAIN` must not
+    // defeat detection — `word_at` on an untrimmed comment returns "" (its first byte, `/` or
+    // `-`, isn't alphanumeric), which `NotExplain`s the whole statement. The wrapped statement
+    // then never gets classified as anything the guard checks, and — since `ANALYZE` runs
+    // it — executes unauthorized.
+    let first = queryflux_core::sql_classify::strip_leading_sql_comments(sql);
+    let start = sql.len() - first.len();
+    let head = word_at(first);
+    if !head.eq_ignore_ascii_case("explain") {
+        return ExplainSplit::NotExplain;
+    }
+    let mut pos = start + head.len();
+    loop {
+        let rest = queryflux_core::sql_classify::strip_leading_sql_comments(&sql[pos..]);
+        pos = sql.len() - rest.len();
+        let rest = &sql[pos..];
+        if let Some(open) = rest.strip_prefix('(') {
+            let first = word_at(open.trim_start()).to_ascii_lowercase();
+            if STATEMENT_STARTERS.contains(&first.as_str()) {
+                return ExplainSplit::Inner(pos); // `EXPLAIN (SELECT …)`: a parenthesized query
+            }
+            match rest.find(')') {
+                Some(close) => pos += close + 1, // an option list: `(ANALYZE, BUFFERS)`
+                None => return ExplainSplit::Unrecognized,
+            }
+            continue;
+        }
+        let word = word_at(rest).to_ascii_lowercase();
+        if STATEMENT_STARTERS.contains(&word.as_str()) {
+            return ExplainSplit::Inner(pos);
+        }
+        if EXPLAIN_MODIFIERS.contains(&word.as_str()) {
+            pos += word.len();
+            continue;
+        }
+        return ExplainSplit::Unrecognized;
+    }
+}
+
 /// The operations a statement's write targets are evaluated under: its own, plus — for a
 /// `CREATE OR REPLACE` — the matching drop, since replacing destroys the existing object.
 /// Reads have none (their tables are evaluated as `table.select`).
@@ -648,6 +788,66 @@ mod tests {
             ("SET search_path = s", "statement.other"),
         ] {
             assert_eq!(classify(sql).await.as_str(), expected, "{sql}");
+        }
+    }
+
+    #[test]
+    fn explain_split_finds_the_wrapped_statement() {
+        let inner = |sql: &str| match explain_split(sql) {
+            ExplainSplit::Inner(at) => Some(sql[at..].to_string()),
+            _ => None,
+        };
+        for (sql, expected) in [
+            ("EXPLAIN SELECT 1", "SELECT 1"),
+            ("  explain analyze select * from t", "select * from t"),
+            ("EXPLAIN (ANALYZE, BUFFERS) SELECT 1", "SELECT 1"),
+            ("EXPLAIN ANALYZE VERBOSE DELETE FROM t", "DELETE FROM t"),
+            ("EXPLAIN PLAN FOR SELECT 1", "SELECT 1"),
+            (
+                "EXPLAIN (TYPE DISTRIBUTED) WITH c AS (SELECT 1) SELECT * FROM c",
+                "WITH c AS (SELECT 1) SELECT * FROM c",
+            ),
+            ("EXPLAIN (SELECT 1)", "(SELECT 1)"),
+        ] {
+            assert_eq!(inner(sql).as_deref(), Some(expected), "{sql}");
+        }
+        assert_eq!(explain_split("SELECT 1"), ExplainSplit::NotExplain);
+        assert_eq!(
+            explain_split("SELECT explain FROM t"),
+            ExplainSplit::NotExplain
+        );
+        assert_eq!(
+            explain_split("EXPLAINED SELECT 1"),
+            ExplainSplit::NotExplain
+        );
+        assert_eq!(explain_split("EXPLAIN"), ExplainSplit::Unrecognized);
+        assert_eq!(
+            explain_split("EXPLAIN mystery SELECT 1"),
+            ExplainSplit::Unrecognized
+        );
+        assert_eq!(
+            explain_split("EXPLAIN (ANALYZE SELECT 1"),
+            ExplainSplit::Unrecognized
+        );
+    }
+
+    /// Regression: a `--` or `/* */` comment before `EXPLAIN` (or before the wrapped
+    /// statement) must not defeat detection — `EXPLAIN`'s own leading-whitespace trim
+    /// doesn't strip comments, so a commented `EXPLAIN ANALYZE DELETE ...` used to fall
+    /// through as `NotExplain` and skip authorization for the statement it wraps and runs.
+    #[test]
+    fn explain_split_skips_leading_comments() {
+        let inner = |sql: &str| match explain_split(sql) {
+            ExplainSplit::Inner(at) => Some(sql[at..].to_string()),
+            _ => None,
+        };
+        for (sql, expected) in [
+            ("-- who reads this\nEXPLAIN SELECT 1", "SELECT 1"),
+            ("/* block */ EXPLAIN ANALYZE DELETE FROM t", "DELETE FROM t"),
+            ("EXPLAIN /* inline */ ANALYZE SELECT 1", "SELECT 1"),
+            ("EXPLAIN -- trailing\nSELECT 1", "SELECT 1"),
+        ] {
+            assert_eq!(inner(sql).as_deref(), Some(expected), "{sql}");
         }
     }
 

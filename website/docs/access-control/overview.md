@@ -137,7 +137,7 @@ accessControl:
         url: http://localhost:8181
         decisionPath: /v1/data/queryflux/access
         timeoutMs: 1000
-      operations: [table.select]        # also: table.insert/update/delete/merge/truncate/create/drop/alter, view.*, schema.*, catalog.*
+      operations: [table.select]        # also: table.insert/update/delete/merge/truncate/create/drop/alter, view.*, schema.*, catalog.*, function.*, procedure.*, grant.*, role.*, session.*
       onMissingSchema: evaluate         # evaluate | deny
       failOpen: false                   # provider error → deny by default
       cacheTtlMs: 5000                  # 0 disables the decision cache
@@ -155,7 +155,7 @@ accessControl:
 | `enabled` | Global default: run access control for a cluster group unless `groups.<name>.enabled` overrides. Default: `true` when `accessControl` is set. Set `false` to opt in only where groups explicitly set `enabled: true`. |
 | `defaultConnection` | Named entry under `connections` that a group uses when it has no explicit `groups.<name>.connection` override. **Unset means such a group gets no access control at all** — there's nothing to route it to. Must reference a key under `connections` when set. |
 | `connections` | Map of named policy-provider connections. No name is reserved — see [Multiple connections](#multiple-connections). |
-| `connections.<name>.operations` | Namespaced ops the connection evaluates; others skip the stage. One of the [operations listed here](#what-policies-apply-to) (`table.*`, `view.*`, `schema.*`, `catalog.*`) — anything else fails validation. Default: `[table.select]`. See [What policies apply to](#what-policies-apply-to). |
+| `connections.<name>.operations` | Namespaced ops the connection evaluates; others skip the stage. One of the [operations listed here](#what-policies-apply-to) (`table.*`, `view.*`, `schema.*`, `catalog.*`, `function.*`, `procedure.*`, `grant.*`, `role.*`, `session.*`) — anything else fails validation. Default: `[table.select]`. See [What policies apply to](#what-policies-apply-to). |
 | `connections.<name>.onMissingSchema` | When columns can't be resolved (`SELECT *` without catalog): `evaluate` still calls the provider with "all columns"; `deny` fails closed. |
 | `connections.<name>.failOpen` | Provider timeout/transport error → allow (`true`) or deny (`false`, default) for groups on this connection. |
 | `connections.<name>.cacheTtlMs` / `cacheCapacity` | TTL cache of identical decisions on this connection; `0` disables. |
@@ -235,6 +235,18 @@ The **write target** is a second, separate provider call, made only when the sta
 | `CREATE VIEW v AS …` / `DROP VIEW v` / `ALTER VIEW v …` | `view.create` / `view.drop` / `view.alter` | `v`, kind `view` | `null` |
 | `CREATE SCHEMA s` / `DROP SCHEMA s` | `schema.create` / `schema.drop` | `s`, kind `schema` (no `table`) | `null` |
 | `CREATE DATABASE d` / `DROP DATABASE d` | `catalog.create` / `catalog.drop` | `d`, kind `catalog` | `null` |
+| `COPY t (a, b) FROM …` | `table.insert` | `t` | the column list |
+| `SELECT … INTO t` | `table.create` | `t` | `null` |
+| `CREATE` / `DROP FUNCTION f`, `CREATE` / `DROP PROCEDURE p` | `function.create` / `function.drop`, `procedure.create` / `procedure.drop` | `f` / `p`, kind `function` / `procedure` | `null` |
+| `CALL p(…)` | `procedure.call` | `p`, kind `procedure` (arguments are not sent) | `null` |
+| `GRANT p ON x TO g` / `REVOKE p ON x FROM g` | `grant.grant` / `grant.revoke` | the object granted on — kind `table`, `view`, `schema`, `catalog`, `function` or `procedure`; `columns` from `SELECT (a)` | — |
+| `CREATE ROLE r` / `DROP ROLE r` | `role.create` / `role.drop` | `r`, kind `role` | — |
+| `GRANT r TO u` / `REVOKE r FROM u` | `role.grant` / `role.revoke` | `r`, kind `role` | — |
+| `SET ROLE r`, `USE ROLE r` | `role.set` | `r`, kind `role` | — |
+| `SET x = v`, `RESET x`, `ALTER SESSION SET …`, `USE WAREHOUSE w` | `session.set` | `x`, kind `session`, with its `value` | — |
+| `USE s` / `USE c.s` | `session.use` | the schema (or catalog), kind `schema` / `catalog` | — |
+
+A `GRANT`/`REVOKE` request also carries `action.grant` — `{"privileges": [...], "grantees": ["alice", "role:bob"], "withGrantOption": true}` — since who receives what is the decision. Role grants carry `grantees` only.
 
 So `UPDATE orders SET amount = 0 WHERE id IN (SELECT id FROM customers)` makes two calls: `table.update` for `orders` (columns `["amount"]`) and `table.select` for `customers`. A statement with no reads (`DELETE`, `TRUNCATE`, `INSERT … VALUES`) makes one.
 
@@ -246,7 +258,11 @@ Writes are **not authorized by default**: with the default `operations: [table.s
 
 Every resource is sent with its `kind` (`table`, `view`, `schema`, `catalog`) and its `name`; a schema or catalog has no `table`. Reads inside DDL are still `table.select`: `CREATE VIEW v AS SELECT … FROM secret` and `CREATE TABLE t AS SELECT … FROM secret` check `v`/`t` under the create operation **and** `secret` as a read, and denying either stops the statement. `CREATE OR REPLACE` destroys the existing object, so it also makes the matching `*.drop` request. As with any non-`UPDATE`/`DELETE` write, a row filter or column mask returned for a DDL target is denied rather than applied.
 
-**Not evaluated** (no operation exists for them yet): `GRANT`/`REVOKE` and role management, session statements (`SET`, `USE`), `CALL` and functions/procedures, indexes, sequences and other object types, `COPY`, and metadata statements (`SHOW`, `DESCRIBE`). Statements that only name a table without reading it (`DESCRIBE`, `DROP TABLE`) are not treated as reads. `CREATE VIEW` stores the caller's filtered definition for everyone who later queries the view, so scope view creation with `view.create` accordingly.
+**Reads hidden inside other statements are checked too**, whatever `operations` says, because they are still reads of a protected table: `COPY (SELECT …) TO …` and `COPY t TO …` (the export's source tables), and `EXPLAIN [ANALYZE] <statement>`, which is checked — and rewritten — as the statement it wraps (`EXPLAIN ANALYZE` executes it). An `EXPLAIN` whose wrapped statement can't be located is denied rather than guessed at. A data-modifying statement nested in a query (`WITH d AS (DELETE … RETURNING *) SELECT …`) can't be attributed as a write, so it is refused (`ACCESS_UNSUPPORTED_STATEMENT`).
+
+**Frontends decide what reaches the guard.** The Postgres-wire and MySQL-wire frontends answer `SET` (including `SET ROLE`) themselves and never dispatch it, so `session.set` and `role.set` only apply where the statement is forwarded (for example `USE ROLE`, `ALTER SESSION SET …`, or frontends that pass `SET` through). `USE` is dispatched on Postgres wire; check your frontend before relying on `session.use`.
+
+**Not evaluated** (no operation exists for them yet): indexes, sequences and other object types (`CREATE INDEX`, `CREATE SEQUENCE`, …), metadata statements (`SHOW`, `DESCRIBE`), and where a `COPY … TO` writes — only what it reads is checked, not the destination. Statements that only name a table without reading it (`DESCRIBE`, `DROP TABLE`) are not treated as reads. Policies match the names QueryFlux sees: a view over a protected table is a separate object, so a policy that protects `customers` does not protect a view `v` over it unless it covers `v` too. `CREATE VIEW` stores the caller's filtered definition for everyone who later queries the view, so scope view creation with `view.create` accordingly.
 
 ---
 

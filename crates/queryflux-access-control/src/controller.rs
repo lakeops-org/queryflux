@@ -197,11 +197,17 @@ impl AccessController {
 /// characters an identifier or column name contains.
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct CacheResourceKey {
+    /// `&'static str`, not `ResourceKind` directly, so this stays `Hash`/`Eq` without adding
+    /// those derives to a public, otherwise-Copy-only enum for this one internal use.
+    kind: &'static str,
     catalog: Option<String>,
     schema: Option<String>,
     table: String,
     /// `None` = "all columns" (`Columns::All`); `Some(cols)` is sorted.
     columns: Option<Vec<String>>,
+    /// A `SET`'s new value — distinct values for the same session setting are distinct
+    /// resources; two SETs to different values must not share a cached decision.
+    value: Option<String>,
 }
 
 /// Stable, exact cache key over everything that changes the decision — **not**
@@ -209,6 +215,16 @@ struct CacheResourceKey {
 /// short-circuits false *misses* via the hash, it still compares keys for a hit, so two
 /// different requests whose fields happened to hash equally are correctly kept apart
 /// instead of one serving the other's cached decision.
+/// `GrantDetail` isn't itself `Hash`/`Eq` (no need for that outside caching); `privileges` and
+/// `grantees` are sorted the same way `groups`/`roles` are — membership, not order, is what a
+/// policy can act on.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct CacheGrantKey {
+    privileges: Vec<String>,
+    grantees: Vec<String>,
+    with_grant_option: bool,
+}
+
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct CacheKey {
     user: String,
@@ -220,6 +236,9 @@ struct CacheKey {
     attributes: Vec<(String, String)>,
     operation: String,
     resources: Vec<CacheResourceKey>,
+    /// Set for `grant.*` / `role.grant`/`role.revoke` requests — distinct privileges,
+    /// grantees, or grant-option flags are distinct requests, not interchangeable.
+    grant: Option<CacheGrantKey>,
     cluster_group: String,
     engine: String,
     session_params: Vec<(String, String)>,
@@ -241,6 +260,7 @@ fn cache_key(req: &AccessRequest) -> CacheKey {
         .resources
         .iter()
         .map(|r| CacheResourceKey {
+            kind: r.kind.as_str(),
             catalog: r.catalog.clone(),
             schema: r.schema.clone(),
             table: r.table.clone(),
@@ -252,11 +272,28 @@ fn cache_key(req: &AccessRequest) -> CacheKey {
                     Some(c)
                 }
             },
+            value: r.value.clone(),
         })
         .collect();
     resources.sort_by(|a, b| {
-        (&a.catalog, &a.schema, &a.table, &a.columns)
-            .cmp(&(&b.catalog, &b.schema, &b.table, &b.columns))
+        (
+            a.kind, &a.catalog, &a.schema, &a.table, &a.value, &a.columns,
+        )
+            .cmp(&(
+                b.kind, &b.catalog, &b.schema, &b.table, &b.value, &b.columns,
+            ))
+    });
+
+    let grant = req.grant.as_ref().map(|g| {
+        let mut privileges = g.privileges.clone();
+        privileges.sort();
+        let mut grantees = g.grantees.clone();
+        grantees.sort();
+        CacheGrantKey {
+            privileges,
+            grantees,
+            with_grant_option: g.with_grant_option,
+        }
     });
 
     let session_params = req
@@ -273,6 +310,7 @@ fn cache_key(req: &AccessRequest) -> CacheKey {
         attributes,
         operation: req.operation.0.clone(),
         resources,
+        grant,
         cluster_group: req.context.cluster_group.clone(),
         engine: req.context.engine.clone(),
         session_params,
@@ -286,7 +324,7 @@ mod tests {
     use async_trait::async_trait;
 
     use queryflux_core::access_model::{
-        AccessResource, Columns, Identity, RequestContext, ResourceKind,
+        AccessResource, Columns, GrantDetail, Identity, RequestContext, ResourceKind,
     };
 
     use super::*;
@@ -325,6 +363,7 @@ mod tests {
 
     fn base_request() -> AccessRequest {
         AccessRequest {
+            grant: None,
             identity: Identity {
                 user: "alice".to_string(),
                 groups: vec![],
@@ -338,6 +377,7 @@ mod tests {
                 schema: None,
                 table: "orders".to_string(),
                 columns: Columns::All,
+                value: None,
             }],
             context: RequestContext {
                 cluster_group: "default".to_string(),
@@ -384,6 +424,79 @@ mod tests {
         );
     }
 
+    /// Regression: `grant.grant` for one set of privileges/grantees must not reuse the
+    /// cached decision for a different `GRANT` on the same table — the policy is meant to
+    /// evaluate each grant's own privileges/grantees, and a stale cached allow letting a
+    /// different grant through unevaluated is exactly the bypass caching must not create.
+    #[tokio::test]
+    async fn distinct_grant_details_do_not_collide() {
+        let provider = Arc::new(CountingProvider::default());
+        let ctl = controller(provider.clone());
+
+        let mut a = base_request();
+        a.operation = Operation("grant.grant".to_string());
+        a.grant = Some(GrantDetail {
+            privileges: vec!["SELECT".to_string()],
+            grantees: vec!["alice".to_string()],
+            with_grant_option: false,
+        });
+        ctl.evaluate(&a).await;
+
+        let mut b = base_request();
+        b.operation = Operation("grant.grant".to_string());
+        b.grant = Some(GrantDetail {
+            privileges: vec!["ALL".to_string()],
+            grantees: vec!["bob".to_string()],
+            with_grant_option: true,
+        });
+        ctl.evaluate(&b).await;
+
+        assert_eq!(
+            provider.calls.load(Ordering::SeqCst),
+            2,
+            "distinct grant privileges/grantees must not share a cache entry"
+        );
+    }
+
+    /// Regression: a resource's `kind` and (for `session.set`) `value` weren't part of the
+    /// cache key — two SETs to different values, or two same-named resources of different
+    /// kinds, could incorrectly share one cached decision.
+    #[tokio::test]
+    async fn distinct_resource_kind_and_value_do_not_collide() {
+        let provider = Arc::new(CountingProvider::default());
+        let ctl = controller(provider.clone());
+
+        let mut a = base_request();
+        a.operation = Operation("session.set".to_string());
+        a.resources = vec![AccessResource {
+            kind: ResourceKind::Session,
+            catalog: None,
+            schema: None,
+            table: "search_path".to_string(),
+            columns: Columns::All,
+            value: Some("public".to_string()),
+        }];
+        ctl.evaluate(&a).await;
+
+        let mut b = base_request();
+        b.operation = Operation("session.set".to_string());
+        b.resources = vec![AccessResource {
+            kind: ResourceKind::Session,
+            catalog: None,
+            schema: None,
+            table: "search_path".to_string(),
+            columns: Columns::All,
+            value: Some("untrusted_schema".to_string()),
+        }];
+        ctl.evaluate(&b).await;
+
+        assert_eq!(
+            provider.calls.load(Ordering::SeqCst),
+            2,
+            "distinct SET values must not share a cache entry"
+        );
+    }
+
     /// Regression: joining `catalog|schema|table` with `|` let a `|`-containing schema
     /// name collide with a differently-split qualified name across the same delimiter.
     #[tokio::test]
@@ -398,6 +511,7 @@ mod tests {
             schema: Some("s|t".to_string()),
             table: "u".to_string(),
             columns: Columns::All,
+            value: None,
         }];
         ctl.evaluate(&a).await;
 
@@ -408,6 +522,7 @@ mod tests {
             schema: Some("s".to_string()),
             table: "t|u".to_string(),
             columns: Columns::All,
+            value: None,
         }];
         ctl.evaluate(&b).await;
 

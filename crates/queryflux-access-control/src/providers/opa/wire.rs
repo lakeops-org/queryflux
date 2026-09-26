@@ -7,7 +7,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use queryflux_core::access_model::{
-    AccessDecision, AccessRequest, AccessResource, ColumnMask, Columns, ResourceDecision, RowFilter,
+    AccessDecision, AccessRequest, AccessResource, ColumnMask, Columns, ResourceDecision,
+    ResourceKind, RowFilter,
 };
 
 // ---- request ----
@@ -36,6 +37,17 @@ pub(super) struct WireIdentity<'a> {
 pub(super) struct WireAction<'a> {
     pub operation: &'a str,
     pub resources: Vec<WireResource<'a>>,
+    /// What a `GRANT`/`REVOKE` hands out. Only present for `grant.*` and `role.grant/revoke`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub grant: Option<WireGrant<'a>>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct WireGrant<'a> {
+    pub privileges: &'a [String],
+    pub grantees: &'a [String],
+    pub with_grant_option: bool,
 }
 
 fn is_empty_str(s: &&str) -> bool {
@@ -50,9 +62,12 @@ pub(super) struct WireResource<'a> {
     pub catalog: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub schema: Option<&'a str>,
-    /// Omitted for `schema`/`catalog` resources, which have no table.
+    /// Only `table` and `view` resources have one; every other kind is identified by `name`.
     #[serde(skip_serializing_if = "is_empty_str")]
     pub table: &'a str,
+    /// The value a `SET` assigns to a session setting.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub value: Option<&'a str>,
     /// The object's own name (table/view, schema, or catalog) — echo it back in the response.
     pub name: &'a str,
     /// `null` = all columns (schema unresolved / `SELECT *`).
@@ -86,7 +101,12 @@ pub(super) fn to_request(req: &AccessRequest) -> OpaRequest<'_> {
                         kind: r.kind.as_str(),
                         catalog: r.catalog.as_deref(),
                         schema: r.schema.as_deref(),
-                        table: &r.table,
+                        table: if matches!(r.kind, ResourceKind::Table | ResourceKind::View) {
+                            &r.table
+                        } else {
+                            ""
+                        },
+                        value: r.value.as_deref(),
                         name: r.name(),
                         columns: match &r.columns {
                             Columns::All => None,
@@ -94,6 +114,11 @@ pub(super) fn to_request(req: &AccessRequest) -> OpaRequest<'_> {
                         },
                     })
                     .collect(),
+                grant: req.grant.as_ref().map(|g| WireGrant {
+                    privileges: &g.privileges,
+                    grantees: &g.grantees,
+                    with_grant_option: g.with_grant_option,
+                }),
             },
             context: WireContext {
                 cluster_group: &req.context.cluster_group,
@@ -279,12 +304,14 @@ mod tests {
 
     fn requested(tables: &[&str]) -> AccessRequest {
         AccessRequest {
+            grant: None,
             identity: Identity::default(),
             operation: Operation::table_select(),
             resources: tables
                 .iter()
                 .map(|t| AccessResource {
                     kind: ResourceKind::Table,
+                    value: None,
                     catalog: None,
                     schema: None,
                     table: t.to_string(),
@@ -315,6 +342,7 @@ mod tests {
         req.operation = Operation("schema.drop".to_string());
         req.resources = vec![AccessResource {
             kind: ResourceKind::Schema,
+            value: None,
             catalog: Some("prod".to_string()),
             schema: Some(schema.to_string()),
             table: String::new(),
@@ -342,6 +370,60 @@ mod tests {
             (t["kind"].as_str(), t["table"].as_str(), t["name"].as_str()),
             (Some("table"), Some("orders"), Some("orders"))
         );
+    }
+
+    /// Administrative resources are identified by `kind` + `name` (no `table`); a session
+    /// setting carries its `value`, and a grant its privileges and grantees.
+    #[test]
+    fn admin_resources_and_grant_detail_are_sent() {
+        use queryflux_core::access_model::GrantDetail;
+        let mut req = requested(&[]);
+        req.operation = Operation("grant.grant".to_string());
+        req.grant = Some(GrantDetail {
+            privileges: vec!["SELECT".to_string()],
+            grantees: vec!["alice".to_string()],
+            with_grant_option: true,
+        });
+        req.resources = vec![
+            AccessResource {
+                kind: ResourceKind::Role,
+                catalog: None,
+                schema: None,
+                table: "analyst".to_string(),
+                columns: Columns::All,
+                value: None,
+            },
+            AccessResource {
+                kind: ResourceKind::Session,
+                catalog: None,
+                schema: None,
+                table: "search_path".to_string(),
+                columns: Columns::All,
+                value: Some("analytics".to_string()),
+            },
+        ];
+        let json = serde_json::to_value(to_request(&req)).unwrap();
+        let a = &json["input"]["action"];
+        assert_eq!(a["grant"]["privileges"], serde_json::json!(["SELECT"]));
+        assert_eq!(a["grant"]["grantees"], serde_json::json!(["alice"]));
+        assert_eq!(a["grant"]["withGrantOption"], true);
+        let (role, session) = (&a["resources"][0], &a["resources"][1]);
+        assert_eq!(
+            (role["kind"].as_str(), role["name"].as_str()),
+            (Some("role"), Some("analyst"))
+        );
+        assert!(
+            role.get("table").is_none() && role.get("value").is_none(),
+            "{role}"
+        );
+        assert_eq!(
+            (session["kind"].as_str(), session["value"].as_str()),
+            (Some("session"), Some("analytics"))
+        );
+
+        // A plain read carries neither.
+        let plain = serde_json::to_value(to_request(&requested(&["orders"]))).unwrap();
+        assert!(plain["input"]["action"].get("grant").is_none());
     }
 
     /// A policy may echo `name` (any kind) or `table` (table resources); `name` wins.
@@ -392,6 +474,7 @@ mod tests {
 
     fn request(tables: &[(&str, &str)]) -> AccessRequest {
         AccessRequest {
+            grant: None,
             identity: Identity::default(),
             operation: Operation::table_select(),
             resources: tables
@@ -402,6 +485,7 @@ mod tests {
                     schema: Some((*s).into()),
                     table: (*t).into(),
                     columns: Columns::All,
+                    value: None,
                 })
                 .collect(),
             context: RequestContext::default(),
@@ -504,6 +588,7 @@ mod tests {
                 schema: Some("analytics".to_string()),
                 table: String::new(),
                 columns: Columns::All,
+                value: None,
             },
             AccessResource {
                 kind: ResourceKind::Schema,
@@ -511,6 +596,7 @@ mod tests {
                 schema: Some("analytics".to_string()),
                 table: String::new(),
                 columns: Columns::All,
+                value: None,
             },
         ];
         let resp: OpaResponse = serde_json::from_str(

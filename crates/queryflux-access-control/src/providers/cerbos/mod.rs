@@ -109,6 +109,7 @@ mod tests {
 
     fn req(table: &str) -> AccessRequest {
         AccessRequest {
+            grant: None,
             identity: Identity {
                 user: "alice".to_string(),
                 roles: vec!["engineer".to_string()],
@@ -117,6 +118,7 @@ mod tests {
             operation: Operation::table_select(),
             resources: vec![AccessResource {
                 kind: ResourceKind::Table,
+                value: None,
                 catalog: None,
                 schema: None,
                 table: table.to_string(),
