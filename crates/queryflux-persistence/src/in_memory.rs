@@ -111,6 +111,9 @@ impl InMemoryPersistence {
             protocol: format!("{:?}", record.frontend_protocol),
             username: record.user,
             sql_preview: record.sql_preview,
+            translation: record.translation.map(|outcome| {
+                serde_json::to_value(outcome).expect("serializable translation outcome")
+            }),
             rewritten_sql: record.rewritten_sql,
             translated_sql: record.translated_sql,
             status: format!("{:?}", record.status),
@@ -1384,6 +1387,7 @@ mod tests {
             .upsert(ExecutingQuery {
                 id: ProxyQueryId("q-qd".into()),
                 sql: "SELECT 1".into(),
+                translation: None,
                 translated_sql: None,
                 client_sql: None,
                 rewritten_sql: None,
@@ -1638,6 +1642,7 @@ mod tests {
             was_rewritten: false,
             rewritten_sql: None,
             was_translated: false,
+            translation: None,
             translated_sql: None,
             user: None,
             catalog: None,

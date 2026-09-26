@@ -99,6 +99,7 @@ config:
         clusters:
           - name: duckdb-1
     translation:
+      mode: bestEffort
       errorOnUnsupported: false
     routers:
       - type: protocolBased

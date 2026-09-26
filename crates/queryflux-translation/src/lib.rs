@@ -12,7 +12,12 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 pub use queryflux_core::schema_context::{ColumnMap, SchemaContext};
-use queryflux_core::{catalog::CatalogProvider, error::Result, query::SqlDialect};
+use queryflux_core::{
+    catalog::CatalogProvider,
+    config::TranslationMode,
+    error::{QueryFluxError, Result},
+    query::{SqlDialect, TranslationOutcome, TranslationReason, TranslationStatus},
+};
 pub use sqlglot::{extract_table_refs_async, SqlglotTranslator, TableRef};
 
 /// Translates SQL from one dialect to another.
@@ -58,7 +63,7 @@ impl TranslatorTrait for PassthroughTranslator {
 /// Central translation service.
 ///
 /// Call `maybe_translate` before submitting SQL to a backend engine.
-/// Returns the original SQL unchanged when dialects match (zero overhead).
+/// Returns the original SQL unchanged when dialects are compatible and no fixups run.
 ///
 /// User-defined Python scripts run after every sqlglot translation. Each script
 /// must define `def transform(sql: str, src: str, dst: str) -> str:`. Top-level
@@ -72,6 +77,8 @@ const DEFAULT_SCHEMA_RESOLUTION_TIMEOUT: Duration = Duration::from_millis(1500);
 
 pub struct TranslationService {
     enabled: bool,
+    mode: TranslationMode,
+    error_on_unsupported: bool,
     python_scripts: Vec<String>,
     schema_resolution_timeout: Duration,
 }
@@ -91,18 +98,36 @@ impl TranslationService {
         }
         Ok(Self {
             enabled: true,
+            mode: TranslationMode::BestEffort,
+            error_on_unsupported: false,
             python_scripts,
             schema_resolution_timeout: DEFAULT_SCHEMA_RESOLUTION_TIMEOUT,
         })
     }
 
-    /// Create a no-op service (translation disabled).
+    /// Create an unavailable service with the default best-effort policy.
     pub fn disabled() -> Self {
         Self {
             enabled: false,
+            mode: TranslationMode::BestEffort,
+            error_on_unsupported: false,
             python_scripts: Vec::new(),
             schema_resolution_timeout: DEFAULT_SCHEMA_RESOLUTION_TIMEOUT,
         }
+    }
+
+    /// Keep configured fixups even if sqlglot is unavailable at startup.
+    pub fn unavailable(python_scripts: Vec<String>) -> Self {
+        Self {
+            python_scripts,
+            ..Self::disabled()
+        }
+    }
+
+    pub fn with_policy(mut self, mode: TranslationMode, error_on_unsupported: bool) -> Self {
+        self.mode = mode;
+        self.error_on_unsupported = error_on_unsupported;
+        self
     }
 
     /// Overrides the default catalog-lookup timeout `resolve_schema_context` uses
@@ -113,7 +138,9 @@ impl TranslationService {
     }
 
     /// Translate `sql` from `src` to `tgt` if they differ.
-    /// Returns the original SQL unchanged when dialects match or translation is disabled.
+    /// Compatible dialects without fixups bypass translation. Required translation
+    /// failures follow the configured policy (best-effort passthrough or strict rejection).
+    /// Fixup statement-kind violations always reject, regardless of policy.
     ///
     /// `group_fixups` are appended after global YAML `translation.pythonScripts` (same contract).
     pub async fn maybe_translate(
@@ -124,17 +151,64 @@ impl TranslationService {
         schema: &SchemaContext,
         group_fixups: &[String],
     ) -> Result<String> {
-        if !self.enabled {
-            return Ok(sql.to_string());
-        }
+        self.maybe_translate_report(sql, src, tgt, schema, group_fixups)
+            .await
+            .result
+    }
+
+    /// Returns an outcome even on strict rejection, so callers can count and record it.
+    pub async fn maybe_translate_report(
+        &self,
+        sql: &str,
+        src: &SqlDialect,
+        tgt: &SqlDialect,
+        schema: &SchemaContext,
+        group_fixups: &[String],
+    ) -> TranslationReport {
         let mut combined = self.python_scripts.clone();
         combined.extend_from_slice(group_fixups);
-        // Skip sqlglot when dialects are compatible AND no fixup scripts need to run.
         if src.is_compatible_with(tgt) && combined.is_empty() {
-            return Ok(sql.to_string());
+            return TranslationReport {
+                result: Ok(sql.to_string()),
+                outcome: TranslationOutcome::not_needed(),
+            };
         }
-        let translator = SqlglotTranslator::new(src.clone(), tgt.clone(), combined);
-        translator.translate(sql, schema).await
+        let strict = self.mode == TranslationMode::Strict || self.error_on_unsupported;
+        let result = if self.enabled {
+            let translator = SqlglotTranslator::new(src.clone(), tgt.clone(), combined)
+                .with_error_on_unsupported(strict);
+            translator.translate_detailed(sql, schema).await
+        } else {
+            Err(sqlglot::SqlglotFailure {
+                error: QueryFluxError::Translation("required translation unavailable: sqlglot is not installed or could not be imported".into()),
+                reason: TranslationReason::SqlglotUnavailable,
+                reject_passthrough: false,
+            })
+        };
+        match result {
+            Ok((translated, fallback)) => TranslationReport {
+                result: Ok(translated),
+                outcome: TranslationOutcome {
+                    status: if fallback.is_some() {
+                        TranslationStatus::Fallback
+                    } else {
+                        TranslationStatus::Yes
+                    },
+                    reason: fallback,
+                },
+            },
+            Err(failure) => TranslationReport {
+                result: if strict || failure.reject_passthrough {
+                    Err(failure.error)
+                } else {
+                    Ok(sql.to_string())
+                },
+                outcome: TranslationOutcome {
+                    status: TranslationStatus::No,
+                    reason: Some(failure.reason),
+                },
+            },
+        }
     }
 
     /// Best-effort schema resolution: extract the tables `sql` references, look them
@@ -220,4 +294,10 @@ impl TranslationService {
             tables: tables_map,
         }
     }
+}
+
+/// Translation result together with metadata retained on success and rejection.
+pub struct TranslationReport {
+    pub result: Result<String>,
+    pub outcome: TranslationOutcome,
 }

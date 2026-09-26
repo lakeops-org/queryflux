@@ -10,6 +10,8 @@ use crate::{ClusterSnapshot, MetricsStore, QueryRecord};
 /// Use alongside `PostgresMetricsStore` (or `NoopMetricsStore`) for historical storage.
 pub struct PrometheusMetrics {
     registry: Registry,
+    translation_skipped_total: CounterVec,
+    translation_fallback_dialect_only_total: CounterVec,
     /// queryflux_queries_total{engine_type, cluster_group, status, protocol}
     queries_total: CounterVec,
     /// queryflux_query_duration_seconds{engine_type, cluster_group}
@@ -68,6 +70,22 @@ impl PrometheusMetrics {
     ) -> std::result::Result<Self, prometheus::Error> {
         let registry = Registry::new();
         crate::adbc::register(&registry)?;
+        let translation_skipped_total = CounterVec::new(
+            Opts::new(
+                "queryflux_translation_skipped_total",
+                "Queries whose translation was skipped or failed, including strict rejection",
+            ),
+            &["reason"],
+        )?;
+        let translation_fallback_dialect_only_total = CounterVec::new(
+            Opts::new(
+                "queryflux_translation_fallback_dialect_only_total",
+                "Queries translated using dialect-only fallback",
+            ),
+            &["reason"],
+        )?;
+        registry.register(Box::new(translation_skipped_total.clone()))?;
+        registry.register(Box::new(translation_fallback_dialect_only_total.clone()))?;
 
         let queries_total = CounterVec::new(
             Opts::new("queryflux_queries_total", "Total completed queries"),
@@ -211,6 +229,8 @@ impl PrometheusMetrics {
 
         Ok(Self {
             registry,
+            translation_skipped_total,
+            translation_fallback_dialect_only_total,
             queries_total,
             query_duration_seconds,
             translated_total,
@@ -252,6 +272,23 @@ impl Default for PrometheusMetrics {
 
 #[async_trait]
 impl MetricsStore for PrometheusMetrics {
+    fn on_translation(&self, outcome: queryflux_core::query::TranslationOutcome) {
+        use queryflux_core::query::TranslationStatus;
+        if let Some(reason) = outcome.reason {
+            match outcome.status {
+                TranslationStatus::No => self
+                    .translation_skipped_total
+                    .with_label_values(&[reason.as_str()])
+                    .inc(),
+                TranslationStatus::Fallback => self
+                    .translation_fallback_dialect_only_total
+                    .with_label_values(&[reason.as_str()])
+                    .inc(),
+                TranslationStatus::Yes => {}
+            }
+        }
+    }
+
     fn on_query_started(&self, group: &str, cluster: &str) {
         self.running_queries
             .with_label_values(&[group, cluster])
@@ -397,5 +434,64 @@ mod tests {
             text.contains('2') || text.contains("2\n"),
             "expected counter value 2 in scrape:\n{text}"
         );
+    }
+}
+
+#[cfg(test)]
+mod translation_tests {
+    use super::*;
+    use crate::{buffered_store::BufferedMetricsStore, MultiMetricsStore};
+    use queryflux_core::query::{TranslationOutcome, TranslationReason, TranslationStatus};
+    use std::{sync::Arc, time::Duration};
+
+    #[tokio::test]
+    async fn translation_counters_survive_fanout_and_buffering() {
+        let prometheus = Arc::new(PrometheusMetrics::new().unwrap());
+        let buffered = Arc::new(BufferedMetricsStore::new(
+            prometheus.clone(),
+            100,
+            Duration::from_secs(60),
+        ));
+        let metrics = MultiMetricsStore::new(vec![buffered]);
+        for reason in [
+            TranslationReason::SqlglotUnavailable,
+            TranslationReason::TranspileError,
+            TranslationReason::NotNeeded,
+        ] {
+            metrics.on_translation(TranslationOutcome {
+                status: TranslationStatus::No,
+                reason: Some(reason),
+            });
+        }
+        for reason in [
+            TranslationReason::NoSchema,
+            TranslationReason::OptimizeError,
+        ] {
+            metrics.on_translation(TranslationOutcome {
+                status: TranslationStatus::Fallback,
+                reason: Some(reason),
+            });
+        }
+        metrics.on_translation(TranslationOutcome {
+            status: TranslationStatus::Yes,
+            reason: None,
+        });
+        let text = prometheus.gather_text();
+        for reason in ["sqlglot_unavailable", "transpile_error", "not_needed"] {
+            assert!(
+                text.contains(&format!(
+                    "queryflux_translation_skipped_total{{reason=\"{reason}\"}} 1"
+                )),
+                "{text}"
+            );
+        }
+        for reason in ["no_schema", "optimize_error"] {
+            assert!(
+                text.contains(&format!(
+                    "queryflux_translation_fallback_dialect_only_total{{reason=\"{reason}\"}} 1"
+                )),
+                "{text}"
+            );
+        }
     }
 }

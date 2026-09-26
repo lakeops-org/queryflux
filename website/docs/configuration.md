@@ -58,6 +58,21 @@ routers:
 routingFallback: trino-default
 ```
 
+## SQL translation
+
+```yaml
+translation:
+  mode: bestEffort  # strict rejects required translation when unavailable or failed
+  errorOnUnsupported: false
+```
+
+`bestEffort` preserves the original SQL on translation failure. Use `strict` to reject
+the query before backend submission instead. Compatible dialects without fixups bypass
+translation; dialect-only fallback remains allowed when it succeeds. The legacy
+`errorOnUnsupported: true` option also enables strict behavior. Restart QueryFlux after
+changing this policy. See [Query translation](./architecture/query-translation) for
+fallback counters and query history outcomes.
+
 ## Authentication, authorization & backend identity
 
 ```yaml

@@ -17,7 +17,7 @@ Client → QueryFlux
 1. **Table-ref extraction** — before translation, QueryFlux parses the SQL (via the same `sqlglot` binding used for dialect translation) to find every table it references, excluding names that resolve to a CTE defined in the same query.
 2. **Catalog lookup** — those table names are looked up via the configured `CatalogProvider`, timeout-guarded so a slow or unreachable catalog never blocks a query.
 3. **Schema-aware translation** — the result populates a `SchemaContext` that `sqlglot`'s optimizer uses to resolve column references and types, producing more accurate translated SQL than dialect-only transpilation.
-4. **Fails open, always** — a parse failure, catalog error, or timeout at any step degrades to the same dialect-only translation QueryFlux always did before this feature existed. Schema-aware translation can only ever *improve* accuracy, never break a query.
+4. **Schema fallback** — a parse failure, catalog error, or timeout during schema resolution falls back to dialect-only translation. If dialect translation also fails, `translation.mode` determines whether to forward the original SQL (`bestEffort`) or reject the query (`strict`). See [Query translation](./query-translation) for outcome reporting.
 
 With no `catalogProvider` configured (the default), a `NullCatalogProvider` returns empty results and step 1 is skipped entirely — a query pays no extra cost.
 

@@ -22,6 +22,11 @@ pub struct QuerySummary {
     pub protocol: String,
     pub username: Option<String>,
     pub sql_preview: String,
+    /// Translation stage outcome; null for records written before this field existed.
+    #[serde(default)]
+    #[sqlx(default)]
+    #[schema(value_type = Option<Object>)]
+    pub translation: Option<serde_json::Value>,
     /// Source-dialect SQL after access-control rewrite. Only present when `was_rewritten` is true.
     #[serde(default)]
     pub rewritten_sql: Option<String>,

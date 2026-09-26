@@ -156,6 +156,7 @@ fn client_safe_message(e: &QueryFluxError) -> &'static str {
     match e {
         Persistence(_) => "Internal service error",
         Engine(_) => "Backend engine error",
+        Translation(_) => "Required SQL translation is unavailable or failed",
         Routing(_) | NoClusterGroupAvailable(_) => "Query routing failed",
         Config(_) => "Configuration error",
         // Empty → caller forwards Display (QueueFull / CapacityWaitTimeout detail).
@@ -1216,6 +1217,7 @@ pub async fn get_executing_statement(
         rewritten_sql: None,
         was_translated: false,
         translated_sql: None,
+        translation: executing.translation,
         query_tags: effective_tags,
         query_params: vec![],
         agent_context: executing.agent_context.clone(),
@@ -1684,6 +1686,7 @@ mod cancel_executing_statement_tests {
         let executing = ExecutingQuery {
             id: ProxyQueryId("proxy-1".into()),
             sql: "SELECT 1".into(),
+            translation: None,
             client_sql: None,
             rewritten_sql: None,
             was_dialect_translated: false,

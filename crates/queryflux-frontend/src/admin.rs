@@ -3405,6 +3405,7 @@ mod tests {
             .upsert(ExecutingQuery {
                 id: ProxyQueryId("exec-1".into()),
                 sql: "SELECT 1".into(),
+                translation: None,
                 client_sql: None,
                 rewritten_sql: None,
                 was_dialect_translated: false,

@@ -1867,11 +1867,22 @@ pub enum CompoundCondition {
 
 // --- Translation ---
 
+/// Policy when required SQL translation is unavailable or fails.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum TranslationMode {
+    #[default]
+    BestEffort,
+    Strict,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct TranslationConfig {
+    #[serde(default)]
+    pub mode: TranslationMode,
     /// If true, fail the query when sqlglot cannot translate a construct.
-    /// If false (default), pass through best-effort.
+    /// If false (default), use `mode` to choose the failure policy.
     #[serde(default)]
     pub error_on_unsupported: bool,
     /// Python scripts run after every sqlglot translation.
@@ -3570,5 +3581,32 @@ tables:
             }
             other => panic!("expected Static, got {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod translation_mode_tests {
+    use super::*;
+
+    #[test]
+    fn translation_mode_defaults_and_explicit_values() {
+        assert_eq!(
+            TranslationConfig::default().mode,
+            TranslationMode::BestEffort
+        );
+        let absent: TranslationConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(absent.mode, TranslationMode::BestEffort);
+        for (name, expected) in [
+            ("bestEffort", TranslationMode::BestEffort),
+            ("strict", TranslationMode::Strict),
+        ] {
+            let config: TranslationConfig =
+                serde_json::from_value(serde_json::json!({"mode": name})).unwrap();
+            assert_eq!(config.mode, expected);
+        }
+        assert!(
+            serde_json::from_value::<TranslationConfig>(serde_json::json!({"mode": "Strict"}))
+                .is_err()
+        );
     }
 }

@@ -65,6 +65,7 @@ clusterGroups:
         # databasePath: /tmp/queryflux.duckdb
 
 translation:
+  mode: bestEffort  # strict rejects required translation when unavailable or failed
   errorOnUnsupported: false
   # Optional Python scripts run after every sqlglot translation.
   # Each script must define: def transform(sql, src, dst) -> str
