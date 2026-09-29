@@ -75,12 +75,33 @@ fn should_attempt_translation(session: &SessionContext, protocol: &FrontendProto
     !matches!(protocol, FrontendProtocol::Mcp) || session.extra.contains_key("dialect")
 }
 
-/// Only connection/availability failures count against a cluster. A SQL error
-/// means the backend answered and must not open its circuit.
+/// Athena's proxy-side completion deadline has a distinct adapter error shape.
+/// Match the whole shape so SQL error text mentioning "max wait" stays excluded.
+fn is_athena_max_wait_timeout(message: &str) -> bool {
+    let Some((execution_id, seconds)) = message
+        .strip_prefix("Athena query ")
+        .and_then(|rest| rest.split_once(" exceeded max wait of "))
+    else {
+        return false;
+    };
+    !execution_id.is_empty()
+        && execution_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        && seconds
+            .strip_suffix('s')
+            .is_some_and(|value| value.parse::<u64>().is_ok())
+}
+
+/// Only connection/availability failures and execution deadlines count against
+/// a cluster. A SQL error means the backend answered and must not open its circuit.
 pub(crate) fn backend_error_outcome(error: &QueryFluxError) -> BackendOutcome {
     let QueryFluxError::Engine(message) = error else {
         return BackendOutcome::Success;
     };
+    if is_athena_max_wait_timeout(message) {
+        return BackendOutcome::Timeout;
+    }
     // Adapter-origin prefixes distinguish transport failures from SQL error
     // bodies. Do not use `is_transient` here: it matches keywords anywhere in
     // the rendered Engine message, including user-controlled query errors.
@@ -118,12 +139,16 @@ pub(crate) fn backend_error_outcome(error: &QueryFluxError) -> BackendOutcome {
     .any(|prefix| message.starts_with(prefix));
     let status_failure = [
         "ClickHouse query failed (HTTP 429 ",
+        "ClickHouse query failed (HTTP 502 ",
         "ClickHouse query failed (HTTP 503 ",
         "DuckDB HTTP server returned 429 ",
+        "DuckDB HTTP server returned 502 ",
         "DuckDB HTTP server returned 503 ",
         "Trino submit returned 429 ",
+        "Trino submit returned 502 ",
         "Trino submit returned 503 ",
         "Trino poll returned 429 ",
+        "Trino poll returned 502 ",
         "Trino poll returned 503 ",
     ]
     .iter()
@@ -233,6 +258,50 @@ mod circuit_breaker_tests {
             )),
             BackendOutcome::Failure
         );
+    }
+
+    #[test]
+    fn gateway_errors_count_as_failures_but_sql_text_does_not() {
+        for message in [
+            "ClickHouse query failed (HTTP 502 Bad Gateway): upstream unavailable",
+            "DuckDB HTTP server returned 502 Bad Gateway: upstream unavailable",
+            "Trino submit returned 502 Bad Gateway: upstream unavailable",
+            "Trino poll returned 502 Bad Gateway: upstream unavailable",
+        ] {
+            assert_eq!(
+                backend_error_outcome(&QueryFluxError::Engine(message.into())),
+                BackendOutcome::Failure,
+                "{message}"
+            );
+        }
+        assert_eq!(
+            backend_error_outcome(&QueryFluxError::Engine(
+                "Trino poll returned 400 Bad Request: syntax error near 502".into()
+            )),
+            BackendOutcome::Success
+        );
+    }
+
+    #[test]
+    fn athena_max_wait_counts_as_timeout_without_matching_query_errors() {
+        assert_eq!(
+            backend_error_outcome(&QueryFluxError::Engine(
+                "Athena query 123e4567-e89b-12d3-a456-426614174000 exceeded max wait of 600s"
+                    .into()
+            )),
+            BackendOutcome::Timeout
+        );
+        for message in [
+            "Athena query failed: exceeded max wait of 600s",
+            "Athena query 123e4567-e89b-12d3-a456-426614174000 exceeded max wait of many seconds",
+            "Athena query 123e4567-e89b-12d3-a456-426614174000 exceeded max wait of 600s extra",
+        ] {
+            assert_eq!(
+                backend_error_outcome(&QueryFluxError::Engine(message.into())),
+                BackendOutcome::Success,
+                "{message}"
+            );
+        }
     }
 }
 

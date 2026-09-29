@@ -1251,12 +1251,13 @@ pub async fn get_executing_statement(
             r
         }
         Err(e) => {
+            let outcome = backend_error_outcome(&e);
             cluster_manager.record_backend_outcome(
                 &executing.cluster_group,
                 &executing.cluster_name,
-                backend_error_outcome(&e),
+                outcome,
             );
-            if e.is_transient() {
+            if outcome != BackendOutcome::Success {
                 warn!(id = %executing.id, "Transient poll error (will retry): {e}");
                 let next_uri = format!("{}/v1/statement/{}", state.external_address, trino_path);
                 let resp = queued_response(&executing.id.0, 0, next_uri);
