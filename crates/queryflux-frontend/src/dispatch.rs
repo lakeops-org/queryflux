@@ -78,14 +78,32 @@ fn should_attempt_translation(session: &SessionContext, protocol: &FrontendProto
 /// Only connection/availability failures count against a cluster. A SQL error
 /// means the backend answered and must not open its circuit.
 pub(crate) fn backend_error_outcome(error: &QueryFluxError) -> BackendOutcome {
+    let QueryFluxError::Engine(message) = error else {
+        return BackendOutcome::Success;
+    };
+    // These adapter prefixes wrap transport operations, not SQL error bodies.
+    // `is_transient` alone misses e.g. reqwest's "connect error" wording.
+    let transport_error = [
+        "ClickHouse request failed:",
+        "DuckDB HTTP request failed:",
+        "DuckDB HTTP read failed:",
+        "Trino submit failed:",
+        "Trino poll GET failed:",
+        "Failed to read Trino response body:",
+        "Failed to read Trino poll body:",
+        "StarRocks pool get_conn failed:",
+    ]
+    .iter()
+    .any(|prefix| message.starts_with(prefix));
+    if !transport_error && !error.is_transient() {
+        return BackendOutcome::Success;
+    }
     let text = error.to_string().to_ascii_lowercase();
     if text.contains("timed out") || text.contains("timeout") || text.contains("deadline exceeded")
     {
         BackendOutcome::Timeout
-    } else if error.is_transient() {
-        BackendOutcome::Failure
     } else {
-        BackendOutcome::Success
+        BackendOutcome::Failure
     }
 }
 
@@ -109,6 +127,30 @@ mod circuit_breaker_tests {
         );
         assert_eq!(
             backend_error_outcome(&QueryFluxError::Unauthorized("denied".into())),
+            BackendOutcome::Success
+        );
+        assert_eq!(
+            backend_error_outcome(&QueryFluxError::Engine(
+                "ClickHouse request failed: connect error".into()
+            )),
+            BackendOutcome::Failure
+        );
+        assert_eq!(
+            backend_error_outcome(&QueryFluxError::Engine(
+                "ClickHouse request failed: connection reset by peer".into()
+            )),
+            BackendOutcome::Failure
+        );
+        assert_eq!(
+            backend_error_outcome(&QueryFluxError::Engine(
+                "ClickHouse request failed: dns error".into()
+            )),
+            BackendOutcome::Failure
+        );
+        assert_eq!(
+            backend_error_outcome(&QueryFluxError::Engine(
+                "syntax error near timeout keyword".into()
+            )),
             BackendOutcome::Success
         );
     }

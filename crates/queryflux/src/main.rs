@@ -1449,18 +1449,24 @@ async fn main() -> Result<()> {
                 let Ok(snapshots) = cluster_manager.all_cluster_states().await else {
                     continue;
                 };
+                let breaker_states: Vec<_> = snapshots
+                    .iter()
+                    .map(|snap| {
+                        let state = snap.breaker_state.map(|state| match state {
+                            queryflux_cluster_manager::circuit_breaker::CircuitState::Closed => 0,
+                            queryflux_cluster_manager::circuit_breaker::CircuitState::Open => 1,
+                            queryflux_cluster_manager::circuit_breaker::CircuitState::HalfOpen => 2,
+                        });
+                        (
+                            snap.group_name.0.clone(),
+                            snap.cluster_name.0.clone(),
+                            state,
+                        )
+                    })
+                    .collect();
+                prometheus.sync_circuit_breaker_states(&breaker_states);
                 let mut records = Vec::with_capacity(snapshots.len());
                 for snap in snapshots {
-                    let breaker_state = snap.breaker_state.map(|state| match state {
-                        queryflux_cluster_manager::circuit_breaker::CircuitState::Closed => 0,
-                        queryflux_cluster_manager::circuit_breaker::CircuitState::Open => 1,
-                        queryflux_cluster_manager::circuit_breaker::CircuitState::HalfOpen => 2,
-                    });
-                    prometheus.set_circuit_breaker_state(
-                        &snap.group_name.0,
-                        &snap.cluster_name.0,
-                        breaker_state,
-                    );
                     let global_running = if let Some(db) = &distributed_backend {
                         let store = db.clone() as Arc<dyn queryflux_persistence::CapacityStore>;
                         store

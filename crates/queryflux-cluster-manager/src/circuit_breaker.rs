@@ -117,7 +117,9 @@ impl CircuitBreaker {
             || inner.timeouts * 100 >= total * usize::from(self.config.timeout_rate_percent)
         {
             inner.state = CircuitState::Open;
-            inner.retry_at = Some(now + inner.backoff);
+            // Invalid programmatic configs must not panic or strand the member
+            // open forever; a failed addition permits the next health tick to probe.
+            inner.retry_at = Some(now.checked_add(inner.backoff).unwrap_or(now));
             inner.samples.clear();
             inner.failures = 0;
             inner.timeouts = 0;
@@ -163,7 +165,7 @@ impl CircuitBreaker {
                 .backoff
                 .saturating_mul(2)
                 .min(Duration::from_secs(self.config.max_backoff_secs));
-            inner.retry_at = Some(now + inner.backoff);
+            inner.retry_at = Some(now.checked_add(inner.backoff).unwrap_or(now));
         }
         inner.state
     }
@@ -260,5 +262,23 @@ mod tests {
             breaker.record_at(BackendOutcome::Success, now);
         }
         assert_eq!(breaker.state(), CircuitState::Closed);
+    }
+
+    #[test]
+    fn unrepresentable_programmatic_backoff_does_not_panic_or_strand_open() {
+        let breaker = CircuitBreaker::new(CircuitBreakerConfig {
+            min_requests: 1,
+            initial_backoff_secs: u64::MAX,
+            max_backoff_secs: u64::MAX,
+            ..config()
+        });
+        let now = Instant::now();
+        assert_eq!(
+            breaker.record_at(BackendOutcome::Failure, now),
+            Some(CircuitState::Open)
+        );
+        assert!(breaker.begin_probe_at(now));
+        assert_eq!(breaker.finish_probe_at(false, now), CircuitState::Open);
+        assert!(breaker.begin_probe_at(now));
     }
 }

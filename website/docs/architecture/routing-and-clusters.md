@@ -194,7 +194,7 @@ clusterGroups:
       maxBackoffSecs: 300
 ```
 
-Completed backend requests contribute to a rolling window. Transient connection/availability errors and timeouts count as failures; SQL and authorization errors do not. Once the minimum sample count and either rate threshold are reached, the member is excluded from new queries. Existing queries are not cancelled. After the backoff, the next periodic health check is the sole half-open probe: success closes the circuit; failure reopens it with an exponentially longer delay, up to `maxBackoffSecs`. The health loop runs every 30 seconds, so a probe may occur later than the configured backoff. Breaker state is local to each QueryFlux process, not shared across replicas.
+Completed backend requests contribute to a rolling window. Transient connection/availability errors and timeouts count as failures; SQL and authorization errors do not. Once the minimum sample count and either rate threshold are reached, the member is excluded from new queries. Existing queries are not cancelled. After the backoff, the next periodic health check is the sole half-open probe: success closes the circuit; failure reopens it with an exponentially longer delay, up to `maxBackoffSecs` (at most one year). The health loop runs every 30 seconds, so a probe may occur later than the configured backoff. Breaker state is local to each QueryFlux process, not shared across replicas.
 
 The admin cluster-state response includes `breaker_state` (`closed`, `open`, or `halfOpen`) and `can_accept_query`. Prometheus exposes `queryflux_circuit_breaker_state{cluster_group,cluster_name}` as 0, 1, or 2 respectively. Omitting `circuitBreaker` preserves the previous health/capacity-only selection behavior.
 

@@ -81,6 +81,9 @@ impl Default for CircuitBreakerConfig {
 
 impl CircuitBreakerConfig {
     pub fn validate(&self) -> std::result::Result<(), &'static str> {
+        // Keep retry deadlines representable on supported platforms and avoid
+        // accepting a policy that would effectively disable automatic recovery.
+        const MAX_BACKOFF_SECS: u64 = 365 * 24 * 60 * 60;
         if self.window_secs == 0 || self.min_requests == 0 {
             return Err("circuitBreaker windowSecs and minRequests must be positive");
         }
@@ -94,6 +97,9 @@ impl CircuitBreakerConfig {
         }
         if self.initial_backoff_secs == 0 || self.max_backoff_secs < self.initial_backoff_secs {
             return Err("circuitBreaker maxBackoffSecs must be at least initialBackoffSecs, and both must be positive");
+        }
+        if self.max_backoff_secs > MAX_BACKOFF_SECS {
+            return Err("circuitBreaker maxBackoffSecs must not exceed one year");
         }
         Ok(())
     }
@@ -2178,6 +2184,12 @@ mod tests {
         assert!(CircuitBreakerConfig {
             failure_rate_percent: 0,
             ..config
+        }
+        .validate()
+        .is_err());
+        assert!(CircuitBreakerConfig {
+            max_backoff_secs: u64::MAX,
+            ..CircuitBreakerConfig::default()
         }
         .validate()
         .is_err());

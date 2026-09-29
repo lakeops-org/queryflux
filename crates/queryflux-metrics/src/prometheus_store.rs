@@ -1,3 +1,5 @@
+use std::{collections::HashSet, sync::Mutex};
+
 use async_trait::async_trait;
 use prometheus::{CounterVec, Encoder, HistogramOpts, HistogramVec, Opts, Registry, TextEncoder};
 use queryflux_core::error::Result;
@@ -23,6 +25,7 @@ pub struct PrometheusMetrics {
     /// queryflux_circuit_breaker_state{cluster_group,cluster_name}: 0 closed,
     /// 1 open, 2 half-open. Absent when circuit breaking is disabled.
     circuit_breaker_state: prometheus::GaugeVec,
+    circuit_breaker_labels: Mutex<HashSet<(String, String)>>,
     /// queryflux_queued_queries{cluster_group}
     queued_queries: prometheus::GaugeVec,
     /// queryflux_query_tags_total{tag_key, tag_value, cluster_group}
@@ -229,6 +232,7 @@ impl PrometheusMetrics {
             rewritten_total,
             running_queries,
             circuit_breaker_state,
+            circuit_breaker_labels: Mutex::new(HashSet::new()),
             queued_queries,
             query_tags_total,
             coordination_failures_total,
@@ -256,15 +260,30 @@ impl PrometheusMetrics {
         String::from_utf8(buffer).unwrap_or_default()
     }
 
-    pub fn set_circuit_breaker_state(&self, group: &str, cluster: &str, state: Option<u8>) {
-        let labels = [group, cluster];
-        if let Some(state) = state {
-            self.circuit_breaker_state
-                .with_label_values(&labels)
-                .set(f64::from(state));
-        } else {
-            let _ = self.circuit_breaker_state.remove_label_values(&labels);
+    /// Replace the breaker gauge series with one complete runtime snapshot.
+    pub fn sync_circuit_breaker_states(&self, states: &[(String, String, Option<u8>)]) {
+        let current: HashSet<_> = states
+            .iter()
+            .filter(|(_, _, state)| state.is_some())
+            .map(|(group, cluster, _)| (group.clone(), cluster.clone()))
+            .collect();
+        let mut previous = self
+            .circuit_breaker_labels
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for (group, cluster) in previous.difference(&current) {
+            let _ = self
+                .circuit_breaker_state
+                .remove_label_values(&[group, cluster]);
         }
+        for (group, cluster, state) in states {
+            if let Some(state) = state {
+                self.circuit_breaker_state
+                    .with_label_values(&[group, cluster])
+                    .set(f64::from(*state));
+            }
+        }
+        *previous = current;
     }
 }
 
@@ -406,10 +425,13 @@ mod tests {
     #[test]
     fn circuit_state_gauge_tracks_transitions_and_disabled_policy() {
         let metrics = PrometheusMetrics::new().expect("prometheus init");
-        metrics.set_circuit_breaker_state("analytics", "trino-a", Some(1));
+        metrics.sync_circuit_breaker_states(&[("analytics".into(), "trino-a".into(), Some(1))]);
         assert!(metrics.gather_text().contains("queryflux_circuit_breaker_state{cluster_group=\"analytics\",cluster_name=\"trino-a\"} 1"));
-        metrics.set_circuit_breaker_state("analytics", "trino-a", None);
+        metrics.sync_circuit_breaker_states(&[("analytics".into(), "trino-a".into(), None)]);
         assert!(!metrics.gather_text().contains("cluster_name=\"trino-a\""));
+        metrics.sync_circuit_breaker_states(&[("analytics".into(), "trino-b".into(), Some(2))]);
+        metrics.sync_circuit_breaker_states(&[]);
+        assert!(!metrics.gather_text().contains("cluster_name=\"trino-b\""));
     }
 
     #[test]
