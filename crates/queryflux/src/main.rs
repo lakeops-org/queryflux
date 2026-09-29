@@ -1829,9 +1829,14 @@ async fn main() -> Result<()> {
                         catalog: l.catalog.clone(),
                     }
                 };
-                match reload_live_config(backend, &mut cache_guard, &prev, metrics).await {
+                // A rejected reload must not change the adapter/state cache that
+                // the next attempt uses to preserve the currently live breakers.
+                let mut candidate_cache = cache_guard.clone();
+                match reload_live_config(backend, &mut candidate_cache, &prev, metrics).await {
                     Ok(new_live) => {
-                        *live.write().await = new_live;
+                        let mut live_guard = live.write().await;
+                        *cache_guard = candidate_cache;
+                        *live_guard = new_live;
                         tracing::info!("Live config reloaded from backend");
                     }
                     Err(e) => {
@@ -2029,14 +2034,14 @@ async fn main() -> Result<()> {
                 };
                 for (adapter, cstate) in &targets {
                     let cluster_name = &cstate.cluster_name.0;
-                    let breaker_probe = cstate.begin_breaker_probe();
+                    let breaker_probe = BreakerProbeGuard::reserve(cstate);
                     let healthy = if let Some(custom_sql) = custom_health.get(cluster_name) {
                         adapter.execute_custom_health_check(custom_sql).await
                     } else {
                         adapter.health_check().await
                     };
-                    if breaker_probe {
-                        let state = cstate.finish_breaker_probe(healthy);
+                    if let Some(probe) = breaker_probe {
+                        let state = probe.finish(healthy);
                         tracing::info!(
                             cluster = %cluster_name,
                             group = %cstate.group_name.0,
@@ -2085,14 +2090,15 @@ async fn main() -> Result<()> {
                         live.custom_reconcile_queries.clone(),
                     )
                 };
+                let targets = reconcile_targets_from_health_targets(&targets);
 
                 if let Some(ref db) = distributed_backend {
                     let capacity_store =
                         db.clone() as Arc<dyn queryflux_persistence::CapacityStore>;
                     match db.try_sweep_lock("engine-reconcile").await {
                         Ok(Some(lock)) => {
-                            for (adapter, cstate) in &targets {
-                                let cluster_name = &cstate.cluster_name.0;
+                            for (adapter, states) in &targets {
+                                let cluster_name = &states[0].cluster_name.0;
                                 let actual = fetch_engine_running_count(
                                     adapter,
                                     cluster_name,
@@ -2113,16 +2119,20 @@ async fn main() -> Result<()> {
                                         );
                                     }
                                 }
-                                apply_reconcile_to_cluster_state(cstate, actual);
+                                for cstate in states {
+                                    apply_reconcile_to_cluster_state(cstate, actual);
+                                }
                             }
                             let _ = lock.release().await;
                         }
                         Ok(None) => {
-                            for (_, cstate) in &targets {
-                                let cluster_name = &cstate.cluster_name.0;
+                            for (_, states) in &targets {
+                                let cluster_name = &states[0].cluster_name.0;
                                 match capacity_store.active_count(cluster_name).await {
                                     Ok(count) => {
-                                        apply_reconcile_to_cluster_state(cstate, Some(count));
+                                        for cstate in states {
+                                            apply_reconcile_to_cluster_state(cstate, Some(count));
+                                        }
                                     }
                                     Err(e) => {
                                         state
@@ -2144,12 +2154,14 @@ async fn main() -> Result<()> {
                         }
                     }
                 } else {
-                    for (adapter, cstate) in &targets {
-                        let cluster_name = &cstate.cluster_name.0;
+                    for (adapter, states) in &targets {
+                        let cluster_name = &states[0].cluster_name.0;
                         let actual =
                             fetch_engine_running_count(adapter, cluster_name, &custom_reconcile)
                                 .await;
-                        apply_reconcile_to_cluster_state(cstate, actual);
+                        for cstate in states {
+                            apply_reconcile_to_cluster_state(cstate, actual);
+                        }
                     }
                 }
             }
@@ -2432,6 +2444,7 @@ fn max_running_queries_u64_from_db(cluster: &str, v: Option<i64>) -> Result<Opti
 /// Holds adapter instances between DB reloads. Adapters are recreated when the
 /// reload fingerprint changes (`engine_key` + config JSON), so engine switches and
 /// endpoint/credential updates rebuild adapters.
+#[derive(Clone)]
 struct AdapterReloadCache {
     adapters: HashMap<String, queryflux_engine_adapters::AdapterKind>,
     config_json: HashMap<String, String>,
@@ -2453,6 +2466,40 @@ struct AdapterReloadCache {
         HashMap<String, Arc<dyn queryflux_cluster_manager::strategy::ClusterSelectionStrategy>>,
 }
 
+/// A cancelled health-check future must not leave its member HalfOpen forever.
+struct BreakerProbeGuard {
+    state: Arc<ClusterState>,
+    completed: bool,
+}
+
+impl BreakerProbeGuard {
+    fn reserve(state: &Arc<ClusterState>) -> Option<Self> {
+        state.begin_breaker_probe().then(|| Self {
+            state: state.clone(),
+            completed: false,
+        })
+    }
+
+    fn finish(
+        mut self,
+        healthy: bool,
+    ) -> Option<queryflux_cluster_manager::circuit_breaker::CircuitState> {
+        let result = self.state.finish_breaker_probe(healthy);
+        self.completed = true;
+        result
+    }
+}
+
+impl Drop for BreakerProbeGuard {
+    fn drop(&mut self) {
+        if !self.completed {
+            // The probe did not finish (for example, its task was cancelled).
+            // Treat it as a failed check and retry after the usual backoff.
+            self.state.finish_breaker_probe(false);
+        }
+    }
+}
+
 fn health_targets_from_groups(
     group_states: &GroupStatesMap,
     adapters: &HashMap<String, queryflux_engine_adapters::AdapterKind>,
@@ -2472,6 +2519,25 @@ fn health_targets_from_groups(
         }
     }
     out
+}
+
+/// Health probes are per group/member; engine reconciliation is per backend.
+/// Keep every member state so the single fetched count reaches all groups.
+fn reconcile_targets_from_health_targets<A: Clone>(
+    targets: &[(A, Arc<ClusterState>)],
+) -> Vec<(A, Vec<Arc<ClusterState>>)> {
+    let mut positions: HashMap<String, usize> = HashMap::new();
+    let mut grouped: Vec<(_, Vec<Arc<ClusterState>>)> = Vec::new();
+    for (adapter, state) in targets {
+        let name = &state.cluster_name.0;
+        if let Some(&index) = positions.get(name) {
+            grouped[index].1.push(state.clone());
+        } else {
+            positions.insert(name.clone(), grouped.len());
+            grouped.push((adapter.clone(), vec![state.clone()]));
+        }
+    }
+    grouped
 }
 
 /// Validate referential integrity of a config that is about to go live.
@@ -2925,7 +2991,7 @@ async fn build_live_config(
         .retain(|name, _| cluster_groups.contains_key(name.as_str()));
 
     let health_check_targets = health_targets_from_groups(&group_states, &cache.adapters);
-    cache.cluster_states = health_check_targets
+    let rebuilt_cluster_states = health_check_targets
         .iter()
         .map(|(_, s)| {
             (
@@ -3157,6 +3223,7 @@ async fn build_live_config(
         }
     }
 
+    cache.cluster_states = rebuilt_cluster_states;
     Ok(LiveConfig {
         router_chain,
         guard_chain: None,
@@ -3969,6 +4036,130 @@ fn in_memory_metrics(
 
 #[cfg(test)]
 mod tests {
+    mod circuit_breaker_reload {
+        use std::collections::HashMap;
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        use queryflux_cluster_manager::circuit_breaker::{BackendOutcome, CircuitState};
+        use queryflux_cluster_manager::cluster_state::ClusterState;
+        use queryflux_core::config::{CircuitBreakerConfig, ClusterGroupConfig};
+        use queryflux_core::query::{ClusterGroupName, ClusterName, EngineType};
+
+        use super::super::{
+            build_live_config, reconcile_targets_from_health_targets, AdapterReloadCache,
+            BreakerProbeGuard,
+        };
+
+        fn state(group: &str, name: &str, breaker: bool) -> Arc<ClusterState> {
+            let state = ClusterState::new(
+                ClusterName(name.to_string()),
+                ClusterGroupName(group.to_string()),
+                None,
+                None,
+                EngineType::ClickHouse,
+                None,
+                10,
+                true,
+            );
+            Arc::new(if breaker {
+                state.with_circuit_breaker(
+                    Some(CircuitBreakerConfig {
+                        min_requests: 1,
+                        failure_rate_percent: 100,
+                        initial_backoff_secs: 1,
+                        max_backoff_secs: 2,
+                        ..CircuitBreakerConfig::default()
+                    }),
+                    None,
+                )
+            } else {
+                state
+            })
+        }
+
+        #[test]
+        fn shared_backend_is_reconciled_once_but_updates_each_group() {
+            let first = state("group-a", "shared", false);
+            let second = state("group-b", "shared", false);
+            let other = state("group-a", "other", false);
+            let targets = vec![
+                ("adapter-a", first.clone()),
+                ("adapter-a", second.clone()),
+                ("adapter-b", other.clone()),
+            ];
+            let grouped = reconcile_targets_from_health_targets(&targets);
+            assert_eq!(grouped.len(), 2);
+            assert_eq!(grouped[0].1.len(), 2);
+            assert_eq!(grouped[1].1.len(), 1);
+            for member in &grouped[0].1 {
+                member.set_running_queries(3);
+            }
+            assert_eq!(first.running_queries(), 3);
+            assert_eq!(second.running_queries(), 3);
+            assert_eq!(other.running_queries(), 0);
+        }
+
+        #[tokio::test]
+        async fn invalid_reload_does_not_replace_cached_breaker_states() {
+            let old = state("group", "old", true);
+            let key = ("group".to_string(), "old".to_string());
+            let mut cache = AdapterReloadCache {
+                adapters: HashMap::new(),
+                config_json: HashMap::new(),
+                cluster_states: HashMap::from([(key.clone(), old.clone())]),
+                routing_fallback: "group".to_string(),
+                routers_cfg: Vec::new(),
+                strategies: HashMap::new(),
+            };
+            let group: ClusterGroupConfig = serde_json::from_value(serde_json::json!({
+                "members": ["missing"],
+                "maxRunningQueries": 10
+            }))
+            .expect("valid group fixture");
+            let result = build_live_config(
+                &[],
+                &HashMap::from([("group".to_string(), group)]),
+                &HashMap::new(),
+                &HashMap::new(),
+                &[],
+                "group",
+                HashMap::new(),
+                &mut cache,
+            )
+            .await;
+            assert!(result.is_err(), "unknown member must reject reload");
+            assert!(Arc::ptr_eq(
+                cache.cluster_states.get(&key).expect("old state retained"),
+                &old
+            ));
+        }
+
+        #[test]
+        fn dropped_probe_reopens_breaker_instead_of_stranding_half_open() {
+            let member = state("group", "backend", true);
+            assert_eq!(
+                member.record_backend_outcome(BackendOutcome::Failure),
+                Some(CircuitState::Open)
+            );
+            std::thread::sleep(Duration::from_secs(1));
+            let probe = BreakerProbeGuard::reserve(&member).expect("probe should be ready");
+            assert_eq!(member.breaker_state(), Some(CircuitState::HalfOpen));
+            drop(probe);
+            assert_eq!(member.breaker_state(), Some(CircuitState::Open));
+        }
+
+        #[test]
+        fn completed_probe_is_not_reopened_on_drop() {
+            let member = state("group", "backend", true);
+            member.record_backend_outcome(BackendOutcome::Failure);
+            std::thread::sleep(Duration::from_secs(1));
+            let probe = BreakerProbeGuard::reserve(&member).expect("probe should be ready");
+            assert_eq!(probe.finish(true), Some(CircuitState::Closed));
+            assert_eq!(member.breaker_state(), Some(CircuitState::Closed));
+        }
+    }
+
     mod group_translation_scripts {
         use std::collections::HashMap;
 

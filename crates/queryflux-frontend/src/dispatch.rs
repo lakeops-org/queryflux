@@ -81,24 +81,63 @@ pub(crate) fn backend_error_outcome(error: &QueryFluxError) -> BackendOutcome {
     let QueryFluxError::Engine(message) = error else {
         return BackendOutcome::Success;
     };
-    // These adapter prefixes wrap transport operations, not SQL error bodies.
-    // `is_transient` alone misses e.g. reqwest's "connect error" wording.
+    // Adapter-origin prefixes distinguish transport failures from SQL error
+    // bodies. Do not use `is_transient` here: it matches keywords anywhere in
+    // the rendered Engine message, including user-controlled query errors.
     let transport_error = [
         "ClickHouse request failed:",
+        "ClickHouse response aborted mid-stream:",
+        "ClickHouse Arrow stream ended unexpectedly:",
         "DuckDB HTTP request failed:",
         "DuckDB HTTP read failed:",
         "Trino submit failed:",
         "Trino poll GET failed:",
         "Failed to read Trino response body:",
         "Failed to read Trino poll body:",
+        "StarRocks pool checkout timed out",
         "StarRocks pool get_conn failed:",
+        "StarRocks control pool checkout timed out",
+        "StarRocks control pool get_conn failed:",
+        "mysql_native: connection failed:",
+        "ADBC: pool error:",
     ]
     .iter()
     .any(|prefix| message.starts_with(prefix));
-    if !transport_error && !error.is_transient() {
+    // HTTP status is part of the adapter's own prefix, not the response body.
+    let status_timeout = [
+        "ClickHouse query failed (HTTP 408 ",
+        "ClickHouse query failed (HTTP 504 ",
+        "DuckDB HTTP server returned 408 ",
+        "DuckDB HTTP server returned 504 ",
+        "Trino submit returned 408 ",
+        "Trino submit returned 504 ",
+        "Trino poll returned 408 ",
+        "Trino poll returned 504 ",
+    ]
+    .iter()
+    .any(|prefix| message.starts_with(prefix));
+    let status_failure = [
+        "ClickHouse query failed (HTTP 429 ",
+        "ClickHouse query failed (HTTP 503 ",
+        "DuckDB HTTP server returned 429 ",
+        "DuckDB HTTP server returned 503 ",
+        "Trino submit returned 429 ",
+        "Trino submit returned 503 ",
+        "Trino poll returned 429 ",
+        "Trino poll returned 503 ",
+    ]
+    .iter()
+    .any(|prefix| message.starts_with(prefix));
+    if status_timeout {
+        return BackendOutcome::Timeout;
+    }
+    if status_failure {
+        return BackendOutcome::Failure;
+    }
+    if !transport_error {
         return BackendOutcome::Success;
     }
-    let text = error.to_string().to_ascii_lowercase();
+    let text = message.to_ascii_lowercase();
     if text.contains("timed out") || text.contains("timeout") || text.contains("deadline exceeded")
     {
         BackendOutcome::Timeout
@@ -114,11 +153,15 @@ mod circuit_breaker_tests {
     #[test]
     fn only_backend_availability_errors_count_as_failures() {
         assert_eq!(
-            backend_error_outcome(&QueryFluxError::Engine("connection refused".into())),
+            backend_error_outcome(&QueryFluxError::Engine(
+                "ClickHouse request failed: connection refused".into()
+            )),
             BackendOutcome::Failure
         );
         assert_eq!(
-            backend_error_outcome(&QueryFluxError::Engine("request timed out".into())),
+            backend_error_outcome(&QueryFluxError::Engine(
+                "ClickHouse request failed: request timed out".into()
+            )),
             BackendOutcome::Timeout
         );
         assert_eq!(
@@ -152,6 +195,43 @@ mod circuit_breaker_tests {
                 "syntax error near timeout keyword".into()
             )),
             BackendOutcome::Success
+        );
+        assert_eq!(
+            backend_error_outcome(&QueryFluxError::Engine(
+                "ClickHouse query failed mid-stream: syntax error near timed out".into()
+            )),
+            BackendOutcome::Success
+        );
+        assert_eq!(
+            backend_error_outcome(&QueryFluxError::Engine(
+                "ClickHouse response aborted mid-stream: connection reset by peer".into()
+            )),
+            BackendOutcome::Failure
+        );
+        assert_eq!(
+            backend_error_outcome(&QueryFluxError::Engine(
+                "ClickHouse query failed (HTTP 503 Service Unavailable): syntax error".into()
+            )),
+            BackendOutcome::Failure
+        );
+        assert_eq!(
+            backend_error_outcome(&QueryFluxError::Engine(
+                "ClickHouse query failed (HTTP 400 Bad Request): syntax error near 503 timed out"
+                    .into()
+            )),
+            BackendOutcome::Success
+        );
+        assert_eq!(
+            backend_error_outcome(&QueryFluxError::Engine(
+                "StarRocks pool checkout timed out (10s)".into()
+            )),
+            BackendOutcome::Timeout
+        );
+        assert_eq!(
+            backend_error_outcome(&QueryFluxError::Engine(
+                "mysql_native: connection failed: connection refused".into()
+            )),
+            BackendOutcome::Failure
         );
     }
 }
