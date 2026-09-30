@@ -2176,10 +2176,7 @@ async fn execute_stream(
     while let Some(result) = stream.next().await {
         match result {
             Err(e) => {
-                let error = QueryFluxError::Engine(e.to_string());
-                setup
-                    .slot
-                    .record_backend_outcome(backend_error_outcome(&error));
+                setup.slot.record_backend_outcome(backend_error_outcome(&e));
                 let msg = e.to_string();
                 let outcome = SyncOutcome {
                     status: QueryStatus::Failed,
@@ -2322,10 +2319,7 @@ async fn execute_native_to_sink(
     while let Some(result) = stream.next().await {
         match result {
             Err(e) => {
-                let error = QueryFluxError::Engine(e.to_string());
-                setup
-                    .slot
-                    .record_backend_outcome(backend_error_outcome(&error));
+                setup.slot.record_backend_outcome(backend_error_outcome(&e));
                 let msg = e.to_string();
                 let outcome = SyncOutcome {
                     status: QueryStatus::Failed,
