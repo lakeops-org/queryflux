@@ -453,8 +453,8 @@ async fn main() -> Result<()> {
             .collect();
         config.cluster_groups = group_records
             .into_iter()
-            .map(|r| (r.name.clone(), r.to_core()))
-            .collect();
+            .map(|r| Ok((r.name.clone(), r.to_core().map_err(anyhow::Error::msg)?)))
+            .collect::<Result<_>>()?;
 
         // Apply persisted security overrides (`security_settings` / `security_config` key).
         // The migration seeds `{}`; that is not an override — keep YAML.
@@ -3304,8 +3304,8 @@ async fn reload_live_config(
         queryflux_core::config::ClusterGroupConfig,
     > = group_records
         .into_iter()
-        .map(|r| (r.name.clone(), r.to_core()))
-        .collect();
+        .map(|r| Ok((r.name.clone(), r.to_core().map_err(anyhow::Error::msg)?)))
+        .collect::<Result<_>>()?;
 
     // Load routing from DB if present; otherwise keep last-known routing (startup YAML or previous DB load).
     let (routing_fallback, routers_cfg) = match pg.load_routing_config().await {

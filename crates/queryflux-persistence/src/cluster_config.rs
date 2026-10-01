@@ -317,8 +317,8 @@ impl UpsertClusterGroupConfig {
 // `parse_query_auth_from_config_json` — both in `queryflux_core::engine_registry`.
 
 impl ClusterGroupConfigRecord {
-    pub fn to_core(&self) -> ClusterGroupConfig {
-        use queryflux_core::config::StrategyConfig;
+    pub fn to_core(&self) -> Result<ClusterGroupConfig, String> {
+        use queryflux_core::config::{CircuitBreakerConfig, StrategyConfig};
 
         let strategy = self
             .strategy
@@ -328,7 +328,20 @@ impl ClusterGroupConfigRecord {
         let circuit_breaker = self
             .circuit_breaker
             .as_ref()
-            .and_then(|v| serde_json::from_value(v.clone()).ok());
+            .map(|value| {
+                let config: CircuitBreakerConfig =
+                    serde_json::from_value(value.clone()).map_err(|e| {
+                        format!(
+                            "group '{}' (id {}): invalid circuitBreaker: {e}",
+                            self.name, self.id
+                        )
+                    })?;
+                config
+                    .validate()
+                    .map_err(|e| format!("group '{}' (id {}): {e}", self.name, self.id))?;
+                Ok::<_, String>(config)
+            })
+            .transpose()?;
 
         let default_tags =
             serde_json::from_value::<queryflux_core::tags::QueryTags>(self.default_tags.clone())
@@ -347,7 +360,7 @@ impl ClusterGroupConfigRecord {
             .as_ref()
             .and_then(|v| serde_json::from_value(v.clone()).ok());
 
-        ClusterGroupConfig {
+        Ok(ClusterGroupConfig {
             enabled: self.enabled,
             members: self.members.clone(),
             strategy,
@@ -362,7 +375,7 @@ impl ClusterGroupConfigRecord {
             },
             default_tags,
             cache,
-        }
+        })
     }
 }
 
@@ -430,7 +443,31 @@ mod tests {
         assert!(upsert.validate_circuit_breaker().is_ok());
         let mut record = make_record(default_tags_value());
         record.circuit_breaker = upsert.circuit_breaker;
-        assert_eq!(record.to_core().circuit_breaker, group.circuit_breaker);
+        assert_eq!(
+            record.to_core().unwrap().circuit_breaker,
+            group.circuit_breaker
+        );
+    }
+
+    #[test]
+    fn malformed_persisted_circuit_breaker_is_rejected() {
+        let mut record = make_record(default_tags_value());
+        record.circuit_breaker = Some(serde_json::json!({"minRequests": "invalid"}));
+        let error = record
+            .to_core()
+            .expect_err("invalid breaker must reject the record");
+        assert!(error.contains("test-group"), "{error}");
+        assert!(error.contains("circuitBreaker"), "{error}");
+    }
+
+    #[test]
+    fn semantically_invalid_persisted_circuit_breaker_is_rejected() {
+        let mut record = make_record(default_tags_value());
+        record.circuit_breaker = Some(serde_json::json!({"minRequests": 0}));
+        let error = record
+            .to_core()
+            .expect_err("invalid policy must reject the record");
+        assert!(error.contains("minRequests"), "{error}");
     }
 
     // --- to_core: JSONB → QueryTags ---
@@ -438,7 +475,7 @@ mod tests {
     #[test]
     fn to_core_key_value_tags() {
         let json = serde_json::json!({"team": "eng", "cost_center": "701"});
-        let core = make_record(json).to_core();
+        let core = make_record(json).to_core().unwrap();
         assert_eq!(
             core.default_tags.get("team"),
             Some(&Some("eng".to_string()))
@@ -452,7 +489,7 @@ mod tests {
     #[test]
     fn to_core_key_only_tags_deserialize_as_none() {
         let json = serde_json::json!({"batch": null, "team": "eng"});
-        let core = make_record(json).to_core();
+        let core = make_record(json).to_core().unwrap();
         assert_eq!(core.default_tags.get("batch"), Some(&None));
         assert_eq!(
             core.default_tags.get("team"),
@@ -462,14 +499,14 @@ mod tests {
 
     #[test]
     fn to_core_empty_json_gives_empty_tags() {
-        let core = make_record(serde_json::json!({})).to_core();
+        let core = make_record(serde_json::json!({})).to_core().unwrap();
         assert!(core.default_tags.is_empty());
     }
 
     #[test]
     fn to_core_malformed_json_falls_back_to_empty() {
         // A non-object JSON value cannot deserialize as QueryTags — should not panic.
-        let core = make_record(serde_json::json!([1, 2, 3])).to_core();
+        let core = make_record(serde_json::json!([1, 2, 3])).to_core().unwrap();
         assert!(core.default_tags.is_empty());
     }
 
@@ -516,7 +553,7 @@ mod tests {
 
         // Simulate what the DB would return: use the JSONB stored in upsert as the record's value.
         let record = make_record(upsert.default_tags.clone());
-        let core_out = record.to_core();
+        let core_out = record.to_core().unwrap();
 
         assert_eq!(
             core_out.default_tags.get("env"),

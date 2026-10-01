@@ -1266,7 +1266,7 @@ mod tests {
             .await
             .unwrap();
 
-        let core = record.to_core();
+        let core = record.to_core().expect("valid stored group");
         assert_eq!(
             core.default_tags.get("team"),
             Some(&Some("eng".to_string()))
