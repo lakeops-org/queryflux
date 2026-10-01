@@ -113,6 +113,9 @@ pub(crate) fn backend_error_outcome(error: &QueryFluxError) -> BackendOutcome {
     // bodies. Do not use `is_transient` here: it matches keywords anywhere in
     // the rendered Engine message, including user-controlled query errors.
     let transport_error = [
+        "Athena StartQueryExecution:",
+        "Athena GetQueryExecution:",
+        "Athena GetQueryResults:",
         "ClickHouse request failed:",
         "ClickHouse response aborted mid-stream:",
         "ClickHouse Arrow stream ended unexpectedly:",
@@ -126,7 +129,9 @@ pub(crate) fn backend_error_outcome(error: &QueryFluxError) -> BackendOutcome {
         "StarRocks pool get_conn failed:",
         "StarRocks control pool checkout timed out",
         "StarRocks control pool get_conn failed:",
+        "StarRocks transport failed:",
         "mysql_native: connection failed:",
+        "mysql_native: transport failed:",
         "ADBC: pool error:",
         "ADBC: failed to get connection from pool:",
     ]
@@ -323,6 +328,56 @@ mod circuit_breaker_tests {
             )),
             BackendOutcome::Success
         );
+    }
+
+    #[test]
+    fn athena_api_errors_count_without_matching_query_failures() {
+        for message in [
+            "Athena StartQueryExecution: service unavailable",
+            "Athena GetQueryExecution: connection reset by peer",
+            "Athena GetQueryResults: request timed out",
+        ] {
+            let expected = if message.contains("timed out") {
+                BackendOutcome::Timeout
+            } else {
+                BackendOutcome::Failure
+            };
+            assert_eq!(
+                backend_error_outcome(&QueryFluxError::Engine(message.into())),
+                expected,
+                "{message}"
+            );
+        }
+        assert_eq!(
+            backend_error_outcome(&QueryFluxError::Engine(
+                "Athena query failed: syntax error near GetQueryResults timed out".into()
+            )),
+            BackendOutcome::Success
+        );
+    }
+
+    #[test]
+    fn mysql_wire_transport_errors_count_without_matching_sql_error_text() {
+        for message in [
+            "StarRocks transport failed: Input/output error: connection refused",
+            "mysql_native: transport failed: Input/output error: connection reset by peer",
+        ] {
+            assert_eq!(
+                backend_error_outcome(&QueryFluxError::Engine(message.into())),
+                BackendOutcome::Failure,
+                "{message}"
+            );
+        }
+        for message in [
+            "StarRocks query failed: Server error: syntax error near connection refused",
+            "mysql_native: query failed: Server error: syntax error near connection reset by peer",
+        ] {
+            assert_eq!(
+                backend_error_outcome(&QueryFluxError::Engine(message.into())),
+                BackendOutcome::Success,
+                "{message}"
+            );
+        }
     }
 
     #[test]

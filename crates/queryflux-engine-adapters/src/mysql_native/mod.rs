@@ -30,6 +30,32 @@ use crate::{BackendQueryIdSlot, NativeExecution};
 /// Number of rows per `NativeResultChunk`. Balances channel overhead vs. memory.
 const BATCH_SIZE: usize = 1_000;
 
+/// Keep driver/network failures distinct from server-reported SQL errors. The
+/// frontend's circuit breaker only counts the former as backend outages.
+pub(crate) fn is_mysql_transport_error(error: &mysql_async::Error) -> bool {
+    use mysql_async::{DriverError, Error};
+
+    matches!(
+        error,
+        Error::Io(_)
+            | Error::Driver(
+                DriverError::ConnectionClosed
+                    | DriverError::PoolDisconnected
+                    | DriverError::PacketOutOfOrder
+                    | DriverError::UnexpectedPacket { .. }
+                    | DriverError::BadCompressedPacketHeader
+            )
+    )
+}
+
+fn native_mysql_error(stage: &str, error: mysql_async::Error) -> QueryFluxError {
+    if is_mysql_transport_error(&error) {
+        QueryFluxError::Engine(format!("mysql_native: transport failed: {error}"))
+    } else {
+        QueryFluxError::Engine(format!("mysql_native: {stage} failed: {error}"))
+    }
+}
+
 /// Bound on opening a `queryAuth: passthrough` connection — see
 /// [`open_passthrough_connection`].
 const PASSTHROUGH_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
@@ -255,16 +281,16 @@ async fn stream_on_conn(
         let use_sql = format!("USE `{}`", db.replace('`', "``"));
         conn.query_drop(&use_sql)
             .await
-            .map_err(|e| QueryFluxError::Engine(format!("mysql_native: USE failed: {e}")))?;
+            .map_err(|e| native_mysql_error("USE", e))?;
     }
 
     if !tags.is_empty() {
         let tag_json = tags_to_json(tags).to_string();
         let escaped = Value::from(tag_json).as_sql(false);
         let set_sql = format!("SET @query_tag = {escaped}");
-        conn.query_drop(&set_sql).await.map_err(|e| {
-            QueryFluxError::Engine(format!("mysql_native: SET @query_tag failed: {e}"))
-        })?;
+        conn.query_drop(&set_sql)
+            .await
+            .map_err(|e| native_mysql_error("SET @query_tag", e))?;
     }
 
     if params.is_empty() {
@@ -272,7 +298,7 @@ async fn stream_on_conn(
         let query_result = conn
             .query_iter(sql)
             .await
-            .map_err(|e| QueryFluxError::Engine(format!("mysql_native: query failed: {e}")))?;
+            .map_err(|e| native_mysql_error("query", e))?;
         stream_mysql_query_result(query_result, chunk_tx).await
     } else {
         let mysql_params = mysql_async::Params::Positional(
@@ -281,7 +307,7 @@ async fn stream_on_conn(
         let query_result = conn
             .exec_iter(sql, mysql_params)
             .await
-            .map_err(|e| QueryFluxError::Engine(format!("mysql_native: exec failed: {e}")))?;
+            .map_err(|e| native_mysql_error("exec", e))?;
         stream_mysql_query_result(query_result, chunk_tx).await
     }
 }
@@ -307,7 +333,7 @@ async fn stream_mysql_query_result<P: mysql_async::prelude::Protocol>(
     while let Some(row) = query_result
         .next()
         .await
-        .map_err(|e| QueryFluxError::Engine(format!("mysql_native: read row failed: {e}")))?
+        .map_err(|e| native_mysql_error("read row", e))?
     {
         batch.push(row_to_native(row, num_cols));
         if batch.len() >= BATCH_SIZE {
@@ -341,7 +367,7 @@ async fn stream_mysql_query_result<P: mysql_async::prelude::Protocol>(
     query_result
         .drop_result()
         .await
-        .map_err(|e| QueryFluxError::Engine(format!("mysql_native: drop_result failed: {e}")))?;
+        .map_err(|e| native_mysql_error("drop_result", e))?;
     Ok(())
 }
 
@@ -460,6 +486,33 @@ mod tests {
     use mysql_async::consts::ColumnType;
     use queryflux_core::params::QueryParam;
     use std::collections::HashMap;
+
+    #[test]
+    fn mysql_wire_errors_keep_transport_distinct_from_sql_failures() {
+        let io_error = std::io::Error::new(std::io::ErrorKind::ConnectionReset, "connection reset");
+        let error = native_mysql_error("query", io_error.into());
+        assert!(
+            matches!(error, QueryFluxError::Engine(message) if message.starts_with("mysql_native: transport failed:"))
+        );
+
+        let closed = native_mysql_error(
+            "read row",
+            mysql_async::DriverError::ConnectionClosed.into(),
+        );
+        assert!(
+            matches!(closed, QueryFluxError::Engine(message) if message.starts_with("mysql_native: transport failed:"))
+        );
+
+        let server = mysql_async::ServerError {
+            code: 1064,
+            message: "syntax error near connection reset by peer".into(),
+            state: "42000".into(),
+        };
+        let error = native_mysql_error("query", server.into());
+        assert!(
+            matches!(error, QueryFluxError::Engine(message) if message.starts_with("mysql_native: query failed:"))
+        );
+    }
 
     // ── passthrough_credentials_from_session ──────────────────────────────────
 
