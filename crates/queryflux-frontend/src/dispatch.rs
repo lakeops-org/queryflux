@@ -102,6 +102,13 @@ pub(crate) fn backend_error_outcome(error: &QueryFluxError) -> BackendOutcome {
     if is_athena_max_wait_timeout(message) {
         return BackendOutcome::Timeout;
     }
+    // Scoped ADBC pool construction includes the cluster name before its
+    // adapter-owned timeout text, so it cannot use a fixed starts_with prefix.
+    if message.starts_with("cluster '")
+        && message.contains("': building a scoped ADBC connection timed out after ")
+    {
+        return BackendOutcome::Timeout;
+    }
     // Adapter-origin prefixes distinguish transport failures from SQL error
     // bodies. Do not use `is_transient` here: it matches keywords anywhere in
     // the rendered Engine message, including user-controlled query errors.
@@ -121,6 +128,7 @@ pub(crate) fn backend_error_outcome(error: &QueryFluxError) -> BackendOutcome {
         "StarRocks control pool get_conn failed:",
         "mysql_native: connection failed:",
         "ADBC: pool error:",
+        "ADBC: failed to get connection from pool:",
     ]
     .iter()
     .any(|prefix| message.starts_with(prefix));
@@ -145,9 +153,11 @@ pub(crate) fn backend_error_outcome(error: &QueryFluxError) -> BackendOutcome {
         "DuckDB HTTP server returned 502 ",
         "DuckDB HTTP server returned 503 ",
         "Trino submit returned 429 ",
+        "Trino submit returned 500 ",
         "Trino submit returned 502 ",
         "Trino submit returned 503 ",
         "Trino poll returned 429 ",
+        "Trino poll returned 500 ",
         "Trino poll returned 502 ",
         "Trino poll returned 503 ",
     ]
@@ -266,7 +276,9 @@ mod circuit_breaker_tests {
             "ClickHouse query failed (HTTP 502 Bad Gateway): upstream unavailable",
             "DuckDB HTTP server returned 502 Bad Gateway: upstream unavailable",
             "Trino submit returned 502 Bad Gateway: upstream unavailable",
+            "Trino submit returned 500 Internal Server Error: upstream unavailable",
             "Trino poll returned 502 Bad Gateway: upstream unavailable",
+            "Trino poll returned 500 Internal Server Error: upstream unavailable",
         ] {
             assert_eq!(
                 backend_error_outcome(&QueryFluxError::Engine(message.into())),
@@ -274,9 +286,40 @@ mod circuit_breaker_tests {
                 "{message}"
             );
         }
+        for message in [
+            "Trino poll returned 400 Bad Request: syntax error near 502",
+            "Trino poll returned 400 Bad Request: syntax error near 500 unavailable",
+        ] {
+            assert_eq!(
+                backend_error_outcome(&QueryFluxError::Engine(message.into())),
+                BackendOutcome::Success,
+                "{message}"
+            );
+        }
+    }
+
+    #[test]
+    fn adbc_connection_errors_count_without_matching_query_error_text() {
         assert_eq!(
             backend_error_outcome(&QueryFluxError::Engine(
-                "Trino poll returned 400 Bad Request: syntax error near 502".into()
+                "ADBC: failed to get connection from pool: connection refused".into()
+            )),
+            BackendOutcome::Failure
+        );
+        for message in [
+            "ADBC: failed to get connection from pool: timed out waiting for connection",
+            "cluster 'warehouse': building a scoped ADBC connection timed out after 30s (backend is unreachable)",
+        ] {
+            assert_eq!(
+                backend_error_outcome(&QueryFluxError::Engine(message.into())),
+                BackendOutcome::Timeout,
+                "{message}"
+            );
+        }
+        assert_eq!(
+            backend_error_outcome(&QueryFluxError::Engine(
+                "ADBC: query execution failed: syntax error near building a scoped ADBC connection timed out"
+                    .into()
             )),
             BackendOutcome::Success
         );
