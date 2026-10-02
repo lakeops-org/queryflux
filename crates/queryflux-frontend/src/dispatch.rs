@@ -30,7 +30,7 @@ use queryflux_metrics::MetricsStore;
 
 use tracing::{debug, info, warn};
 
-use crate::state::{AppState, QueryContext, QueryOutcome};
+use crate::state::{AppState, LiveConfig, QueryContext, QueryOutcome};
 
 /// Resolve the source dialect to record for this query.
 ///
@@ -161,9 +161,11 @@ pub fn rewrite_trino_uri(trino_uri: &str, external_address: &str) -> String {
 }
 
 /// Core dispatch logic shared across all frontend protocol implementations.
+/// `live` must be the snapshot used to route this dispatch attempt.
 #[allow(clippy::too_many_arguments)]
 pub async fn dispatch_query(
     state: &Arc<AppState>,
+    live: &LiveConfig,
     query_id: ProxyQueryId,
     sql: String,
     params: QueryParams,
@@ -177,8 +179,7 @@ pub async fn dispatch_query(
     sequence: u64,
     auth_ctx: &AuthContext,
 ) -> Result<DispatchOutcome> {
-    // Snapshot all live config fields in one lock acquisition. The guard is
-    // dropped before any await point so no lock is held during I/O.
+    // Use the same snapshot that selected the group, including after capacity waits.
     let (
         authorization,
         cluster_manager,
@@ -192,7 +193,6 @@ pub async fn dispatch_query(
         max_queued_queries,
         catalog,
     ) = {
-        let live = state.live.read().await;
         (
             live.authorization.clone(),
             live.cluster_manager.clone(),
@@ -207,16 +207,9 @@ pub async fn dispatch_query(
             live.guard_chain.clone(),
             live.group_guard_chains.get(&group.0).cloned(),
             live.access_control_guard.clone(),
-            // cluster_cfg resolved after cluster selection below; captured here
-            // so credential resolution uses the same config generation.
-            live.cluster_configs.clone(),
-            // adapters snapshotted from the same read guard as cluster_cfg — a config
-            // update landing between credential resolution and adapter selection could
-            // otherwise resolve credentials against one config generation and submit
-            // through an adapter built from a newer one (e.g. HTTP auth removed between
-            // the two reads would make credential resolution and the Trino adapter's own
-            // internal derivation disagree on whether to forward client Authorization).
-            live.adapters.clone(),
+            // Adapter and credentials must match the generation used for routing.
+            &live.cluster_configs,
+            &live.adapters,
             live.group_max_queued_queries
                 .get(&group.0)
                 .copied()
@@ -1437,8 +1430,10 @@ impl From<SyncOutcome> for QueryOutcome {
 /// `SyncQuerySetup.params` is left empty so the adapter receives no raw params.
 ///
 /// Failures before slot acquisition (no adapter) return Err without recording.
+#[allow(clippy::too_many_arguments)]
 async fn setup_sync_query(
     state: &Arc<AppState>,
+    live: &LiveConfig,
     sql: String,
     params: QueryParams,
     mut session: SessionContext,
@@ -1456,7 +1451,6 @@ async fn setup_sync_query(
         catalog,
         access_control_guard,
     ) = {
-        let live = state.live.read().await;
         let wait_timeout_secs = live
             .group_capacity_wait_timeout_secs
             .get(&group.0)
@@ -1513,12 +1507,8 @@ async fn setup_sync_query(
                     }
                     CapacityGrant::Granted => {}
                 }
-                // Read the adapter and its cluster config from the same lock acquisition —
-                // this loop can spin for a while waiting on capacity, so a config update
-                // landing mid-wait must not let a fresh adapter get paired with a stale
-                // (or vice versa) cluster config for credential resolution below.
+                // Keep adapter and credentials in the routing snapshot, even after a wait.
                 let (adapter_for_cluster, cluster_cfg_for_cluster) = {
-                    let live = state.live.read().await;
                     (
                         live.adapters.get(&name.0).cloned(),
                         live.cluster_configs.get(&name.0).cloned(),
@@ -2205,6 +2195,7 @@ async fn run_plan_guards(
 }
 
 /// Execute a query against any backend and stream RecordBatches to `sink`.
+/// `live` must be the snapshot used to route this dispatch attempt.
 ///
 /// Used by all non-Trino-HTTP frontends (MySQL wire, Postgres wire, Flight SQL).
 /// The Trino HTTP frontend keeps its raw-bytes passthrough path unchanged.
@@ -2215,6 +2206,7 @@ async fn run_plan_guards(
 #[allow(clippy::too_many_arguments)]
 pub async fn execute_to_sink(
     state: &Arc<AppState>,
+    live: &LiveConfig,
     sql: String,
     params: QueryParams,
     session: SessionContext,
@@ -2224,7 +2216,6 @@ pub async fn execute_to_sink(
     auth_ctx: &AuthContext,
 ) -> Result<()> {
     let (authorization, guard_chain, group_guard_chain, cache_cfg, access_control_guard, catalog) = {
-        let live = state.live.read().await;
         (
             live.authorization.clone(),
             live.guard_chain.clone(),
@@ -2265,7 +2256,6 @@ pub async fn execute_to_sink(
 
     if let Some(ref key) = cache_key {
         let effective_tags = {
-            let live = state.live.read().await;
             let group_defaults = live
                 .group_default_tags
                 .get(&group.0)
@@ -2443,6 +2433,7 @@ pub async fn execute_to_sink(
         let mut tee = crate::tee_sink::TeeResultSink::new(sink, writer, max_bytes);
         let result = execute_to_sink_inner(
             state,
+            live,
             sql,
             params,
             session,
@@ -2462,6 +2453,7 @@ pub async fn execute_to_sink(
     } else {
         execute_to_sink_inner(
             state,
+            live,
             sql,
             params,
             session,
@@ -2501,6 +2493,7 @@ impl<S: ResultSink + ?Sized> queryflux_cache::CacheSink for SinkCacheAdapter<'_,
 #[allow(clippy::too_many_arguments)]
 async fn execute_to_sink_inner(
     state: &Arc<AppState>,
+    live: &LiveConfig,
     sql: String,
     params: QueryParams,
     session: SessionContext,
@@ -2513,6 +2506,7 @@ async fn execute_to_sink_inner(
 ) -> Result<()> {
     let mut setup = match setup_sync_query(
         state,
+        live,
         sql,
         params,
         session,
@@ -2801,6 +2795,7 @@ mod queue_limit_tests {
 
         dispatch_query(
             &state,
+            &state.snapshot().await,
             ProxyQueryId::new(),
             "SELECT 1".into(),
             vec![],
@@ -2817,6 +2812,7 @@ mod queue_limit_tests {
 
         let err = match dispatch_query(
             &state,
+            &state.snapshot().await,
             ProxyQueryId::new(),
             "SELECT 2".into(),
             vec![],
@@ -2896,6 +2892,7 @@ mod capacity_wait_tests {
         let started = Instant::now();
         let result = setup_sync_query(
             &state,
+            &state.snapshot().await,
             "SELECT 1".into(),
             vec![],
             SessionContext::default(),
@@ -3029,3 +3026,7 @@ mod should_attempt_translation_tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "dispatch_snapshot_tests.rs"]
+mod snapshot_tests;

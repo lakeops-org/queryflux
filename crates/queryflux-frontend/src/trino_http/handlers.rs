@@ -77,13 +77,12 @@ impl Drop for QueueClaimHeartbeat {
 }
 
 async fn allow_query_action_or_forbid(
-    state: &AppState,
+    authz: &dyn queryflux_auth::AuthorizationChecker,
     auth_ctx: &queryflux_auth::AuthContext,
     action: QueryAction,
     submitted_by: &str,
     group: &str,
 ) -> Option<Response<Body>> {
-    let authz = state.live.read().await.authorization.clone();
     let query = QueryAuthz {
         submitted_by: submitted_by.to_string(),
         group: group.to_string(),
@@ -533,7 +532,8 @@ pub async fn post_statement(
 
     // 1. Authenticate — derive AuthContext from request credentials.
     let creds = extract_credentials(&headers);
-    let auth_provider = state.live.read().await.auth_provider.clone();
+    let live = state.snapshot().await;
+    let auth_provider = live.auth_provider.clone();
     let auth_ctx = match auth_provider.authenticate(&creds).await {
         Ok(ctx) => ctx,
         Err(e) => {
@@ -553,10 +553,7 @@ pub async fn post_statement(
     }
 
     // 2. Route — first matching router wins.
-    // `route_with_trace` is CPU-bound (regex match, header lookup); holding the read lock
-    // across this call is fine since it's brief and read-locks don't block each other.
     let routing_result = {
-        let live = state.live.read().await;
         live.router_chain
             .route_with_trace(&sql, &session, &protocol, Some(&auth_ctx))
             .await
@@ -585,7 +582,7 @@ pub async fn post_statement(
             return trino_error_response(&query_id.0, &message).into_response();
         }
     };
-    group = match state
+    group = match live
         .resolve_routed_group(group, &mut routing_trace, &auth_ctx)
         .await
     {
@@ -608,7 +605,6 @@ pub async fn post_statement(
     // When caching is enabled for this group and the query is cacheable,
     // force through the sync execute_to_sink path so the cache intercept works.
     let use_cache_path = {
-        let live = state.live.read().await;
         let caching_requested = live.group_cache_settings.contains_key(&group.0)
             || queryflux_cache::extract_cache_hint(&sql, &session).is_some();
         caching_requested
@@ -618,9 +614,10 @@ pub async fn post_statement(
             )
     };
 
-    if !use_cache_path && state.group_supports_async(&group.0).await {
+    if !use_cache_path && live.group_supports_async(&group.0) {
         match dispatch_query(
             &state,
+            &live,
             query_id.clone(),
             sql.clone(),
             vec![],
@@ -639,6 +636,7 @@ pub async fn post_statement(
                 let mut sink = TrinoHttpResultSink::new(&query_id.0);
                 if let Err(e) = execute_to_sink(
                     &state,
+                    &live,
                     sql,
                     vec![],
                     session,
@@ -672,6 +670,7 @@ pub async fn post_statement(
         let mut sink = TrinoHttpResultSink::new(&query_id.0);
         if let Err(e) = execute_to_sink(
             &state,
+            &live,
             sql,
             vec![],
             session,
@@ -785,8 +784,10 @@ pub async fn get_queued_statement(
     Path((id, seq)): Path<(String, u64)>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
+    // Each poll is a new dispatch attempt against one current generation.
+    let live = state.snapshot().await;
     let creds = extract_credentials(&headers);
-    let auth_provider = state.live.read().await.auth_provider.clone();
+    let auth_provider = live.auth_provider.clone();
     let auth_ctx = match auth_provider.authenticate(&creds).await {
         Ok(ctx) => ctx,
         Err(e) => {
@@ -814,7 +815,6 @@ pub async fn get_queued_statement(
     // Fail on wall-clock wait from enqueue (`creation_time`), not `last_accessed`
     // (polls refresh last_accessed and would otherwise wait forever).
     let wait_timeout_secs = {
-        let live = state.live.read().await;
         live.group_capacity_wait_timeout_secs
             .get(&queued.cluster_group.0)
             .copied()
@@ -836,7 +836,7 @@ pub async fn get_queued_statement(
     }
 
     if let Some(resp) = allow_query_action_or_forbid(
-        &state,
+        live.authorization.as_ref(),
         &auth_ctx,
         QueryAction::Dequeue,
         &queued.submitted_by,
@@ -973,7 +973,6 @@ pub async fn get_queued_statement(
     }
 
     let use_cache_path = {
-        let live = state.live.read().await;
         let caching_requested = live.group_cache_settings.contains_key(&group.0)
             || queryflux_cache::extract_cache_hint(&sql, &session).is_some();
         caching_requested
@@ -983,9 +982,10 @@ pub async fn get_queued_statement(
             )
     };
 
-    if !use_cache_path && state.group_supports_async(&group.0).await {
+    if !use_cache_path && live.group_supports_async(&group.0) {
         match dispatch_query(
             &state,
+            &live,
             query_id.clone(),
             sql.clone(),
             vec![],
@@ -1013,6 +1013,7 @@ pub async fn get_queued_statement(
                 let mut sink = TrinoHttpResultSink::new(&query_id.0);
                 if let Err(e) = execute_to_sink(
                     &state,
+                    &live,
                     sql,
                     vec![],
                     session,
@@ -1046,6 +1047,7 @@ pub async fn get_queued_statement(
         let mut sink = TrinoHttpResultSink::new(&query_id.0);
         if let Err(e) = execute_to_sink(
             &state,
+            &live,
             sql,
             vec![],
             session,
@@ -1113,8 +1115,9 @@ pub async fn get_executing_statement(
         }
     };
 
+    let authz = state.live.read().await.authorization.clone();
     if let Some(resp) = allow_query_action_or_forbid(
-        &state,
+        authz.as_ref(),
         &auth_ctx,
         QueryAction::Poll,
         &executing.submitted_by,
@@ -1431,8 +1434,9 @@ pub async fn delete_executing_statement(
         }
     };
 
+    let authz = state.live.read().await.authorization.clone();
     if let Some(resp) = allow_query_action_or_forbid(
-        &state,
+        authz.as_ref(),
         &auth_ctx,
         QueryAction::Cancel,
         &executing.submitted_by,

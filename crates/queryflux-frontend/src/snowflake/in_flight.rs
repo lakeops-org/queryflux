@@ -81,6 +81,7 @@ impl SnowflakeInFlightRegistry {
 
 /// Parameters shared by wire v1 and SQL API v2 synchronous execute paths.
 pub struct SnowflakeExecParams {
+    pub live: crate::state::LiveConfig,
     pub sql: String,
     pub params: queryflux_core::params::QueryParams,
     pub session_ctx: SessionContext,
@@ -111,6 +112,7 @@ where
         let mut sink = make_sink();
         let result = crate::dispatch::execute_to_sink(
             &app,
+            &exec.live,
             exec.sql,
             exec.params,
             exec.session_ctx,
