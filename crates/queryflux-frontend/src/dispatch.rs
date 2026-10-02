@@ -760,8 +760,8 @@ pub async fn dispatch_query(
                     ..
                 } => {
                     // Query finished on the initial submit — no poll handler will be called.
-                    // Disarm the RAII guard; finalize will call release_query_slot explicitly.
-                    slot.disarm();
+                    // Keep the acquiring generation's guard through terminal cleanup;
+                    // looking up the live manager here could release a different slot.
                     info!(id = %query_id, backend = %backend_query_id, cluster = %cluster_name, "Query completed on submit");
                     let src_dialect = resolve_src_dialect(&session, &protocol);
                     let (original_sql, pipeline) =
@@ -789,6 +789,7 @@ pub async fn dispatch_query(
                     crate::sql_pipeline::apply_pipeline(&mut ctx, &pipeline);
                     finalize_async_terminal_on_submit(
                         state,
+                        &mut slot,
                         &executing,
                         ctx,
                         status,
@@ -819,6 +820,7 @@ pub async fn dispatch_query(
 /// otherwise perform, since no poll request will ever arrive for this query.
 async fn finalize_async_terminal_on_submit(
     state: &Arc<AppState>,
+    slot: &mut ClusterSlotGuard,
     executing: &ExecutingQuery,
     ctx: QueryContext,
     status: QueryStatus,
@@ -858,13 +860,7 @@ async fn finalize_async_terminal_on_submit(
     }
 
     state.record_query(&ctx, outcome);
-    state
-        .release_query_slot(
-            &executing.cluster_group,
-            &executing.cluster_name,
-            &executing.id.0,
-        )
-        .await;
+    slot.release().await;
     if let Err(e) = state.persistence.delete(&executing.backend_query_id).await {
         warn!(id = %executing.id, "Failed to delete executing record on terminal submit: {e}");
     }

@@ -292,3 +292,102 @@ async fn sync_admission_keeps_adapter_and_tags_from_routing_generation() {
     .await
     .expect("sync admission must finish across reload");
 }
+
+#[tokio::test]
+async fn completed_submit_releases_the_acquiring_generation_after_reload() {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        // Both successful and failed terminal responses take the same release path.
+        for terminal_state in ["FINISHED", "FAILED"] {
+            let state = app_state(false);
+            let entered = Arc::new(Notify::new());
+            let resume = Arc::new(Notify::new());
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = format!("http://{}", listener.local_addr().unwrap());
+            let app = axum::Router::new().route("/v1/statement", axum::routing::post({
+                let entered = entered.clone();
+                let resume = resume.clone();
+                move || {
+                    let entered = entered.clone();
+                    let resume = resume.clone();
+                    async move {
+                        entered.notify_one();
+                        resume.notified().await;
+                        axum::Json(serde_json::json!({
+                            "id": "completed-on-submit",
+                            "infoUri": "http://unused.invalid/query",
+                            "stats": { "state": terminal_state, "queued": false, "scheduled": true }
+                        }))
+                    }
+                }
+            }));
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let _server_guard = crate::abort::AbortOnDrop::new(server);
+            let group = ClusterGroupName("old".into());
+            let cluster = ClusterName("old-cluster".into());
+            {
+                let mut live = state.live.write().await;
+                configure_generation(&mut live, "old", 2, 1);
+                live.adapters.insert(
+                    cluster.0.clone(),
+                    AdapterKind::Async(Arc::new(TrinoAdapter::new(
+                        cluster.clone(),
+                        group.clone(),
+                        TrinoConfig {
+                            endpoint,
+                            tls_skip_verify: false,
+                            auth: None,
+                        },
+                    ))),
+                );
+            }
+            let original_manager = state.snapshot().await.cluster_manager;
+            let request = tokio::spawn(submit(state.clone()));
+            entered.notified().await;
+            assert_eq!(
+                original_manager
+                    .cluster_state(&group, &cluster)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .running_queries,
+                1
+            );
+
+            // Publish a replacement with the same names and an independently occupied slot.
+            let mut replacement = state.snapshot().await;
+            configure_generation(&mut replacement, "old", 2, 1);
+            let replacement_manager = replacement.cluster_manager.clone();
+            assert_eq!(
+                replacement_manager.acquire_cluster(&group).await.unwrap(),
+                Some(cluster.clone())
+            );
+            *state.live.write().await = replacement;
+            resume.notify_one();
+
+            let response = request.await.unwrap();
+            assert_eq!(response["stats"]["state"], terminal_state);
+            assert_eq!(
+                original_manager
+                    .cluster_state(&group, &cluster)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .running_queries,
+                0,
+                "terminal submit must release the manager that granted the slot"
+            );
+            assert_eq!(
+                replacement_manager
+                    .cluster_state(&group, &cluster)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .running_queries,
+                1,
+                "terminal submit must not release another generation's slot"
+            );
+        }
+    })
+    .await
+    .expect("terminal dispatch should finish across reload");
+}
