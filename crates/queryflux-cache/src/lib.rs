@@ -1,5 +1,8 @@
+mod eligibility;
 pub mod noop;
 pub mod opendal_cache;
+
+pub use eligibility::is_cacheable;
 
 use std::fmt;
 
@@ -185,7 +188,8 @@ pub fn extract_cache_hint(sql: &str, session: &SessionContext) -> Option<CacheHi
 // Determinism check — AST-based via polyglot-sql with regex fallback
 // ---------------------------------------------------------------------------
 
-/// Returns `true` if the query is deterministic (safe to cache).
+/// Returns `true` if no known non-deterministic expressions are found.
+/// Use [`is_cacheable`] for result caching: determinism alone permits writes.
 /// Uses polyglot-sql AST walk for accuracy; falls back to regex if parse fails.
 pub fn is_deterministic(sql: &str, dialect: &str) -> bool {
     queryflux_fingerprint::is_deterministic(sql, dialect)
