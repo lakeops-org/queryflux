@@ -46,6 +46,8 @@ pub struct QueryRecord {
     /// Source-dialect SQL after access-control rewrite. Only set when `was_rewritten` is true.
     pub rewritten_sql: Option<String>,
     pub was_translated: bool,
+    /// Translation stage outcome. None when the stage was not reached.
+    pub translation: Option<queryflux_core::query::TranslationOutcome>,
     /// The SQL after dialect translation. Only set when `was_translated` is true.
     pub translated_sql: Option<String>,
     pub user: Option<String>,
@@ -111,6 +113,9 @@ pub struct ClusterSnapshot {
 /// Any persistence backend that wants to power the query history page must implement this.
 #[async_trait]
 pub trait MetricsStore: Send + Sync {
+    /// Called exactly once when a query passes through the translation stage, including rejection.
+    fn on_translation(&self, _outcome: queryflux_core::query::TranslationOutcome) {}
+
     async fn record_query(&self, record: QueryRecord) -> Result<()>;
     async fn record_cluster_snapshot(&self, snapshot: ClusterSnapshot) -> Result<()>;
 

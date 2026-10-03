@@ -25,6 +25,7 @@ enum MetricsEvent {
 /// automatically on the current tokio runtime.
 pub struct BufferedMetricsStore {
     tx: mpsc::Sender<MetricsEvent>,
+    inner: Arc<dyn MetricsStore>,
 }
 
 impl BufferedMetricsStore {
@@ -34,13 +35,17 @@ impl BufferedMetricsStore {
     /// - `flush_interval`: flush at least this often regardless of batch size.
     pub fn new(inner: Arc<dyn MetricsStore>, batch_size: usize, flush_interval: Duration) -> Self {
         let (tx, rx) = mpsc::channel(10_000);
-        tokio::spawn(flush_loop(rx, inner, batch_size, flush_interval));
-        Self { tx }
+        tokio::spawn(flush_loop(rx, inner.clone(), batch_size, flush_interval));
+        Self { tx, inner }
     }
 }
 
 #[async_trait]
 impl MetricsStore for BufferedMetricsStore {
+    fn on_translation(&self, outcome: queryflux_core::query::TranslationOutcome) {
+        self.inner.on_translation(outcome);
+    }
+
     async fn record_query(&self, record: QueryRecord) -> Result<()> {
         let _ = self.tx.try_send(MetricsEvent::Query(record));
         Ok(())

@@ -301,16 +301,16 @@ Persistence is pluggable behind traits in `queryflux-persistence` (`Persistence`
 
 Translation is handled by [sqlglot](https://github.com/tobymao/sqlglot) (Python, 31+ dialects) called via PyO3.
 
-**When translation runs:** only when the incoming client dialect differs from the target engine's dialect. Trino client → Trino cluster = zero overhead passthrough.
+**When translation runs:** when the incoming client dialect differs from the target engine's dialect or fixup scripts are configured. Compatible dialects without fixups pass through unchanged. MCP queries without a declared source dialect also bypass translation.
 
 **Two translation modes** (both implemented in `queryflux-translation`; see [query-translation.md](query-translation.md)):
 
-1. **Dialect-only** (empty `SchemaContext`): `sqlglot.transpile(sql, read=src, write=tgt)` — this is what the main dispatch path uses today (`SchemaContext::default()`).
+1. **Dialect-only** (empty `SchemaContext`): parse one executable statement in the source dialect and emit it in the target dialect. Dispatch resolves schema through the catalog provider first; unavailable schema selects this fallback.
 2. **Schema-aware** (non-empty `SchemaContext`): parse → `sqlglot.optimizer.optimize` with `MappingSchema` → emit in target dialect, with fallback to dialect-only if optimization fails.
 
 Source dialect is inferred from the frontend protocol (`TrinoHttp` → Trino, `PostgresWire` → Postgres, etc.). Target dialect comes from the selected cluster’s **engine type** (via the adapter).
 
-Translation gracefully degrades: if sqlglot is unavailable at startup, the service disables itself and SQL passes through untranslated.
+Translation follows `translation.mode`: `bestEffort` forwards the original SQL when required translation is unavailable or fails; `strict` rejects the query before backend submission. Skip and fallback counters, fingerprinted warnings, and history outcomes expose degradation. See [Query translation](./query-translation).
 
 ---
 
