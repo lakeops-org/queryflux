@@ -270,6 +270,7 @@ pub async fn query_request(
     let query_id = Uuid::new_v4().to_string();
 
     let exec = SnowflakeExecParams {
+        live: state.app.snapshot().await,
         sql,
         params,
         session_ctx,
