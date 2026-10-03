@@ -1,8 +1,11 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
+use queryflux_core::config::CircuitBreakerConfig;
 use queryflux_core::query::{ClusterGroupName, ClusterName, EngineType};
 use serde::{Deserialize, Serialize};
+
+use crate::circuit_breaker::{BackendOutcome, CircuitBreaker, CircuitState};
 
 /// Live mutable state for a single cluster instance.
 /// Shared across threads via `Arc`; counters are atomic.
@@ -25,6 +28,7 @@ pub struct ClusterState {
     /// Set to `false` by the background health-check loop when the cluster
     /// fails its health check. Starts as `true` (optimistic).
     is_healthy: Arc<AtomicBool>,
+    breaker: Option<Arc<CircuitBreaker>>,
 }
 
 impl ClusterState {
@@ -52,7 +56,57 @@ impl ClusterState {
             running_queries: Arc::new(AtomicU64::new(0)),
             queued_queries: Arc::new(AtomicU64::new(0)),
             is_healthy: Arc::new(AtomicBool::new(true)),
+            breaker: None,
         }
+    }
+
+    /// Preserve the breaker through a config reload only while its policy is unchanged.
+    pub fn with_circuit_breaker(
+        mut self,
+        config: Option<CircuitBreakerConfig>,
+        previous: Option<&ClusterState>,
+    ) -> Self {
+        self.breaker = config.map(|config| {
+            previous
+                .filter(|state| state.group_name == self.group_name)
+                .and_then(|state| state.breaker.as_ref())
+                .filter(|breaker| breaker.config() == &config)
+                .cloned()
+                .unwrap_or_else(|| Arc::new(CircuitBreaker::new(config)))
+        });
+        self
+    }
+
+    pub fn breaker_state(&self) -> Option<CircuitState> {
+        self.breaker.as_ref().map(|breaker| breaker.state())
+    }
+
+    /// True only when both the periodic health check and query breaker allow admission.
+    pub fn can_accept_query(&self) -> bool {
+        self.is_enabled()
+            && self.is_healthy()
+            && self
+                .breaker
+                .as_ref()
+                .is_none_or(|breaker| breaker.allows_queries())
+    }
+
+    pub fn record_backend_outcome(&self, outcome: BackendOutcome) -> Option<CircuitState> {
+        self.breaker
+            .as_ref()
+            .and_then(|breaker| breaker.record(outcome))
+    }
+
+    pub fn begin_breaker_probe(&self) -> bool {
+        self.breaker
+            .as_ref()
+            .is_some_and(|breaker| breaker.begin_probe())
+    }
+
+    pub fn finish_breaker_probe(&self, healthy: bool) -> Option<CircuitState> {
+        self.breaker
+            .as_ref()
+            .map(|breaker| breaker.finish_probe(healthy))
     }
 
     pub fn max_running_queries(&self) -> u64 {
@@ -180,6 +234,8 @@ impl ClusterState {
             max_running_queries: self.max_running_queries(),
             is_healthy: self.is_healthy(),
             enabled: self.is_enabled(),
+            breaker_state: self.breaker_state(),
+            can_accept_query: self.can_accept_query(),
         }
     }
 }
@@ -201,6 +257,11 @@ pub struct ClusterStateSnapshot {
     pub is_healthy: bool,
     /// Whether this cluster is administratively enabled.
     pub enabled: bool,
+    /// `None` when this group's breaker is disabled.
+    #[serde(default)]
+    pub breaker_state: Option<CircuitState>,
+    /// Whether selection can admit a query before checking capacity.
+    pub can_accept_query: bool,
 }
 
 #[cfg(test)]
@@ -244,5 +305,45 @@ mod capacity_race_probe {
 
         assert_eq!(successful, 1);
         assert_eq!(state.running_queries(), 1);
+    }
+}
+
+#[cfg(test)]
+mod circuit_breaker_tests {
+    use super::*;
+
+    #[test]
+    fn reload_preserves_state_only_within_the_same_group_and_policy() {
+        fn state(group: &str) -> ClusterState {
+            ClusterState::new(
+                ClusterName("shared".into()),
+                ClusterGroupName(group.into()),
+                None,
+                None,
+                EngineType::Trino,
+                None,
+                1,
+                true,
+            )
+        }
+        let config = CircuitBreakerConfig {
+            min_requests: 1,
+            ..CircuitBreakerConfig::default()
+        };
+        let previous = state("first").with_circuit_breaker(Some(config.clone()), None);
+        previous.record_backend_outcome(BackendOutcome::Failure);
+        assert_eq!(previous.breaker_state(), Some(CircuitState::Open));
+        assert_eq!(
+            state("first")
+                .with_circuit_breaker(Some(config.clone()), Some(&previous))
+                .breaker_state(),
+            Some(CircuitState::Open)
+        );
+        assert_eq!(
+            state("second")
+                .with_circuit_breaker(Some(config), Some(&previous))
+                .breaker_state(),
+            Some(CircuitState::Closed)
+        );
     }
 }

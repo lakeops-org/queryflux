@@ -8,7 +8,7 @@ use bytes::Bytes;
 use chrono::Utc;
 use futures::StreamExt;
 use queryflux_auth::{AuthContext, QueryCredentials};
-use queryflux_cluster_manager::ClusterGroupManager;
+use queryflux_cluster_manager::{circuit_breaker::BackendOutcome, ClusterGroupManager};
 use queryflux_core::native_result::NativeResultChunk;
 use queryflux_core::params::{interpolate_params, QueryParams};
 use queryflux_core::tags::{merge_tags, QueryTags};
@@ -73,6 +73,334 @@ fn should_resolve_schema(attempt_translation: bool, access_control_enabled: bool
 
 fn should_attempt_translation(session: &SessionContext, protocol: &FrontendProtocol) -> bool {
     !matches!(protocol, FrontendProtocol::Mcp) || session.extra.contains_key("dialect")
+}
+
+/// Athena's proxy-side completion deadline has a distinct adapter error shape.
+/// Match the whole shape so SQL error text mentioning "max wait" stays excluded.
+fn is_athena_max_wait_timeout(message: &str) -> bool {
+    let Some((execution_id, seconds)) = message
+        .strip_prefix("Athena query ")
+        .and_then(|rest| rest.split_once(" exceeded max wait of "))
+    else {
+        return false;
+    };
+    !execution_id.is_empty()
+        && execution_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        && seconds
+            .strip_suffix('s')
+            .is_some_and(|value| value.parse::<u64>().is_ok())
+}
+
+/// Only connection/availability failures and execution deadlines count against
+/// a cluster. A SQL error means the backend answered and must not open its circuit.
+pub(crate) fn backend_error_outcome(error: &QueryFluxError) -> BackendOutcome {
+    let QueryFluxError::Engine(message) = error else {
+        return BackendOutcome::Success;
+    };
+    if is_athena_max_wait_timeout(message) {
+        return BackendOutcome::Timeout;
+    }
+    // Scoped ADBC pool construction includes the cluster name before its
+    // adapter-owned timeout text, so it cannot use a fixed starts_with prefix.
+    if message.starts_with("cluster '")
+        && message.contains("': building a scoped ADBC connection timed out after ")
+    {
+        return BackendOutcome::Timeout;
+    }
+    // Adapter-origin prefixes distinguish transport failures from SQL error
+    // bodies. Do not use `is_transient` here: it matches keywords anywhere in
+    // the rendered Engine message, including user-controlled query errors.
+    let transport_error = [
+        "Athena StartQueryExecution:",
+        "Athena GetQueryExecution:",
+        "Athena GetQueryResults:",
+        "ClickHouse request failed:",
+        "ClickHouse response aborted mid-stream:",
+        "ClickHouse Arrow stream ended unexpectedly:",
+        "DuckDB HTTP request failed:",
+        "DuckDB HTTP read failed:",
+        "Trino submit failed:",
+        "Trino poll GET failed:",
+        "Failed to read Trino response body:",
+        "Failed to read Trino poll body:",
+        "StarRocks pool checkout timed out",
+        "StarRocks pool get_conn failed:",
+        "StarRocks control pool checkout timed out",
+        "StarRocks control pool get_conn failed:",
+        "StarRocks transport failed:",
+        "mysql_native: connection failed:",
+        "mysql_native: transport failed:",
+        "ADBC: pool error:",
+        "ADBC: failed to get connection from pool:",
+    ]
+    .iter()
+    .any(|prefix| message.starts_with(prefix));
+    // HTTP status is part of the adapter's own prefix, not the response body.
+    let status_timeout = [
+        "ClickHouse query failed (HTTP 408 ",
+        "ClickHouse query failed (HTTP 504 ",
+        "DuckDB HTTP server returned 408 ",
+        "DuckDB HTTP server returned 504 ",
+        "Trino submit returned 408 ",
+        "Trino submit returned 504 ",
+        "Trino poll returned 408 ",
+        "Trino poll returned 504 ",
+    ]
+    .iter()
+    .any(|prefix| message.starts_with(prefix));
+    let status_failure = [
+        "ClickHouse query failed (HTTP 429 ",
+        "ClickHouse query failed (HTTP 502 ",
+        "ClickHouse query failed (HTTP 503 ",
+        "DuckDB HTTP server returned 429 ",
+        "DuckDB HTTP server returned 502 ",
+        "DuckDB HTTP server returned 503 ",
+        "Trino submit returned 429 ",
+        "Trino submit returned 500 ",
+        "Trino submit returned 502 ",
+        "Trino submit returned 503 ",
+        "Trino poll returned 429 ",
+        "Trino poll returned 500 ",
+        "Trino poll returned 502 ",
+        "Trino poll returned 503 ",
+    ]
+    .iter()
+    .any(|prefix| message.starts_with(prefix));
+    if status_timeout {
+        return BackendOutcome::Timeout;
+    }
+    if status_failure {
+        return BackendOutcome::Failure;
+    }
+    if !transport_error {
+        return BackendOutcome::Success;
+    }
+    let text = message.to_ascii_lowercase();
+    if text.contains("timed out") || text.contains("timeout") || text.contains("deadline exceeded")
+    {
+        BackendOutcome::Timeout
+    } else {
+        BackendOutcome::Failure
+    }
+}
+
+#[cfg(test)]
+mod circuit_breaker_tests {
+    use super::*;
+
+    #[test]
+    fn only_backend_availability_errors_count_as_failures() {
+        assert_eq!(
+            backend_error_outcome(&QueryFluxError::Engine(
+                "ClickHouse request failed: connection refused".into()
+            )),
+            BackendOutcome::Failure
+        );
+        assert_eq!(
+            backend_error_outcome(&QueryFluxError::Engine(
+                "ClickHouse request failed: request timed out".into()
+            )),
+            BackendOutcome::Timeout
+        );
+        assert_eq!(
+            backend_error_outcome(&QueryFluxError::Engine("syntax error".into())),
+            BackendOutcome::Success
+        );
+        assert_eq!(
+            backend_error_outcome(&QueryFluxError::Unauthorized("denied".into())),
+            BackendOutcome::Success
+        );
+        assert_eq!(
+            backend_error_outcome(&QueryFluxError::Engine(
+                "ClickHouse request failed: connect error".into()
+            )),
+            BackendOutcome::Failure
+        );
+        assert_eq!(
+            backend_error_outcome(&QueryFluxError::Engine(
+                "ClickHouse request failed: connection reset by peer".into()
+            )),
+            BackendOutcome::Failure
+        );
+        assert_eq!(
+            backend_error_outcome(&QueryFluxError::Engine(
+                "ClickHouse request failed: dns error".into()
+            )),
+            BackendOutcome::Failure
+        );
+        assert_eq!(
+            backend_error_outcome(&QueryFluxError::Engine(
+                "syntax error near timeout keyword".into()
+            )),
+            BackendOutcome::Success
+        );
+        assert_eq!(
+            backend_error_outcome(&QueryFluxError::Engine(
+                "ClickHouse query failed mid-stream: syntax error near timed out".into()
+            )),
+            BackendOutcome::Success
+        );
+        assert_eq!(
+            backend_error_outcome(&QueryFluxError::Engine(
+                "ClickHouse response aborted mid-stream: connection reset by peer".into()
+            )),
+            BackendOutcome::Failure
+        );
+        assert_eq!(
+            backend_error_outcome(&QueryFluxError::Engine(
+                "ClickHouse query failed (HTTP 503 Service Unavailable): syntax error".into()
+            )),
+            BackendOutcome::Failure
+        );
+        assert_eq!(
+            backend_error_outcome(&QueryFluxError::Engine(
+                "ClickHouse query failed (HTTP 400 Bad Request): syntax error near 503 timed out"
+                    .into()
+            )),
+            BackendOutcome::Success
+        );
+        assert_eq!(
+            backend_error_outcome(&QueryFluxError::Engine(
+                "StarRocks pool checkout timed out (10s)".into()
+            )),
+            BackendOutcome::Timeout
+        );
+        assert_eq!(
+            backend_error_outcome(&QueryFluxError::Engine(
+                "mysql_native: connection failed: connection refused".into()
+            )),
+            BackendOutcome::Failure
+        );
+    }
+
+    #[test]
+    fn gateway_errors_count_as_failures_but_sql_text_does_not() {
+        for message in [
+            "ClickHouse query failed (HTTP 502 Bad Gateway): upstream unavailable",
+            "DuckDB HTTP server returned 502 Bad Gateway: upstream unavailable",
+            "Trino submit returned 502 Bad Gateway: upstream unavailable",
+            "Trino submit returned 500 Internal Server Error: upstream unavailable",
+            "Trino poll returned 502 Bad Gateway: upstream unavailable",
+            "Trino poll returned 500 Internal Server Error: upstream unavailable",
+        ] {
+            assert_eq!(
+                backend_error_outcome(&QueryFluxError::Engine(message.into())),
+                BackendOutcome::Failure,
+                "{message}"
+            );
+        }
+        for message in [
+            "Trino poll returned 400 Bad Request: syntax error near 502",
+            "Trino poll returned 400 Bad Request: syntax error near 500 unavailable",
+        ] {
+            assert_eq!(
+                backend_error_outcome(&QueryFluxError::Engine(message.into())),
+                BackendOutcome::Success,
+                "{message}"
+            );
+        }
+    }
+
+    #[test]
+    fn adbc_connection_errors_count_without_matching_query_error_text() {
+        assert_eq!(
+            backend_error_outcome(&QueryFluxError::Engine(
+                "ADBC: failed to get connection from pool: connection refused".into()
+            )),
+            BackendOutcome::Failure
+        );
+        for message in [
+            "ADBC: failed to get connection from pool: timed out waiting for connection",
+            "cluster 'warehouse': building a scoped ADBC connection timed out after 30s (backend is unreachable)",
+        ] {
+            assert_eq!(
+                backend_error_outcome(&QueryFluxError::Engine(message.into())),
+                BackendOutcome::Timeout,
+                "{message}"
+            );
+        }
+        assert_eq!(
+            backend_error_outcome(&QueryFluxError::Engine(
+                "ADBC: query execution failed: syntax error near building a scoped ADBC connection timed out"
+                    .into()
+            )),
+            BackendOutcome::Success
+        );
+    }
+
+    #[test]
+    fn athena_api_errors_count_without_matching_query_failures() {
+        for message in [
+            "Athena StartQueryExecution: service unavailable",
+            "Athena GetQueryExecution: connection reset by peer",
+            "Athena GetQueryResults: request timed out",
+        ] {
+            let expected = if message.contains("timed out") {
+                BackendOutcome::Timeout
+            } else {
+                BackendOutcome::Failure
+            };
+            assert_eq!(
+                backend_error_outcome(&QueryFluxError::Engine(message.into())),
+                expected,
+                "{message}"
+            );
+        }
+        assert_eq!(
+            backend_error_outcome(&QueryFluxError::Engine(
+                "Athena query failed: syntax error near GetQueryResults timed out".into()
+            )),
+            BackendOutcome::Success
+        );
+    }
+
+    #[test]
+    fn mysql_wire_transport_errors_count_without_matching_sql_error_text() {
+        for message in [
+            "StarRocks transport failed: Input/output error: connection refused",
+            "mysql_native: transport failed: Input/output error: connection reset by peer",
+        ] {
+            assert_eq!(
+                backend_error_outcome(&QueryFluxError::Engine(message.into())),
+                BackendOutcome::Failure,
+                "{message}"
+            );
+        }
+        for message in [
+            "StarRocks query failed: Server error: syntax error near connection refused",
+            "mysql_native: query failed: Server error: syntax error near connection reset by peer",
+        ] {
+            assert_eq!(
+                backend_error_outcome(&QueryFluxError::Engine(message.into())),
+                BackendOutcome::Success,
+                "{message}"
+            );
+        }
+    }
+
+    #[test]
+    fn athena_max_wait_counts_as_timeout_without_matching_query_errors() {
+        assert_eq!(
+            backend_error_outcome(&QueryFluxError::Engine(
+                "Athena query 123e4567-e89b-12d3-a456-426614174000 exceeded max wait of 600s"
+                    .into()
+            )),
+            BackendOutcome::Timeout
+        );
+        for message in [
+            "Athena query failed: exceeded max wait of 600s",
+            "Athena query 123e4567-e89b-12d3-a456-426614174000 exceeded max wait of many seconds",
+            "Athena query 123e4567-e89b-12d3-a456-426614174000 exceeded max wait of 600s extra",
+        ] {
+            assert_eq!(
+                backend_error_outcome(&QueryFluxError::Engine(message.into())),
+                BackendOutcome::Success,
+                "{message}"
+            );
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -671,8 +999,12 @@ pub async fn dispatch_query(
                 )
                 .await
             {
-                Ok(e) => e,
+                Ok(e) => {
+                    slot.record_backend_outcome(BackendOutcome::Success);
+                    e
+                }
                 Err(e) => {
+                    slot.record_backend_outcome(backend_error_outcome(&e));
                     slot.release().await;
                     warn!(id = %query_id, "Submit error: {e}");
                     return Err(e);
@@ -930,7 +1262,7 @@ async fn should_yield_to_older_queued(
     let free = match cluster_manager.all_cluster_states().await {
         Ok(snaps) => snaps
             .iter()
-            .filter(|s| s.group_name.0 == group.0 && s.enabled && s.is_healthy)
+            .filter(|s| s.group_name.0 == group.0 && s.can_accept_query)
             .map(|s| s.max_running_queries.saturating_sub(s.running_queries))
             .sum::<u64>(),
         // Can't tell — don't block admission on a read failure.
@@ -1106,6 +1438,11 @@ impl ClusterSlotGuard {
     /// paths (poll, cancel, zombie eviction) become responsible for the release.
     fn disarm(&mut self) {
         self.released = true;
+    }
+
+    fn record_backend_outcome(&self, outcome: BackendOutcome) {
+        self.cluster_manager
+            .record_backend_outcome(&self.group, &self.cluster, outcome);
     }
 
     /// Release the slot on the normal path. Idempotent — safe to call twice.
@@ -1904,6 +2241,7 @@ async fn execute_stream(
     {
         Ok(e) => e,
         Err(e) => {
+            setup.slot.record_backend_outcome(backend_error_outcome(&e));
             let msg = e.to_string();
             warn!(
                 id = %setup.ctx.query_id,
@@ -1936,6 +2274,7 @@ async fn execute_stream(
     while let Some(result) = stream.next().await {
         match result {
             Err(e) => {
+                setup.slot.record_backend_outcome(backend_error_outcome(&e));
                 let msg = e.to_string();
                 let outcome = SyncOutcome {
                     status: QueryStatus::Failed,
@@ -2002,6 +2341,8 @@ async fn execute_stream(
         engine_stats,
     };
 
+    setup.slot.record_backend_outcome(BackendOutcome::Success);
+
     (outcome, sink.on_complete(&stats).await)
 }
 
@@ -2051,6 +2392,7 @@ async fn execute_native_to_sink(
     {
         Ok(e) => e,
         Err(e) => {
+            setup.slot.record_backend_outcome(backend_error_outcome(&e));
             let msg = e.to_string();
             warn!(
                 id = %setup.ctx.query_id,
@@ -2075,6 +2417,7 @@ async fn execute_native_to_sink(
     while let Some(result) = stream.next().await {
         match result {
             Err(e) => {
+                setup.slot.record_backend_outcome(backend_error_outcome(&e));
                 let msg = e.to_string();
                 let outcome = SyncOutcome {
                     status: QueryStatus::Failed,
@@ -2118,6 +2461,8 @@ async fn execute_native_to_sink(
         elapsed_ms,
         engine_stats,
     };
+
+    setup.slot.record_backend_outcome(BackendOutcome::Success);
 
     (outcome, sink.on_complete(&stats).await)
 }

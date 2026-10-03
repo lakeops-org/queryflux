@@ -8,6 +8,7 @@ use queryflux_core::{
 };
 
 use crate::{
+    circuit_breaker::{BackendOutcome, CircuitState},
     cluster_state::{ClusterState, ClusterStateSnapshot},
     strategy::{ClusterCandidate, ClusterSelectionStrategy},
     ClusterGroupManager,
@@ -38,7 +39,7 @@ impl ClusterGroupManager for SimpleClusterGroupManager {
         let eligible: Vec<(usize, &Arc<ClusterState>)> = clusters
             .iter()
             .enumerate()
-            .filter(|(_, c)| c.is_enabled() && c.is_healthy() && !c.is_at_capacity())
+            .filter(|(_, c)| c.can_accept_query() && !c.is_at_capacity())
             .collect();
 
         if eligible.is_empty() {
@@ -93,14 +94,20 @@ impl ClusterGroupManager for SimpleClusterGroupManager {
         // fill `chosen` to capacity or a health check can mark it unhealthy in that
         // window. Re-validate before admitting the query, falling back to any other
         // still-eligible member rather than trusting a snapshot that may be stale.
-        if chosen.is_enabled() && chosen.is_healthy() && chosen.try_increment_running() {
-            return Ok(Some(chosen.cluster_name.clone()));
+        if chosen.can_accept_query() && chosen.try_increment_running() {
+            if !chosen.can_accept_query() {
+                chosen.decrement_running();
+            } else {
+                return Ok(Some(chosen.cluster_name.clone()));
+            }
         }
 
         for (_, candidate) in &eligible {
-            if candidate.is_enabled() && candidate.is_healthy() && candidate.try_increment_running()
-            {
-                return Ok(Some(candidate.cluster_name.clone()));
+            if candidate.can_accept_query() && candidate.try_increment_running() {
+                if candidate.can_accept_query() {
+                    return Ok(Some(candidate.cluster_name.clone()));
+                }
+                candidate.decrement_running();
             }
         }
 
@@ -114,6 +121,21 @@ impl ClusterGroupManager for SimpleClusterGroupManager {
             }
         }
         Ok(())
+    }
+
+    fn record_backend_outcome(
+        &self,
+        group: &ClusterGroupName,
+        cluster: &ClusterName,
+        outcome: BackendOutcome,
+    ) {
+        if let Some((clusters, _)) = self.groups.get(group) {
+            if let Some(state) = clusters.iter().find(|c| &c.cluster_name == cluster) {
+                if state.record_backend_outcome(outcome) == Some(CircuitState::Open) {
+                    tracing::warn!(group = %group, cluster = %cluster, "Cluster circuit breaker opened");
+                }
+            }
+        }
     }
 
     async fn cluster_state(
@@ -156,5 +178,78 @@ impl ClusterGroupManager for SimpleClusterGroupManager {
             state.set_max_running_queries(v);
         }
         Ok(true)
+    }
+}
+
+#[cfg(test)]
+mod circuit_breaker_tests {
+    use super::*;
+    use crate::strategy::FailoverStrategy;
+    use queryflux_core::{config::CircuitBreakerConfig, query::EngineType};
+
+    #[tokio::test]
+    async fn open_member_is_skipped_by_failover_selection() {
+        let group = ClusterGroupName("analytics".into());
+        let broken = Arc::new(
+            ClusterState::new(
+                ClusterName("primary".into()),
+                group.clone(),
+                None,
+                None,
+                EngineType::Trino,
+                None,
+                2,
+                true,
+            )
+            .with_circuit_breaker(
+                Some(CircuitBreakerConfig {
+                    min_requests: 1,
+                    initial_backoff_secs: 1,
+                    ..CircuitBreakerConfig::default()
+                }),
+                None,
+            ),
+        );
+        let fallback = Arc::new(ClusterState::new(
+            ClusterName("secondary".into()),
+            group.clone(),
+            None,
+            None,
+            EngineType::Trino,
+            None,
+            2,
+            true,
+        ));
+        let manager = SimpleClusterGroupManager::new(HashMap::from([(
+            group.clone(),
+            (
+                vec![broken.clone(), fallback],
+                Arc::new(FailoverStrategy) as Arc<dyn ClusterSelectionStrategy>,
+            ),
+        )]));
+
+        assert_eq!(
+            manager.acquire_cluster(&group).await.unwrap(),
+            Some(ClusterName("primary".into()))
+        );
+        manager
+            .release_cluster(&group, &ClusterName("primary".into()))
+            .await
+            .unwrap();
+        manager.record_backend_outcome(
+            &group,
+            &ClusterName("primary".into()),
+            BackendOutcome::Failure,
+        );
+        assert_eq!(broken.breaker_state(), Some(CircuitState::Open));
+        assert_eq!(
+            manager.acquire_cluster(&group).await.unwrap(),
+            Some(ClusterName("secondary".into()))
+        );
+        manager
+            .release_cluster(&group, &ClusterName("secondary".into()))
+            .await
+            .unwrap();
+        assert!(!broken.can_accept_query());
     }
 }

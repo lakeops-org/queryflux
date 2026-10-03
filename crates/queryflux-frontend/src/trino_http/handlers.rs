@@ -10,6 +10,7 @@ use axum::{
 use bytes::Bytes;
 use chrono::Utc;
 use queryflux_auth::{Credentials, QueryAction, QueryAuthz};
+use queryflux_cluster_manager::circuit_breaker::BackendOutcome;
 use queryflux_core::{
     error::QueryFluxError,
     query::{BackendQueryId, FrontendProtocol, ProxyQueryId, QueryPollResult, QueryStatus},
@@ -23,7 +24,9 @@ use serde_json::{json, Value};
 use tracing::{error, info, warn};
 
 use super::result_sink::TrinoHttpResultSink;
-use crate::dispatch::{dispatch_query, execute_to_sink, rewrite_trino_uri, DispatchOutcome};
+use crate::dispatch::{
+    backend_error_outcome, dispatch_query, execute_to_sink, rewrite_trino_uri, DispatchOutcome,
+};
 use crate::state::{AppState, QueryContext, QueryOutcome};
 use queryflux_persistence::QueueCoordinator;
 use queryflux_routing::ChainRouteResult;
@@ -1234,13 +1237,27 @@ pub async fn get_executing_statement(
     };
     let submit_was_guard_blocked = executing.was_guard_blocked;
 
+    let cluster_manager = state.live.read().await.cluster_manager.clone();
     let poll_result = match adapter
         .poll_query(&backend_id, Some(&trino_url), executing.wire_auth.as_ref())
         .await
     {
-        Ok(r) => r,
+        Ok(r) => {
+            cluster_manager.record_backend_outcome(
+                &executing.cluster_group,
+                &executing.cluster_name,
+                BackendOutcome::Success,
+            );
+            r
+        }
         Err(e) => {
-            if e.is_transient() {
+            let outcome = backend_error_outcome(&e);
+            cluster_manager.record_backend_outcome(
+                &executing.cluster_group,
+                &executing.cluster_name,
+                outcome,
+            );
+            if outcome != BackendOutcome::Success {
                 warn!(id = %executing.id, "Transient poll error (will retry): {e}");
                 let next_uri = format!("{}/v1/statement/{}", state.external_address, trino_path);
                 let resp = queued_response(&executing.id.0, 0, next_uri);
