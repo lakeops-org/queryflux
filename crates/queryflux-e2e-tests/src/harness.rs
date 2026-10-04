@@ -55,7 +55,7 @@ use queryflux_routing::{
     RouterTrait,
 };
 use queryflux_translation::TranslationService;
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream};
 
 struct CapturingMetrics {
     records: Arc<Mutex<Vec<QueryRecord>>>,
@@ -1020,28 +1020,32 @@ impl ProtocolWireHarness {
             result_cache: Arc::new(queryflux_cache::noop::NoopResultCache),
         });
 
-        let mysql_port = bind_ephemeral_port().await?;
-        let postgres_port = bind_ephemeral_port().await?;
-        let flight_port = bind_ephemeral_port().await?;
-        let mcp_port = bind_ephemeral_port().await?;
-
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
-        spawn_wire_frontend(
-            MysqlWireFrontend::new(state.clone(), mysql_port, None),
+        let mysql_port = start_wire_frontend(
+            "MySQL",
+            |port| MysqlWireFrontend::new(state.clone(), port, None),
             shutdown_rx.clone(),
-        );
-        spawn_wire_frontend(
-            PostgresWireFrontend::new(state.clone(), postgres_port, None),
+        )
+        .await?;
+        let postgres_port = start_wire_frontend(
+            "Postgres",
+            |port| PostgresWireFrontend::new(state.clone(), port, None),
             shutdown_rx.clone(),
-        );
-        spawn_wire_frontend(
-            FlightSqlFrontend::new(state.clone(), flight_port, None),
+        )
+        .await?;
+        let flight_port = start_wire_frontend(
+            "Flight SQL",
+            |port| FlightSqlFrontend::new(state.clone(), port, None),
             shutdown_rx.clone(),
-        );
-        spawn_wire_frontend(McpFrontend::new(state, mcp_port, None), shutdown_rx);
-
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        )
+        .await?;
+        let mcp_port = start_wire_frontend(
+            "MCP",
+            |port| McpFrontend::new(state.clone(), port, None),
+            shutdown_rx,
+        )
+        .await?;
 
         Ok(Self {
             mysql_port,
@@ -1082,16 +1086,119 @@ impl ProtocolWireHarness {
 
 async fn bind_ephemeral_port() -> Result<u16> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
-    let port = listener.local_addr()?.port();
-    drop(listener);
-    Ok(port)
+    Ok(listener.local_addr()?.port())
 }
 
-fn spawn_wire_frontend<F>(frontend: F, shutdown: ShutdownRx)
+async fn start_wire_frontend<F>(
+    name: &str,
+    make_frontend: impl Fn(u16) -> F,
+    shutdown: ShutdownRx,
+) -> Result<u16>
 where
     F: FrontendListenerTrait + Send + Sync + 'static,
 {
-    tokio::spawn(async move {
-        let _ = frontend.listen(shutdown).await;
-    });
+    // The listener owns its socket, so a temporary port reservation must be released
+    // before it binds. Another process can claim that port in the gap; retry with a
+    // fresh port instead of returning a harness with a dead frontend task.
+    let mut last_error = None;
+    for _ in 0..5 {
+        last_error = None;
+        let port = bind_ephemeral_port().await?;
+        let frontend = make_frontend(port);
+        let mut task = tokio::spawn({
+            let shutdown = shutdown.clone();
+            async move { frontend.listen(shutdown).await }
+        });
+        for _ in 0..50 {
+            tokio::select! {
+                biased;
+                result = &mut task => {
+                    last_error = Some(match result {
+                        Ok(Ok(())) => anyhow!("{name} wire frontend on port {port} stopped before startup"),
+                        Ok(Err(error)) => anyhow!("{name} wire frontend on port {port} failed to start: {error:?}"),
+                        Err(error) => anyhow!("{name} wire frontend on port {port} task failed: {error}"),
+                    });
+                    break;
+                }
+                connected = TcpStream::connect(("127.0.0.1", port)) => {
+                    if connected.is_ok() && !task.is_finished() {
+                        return Ok(port);
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        if !task.is_finished() {
+            task.abort();
+            last_error = Some(anyhow!(
+                "{name} wire frontend on port {port} did not become ready"
+            ));
+        }
+    }
+    Err(last_error.expect("startup attempt must have an error"))
+}
+
+#[cfg(test)]
+mod wire_startup_tests {
+    use super::*;
+    use queryflux_core::error::QueryFluxError;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct FailingFrontend;
+
+    #[async_trait]
+    impl FrontendListenerTrait for FailingFrontend {
+        async fn listen(&self, _shutdown: ShutdownRx) -> QfResult<()> {
+            Err(QueryFluxError::Other(anyhow!("intentional bind failure")))
+        }
+    }
+
+    #[tokio::test]
+    async fn reports_wire_frontend_startup_errors() {
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let error = start_wire_frontend("failing", |_| FailingFrontend, shutdown_rx)
+            .await
+            .expect_err("startup error should be reported");
+        assert!(error.to_string().contains("intentional bind failure"));
+    }
+
+    struct FailOnceFrontend {
+        port: u16,
+        fail: bool,
+    }
+
+    #[async_trait]
+    impl FrontendListenerTrait for FailOnceFrontend {
+        async fn listen(&self, mut shutdown: ShutdownRx) -> QfResult<()> {
+            if self.fail {
+                return Err(QueryFluxError::Other(
+                    std::io::Error::from(std::io::ErrorKind::AddrInUse).into(),
+                ));
+            }
+            let _listener = TcpListener::bind(("127.0.0.1", self.port))
+                .await
+                .map_err(|error| QueryFluxError::Other(error.into()))?;
+            let _ = shutdown.changed().await;
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn retries_wire_frontend_startup_on_a_new_port() {
+        let attempts = AtomicUsize::new(0);
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let port = start_wire_frontend(
+            "test",
+            |port| FailOnceFrontend {
+                port,
+                fail: attempts.fetch_add(1, Ordering::Relaxed) == 0,
+            },
+            shutdown_rx,
+        )
+        .await
+        .expect("second startup attempt should succeed");
+        assert_eq!(attempts.load(Ordering::Relaxed), 2);
+        assert!(TcpStream::connect(("127.0.0.1", port)).await.is_ok());
+        drop(shutdown_tx);
+    }
 }
