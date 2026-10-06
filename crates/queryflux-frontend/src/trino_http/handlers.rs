@@ -1079,7 +1079,8 @@ pub async fn get_executing_statement(
 ) -> impl IntoResponse {
     // Authenticate the polling request when auth is enabled.
     let creds = extract_credentials(&headers);
-    let auth_provider = state.live.read().await.auth_provider.clone();
+    let live = state.snapshot().await;
+    let auth_provider = live.auth_provider.clone();
     let auth_ctx = match auth_provider.authenticate(&creds).await {
         Ok(ctx) => ctx,
         Err(e) => {
@@ -1115,9 +1116,8 @@ pub async fn get_executing_statement(
         }
     };
 
-    let authz = state.live.read().await.authorization.clone();
     if let Some(resp) = allow_query_action_or_forbid(
-        authz.as_ref(),
+        live.authorization.as_ref(),
         &auth_ctx,
         QueryAction::Poll,
         &executing.submitted_by,
@@ -1128,7 +1128,7 @@ pub async fn get_executing_statement(
         return resp;
     }
 
-    let adapter = match state.adapter(&executing.cluster_name.0).await {
+    let adapter = match live.adapters.get(&executing.cluster_name.0).cloned() {
         Some(a) => match a.as_async() {
             Some(async_adapter) => async_adapter,
             None => {
@@ -1402,7 +1402,8 @@ pub async fn delete_executing_statement(
     headers: HeaderMap,
 ) -> impl IntoResponse {
     let creds = extract_credentials(&headers);
-    let auth_provider = state.live.read().await.auth_provider.clone();
+    let live = state.snapshot().await;
+    let auth_provider = live.auth_provider.clone();
     let auth_ctx = match auth_provider.authenticate(&creds).await {
         Ok(ctx) => ctx,
         Err(e) => {
@@ -1434,9 +1435,8 @@ pub async fn delete_executing_statement(
         }
     };
 
-    let authz = state.live.read().await.authorization.clone();
     if let Some(resp) = allow_query_action_or_forbid(
-        authz.as_ref(),
+        live.authorization.as_ref(),
         &auth_ctx,
         QueryAction::Cancel,
         &executing.submitted_by,
@@ -1447,7 +1447,7 @@ pub async fn delete_executing_statement(
         return resp;
     }
 
-    let Some(adapter) = state.adapter(&executing.cluster_name.0).await else {
+    let Some(adapter) = live.adapters.get(&executing.cluster_name.0).cloned() else {
         warn!(
             id = %executing.id,
             cluster = %executing.cluster_name,
@@ -1534,8 +1534,107 @@ mod cancel_executing_statement_tests {
     use queryflux_translation::TranslationService;
     use tokio::sync::RwLock;
 
-    use super::delete_executing_statement;
+    use super::{delete_executing_statement, get_executing_statement};
     use crate::state::{AppState, LiveConfig};
+
+    struct DenyQueryActions;
+
+    #[async_trait]
+    impl AuthorizationChecker for DenyQueryActions {
+        async fn check(&self, _: &queryflux_auth::AuthContext, _: &str) -> bool {
+            false
+        }
+
+        async fn check_query(
+            &self,
+            _: &queryflux_auth::AuthContext,
+            _: queryflux_auth::QueryAction,
+            _: &queryflux_auth::QueryAuthz,
+        ) -> bool {
+            false
+        }
+    }
+
+    /// Force a reload inside authentication, before the handler checks authorization.
+    struct ReloadDuringAuthentication {
+        live: std::sync::Weak<RwLock<LiveConfig>>,
+    }
+
+    #[async_trait]
+    impl AuthProvider for ReloadDuringAuthentication {
+        async fn authenticate(
+            &self,
+            creds: &queryflux_auth::Credentials,
+        ) -> Result<queryflux_auth::AuthContext> {
+            let live = self.live.upgrade().expect("state still exists");
+            {
+                let mut config = live.write().await;
+                config.auth_provider = Arc::new(NoneAuthProvider::new(false));
+                config.authorization = Arc::new(AllowAllAuthorization::default());
+            }
+            NoneAuthProvider::new(false).authenticate(creds).await
+        }
+    }
+
+    async fn assert_query_action_keeps_auth_generation(cancel: bool) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let state = test_state(Some(AdapterKind::Async(Arc::new(CancelStubAdapter {
+            calls: calls.clone(),
+            fail: false,
+        }))))
+        .await;
+        seed_executing(&state, "trino-q-reload").await;
+        {
+            let mut live = state.live.write().await;
+            live.auth_provider = Arc::new(ReloadDuringAuthentication {
+                live: Arc::downgrade(&state.live),
+            });
+            live.authorization = Arc::new(DenyQueryActions);
+        }
+
+        let response = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let path = Path("executing/trino-q-reload".into());
+            if cancel {
+                delete_executing_statement(State(state.clone()), path, HeaderMap::new())
+                    .await
+                    .into_response()
+            } else {
+                get_executing_statement(State(state.clone()), path, HeaderMap::new())
+                    .await
+                    .into_response()
+            }
+        })
+        .await
+        .expect("authentication must run without holding the config read lock");
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(state
+            .persistence
+            .get(&BackendQueryId("trino-q-reload".into()))
+            .await
+            .unwrap()
+            .is_some());
+        assert!(
+            state
+                .live
+                .read()
+                .await
+                .authorization
+                .check(&queryflux_auth::AuthContext::default(), "default")
+                .await
+        );
+    }
+
+    #[tokio::test]
+    async fn poll_keeps_auth_generation_when_config_reloads() {
+        assert_query_action_keeps_auth_generation(false).await;
+    }
+
+    #[tokio::test]
+    async fn cancel_keeps_auth_generation_when_config_reloads() {
+        assert_query_action_keeps_auth_generation(true).await;
+    }
 
     struct CancelStubAdapter {
         calls: Arc<AtomicUsize>,

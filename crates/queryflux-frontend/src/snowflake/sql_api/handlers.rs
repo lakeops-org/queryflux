@@ -10,7 +10,7 @@ use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
-use queryflux_auth::Credentials;
+use queryflux_auth::AuthProvider;
 use queryflux_core::{
     error::{QueryFluxError, Result},
     query::{FrontendProtocol, QueryStats},
@@ -236,7 +236,7 @@ pub async fn submit_statement(
 
     // Stateless auth: Bearer token in Authorization header.
     let live = state.app.snapshot().await;
-    let auth_ctx = match authenticate(&state.app, &live, &headers).await {
+    let auth_ctx = match authenticate(&state.app, live.auth_provider.as_ref(), &headers).await {
         Ok(ctx) => ctx,
         Err(e) => return sql_api_error(StatusCode::UNAUTHORIZED, "390002", &e.to_string()),
     };
@@ -376,8 +376,8 @@ pub async fn cancel_statement(
     headers: HeaderMap,
     axum::extract::Path(handle): axum::extract::Path<String>,
 ) -> Response {
-    let live = state.app.snapshot().await;
-    let auth_ctx = match authenticate(&state.app, &live, &headers).await {
+    let auth_provider = state.app.auth_provider().await;
+    let auth_ctx = match authenticate(&state.app, auth_provider.as_ref(), &headers).await {
         Ok(ctx) => ctx,
         Err(e) => return sql_api_error(StatusCode::UNAUTHORIZED, "390002", &e.to_string()),
     };
@@ -405,29 +405,20 @@ pub async fn cancel_statement(
 
 async fn authenticate(
     state: &std::sync::Arc<crate::state::AppState>,
-    live: &crate::state::LiveConfig,
+    auth_provider: &dyn AuthProvider,
     headers: &HeaderMap,
 ) -> std::result::Result<queryflux_auth::AuthContext, String> {
-    let bearer = headers
-        .get("authorization")
-        .and_then(|v| v.to_str().ok())
-        .and_then(crate::strip_bearer_prefix)
-        .map(|s| s.to_string());
-
-    let auth_provider = live.auth_provider.clone();
-    auth_provider
-        .authenticate(&Credentials {
-            username: None,
-            password: None,
-            bearer_token: bearer,
-        })
-        .await
-        .map_err(|e| {
-            state
-                .metrics
-                .on_auth_failure(&format!("{:?}", FrontendProtocol::SnowflakeSqlApi));
-            e.to_string()
-        })
+    crate::auth::authenticate_bearer(
+        auth_provider,
+        headers.get("authorization").and_then(|v| v.to_str().ok()),
+    )
+    .await
+    .map_err(|e| {
+        state
+            .metrics
+            .on_auth_failure(&format!("{:?}", FrontendProtocol::SnowflakeSqlApi));
+        e.to_string()
+    })
 }
 
 #[cfg(test)]

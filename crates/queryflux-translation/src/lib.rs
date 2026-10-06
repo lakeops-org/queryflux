@@ -105,6 +105,11 @@ impl TranslationService {
         }
     }
 
+    /// Global scripts can change SQL semantics after result-cache eligibility checks.
+    pub fn has_global_fixups(&self) -> bool {
+        !self.python_scripts.is_empty()
+    }
+
     /// Overrides the default catalog-lookup timeout `resolve_schema_context` uses
     /// (config: `translation.schemaResolutionTimeoutMs`).
     pub fn with_schema_resolution_timeout(mut self, timeout: Duration) -> Self {

@@ -81,7 +81,8 @@ fn fingerprint_one(sql: &str, dialect: &str) -> Option<(u64, u64, String, bool)>
 }
 
 /// AST-based determinism check using polyglot-sql.
-/// Returns `true` if the query is deterministic (safe to cache).
+/// Returns `true` if no known non-deterministic expressions are found.
+/// This does not establish read-only behavior or cache eligibility.
 /// Falls back to a conservative regex check if polyglot fails to parse.
 pub fn is_deterministic(sql: &str, dialect: &str) -> bool {
     let sql_owned = sql.to_string();

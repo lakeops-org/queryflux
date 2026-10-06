@@ -8,6 +8,7 @@ license.workspace = true
 queryflux-core = { workspace = true }
 queryflux-persistence = { workspace = true }
 queryflux-fingerprint = { workspace = true }
+polyglot-sql = { workspace = true }
 async-trait = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }

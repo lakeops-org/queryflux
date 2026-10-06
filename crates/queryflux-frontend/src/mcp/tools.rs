@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
-use queryflux_auth::{require_query_owner, AuthContext, Credentials};
+use queryflux_auth::{require_query_owner, AuthContext, AuthProvider};
 use queryflux_core::{
     query::{ClusterGroupName, FrontendProtocol, ProxyQueryId, SqlDialect},
     session::{AgentContext, SessionContext},
@@ -149,23 +149,15 @@ fn extract_headers(ctx: &RequestContext<RoleServer>) -> HashMap<String, String> 
 
 /// Authenticate the calling MCP client from `Authorization: Bearer <token>`.
 async fn authenticate(
-    live: &crate::state::LiveConfig,
+    auth_provider: &dyn AuthProvider,
     headers: &HashMap<String, String>,
 ) -> Result<AuthContext, McpError> {
-    let token = headers
-        .get("authorization")
-        .and_then(|v| crate::strip_bearer_prefix(v))
-        .map(|t| t.to_string());
-    let creds = Credentials {
-        username: None,
-        password: None,
-        bearer_token: token,
-    };
-    let auth_provider = live.auth_provider.clone();
-    auth_provider
-        .authenticate(&creds)
-        .await
-        .map_err(|e| McpError::invalid_request(e.to_string(), None))
+    crate::auth::authenticate_bearer(
+        auth_provider,
+        headers.get("authorization").map(String::as_str),
+    )
+    .await
+    .map_err(|e| McpError::invalid_request(e.to_string(), None))
 }
 
 /// Validate a caller-supplied `dialect` tool parameter against `SqlDialect::KNOWN_DIALECT_NAMES`
@@ -412,7 +404,7 @@ impl QueryFluxMcpServer {
         let dialect = resolve_dialect_override(dialect.as_deref())?;
         let headers = extract_headers(&ctx);
         let live = self.state.snapshot().await;
-        let auth = authenticate(&live, &headers).await?;
+        let auth = authenticate(live.auth_provider.as_ref(), &headers).await?;
         let agent_context = resolve_agent_context(&headers, &agent, &auth);
         let conversation_id = agent_context.conversation_id.clone();
         let mut session = session_for(&auth, agent_context);
@@ -445,7 +437,7 @@ impl QueryFluxMcpServer {
     ) -> Result<CallToolResult, McpError> {
         let headers = extract_headers(&ctx);
         let live = self.state.snapshot().await;
-        let auth = authenticate(&live, &headers).await?;
+        let auth = authenticate(live.auth_provider.as_ref(), &headers).await?;
         let agent_context = resolve_agent_context(&headers, &agent, &auth);
         let conversation_id = agent_context.conversation_id.clone();
         let session = session_for(&auth, agent_context);
@@ -481,7 +473,7 @@ impl QueryFluxMcpServer {
     ) -> Result<CallToolResult, McpError> {
         let headers = extract_headers(&ctx);
         let live = self.state.snapshot().await;
-        let auth = authenticate(&live, &headers).await?;
+        let auth = authenticate(live.auth_provider.as_ref(), &headers).await?;
         let agent_context = resolve_agent_context(&headers, &agent, &auth);
         let conversation_id = agent_context.conversation_id.clone();
         let qualified = qualify_table(schema.as_deref(), &table);
@@ -578,7 +570,7 @@ impl QueryFluxMcpServer {
         let dialect = resolve_dialect_override(dialect.as_deref())?;
         let headers = extract_headers(&ctx);
         let live = self.state.snapshot().await;
-        let auth = authenticate(&live, &headers).await?;
+        let auth = authenticate(live.auth_provider.as_ref(), &headers).await?;
         let agent_context = resolve_agent_context(&headers, &agent, &auth);
         let conversation_id = agent_context.conversation_id.clone();
         let mut session = session_for(&auth, agent_context);
@@ -611,8 +603,8 @@ impl QueryFluxMcpServer {
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         let headers = extract_headers(&ctx);
-        let live = self.state.snapshot().await;
-        let auth = authenticate(&live, &headers).await?;
+        let auth_provider = self.state.auth_provider().await;
+        let auth = authenticate(auth_provider.as_ref(), &headers).await?;
 
         if let Some(executing) = find_executing_query(self.state.persistence.as_ref(), &query_id)
             .await
@@ -670,8 +662,8 @@ impl QueryFluxMcpServer {
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         let headers = extract_headers(&ctx);
-        let live = self.state.snapshot().await;
-        let auth = authenticate(&live, &headers).await?;
+        let auth_provider = self.state.auth_provider().await;
+        let auth = authenticate(auth_provider.as_ref(), &headers).await?;
 
         if let Some(executing) = find_executing_query(self.state.persistence.as_ref(), &query_id)
             .await

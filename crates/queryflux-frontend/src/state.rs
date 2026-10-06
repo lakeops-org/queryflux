@@ -205,10 +205,20 @@ impl AppState {
         self.live.read().await.clone()
     }
 
+    /// Capture only the current identity provider for authentication-only requests.
+    /// Use `snapshot()` when authentication must agree with authorization or routing.
+    pub async fn auth_provider(&self) -> Arc<dyn AuthProvider> {
+        self.live.read().await.auth_provider.clone()
+    }
+
+    /// Read an adapter from the current generation independently of other config reads.
+    /// Dispatch paths requiring generation consistency must use their `LiveConfig` snapshot.
     pub async fn adapter(&self, cluster: &str) -> Option<AdapterKind> {
         self.live.read().await.adapters.get(cluster).cloned()
     }
 
+    /// Read cluster config independently of other config reads. Use the captured
+    /// `LiveConfig` for dispatch paths that require generation consistency.
     pub async fn cluster_config_cloned(&self, cluster: &str) -> Option<ClusterConfig> {
         self.live.read().await.cluster_configs.get(cluster).cloned()
     }
@@ -231,6 +241,10 @@ impl AppState {
     /// and metrics. Call this **once** at every terminal path (success, failure, cancel,
     /// error) instead of manually calling `release_cluster` + `capacity_store.release`
     /// + `on_query_finished` separately.
+    ///
+    /// This uses the current manager, independently of any dispatch snapshot. Callers
+    /// that still own a `ClusterSlotGuard` must release through that guard so cleanup
+    /// reaches the manager that acquired the slot, even after a reload.
     pub async fn release_query_slot(
         &self,
         group: &ClusterGroupName,
