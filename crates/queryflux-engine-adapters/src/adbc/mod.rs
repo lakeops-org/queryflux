@@ -1,9 +1,10 @@
 use std::sync::Arc;
 
 use adbc_core::options::{AdbcVersion, OptionDatabase};
-use adbc_core::{Connection, Driver, Statement, LOAD_FLAG_DEFAULT};
+use adbc_core::{error::Status, Connection, Driver, Statement, LOAD_FLAG_DEFAULT};
 use adbc_driver_manager::{ManagedDatabase, ManagedDriver};
 use arrow::array::Array;
+use arrow::error::ArrowError;
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use queryflux_core::{
@@ -17,6 +18,34 @@ use queryflux_core::{
 use r2d2_adbc::AdbcConnectionManager;
 use tokio::sync::{mpsc, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
+
+fn adbc_backend_error(message: String, status: Status) -> QueryFluxError {
+    match status {
+        Status::Timeout => QueryFluxError::backend_timeout(message),
+        Status::IO | Status::Internal => QueryFluxError::backend_failure(message),
+        _ => QueryFluxError::Engine(message),
+    }
+}
+
+fn adbc_read_error(error: ArrowError) -> QueryFluxError {
+    let message = format!("ADBC: failed to read results: {error}");
+    match &error {
+        ArrowError::IoError(_, source) => QueryFluxError::backend_transport(
+            message,
+            source.kind() == std::io::ErrorKind::TimedOut,
+        ),
+        ArrowError::ExternalError(source) => {
+            if let Some(adbc) = source.downcast_ref::<adbc_core::error::Error>() {
+                adbc_backend_error(message, adbc.status)
+            } else if let Some(adbc) = source.downcast_ref::<r2d2_adbc::AdbcError>() {
+                adbc_backend_error(message, adbc.0.status)
+            } else {
+                QueryFluxError::Engine(message)
+            }
+        }
+        _ => QueryFluxError::Engine(message),
+    }
+}
 
 use crate::{AdapterKind, BackendQueryIdSlot, EngineAdapterFactory, SyncAdapter, SyncExecution};
 use queryflux_core::engine_registry::{
@@ -904,16 +933,17 @@ impl AdbcAdapter {
             opts_with_uri.extend(opts);
 
             let database = driver.new_database_with_opts(opts_with_uri).map_err(|e| {
-                QueryFluxError::Engine(format!(
-                    "cluster '{cluster_name}': failed to create scoped ADBC database: {e}"
-                ))
+                adbc_backend_error(
+                    format!("cluster '{cluster_name}': failed to create scoped ADBC database: {e}"),
+                    e.status,
+                )
             })?;
             let manager = AdbcConnectionManager::new(database);
             r2d2::Pool::builder()
                 .max_size(max_size)
                 .build(manager)
                 .map_err(|e| {
-                    QueryFluxError::Engine(format!(
+                    QueryFluxError::backend_failure(format!(
                         "cluster '{cluster_name}': failed to create scoped ADBC connection \
                          pool: {e}"
                     ))
@@ -923,7 +953,7 @@ impl AdbcAdapter {
         let result = tokio::time::timeout(IDENTITY_POOL_BUILD_TIMEOUT, build)
             .await
             .map_err(|_| {
-                QueryFluxError::Engine(format!(
+                QueryFluxError::backend_timeout(format!(
                     "cluster '{}': building a scoped ADBC connection timed out after {}s (an \
                      OAuth token validation or role/warehouse resolution may be slow, or the \
                      backend is unreachable)",
@@ -933,7 +963,7 @@ impl AdbcAdapter {
             })
             .and_then(|joined| {
                 joined.map_err(|e| {
-                    QueryFluxError::Engine(format!(
+                    QueryFluxError::backend_failure(format!(
                         "cluster '{}': scoped ADBC connection task panicked: {e}",
                         self.cluster_name.0
                     ))
@@ -955,7 +985,7 @@ impl AdbcAdapter {
                 })
                 .await
                 .map_err(|e| {
-                    QueryFluxError::Engine(format!(
+                    QueryFluxError::backend_failure(format!(
                         "cluster '{}': scoped pool cache task failed: {e}",
                         self.cluster_name.0
                     ))
@@ -1209,41 +1239,45 @@ impl SyncAdapter for AdbcAdapter {
                 let mut conn = match pool.get() {
                     Ok(c) => c,
                     Err(e) => {
-                        let _ = batch_tx.blocking_send(Err(QueryFluxError::Engine(format!(
-                            "ADBC: failed to get connection from pool: {e}"
-                        ))));
+                        let _ = batch_tx.blocking_send(Err(QueryFluxError::backend_failure(
+                            format!("ADBC: failed to get connection from pool: {e}"),
+                        )));
                         return;
                     }
                 };
                 let mut stmt = match conn.new_statement() {
                     Ok(s) => s,
                     Err(e) => {
-                        let _ = batch_tx.blocking_send(Err(QueryFluxError::Engine(format!(
-                            "ADBC: failed to create statement: {e}"
-                        ))));
+                        let _ = batch_tx.blocking_send(Err(adbc_backend_error(
+                            format!("ADBC: failed to create statement: {e}"),
+                            e.status,
+                        )));
                         return;
                     }
                 };
                 if let Err(e) = stmt.set_sql_query(&sql) {
-                    let _ = batch_tx.blocking_send(Err(QueryFluxError::Engine(format!(
-                        "ADBC: failed to set SQL query: {e}"
-                    ))));
+                    let _ = batch_tx.blocking_send(Err(adbc_backend_error(
+                        format!("ADBC: failed to set SQL query: {e}"),
+                        e.status,
+                    )));
                     return;
                 }
                 if let Some(batch) = param_batch {
                     if let Err(e) = stmt.bind(batch) {
-                        let _ = batch_tx.blocking_send(Err(QueryFluxError::Engine(format!(
-                            "ADBC: failed to bind parameters: {e}"
-                        ))));
+                        let _ = batch_tx.blocking_send(Err(adbc_backend_error(
+                            format!("ADBC: failed to bind parameters: {e}"),
+                            e.status,
+                        )));
                         return;
                     }
                 }
                 let reader = match stmt.execute() {
                     Ok(r) => r,
                     Err(e) => {
-                        let _ = batch_tx.blocking_send(Err(QueryFluxError::Engine(format!(
-                            "ADBC: query execution failed: {e}"
-                        ))));
+                        let _ = batch_tx.blocking_send(Err(adbc_backend_error(
+                            format!("ADBC: query execution failed: {e}"),
+                            e.status,
+                        )));
                         return;
                     }
                 };
@@ -1257,9 +1291,7 @@ impl SyncAdapter for AdbcAdapter {
                 let mut produced_any = false;
                 for batch in reader {
                     produced_any = true;
-                    let result = batch.map_err(|e| {
-                        QueryFluxError::Engine(format!("ADBC: failed to read results: {e}"))
-                    });
+                    let result = batch.map_err(adbc_read_error);
                     if batch_tx.blocking_send(result).is_err() {
                         return;
                     }
@@ -1284,23 +1316,29 @@ impl SyncAdapter for AdbcAdapter {
             tokio::task::spawn_blocking(move || {
                 let result = (|| -> Result<Option<u64>> {
                     let mut conn = pool.get().map_err(|e| {
-                        QueryFluxError::Engine(format!(
+                        QueryFluxError::backend_failure(format!(
                             "ADBC: failed to get connection from pool: {e}"
                         ))
                     })?;
                     let mut stmt = conn.new_statement().map_err(|e| {
-                        QueryFluxError::Engine(format!("ADBC: failed to create statement: {e}"))
+                        adbc_backend_error(
+                            format!("ADBC: failed to create statement: {e}"),
+                            e.status,
+                        )
                     })?;
                     stmt.set_sql_query(&sql).map_err(|e| {
-                        QueryFluxError::Engine(format!("ADBC: failed to set SQL query: {e}"))
+                        adbc_backend_error(format!("ADBC: failed to set SQL query: {e}"), e.status)
                     })?;
                     if let Some(batch) = param_batch {
                         stmt.bind(batch).map_err(|e| {
-                            QueryFluxError::Engine(format!("ADBC: failed to bind parameters: {e}"))
+                            adbc_backend_error(
+                                format!("ADBC: failed to bind parameters: {e}"),
+                                e.status,
+                            )
                         })?;
                     }
                     let rows = stmt.execute_update().map_err(|e| {
-                        QueryFluxError::Engine(format!("ADBC: DDL/DML execution failed: {e}"))
+                        adbc_backend_error(format!("ADBC: DDL/DML execution failed: {e}"), e.status)
                     })?;
                     Ok(rows.and_then(|n| if n >= 0 { Some(n as u64) } else { None }))
                 })();
@@ -1602,14 +1640,43 @@ impl EngineAdapterFactory for AdbcFactory {
 #[cfg(test)]
 mod tests {
     use super::{
-        compute_scoped_pool_key, compute_scoped_pool_size, jwt_auth_options,
-        normalize_to_pkcs8_pem, oauth_token_options, AdbcAdapter, AdbcConfig, PoolScopeKey,
-        IDENTITY_POOL_MAX_SIZE,
+        adbc_backend_error, adbc_read_error, compute_scoped_pool_key, compute_scoped_pool_size,
+        jwt_auth_options, normalize_to_pkcs8_pem, oauth_token_options, AdbcAdapter, AdbcConfig,
+        PoolScopeKey, IDENTITY_POOL_MAX_SIZE,
     };
     use crate::EngineConfigParseable;
+    use adbc_core::error::Status;
+    use arrow::error::ArrowError;
     use queryflux_auth::QueryCredentials;
+    use queryflux_core::error::QueryFluxError;
     use queryflux_core::query::{EngineType, SqlDialect};
     use queryflux_core::session::SessionContext;
+
+    #[test]
+    fn adbc_status_distinguishes_backend_and_identity_failures() {
+        assert!(matches!(
+            adbc_backend_error("io".into(), Status::IO),
+            QueryFluxError::BackendFailure(_)
+        ));
+        assert!(matches!(
+            adbc_backend_error("timeout".into(), Status::Timeout),
+            QueryFluxError::BackendTimeout(_)
+        ));
+        assert!(matches!(
+            adbc_backend_error("auth".into(), Status::Unauthenticated),
+            QueryFluxError::Engine(_)
+        ));
+        assert!(matches!(
+            adbc_backend_error("sql".into(), Status::InvalidData),
+            QueryFluxError::Engine(_)
+        ));
+
+        let io = adbc_core::error::Error::with_message_and_status("connection lost", Status::IO);
+        assert!(matches!(
+            adbc_read_error(ArrowError::ExternalError(Box::new(io))),
+            QueryFluxError::BackendFailure(_)
+        ));
+    }
 
     fn session_with(pairs: &[(&str, &str)]) -> SessionContext {
         SessionContext {

@@ -5,6 +5,14 @@ pub enum QueryFluxError {
     #[error("Engine error: {0}")]
     Engine(String),
 
+    /// Backend availability failure, distinguished from a server-reported SQL error.
+    #[error("Engine error: {0}")]
+    BackendFailure(String),
+
+    /// Backend request or execution deadline exceeded.
+    #[error("Engine error: {0}")]
+    BackendTimeout(String),
+
     #[error("Translation error: {0}")]
     Translation(String),
 
@@ -65,12 +73,39 @@ pub enum QueryFluxError {
 pub type Result<T> = std::result::Result<T, QueryFluxError>;
 
 impl QueryFluxError {
+    pub fn backend_failure(message: impl Into<String>) -> Self {
+        Self::BackendFailure(message.into())
+    }
+
+    pub fn backend_timeout(message: impl Into<String>) -> Self {
+        Self::BackendTimeout(message.into())
+    }
+
+    pub fn backend_transport(message: String, timed_out: bool) -> Self {
+        if timed_out {
+            Self::BackendTimeout(message)
+        } else {
+            Self::BackendFailure(message)
+        }
+    }
+
+    /// Classify an adapter HTTP response by its status code, never by the
+    /// response body (which may contain a user-controlled SQL error).
+    pub fn backend_http_status(status: u16, message: String) -> Self {
+        match status {
+            408 | 504 => Self::BackendTimeout(message),
+            429 | 502 | 503 => Self::BackendFailure(message),
+            _ => Self::Engine(message),
+        }
+    }
+
     /// Returns `true` if the error is likely transient and the operation may
     /// succeed on retry (e.g. connection refused, pool timeout, serialization
     /// conflict). Returns `false` for permanent failures like constraint
     /// violations, auth errors, or bad input.
     pub fn is_transient(&self) -> bool {
         match self {
+            QueryFluxError::BackendFailure(_) | QueryFluxError::BackendTimeout(_) => true,
             // Persistence errors: inspect the message for sqlx error kinds.
             // Connection-level and pool errors are transient; constraint
             // violations and type errors are permanent.
@@ -130,5 +165,25 @@ mod tests {
         assert!(msg.contains("analytics"), "{msg}");
         assert!(msg.contains("300"), "{msg}");
         assert!(!err.is_transient());
+    }
+
+    #[test]
+    fn backend_http_status_is_based_on_code_not_body() {
+        assert!(matches!(
+            QueryFluxError::backend_http_status(503, "syntax error".into()),
+            QueryFluxError::BackendFailure(_)
+        ));
+        assert!(matches!(
+            QueryFluxError::backend_http_status(504, "unrelated".into()),
+            QueryFluxError::BackendTimeout(_)
+        ));
+        assert!(matches!(
+            QueryFluxError::backend_http_status(400, "connection refused".into()),
+            QueryFluxError::Engine(_)
+        ));
+        assert!(matches!(
+            QueryFluxError::backend_http_status(500, "query failed".into()),
+            QueryFluxError::Engine(_)
+        ));
     }
 }

@@ -50,7 +50,7 @@ pub(crate) fn is_mysql_transport_error(error: &mysql_async::Error) -> bool {
 
 fn native_mysql_error(stage: &str, error: mysql_async::Error) -> QueryFluxError {
     if is_mysql_transport_error(&error) {
-        QueryFluxError::Engine(format!("mysql_native: transport failed: {error}"))
+        QueryFluxError::backend_failure(format!("mysql_native: transport failed: {error}"))
     } else {
         QueryFluxError::Engine(format!("mysql_native: {stage} failed: {error}"))
     }
@@ -240,7 +240,7 @@ pub async fn execute(
         None => pool
             .get_conn()
             .await
-            .map_err(|e| QueryFluxError::Engine(format!("mysql_native: connection failed: {e}")))?,
+            .map_err(|e| native_mysql_error("connection", e))?,
     };
     let conn_id = conn.id();
     id_slot.publish(conn_id.to_string());
@@ -492,7 +492,7 @@ mod tests {
         let io_error = std::io::Error::new(std::io::ErrorKind::ConnectionReset, "connection reset");
         let error = native_mysql_error("query", io_error.into());
         assert!(
-            matches!(error, QueryFluxError::Engine(message) if message.starts_with("mysql_native: transport failed:"))
+            matches!(error, QueryFluxError::BackendFailure(message) if message.starts_with("mysql_native: transport failed:"))
         );
 
         let closed = native_mysql_error(
@@ -500,7 +500,7 @@ mod tests {
             mysql_async::DriverError::ConnectionClosed.into(),
         );
         assert!(
-            matches!(closed, QueryFluxError::Engine(message) if message.starts_with("mysql_native: transport failed:"))
+            matches!(closed, QueryFluxError::BackendFailure(message) if message.starts_with("mysql_native: transport failed:"))
         );
 
         let server = mysql_async::ServerError {
@@ -512,6 +512,16 @@ mod tests {
         assert!(
             matches!(error, QueryFluxError::Engine(message) if message.starts_with("mysql_native: query failed:"))
         );
+
+        let auth_error = mysql_async::ServerError {
+            code: 1045,
+            message: "Access denied".into(),
+            state: "28000".into(),
+        };
+        assert!(matches!(
+            native_mysql_error("connection", auth_error.into()),
+            QueryFluxError::Engine(_)
+        ));
     }
 
     // ── passthrough_credentials_from_session ──────────────────────────────────

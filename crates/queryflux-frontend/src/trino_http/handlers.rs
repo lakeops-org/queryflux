@@ -158,7 +158,7 @@ fn client_safe_message(e: &QueryFluxError) -> &'static str {
     use queryflux_core::error::QueryFluxError::*;
     match e {
         Persistence(_) => "Internal service error",
-        Engine(_) => "Backend engine error",
+        Engine(_) | BackendFailure(_) | BackendTimeout(_) => "Backend engine error",
         Routing(_) | NoClusterGroupAvailable(_) => "Query routing failed",
         Config(_) => "Configuration error",
         // Empty → caller forwards Display (QueueFull / CapacityWaitTimeout detail).
@@ -171,6 +171,19 @@ fn client_safe_message(e: &QueryFluxError) -> &'static str {
         | CapacityWaitTimeout { .. } => "",
         _ => "Internal error",
     }
+}
+
+#[cfg(test)]
+#[test]
+fn typed_backend_errors_keep_the_trino_client_safe_message() {
+    assert_eq!(
+        client_safe_message(&QueryFluxError::backend_failure("connection refused")),
+        "Backend engine error"
+    );
+    assert_eq!(
+        client_safe_message(&QueryFluxError::backend_timeout("deadline exceeded")),
+        "Backend engine error"
+    );
 }
 
 fn json_response(body: impl serde::Serialize) -> Response<Body> {

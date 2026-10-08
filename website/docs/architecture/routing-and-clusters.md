@@ -198,6 +198,8 @@ Completed backend requests contribute to a rolling window. Transient connection/
 
 The admin cluster-state response includes `breaker_state` (`closed`, `open`, or `halfOpen`) and `can_accept_query`. Prometheus exposes `queryflux_circuit_breaker_state{cluster_group,cluster_name}` as 0, 1, or 2 respectively. Omitting `circuitBreaker` preserves the previous health/capacity-only selection behavior.
 
+If a stored group's breaker policy is malformed on reload, QueryFlux logs a warning with the group name and disables the breaker for that group; other groups continue loading.
+
 ## Python script strategy (`pythonScript`)
 
 For groups where none of the built-in strategies fit — custom cost/tiering rules, time-of-day shaping, or any placement logic specific to your deployment — a group's `strategy` can run operator-supplied Python instead. This is the same pattern as the [Python script router](#python-script-router-pythonscript) above, one stage down: that picks a cluster **group**, this picks a member **cluster** within a group already chosen by routing.

@@ -150,6 +150,39 @@ fn aws_err(e: &impl std::error::Error) -> String {
     }
     parts.join(": ")
 }
+
+/// Classify from the SDK error kind and HTTP status, not from a rendered AWS
+/// error message (which may describe bad credentials or an invalid query).
+fn athena_api_error<E>(operation: &str, error: aws_sdk_athena::error::SdkError<E>) -> QueryFluxError
+where
+    E: std::error::Error + 'static,
+{
+    use aws_sdk_athena::error::SdkError;
+
+    let message = format!("{operation}: {}", aws_err(&error));
+    match &error {
+        SdkError::TimeoutError(_) => QueryFluxError::backend_timeout(message),
+        SdkError::DispatchFailure(dispatch) if dispatch.is_timeout() => {
+            QueryFluxError::backend_timeout(message)
+        }
+        SdkError::DispatchFailure(dispatch) if !dispatch.is_user() => {
+            QueryFluxError::backend_failure(message)
+        }
+        SdkError::ResponseError(_) => QueryFluxError::backend_failure(message),
+        SdkError::ServiceError(service) => {
+            athena_service_status(service.raw().status().as_u16(), message)
+        }
+        _ => QueryFluxError::Engine(message),
+    }
+}
+
+fn athena_service_status(status: u16, message: String) -> QueryFluxError {
+    match status {
+        408 | 504 => QueryFluxError::backend_timeout(message),
+        429 | 500..=599 => QueryFluxError::backend_failure(message),
+        _ => QueryFluxError::Engine(message),
+    }
+}
 use queryflux_core::engine_registry::{
     AuthType, ConfigField, ConnectionType, EngineDescriptor, FieldType,
 };
@@ -301,7 +334,7 @@ impl AthenaAdapter {
         loop {
             if tokio::time::Instant::now() >= deadline {
                 self.stop_query_best_effort(execution_id).await;
-                return Err(QueryFluxError::Engine(format!(
+                return Err(QueryFluxError::backend_timeout(format!(
                     "Athena query {execution_id} exceeded max wait of {}s",
                     self.max_wait.as_secs()
                 )));
@@ -315,14 +348,11 @@ impl AthenaAdapter {
             let resp = match tokio::time::timeout_at(deadline, get).await {
                 Ok(Ok(resp)) => resp,
                 Ok(Err(e)) => {
-                    return Err(QueryFluxError::Engine(format!(
-                        "Athena GetQueryExecution: {}",
-                        aws_err(&e)
-                    )));
+                    return Err(athena_api_error("Athena GetQueryExecution", e));
                 }
                 Err(_) => {
                     self.stop_query_best_effort(execution_id).await;
-                    return Err(QueryFluxError::Engine(format!(
+                    return Err(QueryFluxError::backend_timeout(format!(
                         "Athena query {execution_id} exceeded max wait of {}s",
                         self.max_wait.as_secs()
                     )));
@@ -389,10 +419,7 @@ impl AthenaAdapter {
                 Ok(r) => r,
                 Err(e) => {
                     let _ = batch_tx
-                        .send(Err(QueryFluxError::Engine(format!(
-                            "Athena GetQueryResults: {}",
-                            aws_err(&e)
-                        ))))
+                        .send(Err(athena_api_error("Athena GetQueryResults", e)))
                         .await;
                     let _ = stats_tx.send(None);
                     return;
@@ -547,9 +574,7 @@ impl AsyncAdapter for AthenaAdapter {
             .work_group(&self.workgroup)
             .send()
             .await
-            .map_err(|e| {
-                QueryFluxError::Engine(format!("Athena StartQueryExecution: {}", aws_err(&e)))
-            })?;
+            .map_err(|e| athena_api_error("Athena StartQueryExecution", e))?;
 
         let execution_id = resp
             .query_execution_id()
@@ -1037,6 +1062,35 @@ mod tests {
         assert_eq!(DEFAULT_ATHENA_MAX_WAIT_SECS, 600);
         assert_eq!(ATHENA_POLL_INTERVAL, Duration::from_millis(500));
         assert!(ATHENA_POLL_INTERVAL < Duration::from_secs(DEFAULT_ATHENA_MAX_WAIT_SECS));
+    }
+
+    #[test]
+    fn sdk_timeout_is_backend_timeout_but_request_construction_is_not() {
+        use aws_sdk_athena::error::SdkError;
+
+        let source = || std::io::Error::new(std::io::ErrorKind::TimedOut, "timed out");
+        assert!(matches!(
+            athena_api_error(
+                "Athena GetQueryExecution",
+                SdkError::<std::io::Error>::timeout_error(source())
+            ),
+            QueryFluxError::BackendTimeout(_)
+        ));
+        assert!(matches!(
+            athena_api_error(
+                "Athena GetQueryExecution",
+                SdkError::<std::io::Error>::construction_failure(source())
+            ),
+            QueryFluxError::Engine(_)
+        ));
+        assert!(matches!(
+            athena_service_status(403, "AccessDeniedException".into()),
+            QueryFluxError::Engine(_)
+        ));
+        assert!(matches!(
+            athena_service_status(503, "ServiceUnavailableException".into()),
+            QueryFluxError::BackendFailure(_)
+        ));
     }
 
     #[test]

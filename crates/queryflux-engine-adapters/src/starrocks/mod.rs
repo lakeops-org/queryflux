@@ -33,7 +33,7 @@ const DEFAULT_STARROCKS_POOL_SIZE: usize = 8;
 
 fn starrocks_mysql_error(stage: &str, error: mysql_async::Error) -> QueryFluxError {
     if crate::mysql_native::is_mysql_transport_error(&error) {
-        QueryFluxError::Engine(format!("StarRocks transport failed: {error}"))
+        QueryFluxError::backend_failure(format!("StarRocks transport failed: {error}"))
     } else {
         QueryFluxError::Engine(format!("StarRocks {stage} failed: {error}"))
     }
@@ -260,22 +260,18 @@ impl StarRocksAdapter {
         tokio::time::timeout(Duration::from_secs(10), self.pool.get_conn())
             .await
             .map_err(|_| {
-                QueryFluxError::Engine("StarRocks pool checkout timed out (10s)".to_string())
+                QueryFluxError::backend_timeout("StarRocks pool checkout timed out (10s)")
             })?
-            .map_err(|e| QueryFluxError::Engine(format!("StarRocks pool get_conn failed: {e}")))
+            .map_err(|e| starrocks_mysql_error("pool get_conn", e))
     }
 
     async fn acquire_control_conn(&self) -> Result<Conn> {
         tokio::time::timeout(Duration::from_secs(10), self.control_pool.get_conn())
             .await
             .map_err(|_| {
-                QueryFluxError::Engine(
-                    "StarRocks control pool checkout timed out (10s)".to_string(),
-                )
+                QueryFluxError::backend_timeout("StarRocks control pool checkout timed out (10s)")
             })?
-            .map_err(|e| {
-                QueryFluxError::Engine(format!("StarRocks control pool get_conn failed: {e}"))
-            })
+            .map_err(|e| starrocks_mysql_error("control pool get_conn", e))
     }
 
     async fn run_query(&self, sql: &str) -> Result<Vec<Row>> {
@@ -999,7 +995,7 @@ mod tests {
             std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "connection refused");
         let error = starrocks_mysql_error("query", io_error.into());
         assert!(
-            matches!(error, QueryFluxError::Engine(message) if message.starts_with("StarRocks transport failed:"))
+            matches!(error, QueryFluxError::BackendFailure(message) if message.starts_with("StarRocks transport failed:"))
         );
 
         let server = mysql_async::ServerError {
@@ -1011,6 +1007,16 @@ mod tests {
         assert!(
             matches!(error, QueryFluxError::Engine(message) if message.starts_with("StarRocks query failed:"))
         );
+
+        let auth_error = mysql_async::ServerError {
+            code: 1045,
+            message: "Access denied".into(),
+            state: "28000".into(),
+        };
+        assert!(matches!(
+            starrocks_mysql_error("pool get_conn", auth_error.into()),
+            QueryFluxError::Engine(_)
+        ));
     }
 
     #[test]

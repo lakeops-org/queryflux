@@ -330,18 +330,20 @@ impl ClusterGroupConfigRecord {
             .as_ref()
             .map(|value| {
                 let config: CircuitBreakerConfig =
-                    serde_json::from_value(value.clone()).map_err(|e| {
-                        format!(
-                            "group '{}' (id {}): invalid circuitBreaker: {e}",
-                            self.name, self.id
-                        )
-                    })?;
-                config
-                    .validate()
-                    .map_err(|e| format!("group '{}' (id {}): {e}", self.name, self.id))?;
+                    serde_json::from_value(value.clone()).map_err(|e| e.to_string())?;
+                config.validate().map_err(|e| e.to_string())?;
                 Ok::<_, String>(config)
             })
-            .transpose()?;
+            .transpose()
+            .unwrap_or_else(|error| {
+                tracing::warn!(
+                    group_id = self.id,
+                    group_name = %self.name,
+                    %error,
+                    "invalid persisted circuitBreaker — disabling breaker for this group"
+                );
+                None
+            });
 
         let default_tags =
             serde_json::from_value::<queryflux_core::tags::QueryTags>(self.default_tags.clone())
@@ -395,6 +397,7 @@ fn default_tags_value() -> serde_json::Value {
 mod tests {
     use super::*;
     use chrono::Utc;
+    use queryflux_core::config::CircuitBreakerConfig;
     use queryflux_core::tags::QueryTags;
 
     fn make_record(default_tags: serde_json::Value) -> ClusterGroupConfigRecord {
@@ -450,24 +453,22 @@ mod tests {
     }
 
     #[test]
-    fn malformed_persisted_circuit_breaker_is_rejected() {
+    fn malformed_persisted_circuit_breaker_disables_only_that_group() {
         let mut record = make_record(default_tags_value());
         record.circuit_breaker = Some(serde_json::json!({"minRequests": "invalid"}));
-        let error = record
-            .to_core()
-            .expect_err("invalid breaker must reject the record");
-        assert!(error.contains("test-group"), "{error}");
-        assert!(error.contains("circuitBreaker"), "{error}");
+        assert!(record.to_core().unwrap().circuit_breaker.is_none());
     }
 
     #[test]
-    fn semantically_invalid_persisted_circuit_breaker_is_rejected() {
+    fn semantically_invalid_persisted_circuit_breaker_disables_only_that_group() {
         let mut record = make_record(default_tags_value());
         record.circuit_breaker = Some(serde_json::json!({"minRequests": 0}));
-        let error = record
-            .to_core()
-            .expect_err("invalid policy must reject the record");
-        assert!(error.contains("minRequests"), "{error}");
+        assert!(record.to_core().unwrap().circuit_breaker.is_none());
+
+        let mut other = make_record(default_tags_value());
+        other.circuit_breaker =
+            Some(serde_json::to_value(CircuitBreakerConfig::default()).unwrap());
+        assert!(other.to_core().unwrap().circuit_breaker.is_some());
     }
 
     // --- to_core: JSONB → QueryTags ---

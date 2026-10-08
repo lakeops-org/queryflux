@@ -371,10 +371,9 @@ impl AsyncAdapter for TrinoAdapter {
         req = self.apply_session_headers(req, session, tags, credentials);
         req = self.with_control_timeout(req);
 
-        let resp = req
-            .send()
-            .await
-            .map_err(|e| QueryFluxError::Engine(format!("Trino submit failed: {e}")))?;
+        let resp = req.send().await.map_err(|e| {
+            QueryFluxError::backend_transport(format!("Trino submit failed: {e}"), e.is_timeout())
+        })?;
 
         if resp.status() == StatusCode::UNAUTHORIZED {
             let www_auth = resp
@@ -391,13 +390,19 @@ impl AsyncAdapter for TrinoAdapter {
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
-            return Err(QueryFluxError::Engine(format!(
-                "Trino submit returned {status}: {body}"
-            )));
+            let message = format!("Trino submit returned {status}: {body}");
+            return Err(if status == StatusCode::INTERNAL_SERVER_ERROR {
+                QueryFluxError::backend_failure(message)
+            } else {
+                QueryFluxError::backend_http_status(status.as_u16(), message)
+            });
         }
 
         let body_bytes = resp.bytes().await.map_err(|e| {
-            QueryFluxError::Engine(format!("Failed to read Trino response body: {e}"))
+            QueryFluxError::backend_transport(
+                format!("Failed to read Trino response body: {e}"),
+                e.is_timeout(),
+            )
         })?;
 
         let trino_resp: TrinoResponse = serde_json::from_slice(&body_bytes)
@@ -456,20 +461,30 @@ impl AsyncAdapter for TrinoAdapter {
             .apply_stored_wire_auth(self.http_client.get(uri), wire_auth)
             .send()
             .await
-            .map_err(|e| QueryFluxError::Engine(format!("Trino poll GET failed: {e}")))?;
+            .map_err(|e| {
+                QueryFluxError::backend_transport(
+                    format!("Trino poll GET failed: {e}"),
+                    e.is_timeout(),
+                )
+            })?;
 
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
-            return Err(QueryFluxError::Engine(format!(
-                "Trino poll returned {status}: {body}"
-            )));
+            let message = format!("Trino poll returned {status}: {body}");
+            return Err(if status == StatusCode::INTERNAL_SERVER_ERROR {
+                QueryFluxError::backend_failure(message)
+            } else {
+                QueryFluxError::backend_http_status(status.as_u16(), message)
+            });
         }
 
-        let body_bytes = resp
-            .bytes()
-            .await
-            .map_err(|e| QueryFluxError::Engine(format!("Failed to read Trino poll body: {e}")))?;
+        let body_bytes = resp.bytes().await.map_err(|e| {
+            QueryFluxError::backend_transport(
+                format!("Failed to read Trino poll body: {e}"),
+                e.is_timeout(),
+            )
+        })?;
 
         let trino_resp: TrinoResponse = serde_json::from_slice(&body_bytes).map_err(|e| {
             QueryFluxError::Engine(format!("Failed to parse Trino poll response: {e}"))

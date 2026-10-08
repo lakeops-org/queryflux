@@ -271,22 +271,29 @@ impl DuckDbHttpAdapter {
             .body(sql.to_string())
             .send()
             .await
-            .map_err(|e| QueryFluxError::Engine(format!("DuckDB HTTP request failed: {e}")))?;
+            .map_err(|e| {
+                QueryFluxError::backend_transport(
+                    format!("DuckDB HTTP request failed: {e}"),
+                    e.is_timeout(),
+                )
+            })?;
 
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
-            return Err(QueryFluxError::Engine(format!(
-                "DuckDB HTTP server returned {status}: {body}"
-            )));
+            return Err(QueryFluxError::backend_http_status(
+                status.as_u16(),
+                format!("DuckDB HTTP server returned {status}: {body}"),
+            ));
         }
 
         let mut body: Vec<u8> = Vec::new();
-        while let Some(chunk) = resp
-            .chunk()
-            .await
-            .map_err(|e| QueryFluxError::Engine(format!("DuckDB HTTP read failed: {e}")))?
-        {
+        while let Some(chunk) = resp.chunk().await.map_err(|e| {
+            QueryFluxError::backend_transport(
+                format!("DuckDB HTTP read failed: {e}"),
+                e.is_timeout(),
+            )
+        })? {
             if body.len() + chunk.len() > cap {
                 return Err(QueryFluxError::Engine(format!(
                     "DuckDB HTTP result exceeded the {cap}-byte buffered-result cap; \
