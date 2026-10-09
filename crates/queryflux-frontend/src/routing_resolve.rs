@@ -8,8 +8,9 @@ use queryflux_routing::chain::RoutingTrace;
 /// `group_order` the caller may access. Explicit router matches are returned as-is
 /// (dispatch enforces `allowUsers` / `allowGroups` separately).
 ///
-/// Callers should snapshot `group_order` and `authorization` and drop any live-config
-/// lock before awaiting this — `check` may perform remote I/O (e.g. OpenFGA).
+/// `group_order` and `authorization` must come from the same `LiveConfig` snapshot
+/// as the router chain and subsequent dispatch. No live-config lock should be held
+/// while awaiting this — `check` may perform remote I/O (e.g. OpenFGA).
 pub async fn resolve_routed_group(
     group_order: &[String],
     authorization: &dyn AuthorizationChecker,

@@ -65,7 +65,8 @@ pub async fn login_request(
         .filter(|s| !s.is_empty())
         .cloned();
 
-    let auth_provider = state.app.live.read().await.auth_provider.clone();
+    let live = state.app.snapshot().await;
+    let auth_provider = live.auth_provider.clone();
     let auth_ctx = match auth_provider
         .authenticate(&Credentials {
             username: Some(login_name.clone()),
@@ -117,7 +118,6 @@ pub async fn login_request(
         agent_context: None,
     };
     let routing_result = {
-        let live = state.app.live.read().await;
         live.router_chain
             .route_with_trace(
                 "",
@@ -144,8 +144,7 @@ pub async fn login_request(
             return sf_error("390201", &message);
         }
     };
-    group = match state
-        .app
+    group = match live
         .resolve_routed_group(group, &mut routing_trace, &auth_ctx)
         .await
     {

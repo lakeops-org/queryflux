@@ -132,6 +132,7 @@ impl Fixture {
         let mut sink = Sink::default();
         execute_to_sink(
             &self.state,
+            &self.state.snapshot().await,
             sql.into(),
             vec![],
             self.session.clone(),
