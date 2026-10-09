@@ -195,19 +195,15 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-
-      - uses: actions/cache@v4
-        id: venv-cache
-        with:
-          path: .venv
-          key: venv-${{ runner.os }}-py3.12-${{ hashFiles('requirements.txt') }}
+          cache: pip
+          cache-dependency-path: requirements.txt
 
       - name: Python venv (sqlglot / PyO3)
         run: |
-          if [ ! -x .venv/bin/python3 ]; then
-            python3 -m venv .venv
-            .venv/bin/pip install -r requirements.txt
-          fi
+          # Virtualenv interpreter links can break when the runner's Python patch changes.
+          # Cache pip downloads above, but always recreate the environment itself.
+          python3 -m venv --clear .venv
+          .venv/bin/python3 -m pip install -r requirements.txt
           echo "PYO3_PYTHON=${GITHUB_WORKSPACE}/.venv/bin/python3" >> "$GITHUB_ENV"
           echo "PYTHONPATH=$(.venv/bin/python3 -c 'import site; print(site.getsitepackages()[0])')" >> "$GITHUB_ENV"
 
