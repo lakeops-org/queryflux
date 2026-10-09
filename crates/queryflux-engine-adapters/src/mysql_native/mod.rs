@@ -145,10 +145,23 @@ pub async fn open_passthrough_connection(
     credentials: &QueryCredentials,
     session: &SessionContext,
 ) -> Result<Option<mysql_async::Conn>> {
-    if !matches!(credentials, QueryCredentials::Passthrough) {
+    if !matches!(
+        credentials,
+        QueryCredentials::Passthrough | QueryCredentials::Bearer { .. }
+    ) {
         return Ok(None);
     }
-    let (username, password) = passthrough_credentials_from_session(session)?;
+    let (username, password) = if let QueryCredentials::Bearer { token } = credentials {
+        (
+            session
+                .user()
+                .ok_or_else(|| QueryFluxError::Auth("JWT backend requires a verified user".into()))?
+                .to_owned(),
+            token.clone(),
+        )
+    } else {
+        passthrough_credentials_from_session(session)?
+    };
     let opts = mysql_async::Opts::from(
         mysql_async::OptsBuilder::from_opts(base_opts.clone())
             .user(Some(username))
@@ -186,7 +199,8 @@ fn passthrough_credentials_from_session(session: &SessionContext) -> Result<(Str
         .ok_or_else(missing)?;
     let password = session
         .extra
-        .get("passthrough_password")
+        .get("passthrough_jwt")
+        .or_else(|| session.extra.get("passthrough_password"))
         .cloned()
         .ok_or_else(missing)?;
     Ok((username, password))

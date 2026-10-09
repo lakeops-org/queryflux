@@ -18,6 +18,12 @@ pub async fn token_request(
         Some(t) => t,
         None => return unauthorized(),
     };
+    if super::common::authenticated_session(&state, &token)
+        .await
+        .is_none()
+    {
+        return unauthorized();
+    }
     match state.sessions.validate_session(&token) {
         Some((remaining, _)) => (
             StatusCode::OK,

@@ -92,6 +92,7 @@ pub struct MysqlWireFrontend {
     state: Arc<AppState>,
     port: u16,
     max_connections: Option<usize>,
+    tls: Option<queryflux_core::config::FrontendTlsConfig>,
 }
 
 impl MysqlWireFrontend {
@@ -100,7 +101,12 @@ impl MysqlWireFrontend {
             state,
             port,
             max_connections,
+            tls: None,
         }
+    }
+    pub fn with_tls(mut self, tls: Option<queryflux_core::config::FrontendTlsConfig>) -> Self {
+        self.tls = tls;
+        self
     }
 }
 
@@ -113,6 +119,7 @@ impl FrontendListenerTrait for MysqlWireFrontend {
             .await
             .map_err(|e| QueryFluxError::Other(e.into()))?;
 
+        let tls = crate::wire_tls::load_tls(self.tls.as_ref())?;
         let active = Arc::new(AtomicUsize::new(0));
         let max_conn = self.max_connections.filter(|&l| l > 0);
 
@@ -128,12 +135,13 @@ impl FrontendListenerTrait for MysqlWireFrontend {
                         }
                     }
                     debug!(peer = %peer, "MySQL wire: new connection");
+                    let tls = tls.clone();
                     let state = self.state.clone();
                     let conn_id = CONNECTION_ID.fetch_add(1, Ordering::Relaxed);
                     let active = active.clone();
                     active.fetch_add(1, Ordering::Relaxed);
                     tokio::spawn(async move {
-                        if let Err(e) = handle_connection(stream, state, conn_id).await {
+                        if let Err(e) = handle_connection(stream, state, conn_id, tls).await {
                             debug!(conn_id, "MySQL wire connection closed: {e}");
                         }
                         active.fetch_sub(1, Ordering::Relaxed);
@@ -159,38 +167,95 @@ async fn handle_connection(
     stream: TcpStream,
     state: Arc<AppState>,
     connection_id: u32,
+    tls: Option<tokio_rustls::TlsAcceptor>,
 ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
     stream.set_nodelay(true)?;
-    let (mut reader, mut writer) = stream.into_split();
-
-    // Send server handshake.
-    write_packet(&mut writer, 0, &build_handshake(connection_id)).await?;
-
-    // Read client HandshakeResponse or SSLRequest.
-    let (_, payload) = read_packet(&mut reader).await?;
-
+    let provider = state.live.read().await.auth_provider.clone();
+    let kind = provider.wire_auth_kind();
+    let mut transport: crate::wire_tls::BoxIo = Box::new(stream);
+    let mut secure = false;
+    write_packet(
+        &mut transport,
+        0,
+        &build_handshake_with_tls(connection_id, tls.is_some()),
+    )
+    .await?;
+    let (mut seq, mut payload) = read_packet(&mut transport).await?;
     if is_ssl_request(&payload) {
-        warn!(
-            conn_id = connection_id,
-            "MySQL wire: client requested TLS (SSLRequest); TLS is not supported — closing"
+        let Some(tls) = tls else {
+            write_packet(
+                &mut transport,
+                seq.wrapping_add(1),
+                &build_err(1045, "TLS is not configured"),
+            )
+            .await?;
+            return Ok(());
+        };
+        transport = Box::new(
+            tokio::time::timeout(std::time::Duration::from_secs(30), tls.accept(transport))
+                .await??,
         );
-        write_packet(
-            &mut writer,
-            1,
-            &build_err(
-                1105,
-                "QueryFlux MySQL wire does not support TLS. Disable SSL on the client \
-                 (e.g. mysql --ssl-mode=DISABLED, JDBC useSSL=false).",
-            ),
-        )
-        .await?;
-        return Ok(());
+        secure = true;
+        (seq, payload) = read_packet(&mut transport).await?;
     }
-
+    let (mut reader, mut writer) = crate::wire_tls::split(transport);
+    if payload.len() < 32 {
+        return Err("invalid MySQL HandshakeResponse".into());
+    }
     let (user, schema) = parse_handshake_response(&payload);
-
-    // Accept any credentials — QueryFlux trusts the network here.
-    write_packet(&mut writer, 2, &build_ok(0, 0)).await?;
+    let mut creds = Credentials {
+        username: Some(user.clone()),
+        ..Default::default()
+    };
+    if kind != queryflux_auth::provider::WireAuthKind::None {
+        if !secure {
+            write_packet(
+                &mut writer,
+                seq.wrapping_add(1),
+                &build_err(1045, "TLS is required for credential authentication"),
+            )
+            .await?;
+            return Ok(());
+        }
+        let plugin = if kind == queryflux_auth::provider::WireAuthKind::Jwt {
+            "authentication_openid_connect_client"
+        } else {
+            "mysql_clear_password"
+        };
+        let mut switch = vec![0xfe];
+        switch.extend_from_slice(plugin.as_bytes());
+        switch.push(0);
+        seq = seq.wrapping_add(1);
+        write_packet(&mut writer, seq, &switch).await?;
+        let (response_seq, response) =
+            tokio::time::timeout(std::time::Duration::from_secs(30), read_packet(&mut reader))
+                .await??;
+        if response_seq != seq.wrapping_add(1) {
+            return Err("invalid authentication packet sequence".into());
+        }
+        seq = response_seq;
+        if kind == queryflux_auth::provider::WireAuthKind::Jwt {
+            creds.bearer_token = Some(parse_oidc_response(&response)?);
+        } else {
+            if response.last() != Some(&0) || response[..response.len() - 1].contains(&0) {
+                return Err("invalid password framing".into());
+            }
+            creds.password = Some(String::from_utf8(response[..response.len() - 1].to_vec())?);
+        }
+    }
+    let identity = match crate::lease::authenticate_initial(&state, &mut creds).await {
+        Ok(ctx) => ctx,
+        Err(e) => {
+            write_packet(
+                &mut writer,
+                seq.wrapping_add(1),
+                &build_err(1045, &e.to_string()),
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+    write_packet(&mut writer, seq.wrapping_add(1), &build_ok(0, 0)).await?;
 
     info!(
         user,
@@ -200,7 +265,7 @@ async fn handle_connection(
     );
 
     let mut session = SessionContext {
-        user: if user.is_empty() { None } else { Some(user) },
+        user: Some(identity.user),
         database: schema,
         // MySQL wire / StarRocks has no catalog concept — just a database/schema.
         catalog: None,
@@ -249,6 +314,7 @@ async fn handle_connection(
                     &mut session,
                     &sql,
                     seq.wrapping_add(1),
+                    &creds,
                 )
                 .await?;
             }
@@ -279,12 +345,13 @@ async fn handle_connection(
 // ── Query execution ───────────────────────────────────────────────────────────
 
 async fn handle_com_query(
-    reader: &mut tokio::net::tcp::OwnedReadHalf,
-    writer: &mut tokio::net::tcp::OwnedWriteHalf,
+    reader: &mut crate::wire_tls::WireReader,
+    writer: &mut crate::wire_tls::WireWriter,
     state: &Arc<AppState>,
     session: &mut SessionContext,
     sql: &str,
     start_seq: u8,
+    creds: &Credentials,
 ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Unwrap MySQL conditional comments: /*!40101 SET ... */ → SET ...
     let logical = strip_mysql_conditional_comment(sql);
@@ -293,18 +360,7 @@ async fn handle_com_query(
     // Auth-complete early gate: all statement/metadata fast paths must still
     // be subject to authentication when `auth.required=true`.
     let protocol = FrontendProtocol::MySqlWire;
-    // No `bearer_token` captured here — the MySQL wire handshake password is not threaded
-    // through to `Credentials`, so `AuthContext.raw_token` is always `None` for this
-    // frontend. `queryAuth: passthrough` / `tokenExchange` on a backend cluster can never
-    // resolve a per-user credential when reached this way — only `serviceAccount` (and
-    // `impersonate`, backend-side) work. Use the Trino HTTP or Flight SQL frontend when
-    // per-user backend identity is required.
-    let creds = Credentials {
-        username: session.user().map(|s| s.to_string()),
-        ..Default::default()
-    };
-    let auth_provider = state.live.read().await.auth_provider.clone();
-    let auth_ctx = match auth_provider.authenticate(&creds).await {
+    let auth_ctx = match crate::lease::authenticate(state, creds).await {
         Ok(ctx) => ctx,
         Err(e) => {
             state
@@ -957,7 +1013,11 @@ async fn write_packet<W: AsyncWriteExt + Unpin>(
 // ── Packet builders ───────────────────────────────────────────────────────────
 
 fn build_handshake(connection_id: u32) -> Vec<u8> {
-    let caps: u32 = CLIENT_LONG_PASSWORD
+    build_handshake_with_tls(connection_id, false)
+}
+
+fn build_handshake_with_tls(connection_id: u32, tls: bool) -> Vec<u8> {
+    let mut caps: u32 = CLIENT_LONG_PASSWORD
         | CLIENT_FOUND_ROWS
         | CLIENT_LONG_FLAG
         | CLIENT_CONNECT_WITH_DB
@@ -966,6 +1026,9 @@ fn build_handshake(connection_id: u32) -> Vec<u8> {
         | CLIENT_TRANSACTIONS
         | CLIENT_SECURE_CONNECTION
         | CLIENT_PLUGIN_AUTH;
+    if tls {
+        caps |= CLIENT_SSL;
+    }
 
     let mut pkt = Vec::new();
     pkt.push(0x0a); // protocol version 10
@@ -1429,6 +1492,33 @@ fn parse_handshake_response(payload: &[u8]) -> (String, Option<String>) {
     };
 
     (user, database)
+}
+
+fn parse_oidc_response(
+    payload: &[u8],
+) -> std::result::Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    if payload.first() != Some(&1) {
+        return Err("unsupported OIDC client capability".into());
+    }
+    let mut pos = 1;
+    let marker = *payload.get(pos).ok_or("missing OIDC token length")?;
+    pos += 1;
+    let size = match marker {
+        0..=250 => marker as usize,
+        252 => {
+            let b: [u8; 2] = payload
+                .get(pos..pos + 2)
+                .ok_or("truncated OIDC length")?
+                .try_into()?;
+            pos += 2;
+            u16::from_le_bytes(b) as usize
+        }
+        _ => return Err("invalid OIDC token length".into()),
+    };
+    if size == 0 || size > 10240 || payload.len() != pos + size {
+        return Err("invalid OIDC token size".into());
+    }
+    Ok(std::str::from_utf8(&payload[pos..])?.to_owned())
 }
 
 fn read_nul_str(payload: &[u8], pos: &mut usize) -> String {
@@ -2004,7 +2094,7 @@ mod tests {
 
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.expect("accept");
-            let (mut reader, mut writer) = stream.into_split();
+            let (mut reader, mut writer) = crate::wire_tls::split(Box::new(stream));
             let mut session = SessionContext::default();
             super::handle_com_query(
                 &mut reader,
@@ -2013,6 +2103,7 @@ mod tests {
                 &mut session,
                 "SET query_tags='team:eng'",
                 0,
+                &Credentials::default(),
             )
             .await
             .expect("handle_com_query");
@@ -2028,6 +2119,25 @@ mod tests {
             buf[4], 0xff,
             "expected MySQL ERR packet when auth is required"
         );
+    }
+
+    #[test]
+    fn oidc_response_checks_capability_and_exact_length() {
+        assert_eq!(
+            parse_oidc_response(&[1, 3, b'j', b'w', b't']).unwrap(),
+            "jwt"
+        );
+        for packet in [
+            &[0, 3, b'j', b'w', b't'][..],
+            &[1, 4, b'j', b'w', b't'],
+            &[1, 3, b'j', b'w', b't', 0],
+            &[1, 252, 1],
+        ] {
+            assert!(parse_oidc_response(packet).is_err());
+        }
+        let mut packet = vec![1, 252, 44, 1];
+        packet.extend(vec![b'x'; 300]);
+        assert_eq!(parse_oidc_response(&packet).unwrap().len(), 300);
     }
 
     #[tokio::test]

@@ -107,6 +107,28 @@ impl ClusterGroupManager for SimpleClusterGroupManager {
         Ok(None)
     }
 
+    async fn acquire_specific_cluster(
+        &self,
+        group: &ClusterGroupName,
+        cluster: &ClusterName,
+    ) -> Result<Option<ClusterName>> {
+        let (clusters, _) = self
+            .groups
+            .get(group)
+            .ok_or_else(|| QueryFluxError::NoClusterGroupAvailable(group.0.clone()))?;
+        let chosen = clusters
+            .iter()
+            .find(|c| &c.cluster_name == cluster)
+            .ok_or_else(|| {
+                QueryFluxError::Routing("transaction cluster is no longer configured".into())
+            })?;
+        if chosen.is_enabled() && chosen.is_healthy() && chosen.try_increment_running() {
+            Ok(Some(chosen.cluster_name.clone()))
+        } else {
+            Ok(None)
+        }
+    }
+
     async fn release_cluster(&self, group: &ClusterGroupName, cluster: &ClusterName) -> Result<()> {
         if let Some((clusters, _)) = self.groups.get(group) {
             if let Some(state) = clusters.iter().find(|c| &c.cluster_name == cluster) {

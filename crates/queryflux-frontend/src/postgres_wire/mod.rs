@@ -10,6 +10,10 @@
 //!
 //! Results are streamed as Arrow RecordBatches and serialised to Postgres text format.
 
+mod binary;
+mod copy;
+mod extended;
+
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -37,6 +41,36 @@ use crate::state::AppState;
 use crate::{FrontendListenerTrait, ShutdownRx, MAX_FRONTEND_MESSAGE_BYTES};
 use queryflux_routing::ChainRouteResult;
 
+async fn read_startup(
+    stream: &mut crate::wire_tls::BoxIo,
+) -> std::result::Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
+    let len = checked_frontend_len(read_i32(stream).await?)?;
+    if len < 8 {
+        return Err("invalid startup length".into());
+    }
+    let mut body = vec![0; len - 4];
+    stream.read_exact(&mut body).await?;
+    Ok(body)
+}
+
+async fn read_password(
+    reader: &mut crate::wire_tls::WireReader,
+) -> std::result::Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    if read_byte(reader).await? != b'p' {
+        return Err("expected PasswordMessage".into());
+    }
+    let len = checked_frontend_len(read_i32(reader).await?)?;
+    if !(5..=16389).contains(&len) {
+        return Err("invalid credential length".into());
+    }
+    let mut body = vec![0; len - 4];
+    reader.read_exact(&mut body).await?;
+    if body.pop() != Some(0) || body.contains(&0) {
+        return Err("invalid password framing".into());
+    }
+    Ok(String::from_utf8(body)?)
+}
+
 // ── Postgres type OIDs (text-format only in V1) ───────────────────────────────
 
 const PG_OID_BOOL: i32 = 16;
@@ -52,6 +86,14 @@ const PG_OID_TIMESTAMP: i32 = 1114;
 const PG_OID_NUMERIC: i32 = 1700;
 
 static CONNECTION_ID: AtomicU32 = AtomicU32::new(1);
+static CANCELS: std::sync::LazyLock<dashmap::DashMap<(u32, u32), tokio::task::AbortHandle>> =
+    std::sync::LazyLock::new(dashmap::DashMap::new);
+struct CancelRegistration((u32, u32));
+impl Drop for CancelRegistration {
+    fn drop(&mut self) {
+        CANCELS.remove(&self.0);
+    }
+}
 
 // ── Frontend ──────────────────────────────────────────────────────────────────
 
@@ -59,6 +101,7 @@ pub struct PostgresWireFrontend {
     state: Arc<AppState>,
     port: u16,
     max_connections: Option<usize>,
+    tls: Option<queryflux_core::config::FrontendTlsConfig>,
 }
 
 impl PostgresWireFrontend {
@@ -67,7 +110,12 @@ impl PostgresWireFrontend {
             state,
             port,
             max_connections,
+            tls: None,
         }
+    }
+    pub fn with_tls(mut self, tls: Option<queryflux_core::config::FrontendTlsConfig>) -> Self {
+        self.tls = tls;
+        self
     }
 }
 
@@ -80,6 +128,7 @@ impl FrontendListenerTrait for PostgresWireFrontend {
             .await
             .map_err(|e| QueryFluxError::Other(e.into()))?;
 
+        let tls = crate::wire_tls::load_tls(self.tls.as_ref())?;
         let active = Arc::new(AtomicUsize::new(0));
         let max_conn = self.max_connections.filter(|&l| l > 0);
 
@@ -95,12 +144,13 @@ impl FrontendListenerTrait for PostgresWireFrontend {
                         }
                     }
                     debug!(peer = %peer, "Postgres wire: new connection");
+                    let tls = tls.clone();
                     let state = self.state.clone();
                     let conn_id = CONNECTION_ID.fetch_add(1, Ordering::Relaxed);
                     let active = active.clone();
                     active.fetch_add(1, Ordering::Relaxed);
                     tokio::spawn(async move {
-                        if let Err(e) = handle_connection(stream, state, conn_id).await {
+                        if let Err(e) = handle_connection(stream, state, conn_id, tls).await {
                             debug!(conn_id, "Postgres wire connection closed: {e}");
                         }
                         active.fetch_sub(1, Ordering::Relaxed);
@@ -126,46 +176,89 @@ async fn handle_connection(
     stream: TcpStream,
     state: Arc<AppState>,
     connection_id: u32,
+    tls: Option<tokio_rustls::TlsAcceptor>,
 ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
     stream.set_nodelay(true)?;
-    let (mut reader, mut writer) = stream.into_split();
+    let mut transport: crate::wire_tls::BoxIo = Box::new(stream);
+    let mut secure = false;
 
     // ── Startup phase ────────────────────────────────────────────────────────
 
-    // Read the startup message: 4-byte length + 4-byte protocol version + params.
-    let startup_len = checked_frontend_len(read_i32(&mut reader).await?)?;
-    if startup_len < 8 {
+    let mut startup_body = read_startup(&mut transport).await?;
+    let mut protocol_version = i32::from_be_bytes(startup_body[..4].try_into()?);
+    if protocol_version == 80877103 {
+        if let Some(tls) = tls {
+            transport.write_all(b"S").await?;
+            transport.flush().await?;
+            transport = Box::new(
+                tokio::time::timeout(std::time::Duration::from_secs(30), tls.accept(transport))
+                    .await??,
+            );
+            secure = true;
+        } else {
+            transport.write_all(b"N").await?;
+            transport.flush().await?;
+        }
+        startup_body = read_startup(&mut transport).await?;
+        protocol_version = i32::from_be_bytes(startup_body[..4].try_into()?);
+    }
+    if protocol_version == 80877102 {
+        if startup_body.len() == 12 {
+            let pid = u32::from_be_bytes(startup_body[4..8].try_into()?);
+            let secret = u32::from_be_bytes(startup_body[8..12].try_into()?);
+            if let Some(query) = CANCELS.get(&(pid, secret)) {
+                query.abort();
+            }
+        }
         return Ok(());
     }
-    let mut startup_body = vec![0u8; startup_len - 4];
-    reader.read_exact(&mut startup_body).await?;
-
-    let protocol_version = i32::from_be_bytes([
-        startup_body[0],
-        startup_body[1],
-        startup_body[2],
-        startup_body[3],
-    ]);
-
-    // SSL request (magic number 80877103) — tell client we don't support SSL.
-    if protocol_version == 80877103 {
-        writer.write_all(b"N").await?; // 'N' = no SSL
-        writer.flush().await?;
-        // Re-read the real startup message.
-        let real_len = checked_frontend_len(read_i32(&mut reader).await?)?;
-        if real_len < 8 {
-            return Ok(());
-        }
-        let mut real_body = vec![0u8; real_len - 4];
-        reader.read_exact(&mut real_body).await?;
-        startup_body = real_body;
+    if protocol_version != 196608 {
+        return Err("unsupported PostgreSQL protocol version".into());
     }
+    let (mut reader, mut writer) = crate::wire_tls::split(transport);
 
     let params = parse_startup_params(&startup_body[4..]);
     let user = params.get("user").cloned().unwrap_or_default();
     let database = params.get("database").cloned();
 
     info!(user, database = ?database, conn_id = connection_id, "Postgres wire: client connecting");
+
+    let provider = state.live.read().await.auth_provider.clone();
+    let kind = provider.wire_auth_kind();
+    let mut creds = Credentials {
+        username: Some(user.clone()),
+        ..Default::default()
+    };
+    if kind != queryflux_auth::provider::WireAuthKind::None {
+        if !secure {
+            write_error_response(
+                &mut writer,
+                "28000",
+                "TLS is required for credential authentication",
+            )
+            .await?;
+            return Ok(());
+        }
+        write_msg(&mut writer, b'R', &3i32.to_be_bytes()).await?;
+        writer.flush().await?;
+        let password = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            read_password(&mut reader),
+        )
+        .await??;
+        if kind == queryflux_auth::provider::WireAuthKind::Jwt {
+            creds.bearer_token = Some(password);
+        } else {
+            creds.password = Some(password);
+        }
+    }
+    let identity = match crate::lease::authenticate_initial(&state, &mut creds).await {
+        Ok(ctx) => ctx,
+        Err(e) => {
+            write_error_response(&mut writer, "28000", &e.to_string()).await?;
+            return Ok(());
+        }
+    };
 
     // AuthenticationOk
     write_msg(&mut writer, b'R', &0i32.to_be_bytes()).await?;
@@ -186,10 +279,11 @@ async fn handle_connection(
         write_msg(&mut writer, b'S', &body).await?;
     }
 
-    // BackendKeyData (conn_id as both process ID and secret — clients use this for cancellation).
+    // BackendKeyData: an unpredictable per-connection cancellation secret.
+    let cancel_secret = uuid::Uuid::new_v4().as_u128() as u32;
     let mut bkd = Vec::new();
     bkd.extend_from_slice(&connection_id.to_be_bytes());
-    bkd.extend_from_slice(&connection_id.to_be_bytes()); // secret
+    bkd.extend_from_slice(&cancel_secret.to_be_bytes()); // secret
     write_msg(&mut writer, b'K', &bkd).await?;
 
     // ReadyForQuery ('I' = idle, not in a transaction).
@@ -208,8 +302,20 @@ async fn handle_connection(
         .into_iter()
         .filter(|(k, _)| !well_known.contains(&k.as_str()))
         .collect();
+    let transaction_id = uuid::Uuid::new_v4().to_string();
+    let _rollback = crate::transaction::DisconnectRollback {
+        state: state.clone(),
+        id: transaction_id.clone(),
+    };
+    let mut extra = extra;
+    extra.insert(crate::transaction::SESSION_KEY.into(), transaction_id);
+    extra.insert("queryflux.pg_cancel_pid".into(), connection_id.to_string());
+    extra.insert(
+        "queryflux.pg_cancel_secret".into(),
+        cancel_secret.to_string(),
+    );
     let session = SessionContext {
-        user: if user.is_empty() { None } else { Some(user) },
+        user: Some(identity.user),
         database,
         // Postgres wire has no catalog concept — just a database.
         catalog: None,
@@ -217,6 +323,8 @@ async fn handle_connection(
         extra,
         agent_context: None,
     };
+
+    let mut extended = extended::Extended::default();
 
     // ── Command loop ─────────────────────────────────────────────────────────
 
@@ -237,6 +345,9 @@ async fn handle_connection(
             reader.read_exact(&mut body).await?;
         }
 
+        if extended.failed && !matches!(msg_type, b'S' | b'X' | b'H') {
+            continue;
+        }
         match msg_type {
             b'X' => break, // Terminate
 
@@ -247,23 +358,48 @@ async fn handle_connection(
                     .trim()
                     .to_string();
                 debug!(conn_id = connection_id, sql = %sql, "Postgres wire: query");
-                handle_simple_query(&mut reader, &mut writer, &state, &session, &sql).await?;
+                handle_simple_query(&mut reader, &mut writer, &state, &session, &sql, &creds)
+                    .await?;
             }
 
-            b'P' => {
-                // Parse (prepared statements) — not supported in V1.
+            b'P' | b'B' | b'D' | b'E' | b'C' => {
+                if !extended.failed {
+                    if let Err(e) = extended
+                        .handle(msg_type, &body, &mut writer, &state, &session, &creds)
+                        .await
+                    {
+                        extended.failed = true;
+                        write_error_response(&mut writer, "0A000", &e.to_string()).await?;
+                        if let Ok(identity) = crate::lease::authenticate(&state, &creds).await {
+                            if let Some(id) = session.extra.get(crate::transaction::SESSION_KEY) {
+                                if let Ok(Some(t)) = state.transactions.lookup(
+                                    id,
+                                    &identity,
+                                    &FrontendProtocol::PostgresWire,
+                                ) {
+                                    t.failed.store(true, Ordering::Release);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            b'H' => {
+                writer.flush().await?;
+            }
+            b'S' => {
+                extended.failed = false;
+                write_ready(&mut writer, &state, &session, &creds).await?;
+            }
+            b'd' | b'c' | b'f' => {
                 write_error_response(
                     &mut writer,
-                    "42000",
-                    "Prepared statements are not supported",
+                    "0A000",
+                    "COPY data requires an active COPY operation",
                 )
                 .await?;
-                write_msg(&mut writer, b'Z', b"I").await?;
-            }
-
-            b'd' | b'c' | b'f' | b'H' | b'S' => {
-                // CopyData, CopyDone, CopyFail, Flush, Sync — acknowledge.
-                write_msg(&mut writer, b'Z', b"I").await?;
+                write_ready(&mut writer, &state, &session, &creds).await?;
             }
 
             _ => {
@@ -277,7 +413,7 @@ async fn handle_connection(
                     &format!("Unsupported message type: {}", msg_type as char),
                 )
                 .await?;
-                write_msg(&mut writer, b'Z', b"I").await?;
+                write_ready(&mut writer, &state, &session, &creds).await?;
             }
         }
     }
@@ -289,52 +425,73 @@ async fn handle_connection(
 // ── Query execution ───────────────────────────────────────────────────────────
 
 async fn handle_simple_query(
-    reader: &mut tokio::net::tcp::OwnedReadHalf,
-    writer: &mut tokio::net::tcp::OwnedWriteHalf,
+    reader: &mut crate::wire_tls::WireReader,
+    writer: &mut crate::wire_tls::WireWriter,
     state: &Arc<AppState>,
     session: &SessionContext,
     sql: &str,
+    creds: &Credentials,
 ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if sql.is_empty() {
         // Empty query: EmptyQueryResponse + ReadyForQuery.
         write_msg(writer, b'I', &[]).await?;
-        write_msg(writer, b'Z', b"I").await?;
+        write_ready(writer, state, session, creds).await?;
         return Ok(());
     }
 
+    let parse_sql = sql.to_owned();
+    let tokens = queryflux_core::polyglot_pool::run(move || {
+        polyglot_sql::dialects::Dialect::get(polyglot_sql::DialectType::PostgreSQL)
+            .tokenize(&parse_sql)
+    });
+    let tokens = match tokens {
+        Some(Ok(tokens)) => tokens,
+        _ => {
+            write_error_response(writer, "42601", "Invalid SQL token framing").await?;
+            write_ready(writer, state, session, creds).await?;
+            return Ok(());
+        }
+    };
+    if tokens.iter().enumerate().any(|(i, token)| {
+        token.token_type == polyglot_sql::tokens::TokenType::Semicolon && i + 1 < tokens.len()
+    }) {
+        write_error_response(writer, "0A000", "Send one SQL statement per request; multi-statement simple query batches are not supported yet").await?;
+        write_ready(writer, state, session, creds).await?;
+        return Ok(());
+    }
     let sql_lower = sql.trim().to_lowercase();
 
     let protocol = FrontendProtocol::PostgresWire;
 
-    // No `bearer_token` captured here — the Postgres wire startup message carries only a
-    // username (password auth, if any, happens in a separate AuthenticationMD5Password/
-    // cleartext exchange this handler doesn't thread through to `Credentials`). That means
-    // `AuthContext.raw_token` is always `None` for this frontend, so `queryAuth: passthrough`
-    // / `tokenExchange` on a backend cluster can never resolve a per-user credential when
-    // reached this way — only `serviceAccount` (and `impersonate`, backend-side) work.
-    // Use the Trino HTTP or Flight SQL frontend when per-user backend identity is required.
-    let creds = Credentials {
-        username: session.user().map(|s| s.to_string()),
-        ..Default::default()
-    };
-    let auth_provider = state.live.read().await.auth_provider.clone();
-    let auth_ctx = match auth_provider.authenticate(&creds).await {
+    let auth_ctx = match crate::lease::authenticate(state, creds).await {
         Ok(ctx) => ctx,
         Err(e) => {
             state
                 .metrics
                 .on_auth_failure(&format!("{:?}", FrontendProtocol::PostgresWire));
             write_error_response(writer, "28000", &e.to_string()).await?;
-            write_msg(writer, b'Z', b"I").await?;
+            write_ready(writer, state, session, creds).await?;
             return Ok(());
         }
     };
+
+    if queryflux_core::sql_classify::strip_leading_sql_comments(sql)
+        .trim_start()
+        .to_ascii_uppercase()
+        .starts_with("COPY ")
+    {
+        if let Err(e) = copy::run(reader, writer, state, session, sql, creds).await {
+            write_error_response(writer, "0A000", &e.to_string()).await?;
+        }
+        write_ready(writer, state, session, creds).await?;
+        return Ok(());
+    }
 
     // Auth-complete fast path: `SET` statements are handled locally by the proxy,
     // but must still go through authentication when `auth.required=true`.
     if sql_lower.starts_with("set ") || sql_lower.starts_with("set\t") {
         write_msg(writer, b'C', b"SET\0").await?;
-        write_msg(writer, b'Z', b"I").await?;
+        write_ready(writer, state, session, creds).await?;
         return Ok(());
     }
 
@@ -348,7 +505,7 @@ async fn handle_simple_query(
         Ok(r) => r,
         Err(e) => {
             write_error_response(writer, "42000", &e.to_string()).await?;
-            write_msg(writer, b'Z', b"I").await?;
+            write_ready(writer, state, session, creds).await?;
             return Ok(());
         }
     };
@@ -358,7 +515,7 @@ async fn handle_simple_query(
             state.record_routing_deny(sql, session, protocol, &message, Some(routing_trace));
             // 42501 = insufficient_privilege
             write_error_response(writer, "42501", &message).await?;
-            write_msg(writer, b'Z', b"I").await?;
+            write_ready(writer, state, session, creds).await?;
             return Ok(());
         }
     };
@@ -369,15 +526,60 @@ async fn handle_simple_query(
         Ok(g) => g,
         Err(QueryFluxError::Unauthorized(msg)) => {
             write_error_response(writer, "42501", &msg).await?;
-            write_msg(writer, b'Z', b"I").await?;
+            write_ready(writer, state, session, creds).await?;
             return Ok(());
         }
         Err(e) => {
             write_error_response(writer, "42000", &e.to_string()).await?;
-            write_msg(writer, b'Z', b"I").await?;
+            write_ready(writer, state, session, creds).await?;
             return Ok(());
         }
     };
+
+    let id = session
+        .extra
+        .get(crate::transaction::SESSION_KEY)
+        .expect("connection transaction id");
+    if crate::transaction::transaction_command(sql).is_some() {
+        match state
+            .transactions
+            .begin(state, id, group, &auth_ctx, protocol, session)
+            .await
+        {
+            Ok(()) => write_msg(writer, b'C', b"BEGIN\0").await?,
+            Err(e) => write_error_response(writer, "0A000", &e.to_string()).await?,
+        }
+        write_ready(writer, state, session, creds).await?;
+        return Ok(());
+    }
+    if let Some(commit) = crate::transaction::transaction_end(sql) {
+        let failed = state
+            .transactions
+            .lookup(id, &auth_ctx, &protocol)
+            .map(|t| t.is_some_and(|t| t.failed.load(Ordering::Acquire)))
+            .unwrap_or(true);
+        match state
+            .transactions
+            .finish(id, &auth_ctx, &protocol, commit)
+            .await
+        {
+            Ok(()) => {
+                write_msg(
+                    writer,
+                    b'C',
+                    if commit && !failed {
+                        b"COMMIT\0"
+                    } else {
+                        b"ROLLBACK\0"
+                    },
+                )
+                .await?
+            }
+            Err(e) => write_error_response(writer, "XX000", &e.to_string()).await?,
+        }
+        write_ready(writer, state, session, creds).await?;
+        return Ok(());
+    }
 
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
     let mut sink = PostgresResultSink::new(tx, sql);
@@ -386,7 +588,8 @@ async fn handle_simple_query(
     let session2 = session.clone();
     let sql2 = sql.to_string();
 
-    let exec_task = AbortOnDrop::new(tokio::spawn(async move {
+    let cancel_group = group.clone();
+    let exec_task = tokio::spawn(async move {
         execute_to_sink(
             &state2,
             sql2,
@@ -399,7 +602,42 @@ async fn handle_simple_query(
         )
         .await
         // sink drops here, closing tx
-    }));
+    });
+
+    let cancellation_supported = {
+        let live = state.live.read().await;
+        live.group_members
+            .get(&cancel_group.0)
+            .is_some_and(|members| {
+                !members.is_empty()
+                    && members.iter().all(|name| match live.adapters.get(name) {
+                        Some(queryflux_engine_adapters::AdapterKind::Sync(a)) => {
+                            a.supports_cancellation()
+                        }
+                        Some(queryflux_engine_adapters::AdapterKind::Async(_)) => true,
+                        None => false,
+                    })
+            })
+    };
+    let cancel_key = session
+        .extra
+        .get("queryflux.pg_cancel_pid")
+        .and_then(|p| p.parse::<u32>().ok())
+        .zip(
+            session
+                .extra
+                .get("queryflux.pg_cancel_secret")
+                .and_then(|p| p.parse::<u32>().ok()),
+        );
+    let _registration = if cancellation_supported {
+        cancel_key.map(|key| {
+            CANCELS.insert(key, exec_task.abort_handle());
+            CancelRegistration(key)
+        })
+    } else {
+        None
+    };
+    let exec_task = AbortOnDrop::new(exec_task);
 
     // Forward encoded Postgres messages. Abort the engine query if the client
     // closes (or sends another message) while we are still waiting for results.
@@ -422,12 +660,48 @@ async fn handle_simple_query(
     }
 
     if let Err(e) = exec_task.join().await {
-        warn!("Postgres query task panicked: {e}");
+        if e.is_cancelled() {
+            write_error_response(writer, "57014", "canceling statement due to user request")
+                .await?;
+        } else {
+            warn!("Postgres query task panicked: {e}");
+            write_error_response(writer, "XX000", "query task failed").await?;
+        }
     }
 
     // ReadyForQuery after each command.
-    write_msg(writer, b'Z', b"I").await?;
+    write_ready(writer, state, session, creds).await?;
     Ok(())
+}
+
+async fn write_ready(
+    writer: &mut crate::wire_tls::WireWriter,
+    state: &AppState,
+    session: &SessionContext,
+    creds: &Credentials,
+) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let status = match crate::lease::authenticate(state, creds).await {
+        Ok(identity) => match session.extra.get(crate::transaction::SESSION_KEY) {
+            Some(id) => {
+                match state
+                    .transactions
+                    .lookup(id, &identity, &FrontendProtocol::PostgresWire)
+                {
+                    Ok(Some(t)) => {
+                        if t.failed.load(Ordering::Acquire) {
+                            b'E'
+                        } else {
+                            b'T'
+                        }
+                    }
+                    _ => b'I',
+                }
+            }
+            None => b'I',
+        },
+        Err(_) => b'I',
+    };
+    write_msg(writer, b'Z', &[status]).await
 }
 
 // ── PostgresResultSink ────────────────────────────────────────────────────────
@@ -1059,13 +1333,14 @@ mod tests {
 
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.expect("accept");
-            let (mut reader, mut writer) = stream.into_split();
+            let (mut reader, mut writer) = crate::wire_tls::split(Box::new(stream));
             super::handle_simple_query(
                 &mut reader,
                 &mut writer,
                 &state,
                 &session,
                 "SET search_path = public",
+                &Credentials::default(),
             )
             .await
             .expect("handle_simple_query");
@@ -1088,5 +1363,386 @@ mod tests {
         assert!(checked_frontend_len(-1).is_err());
         assert!(checked_frontend_len((MAX_FRONTEND_MESSAGE_BYTES + 1) as i32).is_err());
         assert_eq!(checked_frontend_len(8).unwrap(), 8);
+    }
+}
+
+#[cfg(test)]
+mod native_integration_tests {
+    use super::*;
+    async fn fixture() -> (Arc<AppState>, TcpListener) {
+        use queryflux_core::query::{ClusterGroupName, ClusterName};
+        use queryflux_engine_adapters::{
+            duckdb::{DuckDbAdapter, DuckDbConfig},
+            AdapterKind,
+        };
+        let state = crate::state::test_fixtures::app_state(false);
+        let adapter = Arc::new(
+            DuckDbAdapter::new(
+                ClusterName("trino".into()),
+                ClusterGroupName("default".into()),
+                DuckDbConfig {
+                    database_path: None,
+                    motherduck_token: None,
+                    pool_size: 1,
+                    max_result_buffer_bytes: 16 * 1024 * 1024,
+                },
+            )
+            .unwrap(),
+        );
+        state
+            .live
+            .write()
+            .await
+            .adapters
+            .insert("trino".into(), AdapterKind::Sync(adapter));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        (state, listener)
+    }
+    async fn send(stream: &mut TcpStream, kind: u8, body: &[u8]) {
+        let mut packet = vec![kind];
+        packet.extend_from_slice(&((body.len() + 4) as i32).to_be_bytes());
+        packet.extend_from_slice(body);
+        stream.write_all(&packet).await.unwrap();
+    }
+    async fn receive(stream: &mut TcpStream) -> (u8, Vec<u8>) {
+        let kind = tokio::time::timeout(std::time::Duration::from_secs(10), stream.read_u8())
+            .await
+            .unwrap()
+            .unwrap();
+        let length = stream.read_i32().await.unwrap();
+        let mut bytes = vec![0; length as usize - 4];
+        stream.read_exact(&mut bytes).await.unwrap();
+        (kind, bytes)
+    }
+    async fn connect_fixture() -> (TcpStream, tokio::task::JoinHandle<()>) {
+        let (state, listener) = fixture().await;
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            handle_connection(socket, state, 901, None).await.unwrap();
+        });
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let mut body = 196608i32.to_be_bytes().to_vec();
+        body.extend_from_slice(b"user\0alice\0database\0default\0\0");
+        stream
+            .write_all(&((body.len() + 4) as i32).to_be_bytes())
+            .await
+            .unwrap();
+        stream.write_all(&body).await.unwrap();
+        loop {
+            if receive(&mut stream).await.0 == b'Z' {
+                break;
+            }
+        }
+        (stream, server)
+    }
+    #[tokio::test]
+    async fn protocol_portal_suspends_and_resumes_without_reexecution() {
+        let (mut stream, server) = connect_fixture().await;
+        let mut parse = b"stmt\0SELECT n FROM (VALUES (1), (2), (3)) AS t(n)\0".to_vec();
+        parse.extend_from_slice(&0i16.to_be_bytes());
+        send(&mut stream, b'P', &parse).await;
+        let mut bind = b"portal\0stmt\0".to_vec();
+        bind.extend_from_slice(&[0; 6]);
+        send(&mut stream, b'B', &bind).await;
+        send(&mut stream, b'D', b"Pportal\0").await;
+        let mut exec = b"portal\0".to_vec();
+        exec.extend_from_slice(&2i32.to_be_bytes());
+        send(&mut stream, b'E', &exec).await;
+        for kind in [b'1', b'2', b'T', b'D', b'D', b's'] {
+            let (got, body) = receive(&mut stream).await;
+            assert_eq!(got, kind, "{}", String::from_utf8_lossy(&body));
+        }
+        let mut exec = b"portal\0".to_vec();
+        exec.extend_from_slice(&0i32.to_be_bytes());
+        send(&mut stream, b'E', &exec).await;
+        send(&mut stream, b'S', &[]).await;
+        for kind in [b'D', b'C', b'Z'] {
+            let (got, body) = receive(&mut stream).await;
+            assert_eq!(got, kind, "{}", String::from_utf8_lossy(&body));
+        }
+        send(&mut stream, b'X', &[]).await;
+        drop(stream);
+        server.await.unwrap();
+    }
+    #[tokio::test]
+    async fn protocol_binary_integer_parameter_and_result() {
+        let (mut stream, server) = connect_fixture().await;
+        let mut parse = b"stmt\0SELECT $1::INTEGER + 1 AS answer\0".to_vec();
+        parse.extend_from_slice(&1i16.to_be_bytes());
+        parse.extend_from_slice(&PG_OID_INT4.to_be_bytes());
+        send(&mut stream, b'P', &parse).await;
+        let mut bind = b"portal\0stmt\0".to_vec();
+        bind.extend_from_slice(&1i16.to_be_bytes());
+        bind.extend_from_slice(&1i16.to_be_bytes());
+        bind.extend_from_slice(&1i16.to_be_bytes());
+        bind.extend_from_slice(&4i32.to_be_bytes());
+        bind.extend_from_slice(&41i32.to_be_bytes());
+        bind.extend_from_slice(&1i16.to_be_bytes());
+        bind.extend_from_slice(&1i16.to_be_bytes());
+        send(&mut stream, b'B', &bind).await;
+        send(&mut stream, b'D', b"Pportal\0").await;
+        let mut exec = b"portal\0".to_vec();
+        exec.extend_from_slice(&0i32.to_be_bytes());
+        send(&mut stream, b'E', &exec).await;
+        send(&mut stream, b'S', &[]).await;
+        for kind in [b'1', b'2', b'T'] {
+            let (got, body) = receive(&mut stream).await;
+            assert_eq!(got, kind, "{}", String::from_utf8_lossy(&body));
+        }
+        let (kind, body) = receive(&mut stream).await;
+        assert_eq!(kind, b'D');
+        assert_eq!(body, [0, 1, 0, 0, 0, 4, 0, 0, 0, 42]);
+        assert_eq!(receive(&mut stream).await.0, b'C');
+        assert_eq!(receive(&mut stream).await.0, b'Z');
+        send(&mut stream, b'X', &[]).await;
+        drop(stream);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn native_psql_tls_jwt_validates_jwks_and_rejects_forgery() {
+        use base64::Engine;
+        if std::process::Command::new("psql")
+            .arg("--version")
+            .output()
+            .is_err()
+            || std::process::Command::new("openssl")
+                .arg("version")
+                .output()
+                .is_err()
+        {
+            eprintln!("psql/openssl unavailable; TLS OIDC integration skipped");
+            return;
+        }
+        struct Temp(std::path::PathBuf);
+        impl Drop for Temp {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let temp = Temp(
+            std::env::temp_dir().join(format!("queryflux-pg-tls-test-{}", uuid::Uuid::new_v4())),
+        );
+        std::fs::create_dir_all(&temp.0).unwrap();
+        let cert = temp.0.join("cert.pem");
+        let key = temp.0.join("key.pem");
+        let result = std::process::Command::new("openssl")
+            .args([
+                "req",
+                "-x509",
+                "-newkey",
+                "rsa:2048",
+                "-nodes",
+                "-days",
+                "1",
+                "-subj",
+                "/CN=127.0.0.1",
+                "-addext",
+                "subjectAltName=IP:127.0.0.1",
+                "-keyout",
+            ])
+            .arg(&key)
+            .arg("-out")
+            .arg(&cert)
+            .output()
+            .unwrap();
+        assert!(result.status.success());
+        let jwks: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../queryflux-auth/tests/fixtures/oidc-test-jwks.json"
+        ))
+        .unwrap();
+        let jwks_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let jwks_port = jwks_listener.local_addr().unwrap().port();
+        let jwks_server = AbortOnDrop::new(tokio::spawn(async move {
+            axum::serve(
+                jwks_listener,
+                axum::Router::new().route(
+                    "/jwks",
+                    axum::routing::get(move || {
+                        let keys = jwks.clone();
+                        async move { axum::Json(keys) }
+                    }),
+                ),
+            )
+            .await
+            .unwrap();
+        }));
+        let (state, listener) = fixture().await;
+        let port = listener.local_addr().unwrap().port();
+        state.live.write().await.auth_provider = Arc::new(queryflux_auth::OidcAuthProvider::new(
+            queryflux_core::config::OidcConfig {
+                issuer: "https://test.knorket.invalid".into(),
+                jwks_uri: format!("http://127.0.0.1:{jwks_port}/jwks"),
+                audience: Some("cluster-a".into()),
+                groups_claim: "groups".into(),
+                roles_claim: Some("role".into()),
+                attribute_claims: vec!["tenant_id".into(), "cluster_id".into()],
+            },
+            true,
+        ));
+        state.live.write().await.authorization = Arc::new(
+            queryflux_auth::SimpleAuthorizationPolicy::new(HashMap::from([(
+                "default".into(),
+                queryflux_core::config::ClusterGroupAuthorizationConfig {
+                    allow_groups: vec![],
+                    allow_users: vec!["verified-user".into()],
+                },
+            )])),
+        );
+        let header = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(br#"{"alg":"RS256","typ":"JWT","kid":"test-only"}"#);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let claims = serde_json::json!({"iss":"https://test.knorket.invalid","aud":"cluster-a","sub":"verified-user","exp":now+1800,"iat":now,"tenant_id":"tenant-a","cluster_id":"cluster-a","token_type":"cluster_access","role":"reader"});
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(claims.to_string());
+        let unsigned = format!("{header}.{payload}");
+        let fixture_key = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../queryflux-auth/tests/fixtures/oidc-test-private.pem");
+        let mut signer = std::process::Command::new("openssl")
+            .args(["dgst", "-sha256", "-sign"])
+            .arg(fixture_key)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        std::io::Write::write_all(&mut signer.stdin.take().unwrap(), unsigned.as_bytes()).unwrap();
+        let signature = signer.wait_with_output().unwrap();
+        assert!(signature.status.success());
+        let jwt = format!(
+            "{unsigned}.{}",
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(signature.stdout)
+        );
+        let tls = crate::wire_tls::load_tls(Some(&queryflux_core::config::FrontendTlsConfig {
+            cert_file: cert.to_string_lossy().into(),
+            key_file: key.to_string_lossy().into(),
+        }))
+        .unwrap();
+        let server = tokio::spawn(async move {
+            for id in 910..912 {
+                let (socket, _) = listener.accept().await.unwrap();
+                let _ = handle_connection(socket, state.clone(), id, tls.clone()).await;
+            }
+        });
+        for (token, success) in [(jwt, true), (format!("{unsigned}.AAAA"), false)] {
+            let output = tokio::process::Command::new("psql")
+                .args([
+                    "-X",
+                    "-w",
+                    "-h",
+                    "127.0.0.1",
+                    "-p",
+                    &port.to_string(),
+                    "-U",
+                    "spoofed-user",
+                    "-d",
+                    "default",
+                    "-At",
+                    "-c",
+                    "SELECT 1",
+                ])
+                .env("PGSSLMODE", "verify-full")
+                .env("PGSSLROOTCERT", &cert)
+                .env("PGGSSENCMODE", "disable")
+                .env("PGPASSWORD", token)
+                .env_remove("PGSERVICE")
+                .output()
+                .await
+                .unwrap();
+            assert_eq!(
+                output.status.success(),
+                success,
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            if success {
+                assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "1");
+            }
+        }
+        server.await.unwrap();
+        drop(jwks_server);
+    }
+
+    #[tokio::test]
+    async fn native_psql_transactions_and_copy_text() {
+        if std::process::Command::new("psql")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            eprintln!("psql is unavailable; native integration skipped");
+            return;
+        }
+        let (state, listener) = fixture().await;
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            handle_connection(socket, state, 900, None).await.unwrap();
+        });
+        let mut command = tokio::process::Command::new("psql");
+        command
+            .args([
+                "-X",
+                "-w",
+                "-h",
+                "127.0.0.1",
+                "-p",
+                &port.to_string(),
+                "-U",
+                "alice",
+                "-d",
+                "default",
+                "-v",
+                "ON_ERROR_STOP=1",
+                "-At",
+            ])
+            .args([
+                "-c",
+                "CREATE TABLE native_rows (n INTEGER, label VARCHAR)",
+                "-c",
+                "BEGIN",
+                "-c",
+                "INSERT INTO native_rows VALUES (99, 'rollback')",
+                "-c",
+                "ROLLBACK",
+                "-c",
+                "\\copy native_rows FROM STDIN",
+                "-c",
+                "SELECT n, label FROM native_rows ORDER BY n",
+                "-c",
+                "\\copy native_rows TO STDOUT",
+            ])
+            .env("PGSSLMODE", "disable")
+            .env("PGGSSENCMODE", "disable")
+            .env_remove("PGPASSWORD")
+            .env_remove("PGSERVICE")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let mut child = command.spawn().unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(b"1\tfirst\n2\tsecond\n")
+            .await
+            .unwrap();
+        let output =
+            tokio::time::timeout(std::time::Duration::from_secs(30), child.wait_with_output())
+                .await
+                .unwrap()
+                .unwrap();
+        assert!(
+            output.status.success(),
+            "psql failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert!(stdout.contains("1|first"), "{stdout}");
+        assert!(stdout.contains("2\tsecond"), "{stdout}");
+        assert!(!stdout.contains("rollback"), "{stdout}");
+        server.await.unwrap();
     }
 }

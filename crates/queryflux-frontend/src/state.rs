@@ -86,6 +86,8 @@ pub struct LiveConfig {
 /// Shared application state — passed to every handler via `axum::extract::State`.
 /// Shared across all frontend protocol implementations (Trino HTTP, PG wire, etc.).
 pub struct AppState {
+    pub transactions: crate::transaction::Transactions,
+    pub native_leases: crate::lease::LeaseStore,
     /// The external URL clients use to reach QueryFlux (used for nextUri rewriting).
     pub external_address: String,
     /// Hot-reloadable: routing rules, cluster registry, auth, authorization.
@@ -696,6 +698,8 @@ pub mod test_fixtures {
             catalog: Arc::new(queryflux_core::catalog::NullCatalogProvider),
         };
         Arc::new(AppState {
+            transactions: Default::default(),
+            native_leases: Default::default(),
             external_address: "http://127.0.0.1:8080".into(),
             live: Arc::new(RwLock::new(live)),
             persistence: Arc::new(InMemoryPersistence::new()),

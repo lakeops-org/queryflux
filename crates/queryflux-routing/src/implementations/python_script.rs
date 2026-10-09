@@ -70,7 +70,7 @@ fn protocol_camel(p: FrontendProtocol) -> &'static str {
         FrontendProtocol::TrinoHttp => "trinoHttp",
         FrontendProtocol::PostgresWire => "postgresWire",
         FrontendProtocol::MySqlWire => "mysqlWire",
-        FrontendProtocol::ClickHouseHttp => "clickHouseHttp",
+        FrontendProtocol::ClickHouseHttp | FrontendProtocol::ClickHouseNative => "clickHouseHttp",
         FrontendProtocol::FlightSql => "flightSql",
         FrontendProtocol::SnowflakeHttp => "snowflakeHttp",
         FrontendProtocol::SnowflakeSqlApi => "snowflakeSqlApi",

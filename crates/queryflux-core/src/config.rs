@@ -746,6 +746,8 @@ pub struct FrontendsConfig {
     #[serde(default)]
     pub clickhouse_http: Option<FrontendConfig>,
     #[serde(default)]
+    pub clickhouse_native: Option<FrontendConfig>,
+    #[serde(default)]
     pub flight_sql: Option<FrontendConfig>,
     #[serde(default)]
     pub snowflake_http: Option<SnowflakeHttpFrontendConfig>,
@@ -766,6 +768,16 @@ pub struct FrontendConfig {
     /// that are idle between requests do not count against it. `None` or `0` = unlimited.
     #[serde(default)]
     pub max_connections: Option<usize>,
+    /// PEM server certificate chain and private key for SQL wire TLS.
+    #[serde(default)]
+    pub tls: Option<FrontendTlsConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FrontendTlsConfig {
+    pub cert_file: String,
+    pub key_file: String,
 }
 
 impl Default for FrontendConfig {
@@ -774,6 +786,7 @@ impl Default for FrontendConfig {
             enabled: true,
             port: 8080,
             max_connections: None,
+            tls: None,
         }
     }
 }
@@ -1654,22 +1667,20 @@ pub fn query_auth_supported(
     };
     match engine {
         Some(EngineConfig::Trino) => Ok(()),
-        Some(EngineConfig::ClickHouse) if matches!(mode, QueryAuthConfig::Impersonate) => Ok(()),
-        Some(EngineConfig::ClickHouse) => Err(format!(
-            "queryAuth.type = {mode_name} is not supported for ClickHouse in this release \
-             (only impersonate, self-hosted ClickHouse 25.11+ with \
-             access_control_improvements.allow_impersonate_user = 1 and GRANT IMPERSONATE — \
-             not supported on ClickHouse Cloud)"
-        )),
-        // `passthrough` here means LDAP-password `COM_CHANGE_USER`, not a bearer token —
-        // see `mysql_native::apply_passthrough_identity`. Only valid when the cluster's own
-        // TLS + `enable_cleartext_plugin` requirements are met; the adapter constructor
-        // (`StarRocksAdapter::new`) enforces that, not this function (it doesn't have the
-        // connection URL). `impersonate`/`tokenExchange` have no StarRocks mechanism.
-        Some(EngineConfig::StarRocks) if matches!(mode, QueryAuthConfig::Passthrough) => Ok(()),
+        Some(EngineConfig::ClickHouse) => Ok(()),
+        // StarRocks authenticates dedicated per-query connections using LDAP passwords
+        // or the MySQL OIDC plugin. Construction enforces encrypted backend transport.
+        Some(EngineConfig::StarRocks)
+            if matches!(
+                mode,
+                QueryAuthConfig::Passthrough | QueryAuthConfig::TokenExchange(_)
+            ) =>
+        {
+            Ok(())
+        }
         Some(EngineConfig::StarRocks) => Err(format!(
             "queryAuth.type = {mode_name} is not supported for StarRocks in this release \
-             (only passthrough, which requires TLS on the cluster endpoint — see \
+             (passthrough or tokenExchange require TLS on the cluster endpoint — see \
              auth-authz-design.md \"StarRocks\")"
         )),
         Some(EngineConfig::Adbc)
@@ -2172,7 +2183,7 @@ mod tests {
     }
 
     #[test]
-    fn starrocks_allows_only_passthrough() {
+    fn starrocks_allows_password_or_oidc_passthrough_and_token_exchange() {
         assert!(query_auth_supported(
             Some(&EngineConfig::StarRocks),
             None,
@@ -2187,7 +2198,7 @@ mod tests {
         .is_err());
         assert!(
             query_auth_supported(Some(&EngineConfig::StarRocks), None, &token_exchange_mode())
-                .is_err()
+                .is_ok()
         );
         assert!(query_auth_supported(
             Some(&EngineConfig::StarRocks),
@@ -2198,7 +2209,7 @@ mod tests {
     }
 
     #[test]
-    fn clickhouse_allows_only_impersonate() {
+    fn clickhouse_allows_impersonation_and_bearer_identity() {
         assert!(query_auth_supported(
             Some(&EngineConfig::ClickHouse),
             None,
@@ -2210,13 +2221,13 @@ mod tests {
             None,
             &QueryAuthConfig::Passthrough
         )
-        .is_err());
+        .is_ok());
         assert!(query_auth_supported(
             Some(&EngineConfig::ClickHouse),
             None,
             &token_exchange_mode()
         )
-        .is_err());
+        .is_ok());
     }
 
     #[test]

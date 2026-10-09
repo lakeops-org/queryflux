@@ -365,6 +365,8 @@ impl TestHarness {
         };
         let records = Arc::new(Mutex::new(Vec::<QueryRecord>::new()));
         let state = Arc::new(AppState {
+            transactions: Default::default(),
+            native_leases: Default::default(),
             external_address: format!("http://127.0.0.1:{port}"),
             live: Arc::new(tokio::sync::RwLock::new(live_config)),
             persistence: Arc::new(InMemoryPersistence::new()),
@@ -618,6 +620,8 @@ impl WireTestHarness {
         };
 
         let state = Arc::new(AppState {
+            transactions: Default::default(),
+            native_leases: Default::default(),
             external_address: format!("http://127.0.0.1:{port}"),
             live: Arc::new(tokio::sync::RwLock::new(live_config)),
             persistence: Arc::new(InMemoryPersistence::new()),
@@ -765,6 +769,8 @@ impl WireTestHarness {
         };
 
         let state = Arc::new(AppState {
+            transactions: Default::default(),
+            native_leases: Default::default(),
             external_address: format!("http://127.0.0.1:{port}"),
             live: Arc::new(tokio::sync::RwLock::new(live_config)),
             persistence: Arc::new(InMemoryPersistence::new()),
@@ -1008,6 +1014,8 @@ impl ProtocolWireHarness {
 
         let records: Arc<Mutex<Vec<QueryRecord>>> = Arc::new(Mutex::new(Vec::new()));
         let state = Arc::new(AppState {
+            transactions: Default::default(),
+            native_leases: Default::default(),
             external_address: "http://127.0.0.1:0".to_string(),
             live: Arc::new(tokio::sync::RwLock::new(live_config)),
             persistence: Arc::new(InMemoryPersistence::new()),

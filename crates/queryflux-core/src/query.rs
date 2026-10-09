@@ -66,6 +66,7 @@ pub enum FrontendProtocol {
     PostgresWire,
     MySqlWire,
     ClickHouseHttp,
+    ClickHouseNative,
     FlightSql,
     /// Snowflake HTTP wire (session + query endpoints) used by JDBC/ODBC/Python connectors.
     SnowflakeHttp,
@@ -82,7 +83,9 @@ impl FrontendProtocol {
             FrontendProtocol::TrinoHttp => SqlDialect::Trino,
             FrontendProtocol::PostgresWire => SqlDialect::Postgres,
             FrontendProtocol::MySqlWire => SqlDialect::MySql,
-            FrontendProtocol::ClickHouseHttp => SqlDialect::ClickHouse,
+            FrontendProtocol::ClickHouseHttp | FrontendProtocol::ClickHouseNative => {
+                SqlDialect::ClickHouse
+            }
             FrontendProtocol::FlightSql | FrontendProtocol::Mcp => SqlDialect::Generic,
             FrontendProtocol::SnowflakeHttp | FrontendProtocol::SnowflakeSqlApi => {
                 SqlDialect::Snowflake

@@ -38,7 +38,9 @@ impl RouterTrait for ProtocolBasedRouter {
             FrontendProtocol::TrinoHttp => self.trino_http.clone(),
             FrontendProtocol::PostgresWire => self.postgres_wire.clone(),
             FrontendProtocol::MySqlWire => self.mysql_wire.clone(),
-            FrontendProtocol::ClickHouseHttp => self.clickhouse_http.clone(),
+            FrontendProtocol::ClickHouseHttp | FrontendProtocol::ClickHouseNative => {
+                self.clickhouse_http.clone()
+            }
             FrontendProtocol::FlightSql => self.flight_sql.clone(),
             FrontendProtocol::SnowflakeHttp => self.snowflake_http.clone(),
             FrontendProtocol::SnowflakeSqlApi => self.snowflake_sql_api.clone(),

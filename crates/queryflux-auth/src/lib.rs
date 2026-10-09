@@ -14,3 +14,5 @@ pub use credentials::{require_query_owner, AuthContext, Credentials, QueryCreden
 pub use ldap::LdapAuthProvider;
 pub use provider::{AuthProvider, NoneAuthProvider, OidcAuthProvider, StaticAuthProvider};
 pub use resolver::BackendIdentityResolver;
+
+pub mod lease;

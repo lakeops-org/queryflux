@@ -18,6 +18,17 @@ pub trait ClusterGroupManager: Send + Sync {
     /// Returns `None` if the group is at capacity (triggers queueing).
     async fn acquire_cluster(&self, group: &ClusterGroupName) -> Result<Option<ClusterName>>;
 
+    /// Acquire capacity on the exact cluster owning a transaction; never reroute.
+    async fn acquire_specific_cluster(
+        &self,
+        _group: &ClusterGroupName,
+        _cluster: &ClusterName,
+    ) -> Result<Option<ClusterName>> {
+        Err(queryflux_core::error::QueryFluxError::Routing(
+            "manager does not support pinned transactions".into(),
+        ))
+    }
+
     /// Signal that a query has finished on a cluster (success, failure, or cancel).
     async fn release_cluster(&self, group: &ClusterGroupName, cluster: &ClusterName) -> Result<()>;
 

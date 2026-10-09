@@ -1,5 +1,6 @@
 pub mod api;
 
+mod transaction;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -355,6 +356,12 @@ impl TrinoAdapter {
 
 #[async_trait]
 impl AsyncAdapter for TrinoAdapter {
+    async fn begin_transaction(
+        &self,
+        session: &SessionContext,
+    ) -> Result<Arc<dyn crate::SyncAdapter>> {
+        transaction::open(self.clone(), session.clone()).await
+    }
     async fn submit_query(
         &self,
         sql: &str,
@@ -550,6 +557,17 @@ impl AsyncAdapter for TrinoAdapter {
         use crate::SyncExecution;
         use queryflux_core::query::QueryPollResult;
         use tokio_stream::wrappers::ReceiverStream;
+
+        let service_session;
+        let session = if matches!(
+            credentials,
+            queryflux_auth::QueryCredentials::ServiceAccount
+        ) {
+            service_session = transaction::service_session(self, session);
+            &service_session
+        } else {
+            session
+        };
 
         // Resolve once, before submit, so the exact same wire auth used for the initial
         // POST is reused for every poll/cancel this execution performs — mirrors what

@@ -22,16 +22,18 @@ use arrow::record_batch::RecordBatch;
 use arrow_flight::encode::FlightDataEncoderBuilder;
 use arrow_flight::error::FlightError;
 use arrow_flight::sql::{
-    server::FlightSqlService, CommandStatementQuery, ProstMessageExt, SqlInfo, TicketStatementQuery,
+    server::FlightSqlService, ActionBeginTransactionRequest, ActionBeginTransactionResult,
+    ActionEndTransactionRequest, CommandStatementQuery, ProstMessageExt, SqlInfo,
+    TicketStatementQuery,
 };
 use arrow_flight::{
-    flight_service_server::FlightServiceServer, FlightDescriptor, FlightEndpoint, FlightInfo,
-    SchemaAsIpc, Ticket,
+    flight_service_server::FlightServiceServer, Action, FlightDescriptor, FlightEndpoint,
+    FlightInfo, SchemaAsIpc, Ticket,
 };
 use async_trait::async_trait;
 use futures::{Stream, StreamExt};
 use prost::Message;
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::mpsc::Sender;
 use tonic::{Request, Response, Status};
 use tracing::{debug, info};
 
@@ -54,6 +56,7 @@ pub struct FlightSqlFrontend {
     state: Arc<AppState>,
     port: u16,
     max_connections: Option<usize>,
+    tls: Option<queryflux_core::config::FrontendTlsConfig>,
 }
 
 impl FlightSqlFrontend {
@@ -62,7 +65,12 @@ impl FlightSqlFrontend {
             state,
             port,
             max_connections,
+            tls: None,
         }
+    }
+    pub fn with_tls(mut self, tls: Option<queryflux_core::config::FrontendTlsConfig>) -> Self {
+        self.tls = tls;
+        self
     }
 }
 
@@ -78,7 +86,29 @@ impl FrontendListenerTrait for FlightSqlFrontend {
         let service = QueryFluxFlightSql::new(self.state.clone());
         let flight_server = FlightServiceServer::new(service);
 
+        if self.tls.is_none()
+            && self.state.live.read().await.auth_provider.wire_auth_kind()
+                != queryflux_auth::provider::WireAuthKind::None
+        {
+            return Err(QueryFluxError::Auth(
+                "Flight SQL credential authentication requires frontend TLS configuration".into(),
+            ));
+        }
         let mut builder = tonic::transport::Server::builder();
+        if let Some(tls) = &self.tls {
+            let cert = tokio::fs::read(&tls.cert_file)
+                .await
+                .map_err(|e| QueryFluxError::Other(e.into()))?;
+            let key = tokio::fs::read(&tls.key_file)
+                .await
+                .map_err(|e| QueryFluxError::Other(e.into()))?;
+            builder = builder
+                .tls_config(
+                    tonic::transport::ServerTlsConfig::new()
+                        .identity(tonic::transport::Identity::from_pem(cert, key)),
+                )
+                .map_err(|e| QueryFluxError::Other(e.into()))?;
+        }
         if let Some(limit) = self.max_connections.filter(|&l| l > 0) {
             builder = builder.concurrency_limit_per_connection(limit);
         }
@@ -97,20 +127,52 @@ impl FrontendListenerTrait for FlightSqlFrontend {
 #[derive(Clone)]
 pub struct QueryFluxFlightSql {
     state: Arc<AppState>,
+    tickets: Arc<dashmap::DashMap<String, FlightTicket>>,
+}
+struct FlightTicket {
+    sql: String,
+    owner: String,
+    session: SessionContext,
+    created: std::time::Instant,
 }
 
 impl QueryFluxFlightSql {
     pub fn new(state: Arc<AppState>) -> Self {
-        Self { state }
+        Self {
+            state,
+            tickets: Arc::new(dashmap::DashMap::new()),
+        }
     }
 
+    async fn authenticate_request<T>(
+        &self,
+        request: &Request<T>,
+    ) -> std::result::Result<queryflux_auth::AuthContext, Status> {
+        let bearer = request
+            .metadata()
+            .get("authorization")
+            .and_then(|v| v.to_str().ok())
+            .and_then(crate::strip_bearer_prefix)
+            .map(str::to_owned);
+        let provider = self.state.live.read().await.auth_provider.clone();
+        provider
+            .authenticate(&Credentials {
+                bearer_token: bearer,
+                ..Default::default()
+            })
+            .await
+            .map_err(|e| Status::unauthenticated(e.to_string()))
+    }
     fn session_from_request<T>(&self, request: &Request<T>) -> SessionContext {
         // Extract gRPC metadata as key-value headers.
         let headers: HashMap<String, String> = request
             .metadata()
             .iter()
             .filter_map(|kv| match kv {
-                tonic::metadata::KeyAndValueRef::Ascii(k, v) => {
+                tonic::metadata::KeyAndValueRef::Ascii(k, v)
+                    if k.as_str() != "authorization"
+                        && k.as_str() != crate::transaction::SESSION_KEY =>
+                {
                     Some((k.as_str().to_string(), v.to_str().ok()?.to_string()))
                 }
                 _ => None,
@@ -145,14 +207,50 @@ impl FlightSqlService for QueryFluxFlightSql {
     async fn get_flight_info_statement(
         &self,
         query: CommandStatementQuery,
-        _request: Request<FlightDescriptor>,
+        request: Request<FlightDescriptor>,
     ) -> std::result::Result<Response<FlightInfo>, Status> {
+        let identity = self.authenticate_request(&request).await?;
+        let mut session = self.session_from_request(&request);
+        session.user = Some(identity.user.clone());
+        if let Some(transaction) = query.transaction_id {
+            let id = String::from_utf8(transaction.to_vec())
+                .map_err(|_| Status::invalid_argument("invalid transaction id"))?;
+            if self
+                .state
+                .transactions
+                .lookup(&id, &identity, &FrontendProtocol::FlightSql)
+                .map_err(|e| Status::permission_denied(e.to_string()))?
+                .is_none()
+            {
+                return Err(Status::not_found("transaction not found"));
+            }
+            session
+                .extra
+                .insert(crate::transaction::SESSION_KEY.into(), id);
+        }
+        self.tickets
+            .retain(|_, t| t.created.elapsed() < std::time::Duration::from_secs(300));
+        if self.tickets.len() >= 10000 {
+            return Err(Status::resource_exhausted(
+                "Flight SQL ticket capacity exceeded",
+            ));
+        }
+        let id = uuid::Uuid::new_v4().to_string();
         let sql = &query.query;
+        self.tickets.insert(
+            id.clone(),
+            FlightTicket {
+                sql: sql.clone(),
+                owner: identity.session_owner(),
+                session,
+                created: std::time::Instant::now(),
+            },
+        );
         debug!(sql = %sql, "Flight SQL: GetFlightInfo");
 
         // Encode the SQL as a TicketStatementQuery → Any → bytes → Ticket.
         let ticket_query = TicketStatementQuery {
-            statement_handle: sql.as_bytes().to_vec().into(),
+            statement_handle: id.into_bytes().into(),
         };
         let ticket_bytes = ticket_query.as_any().encode_to_vec();
 
@@ -182,35 +280,33 @@ impl FlightSqlService for QueryFluxFlightSql {
         ticket: TicketStatementQuery,
         request: Request<Ticket>,
     ) -> std::result::Result<Response<FlightDataStream>, Status> {
-        let sql = String::from_utf8(ticket.statement_handle.to_vec())
-            .map_err(|_| Status::invalid_argument("statement_handle is not valid UTF-8"))?;
-        debug!(sql = %sql, "Flight SQL: DoGet");
-
-        let session = self.session_from_request(&request);
+        let identity = self.authenticate_request(&request).await?;
+        let id = String::from_utf8(ticket.statement_handle.to_vec())
+            .map_err(|_| Status::invalid_argument("invalid ticket"))?;
+        let pending = self
+            .tickets
+            .get(&id)
+            .ok_or_else(|| Status::not_found("query ticket not found"))?;
+        if pending.owner != identity.session_owner() {
+            return Err(Status::permission_denied(
+                "query ticket belongs to another user",
+            ));
+        }
+        if pending.created.elapsed() >= std::time::Duration::from_secs(300) {
+            drop(pending);
+            self.tickets.remove(&id);
+            return Err(Status::not_found("query ticket expired"));
+        }
+        drop(pending);
+        let (_, pending) = self
+            .tickets
+            .remove(&id)
+            .ok_or_else(|| Status::not_found("query ticket already used"))?;
+        let sql = pending.sql;
+        let mut session = pending.session;
+        session.user = Some(identity.user.clone());
         let protocol = FrontendProtocol::FlightSql;
-
-        // Authenticate — extract bearer token from gRPC metadata (Phase 1: NoneAuthProvider).
-        let bearer = request
-            .metadata()
-            .get("authorization")
-            .and_then(|v| v.to_str().ok())
-            .and_then(crate::strip_bearer_prefix)
-            .map(|t| t.to_string());
-        let creds = Credentials {
-            username: session.user().map(|s| s.to_string()),
-            bearer_token: bearer,
-            ..Default::default()
-        };
-        let auth_provider = self.state.live.read().await.auth_provider.clone();
-        let auth_ctx = match auth_provider.authenticate(&creds).await {
-            Ok(ctx) => ctx,
-            Err(e) => {
-                self.state
-                    .metrics
-                    .on_auth_failure(&format!("{:?}", FrontendProtocol::FlightSql));
-                return Err(Status::unauthenticated(e.to_string()));
-            }
-        };
+        let auth_ctx = identity;
 
         let routing_result = {
             let live = self.state.live.read().await;
@@ -244,7 +340,7 @@ impl FlightSqlService for QueryFluxFlightSql {
 
         // Channel: sink sends RecordBatches; FlightDataEncoderBuilder encodes them.
         let (tx, rx) =
-            tokio::sync::mpsc::unbounded_channel::<std::result::Result<RecordBatch, FlightError>>();
+            tokio::sync::mpsc::channel::<std::result::Result<RecordBatch, FlightError>>(8);
         let mut sink = FlightSqlResultSink { tx };
 
         let state2 = self.state.clone();
@@ -266,7 +362,7 @@ impl FlightSqlService for QueryFluxFlightSql {
         }));
 
         let batch_stream = AbortOnDropStream {
-            inner: tokio_stream::wrappers::UnboundedReceiverStream::new(rx),
+            inner: tokio_stream::wrappers::ReceiverStream::new(rx),
             _abort: exec_task,
         };
 
@@ -275,6 +371,86 @@ impl FlightSqlService for QueryFluxFlightSql {
             .map(|r| r.map_err(|e| Status::internal(e.to_string())));
 
         Ok(Response::new(Box::pin(flight_data_stream)))
+    }
+
+    async fn do_action_begin_transaction(
+        &self,
+        _query: ActionBeginTransactionRequest,
+        request: Request<Action>,
+    ) -> std::result::Result<ActionBeginTransactionResult, Status> {
+        let identity = self.authenticate_request(&request).await?;
+        let mut session = self.session_from_request(&request);
+        session.user = Some(identity.user.clone());
+        let (route, mut trace) = self
+            .state
+            .live
+            .read()
+            .await
+            .router_chain
+            .route_with_trace(
+                "BEGIN",
+                &session,
+                &FrontendProtocol::FlightSql,
+                Some(&identity),
+            )
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+        let group = match route {
+            ChainRouteResult::Routed(g) => g,
+            ChainRouteResult::Denied { message } => return Err(Status::permission_denied(message)),
+        };
+        let group = self
+            .state
+            .resolve_routed_group(group, &mut trace, &identity)
+            .await
+            .map_err(|e| Status::permission_denied(e.to_string()))?;
+        let id = uuid::Uuid::new_v4().to_string();
+        self.state
+            .transactions
+            .begin(
+                &self.state,
+                &id,
+                group,
+                &identity,
+                FrontendProtocol::FlightSql,
+                &session,
+            )
+            .await
+            .map_err(|e| Status::failed_precondition(e.to_string()))?;
+        Ok(ActionBeginTransactionResult {
+            transaction_id: id.into_bytes().into(),
+        })
+    }
+    async fn do_action_end_transaction(
+        &self,
+        query: ActionEndTransactionRequest,
+        request: Request<Action>,
+    ) -> std::result::Result<(), Status> {
+        let identity = self.authenticate_request(&request).await?;
+        let id = String::from_utf8(query.transaction_id.to_vec())
+            .map_err(|_| Status::invalid_argument("invalid transaction id"))?;
+        if !matches!(query.action, 1 | 2) {
+            return Err(Status::invalid_argument("invalid transaction end action"));
+        }
+        if self
+            .state
+            .transactions
+            .lookup(&id, &identity, &FrontendProtocol::FlightSql)
+            .map_err(|e| Status::permission_denied(e.to_string()))?
+            .is_none()
+        {
+            return Err(Status::not_found("transaction not found"));
+        }
+        self.state
+            .transactions
+            .finish(
+                &id,
+                &identity,
+                &FrontendProtocol::FlightSql,
+                query.action == 1,
+            )
+            .await
+            .map_err(|e| Status::internal(e.to_string()))
     }
 
     // ── SqlInfo (minimal-trino — return empty) ──────────────────────────────────────
@@ -287,19 +463,23 @@ impl FlightSqlService for QueryFluxFlightSql {
 /// Collects Arrow RecordBatches from `execute_to_sink` and sends them to a channel.
 /// `FlightDataEncoderBuilder` on the other end encodes them as Arrow IPC + gRPC FlightData.
 struct FlightSqlResultSink {
-    tx: UnboundedSender<std::result::Result<RecordBatch, FlightError>>,
+    tx: Sender<std::result::Result<RecordBatch, FlightError>>,
 }
 
 #[async_trait]
 impl ResultSink for FlightSqlResultSink {
-    async fn on_schema(&mut self, _schema: &Schema) -> Result<()> {
-        // Schema is extracted by FlightDataEncoderBuilder from the first RecordBatch.
-        Ok(())
+    async fn on_schema(&mut self, schema: &Schema) -> Result<()> {
+        self.tx
+            .send(Ok(RecordBatch::new_empty(Arc::new(schema.clone()))))
+            .await
+            .map_err(|_| QueryFluxError::Engine("Flight client disconnected".into()))
     }
 
     async fn on_batch(&mut self, batch: &RecordBatch) -> Result<()> {
-        let _ = self.tx.send(Ok(batch.clone()));
-        Ok(())
+        self.tx
+            .send(Ok(batch.clone()))
+            .await
+            .map_err(|_| QueryFluxError::Engine("Flight client disconnected".into()))
     }
 
     async fn on_complete(&mut self, _stats: &QueryStats) -> Result<()> {
@@ -309,7 +489,8 @@ impl ResultSink for FlightSqlResultSink {
     async fn on_error(&mut self, message: &str) -> Result<()> {
         let _ = self
             .tx
-            .send(Err(FlightError::ExternalError(message.to_string().into())));
+            .send(Err(FlightError::ExternalError(message.to_string().into())))
+            .await;
         Ok(())
     }
 }
@@ -337,4 +518,37 @@ fn encode_empty_schema() -> bytes::Bytes {
     let options = IpcWriteOptions::default();
     let ipc: arrow_flight::FlightData = SchemaAsIpc::new(&schema, &options).into();
     ipc.data_header
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[tokio::test]
+    async fn initial_query_requires_authentication() {
+        let service = QueryFluxFlightSql::new(crate::state::test_fixtures::app_state(true));
+        let result = service
+            .get_flight_info_statement(
+                CommandStatementQuery {
+                    query: "SELECT 1".into(),
+                    transaction_id: None,
+                },
+                Request::new(FlightDescriptor::default()),
+            )
+            .await;
+        assert!(matches!(result, Err(ref e) if e.code() == tonic::Code::Unauthenticated));
+        assert!(service.tickets.is_empty());
+    }
+    #[tokio::test]
+    async fn raw_sql_is_not_a_valid_query_ticket() {
+        let service = QueryFluxFlightSql::new(crate::state::test_fixtures::app_state(false));
+        let result = service
+            .do_get_statement(
+                TicketStatementQuery {
+                    statement_handle: bytes::Bytes::from_static(b"SELECT 1"),
+                },
+                Request::new(Ticket::default()),
+            )
+            .await;
+        assert!(matches!(result, Err(ref e) if e.code() == tonic::Code::NotFound));
+    }
 }

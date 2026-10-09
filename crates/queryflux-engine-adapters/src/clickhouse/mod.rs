@@ -102,9 +102,9 @@ fn parse_max_result_buffer_from_json(
 impl ClickHouseConfig {
     fn reject_non_basic_auth(auth: &Option<ClusterAuth>, cluster_name: &str) -> Result<()> {
         if let Some(a) = auth {
-            if !matches!(a, ClusterAuth::Basic { .. }) {
+            if !matches!(a, ClusterAuth::Basic { .. } | ClusterAuth::Bearer { .. }) {
                 return Err(QueryFluxError::Engine(format!(
-                    "cluster '{cluster_name}': ClickHouse only supports basic auth (username + password)"
+                    "cluster '{cluster_name}': ClickHouse supports basic or bearer auth"
                 )));
             }
         }
@@ -164,6 +164,7 @@ pub struct ClickHouseAdapter {
     endpoint: String,
     /// Basic-auth credentials (username, password) when configured.
     basic_auth: Option<(String, String)>,
+    bearer_auth: Option<String>,
     /// In-flight Arrow decode-window cap in bytes (`maxResultBufferBytes`).
     max_result_buffer_bytes: usize,
     client: reqwest::Client,
@@ -185,6 +186,10 @@ impl ClickHouseAdapter {
                 cluster_name.0
             ))
         })?;
+        let bearer_auth = match &config.auth {
+            Some(ClusterAuth::Bearer { token }) => Some(token.clone()),
+            _ => None,
+        };
         let basic_auth = match config.auth {
             Some(ClusterAuth::Basic { username, password }) => Some((username, password)),
             _ => None,
@@ -194,6 +199,7 @@ impl ClickHouseAdapter {
             group_name,
             endpoint: config.endpoint.trim_end_matches('/').to_string(),
             basic_auth,
+            bearer_auth,
             max_result_buffer_bytes: config.max_result_buffer_bytes,
             client,
         })
@@ -208,7 +214,7 @@ impl ClickHouseAdapter {
             connection_type: ConnectionType::Http,
             default_port: Some(8123),
             endpoint_example: Some("http://clickhouse:8123"),
-            supported_auth: vec![AuthType::Basic],
+            supported_auth: vec![AuthType::Basic, AuthType::Bearer],
             implemented: true,
             config_fields: vec![
                 ConfigField {
@@ -287,6 +293,9 @@ impl ClickHouseAdapter {
             .body(sql.to_string());
         if let Some((user, pass)) = &self.basic_auth {
             req = req.basic_auth(user, Some(pass));
+        }
+        if let Some(token) = &self.bearer_auth {
+            req = req.bearer_auth(token);
         }
         req
     }
@@ -809,14 +818,36 @@ impl crate::SyncAdapter for ClickHouseAdapter {
     ) -> Result<SyncExecution> {
         let query_id = uuid::Uuid::new_v4().to_string();
         id_slot.publish(query_id.clone());
-        // `passthrough`/`tokenExchange` never reach here — startup validation
-        // (`query_auth_supported`) rejects them for ClickHouse, and `serviceAccount` is a
-        // no-op below. `impersonate` is the only mode ClickHouse adapts SQL for.
+        // Impersonation changes SQL; passthrough and token exchange instead replace
+        // the HTTP request's authorization credential below.
         let effective_sql = match credentials {
             queryflux_auth::QueryCredentials::Impersonate { user } => wrap_execute_as(user, sql),
             _ => sql.to_string(),
         };
         let mut req = self.query_request_with_id(&effective_sql, "ArrowStream", &query_id);
+        match credentials {
+            queryflux_auth::QueryCredentials::Passthrough => {
+                let auth = session
+                    .extra
+                    .get("authorization")
+                    .filter(|s| {
+                        s.as_bytes()
+                            .get(..7)
+                            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"Bearer "))
+                    })
+                    .ok_or_else(|| {
+                        QueryFluxError::Auth(
+                            "ClickHouse passthrough requires a JWT bearer token".into(),
+                        )
+                    })?;
+                req = req.header(reqwest::header::AUTHORIZATION, auth);
+            }
+            queryflux_auth::QueryCredentials::Bearer { token } => {
+                req = req.bearer_auth(token);
+            }
+            _ => {}
+        }
+
         if let Some(db) = session.database_hint() {
             req = req.query(&[("database", db)]);
         }
@@ -867,6 +898,9 @@ impl crate::SyncAdapter for ClickHouseAdapter {
         EngineType::ClickHouse
     }
 
+    fn supports_cancellation(&self) -> bool {
+        true
+    }
     async fn cancel_query(&self, backend_id: &BackendQueryId) -> Result<()> {
         let Some(sql) = kill_query_sql(&backend_id.0) else {
             tracing::debug!(
@@ -1062,18 +1096,12 @@ mod tests {
     }
 
     #[test]
-    fn from_json_rejects_bearer_auth() {
-        let err = ClickHouseConfig::from_json(
-            &json!({
-                "endpoint": "http://ch:8123",
-                "authType": "bearer",
-                "authToken": "tok"
-            }),
+    fn from_json_accepts_bearer_auth() {
+        assert!(ClickHouseConfig::from_json(
+            &json!({"endpoint": "https://ch:8443", "authType": "bearer", "authToken": "tok"}),
             "ch-1",
         )
-        .map(|_| ())
-        .unwrap_err();
-        assert!(err.to_string().contains("only supports basic auth"));
+        .is_ok());
     }
 
     #[test]
@@ -1105,10 +1133,7 @@ mod tests {
         cfg.auth = Some(ClusterAuth::Bearer {
             token: "tok".to_string(),
         });
-        let err = ClickHouseConfig::from_cluster_config(&cfg, "ch-1")
-            .map(|_| ())
-            .unwrap_err();
-        assert!(err.to_string().contains("only supports basic auth"));
+        assert!(ClickHouseConfig::from_cluster_config(&cfg, "ch-1").is_ok());
 
         cfg.auth = Some(ClusterAuth::Basic {
             username: "qf".to_string(),

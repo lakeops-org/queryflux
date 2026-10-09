@@ -17,3 +17,7 @@ ldap3 = { version = "0.12.1", default-features = false, features = ["tls-rustls-
 dashmap = { workspace = true }
 tokio = { workspace = true }
 bcrypt = { workspace = true }
+
+sha2 = "0.10"
+uuid = { version = "1", features = ["v4"] }
+base64 = "0.22"

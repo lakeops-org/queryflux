@@ -23,6 +23,7 @@ fn protocol_from_config(s: &str) -> Option<FrontendProtocol> {
         "trinoHttp" => Some(FrontendProtocol::TrinoHttp),
         "postgresWire" => Some(FrontendProtocol::PostgresWire),
         "mysqlWire" => Some(FrontendProtocol::MySqlWire),
+        "clickhouseNative" => Some(FrontendProtocol::ClickHouseNative),
         "clickhouseHttp" => Some(FrontendProtocol::ClickHouseHttp),
         "flightSql" => Some(FrontendProtocol::FlightSql),
         "snowflakeHttp" => Some(FrontendProtocol::SnowflakeHttp),

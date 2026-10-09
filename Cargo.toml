@@ -1,5 +1,6 @@
 [workspace]
 resolver = "2"
+exclude = ["vendor/mysql_async", "vendor/opensrv-clickhouse"]
 members = [
     "crates/queryflux",
     "crates/queryflux-bench",
@@ -112,3 +113,7 @@ utoipa = { version = "5.4.0", features = ["axum_extras", "chrono"] }
 
 # Password hashing
 bcrypt = "0.16"
+
+[patch.crates-io]
+mysql_async = { path = "vendor/mysql_async" }
+opensrv-clickhouse = { path = "vendor/opensrv-clickhouse" }

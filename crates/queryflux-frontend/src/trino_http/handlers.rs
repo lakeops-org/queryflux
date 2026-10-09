@@ -1665,6 +1665,8 @@ mod cancel_executing_statement_tests {
             catalog: Arc::new(queryflux_core::catalog::NullCatalogProvider),
         };
         Arc::new(AppState {
+            transactions: Default::default(),
+            native_leases: Default::default(),
             external_address: "http://127.0.0.1:8080".into(),
             live: Arc::new(RwLock::new(live)),
             persistence: Arc::new(InMemoryPersistence::new()),

@@ -229,6 +229,29 @@ pub struct NativeExecution {
 /// Used by DuckDB (embedded + HTTP), StarRocks, ClickHouse, and ADBC.
 #[async_trait]
 pub trait SyncAdapter: Send + Sync {
+    /// Dedicated service-account connection; unsupported engines fail closed.
+    async fn begin_transaction(
+        &self,
+        _session: &queryflux_core::session::SessionContext,
+    ) -> Result<Arc<dyn SyncAdapter>> {
+        Err(queryflux_core::error::QueryFluxError::Engine(
+            "transactions are not supported by this backend adapter".into(),
+        ))
+    }
+    async fn finish_transaction(&self, _commit: bool) -> Result<()> {
+        Err(queryflux_core::error::QueryFluxError::Engine(
+            "this adapter is not a transaction connection".into(),
+        ))
+    }
+    async fn describe_query(&self, _sql: &str) -> Result<Arc<arrow::datatypes::Schema>> {
+        Err(queryflux_core::error::QueryFluxError::Engine(
+            "query description is not supported by this backend adapter".into(),
+        ))
+    }
+    fn supports_cancellation(&self) -> bool {
+        false
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn execute_as_arrow(
         &self,
@@ -287,7 +310,9 @@ pub trait SyncAdapter: Send + Sync {
     /// API (ClickHouse `KILL QUERY`, StarRocks `KILL QUERY`, DuckDB interrupt).
     /// "Query already finished" must be treated as success.
     async fn cancel_query(&self, _backend_id: &BackendQueryId) -> Result<()> {
-        Ok(())
+        Err(queryflux_core::error::QueryFluxError::Engine(
+            "backend query cancellation is not supported".into(),
+        ))
     }
 
     async fn health_check(&self) -> bool;
@@ -315,6 +340,14 @@ pub trait SyncAdapter: Send + Sync {
 /// Used by Trino and Athena.
 #[async_trait]
 pub trait AsyncAdapter: Send + Sync {
+    async fn begin_transaction(
+        &self,
+        _session: &queryflux_core::session::SessionContext,
+    ) -> Result<Arc<dyn SyncAdapter>> {
+        Err(queryflux_core::error::QueryFluxError::Engine(
+            "backend does not support transactions".into(),
+        ))
+    }
     async fn submit_query(
         &self,
         sql: &str,

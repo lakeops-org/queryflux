@@ -86,6 +86,16 @@ pub fn enrich_session_for_passthrough(
                 .insert("authorization".to_string(), format!("Bearer {token}"));
         }
     }
+    if let Some(token) = &auth_ctx.raw_token {
+        session
+            .extra
+            .entry("passthrough_username".into())
+            .or_insert_with(|| auth_ctx.user.clone());
+        session
+            .extra
+            .entry("passthrough_jwt".into())
+            .or_insert_with(|| token.clone());
+    }
     // MySQL-wire-shaped (StarRocks and any future mysql_native consumer): username +
     // password for COM_CHANGE_USER. Only ever populated when `raw_password` came from a
     // provider that verified it against the same identity backend the target cluster

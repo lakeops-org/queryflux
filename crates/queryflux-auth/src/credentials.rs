@@ -168,3 +168,75 @@ mod tests {
         assert!(require_query_owner(&ctx("anonymous"), "").is_ok());
     }
 }
+
+impl AuthContext {
+    /// Stable identity for gateway-owned resources across refreshed JWTs. Only
+    /// call on an AuthContext returned by the configured authentication provider.
+    pub fn session_owner(&self) -> String {
+        use base64::Engine;
+        let claims = self
+            .raw_token
+            .as_deref()
+            .and_then(|t| t.split('.').nth(1))
+            .and_then(|p| {
+                base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .decode(p)
+                    .ok()
+            })
+            .and_then(|p| serde_json::from_slice::<serde_json::Value>(&p).ok());
+        let mut binding = serde_json::Map::new();
+        binding.insert("user".into(), serde_json::Value::String(self.user.clone()));
+        if let Some(claims) = claims {
+            for key in [
+                "iss",
+                "aud",
+                "sub",
+                "tenant_id",
+                "cluster_id",
+                "cluster_ref",
+                "token_type",
+                "actor_id",
+                "actor_email",
+                "actor",
+                "policy_test",
+                "context",
+                "agent_manifest_id",
+                "agent_session_id",
+                "capability_attachment_id",
+                "agent_id",
+                "conversation_id",
+            ] {
+                binding.insert(key.into(), claims[key].clone());
+            }
+        }
+        serde_json::Value::Object(binding).to_string()
+    }
+}
+
+#[cfg(test)]
+mod session_owner_tests {
+    use super::*;
+    use base64::Engine;
+    fn context(cluster: &str, role: &str, nonce: u64) -> AuthContext {
+        let claims = serde_json::json!({"iss":"issuer", "sub":"same-user", "tenant_id":"tenant", "cluster_id":cluster, "role":role, "jti":nonce});
+        AuthContext {
+            user: "same-user".into(),
+            raw_token: Some(format!(
+                "test.{}.test",
+                base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(claims.to_string())
+            )),
+            ..Default::default()
+        }
+    }
+    #[test]
+    fn renewed_roles_keep_owner_but_another_cluster_does_not() {
+        assert_eq!(
+            context("cluster1", "reader", 1).session_owner(),
+            context("cluster1", "writer", 2).session_owner()
+        );
+        assert_ne!(
+            context("cluster1", "reader", 1).session_owner(),
+            context("cluster2", "reader", 1).session_owner()
+        );
+    }
+}

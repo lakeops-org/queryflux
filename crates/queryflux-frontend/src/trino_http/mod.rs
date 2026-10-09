@@ -33,6 +33,11 @@ impl TrinoHttpFrontend {
 
     pub fn router(&self) -> Router {
         Router::new()
+            .route("/v1/session-leases", post(crate::lease::register))
+            .route(
+                "/v1/session-leases/{id}",
+                post(crate::lease::renew).delete(crate::lease::revoke),
+            )
             .route("/v1/statement", post(post_statement))
             .route(
                 "/v1/statement/qf/queued/{id}/{seq}",

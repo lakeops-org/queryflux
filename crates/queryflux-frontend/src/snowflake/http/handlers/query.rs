@@ -46,6 +46,7 @@ struct SnowflakeSink {
     schema: Option<Arc<Schema>>,
     batches: Vec<RecordBatch>,
     error: Option<String>,
+    bytes: usize,
 }
 
 impl SnowflakeSink {
@@ -54,6 +55,7 @@ impl SnowflakeSink {
             schema: None,
             batches: Vec::new(),
             error: None,
+            bytes: 0,
         }
     }
 
@@ -118,6 +120,7 @@ fn synthetic_ok_sink() -> SnowflakeSink {
         schema: Some(schema),
         batches: vec![batch],
         error: None,
+        bytes: 0,
     }
 }
 
@@ -129,6 +132,12 @@ impl ResultSink for SnowflakeSink {
     }
 
     async fn on_batch(&mut self, batch: &RecordBatch) -> Result<()> {
+        self.bytes += batch.get_array_memory_size();
+        if self.bytes > 16 * 1024 * 1024 {
+            return Err(queryflux_core::error::QueryFluxError::Engine(
+                "Snowflake result exceeds the 16 MiB inline limit".into(),
+            ));
+        }
         self.batches.push(batch.clone());
         Ok(())
     }
@@ -157,11 +166,15 @@ pub async fn query_request(
         None => return unauthorized(),
     };
 
+    let current_identity = match super::common::authenticated_session(&state, &token).await {
+        Some(identity) => identity,
+        None => return unauthorized(),
+    };
     // Validate session and extract stored context.
     let (auth_ctx, group, mut database, mut schema_name, role, warehouse, password) = {
         match state.sessions.validate_session(&token) {
             Some((_, session)) => (
-                session.auth_ctx.clone(),
+                current_identity.clone(),
                 session.group.clone(),
                 session.database.clone(),
                 session.schema.clone(),
@@ -193,6 +206,20 @@ pub async fn query_request(
     // `AdbcAdapter`'s session-scoped sub-pool, which is what a *real* query after one of these
     // statements routes through instead).
     if let Some((target, mut names)) = try_parse_snowflake_use(&sql) {
+        match state.app.transactions.lookup(
+            &format!("snowflake:{token}"),
+            &auth_ctx,
+            &FrontendProtocol::SnowflakeHttp,
+        ) {
+            Ok(None) => {}
+            Ok(Some(_)) => {
+                return sf_error(
+                    "0A000",
+                    "Finish the active transaction before changing role, warehouse, or namespace",
+                )
+            }
+            Err(e) => return sf_error("002043", &e.to_string()),
+        }
         // Parsing guarantees one identifier, or two for a qualified schema.
         let value = names.pop().expect("USE has an identifier");
         match target {
@@ -232,7 +259,12 @@ pub async fn query_request(
     // Wire v1 uses "parameterBindings" (SQL API v2 uses "bindings").
     let params = bindings_to_params(body_json.get("parameterBindings"));
 
+    let transaction_id = format!("snowflake:{token}");
     let mut extra = std::collections::HashMap::new();
+    extra.insert(
+        crate::transaction::SESSION_KEY.into(),
+        transaction_id.clone(),
+    );
     if let Some(role) = &role {
         extra.insert("snowflake.role".to_string(), role.clone());
     }
@@ -267,6 +299,48 @@ pub async fn query_request(
         agent_context: None,
     };
 
+    if crate::transaction::transaction_command(&sql).is_some() {
+        if let Err(e) = state
+            .app
+            .transactions
+            .begin(
+                &state.app,
+                &transaction_id,
+                group.clone(),
+                &auth_ctx,
+                FrontendProtocol::SnowflakeHttp,
+                &session_ctx,
+            )
+            .await
+        {
+            return sf_error("002043", &e.to_string());
+        }
+        return synthetic_ok_sink().into_response(
+            &Uuid::new_v4().to_string(),
+            database.as_deref().unwrap_or_default(),
+            schema_name.as_deref().unwrap_or_default(),
+        );
+    }
+    if let Some(commit) = crate::transaction::transaction_end(&sql) {
+        if let Err(e) = state
+            .app
+            .transactions
+            .finish(
+                &transaction_id,
+                &auth_ctx,
+                &FrontendProtocol::SnowflakeHttp,
+                commit,
+            )
+            .await
+        {
+            return sf_error("002043", &e.to_string());
+        }
+        return synthetic_ok_sink().into_response(
+            &Uuid::new_v4().to_string(),
+            database.as_deref().unwrap_or_default(),
+            schema_name.as_deref().unwrap_or_default(),
+        );
+    }
     let query_id = Uuid::new_v4().to_string();
 
     let exec = SnowflakeExecParams {
@@ -277,6 +351,51 @@ pub async fn query_request(
         group,
         auth_ctx: auth_ctx.clone(),
     };
+
+    if body_json["asyncExec"].as_bool() == Some(true) {
+        if !state
+            .in_flight
+            .reserve_result(&query_id, &auth_ctx, &exec.group.0)
+        {
+            return sf_error("390000", "Async result capacity exceeded");
+        }
+        let id = query_id.clone();
+        let app = state.app.clone();
+        let registry = state.in_flight.clone();
+        tokio::spawn(async move {
+            let response = match crate::snowflake::in_flight::spawn_async_execute(
+                &app,
+                &registry,
+                id.clone(),
+                auth_ctx.user.clone(),
+                exec,
+                SnowflakeSink::new,
+            )
+            .await
+            {
+                SpawnExecuteResult::Completed(result, mut sink) => {
+                    if let Err(e) = result {
+                        sink.error = Some(e.to_string());
+                    }
+                    sink.into_response(
+                        &id,
+                        database.as_deref().unwrap_or_default(),
+                        schema_name.as_deref().unwrap_or_default(),
+                    )
+                }
+                SpawnExecuteResult::Cancelled => sf_error("000630", "Query cancelled."),
+                SpawnExecuteResult::JoinFailed(e) => sf_error("390000", &e),
+            };
+            let body = match axum::body::to_bytes(response.into_body(), 32 * 1024 * 1024).await {
+                Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_else(
+                    |_| json!({"success": false, "message": "Invalid query result"}),
+                ),
+                Err(_) => json!({"success": false, "message": "Query result too large"}),
+            };
+            registry.complete_result(&id, body);
+        });
+        return (StatusCode::OK, axum::Json(json!({"success": true, "code": "333334", "data": {"queryId": query_id, "getResultUrl": format!("/queries/{query_id}/result")}}))).into_response();
+    }
 
     match crate::snowflake::in_flight::spawn_execute(
         &state.app,
@@ -332,13 +451,13 @@ pub async fn query_monitoring_request(
         None => return unauthorized(),
     };
 
-    let user = match state.sessions.validate_session(&token) {
-        Some((_, session)) => session.auth_ctx.user.clone(),
+    let identity = match super::common::authenticated_session(&state, &token).await {
+        Some(identity) => identity,
         None => return unauthorized(),
     };
 
-    let ids = state.in_flight.ids_for_owner(&user);
-    let queries: Vec<_> = ids
+    let ids = state.in_flight.ids_for_identity(&identity);
+    let mut queries: Vec<_> = ids
         .into_iter()
         .map(|id| {
             json!({
@@ -348,6 +467,11 @@ pub async fn query_monitoring_request(
         })
         .collect();
 
+    for result in state.in_flight.result_statuses(&identity) {
+        if !queries.iter().any(|q| q["id"] == result["id"]) {
+            queries.push(result);
+        }
+    }
     (
         StatusCode::OK,
         axum::Json(json!({
@@ -374,11 +498,35 @@ pub async fn cancel_query(
         None => return unauthorized(),
     };
 
-    let auth_ctx = match state.sessions.validate_session(&token) {
-        Some((_, session)) => session.auth_ctx.clone(),
+    let auth_ctx = match super::common::authenticated_session(&state, &token).await {
+        Some(identity) => identity,
         None => return unauthorized(),
     };
 
+    match state.in_flight.query_group(&query_id, &auth_ctx) {
+        Err(()) => {
+            return (
+                StatusCode::FORBIDDEN,
+                axum::Json(
+                    json!({"success": false, "message": "Query belongs to another identity"}),
+                ),
+            )
+                .into_response()
+        }
+        Ok(Some(group)) => {
+            let authorization = state.app.live.read().await.authorization.clone();
+            if !authorization.check(&auth_ctx, &group).await {
+                return (
+                    StatusCode::FORBIDDEN,
+                    axum::Json(
+                        json!({"success": false, "message": "Query group authorization denied"}),
+                    ),
+                )
+                    .into_response();
+            }
+        }
+        Ok(None) => {}
+    }
     match state.in_flight.cancel(&query_id, &auth_ctx) {
         CancelOutcome::Aborted | CancelOutcome::NotFound => (
             StatusCode::OK,
@@ -390,6 +538,10 @@ pub async fn cancel_query(
             })),
         )
             .into_response(),
+        CancelOutcome::Unsupported => sf_error(
+            "0A000",
+            "Selected backend adapter cannot cancel running queries",
+        ),
         CancelOutcome::Forbidden => (
             StatusCode::FORBIDDEN,
             axum::Json(json!({
@@ -679,5 +831,37 @@ mod tests {
         assert!(try_parse_snowflake_use("USE WAREHOUSE MY WH").is_none());
         assert!(try_parse_snowflake_use("USE DATABASE MY DB").is_none());
         assert!(try_parse_snowflake_use("USE SCHEMA MY SCHEMA").is_none());
+    }
+}
+
+/// Native connector result retrieval; owner checked on every poll.
+pub async fn query_result(
+    State(state): State<SnowflakeWireState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    let Some(token) = extract_snowflake_token(&headers) else {
+        return unauthorized();
+    };
+    let Some(identity) = super::common::authenticated_session(&state, &token).await else {
+        return unauthorized();
+    };
+    if let Ok(Some(group)) = state.in_flight.result_group(&id, &identity) {
+        let authorization = state.app.live.read().await.authorization.clone();
+        if !authorization.check(&identity, &group).await {
+            return (
+                StatusCode::FORBIDDEN,
+                axum::Json(
+                    json!({"success": false, "message": "Query group authorization denied"}),
+                ),
+            )
+                .into_response();
+        }
+    }
+    match state.in_flight.result(&id, &identity) {
+        Ok(Some(Some(body))) => (StatusCode::OK, axum::Json(body)).into_response(),
+        Ok(Some(None)) => (StatusCode::OK, axum::Json(json!({"success": true, "code": "333333", "data": {"queryId": id, "getResultUrl": format!("/queries/{id}/result")}}))).into_response(),
+        Ok(None) => (StatusCode::NOT_FOUND, axum::Json(json!({"success": false, "message": "Query result not found or expired"}))).into_response(),
+        Err(()) => (StatusCode::FORBIDDEN, axum::Json(json!({"success": false, "message": "Query belongs to another user"}))).into_response(),
     }
 }

@@ -278,6 +278,11 @@ fn config_requires_translation(config: &ProxyConfig) -> bool {
             enabled_frontends.push((FrontendProtocol::ClickHouseHttp, SqlDialect::ClickHouse));
         }
     }
+    if let Some(ref f) = config.queryflux.frontends.clickhouse_native {
+        if f.enabled {
+            enabled_frontends.push((FrontendProtocol::ClickHouseNative, SqlDialect::ClickHouse));
+        }
+    }
     if let Some(ref f) = config.queryflux.frontends.flight_sql {
         if f.enabled {
             enabled_frontends.push((FrontendProtocol::FlightSql, SqlDialect::Generic));

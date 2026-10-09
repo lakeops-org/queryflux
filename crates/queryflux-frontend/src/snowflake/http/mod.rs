@@ -52,6 +52,10 @@ impl FromRef<SnowflakeWireState> for Arc<AppState> {
 pub fn routes() -> Router<SnowflakeWireState> {
     Router::new()
         .route(
+            "/queries/{query_id}/result",
+            get(handlers::query::query_result),
+        )
+        .route(
             "/session/v1/login-request",
             post(handlers::session::login_request),
         )

@@ -6,7 +6,7 @@ use arrow::compute::cast as arrow_cast;
 use arrow::datatypes::{DataType, Schema};
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
@@ -37,6 +37,7 @@ struct SqlApiSink {
     schema: Option<Arc<Schema>>,
     rows: Vec<Vec<Value>>,
     error: Option<String>,
+    bytes: usize,
 }
 
 impl SqlApiSink {
@@ -45,6 +46,7 @@ impl SqlApiSink {
             schema: None,
             rows: Vec::new(),
             error: None,
+            bytes: 0,
         }
     }
 }
@@ -57,6 +59,12 @@ impl ResultSink for SqlApiSink {
     }
 
     async fn on_batch(&mut self, batch: &RecordBatch) -> Result<()> {
+        self.bytes += batch.get_array_memory_size();
+        if self.bytes > 16 * 1024 * 1024 {
+            return Err(QueryFluxError::Engine(
+                "SQL API inline result exceeds 16 MiB".into(),
+            ));
+        }
         let cast_columns: Vec<CastColumn> = (0..batch.num_columns())
             .map(|col_idx| CastColumn::new(batch.column(col_idx)))
             .collect();
@@ -213,6 +221,7 @@ fn sql_api_error(status: StatusCode, code: &str, message: &str) -> Response {
 /// POST /api/v2/statements  — submit SQL, execute synchronously, return jsonv2
 pub async fn submit_statement(
     State(state): State<SnowflakeWireState>,
+    Query(options): Query<HashMap<String, String>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
@@ -244,6 +253,9 @@ pub async fn submit_statement(
     // (x-agent-id, x-conversation-id, etc.) are resolved lazily in dispatch.
     let mut extra: HashMap<String, String> = headers
         .iter()
+        .filter(|(k, _)| {
+            k.as_str() != "authorization" && k.as_str() != crate::transaction::SESSION_KEY
+        })
         .filter_map(|(k, v)| {
             v.to_str()
                 .ok()
@@ -307,6 +319,15 @@ pub async fn submit_statement(
         Err(e) => return sql_api_error(StatusCode::BAD_GATEWAY, "390000", &e.to_string()),
     };
 
+    if crate::transaction::transaction_command(&sql).is_some()
+        || crate::transaction::transaction_end(&sql).is_some()
+    {
+        return sql_api_error(
+            StatusCode::BAD_REQUEST,
+            "0A000",
+            "Transactions require a session-based frontend or Flight SQL transaction handle",
+        );
+    }
     let handle = Uuid::new_v4().to_string();
 
     let exec = SnowflakeExecParams {
@@ -317,6 +338,54 @@ pub async fn submit_statement(
         group,
         auth_ctx: auth_ctx.clone(),
     };
+
+    if options.get("async").is_some_and(|v| v == "true") {
+        if !state
+            .in_flight
+            .reserve_result(&handle, &auth_ctx, &exec.group.0)
+        {
+            return sql_api_error(
+                StatusCode::TOO_MANY_REQUESTS,
+                "390000",
+                "Async result capacity exceeded",
+            );
+        }
+        let id = handle.clone();
+        let app = state.app.clone();
+        let registry = state.in_flight.clone();
+        tokio::spawn(async move {
+            let response = match crate::snowflake::in_flight::spawn_async_execute(
+                &app,
+                &registry,
+                id.clone(),
+                auth_ctx.user.clone(),
+                exec,
+                SqlApiSink::new,
+            )
+            .await
+            {
+                SpawnExecuteResult::Completed(result, mut sink) => {
+                    if let Err(e) = result {
+                        sink.error = Some(e.to_string());
+                    }
+                    sink.into_response(&id)
+                }
+                SpawnExecuteResult::Cancelled => {
+                    sql_api_error(StatusCode::OK, "000630", "Statement aborted")
+                }
+                SpawnExecuteResult::JoinFailed(e) => {
+                    sql_api_error(StatusCode::INTERNAL_SERVER_ERROR, "390000", &e)
+                }
+            };
+            let body = match axum::body::to_bytes(response.into_body(), 32 * 1024 * 1024).await {
+                Ok(bytes) => serde_json::from_slice(&bytes)
+                    .unwrap_or_else(|_| json!({"code": "390000", "message": "Invalid result"})),
+                Err(_) => json!({"code": "390000", "message": "Result too large"}),
+            };
+            registry.complete_result(&id, body);
+        });
+        return (StatusCode::ACCEPTED, axum::Json(json!({"statementHandle": handle, "statementStatusUrl": format!("/api/v2/statements/{handle}"), "code": "333334", "message": "Statement is executing"}))).into_response();
+    }
 
     match crate::snowflake::in_flight::spawn_execute(
         &state.app,
@@ -353,21 +422,31 @@ pub async fn submit_statement(
 
 /// GET /api/v2/statements/:handle  — stub (sync execution, nothing to poll)
 pub async fn get_statement(
-    State(_state): State<SnowflakeWireState>,
-    _headers: HeaderMap,
+    State(state): State<SnowflakeWireState>,
+    headers: HeaderMap,
     axum::extract::Path(handle): axum::extract::Path<String>,
     _raw_query: axum::extract::RawQuery,
 ) -> Response {
-    (
-        StatusCode::NOT_FOUND,
-        axum::Json(json!({
-            "code": "390142",
-            "message": format!("Statement handle {handle} not found or already complete."),
-            "sqlState": "02000",
-            "statementHandle": handle
-        })),
-    )
-        .into_response()
+    let auth = match authenticate(&state.app, &headers).await {
+        Ok(a) => a,
+        Err(e) => return sql_api_error(StatusCode::UNAUTHORIZED, "390002", &e),
+    };
+    if let Ok(Some(group)) = state.in_flight.result_group(&handle, &auth) {
+        let authorization = state.app.live.read().await.authorization.clone();
+        if !authorization.check(&auth, &group).await {
+            return sql_api_error(
+                StatusCode::FORBIDDEN,
+                "390403",
+                "Query group authorization denied",
+            );
+        }
+    }
+    match state.in_flight.result(&handle, &auth) {
+        Ok(Some(Some(body))) => (StatusCode::OK, axum::Json(body)).into_response(),
+        Ok(Some(None)) => (StatusCode::ACCEPTED, axum::Json(json!({"statementHandle": handle, "code": "333334", "message": "Statement is executing"}))).into_response(),
+        Ok(None) => sql_api_error(StatusCode::NOT_FOUND, "390142", "Statement not found or result expired"),
+        Err(()) => sql_api_error(StatusCode::FORBIDDEN, "390403", "Statement belongs to another user"),
+    }
 }
 
 /// DELETE /api/v2/statements/:handle  — abort an in-flight statement
@@ -381,6 +460,26 @@ pub async fn cancel_statement(
         Err(e) => return sql_api_error(StatusCode::UNAUTHORIZED, "390002", &e.to_string()),
     };
 
+    match state.in_flight.query_group(&handle, &auth_ctx) {
+        Err(()) => {
+            return sql_api_error(
+                StatusCode::FORBIDDEN,
+                "390403",
+                "Statement belongs to another identity",
+            )
+        }
+        Ok(Some(group)) => {
+            let authorization = state.app.live.read().await.authorization.clone();
+            if !authorization.check(&auth_ctx, &group).await {
+                return sql_api_error(
+                    StatusCode::FORBIDDEN,
+                    "390403",
+                    "Query group authorization denied",
+                );
+            }
+        }
+        Ok(None) => {}
+    }
     match state.in_flight.cancel(&handle, &auth_ctx) {
         CancelOutcome::Aborted | CancelOutcome::NotFound => (
             StatusCode::OK,
@@ -390,6 +489,11 @@ pub async fn cancel_statement(
             })),
         )
             .into_response(),
+        CancelOutcome::Unsupported => sql_api_error(
+            StatusCode::NOT_IMPLEMENTED,
+            "0A000",
+            "Selected backend adapter cannot cancel running queries",
+        ),
         CancelOutcome::Forbidden => sql_api_error(
             StatusCode::FORBIDDEN,
             "390403",

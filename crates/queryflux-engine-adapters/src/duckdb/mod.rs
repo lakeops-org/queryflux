@@ -160,6 +160,7 @@ pub struct DuckDbAdapter {
     checkout: Arc<Semaphore>,
     next_slot: AtomicUsize,
     max_result_buffer_bytes: usize,
+    transaction: bool,
 }
 
 fn open_duckdb_connection(config: &DuckDbConfig) -> Result<Connection> {
@@ -198,6 +199,7 @@ impl DuckDbAdapter {
             checkout: Arc::new(Semaphore::new(permits as usize)),
             next_slot: AtomicUsize::new(0),
             max_result_buffer_bytes: config.max_result_buffer_bytes,
+            transaction: false,
         })
     }
 
@@ -239,6 +241,119 @@ fn build_connection_string(
 
 #[async_trait]
 impl SyncAdapter for DuckDbAdapter {
+    async fn begin_transaction(&self, _session: &SessionContext) -> Result<Arc<dyn SyncAdapter>> {
+        let source = self.slots[0].conn.clone();
+        let conn = tokio::task::spawn_blocking(move || {
+            let conn = source
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .try_clone()
+                .map_err(|e| QueryFluxError::Engine(e.to_string()))?;
+            conn.execute_batch("BEGIN TRANSACTION")
+                .map_err(|e| QueryFluxError::Engine(e.to_string()))?;
+            Ok::<_, QueryFluxError>(conn)
+        })
+        .await
+        .map_err(|e| QueryFluxError::Engine(e.to_string()))??;
+        let interrupt = conn.interrupt_handle();
+        Ok(Arc::new(Self {
+            cluster_name: self.cluster_name.clone(),
+            group_name: self.group_name.clone(),
+            slots: Arc::new(vec![ConnectionSlot {
+                conn: Arc::new(Mutex::new(conn)),
+                interrupt,
+                inflight: Arc::new(Mutex::new(None)),
+            }]),
+            checkout: Arc::new(Semaphore::new(1)),
+            next_slot: AtomicUsize::new(0),
+            max_result_buffer_bytes: self.max_result_buffer_bytes,
+            transaction: true,
+        }))
+    }
+    async fn finish_transaction(&self, commit: bool) -> Result<()> {
+        if !self.transaction {
+            return Err(QueryFluxError::Engine(
+                "not a transaction connection".into(),
+            ));
+        }
+        let conn = self.slots[0].conn.clone();
+        tokio::task::spawn_blocking(move || {
+            conn.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .execute_batch(if commit { "COMMIT" } else { "ROLLBACK" })
+                .map_err(|e| QueryFluxError::Engine(e.to_string()))
+        })
+        .await
+        .map_err(|e| QueryFluxError::Engine(e.to_string()))?
+    }
+    async fn describe_query(&self, sql: &str) -> Result<Arc<arrow::datatypes::Schema>> {
+        let conn = self.slots[0].conn.clone();
+        let sql = sql.to_owned();
+        tokio::task::spawn_blocking(move || {
+            let guard = conn.lock().unwrap_or_else(|e| e.into_inner());
+            let stmt = guard
+                .prepare(&sql)
+                .map_err(|e| QueryFluxError::Engine(e.to_string()))?;
+            drop(stmt);
+            if !queryflux_core::sql_classify::is_read_like_sql(
+                &sql,
+                &queryflux_core::query::SqlDialect::DuckDb,
+            ) {
+                return Ok(Arc::new(arrow::datatypes::Schema::empty()));
+            }
+            let mut describe = guard
+                .prepare(&format!("DESCRIBE {}", sql.trim().trim_end_matches(';')))
+                .map_err(|e| QueryFluxError::Engine(e.to_string()))?;
+            let rows = describe
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })
+                .map_err(|e| QueryFluxError::Engine(e.to_string()))?;
+            let mut fields = Vec::new();
+            for row in rows {
+                let (name, kind) = row.map_err(|e| QueryFluxError::Engine(e.to_string()))?;
+                use arrow::datatypes::{DataType, TimeUnit};
+                let data_type = match kind.as_str() {
+                    "BOOLEAN" => DataType::Boolean,
+                    "TINYINT" => DataType::Int8,
+                    "SMALLINT" => DataType::Int16,
+                    "INTEGER" => DataType::Int32,
+                    "BIGINT" => DataType::Int64,
+                    "UTINYINT" => DataType::UInt8,
+                    "USMALLINT" => DataType::UInt16,
+                    "UINTEGER" => DataType::UInt32,
+                    "UBIGINT" => DataType::UInt64,
+                    "FLOAT" => DataType::Float32,
+                    "DOUBLE" => DataType::Float64,
+                    "DATE" => DataType::Date32,
+                    "TIMESTAMP" => DataType::Timestamp(TimeUnit::Microsecond, None),
+                    "BLOB" => DataType::Binary,
+                    _ if kind.starts_with("DECIMAL(") => {
+                        let parts = kind
+                            .trim_start_matches("DECIMAL(")
+                            .trim_end_matches(')')
+                            .split(',')
+                            .collect::<Vec<_>>();
+                        DataType::Decimal128(
+                            parts
+                                .first()
+                                .and_then(|n| n.trim().parse().ok())
+                                .unwrap_or(38),
+                            parts
+                                .get(1)
+                                .and_then(|n| n.trim().parse().ok())
+                                .unwrap_or(0),
+                        )
+                    }
+                    _ => DataType::Utf8,
+                };
+                fields.push(arrow::datatypes::Field::new(name, data_type, true));
+            }
+            Ok::<_, QueryFluxError>(Arc::new(arrow::datatypes::Schema::new(fields)))
+        })
+        .await
+        .map_err(|e| QueryFluxError::Engine(e.to_string()))?
+    }
     async fn health_check(&self) -> bool {
         let conn = Arc::clone(&self.slots[0].conn);
         tokio::task::spawn_blocking(move || {
@@ -254,6 +369,10 @@ impl SyncAdapter for DuckDbAdapter {
     }
 
     fn supports_native_params(&self) -> bool {
+        true
+    }
+
+    fn supports_cancellation(&self) -> bool {
         true
     }
 

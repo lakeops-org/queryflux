@@ -1449,6 +1449,15 @@ async fn setup_sync_query(
     auth_ctx: &AuthContext,
     group_fixups: &[String],
 ) -> Result<SyncQuerySetup> {
+    let pinned = match session.extra.get(crate::transaction::SESSION_KEY) {
+        Some(id) => state.transactions.lookup(id, auth_ctx, &protocol)?,
+        None => None,
+    };
+    if pinned.as_ref().is_some_and(|p| p.group != group) {
+        return Err(QueryFluxError::Routing(
+            "transaction cannot change cluster group".into(),
+        ));
+    }
     let query_id = ProxyQueryId::new();
 
     let (cluster_manager, group_default_tags, wait_timeout_secs, catalog, access_control_guard) = {
@@ -1490,7 +1499,13 @@ async fn setup_sync_query(
             seq += 1;
             continue;
         }
-        match cluster_manager.acquire_cluster(&group).await? {
+        match if let Some(p) = &pinned {
+            cluster_manager
+                .acquire_specific_cluster(&group, &p.cluster)
+                .await?
+        } else {
+            cluster_manager.acquire_cluster(&group).await?
+        } {
             Some(name) => {
                 match acquire_global_capacity(state, &cluster_manager, &group, &name, &query_id.0)
                     .await
@@ -1512,7 +1527,10 @@ async fn setup_sync_query(
                 let (adapter_for_cluster, cluster_cfg_for_cluster) = {
                     let live = state.live.read().await;
                     (
-                        live.adapters.get(&name.0).cloned(),
+                        pinned
+                            .as_ref()
+                            .map(|p| AdapterKind::Sync(p.adapter.clone()))
+                            .or_else(|| live.adapters.get(&name.0).cloned()),
                         live.cluster_configs.get(&name.0).cloned(),
                     )
                 };
@@ -2212,6 +2230,100 @@ pub async fn execute_to_sink(
     session: SessionContext,
     protocol: FrontendProtocol,
     group: ClusterGroupName,
+    sink: &mut dyn ResultSink,
+    auth_ctx: &AuthContext,
+) -> Result<()> {
+    let transaction = match session.extra.get(crate::transaction::SESSION_KEY) {
+        Some(id) => state.transactions.lookup(id, auth_ctx, &protocol)?,
+        None => None,
+    };
+    let _operation = if let Some(t) = &transaction {
+        Some(t.operation.lock().await)
+    } else {
+        None
+    };
+    if transaction
+        .as_ref()
+        .is_some_and(|t| t.failed.load(std::sync::atomic::Ordering::Acquire))
+    {
+        return Err(QueryFluxError::Engine(
+            "current transaction is aborted; ROLLBACK required".into(),
+        ));
+    }
+    let mut failure_guard = TransactionFailureGuard {
+        transaction: transaction.clone(),
+        success: false,
+    };
+    let mut tracked = TransactionSink {
+        inner: sink,
+        failed: false,
+    };
+    let result = execute_to_sink_dispatch(
+        state,
+        sql,
+        params,
+        session,
+        protocol,
+        group,
+        &mut tracked,
+        auth_ctx,
+    )
+    .await;
+    if result.is_err() || tracked.failed {
+        if let Some(t) = transaction.as_ref() {
+            t.failed.store(true, std::sync::atomic::Ordering::Release);
+        }
+    }
+    failure_guard.success = result.is_ok() && !tracked.failed;
+    result
+}
+struct TransactionFailureGuard {
+    transaction: Option<Arc<crate::transaction::PinnedTransaction>>,
+    success: bool,
+}
+impl Drop for TransactionFailureGuard {
+    fn drop(&mut self) {
+        if !self.success {
+            if let Some(t) = &self.transaction {
+                t.failed.store(true, std::sync::atomic::Ordering::Release);
+            }
+        }
+    }
+}
+struct TransactionSink<'a> {
+    inner: &'a mut dyn ResultSink,
+    failed: bool,
+}
+#[async_trait]
+impl ResultSink for TransactionSink<'_> {
+    async fn on_schema(&mut self, schema: &arrow::datatypes::Schema) -> Result<()> {
+        self.inner.on_schema(schema).await
+    }
+    async fn on_batch(&mut self, batch: &arrow::record_batch::RecordBatch) -> Result<()> {
+        self.inner.on_batch(batch).await
+    }
+    async fn on_complete(&mut self, stats: &QueryStats) -> Result<()> {
+        self.inner.on_complete(stats).await
+    }
+    async fn on_error(&mut self, message: &str) -> Result<()> {
+        self.failed = true;
+        self.inner.on_error(message).await
+    }
+    async fn on_native_chunk(&mut self, chunk: &NativeResultChunk) -> Result<()> {
+        self.inner.on_native_chunk(chunk).await
+    }
+    async fn on_translated_sql(&mut self, sql: &str) -> Result<()> {
+        self.inner.on_translated_sql(sql).await
+    }
+}
+
+async fn execute_to_sink_dispatch(
+    state: &Arc<AppState>,
+    sql: String,
+    params: QueryParams,
+    session: SessionContext,
+    protocol: FrontendProtocol,
+    group: ClusterGroupName,
     sink: &mut impl ResultSink,
     auth_ctx: &AuthContext,
 ) -> Result<()> {
@@ -2255,7 +2367,14 @@ pub async fn execute_to_sink(
     // execution so a reload cannot change the SQL after cache eligibility is decided.
     let fixups_can_run = should_attempt_translation(&session, &protocol)
         && (!group_fixups.is_empty() || state.translation.has_global_fixups());
-    let cache_eligible = if effective_cache.is_some() && !fixups_can_run {
+    let has_transaction = match session.extra.get(crate::transaction::SESSION_KEY) {
+        Some(id) => state
+            .transactions
+            .lookup(id, auth_ctx, &protocol)?
+            .is_some(),
+        None => false,
+    };
+    let cache_eligible = if effective_cache.is_some() && !fixups_can_run && !has_transaction {
         let sql = sql.clone();
         let dialect =
             queryflux_fingerprint::polyglot_dialect(&resolve_src_dialect(&session, &protocol));

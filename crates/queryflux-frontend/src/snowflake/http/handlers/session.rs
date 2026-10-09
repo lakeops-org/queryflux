@@ -44,6 +44,10 @@ pub async fn login_request(
         Some(s) if !s.is_empty() => s.to_string(),
         _ => return sf_error("390000", "Missing LOGIN_NAME"),
     };
+    let bearer_token = match super::common::oauth_login_token(data) {
+        Ok(token) => token,
+        Err(message) => return sf_error("390100", message),
+    };
     let password = data["PASSWORD"].as_str().unwrap_or("").to_string();
     // Retained for `passthrough` mode (see `SnowflakeSession::password`) — unconditionally,
     // since a login handler has no way to know yet whether the query group it's about to
@@ -65,34 +69,32 @@ pub async fn login_request(
         .filter(|s| !s.is_empty())
         .cloned();
 
-    let auth_provider = state.app.live.read().await.auth_provider.clone();
-    let auth_ctx = match auth_provider
-        .authenticate(&Credentials {
-            username: Some(login_name.clone()),
-            password: Some(password),
-            bearer_token: None,
-        })
-        .await
-    {
-        Ok(ctx) => ctx,
-        Err(e) => {
-            state
-                .app
-                .metrics
-                .on_auth_failure(&format!("{:?}", FrontendProtocol::SnowflakeHttp));
-            warn!(user = %login_name, "Snowflake wire login failed: {e}");
-            return (
-                StatusCode::UNAUTHORIZED,
-                axum::Json(json!({
-                    "data": null,
-                    "message": "Incorrect username or password was specified.",
-                    "success": false,
-                    "code": "390100"
-                })),
-            )
-                .into_response();
-        }
+    let mut lease_credentials = Credentials {
+        username: Some(login_name.clone()),
+        password: Some(password),
+        bearer_token,
     };
+    let mut auth_ctx =
+        match crate::lease::authenticate_initial(&state.app, &mut lease_credentials).await {
+            Ok(ctx) => ctx,
+            Err(e) => {
+                state
+                    .app
+                    .metrics
+                    .on_auth_failure(&format!("{:?}", FrontendProtocol::SnowflakeHttp));
+                warn!(user = %login_name, "Snowflake wire login failed: {e}");
+                return (
+                    StatusCode::UNAUTHORIZED,
+                    axum::Json(json!({
+                        "data": null,
+                        "message": "Incorrect username or password was specified.",
+                        "success": false,
+                        "code": "390100"
+                    })),
+                )
+                    .into_response();
+            }
+        };
 
     // Resolve routing group at login time — stored in session so every subsequent
     // query in this session lands on the same cluster group.
@@ -154,6 +156,8 @@ pub async fn login_request(
         Err(e) => return sf_error("390000", &format!("Routing error: {e}")),
     };
 
+    auth_ctx.raw_token = lease_credentials.bearer_token;
+
     let token = state.sessions.create_session(
         auth_ctx.user.clone(),
         auth_ctx,
@@ -214,6 +218,16 @@ pub async fn login_request(
 
 pub async fn logout(State(state): State<SnowflakeWireState>, headers: HeaderMap) -> Response {
     if let Some(token) = extract_snowflake_token(&headers) {
+        if super::common::authenticated_session(&state, &token)
+            .await
+            .is_none()
+        {
+            return unauthorized();
+        }
+        state
+            .app
+            .transactions
+            .rollback_on_disconnect(&format!("snowflake:{token}"));
         state.sessions.remove_session(&token);
     }
     (
@@ -232,6 +246,12 @@ pub async fn heartbeat(State(state): State<SnowflakeWireState>, headers: HeaderM
         Some(t) => t,
         None => return unauthorized(),
     };
+    if super::common::authenticated_session(&state, &token)
+        .await
+        .is_none()
+    {
+        return unauthorized();
+    }
     match state.sessions.validate_session(&token) {
         Some((remaining, _)) => (
             StatusCode::OK,

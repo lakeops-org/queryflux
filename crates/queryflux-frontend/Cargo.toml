@@ -37,7 +37,7 @@ futures = { workspace = true }
 tokio-stream = { workspace = true }
 arrow-flight = { version = "58.1.0", features = ["flight-sql"] }
 arrow-ipc = "58.1.0"
-tonic = { version = "0.14.5", features = ["transport"] }
+tonic = { version = "0.14.5", features = ["transport", "tls-ring"] }
 prost = "0.14.3"
 dashmap = { workspace = true }
 sha2 = "0.10"
@@ -48,3 +48,7 @@ anyhow = { workspace = true }
 rmcp = { version = "3", features = ["server", "transport-streamable-http-server", "transport-streamable-http-server-session"] }
 schemars = "1"
 tokio-util = "0.7"
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+rustls-pemfile = "2"
+
+opensrv-clickhouse = "0.7"

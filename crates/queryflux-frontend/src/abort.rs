@@ -1,13 +1,12 @@
 //! Abort a spawned query task when the caller is dropped (client disconnect).
 
-use tokio::net::tcp::OwnedReadHalf;
+use tokio::io::{AsyncBufRead, AsyncBufReadExt};
 use tokio::task::{JoinError, JoinHandle};
 
 /// Resolves when the client TCP stream is readable — EOF, a socket error, or
 /// a pipelined next command — without consuming any bytes.
-pub async fn wait_client_gone(reader: &mut OwnedReadHalf) {
-    let mut buf = [0u8; 1];
-    let _ = reader.peek(&mut buf).await;
+pub async fn wait_client_gone<R: AsyncBufRead + Unpin>(reader: &mut R) {
+    let _ = reader.fill_buf().await;
 }
 
 /// Wraps a [`JoinHandle`] and aborts the task if dropped before [`join`](Self::join).

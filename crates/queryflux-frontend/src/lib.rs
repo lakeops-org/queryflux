@@ -1,8 +1,10 @@
 pub mod abort;
 pub mod access_control_guard;
 pub mod admin;
+pub mod clickhouse_native;
 pub mod dispatch;
 pub mod flight_sql;
+pub mod lease;
 pub mod mcp;
 pub mod mysql_wire;
 pub mod postgres_wire;
@@ -11,7 +13,9 @@ pub mod snowflake;
 pub mod sql_pipeline;
 pub mod state;
 pub mod tee_sink;
+pub mod transaction;
 pub mod trino_http;
+pub mod wire_tls;
 
 use async_trait::async_trait;
 use queryflux_core::error::Result;

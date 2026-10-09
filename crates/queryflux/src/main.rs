@@ -1213,6 +1213,8 @@ async fn main() -> Result<()> {
     };
 
     let app_state = Arc::new(AppState {
+        transactions: Default::default(),
+        native_leases: Default::default(),
         external_address: external_address.clone(),
         live: live.clone(),
         persistence,
@@ -1227,6 +1229,18 @@ async fn main() -> Result<()> {
             .build()
             .expect("build shared http client"),
         result_cache,
+    });
+
+    let transaction_gc_state = Arc::downgrade(&app_state);
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+        loop {
+            interval.tick().await;
+            let Some(state) = transaction_gc_state.upgrade() else {
+                break;
+            };
+            state.transactions.expire_idle();
+        }
     });
 
     // --- Start admin server (Prometheus /metrics + future /admin/* endpoints) ---
@@ -2143,6 +2157,7 @@ async fn main() -> Result<()> {
             let rx = shutdown_rx.clone();
             async move {
                 MysqlWireFrontend::new(state, cfg.port, cfg.max_connections)
+                    .with_tls(cfg.tls)
                     .listen(rx)
                     .await
             }
@@ -2154,6 +2169,18 @@ async fn main() -> Result<()> {
             let rx = shutdown_rx.clone();
             async move {
                 PostgresWireFrontend::new(state, cfg.port, cfg.max_connections)
+                    .with_tls(cfg.tls)
+                    .listen(rx)
+                    .await
+            }
+        });
+    }
+    if let Some(cfg) = config.queryflux.frontends.clickhouse_native.clone() {
+        frontend_tasks.spawn_if_enabled("ClickHouse native", cfg.enabled, || {
+            let state = app_state.clone();
+            let rx = shutdown_rx.clone();
+            async move {
+                queryflux_frontend::clickhouse_native::ClickHouseNativeFrontend::new(state, cfg)
                     .listen(rx)
                     .await
             }
@@ -2165,6 +2192,7 @@ async fn main() -> Result<()> {
             let rx = shutdown_rx.clone();
             async move {
                 FlightSqlFrontend::new(state, cfg.port, cfg.max_connections)
+                    .with_tls(cfg.tls)
                     .listen(rx)
                     .await
             }

@@ -23,6 +23,17 @@ use crate::credentials::{AuthContext, Credentials};
 #[async_trait]
 pub trait AuthProvider: Send + Sync {
     async fn authenticate(&self, creds: &Credentials) -> Result<AuthContext>;
+    /// Credential exchange a SQL wire listener must perform before accepting login.
+    fn wire_auth_kind(&self) -> WireAuthKind {
+        WireAuthKind::Password
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WireAuthKind {
+    None,
+    Password,
+    Jwt,
 }
 
 // ---------------------------------------------------------------------------
@@ -50,6 +61,9 @@ impl NoneAuthProvider {
 
 #[async_trait]
 impl AuthProvider for NoneAuthProvider {
+    fn wire_auth_kind(&self) -> WireAuthKind {
+        WireAuthKind::None
+    }
     async fn authenticate(&self, creds: &Credentials) -> Result<AuthContext> {
         let user = match &creds.username {
             Some(u) if !u.is_empty() => u.clone(),
@@ -220,6 +234,9 @@ impl OidcAuthProvider {
 
 #[async_trait]
 impl AuthProvider for OidcAuthProvider {
+    fn wire_auth_kind(&self) -> WireAuthKind {
+        WireAuthKind::Jwt
+    }
     async fn authenticate(&self, creds: &Credentials) -> Result<AuthContext> {
         let token = match &creds.bearer_token {
             Some(t) => t.as_str(),
@@ -386,6 +403,147 @@ mod tests {
                 .contains("OIDC audience validation required"),
             "unexpected error: {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn native_lease_reverifies_fresh_jwt_and_current_roles() {
+        use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+        let provider = OidcAuthProvider::new(
+            OidcConfig {
+                issuer: "https://tenant.example".into(),
+                jwks_uri: "https://unused.example/jwks".into(),
+                audience: Some("cluster-a".into()),
+                groups_claim: "groups".into(),
+                roles_claim: Some("role".into()),
+                attribute_claims: vec!["tenant_id".into(), "cluster_id".into()],
+            },
+            true,
+        );
+        *provider.jwks_cache.write().await = Some((
+            serde_json::from_str(include_str!("../tests/fixtures/oidc-test-jwks.json")).unwrap(),
+            Instant::now(),
+        ));
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let signing_key =
+            EncodingKey::from_rsa_pem(include_bytes!("../tests/fixtures/oidc-test-private.pem"))
+                .unwrap();
+        let mut header = Header::new(Algorithm::RS256);
+        header.kid = Some("test-only".into());
+        let mint = |role: &str, tenant: &str, exp: u64| {
+            Credentials {
+            bearer_token: Some(encode(&header, &serde_json::json!({"sub":"verified-user", "iss":"https://tenant.example", "aud":"cluster-a", "exp":exp,
+                "token_type":"cluster_access", "role":role, "tenant_id":tenant, "cluster_id":"cluster-a"}), &signing_key).unwrap()),
+            ..Default::default()
+        }
+        };
+        let store = crate::lease::LeaseStore::default();
+        let initial = mint("reader", "tenant-a", now + 2);
+        let verified = provider.authenticate(&initial).await.unwrap();
+        let (id, secret, connection_token) = store.register(initial.clone(), &verified).unwrap();
+        let (unused_id, unused_secret, unused_ticket) =
+            store.register(initial.clone(), &verified).unwrap();
+        let mut established = initial;
+        established.bearer_token = Some(connection_token);
+        store
+            .authenticate_initial(&provider, &mut established)
+            .await
+            .unwrap();
+        let fresh = mint("writer", "tenant-a", now + 1801);
+        let verified = provider.authenticate(&fresh).await.unwrap();
+        store.renew(&id, &secret, fresh.clone(), &verified).unwrap();
+        store
+            .renew(&unused_id, &unused_secret, fresh.clone(), &verified)
+            .unwrap();
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        // The original short-lived connection JWT has now expired, while the
+        // established session remains authorized by the renewed Knorket token.
+        let mut expired_unused_ticket = Credentials {
+            bearer_token: Some(unused_ticket),
+            ..Default::default()
+        };
+        assert!(store
+            .authenticate_initial(&provider, &mut expired_unused_ticket)
+            .await
+            .is_err());
+        let current = store.authenticate(&provider, &established).await.unwrap();
+        assert_eq!(current.roles, vec!["writer"]);
+        assert_eq!(current.raw_token, fresh.bearer_token);
+        let wrong_scope = mint("writer", "other-tenant", now + 1800);
+        let verified = provider.authenticate(&wrong_scope).await.unwrap();
+        assert!(store.renew(&id, &secret, wrong_scope, &verified).is_err());
+        assert!(provider
+            .authenticate(&mint("writer", "tenant-a", now - 120))
+            .await
+            .is_err());
+        assert!(store
+            .authenticate(&NoneAuthProvider::new(false), &established)
+            .await
+            .is_err());
+        store.revoke(&id, &secret).unwrap();
+        assert!(store.authenticate(&provider, &established).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn knorket_jwt_verifies_subject_role_scope_expiry_and_signature() {
+        use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+        let provider = OidcAuthProvider::new(
+            OidcConfig {
+                issuer: "https://tenant.example".into(),
+                jwks_uri: "https://unused.example/jwks".into(),
+                audience: Some("cluster-a".into()),
+                groups_claim: "groups".into(),
+                roles_claim: Some("role".into()),
+                attribute_claims: vec!["tenant_id".into(), "cluster_id".into()],
+            },
+            true,
+        );
+        let keys: JwkSet =
+            serde_json::from_str(include_str!("../tests/fixtures/oidc-test-jwks.json")).unwrap();
+        *provider.jwks_cache.write().await = Some((keys, Instant::now()));
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let claims = serde_json::json!({"sub":"verified-user", "email":"user@example", "iss":"https://tenant.example", "aud":"cluster-a", "exp":now+1800, "iat":now, "token_type":"cluster_access", "role":"member", "tenant_id":"tenant-a", "cluster_id":"cluster-a"});
+        let signing_key =
+            EncodingKey::from_rsa_pem(include_bytes!("../tests/fixtures/oidc-test-private.pem"))
+                .unwrap();
+        let mut header = Header::new(Algorithm::RS256);
+        header.kid = Some("test-only".into());
+        let token = encode(&header, &claims, &signing_key).unwrap();
+        let credentials = |token: String| Credentials {
+            username: Some("spoofed-user".into()),
+            bearer_token: Some(token),
+            password: None,
+        };
+        let identity = provider
+            .authenticate(&credentials(token.clone()))
+            .await
+            .unwrap();
+        assert_eq!(identity.user, "verified-user");
+        assert_eq!(identity.roles, vec!["member"]);
+        assert_eq!(identity.attributes["tenant_id"], "tenant-a");
+        assert_eq!(identity.raw_token.as_deref(), Some(token.as_str()));
+        for (key, value) in [
+            ("aud", serde_json::json!("cluster-b")),
+            ("iss", serde_json::json!("https://other.example")),
+            ("exp", serde_json::json!(now - 120)),
+        ] {
+            let mut invalid = claims.clone();
+            invalid[key] = value;
+            let signed = encode(&header, &invalid, &signing_key).unwrap();
+            assert!(
+                provider.authenticate(&credentials(signed)).await.is_err(),
+                "accepted invalid {key}"
+            );
+        }
+        let mut forged = token;
+        let signature = forged.rfind('.').unwrap() + 1;
+        forged.replace_range(signature.., "AAAA");
+        assert!(provider.authenticate(&credentials(forged)).await.is_err());
     }
 
     #[test]

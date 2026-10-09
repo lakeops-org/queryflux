@@ -173,7 +173,7 @@ impl StarRocksAdapter {
         // built `Opts`, not assumed.
         let requires_passthrough = matches!(
             config.query_auth,
-            Some(queryflux_core::config::QueryAuthConfig::Passthrough)
+            Some(queryflux_auth_config) if matches!(queryflux_auth_config, queryflux_core::config::QueryAuthConfig::Passthrough | queryflux_core::config::QueryAuthConfig::TokenExchange(_))
         );
 
         let make_builder = || -> Result<OptsBuilder> {
@@ -471,6 +471,9 @@ impl SyncAdapter for StarRocksAdapter {
         .await
     }
 
+    fn supports_cancellation(&self) -> bool {
+        true
+    }
     async fn cancel_query(&self, backend_id: &BackendQueryId) -> Result<()> {
         let Some(sql) = kill_query_sql(&backend_id.0) else {
             tracing::debug!(

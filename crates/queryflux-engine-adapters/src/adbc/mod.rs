@@ -32,6 +32,7 @@ mod snowflake;
 mod sql_helpers;
 #[cfg(test)]
 mod test_fixtures;
+mod transaction;
 
 use introspection::AdbcIntrospection;
 use scoped_pools::{
@@ -645,6 +646,8 @@ pub struct AdbcAdapter {
     pub cluster_name: ClusterName,
     pub group_name: ClusterGroupName,
     pool: AdbcPool,
+    transaction_database: ManagedDatabase,
+    transaction_options: Vec<(OptionDatabase, adbc_core::options::OptionValue)>,
     /// Kept (not dropped after `new()`) so per-identity `ManagedDatabase`s can be built on
     /// demand — cheap to clone (`Arc` inside), see `adbc_driver_manager::ManagedDriver`.
     driver: ManagedDriver,
@@ -720,6 +723,7 @@ impl AdbcAdapter {
             opts.push((OptionDatabase::Other(k.clone()), v.clone().into()));
         }
 
+        let transaction_options = opts.clone();
         let database = driver.new_database_with_opts(opts).map_err(|e| {
             QueryFluxError::Engine(format!(
                 "cluster '{}': failed to create ADBC database: {e}",
@@ -731,6 +735,7 @@ impl AdbcAdapter {
         // `scoped_pool_for`. Cloning it is cheap (Arc-backed), and the shared library stays
         // loaded via that Arc either way.
 
+        let transaction_database = database.clone();
         let manager = AdbcConnectionManager::new(database);
         let pool = r2d2::Pool::builder()
             .max_size(config.pool_size)
@@ -761,6 +766,8 @@ impl AdbcAdapter {
             cluster_name,
             group_name,
             pool,
+            transaction_database,
+            transaction_options,
             driver,
             driver_name,
             base_uri,
@@ -1134,6 +1141,52 @@ pub(crate) fn collect_batches(
 
 #[async_trait]
 impl SyncAdapter for AdbcAdapter {
+    async fn begin_transaction(&self, session: &SessionContext) -> Result<Arc<dyn SyncAdapter>> {
+        let database = if let Some(key) =
+            self.scoped_pool_key(session, &queryflux_auth::QueryCredentials::ServiceAccount)
+        {
+            let mut options = self.transaction_options.clone();
+            options.extend(Self::scoped_pool_options(&self.driver_name, &key)?);
+            let mut driver = self.driver.clone();
+            tokio::task::spawn_blocking(move || {
+                driver
+                    .new_database_with_opts(options)
+                    .map_err(|e| QueryFluxError::Engine(format!("ADBC transaction database: {e}")))
+            })
+            .await
+            .map_err(|e| QueryFluxError::Engine(e.to_string()))??
+        } else {
+            self.transaction_database.clone()
+        };
+        transaction::open(
+            database,
+            self.engine_type.clone(),
+            self.translation_dialect.clone(),
+        )
+        .await
+    }
+    async fn describe_query(&self, sql: &str) -> Result<Arc<arrow::datatypes::Schema>> {
+        let pool = self.pool.clone();
+        let sql = sql.to_owned();
+        tokio::task::spawn_blocking(move || {
+            let mut conn = pool
+                .get()
+                .map_err(|e| QueryFluxError::Engine(format!("ADBC describe checkout: {e}")))?;
+            let mut stmt = conn
+                .new_statement()
+                .map_err(|e| QueryFluxError::Engine(e.to_string()))?;
+            stmt.set_sql_query(&sql)
+                .map_err(|e| QueryFluxError::Engine(e.to_string()))?;
+            stmt.prepare()
+                .map_err(|e| QueryFluxError::Engine(e.to_string()))?;
+            stmt.execute_schema()
+                .map(Arc::new)
+                .map_err(|e| QueryFluxError::Engine(e.to_string()))
+        })
+        .await
+        .map_err(|e| QueryFluxError::Engine(e.to_string()))?
+    }
+
     fn supports_native_params(&self) -> bool {
         true
     }
