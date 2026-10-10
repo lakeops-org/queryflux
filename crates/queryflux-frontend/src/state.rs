@@ -131,6 +131,7 @@ pub struct QueryContext {
     pub was_rewritten: bool,
     pub rewritten_sql: Option<String>,
     pub was_translated: bool,
+    pub translation: Option<queryflux_core::query::TranslationOutcome>,
     pub translated_sql: Option<String>,
     pub query_tags: QueryTags,
     /// Typed positional parameters extracted from the client's wire protocol.
@@ -260,6 +261,7 @@ impl AppState {
             was_rewritten: ctx.was_rewritten,
             rewritten_sql: ctx.rewritten_sql.clone(),
             was_translated: ctx.was_translated,
+            translation: ctx.translation,
             translated_sql: ctx.translated_sql.clone(),
             user: ctx.session.user().map(|s| s.to_string()),
             catalog: ctx.session.catalog().map(|s| s.to_string()),
@@ -349,6 +351,7 @@ impl AppState {
             rewritten_sql: None,
             was_translated: false,
             translated_sql: None,
+            translation: executing.translation,
             query_tags: executing.query_tags.clone(),
             query_params: vec![],
             agent_context: executing.agent_context.clone(),
@@ -399,6 +402,7 @@ impl AppState {
             was_rewritten: false,
             rewritten_sql: None,
             was_translated: false,
+            translation: None,
             translated_sql: None,
             query_tags: session.tags.clone(),
             query_params: vec![],
@@ -475,6 +479,7 @@ impl AppState {
             was_rewritten: false,
             rewritten_sql: None,
             was_translated: false,
+            translation: None,
             translated_sql: None,
             query_tags,
             query_params: vec![],
@@ -577,6 +582,10 @@ mod record_terminal_tests {
         let executing = ExecutingQuery {
             id: ProxyQueryId("q-exec-cancel".into()),
             sql: "SELECT 1".into(),
+            translation: Some(queryflux_core::query::TranslationOutcome {
+                status: queryflux_core::query::TranslationStatus::Fallback,
+                reason: Some(queryflux_core::query::TranslationReason::NoSchema),
+            }),
             client_sql: None,
             rewritten_sql: None,
             was_dialect_translated: false,
@@ -597,6 +606,14 @@ mod record_terminal_tests {
             wire_auth: None,
             queue_duration_ms: 2500,
         };
+        let stored = serde_json::to_value(&executing).unwrap();
+        let executing: ExecutingQuery = serde_json::from_value(stored.clone()).unwrap();
+        let mut legacy = stored;
+        legacy.as_object_mut().unwrap().remove("translation");
+        assert!(serde_json::from_value::<ExecutingQuery>(legacy)
+            .unwrap()
+            .translation
+            .is_none());
         state.record_executing_cancelled(
             &executing,
             FrontendProtocol::TrinoHttp,
@@ -617,6 +634,11 @@ mod record_terminal_tests {
         assert!(rows[0].status.contains("Cancelled"));
         assert_eq!(rows[0].error_message.as_deref(), Some("client cancelled"));
         assert_eq!(rows[0].queue_duration_ms, 2500);
+        assert!(!rows[0].was_translated);
+        assert_eq!(
+            rows[0].translation,
+            Some(serde_json::json!({"status": "fallback", "reason": "no_schema"}))
+        );
     }
 }
 

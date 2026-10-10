@@ -29,6 +29,12 @@ impl MultiMetricsStore {
 
 #[async_trait]
 impl MetricsStore for MultiMetricsStore {
+    fn on_translation(&self, outcome: queryflux_core::query::TranslationOutcome) {
+        for store in &self.stores {
+            store.on_translation(outcome);
+        }
+    }
+
     fn on_query_started(&self, group: &str, cluster: &str) {
         for s in &self.stores {
             s.on_query_started(group, cluster);

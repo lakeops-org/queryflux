@@ -5,7 +5,7 @@ use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use queryflux_core::{
     error::{QueryFluxError, Result},
-    query::SqlDialect,
+    query::{SqlDialect, TranslationReason},
 };
 use tracing::debug;
 
@@ -129,6 +129,24 @@ fn extract_table_refs_with_gil(py: Python<'_>, sql: &str, dialect: &str) -> Resu
     Ok(refs)
 }
 
+/// Keep failure reasons and nonrecoverable rejections distinct without parsing error text.
+pub(crate) struct SqlglotFailure {
+    pub error: QueryFluxError,
+    pub reason: TranslationReason,
+    /// Invariant violations must reject the request even under best-effort policy.
+    pub reject_passthrough: bool,
+}
+
+impl From<QueryFluxError> for SqlglotFailure {
+    fn from(error: QueryFluxError) -> Self {
+        Self {
+            error,
+            reason: TranslationReason::TranspileError,
+            reject_passthrough: false,
+        }
+    }
+}
+
 /// SQL translator backed by the sqlglot Python library (via PyO3).
 pub struct SqlglotTranslator {
     source: SqlDialect,
@@ -136,6 +154,7 @@ pub struct SqlglotTranslator {
     /// User-defined Python scripts executed in order after sqlglot translation.
     /// Each script must define `def transform(sql: str, src: str, dst: str) -> str`.
     python_scripts: Vec<String>,
+    error_on_unsupported: bool,
 }
 
 impl SqlglotTranslator {
@@ -144,7 +163,31 @@ impl SqlglotTranslator {
             source,
             target,
             python_scripts,
+            error_on_unsupported: false,
         }
+    }
+
+    pub fn with_error_on_unsupported(mut self, enabled: bool) -> Self {
+        self.error_on_unsupported = enabled;
+        self
+    }
+
+    pub(crate) async fn translate_detailed(
+        &self,
+        sql: &str,
+        schema: &SchemaContext,
+    ) -> std::result::Result<(String, Option<TranslationReason>), SqlglotFailure> {
+        let sql = sql.to_string();
+        let src = self.source.sqlglot_write_name();
+        let tgt = self.target.sqlglot_write_name();
+        let schema = schema.clone();
+        let scripts = self.python_scripts.clone();
+        let strict = self.error_on_unsupported;
+        tokio::task::spawn_blocking(move || {
+            translate_with_gil(&sql, &src, &tgt, &schema, &scripts, strict)
+        })
+        .await
+        .map_err(|e| QueryFluxError::Translation(format!("spawn_blocking error: {e}")))?
     }
 
     /// Verify that sqlglot is importable. Call once at startup.
@@ -170,7 +213,8 @@ impl SqlglotTranslator {
 pub fn validate_fixup_script(script: &str) -> Result<()> {
     Python::attach(|py| run_fixup_scripts(py, "SELECT 1", "trino", "trino", &[script.to_string()]))
         .map(|_| ())
-        .map_err(|e| {
+        .map_err(|failure| {
+            let e = failure.error;
             QueryFluxError::Translation(format!(
                 "fixup script failed validation against the current transform(sql: str, src: \
                  str, dst: str) -> str contract (a script written for the old \
@@ -190,17 +234,10 @@ impl TranslatorTrait for SqlglotTranslator {
     }
 
     async fn translate(&self, sql: &str, schema_context: &SchemaContext) -> Result<String> {
-        let sql = sql.to_string();
-        let src = self.source.sqlglot_write_name();
-        let tgt = self.target.sqlglot_write_name();
-        let schema_context = schema_context.clone();
-        let python_scripts = self.python_scripts.clone();
-
-        tokio::task::spawn_blocking(move || {
-            translate_with_gil(&sql, &src, &tgt, &schema_context, &python_scripts)
-        })
-        .await
-        .map_err(|e| QueryFluxError::Translation(format!("spawn_blocking error: {e}")))?
+        self.translate_detailed(sql, schema_context)
+            .await
+            .map(|(sql, _)| sql)
+            .map_err(|failure| failure.error)
     }
 }
 
@@ -210,59 +247,154 @@ fn translate_with_gil(
     tgt: &str,
     schema_context: &SchemaContext,
     python_scripts: &[String],
-) -> Result<String> {
+    strict: bool,
+) -> std::result::Result<(String, Option<TranslationReason>), SqlglotFailure> {
     Python::attach(|py| {
-        let sqlglot = PyModule::import(py, "sqlglot")
-            .map_err(|e| QueryFluxError::Translation(format!("Failed to import sqlglot: {e}")))?;
+        let sqlglot = PyModule::import(py, "sqlglot").map_err(|e| SqlglotFailure {
+            error: QueryFluxError::Translation(format!("Failed to import sqlglot: {e}")),
+            reason: TranslationReason::SqlglotUnavailable,
+            reject_passthrough: false,
+        })?;
+
+        // sqlglot can accept unknown syntax as an opaque Command even with
+        // unsupported_level=RAISE. Keep the validated executable AST so empty
+        // statements and standalone comments cannot change which SQL we emit.
+        let tree = parse_translatable_statement(py, &sqlglot, sql, src)?;
 
         // 1. Dialect translation (skipped when src == tgt; fixup scripts may still run).
-        let translated = if src == tgt {
-            sql.to_string()
+        let (translated, fallback) = if src == tgt {
+            let sql = if python_scripts.is_empty() {
+                sql.to_string()
+            } else {
+                render_sql(py, &tree, tgt, strict)?
+            };
+            (sql, None)
         } else if schema_context.is_empty() {
             debug!(src, tgt, "sqlglot dialect-only translation");
-            translate_dialect_only(py, &sqlglot, sql, src, tgt)?
+            (
+                render_sql(py, &tree, tgt, strict)?,
+                Some(TranslationReason::NoSchema),
+            )
         } else {
             debug!(src, tgt, "sqlglot schema-aware translation");
-            translate_with_schema(py, &sqlglot, sql, src, tgt, schema_context)?
+            match translate_with_schema(py, &tree, src, tgt, schema_context, strict) {
+                Ok(sql) => (sql, None),
+                Err(_) => (
+                    render_sql(py, &tree, tgt, strict)?,
+                    Some(TranslationReason::OptimizeError),
+                ),
+            }
         };
 
         // 2. Run user fixup scripts in order. Each receives SQL text and returns SQL text.
         if python_scripts.is_empty() {
-            return Ok(translated);
+            return Ok((translated, fallback));
         }
-        run_fixup_scripts(py, &translated, src, tgt, python_scripts)
+        let sql = run_fixup_scripts(py, &translated, src, tgt, python_scripts)?;
+        Ok((sql, fallback))
     })
 }
 
-fn translate_dialect_only(
-    py: Python<'_>,
-    sqlglot: &Bound<'_, PyModule>,
+fn parse_translatable_statement<'py>(
+    py: Python<'py>,
+    sqlglot: &Bound<'py, PyModule>,
     sql: &str,
     src: &str,
-    tgt: &str,
-) -> Result<String> {
+) -> Result<Bound<'py, PyAny>> {
     let kwargs = PyDict::new(py);
-    kwargs.set_item("read", src).ok();
-    kwargs.set_item("write", tgt).ok();
-
-    let result = sqlglot
-        .call_method("transpile", (sql,), Some(&kwargs))
-        .map_err(|e| QueryFluxError::Translation(format!("sqlglot.transpile failed: {e}")))?;
-
-    let list: Vec<String> = result.extract().map_err(|e| {
-        QueryFluxError::Translation(format!("Failed to extract transpile result: {e}"))
+    kwargs
+        .set_item("read", src)
+        .map_err(|e| QueryFluxError::Translation(format!("setting source dialect failed: {e}")))?;
+    let statements: Vec<Bound<'_, PyAny>> = sqlglot
+        .call_method("parse", (sql,), Some(&kwargs))
+        .and_then(|parsed| parsed.extract())
+        .map_err(|e| QueryFluxError::Translation(format!("sqlglot.parse failed: {e}")))?;
+    let expressions = PyModule::import(py, "sqlglot.expressions").map_err(|e| {
+        QueryFluxError::Translation(format!("loading sqlglot expressions failed: {e}"))
     })?;
+    let semicolon = expressions.getattr("Semicolon").map_err(|e| {
+        QueryFluxError::Translation(format!("loading sqlglot Semicolon failed: {e}"))
+    })?;
+    let mut executable = Vec::new();
+    let mut comments: Vec<String> = Vec::new();
+    for statement in statements {
+        if statement.is_none() {
+            continue;
+        }
+        if statement.is_instance(&semicolon).map_err(|e| {
+            QueryFluxError::Translation(format!("checking statement type failed: {e}"))
+        })? {
+            let trailing: Option<Vec<String>> = statement
+                .getattr("comments")
+                .and_then(|value| value.extract())
+                .map_err(|e| {
+                    QueryFluxError::Translation(format!("reading SQL comments failed: {e}"))
+                })?;
+            comments.extend(trailing.unwrap_or_default());
+        } else {
+            executable.push(statement);
+        }
+    }
+    let statements = executable;
+    if statements.len() != 1 {
+        return Err(QueryFluxError::Translation(
+            "required translation supports exactly one SQL statement per query".into(),
+        ));
+    }
+    let command = expressions
+        .getattr("Command")
+        .and_then(|command| statements[0].call_method1("find", (command,)))
+        .map_err(|e| QueryFluxError::Translation(format!("checking SQL syntax failed: {e}")))?;
+    if !command.is_none() {
+        return Err(QueryFluxError::Translation(
+            "required translation cannot translate an opaque sqlglot command".into(),
+        ));
+    }
+    let tree = statements
+        .into_iter()
+        .next()
+        .expect("one executable statement");
+    if !comments.is_empty() {
+        tree.call_method1("add_comments", (comments,))
+            .map_err(|e| {
+                QueryFluxError::Translation(format!("preserving SQL comments failed: {e}"))
+            })?;
+    }
+    Ok(tree)
+}
 
-    Ok(list.into_iter().next().unwrap_or_default())
+fn set_unsupported_level(py: Python<'_>, kwargs: &Bound<'_, PyDict>, strict: bool) -> Result<()> {
+    if strict {
+        let level = PyModule::import(py, "sqlglot.errors")
+            .and_then(|m| m.getattr("ErrorLevel"))
+            .and_then(|c| c.getattr("RAISE"))
+            .map_err(|e| {
+                QueryFluxError::Translation(format!("sqlglot ErrorLevel unavailable: {e}"))
+            })?;
+        kwargs.set_item("unsupported_level", level).map_err(|e| {
+            QueryFluxError::Translation(format!("setting unsupported_level failed: {e}"))
+        })?;
+    }
+    Ok(())
+}
+
+fn render_sql(py: Python<'_>, tree: &Bound<'_, PyAny>, tgt: &str, strict: bool) -> Result<String> {
+    let kwargs = PyDict::new(py);
+    kwargs.set_item("dialect", tgt).ok();
+    set_unsupported_level(py, &kwargs, strict)?;
+
+    tree.call_method("sql", (), Some(&kwargs))
+        .and_then(|result| result.extract())
+        .map_err(|e| QueryFluxError::Translation(format!("AST.sql() failed: {e}")))
 }
 
 fn translate_with_schema(
     py: Python<'_>,
-    sqlglot: &Bound<'_, PyModule>,
-    sql: &str,
+    tree: &Bound<'_, PyAny>,
     src: &str,
     tgt: &str,
     schema_context: &SchemaContext,
+    strict: bool,
 ) -> Result<String> {
     let schema_dict = PyDict::new(py);
     for (table, cols) in &schema_context.tables {
@@ -273,11 +405,10 @@ fn translate_with_schema(
         schema_dict.set_item(table, col_dict).ok();
     }
 
-    let parse_kwargs = PyDict::new(py);
-    parse_kwargs.set_item("dialect", src).ok();
-    let tree = sqlglot
-        .call_method("parse_one", (sql,), Some(&parse_kwargs))
-        .map_err(|e| QueryFluxError::Translation(format!("sqlglot.parse_one failed: {e}")))?;
+    // Preserve the parsed AST for dialect-only fallback if optimization fails.
+    let tree = tree
+        .call_method0("copy")
+        .map_err(|e| QueryFluxError::Translation(format!("copying SQL AST failed: {e}")))?;
 
     let optimizer = PyModule::import(py, "sqlglot.optimizer").map_err(|e| {
         QueryFluxError::Translation(format!("Failed to import sqlglot.optimizer: {e}"))
@@ -299,20 +430,9 @@ fn translate_with_schema(
     opt_kwargs.set_item("dialect", src).ok();
     let optimized = optimizer
         .call_method("optimize", (&tree,), Some(&opt_kwargs))
-        .unwrap_or_else(|e| {
-            tracing::warn!("sqlglot optimizer failed ({e}), falling back to dialect-only");
-            tree
-        });
+        .map_err(|e| QueryFluxError::Translation(format!("sqlglot.optimize failed: {e}")))?;
 
-    let sql_kwargs = PyDict::new(py);
-    sql_kwargs.set_item("dialect", tgt).ok();
-    let translated: String = optimized
-        .call_method("sql", (), Some(&sql_kwargs))
-        .map_err(|e| QueryFluxError::Translation(format!("AST.sql() failed: {e}")))?
-        .extract()
-        .map_err(|e| QueryFluxError::Translation(format!("Failed to extract sql result: {e}")))?;
-
-    Ok(translated)
+    render_sql(py, &optimized, tgt, strict)
 }
 
 /// Execute user-defined Python fixup scripts against the translated SQL.
@@ -360,7 +480,7 @@ fn run_fixup_scripts(
     src: &str,
     tgt: &str,
     scripts: &[String],
-) -> Result<String> {
+) -> std::result::Result<String, SqlglotFailure> {
     let dialect = SqlDialect::Sqlglot(tgt.to_string());
     let mut current = sql.to_string();
 
@@ -407,9 +527,13 @@ fn run_fixup_scripts(
 
         let read_like_after = queryflux_core::sql_classify::is_read_like_sql(&current, &dialect);
         if read_like_before && !read_like_after {
-            return Err(QueryFluxError::Translation(format!(
-                "translation script {i} changed the statement kind from read to non-read; rejected"
-            )));
+            return Err(SqlglotFailure {
+                error: QueryFluxError::Translation(format!(
+                    "translation script {i} changed the statement kind from read to non-read; rejected"
+                )),
+                reason: TranslationReason::TranspileError,
+                reject_passthrough: true,
+            });
         }
     }
 

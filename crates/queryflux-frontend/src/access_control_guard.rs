@@ -108,6 +108,26 @@ pub struct OpaAccessGuard {
 }
 
 impl OpaAccessGuard {
+    #[cfg(test)]
+    pub(crate) fn with_test_controller(controller: Arc<AccessController>) -> Self {
+        Self {
+            connections: HashMap::from([(
+                "test".to_string(),
+                ConnectionRuntime {
+                    controller,
+                    session_param_keys: vec![],
+                    on_missing_schema: OnMissingSchema::Evaluate,
+                },
+            )]),
+            config: Arc::new(queryflux_core::access_config::AccessControlConfig {
+                enabled: true,
+                default_connection: Some("test".to_string()),
+                connections: HashMap::from([("test".to_string(), Default::default())]),
+                groups: HashMap::new(),
+            }),
+        }
+    }
+
     /// Whether access control is administratively enabled for `group`. Does **not** by
     /// itself mean access control runs for it — see [`Self::connection_name_for_group`].
     pub fn enabled_for_group(&self, group: &str) -> bool {

@@ -37,7 +37,7 @@ Everything below is implemented and available on the `main` branch.
 | | Load balancing strategies: `roundRobin`, `leastLoaded`, `failover`, `engineAffinity`, `weighted` |
 | | Health-aware cluster selection and background health checks |
 | **Translation** | Dialect-only translation via sqlglot (31+ dialects, PyO3) |
-| | Graceful degradation when sqlglot is unavailable |
+| | Configurable best-effort or strict translation, with skip/fallback metrics and history outcomes |
 | **Persistence** | In-memory store (`DashMap`) — single-instance, zero config |
 | | PostgreSQL store (JSONB) — production HA, shared state across replicas |
 | | Schema migrations via Refinery (`queryflux migrate` + optional autoMigrate on start) |
