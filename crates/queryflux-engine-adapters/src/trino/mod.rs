@@ -198,6 +198,29 @@ impl TrinoAdapter {
         }
     }
 
+    /// Whether the submit request already identifies the user to Trino — via a client
+    /// `x-trino-user` header, an `Authorization` header (resolved credentials or cluster
+    /// auth), or an impersonated `X-Trino-User`.
+    fn request_carries_identity(
+        &self,
+        session: &SessionContext,
+        credentials: &queryflux_auth::QueryCredentials,
+    ) -> bool {
+        if session
+            .extra
+            .keys()
+            .any(|k| k.eq_ignore_ascii_case("x-trino-user"))
+        {
+            return true;
+        }
+        let wire_auth = crate::wire_auth::resolve_stored_wire_auth(
+            credentials,
+            session,
+            self.cluster_sets_http_authorization(),
+        );
+        wire_auth.is_some() || self.cluster_sets_http_authorization()
+    }
+
     fn with_control_timeout(&self, builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
         builder.timeout(TRINO_CONTROL_TIMEOUT)
     }
@@ -254,6 +277,18 @@ impl TrinoAdapter {
             }
             if k_lower.starts_with("x-trino-") {
                 builder = builder.header(k, v);
+            }
+        }
+
+        // Non-Trino frontends (MySQL wire, MCP, …) carry the caller in `session.user`
+        // rather than `extra["x-trino-user"]`. Without a user header or Authorization,
+        // Trino rejects the submit with 401 — so fall back to `session.user`, but only
+        // when the request carries no other identity: Impersonate already set a verified
+        // `X-Trino-User`, and with an Authorization header Trino takes the user from the
+        // credential (adding `X-Trino-User` there would turn into an impersonation check).
+        if !self.request_carries_identity(session, credentials) {
+            if let Some(user) = session.user.as_deref().filter(|u| !u.is_empty()) {
+                builder = builder.header("X-Trino-User", user);
             }
         }
 
@@ -1643,6 +1678,112 @@ mod tests {
         let req = builder.build().expect("request should build");
 
         assert_eq!(header_value(&req, "x-trino-user"), "bob");
+    }
+
+    /// Build the submit request the way `submit_query` does: credentials, then session headers.
+    fn submit_request(
+        adapter: &TrinoAdapter,
+        session: &SessionContext,
+        credentials: &QueryCredentials,
+    ) -> reqwest::Request {
+        let builder = adapter
+            .apply_query_credentials(
+                adapter.http_client.post("http://trino:8080/v1/statement"),
+                credentials,
+                session,
+            )
+            .expect("credentials should apply");
+        adapter
+            .apply_session_headers(builder, session, &QueryTags::new(), credentials)
+            .build()
+            .expect("request should build")
+    }
+
+    fn x_trino_users(req: &reqwest::Request) -> Vec<&str> {
+        req.headers()
+            .get_all("x-trino-user")
+            .iter()
+            .map(|v| v.to_str().unwrap_or(""))
+            .collect()
+    }
+
+    #[test]
+    fn non_trino_frontend_user_becomes_x_trino_user_without_auth() {
+        // MySQL wire / MCP sessions carry the caller in `session.user`, not in
+        // `extra["x-trino-user"]`. With no cluster auth Trino needs a user header or
+        // it rejects the submit with 401 (#291).
+        let adapter = adapter_with_auth(None);
+        let session = SessionContext {
+            user: Some("alice".to_string()),
+            ..Default::default()
+        };
+
+        let req = submit_request(&adapter, &session, &QueryCredentials::ServiceAccount);
+
+        assert_eq!(x_trino_users(&req), vec!["alice"]);
+        assert!(req.headers().get("authorization").is_none());
+    }
+
+    #[test]
+    fn client_x_trino_user_wins_over_session_user_fallback() {
+        let adapter = adapter_with_auth(None);
+        let mut session = SessionContext {
+            user: Some("alice".to_string()),
+            ..Default::default()
+        };
+        session
+            .extra
+            .insert("X-Trino-User".to_string(), "bob".to_string());
+
+        let req = submit_request(&adapter, &session, &QueryCredentials::ServiceAccount);
+
+        assert_eq!(x_trino_users(&req), vec!["bob"]);
+    }
+
+    #[test]
+    fn session_user_fallback_skipped_when_authorization_is_sent() {
+        // With an Authorization header Trino derives the user from the credential;
+        // adding X-Trino-User would trigger an impersonation check and could break
+        // existing service-account setups.
+        let basic = adapter_with_auth(Some(queryflux_core::config::ClusterAuth::Basic {
+            username: "svc".to_string(),
+            password: "svc-pass".to_string(),
+        }));
+        let session = SessionContext {
+            user: Some("alice".to_string()),
+            ..Default::default()
+        };
+        let req = submit_request(&basic, &session, &QueryCredentials::ServiceAccount);
+        assert!(x_trino_users(&req).is_empty());
+
+        let no_cluster_auth = adapter_with_auth(None);
+        let req = submit_request(
+            &no_cluster_auth,
+            &session,
+            &QueryCredentials::Bearer {
+                token: "exchanged-token".to_string(),
+            },
+        );
+        assert!(x_trino_users(&req).is_empty());
+    }
+
+    #[test]
+    fn session_user_fallback_not_added_under_impersonate() {
+        let adapter = adapter_with_auth(None);
+        let session = SessionContext {
+            user: Some("mysql-user".to_string()),
+            ..Default::default()
+        };
+
+        let req = submit_request(
+            &adapter,
+            &session,
+            &QueryCredentials::Impersonate {
+                user: "alice".to_string(),
+            },
+        );
+
+        assert_eq!(x_trino_users(&req), vec!["alice"]);
     }
 
     #[test]
