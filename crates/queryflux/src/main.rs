@@ -2099,6 +2099,7 @@ async fn main() -> Result<()> {
                         Ok(Some(lock)) => {
                             for (adapter, states) in &targets {
                                 let cluster_name = &states[0].cluster_name.0;
+                                let tracked = observe_running(states);
                                 let actual = fetch_engine_running_count(
                                     adapter,
                                     cluster_name,
@@ -2119,8 +2120,8 @@ async fn main() -> Result<()> {
                                         );
                                     }
                                 }
-                                for cstate in states {
-                                    apply_reconcile_to_cluster_state(cstate, actual);
+                                for (cstate, tracked) in states.iter().zip(tracked) {
+                                    apply_reconcile_to_cluster_state(cstate, tracked, actual);
                                 }
                             }
                             let _ = lock.release().await;
@@ -2128,10 +2129,15 @@ async fn main() -> Result<()> {
                         Ok(None) => {
                             for (_, states) in &targets {
                                 let cluster_name = &states[0].cluster_name.0;
+                                let tracked = observe_running(states);
                                 match capacity_store.active_count(cluster_name).await {
                                     Ok(count) => {
-                                        for cstate in states {
-                                            apply_reconcile_to_cluster_state(cstate, Some(count));
+                                        for (cstate, tracked) in states.iter().zip(tracked) {
+                                            apply_reconcile_to_cluster_state(
+                                                cstate,
+                                                tracked,
+                                                Some(count),
+                                            );
                                         }
                                     }
                                     Err(e) => {
@@ -2156,11 +2162,12 @@ async fn main() -> Result<()> {
                 } else {
                     for (adapter, states) in &targets {
                         let cluster_name = &states[0].cluster_name.0;
+                        let tracked = observe_running(states);
                         let actual =
                             fetch_engine_running_count(adapter, cluster_name, &custom_reconcile)
                                 .await;
-                        for cstate in states {
-                            apply_reconcile_to_cluster_state(cstate, actual);
+                        for (cstate, tracked) in states.iter().zip(tracked) {
+                            apply_reconcile_to_cluster_state(cstate, tracked, actual);
                         }
                     }
                 }
@@ -3986,12 +3993,24 @@ async fn fetch_engine_running_count(
     }
 }
 
+/// Read every state's running counter before the (slow) engine fetch, so the correction can
+/// be applied relative to what was observed — see [`apply_reconcile_to_cluster_state`].
+fn observe_running(
+    states: &[Arc<queryflux_cluster_manager::cluster_state::ClusterState>],
+) -> Vec<u64> {
+    states.iter().map(|s| s.running_queries()).collect()
+}
+
+/// `tracked` is the counter value observed *before* the engine count was fetched. The fix is
+/// applied as a relative correction (`ClusterState::reconcile_running`), so queries admitted or
+/// released while the fetch was in flight — including through a newer config generation that
+/// shares this counter after a reload — are not overwritten by a stale count.
 fn apply_reconcile_to_cluster_state(
     cstate: &queryflux_cluster_manager::cluster_state::ClusterState,
+    tracked: u64,
     actual: Option<u64>,
 ) {
     let cluster_name = &cstate.cluster_name.0;
-    let tracked = cstate.running_queries();
     let max = cstate.max_running_queries();
     if tracked > max {
         let fix = actual.unwrap_or(0);
@@ -4003,7 +4022,7 @@ fn apply_reconcile_to_cluster_state(
             fix,
             "running_queries above group capacity; resetting from engine count"
         );
-        cstate.set_running_queries(fix);
+        cstate.reconcile_running(tracked, fix);
         return;
     }
     if let Some(actual) = actual {
@@ -4015,7 +4034,7 @@ fn apply_reconcile_to_cluster_state(
                 actual,
                 "Reconciling running_queries counter with engine ground truth"
             );
-            cstate.set_running_queries(actual);
+            cstate.reconcile_running(tracked, actual);
         }
     }
 }
@@ -4218,6 +4237,43 @@ mod tests {
             assert_eq!(running(&gen2).await, 0);
             let gen3 = reload(&record, &mut cache).await;
             assert_eq!(running(&gen3).await, 0);
+        }
+
+        /// A reconcile pass that captured the previous generation must not overwrite an
+        /// admission made through the new generation while the engine fetch was in flight.
+        #[tokio::test]
+        async fn stale_generation_reconcile_keeps_new_generation_admissions() {
+            let record = duck_record(serde_json::json!({}));
+            let mut cache = empty_cache();
+            let group = ClusterGroupName("g".to_string());
+
+            let gen1 = reload(&record, &mut cache).await;
+            // One leaked slot: the counter says 1, the engine runs nothing.
+            gen1.cluster_manager
+                .acquire_cluster(&group)
+                .await
+                .unwrap()
+                .unwrap();
+            let gen1_state = cache
+                .cluster_states
+                .get(&("g".to_string(), "duck".to_string()))
+                .cloned()
+                .expect("gen1 state cached");
+            let tracked = gen1_state.running_queries(); // reconcile observes 1, starts the fetch
+
+            // A reload shares the counter; the new generation admits a real query.
+            let gen2 = reload(&record, &mut cache).await;
+            gen2.cluster_manager
+                .acquire_cluster(&group)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(running(&gen2).await, 2);
+
+            // The engine count (0, taken before the admission) lands through the stale state:
+            // only the leaked slot is removed, the new admission survives.
+            super::super::apply_reconcile_to_cluster_state(&gen1_state, tracked, Some(0));
+            assert_eq!(running(&gen2).await, 1);
         }
 
         /// With a changed cluster config the new generation starts empty and the old one
