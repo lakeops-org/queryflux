@@ -13,6 +13,9 @@
 //!   engine counts this process uses, so one `maxRunningQueries` holds across it and every
 //!   worker. Available only when this process has a coordination store (Postgres).
 //!
+//! - `/worker/query-records` stores the query history workers send (a
+//!   [`QueryRecordBatchV1`]) in this process's history store, stamped with the worker.
+//!
 //! Workers authenticate with `Authorization: Bearer <workerApi.sharedSecret>`, separate
 //! from the admin API's Basic auth.
 
@@ -28,7 +31,10 @@ use axum::{
     Json, Router,
 };
 use queryflux_core::worker_snapshot::{WorkerSnapshotV1, WORKER_SNAPSHOT_MEDIA_TYPE};
-use queryflux_persistence::{CoordinationStore, SweepGuard, WorkerRecord, WorkerRegistryStore};
+use queryflux_persistence::{
+    CoordinationStore, MetricsStore, QueryRecordBatchV1, SweepGuard, WorkerRecord,
+    WorkerRegistryStore, QUERY_RECORDS_SCHEMA_VERSION,
+};
 
 /// Builds the current snapshot. `Err` carries a message for the worker (for example
 /// "config cannot be published: …").
@@ -48,7 +54,13 @@ pub struct WorkerApi {
     pub changes: Option<tokio::sync::watch::Receiver<u64>>,
     /// This process's coordination store, shared with workers; `None` when it has none.
     pub coordination: Option<Arc<dyn CoordinationStore>>,
+    /// Where worker query records are stored (history only, not Prometheus: each worker
+    /// exports its own metrics). `None` refuses them.
+    pub history: Option<Arc<dyn MetricsStore>>,
 }
+
+/// Largest query-record batch accepted. Workers send at most a few hundred records.
+const MAX_RECORD_BATCH_BYTES: usize = 32 * 1024 * 1024;
 
 /// A long-poll never holds a request longer than this.
 const MAX_WAIT_SECS: u64 = 60;
@@ -70,6 +82,11 @@ pub fn router(api: WorkerApi) -> Router {
             get(running_get).post(running_publish),
         )
         .route("/worker/capacity/leases", get(lease_count))
+        .route(
+            "/worker/query-records",
+            post(ingest_records)
+                .layer(axum::extract::DefaultBodyLimit::max(MAX_RECORD_BATCH_BYTES)),
+        )
         .route("/worker/sweep-lock/{name}", post(sweep_lock_acquire))
         .route(
             "/worker/sweep-lock/{name}/{token}",
@@ -271,6 +288,48 @@ async fn warn_on_unshared_capacity(st: &WorkerApiState, registry: &dyn WorkerReg
              are not shared, so a group can run up to its limit on each of those workers"
         );
     }
+}
+
+// -- Query history ----------------------------------------------------------
+
+async fn ingest_records(
+    State(st): State<Arc<WorkerApiState>>,
+    headers: HeaderMap,
+    Json(batch): Json<QueryRecordBatchV1>,
+) -> Response {
+    if !authorized(&headers, &st.api.shared_secret) {
+        return unauthorized();
+    }
+    let Some(store) = st.api.history.clone() else {
+        return (
+            StatusCode::NOT_IMPLEMENTED,
+            "this control plane does not store worker query history",
+        )
+            .into_response();
+    };
+    if batch.schema_version != QUERY_RECORDS_SCHEMA_VERSION {
+        return (
+            StatusCode::BAD_REQUEST,
+            format!(
+                "unsupported query-records schemaVersion {} (this control plane accepts {})",
+                batch.schema_version, QUERY_RECORDS_SCHEMA_VERSION
+            ),
+        )
+            .into_response();
+    }
+    let accepted = batch.records.len();
+    for mut record in batch.records {
+        record.worker = Some(batch.worker.clone());
+        // Retried batches repeat records; the store keeps the first per proxy query id.
+        if let Err(e) = store.record_query(record).await {
+            return (StatusCode::SERVICE_UNAVAILABLE, e.to_string()).into_response();
+        }
+    }
+    (
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({ "accepted": accepted })),
+    )
+        .into_response()
 }
 
 // -- Shared capacity --------------------------------------------------------
@@ -513,6 +572,7 @@ mod tests {
             routing_fallback: "g".into(),
             group_translation_scripts: Default::default(),
             settings: SnapshotSettings::default(),
+            history: None,
         }
         .seal()
     }
@@ -527,6 +587,7 @@ mod tests {
             registry: None,
             changes: None,
             coordination: None,
+            history: None,
         })
     }
 
@@ -606,6 +667,7 @@ mod tests {
             registry,
             changes: Some(changes),
             coordination: None,
+            history: None,
         })
     }
 
@@ -701,6 +763,7 @@ mod tests {
             registry: None,
             changes: None,
             coordination: Some(store),
+            history: None,
         });
         let post = |path: &str, body: serde_json::Value| {
             Request::post(path.to_string())
@@ -751,5 +814,62 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+    }
+
+    #[tokio::test]
+    async fn worker_records_are_stored_with_the_worker_name() {
+        let store = Arc::new(queryflux_persistence::in_memory::InMemoryPersistence::new());
+        let app = router(WorkerApi {
+            shared_secret: "s3cret".into(),
+            snapshot: Arc::new(|| Box::pin(async { Err("unused".to_string()) })),
+            registry: None,
+            changes: None,
+            coordination: None,
+            history: Some(store.clone()),
+        });
+        let record = serde_json::json!({
+            "proxyQueryId": "q-1",
+            "clusterGroup": "g",
+            "clusterName": "c",
+            "engineType": "duckDb",
+            "frontendProtocol": "trinoHttp",
+            "sourceDialect": "trino",
+            "targetDialect": "duckDb",
+            "wasRewritten": false,
+            "wasTranslated": false,
+            "sqlPreview": "SELECT 1",
+            "status": "success",
+            "queueDurationMs": 0,
+            "executionDurationMs": 3,
+            "createdAt": "2026-10-14T00:00:00Z",
+            "worker": "spoofed"
+        });
+        let post = |body: serde_json::Value| {
+            Request::post("/worker/query-records")
+                .header(header::AUTHORIZATION, "Bearer s3cret")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap()
+        };
+        let batch = serde_json::json!({
+            "schemaVersion": 1, "worker": "worker-a", "records": [record.clone(), record]
+        });
+        let resp = app.clone().oneshot(post(batch)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+
+        use queryflux_persistence::QueryHistoryStore;
+        let page = store
+            .list_queries(&queryflux_persistence::query_history::QueryFilters {
+                limit: 10,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(page.len(), 1, "a repeated record is stored once");
+        assert_eq!(page[0].worker.as_deref(), Some("worker-a"));
+
+        let future = serde_json::json!({ "schemaVersion": 2, "worker": "w", "records": [] });
+        let resp = app.oneshot(post(future)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 }

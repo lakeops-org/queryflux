@@ -90,6 +90,10 @@ pub struct QuerySummary {
     #[serde(default)]
     #[sqlx(default)]
     pub cache_hit: bool,
+    /// The worker that ran the query; `None` when the proxy itself ran it.
+    #[serde(default)]
+    #[sqlx(default)]
+    pub worker: Option<String>,
 }
 
 /// Aggregated stats for the last hour, shown on the dashboard.

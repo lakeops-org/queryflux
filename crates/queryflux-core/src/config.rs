@@ -983,6 +983,9 @@ pub struct WorkerApiConfig {
     /// The secret workers present (`controlPlane.auth.sharedSecret` on the worker).
     #[serde(default)]
     pub shared_secret: Option<String>,
+    /// Sent to workers in the snapshot: where they send query history and its redaction.
+    #[serde(default)]
+    pub history: Option<crate::worker_snapshot::HistoryPolicy>,
 }
 
 impl QueryFluxConfig {

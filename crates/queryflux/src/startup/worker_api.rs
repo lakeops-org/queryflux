@@ -9,8 +9,8 @@ use queryflux_frontend::worker_api::WorkerApi;
 use queryflux_persistence::ConfigSnapshotStore;
 
 use crate::live_config::{
-    build_worker_snapshot, inline_script_files, snapshot_from_inputs, validate_snapshot_inputs,
-    LiveConfigInputs, SettingsInputs,
+    build_worker_snapshot, history_policy, inline_script_files, snapshot_from_inputs,
+    validate_snapshot_inputs, LiveConfigInputs, SettingsInputs,
 };
 
 /// The worker API for this process, if `queryflux.workerApi.enabled`.
@@ -26,6 +26,7 @@ pub(crate) fn worker_api(
     registry: Arc<dyn queryflux_persistence::WorkerRegistryStore>,
     changes: tokio::sync::watch::Receiver<u64>,
     coordination: Option<Arc<dyn queryflux_persistence::CoordinationStore>>,
+    history: Arc<dyn queryflux_persistence::MetricsStore>,
 ) -> Result<Option<WorkerApi>> {
     let Some(api_cfg) = config.queryflux.worker_api.as_ref().filter(|a| a.enabled) else {
         return Ok(None);
@@ -60,7 +61,9 @@ pub(crate) fn worker_api(
                     issues.join("; ")
                 );
             }
-            let fixed = snapshot_from_inputs(&inputs, credentials)?;
+            let mut fixed = snapshot_from_inputs(&inputs, credentials)?;
+            fixed.history = history_policy(config);
+            let fixed = fixed.seal();
             tracing::info!(revision = %fixed.revision, "Serving a fixed worker config snapshot (no Postgres)");
             Arc::new(move || {
                 let fixed = fixed.clone();
@@ -78,6 +81,7 @@ pub(crate) fn worker_api(
         registry: Some(registry),
         changes: Some(changes),
         coordination,
+        history: Some(history),
     }))
 }
 

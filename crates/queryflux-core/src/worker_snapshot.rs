@@ -51,6 +51,36 @@ pub struct WorkerSnapshotV1 {
     pub routing_fallback: String,
     pub group_translation_scripts: BTreeMap<String, Vec<String>>,
     pub settings: SnapshotSettings,
+    /// Where workers send query history and how much SQL it may carry. `None` means the
+    /// control plane's own `/worker/query-records`, unredacted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history: Option<HistoryPolicy>,
+}
+
+/// Where a worker sends its query records, and what they may contain.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HistoryPolicy {
+    /// Ingest URL that accepts `POST` of a query-record batch. `None` is the control
+    /// plane's `/worker/query-records`.
+    #[serde(default)]
+    pub endpoint: Option<String>,
+    #[serde(default)]
+    pub redaction: HistoryRedaction,
+}
+
+/// How much SQL a query record keeps when it leaves the worker.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum HistoryRedaction {
+    /// Records as captured.
+    #[default]
+    Full,
+    /// SQL replaced by its parameterized digest; literals in other SQL and error text
+    /// replaced with `?`.
+    MaskLiterals,
+    /// No SQL or error text: fingerprints, timings, status and engine stats only.
+    Metadata,
 }
 
 /// Serialize `value` with object keys sorted at every level. `serde_json::Value` keeps
@@ -266,6 +296,7 @@ mod tests {
             routers: vec![],
             routing_fallback: "analytics".into(),
             group_translation_scripts: BTreeMap::new(),
+            history: None,
             settings: SnapshotSettings {
                 security: Some(serde_json::json!({
                     "provider": "oidc",

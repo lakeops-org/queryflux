@@ -292,6 +292,10 @@ pub(crate) struct WorkerSyncState {
     /// Why the last fetch or activation failed; cleared on the next success.
     pub(crate) last_error: Option<String>,
     pub(crate) consecutive_failures: u32,
+    /// The active snapshot's history policy (endpoint and redaction).
+    pub(crate) history: Option<queryflux_core::worker_snapshot::HistoryPolicy>,
+    /// Query history delivery to the control plane or the named endpoint.
+    pub(crate) history_uplink: crate::history_uplink::HistoryUplinkStatus,
 }
 
 /// A worker's config source: the control plane's `GET /worker/config` (#255).
@@ -481,6 +485,7 @@ impl ConfigSource for RemoteConfigSource {
                 let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
                 st.active_revision = Some(snapshot.revision.clone());
                 st.activated_at = Some(chrono::Utc::now());
+                st.history = snapshot.history.clone();
                 st.last_error = None;
                 st.consecutive_failures = 0;
                 tracing::info!(revision = %snapshot.revision, "Worker config activated");
@@ -615,6 +620,7 @@ mod tests {
             routing_fallback: "g".into(),
             group_translation_scripts: Default::default(),
             settings: SnapshotSettings::default(),
+            history: None,
         }
         .seal()
     }
@@ -632,6 +638,7 @@ mod tests {
             registry: None,
             changes: None,
             coordination: None,
+            history: None,
         };
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();

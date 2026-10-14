@@ -29,7 +29,10 @@ use crate::{
 
 // Re-export so callers can do `queryflux_persistence::MetricsStore` etc.
 pub use cache_store::{CacheEntryMeta, CacheEntryRef, CacheStore};
-pub use metrics_store::{ClusterSnapshot, GuardAction, MetricsStore, QueryRecord};
+pub use metrics_store::{
+    ClusterSnapshot, GuardAction, MetricsStore, QueryRecord, QueryRecordBatchV1,
+    QUERY_RECORDS_SCHEMA_VERSION,
+};
 pub use migrate::{run_persistence_migrations, SchemaMigrator};
 pub use query_history::{AgentSummary, ConversationSummary, QuerySummary};
 pub use script_library::{

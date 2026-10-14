@@ -153,6 +153,7 @@ impl InMemoryPersistence {
             guard_actions: serde_json::to_value(&record.guard_actions).ok(),
             was_guard_blocked: record.was_guard_blocked,
             cache_hit: record.cache_hit,
+            worker: record.worker,
         }
     }
 }
@@ -1723,6 +1724,7 @@ mod tests {
             guard_actions: vec![],
             was_guard_blocked: false,
             cache_hit: false,
+            worker: None,
         };
         store.record_query(first.clone()).await.unwrap();
         first.status = QueryStatus::Cancelled;

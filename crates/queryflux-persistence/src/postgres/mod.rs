@@ -282,7 +282,7 @@ impl QueryHistoryStore for PostgresStore {
                       qr.physical_input_bytes, qr.peak_memory_bytes, qr.spilled_bytes, qr.total_splits,
                       qr.query_tags, qr.query_hash, qr.query_parameterized_hash, qr.translated_query_hash,
                       qr.agent_id, qr.conversation_id, qr.step_index, qr.tool_call_id, qr.query_intent,
-                      qr.guard_actions, qr.was_guard_blocked, qr.cache_hit
+                      qr.guard_actions, qr.was_guard_blocked, qr.cache_hit, qr.worker
                FROM query_records qr
                LEFT JOIN cluster_group_configs cg ON cg.id = qr.cluster_group_id
                LEFT JOIN cluster_configs cc ON cc.id = qr.cluster_id
@@ -477,7 +477,7 @@ impl QueryHistoryStore for PostgresStore {
                       qr.physical_input_bytes, qr.peak_memory_bytes, qr.spilled_bytes, qr.total_splits,
                       qr.query_tags, qr.query_hash, qr.query_parameterized_hash, qr.translated_query_hash,
                       qr.agent_id, qr.conversation_id, qr.step_index, qr.tool_call_id, qr.query_intent,
-                      qr.guard_actions, qr.was_guard_blocked, qr.cache_hit
+                      qr.guard_actions, qr.was_guard_blocked, qr.cache_hit, qr.worker
                FROM query_records qr
                LEFT JOIN cluster_group_configs cg ON cg.id = qr.cluster_group_id
                LEFT JOIN cluster_configs cc ON cc.id = qr.cluster_id
@@ -1918,10 +1918,20 @@ impl MetricsStore for PostgresStore {
                  total_splits, cluster_group_id, cluster_id, query_tags,
                  query_hash, query_parameterized_hash, translated_query_hash,
                  agent_id, conversation_id, step_index, tool_call_id, query_intent,
-                 guard_actions, was_guard_blocked, cache_hit, translation)
+                 guard_actions, was_guard_blocked, cache_hit, translation, worker)
                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,
-                       $21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,$37,$38,
-                       $39,$40,$41,$42,$43,$44,$45,$46)
+                       $21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,
+                       -- Records from workers (#255) carry names, not this database's
+                       -- ids, and may arrive after a cluster was deleted: resolve by name
+                       -- for those, and store a missing row as NULL rather than failing
+                       -- the foreign key.
+                       COALESCE((SELECT id FROM cluster_group_configs WHERE id = $32),
+                                (SELECT id FROM cluster_group_configs
+                                  WHERE $47::text IS NOT NULL AND name = $3)),
+                       COALESCE((SELECT id FROM cluster_configs WHERE id = $33),
+                                (SELECT id FROM cluster_configs
+                                  WHERE $47::text IS NOT NULL AND name = $4)),
+                       $34,$35,$36,$37,$38,$39,$40,$41,$42,$43,$44,$45,$46,$47)
                ON CONFLICT (proxy_query_id) DO NOTHING"#,
         )
         .bind(&r.proxy_query_id)
@@ -1972,6 +1982,7 @@ impl MetricsStore for PostgresStore {
         .bind(r.translation.map(|outcome| {
             serde_json::to_value(outcome).expect("serializable translation outcome")
         }))
+        .bind(&r.worker)
         .execute(&self.admin_pool)
         .await
         .map_err(|e| QueryFluxError::Persistence(format!("Insert query_records: {e}")))?;
@@ -3394,6 +3405,7 @@ mod tests {
             guard_actions: vec![],
             was_guard_blocked: false,
             cache_hit: false,
+            worker: None,
         };
         first.was_rewritten = true;
         first.rewritten_sql = Some("SELECT 1 WHERE tenant_id = 42".into());

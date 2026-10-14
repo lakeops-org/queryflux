@@ -363,6 +363,7 @@ impl AppState {
             guard_actions: outcome.guard_actions,
             was_guard_blocked: outcome.was_guard_blocked,
             cache_hit: outcome.cache_hit,
+            worker: None,
         };
         let metrics = self.metrics.clone();
         tokio::spawn(async move {
