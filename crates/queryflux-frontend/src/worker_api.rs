@@ -8,6 +8,11 @@
 //! - `POST /worker/register` and `POST /worker/heartbeat` record what each worker reports
 //!   (name, version, labels, coordination mode, revisions, last error).
 //!
+//! - `/worker/capacity/*` and `/worker/sweep-lock/*` give workers with
+//!   `coordination.mode: controlPlane` the same capacity leases, sweep locks and published
+//!   engine counts this process uses, so one `maxRunningQueries` holds across it and every
+//!   worker. Available only when this process has a coordination store (Postgres).
+//!
 //! Workers authenticate with `Authorization: Bearer <workerApi.sharedSecret>`, separate
 //! from the admin API's Basic auth.
 
@@ -23,7 +28,7 @@ use axum::{
     Json, Router,
 };
 use queryflux_core::worker_snapshot::{WorkerSnapshotV1, WORKER_SNAPSHOT_MEDIA_TYPE};
-use queryflux_persistence::{WorkerRecord, WorkerRegistryStore};
+use queryflux_persistence::{CoordinationStore, SweepGuard, WorkerRecord, WorkerRegistryStore};
 
 /// Builds the current snapshot. `Err` carries a message for the worker (for example
 /// "config cannot be published: …").
@@ -41,6 +46,8 @@ pub struct WorkerApi {
     pub registry: Option<Arc<dyn WorkerRegistryStore>>,
     /// Bumped whenever this process reloads its config; wakes long-polls.
     pub changes: Option<tokio::sync::watch::Receiver<u64>>,
+    /// This process's coordination store, shared with workers; `None` when it has none.
+    pub coordination: Option<Arc<dyn CoordinationStore>>,
 }
 
 /// A long-poll never holds a request longer than this.
@@ -54,16 +61,39 @@ pub fn router(api: WorkerApi) -> Router {
         .route("/worker/config/wait", get(wait_config))
         .route("/worker/register", post(report))
         .route("/worker/heartbeat", post(report))
+        .route("/worker/capacity/acquire", post(capacity_acquire))
+        .route("/worker/capacity/release", post(capacity_release))
+        .route("/worker/capacity/heartbeat", post(capacity_heartbeat))
+        .route("/worker/capacity/release-all", post(capacity_release_all))
+        .route(
+            "/worker/capacity/running",
+            get(running_get).post(running_publish),
+        )
+        .route("/worker/capacity/leases", get(lease_count))
+        .route("/worker/sweep-lock/{name}", post(sweep_lock_acquire))
+        .route(
+            "/worker/sweep-lock/{name}/{token}",
+            axum::routing::delete(sweep_lock_release),
+        )
         .with_state(Arc::new(WorkerApiState {
             api,
             last_fleet_warning: std::sync::atomic::AtomicI64::new(0),
+            sweep_locks: tokio::sync::Mutex::new(std::collections::HashMap::new()),
         }))
 }
+
+/// A sweep lock this process holds on a worker's behalf, until the worker releases it or
+/// it is older than [`SWEEP_LOCK_TTL`] (a worker that died mid-sweep).
+type HeldSweepLocks = tokio::sync::Mutex<
+    std::collections::HashMap<String, (Box<dyn SweepGuard>, std::time::Instant)>,
+>;
+const SWEEP_LOCK_TTL: std::time::Duration = std::time::Duration::from_secs(300);
 
 struct WorkerApiState {
     api: WorkerApi,
     /// Unix seconds of the last shared-capacity warning (rate limit).
     last_fleet_warning: std::sync::atomic::AtomicI64,
+    sweep_locks: HeldSweepLocks,
 }
 
 /// Constant-time comparison, so response timing does not leak how much of the
@@ -243,6 +273,225 @@ async fn warn_on_unshared_capacity(st: &WorkerApiState, registry: &dyn WorkerReg
     }
 }
 
+// -- Shared capacity --------------------------------------------------------
+
+#[derive(serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AcquireRequest {
+    pub cluster: String,
+    pub max_running_queries: u64,
+    pub instance_id: String,
+    pub query_id: String,
+}
+
+#[derive(serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReleaseRequest {
+    pub cluster: String,
+    pub query_id: String,
+}
+
+#[derive(serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InstanceRequest {
+    pub instance_id: String,
+}
+
+#[derive(serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClusterQuery {
+    pub cluster: String,
+}
+
+#[derive(serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PublishRunning {
+    pub cluster: String,
+    pub count: u64,
+}
+
+/// Authorize the worker and return the coordination store, or the response to send.
+#[allow(clippy::result_large_err)]
+fn coordination(
+    st: &WorkerApiState,
+    headers: &HeaderMap,
+) -> Result<Arc<dyn CoordinationStore>, Response> {
+    if !authorized(headers, &st.api.shared_secret) {
+        return Err(unauthorized());
+    }
+    st.api.coordination.clone().ok_or_else(|| {
+        (
+            StatusCode::NOT_IMPLEMENTED,
+            "this control plane has no coordination store; use coordination.mode: local",
+        )
+            .into_response()
+    })
+}
+
+fn store_error(e: queryflux_core::error::QueryFluxError) -> Response {
+    (StatusCode::SERVICE_UNAVAILABLE, e.to_string()).into_response()
+}
+
+async fn capacity_acquire(
+    State(st): State<Arc<WorkerApiState>>,
+    headers: HeaderMap,
+    Json(req): Json<AcquireRequest>,
+) -> Response {
+    let store = match coordination(&st, &headers) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    match store
+        .try_acquire(
+            &req.cluster,
+            req.max_running_queries,
+            &req.instance_id,
+            &req.query_id,
+        )
+        .await
+    {
+        Ok(granted) => Json(serde_json::json!({ "granted": granted })).into_response(),
+        Err(e) => store_error(e),
+    }
+}
+
+async fn capacity_release(
+    State(st): State<Arc<WorkerApiState>>,
+    headers: HeaderMap,
+    Json(req): Json<ReleaseRequest>,
+) -> Response {
+    let store = match coordination(&st, &headers) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    match store.release(&req.cluster, &req.query_id).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => store_error(e),
+    }
+}
+
+async fn capacity_heartbeat(
+    State(st): State<Arc<WorkerApiState>>,
+    headers: HeaderMap,
+    Json(req): Json<InstanceRequest>,
+) -> Response {
+    let store = match coordination(&st, &headers) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    match store.heartbeat(&req.instance_id).await {
+        Ok(n) => Json(serde_json::json!({ "renewed": n })).into_response(),
+        Err(e) => store_error(e),
+    }
+}
+
+async fn capacity_release_all(
+    State(st): State<Arc<WorkerApiState>>,
+    headers: HeaderMap,
+    Json(req): Json<InstanceRequest>,
+) -> Response {
+    let store = match coordination(&st, &headers) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    match store.release_all_for_instance(&req.instance_id).await {
+        Ok(n) => Json(serde_json::json!({ "released": n })).into_response(),
+        Err(e) => store_error(e),
+    }
+}
+
+async fn running_get(
+    State(st): State<Arc<WorkerApiState>>,
+    headers: HeaderMap,
+    Query(q): Query<ClusterQuery>,
+) -> Response {
+    let store = match coordination(&st, &headers) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    match store.active_count(&q.cluster).await {
+        Ok(n) => Json(serde_json::json!({ "count": n })).into_response(),
+        Err(e) => store_error(e),
+    }
+}
+
+async fn running_publish(
+    State(st): State<Arc<WorkerApiState>>,
+    headers: HeaderMap,
+    Json(req): Json<PublishRunning>,
+) -> Response {
+    let store = match coordination(&st, &headers) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    match store.publish_running_count(&req.cluster, req.count).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => store_error(e),
+    }
+}
+
+async fn lease_count(
+    State(st): State<Arc<WorkerApiState>>,
+    headers: HeaderMap,
+    Query(q): Query<ClusterQuery>,
+) -> Response {
+    let store = match coordination(&st, &headers) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    match store.active_lease_count(&q.cluster).await {
+        Ok(n) => Json(serde_json::json!({ "count": n })).into_response(),
+        Err(e) => store_error(e),
+    }
+}
+
+async fn sweep_lock_acquire(
+    State(st): State<Arc<WorkerApiState>>,
+    headers: HeaderMap,
+    axum::extract::Path(name): axum::extract::Path<String>,
+) -> Response {
+    let store = match coordination(&st, &headers) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    let mut held = st.sweep_locks.lock().await;
+    // Release locks a worker took and never returned (it died mid-sweep).
+    let expired: Vec<String> = held
+        .iter()
+        .filter(|(_, (_, at))| at.elapsed() > SWEEP_LOCK_TTL)
+        .map(|(k, _)| k.clone())
+        .collect();
+    for token in expired {
+        if let Some((guard, _)) = held.remove(&token) {
+            guard.release().await;
+        }
+    }
+    match store.try_sweep_lock(&name).await {
+        Ok(Some(guard)) => {
+            let token = uuid::Uuid::new_v4().to_string();
+            held.insert(token.clone(), (guard, std::time::Instant::now()));
+            Json(serde_json::json!({ "token": token })).into_response()
+        }
+        Ok(None) => Json(serde_json::json!({ "token": null })).into_response(),
+        Err(e) => store_error(e),
+    }
+}
+
+async fn sweep_lock_release(
+    State(st): State<Arc<WorkerApiState>>,
+    headers: HeaderMap,
+    axum::extract::Path((_name, token)): axum::extract::Path<(String, String)>,
+) -> Response {
+    if let Err(r) = coordination(&st, &headers) {
+        return r;
+    }
+    let guard = st.sweep_locks.lock().await.remove(&token);
+    if let Some((guard, _)) = guard {
+        guard.release().await;
+    }
+    StatusCode::NO_CONTENT.into_response()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -277,6 +526,7 @@ mod tests {
             }),
             registry: None,
             changes: None,
+            coordination: None,
         })
     }
 
@@ -355,6 +605,7 @@ mod tests {
             }),
             registry,
             changes: Some(changes),
+            coordination: None,
         })
     }
 
@@ -439,5 +690,66 @@ mod tests {
         assert_eq!(workers.len(), 1);
         assert_eq!(workers[0].active_revision.as_deref(), Some("abc"));
         assert_eq!(workers[0].labels["app"], "checkout");
+    }
+
+    #[tokio::test]
+    async fn capacity_is_shared_through_the_control_plane() {
+        let store = Arc::new(queryflux_persistence::in_memory::InMemoryPersistence::new());
+        let app = router(WorkerApi {
+            shared_secret: "s3cret".into(),
+            snapshot: Arc::new(|| Box::pin(async { Err("unused".to_string()) })),
+            registry: None,
+            changes: None,
+            coordination: Some(store),
+        });
+        let post = |path: &str, body: serde_json::Value| {
+            Request::post(path.to_string())
+                .header(header::AUTHORIZATION, "Bearer s3cret")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap()
+        };
+        let resp = app
+            .clone()
+            .oneshot(post(
+                "/worker/capacity/acquire",
+                serde_json::json!({
+                    "cluster": "c", "maxRunningQueries": 1, "instanceId": "w1", "queryId": "q1"
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(v["granted"].is_boolean());
+
+        let lock = app
+            .clone()
+            .oneshot(
+                Request::post("/worker/sweep-lock/reconcile")
+                    .header(header::AUTHORIZATION, "Bearer s3cret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(lock.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn capacity_needs_a_coordination_store() {
+        let resp = app(Ok(snapshot()))
+            .oneshot(
+                Request::get("/worker/capacity/running?cluster=c")
+                    .header(header::AUTHORIZATION, "Bearer s3cret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
     }
 }

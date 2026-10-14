@@ -21,6 +21,7 @@ mod config_source;
 mod guards;
 mod live_config;
 mod registered_engines;
+mod remote_coordination;
 mod startup;
 
 use crate::config_source::{
@@ -128,17 +129,6 @@ async fn main() -> Result<()> {
     // and skips the config-loading and security checks below, which describe config it
     // does not have.
     let is_worker = config.queryflux.role == queryflux_core::config::Role::Worker;
-    if is_worker
-        && config.queryflux.coordination.as_ref().map_or(
-            queryflux_core::config::CoordinationMode::ControlPlane,
-            |c| c.mode,
-        ) == queryflux_core::config::CoordinationMode::ControlPlane
-    {
-        tracing::warn!(
-            "coordination.mode: controlPlane is not available in this build yet; limits apply \
-             to this worker alone (as with coordination.mode: local)"
-        );
-    }
 
     let external_address = config
         .queryflux
@@ -160,6 +150,34 @@ async fn main() -> Result<()> {
         snapshot_store,
         worker_registry,
     } = startup::stores::build_stores(&config).await?;
+    // Coordination the control plane serves to workers: its own, only when it enforces
+    // capacity with it (otherwise dead workers' leases would never expire).
+    let served_coordination = coordination.clone();
+    // A worker's executing and queued queries live in its own memory, so it sweeps them
+    // itself (`local_sweeps`), while capacity leases and engine counts are shared through
+    // the control plane with `coordination.mode: controlPlane`.
+    let (coordination, local_sweeps) = if is_worker {
+        let coord_cfg = config.queryflux.coordination.clone().unwrap_or_default();
+        let remote = match (&config.queryflux.control_plane, coord_cfg.mode) {
+            (Some(cp), queryflux_core::config::CoordinationMode::ControlPlane) => {
+                info!(
+                    on_unavailable = ?coord_cfg.on_unavailable,
+                    "Capacity limits are shared with the fleet through the control plane"
+                );
+                Some(remote_coordination::remote_coordination(
+                    cp,
+                    coord_cfg.on_unavailable,
+                ))
+            }
+            _ => {
+                info!("coordination.mode: local — limits apply to this worker alone");
+                None
+            }
+        };
+        (remote, None)
+    } else {
+        (coordination.clone(), coordination)
+    };
 
     // Filled when Postgres loads cluster/group rows — used for query_history FKs on ClusterState.
     let mut cluster_ids_by_name: HashMap<String, i64> = HashMap::new();
@@ -561,11 +579,11 @@ async fn main() -> Result<()> {
         )
         .map_err(|e| anyhow::anyhow!(e))?;
 
-    if distributed {
+    if distributed && !is_worker {
         tracing::warn!(
             "Distributed coordination is enabled. \
-             This requires HA Postgres — during a Postgres outage the fleet reverts to \
-             per-replica capacity limits (group_limit × replicas worst case). \
+             This requires HA Postgres — during a Postgres outage new queries cannot take \
+             a capacity lease and wait in the queue (fail-closed) until it returns. \
              Alert on queryflux_coordination_failures_total > 0."
         );
     }
@@ -758,6 +776,7 @@ async fn main() -> Result<()> {
         &inputs,
         worker_registry,
         config_changed_rx,
+        served_coordination.filter(|_| distributed),
     )?;
     let admin = AdminFrontend::new(
         prometheus.clone(),
@@ -797,7 +816,7 @@ async fn main() -> Result<()> {
         );
     }
 
-    if distributed {
+    if distributed && !is_worker {
         if config
             .queryflux
             .periodic_config_reload_interval_secs()
@@ -832,15 +851,15 @@ async fn main() -> Result<()> {
         &app_state,
         &prometheus,
         &backend,
-        &coordination,
+        &local_sweeps,
         &shutdown_rx,
     );
 
     startup::tasks::spawn_lease_heartbeat(&app_state, &shutdown_rx);
 
-    startup::tasks::spawn_zombie_sweep(&app_state, &coordination, &shutdown_rx);
+    startup::tasks::spawn_zombie_sweep(&app_state, &local_sweeps, &shutdown_rx);
 
-    startup::tasks::spawn_stale_queue_sweep(&app_state, &coordination, &shutdown_rx);
+    startup::tasks::spawn_stale_queue_sweep(&app_state, &local_sweeps, &shutdown_rx);
 
     startup::tasks::spawn_cache_cleanup(&app_state, &shutdown_rx, &config);
 

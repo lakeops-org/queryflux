@@ -24,6 +24,7 @@ pub(crate) fn worker_api(
     startup_inputs: &LiveConfigInputs,
     registry: Arc<dyn queryflux_persistence::WorkerRegistryStore>,
     changes: tokio::sync::watch::Receiver<u64>,
+    coordination: Option<Arc<dyn queryflux_persistence::CoordinationStore>>,
 ) -> Result<Option<WorkerApi>> {
     let Some(api_cfg) = config.queryflux.worker_api.as_ref().filter(|a| a.enabled) else {
         return Ok(None);
@@ -65,11 +66,15 @@ pub(crate) fn worker_api(
             })
         }
     };
-    tracing::info!("Worker API enabled on the admin listener (/worker/config)");
+    tracing::info!(
+        shared_capacity = coordination.is_some(),
+        "Worker API enabled on the admin listener (/worker/config)"
+    );
     Ok(Some(WorkerApi {
         shared_secret,
         snapshot,
         registry: Some(registry),
         changes: Some(changes),
+        coordination,
     }))
 }
