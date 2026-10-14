@@ -77,6 +77,18 @@ impl ClusterState {
         self
     }
 
+    /// Share the running/queued counters of the previous generation's state across a config
+    /// reload. Queries admitted before the reload release through the cluster manager that
+    /// admitted them, i.e. the previous state; copying the counts instead would leave the new
+    /// state holding those slots forever.
+    pub fn with_shared_load_counters(mut self, previous: Option<&ClusterState>) -> Self {
+        if let Some(state) = previous.filter(|state| state.group_name == self.group_name) {
+            self.running_queries = state.running_queries.clone();
+            self.queued_queries = state.queued_queries.clone();
+        }
+        self
+    }
+
     pub fn breaker_state(&self) -> Option<CircuitState> {
         self.breaker.as_ref().map(|breaker| breaker.state())
     }
@@ -345,5 +357,42 @@ mod circuit_breaker_tests {
                 .breaker_state(),
             Some(CircuitState::Closed)
         );
+    }
+}
+
+#[cfg(test)]
+mod reload_counter_tests {
+    use super::*;
+
+    fn state(group: &str) -> ClusterState {
+        ClusterState::new(
+            ClusterName("shared".into()),
+            ClusterGroupName(group.into()),
+            None,
+            None,
+            EngineType::Trino,
+            None,
+            10,
+            true,
+        )
+    }
+
+    #[test]
+    fn reload_shares_load_counters_within_the_same_group() {
+        let previous = state("first");
+        assert!(previous.try_increment_running());
+        previous.increment_queued();
+
+        let next = state("first").with_shared_load_counters(Some(&previous));
+        assert_eq!(next.running_queries(), 1);
+        assert_eq!(next.queued_queries(), 1);
+
+        // A query admitted before the reload releases through the previous state.
+        previous.decrement_running();
+        assert_eq!(next.running_queries(), 0);
+
+        let other_group = state("second").with_shared_load_counters(Some(&previous));
+        assert!(other_group.try_increment_running());
+        assert_eq!(previous.running_queries(), 0);
     }
 }

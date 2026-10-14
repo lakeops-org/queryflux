@@ -2927,11 +2927,15 @@ async fn build_live_config(
             let previous = cache
                 .cluster_states
                 .get(&(group_name.clone(), member_name.clone()));
-            let previous_breaker = if config_unchanged {
+            let previous_unchanged = if config_unchanged {
                 previous.map(Arc::as_ref)
             } else {
                 None
             };
+            // Load counters are shared (not copied) with the previous generation: queries
+            // admitted before this reload release through the old cluster manager, so a copied
+            // count would never be decremented and the slots would leak (#299). With a changed
+            // config the new state starts at zero and the old one drains on its own.
             let state = Arc::new(
                 ClusterState::new(
                     ClusterName(member_name.clone()),
@@ -2943,15 +2947,11 @@ async fn build_live_config(
                     max_q,
                     record.enabled,
                 )
-                .with_circuit_breaker(group_config.circuit_breaker.clone(), previous_breaker),
+                .with_circuit_breaker(group_config.circuit_breaker.clone(), previous_unchanged)
+                .with_shared_load_counters(previous_unchanged),
             );
             if let Some(prev) = previous {
-                let snap = prev.snapshot();
-                state.set_healthy(snap.is_healthy);
-                if config_unchanged {
-                    state.set_running_queries(snap.running_queries);
-                    state.set_queued_queries(snap.queued_queries);
-                }
+                state.set_healthy(prev.is_healthy());
             }
             states.push(state);
         }
@@ -4133,6 +4133,116 @@ mod tests {
                 cache.cluster_states.get(&key).expect("old state retained"),
                 &old
             ));
+        }
+
+        fn duck_record(
+            config: serde_json::Value,
+        ) -> queryflux_persistence::cluster_config::ClusterConfigRecord {
+            queryflux_persistence::cluster_config::ClusterConfigRecord {
+                id: 1,
+                name: "duck".to_string(),
+                engine_key: "duckDb".to_string(),
+                enabled: true,
+                max_running_queries: None,
+                config,
+                variants: serde_json::json!([]),
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+            }
+        }
+
+        async fn reload(
+            record: &queryflux_persistence::cluster_config::ClusterConfigRecord,
+            cache: &mut AdapterReloadCache,
+        ) -> crate::LiveConfig {
+            let group: ClusterGroupConfig = serde_json::from_value(serde_json::json!({
+                "members": ["duck"],
+                "maxRunningQueries": 10
+            }))
+            .expect("valid group fixture");
+            build_live_config(
+                std::slice::from_ref(record),
+                &HashMap::from([("g".to_string(), group)]),
+                &HashMap::new(),
+                &HashMap::new(),
+                &[],
+                "g",
+                HashMap::new(),
+                cache,
+            )
+            .await
+            .expect("reload succeeds")
+        }
+
+        async fn running(live: &crate::LiveConfig) -> u64 {
+            live.cluster_manager.all_cluster_states().await.unwrap()[0].running_queries
+        }
+
+        fn empty_cache() -> AdapterReloadCache {
+            AdapterReloadCache {
+                adapters: HashMap::new(),
+                config_json: HashMap::new(),
+                cluster_states: HashMap::new(),
+                routing_fallback: "g".to_string(),
+                routers_cfg: Vec::new(),
+                strategies: HashMap::new(),
+            }
+        }
+
+        /// Regression for #299: a query in flight across a reload releases through the
+        /// generation that admitted it; the new generation must not keep its slot.
+        #[tokio::test]
+        async fn reload_does_not_leak_in_flight_running_count() {
+            let record = duck_record(serde_json::json!({}));
+            let mut cache = empty_cache();
+            let group = ClusterGroupName("g".to_string());
+
+            let gen1 = reload(&record, &mut cache).await;
+            let cluster = gen1
+                .cluster_manager
+                .acquire_cluster(&group)
+                .await
+                .unwrap()
+                .unwrap();
+            let gen2 = reload(&record, &mut cache).await;
+            assert_eq!(
+                running(&gen2).await,
+                1,
+                "in-flight query still counts after reload"
+            );
+
+            gen1.cluster_manager
+                .release_cluster(&group, &cluster)
+                .await
+                .unwrap();
+            assert_eq!(running(&gen2).await, 0);
+            let gen3 = reload(&record, &mut cache).await;
+            assert_eq!(running(&gen3).await, 0);
+        }
+
+        /// With a changed cluster config the new generation starts empty and the old one
+        /// drains independently — neither leaks nor underflows.
+        #[tokio::test]
+        async fn changed_config_reload_starts_fresh_and_old_generation_drains() {
+            let mut cache = empty_cache();
+            let group = ClusterGroupName("g".to_string());
+
+            let gen1 = reload(&duck_record(serde_json::json!({})), &mut cache).await;
+            let cluster = gen1
+                .cluster_manager
+                .acquire_cluster(&group)
+                .await
+                .unwrap()
+                .unwrap();
+            let gen2 = reload(&duck_record(serde_json::json!({"poolSize": 2})), &mut cache).await;
+            assert_eq!(running(&gen2).await, 0);
+
+            gen1.cluster_manager
+                .release_cluster(&group, &cluster)
+                .await
+                .unwrap();
+            assert_eq!(running(&gen1).await, 0);
+            assert_eq!(running(&gen2).await, 0);
         }
 
         #[test]
