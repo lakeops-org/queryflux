@@ -144,6 +144,7 @@ async fn main() -> Result<()> {
         backend,
         distributed_backend,
         coordination,
+        snapshot_store,
     } = startup::stores::build_stores(&config).await?;
 
     // Filled when Postgres loads cluster/group rows — used for query_history FKs on ClusterState.
@@ -727,6 +728,7 @@ async fn main() -> Result<()> {
              Set queryflux.adminApi.corsAllowedOrigins to restrict cross-origin access in production."
         );
     }
+    let worker_api = startup::worker_api::worker_api(&config, snapshot_store, &inputs)?;
     let admin = AdminFrontend::new(
         prometheus.clone(),
         live.clone(),
@@ -746,6 +748,10 @@ async fn main() -> Result<()> {
         app_state.result_cache.clone(),
         app_state.clone(),
     );
+    let admin = match worker_api {
+        Some(api) => admin.with_worker_api(api),
+        None => admin,
+    };
 
     // --- Start Trino HTTP frontend (honors frontends.trinoHttp.enabled) ---
     let trino_cfg = config.queryflux.frontends.trino_http.clone();

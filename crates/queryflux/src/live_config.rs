@@ -350,8 +350,6 @@ impl SectionError {
 /// (`UpsertClusterConfig::from_core`), which drops key-pair private keys, `driver` and
 /// `maxWaitSecs`; a YAML-only control plane should use `CredentialMode::Stripped` and
 /// secret resolution on workers for those.
-// Wired up by the control plane's worker API and the worker's config sync (#255).
-#[allow(dead_code)]
 pub(crate) fn snapshot_from_inputs(
     inputs: &LiveConfigInputs,
     credentials: queryflux_core::worker_snapshot::CredentialMode,
@@ -471,8 +469,6 @@ pub(crate) fn inputs_from_snapshot(
 /// Read every config row in one consistent read and turn it into the inputs a worker
 /// snapshot is built from. `yaml_routing` is used when routing was never saved through
 /// the admin API (it lives in the control plane's YAML).
-// Wired up by the control plane's worker API (#255).
-#[allow(dead_code)]
 pub(crate) async fn load_snapshot_inputs(
     store: &dyn queryflux_persistence::ConfigSnapshotStore,
     yaml_routing: (&str, &[queryflux_core::config::RouterConfig]),
@@ -522,8 +518,6 @@ pub(crate) async fn load_snapshot_inputs(
 
 /// Replace every `scriptFile` (routing scripts and selection strategies) with the file's
 /// contents. A path on the control plane does not exist on a worker.
-// Wired up by the control plane's worker API (#255).
-#[allow(dead_code)]
 pub(crate) fn inline_script_files(inputs: &mut LiveConfigInputs) -> Result<()> {
     use queryflux_core::config::{RouterConfig, StrategyConfig};
     let read = |path: &str| {
@@ -557,8 +551,6 @@ pub(crate) fn inline_script_files(inputs: &mut LiveConfigInputs) -> Result<()> {
 /// Checks a config before it is published to workers: routers and the fallback target
 /// enabled groups, and every member of an enabled group is an enabled cluster (variant
 /// names included). Returns one message per problem; empty means publishable.
-// Wired up by the control plane's worker API (#255).
-#[allow(dead_code)]
 pub(crate) fn validate_snapshot_inputs(inputs: &LiveConfigInputs) -> Vec<String> {
     let enabled_groups: HashSet<&str> = inputs
         .groups
@@ -597,8 +589,6 @@ pub(crate) fn validate_snapshot_inputs(inputs: &LiveConfigInputs) -> Vec<String>
 
 /// Everything the control plane does to publish config to workers: one consistent
 /// read, scripts inlined, validation, then the sealed snapshot.
-// Wired up by the control plane's worker API (#255).
-#[allow(dead_code)]
 pub(crate) async fn build_worker_snapshot(
     store: &dyn queryflux_persistence::ConfigSnapshotStore,
     yaml_routing: (&str, &[queryflux_core::config::RouterConfig]),

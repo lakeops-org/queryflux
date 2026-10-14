@@ -25,6 +25,8 @@ pub(crate) struct Stores {
     pub(crate) backend: Option<Arc<dyn BackendStore>>,
     pub(crate) distributed_backend: Option<Arc<dyn DistributedBackendStore>>,
     pub(crate) coordination: Option<Arc<dyn CoordinationStore>>,
+    /// Consistent config reads for the worker API; `None` in in-memory mode.
+    pub(crate) snapshot_store: Option<Arc<dyn queryflux_persistence::ConfigSnapshotStore>>,
 }
 
 /// When Postgres is configured we seed cluster/group config on first run and read from
@@ -101,6 +103,8 @@ pub(crate) async fn build_stores(config: &ProxyConfig) -> Result<Stores> {
     // `DistributedBackendStore` (Postgres today) are stored here.
     let distributed_backend: Option<Arc<dyn DistributedBackendStore>> =
         pg_store.clone().map(|pg| pg as _);
+    let snapshot_store: Option<Arc<dyn queryflux_persistence::ConfigSnapshotStore>> =
+        pg_store.clone().map(|pg| pg as _);
     // The narrower view admission and the lease/reconcile/sweep tasks use: leases, sweep
     // locks and published engine counts, without config or history storage.
     let coordination: Option<Arc<dyn CoordinationStore>> = pg_store.map(|pg| pg as _);
@@ -113,6 +117,7 @@ pub(crate) async fn build_stores(config: &ProxyConfig) -> Result<Stores> {
         backend,
         distributed_backend,
         coordination,
+        snapshot_store,
     })
 }
 

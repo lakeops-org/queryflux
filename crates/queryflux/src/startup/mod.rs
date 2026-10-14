@@ -4,3 +4,4 @@ pub(crate) mod frontends;
 pub(crate) mod shutdown;
 pub(crate) mod stores;
 pub(crate) mod tasks;
+pub(crate) mod worker_api;
