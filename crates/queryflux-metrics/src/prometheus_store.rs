@@ -1,3 +1,5 @@
+use std::{collections::HashSet, sync::Mutex};
+
 use async_trait::async_trait;
 use prometheus::{CounterVec, Encoder, HistogramOpts, HistogramVec, Opts, Registry, TextEncoder};
 use queryflux_core::error::Result;
@@ -20,6 +22,10 @@ pub struct PrometheusMetrics {
     rewritten_total: CounterVec,
     /// queryflux_running_queries{cluster_group, cluster_name}
     running_queries: prometheus::GaugeVec,
+    /// queryflux_circuit_breaker_state{cluster_group,cluster_name}: 0 closed,
+    /// 1 open, 2 half-open. Absent when circuit breaking is disabled.
+    circuit_breaker_state: prometheus::GaugeVec,
+    circuit_breaker_labels: Mutex<HashSet<(String, String)>>,
     /// queryflux_queued_queries{cluster_group}
     queued_queries: prometheus::GaugeVec,
     /// queryflux_query_tags_total{tag_key, tag_value, cluster_group}
@@ -105,6 +111,14 @@ impl PrometheusMetrics {
             Opts::new(
                 "queryflux_running_queries",
                 "Current number of queries executing on each cluster",
+            ),
+            &["cluster_group", "cluster_name"],
+        )?;
+
+        let circuit_breaker_state = prometheus::GaugeVec::new(
+            Opts::new(
+                "queryflux_circuit_breaker_state",
+                "Cluster breaker state: 0 closed, 1 open, 2 half-open",
             ),
             &["cluster_group", "cluster_name"],
         )?;
@@ -197,6 +211,7 @@ impl PrometheusMetrics {
         registry.register(Box::new(translated_total.clone()))?;
         registry.register(Box::new(rewritten_total.clone()))?;
         registry.register(Box::new(running_queries.clone()))?;
+        registry.register(Box::new(circuit_breaker_state.clone()))?;
         registry.register(Box::new(queued_queries.clone()))?;
         registry.register(Box::new(query_tags_total.clone()))?;
         registry.register(Box::new(coordination_failures_total.clone()))?;
@@ -216,6 +231,8 @@ impl PrometheusMetrics {
             translated_total,
             rewritten_total,
             running_queries,
+            circuit_breaker_state,
+            circuit_breaker_labels: Mutex::new(HashSet::new()),
             queued_queries,
             query_tags_total,
             coordination_failures_total,
@@ -241,6 +258,32 @@ impl PrometheusMetrics {
             .encode(&metric_families, &mut buffer)
             .unwrap_or_default();
         String::from_utf8(buffer).unwrap_or_default()
+    }
+
+    /// Replace the breaker gauge series with one complete runtime snapshot.
+    pub fn sync_circuit_breaker_states(&self, states: &[(String, String, Option<u8>)]) {
+        let current: HashSet<_> = states
+            .iter()
+            .filter(|(_, _, state)| state.is_some())
+            .map(|(group, cluster, _)| (group.clone(), cluster.clone()))
+            .collect();
+        let mut previous = self
+            .circuit_breaker_labels
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for (group, cluster) in previous.difference(&current) {
+            let _ = self
+                .circuit_breaker_state
+                .remove_label_values(&[group, cluster]);
+        }
+        for (group, cluster, state) in states {
+            if let Some(state) = state {
+                self.circuit_breaker_state
+                    .with_label_values(&[group, cluster])
+                    .set(f64::from(*state));
+            }
+        }
+        *previous = current;
     }
 }
 
@@ -378,6 +421,18 @@ impl MetricsStore for PrometheusMetrics {
 mod tests {
     use super::*;
     use queryflux_persistence::MetricsStore;
+
+    #[test]
+    fn circuit_state_gauge_tracks_transitions_and_disabled_policy() {
+        let metrics = PrometheusMetrics::new().expect("prometheus init");
+        metrics.sync_circuit_breaker_states(&[("analytics".into(), "trino-a".into(), Some(1))]);
+        assert!(metrics.gather_text().contains("queryflux_circuit_breaker_state{cluster_group=\"analytics\",cluster_name=\"trino-a\"} 1"));
+        metrics.sync_circuit_breaker_states(&[("analytics".into(), "trino-a".into(), None)]);
+        assert!(!metrics.gather_text().contains("cluster_name=\"trino-a\""));
+        metrics.sync_circuit_breaker_states(&[("analytics".into(), "trino-b".into(), Some(2))]);
+        metrics.sync_circuit_breaker_states(&[]);
+        assert!(!metrics.gather_text().contains("cluster_name=\"trino-b\""));
+    }
 
     #[test]
     fn config_reload_failure_increments_counter() {

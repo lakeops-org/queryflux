@@ -10,6 +10,9 @@ use axum::{
     Json, Router,
 };
 use queryflux_auth::AdminCredentialsManager;
+use queryflux_cluster_manager::{
+    circuit_breaker::CircuitState, cluster_state::ClusterStateSnapshot,
+};
 use queryflux_core::{
     config::{
         AuthConfig, AuthProviderConfig, AuthorizationConfig, AuthorizationProviderConfig,
@@ -89,6 +92,69 @@ pub struct ClusterStateDto {
     pub is_healthy: bool,
     /// Whether this cluster is administratively enabled.
     pub enabled: bool,
+    /// Closed, open, or halfOpen; null when circuit breaking is disabled.
+    pub breaker_state: Option<String>,
+    /// Whether this member can accept a new query before checking capacity.
+    pub can_accept_query: bool,
+}
+
+impl From<ClusterStateSnapshot> for ClusterStateDto {
+    fn from(snapshot: ClusterStateSnapshot) -> Self {
+        Self {
+            group_name: snapshot.group_name.0,
+            cluster_name: snapshot.cluster_name.0,
+            engine_type: format!("{:?}", snapshot.engine_type),
+            endpoint: snapshot.endpoint,
+            running_queries: snapshot.running_queries,
+            queued_queries: snapshot.queued_queries,
+            max_running_queries: snapshot.max_running_queries,
+            is_healthy: snapshot.is_healthy,
+            enabled: snapshot.enabled,
+            breaker_state: snapshot.breaker_state.map(|state| match state {
+                CircuitState::Closed => "closed".to_string(),
+                CircuitState::Open => "open".to_string(),
+                CircuitState::HalfOpen => "halfOpen".to_string(),
+            }),
+            can_accept_query: snapshot.can_accept_query,
+        }
+    }
+}
+
+#[cfg(test)]
+mod circuit_breaker_dto_tests {
+    use super::*;
+    use queryflux_cluster_manager::{circuit_breaker::BackendOutcome, cluster_state::ClusterState};
+    use queryflux_core::{config::CircuitBreakerConfig, query::EngineType};
+
+    #[test]
+    fn cluster_state_dto_and_openapi_expose_breaker_fields() {
+        let state = ClusterState::new(
+            ClusterName("trino-a".into()),
+            ClusterGroupName("analytics".into()),
+            None,
+            None,
+            EngineType::Trino,
+            None,
+            10,
+            true,
+        )
+        .with_circuit_breaker(
+            Some(CircuitBreakerConfig {
+                min_requests: 1,
+                ..CircuitBreakerConfig::default()
+            }),
+            None,
+        );
+        state.record_backend_outcome(BackendOutcome::Failure);
+        let dto = serde_json::to_value(ClusterStateDto::from(state.snapshot())).unwrap();
+        assert_eq!(dto["breaker_state"], "open");
+        assert_eq!(dto["can_accept_query"], false);
+
+        let schema = serde_json::to_value(ApiDoc::openapi()).unwrap();
+        let properties = &schema["components"]["schemas"]["ClusterStateDto"]["properties"];
+        assert!(properties.get("breaker_state").is_some());
+        assert!(properties.get("can_accept_query").is_some());
+    }
 }
 
 #[derive(OpenApi)]
@@ -1048,20 +1114,7 @@ async fn clusters_handler(State(state): State<Arc<AdminState>>) -> impl IntoResp
     let cluster_manager = state.live.read().await.cluster_manager.clone();
     match cluster_manager.all_cluster_states().await {
         Ok(snapshots) => {
-            let dtos: Vec<ClusterStateDto> = snapshots
-                .into_iter()
-                .map(|s| ClusterStateDto {
-                    group_name: s.group_name.0,
-                    cluster_name: s.cluster_name.0,
-                    engine_type: format!("{:?}", s.engine_type),
-                    endpoint: s.endpoint,
-                    running_queries: s.running_queries,
-                    queued_queries: s.queued_queries,
-                    max_running_queries: s.max_running_queries,
-                    is_healthy: s.is_healthy,
-                    enabled: s.enabled,
-                })
-                .collect();
+            let dtos: Vec<ClusterStateDto> = snapshots.into_iter().map(Into::into).collect();
             Json(dtos).into_response()
         }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
@@ -1597,18 +1650,7 @@ async fn update_cluster_handler(
         Ok(false) => (StatusCode::NOT_FOUND, "Cluster not found").into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
         Ok(true) => match cluster_manager.cluster_state(&group, &cluster_name).await {
-            Ok(Some(s)) => Json(ClusterStateDto {
-                group_name: s.group_name.0,
-                cluster_name: s.cluster_name.0,
-                engine_type: format!("{:?}", s.engine_type),
-                endpoint: s.endpoint,
-                running_queries: s.running_queries,
-                queued_queries: s.queued_queries,
-                max_running_queries: s.max_running_queries,
-                is_healthy: s.is_healthy,
-                enabled: s.enabled,
-            })
-            .into_response(),
+            Ok(Some(s)) => Json(ClusterStateDto::from(s)).into_response(),
             Ok(None) => (StatusCode::NOT_FOUND, "Cluster not found after update").into_response(),
             Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
         },

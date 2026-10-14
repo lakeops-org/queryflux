@@ -301,7 +301,12 @@ impl ClickHouseAdapter {
             .timeout(CONTROL_TIMEOUT)
             .send()
             .await
-            .map_err(|e| QueryFluxError::Engine(format!("ClickHouse request failed: {e}")))?;
+            .map_err(|e| {
+                QueryFluxError::backend_transport(
+                    format!("ClickHouse request failed: {e}"),
+                    e.is_timeout(),
+                )
+            })?;
         let status = resp.status();
         let exception_code = header_string(&resp, "x-clickhouse-exception-code");
         let exception_tag = header_string(&resp, "x-clickhouse-exception-tag");
@@ -320,9 +325,10 @@ impl ClickHouseAdapter {
             }
         }
         if let Some(e) = transfer_error {
-            return Err(QueryFluxError::Engine(format!(
-                "ClickHouse response aborted mid-stream: {e}"
-            )));
+            return Err(QueryFluxError::backend_transport(
+                format!("ClickHouse response aborted mid-stream: {e}"),
+                e.is_timeout(),
+            ));
         }
         Ok(String::from_utf8_lossy(&body)
             .lines()
@@ -409,9 +415,10 @@ fn clickhouse_http_error(
         .unwrap_or_default();
     // Truncate on char boundaries — exception bodies can contain multi-byte text.
     let body: String = body.trim().chars().take(MAX_ERROR_BODY).collect();
-    QueryFluxError::Engine(format!(
-        "ClickHouse query failed (HTTP {status}{code}): {body}"
-    ))
+    QueryFluxError::backend_http_status(
+        status.as_u16(),
+        format!("ClickHouse query failed (HTTP {status}{code}): {body}"),
+    )
 }
 
 fn header_string(resp: &reqwest::Response, name: &str) -> Option<String> {
@@ -613,7 +620,7 @@ impl ClickHouseArrowDecoder {
         Ok(None)
     }
 
-    fn finish(&mut self, transfer_error: Option<String>) -> Result<Option<RecordBatch>> {
+    fn finish(&mut self, transfer_error: Option<(String, bool)>) -> Result<Option<RecordBatch>> {
         if let Some(body) = &self.exception_body {
             if let Some(tag) = &self.exception_tag {
                 if let Some(msg) = find_exception_frame(body, tag) {
@@ -623,24 +630,28 @@ impl ClickHouseArrowDecoder {
                     )));
                 }
             }
-            if let Some(error) = transfer_error {
-                return Err(QueryFluxError::Engine(format!(
-                    "ClickHouse response aborted mid-stream: {error}"
-                )));
+            if let Some((error, timed_out)) = transfer_error {
+                return Err(QueryFluxError::backend_transport(
+                    format!("ClickHouse response aborted mid-stream: {error}"),
+                    timed_out,
+                ));
             }
             return Err(QueryFluxError::Engine(
                 "ClickHouse response contained an incomplete exception frame".to_string(),
             ));
         }
 
-        if let Some(error) = transfer_error {
-            return Err(QueryFluxError::Engine(format!(
-                "ClickHouse response aborted mid-stream: {error}"
-            )));
+        if let Some((error, timed_out)) = transfer_error {
+            return Err(QueryFluxError::backend_transport(
+                format!("ClickHouse response aborted mid-stream: {error}"),
+                timed_out,
+            ));
         }
 
         self.decoder.finish().map_err(|e| {
-            QueryFluxError::Engine(format!("ClickHouse Arrow stream ended unexpectedly: {e}"))
+            QueryFluxError::backend_failure(format!(
+                "ClickHouse Arrow stream ended unexpectedly: {e}"
+            ))
         })?;
 
         // DDL and INSERT responses have no body and therefore no schema. A
@@ -712,7 +723,7 @@ async fn stream_arrow_response(
                 }
             }
             Ok(None) => break None,
-            Err(error) => break Some(error.to_string()),
+            Err(error) => break Some((error.to_string(), error.is_timeout())),
         }
     };
     if transfer_error.is_none()
@@ -828,10 +839,12 @@ impl crate::SyncAdapter for ClickHouseAdapter {
             req = req.query(&[("log_comment", tag_json.as_str())]);
         }
 
-        let mut resp = req
-            .send()
-            .await
-            .map_err(|e| QueryFluxError::Engine(format!("ClickHouse request failed: {e}")))?;
+        let mut resp = req.send().await.map_err(|e| {
+            QueryFluxError::backend_transport(
+                format!("ClickHouse request failed: {e}"),
+                e.is_timeout(),
+            )
+        })?;
         let status = resp.status();
         let exception_code = header_string(&resp, "x-clickhouse-exception-code");
         let exception_tag = header_string(&resp, "x-clickhouse-exception-tag");
@@ -1238,6 +1251,22 @@ mod tests {
     }
 
     #[test]
+    fn http_status_classification_ignores_sql_error_text() {
+        assert!(matches!(
+            clickhouse_http_error(
+                reqwest::StatusCode::SERVICE_UNAVAILABLE,
+                None,
+                "syntax error"
+            ),
+            QueryFluxError::BackendFailure(_)
+        ));
+        assert!(matches!(
+            clickhouse_http_error(reqwest::StatusCode::BAD_REQUEST, None, "connection refused"),
+            QueryFluxError::Engine(_)
+        ));
+    }
+
+    #[test]
     fn frame_with_wrong_tag_returns_none() {
         let body = framed("boom");
         assert_eq!(find_exception_frame(&body, "aaaaaaaaaaaaaaaa"), None);
@@ -1451,7 +1480,7 @@ mod tests {
             decoder.push_chunk(&body[split..]).unwrap();
             collect_available(&mut decoder, false, &mut decoded).unwrap();
             let err = decoder
-                .finish(Some("connection closed".to_string()))
+                .finish(Some(("connection closed".to_string(), false)))
                 .unwrap_err();
             assert_eq!(
                 decoded.as_slice(),
@@ -1463,6 +1492,15 @@ mod tests {
                 "split offset {split}: {err}"
             );
         }
+    }
+
+    #[test]
+    fn arrow_transfer_timeout_is_recorded_as_backend_timeout() {
+        let mut decoder = ClickHouseArrowDecoder::new(None, 1024);
+        assert!(matches!(
+            decoder.finish(Some(("request timed out".to_string(), true))),
+            Err(QueryFluxError::BackendTimeout(_))
+        ));
     }
 
     #[tokio::test]

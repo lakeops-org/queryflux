@@ -1,9 +1,10 @@
 use std::sync::Arc;
 
 use adbc_core::options::{AdbcVersion, OptionDatabase};
-use adbc_core::{Connection, Driver, Statement, LOAD_FLAG_DEFAULT};
+use adbc_core::{error::Status, Connection, Driver, Statement, LOAD_FLAG_DEFAULT};
 use adbc_driver_manager::{ManagedDatabase, ManagedDriver};
 use arrow::array::Array;
+use arrow::error::ArrowError;
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use queryflux_core::{
@@ -17,6 +18,34 @@ use queryflux_core::{
 use r2d2_adbc::AdbcConnectionManager;
 use tokio::sync::{mpsc, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
+
+fn adbc_backend_error(message: String, status: Status) -> QueryFluxError {
+    match status {
+        Status::Timeout => QueryFluxError::backend_timeout(message),
+        Status::IO | Status::Internal => QueryFluxError::backend_failure(message),
+        _ => QueryFluxError::Engine(message),
+    }
+}
+
+fn adbc_read_error(error: ArrowError) -> QueryFluxError {
+    let message = format!("ADBC: failed to read results: {error}");
+    match &error {
+        ArrowError::IoError(_, source) => QueryFluxError::backend_transport(
+            message,
+            source.kind() == std::io::ErrorKind::TimedOut,
+        ),
+        ArrowError::ExternalError(source) => {
+            if let Some(adbc) = source.downcast_ref::<adbc_core::error::Error>() {
+                adbc_backend_error(message, adbc.status)
+            } else if let Some(adbc) = source.downcast_ref::<r2d2_adbc::AdbcError>() {
+                adbc_backend_error(message, adbc.0.status)
+            } else {
+                QueryFluxError::Engine(message)
+            }
+        }
+        _ => QueryFluxError::Engine(message),
+    }
+}
 
 use crate::{AdapterKind, BackendQueryIdSlot, EngineAdapterFactory, SyncAdapter, SyncExecution};
 use queryflux_core::engine_registry::{
@@ -904,16 +933,17 @@ impl AdbcAdapter {
             opts_with_uri.extend(opts);
 
             let database = driver.new_database_with_opts(opts_with_uri).map_err(|e| {
-                QueryFluxError::Engine(format!(
-                    "cluster '{cluster_name}': failed to create scoped ADBC database: {e}"
-                ))
+                adbc_backend_error(
+                    format!("cluster '{cluster_name}': failed to create scoped ADBC database: {e}"),
+                    e.status,
+                )
             })?;
             let manager = AdbcConnectionManager::new(database);
             r2d2::Pool::builder()
                 .max_size(max_size)
                 .build(manager)
                 .map_err(|e| {
-                    QueryFluxError::Engine(format!(
+                    QueryFluxError::backend_failure(format!(
                         "cluster '{cluster_name}': failed to create scoped ADBC connection \
                          pool: {e}"
                     ))
@@ -923,7 +953,7 @@ impl AdbcAdapter {
         let result = tokio::time::timeout(IDENTITY_POOL_BUILD_TIMEOUT, build)
             .await
             .map_err(|_| {
-                QueryFluxError::Engine(format!(
+                QueryFluxError::backend_timeout(format!(
                     "cluster '{}': building a scoped ADBC connection timed out after {}s (an \
                      OAuth token validation or role/warehouse resolution may be slow, or the \
                      backend is unreachable)",
@@ -933,7 +963,7 @@ impl AdbcAdapter {
             })
             .and_then(|joined| {
                 joined.map_err(|e| {
-                    QueryFluxError::Engine(format!(
+                    QueryFluxError::backend_failure(format!(
                         "cluster '{}': scoped ADBC connection task panicked: {e}",
                         self.cluster_name.0
                     ))
@@ -955,7 +985,7 @@ impl AdbcAdapter {
                 })
                 .await
                 .map_err(|e| {
-                    QueryFluxError::Engine(format!(
+                    QueryFluxError::backend_failure(format!(
                         "cluster '{}': scoped pool cache task failed: {e}",
                         self.cluster_name.0
                     ))
@@ -1132,6 +1162,61 @@ pub(crate) fn collect_batches(
         .map_err(|e| QueryFluxError::Engine(format!("ADBC: failed to read results: {e}")))
 }
 
+// ---------------------------------------------------------------------------
+// Catalog-browsing SQL
+// ---------------------------------------------------------------------------
+//
+// Engines with a single connection-wide `information_schema` (Snowflake,
+// PostgreSQL, …) can be queried unqualified. Trino has one `information_schema`
+// per catalog and no session catalog unless the URI sets one, so an unqualified
+// reference fails with "Catalog must be specified when session catalog is not set".
+
+fn sql_string_literal(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+fn sql_quoted_identifier(value: &str) -> String {
+    format!("\"{}\"", value.replace('"', "\"\""))
+}
+
+fn list_catalogs_sql(engine: &EngineType) -> String {
+    match engine {
+        EngineType::Trino => {
+            "SELECT catalog_name FROM system.metadata.catalogs ORDER BY catalog_name".to_string()
+        }
+        _ => "SELECT catalog_name FROM information_schema.schemata GROUP BY catalog_name ORDER BY catalog_name"
+            .to_string(),
+    }
+}
+
+fn list_databases_sql(engine: &EngineType, catalog: &str) -> String {
+    match engine {
+        EngineType::Trino => format!(
+            "SELECT schema_name FROM {}.information_schema.schemata ORDER BY schema_name",
+            sql_quoted_identifier(catalog)
+        ),
+        _ => format!(
+            "SELECT schema_name FROM information_schema.schemata WHERE catalog_name = {} ORDER BY schema_name",
+            sql_string_literal(catalog)
+        ),
+    }
+}
+
+fn list_tables_sql(engine: &EngineType, catalog: &str, database: &str) -> String {
+    match engine {
+        EngineType::Trino => format!(
+            "SELECT table_name FROM {}.information_schema.tables WHERE table_schema = {} ORDER BY table_name",
+            sql_quoted_identifier(catalog),
+            sql_string_literal(database)
+        ),
+        _ => format!(
+            "SELECT table_name FROM information_schema.tables WHERE table_catalog = {} AND table_schema = {} ORDER BY table_name",
+            sql_string_literal(catalog),
+            sql_string_literal(database)
+        ),
+    }
+}
+
 #[async_trait]
 impl SyncAdapter for AdbcAdapter {
     fn supports_native_params(&self) -> bool {
@@ -1209,41 +1294,45 @@ impl SyncAdapter for AdbcAdapter {
                 let mut conn = match pool.get() {
                     Ok(c) => c,
                     Err(e) => {
-                        let _ = batch_tx.blocking_send(Err(QueryFluxError::Engine(format!(
-                            "ADBC: failed to get connection from pool: {e}"
-                        ))));
+                        let _ = batch_tx.blocking_send(Err(QueryFluxError::backend_failure(
+                            format!("ADBC: failed to get connection from pool: {e}"),
+                        )));
                         return;
                     }
                 };
                 let mut stmt = match conn.new_statement() {
                     Ok(s) => s,
                     Err(e) => {
-                        let _ = batch_tx.blocking_send(Err(QueryFluxError::Engine(format!(
-                            "ADBC: failed to create statement: {e}"
-                        ))));
+                        let _ = batch_tx.blocking_send(Err(adbc_backend_error(
+                            format!("ADBC: failed to create statement: {e}"),
+                            e.status,
+                        )));
                         return;
                     }
                 };
                 if let Err(e) = stmt.set_sql_query(&sql) {
-                    let _ = batch_tx.blocking_send(Err(QueryFluxError::Engine(format!(
-                        "ADBC: failed to set SQL query: {e}"
-                    ))));
+                    let _ = batch_tx.blocking_send(Err(adbc_backend_error(
+                        format!("ADBC: failed to set SQL query: {e}"),
+                        e.status,
+                    )));
                     return;
                 }
                 if let Some(batch) = param_batch {
                     if let Err(e) = stmt.bind(batch) {
-                        let _ = batch_tx.blocking_send(Err(QueryFluxError::Engine(format!(
-                            "ADBC: failed to bind parameters: {e}"
-                        ))));
+                        let _ = batch_tx.blocking_send(Err(adbc_backend_error(
+                            format!("ADBC: failed to bind parameters: {e}"),
+                            e.status,
+                        )));
                         return;
                     }
                 }
                 let reader = match stmt.execute() {
                     Ok(r) => r,
                     Err(e) => {
-                        let _ = batch_tx.blocking_send(Err(QueryFluxError::Engine(format!(
-                            "ADBC: query execution failed: {e}"
-                        ))));
+                        let _ = batch_tx.blocking_send(Err(adbc_backend_error(
+                            format!("ADBC: query execution failed: {e}"),
+                            e.status,
+                        )));
                         return;
                     }
                 };
@@ -1257,9 +1346,7 @@ impl SyncAdapter for AdbcAdapter {
                 let mut produced_any = false;
                 for batch in reader {
                     produced_any = true;
-                    let result = batch.map_err(|e| {
-                        QueryFluxError::Engine(format!("ADBC: failed to read results: {e}"))
-                    });
+                    let result = batch.map_err(adbc_read_error);
                     if batch_tx.blocking_send(result).is_err() {
                         return;
                     }
@@ -1284,23 +1371,29 @@ impl SyncAdapter for AdbcAdapter {
             tokio::task::spawn_blocking(move || {
                 let result = (|| -> Result<Option<u64>> {
                     let mut conn = pool.get().map_err(|e| {
-                        QueryFluxError::Engine(format!(
+                        QueryFluxError::backend_failure(format!(
                             "ADBC: failed to get connection from pool: {e}"
                         ))
                     })?;
                     let mut stmt = conn.new_statement().map_err(|e| {
-                        QueryFluxError::Engine(format!("ADBC: failed to create statement: {e}"))
+                        adbc_backend_error(
+                            format!("ADBC: failed to create statement: {e}"),
+                            e.status,
+                        )
                     })?;
                     stmt.set_sql_query(&sql).map_err(|e| {
-                        QueryFluxError::Engine(format!("ADBC: failed to set SQL query: {e}"))
+                        adbc_backend_error(format!("ADBC: failed to set SQL query: {e}"), e.status)
                     })?;
                     if let Some(batch) = param_batch {
                         stmt.bind(batch).map_err(|e| {
-                            QueryFluxError::Engine(format!("ADBC: failed to bind parameters: {e}"))
+                            adbc_backend_error(
+                                format!("ADBC: failed to bind parameters: {e}"),
+                                e.status,
+                            )
                         })?;
                     }
                     let rows = stmt.execute_update().map_err(|e| {
-                        QueryFluxError::Engine(format!("ADBC: DDL/DML execution failed: {e}"))
+                        adbc_backend_error(format!("ADBC: DDL/DML execution failed: {e}"), e.status)
                     })?;
                     Ok(rows.and_then(|n| if n >= 0 { Some(n as u64) } else { None }))
                 })();
@@ -1448,17 +1541,19 @@ impl SyncAdapter for AdbcAdapter {
 
     async fn list_catalogs(&self) -> Result<Vec<String>> {
         let pool = self.pool.clone();
+        let sql = list_catalogs_sql(&self.engine_type);
         let result = tokio::task::spawn_blocking(move || {
-            let mut conn = pool.get().map_err(|e| {
-                QueryFluxError::Engine(format!("ADBC: pool error: {e}"))
-            })?;
-            let mut stmt = conn.new_statement().map_err(|e| {
-                QueryFluxError::Engine(format!("ADBC: statement error: {e}"))
-            })?;
-            stmt.set_sql_query("SELECT catalog_name FROM information_schema.schemata GROUP BY catalog_name ORDER BY catalog_name")
+            let mut conn = pool
+                .get()
+                .map_err(|e| QueryFluxError::Engine(format!("ADBC: pool error: {e}")))?;
+            let mut stmt = conn
+                .new_statement()
+                .map_err(|e| QueryFluxError::Engine(format!("ADBC: statement error: {e}")))?;
+            stmt.set_sql_query(sql)
                 .map_err(|e| QueryFluxError::Engine(format!("ADBC: {e}")))?;
             let batches = collect_batches(
-                stmt.execute().map_err(|e| QueryFluxError::Engine(format!("ADBC: {e}")))?,
+                stmt.execute()
+                    .map_err(|e| QueryFluxError::Engine(format!("ADBC: {e}")))?,
             )?;
             let mut catalogs = Vec::new();
             for batch in batches {
@@ -1466,9 +1561,7 @@ impl SyncAdapter for AdbcAdapter {
                     continue;
                 }
                 let col = batch.column(0);
-                let arr = col
-                    .as_any()
-                    .downcast_ref::<arrow::array::StringArray>();
+                let arr = col.as_any().downcast_ref::<arrow::array::StringArray>();
                 if let Some(arr) = arr {
                     for i in 0..arr.len() {
                         if !arr.is_null(i) {
@@ -1487,24 +1580,29 @@ impl SyncAdapter for AdbcAdapter {
 
     async fn list_databases(&self, catalog: &str) -> Result<Vec<String>> {
         let pool = self.pool.clone();
-        let catalog = catalog.to_string();
+        let sql = list_databases_sql(&self.engine_type, catalog);
         let result = tokio::task::spawn_blocking(move || {
-            let catalog = catalog.replace('\'', "''");
-            let mut conn = pool.get().map_err(|e| QueryFluxError::Engine(format!("ADBC: {e}")))?;
-            let mut stmt = conn.new_statement().map_err(|e| QueryFluxError::Engine(format!("ADBC: {e}")))?;
-            stmt.set_sql_query(format!(
-                "SELECT schema_name FROM information_schema.schemata WHERE catalog_name = '{catalog}' ORDER BY schema_name"
-            ))
-            .map_err(|e| QueryFluxError::Engine(format!("ADBC: {e}")))?;
+            let mut conn = pool
+                .get()
+                .map_err(|e| QueryFluxError::Engine(format!("ADBC: {e}")))?;
+            let mut stmt = conn
+                .new_statement()
+                .map_err(|e| QueryFluxError::Engine(format!("ADBC: {e}")))?;
+            stmt.set_sql_query(sql)
+                .map_err(|e| QueryFluxError::Engine(format!("ADBC: {e}")))?;
             let batches = collect_batches(
-                stmt.execute().map_err(|e| QueryFluxError::Engine(format!("ADBC: {e}")))?,
+                stmt.execute()
+                    .map_err(|e| QueryFluxError::Engine(format!("ADBC: {e}")))?,
             )?;
             let mut schemas = Vec::new();
             for batch in batches {
                 if batch.num_columns() == 0 {
                     continue;
                 }
-                let arr = batch.column(0).as_any().downcast_ref::<arrow::array::StringArray>();
+                let arr = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<arrow::array::StringArray>();
                 if let Some(arr) = arr {
                     for i in 0..arr.len() {
                         if !arr.is_null(i) {
@@ -1523,26 +1621,29 @@ impl SyncAdapter for AdbcAdapter {
 
     async fn list_tables(&self, catalog: &str, database: &str) -> Result<Vec<String>> {
         let pool = self.pool.clone();
-        let catalog = catalog.to_string();
-        let database = database.to_string();
+        let sql = list_tables_sql(&self.engine_type, catalog, database);
         let result = tokio::task::spawn_blocking(move || {
-            let catalog = catalog.replace('\'', "''");
-            let database = database.replace('\'', "''");
-            let mut conn = pool.get().map_err(|e| QueryFluxError::Engine(format!("ADBC: {e}")))?;
-            let mut stmt = conn.new_statement().map_err(|e| QueryFluxError::Engine(format!("ADBC: {e}")))?;
-            stmt.set_sql_query(format!(
-                "SELECT table_name FROM information_schema.tables WHERE table_catalog = '{catalog}' AND table_schema = '{database}' ORDER BY table_name"
-            ))
-            .map_err(|e| QueryFluxError::Engine(format!("ADBC: {e}")))?;
+            let mut conn = pool
+                .get()
+                .map_err(|e| QueryFluxError::Engine(format!("ADBC: {e}")))?;
+            let mut stmt = conn
+                .new_statement()
+                .map_err(|e| QueryFluxError::Engine(format!("ADBC: {e}")))?;
+            stmt.set_sql_query(sql)
+                .map_err(|e| QueryFluxError::Engine(format!("ADBC: {e}")))?;
             let batches = collect_batches(
-                stmt.execute().map_err(|e| QueryFluxError::Engine(format!("ADBC: {e}")))?,
+                stmt.execute()
+                    .map_err(|e| QueryFluxError::Engine(format!("ADBC: {e}")))?,
             )?;
             let mut tables = Vec::new();
             for batch in batches {
                 if batch.num_columns() == 0 {
                     continue;
                 }
-                let arr = batch.column(0).as_any().downcast_ref::<arrow::array::StringArray>();
+                let arr = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<arrow::array::StringArray>();
                 if let Some(arr) = arr {
                     for i in 0..arr.len() {
                         if !arr.is_null(i) {
@@ -1602,14 +1703,44 @@ impl EngineAdapterFactory for AdbcFactory {
 #[cfg(test)]
 mod tests {
     use super::{
-        compute_scoped_pool_key, compute_scoped_pool_size, jwt_auth_options,
+        adbc_backend_error, adbc_read_error, compute_scoped_pool_key, compute_scoped_pool_size,
+        jwt_auth_options, list_catalogs_sql, list_databases_sql, list_tables_sql,
         normalize_to_pkcs8_pem, oauth_token_options, AdbcAdapter, AdbcConfig, PoolScopeKey,
         IDENTITY_POOL_MAX_SIZE,
     };
     use crate::EngineConfigParseable;
+    use adbc_core::error::Status;
+    use arrow::error::ArrowError;
     use queryflux_auth::QueryCredentials;
+    use queryflux_core::error::QueryFluxError;
     use queryflux_core::query::{EngineType, SqlDialect};
     use queryflux_core::session::SessionContext;
+
+    #[test]
+    fn adbc_status_distinguishes_backend_and_identity_failures() {
+        assert!(matches!(
+            adbc_backend_error("io".into(), Status::IO),
+            QueryFluxError::BackendFailure(_)
+        ));
+        assert!(matches!(
+            adbc_backend_error("timeout".into(), Status::Timeout),
+            QueryFluxError::BackendTimeout(_)
+        ));
+        assert!(matches!(
+            adbc_backend_error("auth".into(), Status::Unauthenticated),
+            QueryFluxError::Engine(_)
+        ));
+        assert!(matches!(
+            adbc_backend_error("sql".into(), Status::InvalidData),
+            QueryFluxError::Engine(_)
+        ));
+
+        let io = adbc_core::error::Error::with_message_and_status("connection lost", Status::IO);
+        assert!(matches!(
+            adbc_read_error(ArrowError::ExternalError(Box::new(io))),
+            QueryFluxError::BackendFailure(_)
+        ));
+    }
 
     fn session_with(pairs: &[(&str, &str)]) -> SessionContext {
         SessionContext {
@@ -2599,6 +2730,40 @@ mod tests {
         assert_eq!(
             batch_first_cell_as_u64(&RecordBatch::new_empty(Arc::new(Schema::empty()))),
             None
+        );
+    }
+
+    #[test]
+    fn trino_metadata_sql_is_catalog_qualified() {
+        // Trino has no session catalog unless the URI sets one, so an unqualified
+        // `information_schema` reference fails there.
+        assert_eq!(
+            list_catalogs_sql(&EngineType::Trino),
+            "SELECT catalog_name FROM system.metadata.catalogs ORDER BY catalog_name"
+        );
+        assert_eq!(
+            list_databases_sql(&EngineType::Trino, "ice\"berg"),
+            "SELECT schema_name FROM \"ice\"\"berg\".information_schema.schemata ORDER BY schema_name"
+        );
+        assert_eq!(
+            list_tables_sql(&EngineType::Trino, "system", "o'brien"),
+            "SELECT table_name FROM \"system\".information_schema.tables WHERE table_schema = 'o''brien' ORDER BY table_name"
+        );
+    }
+
+    #[test]
+    fn non_trino_metadata_sql_keeps_unqualified_information_schema() {
+        assert_eq!(
+            list_catalogs_sql(&EngineType::Snowflake),
+            "SELECT catalog_name FROM information_schema.schemata GROUP BY catalog_name ORDER BY catalog_name"
+        );
+        assert_eq!(
+            list_databases_sql(&EngineType::Snowflake, "o'db"),
+            "SELECT schema_name FROM information_schema.schemata WHERE catalog_name = 'o''db' ORDER BY schema_name"
+        );
+        assert_eq!(
+            list_tables_sql(&EngineType::Snowflake, "db", "s"),
+            "SELECT table_name FROM information_schema.tables WHERE table_catalog = 'db' AND table_schema = 's' ORDER BY table_name"
         );
     }
 }
