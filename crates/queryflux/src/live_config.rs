@@ -135,11 +135,32 @@ pub(crate) fn validate_live_config_refs(
     group_members: &HashMap<String, Vec<String>>,
     adapters: &HashMap<String, queryflux_engine_adapters::AdapterKind>,
 ) -> Vec<String> {
+    let mut issues = router_ref_issues(routers_cfg, routing_fallback, |g| {
+        group_members.contains_key(g)
+    });
+    for (group, members) in group_members {
+        for member in members {
+            if !adapters.contains_key(member.as_str()) {
+                issues.push(format!(
+                    "group '{group}' member '{member}' has no built adapter"
+                ));
+            }
+        }
+    }
+    issues
+}
+
+/// Routers and the fallback must target groups that exist (`group_exists`).
+fn router_ref_issues(
+    routers_cfg: &[queryflux_core::config::RouterConfig],
+    routing_fallback: &str,
+    group_exists: impl Fn(&str) -> bool,
+) -> Vec<String> {
     use queryflux_core::config::RouterConfig;
 
     let mut issues: Vec<String> = Vec::new();
 
-    if !group_members.contains_key(routing_fallback) {
+    if !group_exists(routing_fallback) {
         issues.push(format!(
             "routing_fallback references unknown group '{routing_fallback}'"
         ));
@@ -199,18 +220,8 @@ pub(crate) fn validate_live_config_refs(
             RouterConfig::PythonScript { .. } => {}
         }
         for group in refs {
-            if !group_members.contains_key(group) {
+            if !group_exists(group) {
                 issues.push(format!("router references unknown group '{group}'"));
-            }
-        }
-    }
-
-    for (group, members) in group_members {
-        for member in members {
-            if !adapters.contains_key(member.as_str()) {
-                issues.push(format!(
-                    "group '{group}' member '{member}' has no built adapter"
-                ));
             }
         }
     }
@@ -455,6 +466,155 @@ pub(crate) fn inputs_from_snapshot(
                 .collect(),
         },
     }
+}
+
+/// Read every config row in one consistent read and turn it into the inputs a worker
+/// snapshot is built from. `yaml_routing` is used when routing was never saved through
+/// the admin API (it lives in the control plane's YAML).
+// Wired up by the control plane's worker API (#255).
+#[allow(dead_code)]
+pub(crate) async fn load_snapshot_inputs(
+    store: &dyn queryflux_persistence::ConfigSnapshotStore,
+    yaml_routing: (&str, &[queryflux_core::config::RouterConfig]),
+) -> Result<(LiveConfigInputs, ConfigIds)> {
+    let rows = store
+        .load_config_snapshot_rows()
+        .await
+        .context("load config snapshot rows")?;
+    let ids = ConfigIds::from_records(&rows.clusters, &rows.groups);
+    let groups = rows
+        .groups
+        .iter()
+        .map(|r| Ok((r.name.clone(), r.to_core().map_err(anyhow::Error::msg)?)))
+        .collect::<Result<HashMap<_, _>>>()?;
+    let (routing_fallback, routers) = match rows.routing {
+        Some(loaded) => {
+            let routers = loaded
+                .routers
+                .into_iter()
+                .map(serde_json::from_value::<queryflux_core::config::RouterConfig>)
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .context("a saved routing rule does not parse")?;
+            (loaded.routing_fallback, routers)
+        }
+        None => (yaml_routing.0.to_string(), yaml_routing.1.to_vec()),
+    };
+    let mut inputs = LiveConfigInputs::from_records(
+        &rows.clusters,
+        groups,
+        routers,
+        routing_fallback,
+        validate_group_translation_scripts(rows.group_translation_bodies),
+    );
+    inputs.settings = SettingsInputs {
+        guardrails: rows.guardrails,
+        security: rows.security,
+        catalog: rows.catalog,
+        access_control: rows.access_control,
+        guard_script_bodies: rows
+            .guard_scripts
+            .into_iter()
+            .map(|s| (s.id, s.body))
+            .collect(),
+    };
+    Ok((inputs, ids))
+}
+
+/// Replace every `scriptFile` (routing scripts and selection strategies) with the file's
+/// contents. A path on the control plane does not exist on a worker.
+// Wired up by the control plane's worker API (#255).
+#[allow(dead_code)]
+pub(crate) fn inline_script_files(inputs: &mut LiveConfigInputs) -> Result<()> {
+    use queryflux_core::config::{RouterConfig, StrategyConfig};
+    let read = |path: &str| {
+        std::fs::read_to_string(path).with_context(|| format!("cannot inline scriptFile '{path}'"))
+    };
+    for router in &mut inputs.routers {
+        if let RouterConfig::PythonScript {
+            script,
+            script_file,
+        } = router
+        {
+            if let Some(path) = script_file.take() {
+                *script = read(&path)?;
+            }
+        }
+    }
+    for group in inputs.groups.values_mut() {
+        if let Some(StrategyConfig::PythonScript {
+            script,
+            script_file,
+        }) = &mut group.strategy
+        {
+            if let Some(path) = script_file.take() {
+                *script = Some(read(&path)?);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Checks a config before it is published to workers: routers and the fallback target
+/// enabled groups, and every member of an enabled group is an enabled cluster (variant
+/// names included). Returns one message per problem; empty means publishable.
+// Wired up by the control plane's worker API (#255).
+#[allow(dead_code)]
+pub(crate) fn validate_snapshot_inputs(inputs: &LiveConfigInputs) -> Vec<String> {
+    let enabled_groups: HashSet<&str> = inputs
+        .groups
+        .iter()
+        .filter(|(_, g)| g.enabled)
+        .map(|(n, _)| n.as_str())
+        .collect();
+    let mut issues = router_ref_issues(&inputs.routers, &inputs.routing_fallback, |g| {
+        enabled_groups.contains(g)
+    });
+    let clusters = match runtime_clusters(&inputs.clusters) {
+        Ok(c) => c,
+        Err(e) => {
+            issues.push(e.to_string());
+            return issues;
+        }
+    };
+    let enabled_clusters: HashSet<&str> = clusters
+        .iter()
+        .filter(|c| c.enabled && c.engine_type.is_some())
+        .map(|c| c.name.as_str())
+        .collect();
+    let mut groups: Vec<_> = inputs.groups.iter().filter(|(_, g)| g.enabled).collect();
+    groups.sort_by_key(|(n, _)| n.as_str());
+    for (group, cfg) in groups {
+        for member in &cfg.members {
+            if !enabled_clusters.contains(member.as_str()) {
+                issues.push(format!(
+                    "group '{group}' member '{member}' is not an enabled cluster"
+                ));
+            }
+        }
+    }
+    issues
+}
+
+/// Everything the control plane does to publish config to workers: one consistent
+/// read, scripts inlined, validation, then the sealed snapshot.
+// Wired up by the control plane's worker API (#255).
+#[allow(dead_code)]
+pub(crate) async fn build_worker_snapshot(
+    store: &dyn queryflux_persistence::ConfigSnapshotStore,
+    yaml_routing: (&str, &[queryflux_core::config::RouterConfig]),
+    credentials: queryflux_core::worker_snapshot::CredentialMode,
+) -> Result<queryflux_core::worker_snapshot::WorkerSnapshotV1> {
+    let (mut inputs, _ids) = load_snapshot_inputs(store, yaml_routing).await?;
+    inline_script_files(&mut inputs)?;
+    let issues = validate_snapshot_inputs(&inputs);
+    if !issues.is_empty() {
+        anyhow::bail!(
+            "config cannot be published to workers ({} issue(s)): {}",
+            issues.len(),
+            issues.join("; ")
+        );
+    }
+    snapshot_from_inputs(&inputs, credentials)
 }
 
 /// Postgres row ids, used only for `query_history` foreign keys on `ClusterState`.
@@ -1687,6 +1847,148 @@ mod tests {
         )
         .await
         .expect("worker compiles the snapshot");
+    }
+
+    #[test]
+    fn publish_validation_reports_every_dangling_reference() {
+        let mut i = inputs(
+            vec![
+                persisted("duck", serde_json::json!({}), serde_json::json!([])),
+                ClusterSpec {
+                    enabled: false,
+                    ..persisted("off", serde_json::json!({}), serde_json::json!([]))
+                },
+            ],
+            vec![
+                (
+                    "g",
+                    group(serde_json::json!({ "members": ["duck", "off", "ghost"] })),
+                ),
+                (
+                    "disabled",
+                    group(serde_json::json!({ "members": ["duck"], "enabled": false })),
+                ),
+            ],
+        );
+        i.routing_fallback = "nowhere".into();
+        i.routers = vec![serde_json::from_value(serde_json::json!({
+            "type": "userGroup",
+            "userToGroup": { "alice": "disabled" }
+        }))
+        .unwrap()];
+        let issues = validate_snapshot_inputs(&i);
+        assert_eq!(
+            issues,
+            vec![
+                "routing_fallback references unknown group 'nowhere'".to_string(),
+                "router references unknown group 'disabled'".to_string(),
+                "group 'g' member 'off' is not an enabled cluster".to_string(),
+                "group 'g' member 'ghost' is not an enabled cluster".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn publish_validation_accepts_variant_members() {
+        let i = inputs(
+            vec![persisted(
+                "duck",
+                serde_json::json!({}),
+                serde_json::json!([{ "name": "a" }]),
+            )],
+            vec![("g", group(serde_json::json!({ "members": ["duck::a"] })))],
+        );
+        assert!(validate_snapshot_inputs(&i).is_empty());
+    }
+
+    #[test]
+    fn script_files_are_inlined_for_workers() {
+        let dir = std::env::temp_dir().join(format!("qf-inline-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let router_file = dir.join("router.py");
+        let strategy_file = dir.join("strategy.py");
+        std::fs::write(&router_file, "def route(q): return None").unwrap();
+        std::fs::write(&strategy_file, "def select_cluster(c): return None").unwrap();
+
+        let mut i = inputs(
+            vec![],
+            vec![(
+                "g",
+                group(serde_json::json!({
+                    "members": [],
+                    "strategy": { "type": "pythonScript", "scriptFile": strategy_file }
+                })),
+            )],
+        );
+        i.routers = vec![serde_json::from_value(serde_json::json!({
+            "type": "pythonScript",
+            "script": "",
+            "scriptFile": router_file
+        }))
+        .unwrap()];
+        inline_script_files(&mut i).expect("files exist");
+
+        let router = serde_json::to_value(&i.routers[0]).unwrap();
+        assert_eq!(router["script"], "def route(q): return None");
+        assert!(router
+            .get("scriptFile")
+            .is_none_or(serde_json::Value::is_null));
+        let strategy = serde_json::to_value(i.groups["g"].strategy.as_ref().unwrap()).unwrap();
+        assert_eq!(strategy["script"], "def select_cluster(c): return None");
+        assert!(strategy
+            .get("scriptFile")
+            .is_none_or(serde_json::Value::is_null));
+
+        i.routers = vec![serde_json::from_value(serde_json::json!({
+            "type": "pythonScript",
+            "script": "",
+            "scriptFile": "/nonexistent/router.py"
+        }))
+        .unwrap()];
+        assert!(inline_script_files(&mut i).is_err());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// End to end on the in-memory store: rows written through the admin store API come
+    /// back as a published snapshot that a worker can compile.
+    #[tokio::test]
+    async fn build_worker_snapshot_from_stored_config() {
+        use queryflux_core::worker_snapshot::CredentialMode;
+        use queryflux_persistence::ClusterConfigStore;
+        let store = queryflux_persistence::in_memory::InMemoryPersistence::new();
+        let upsert: queryflux_persistence::cluster_config::UpsertClusterConfig =
+            serde_json::from_value(serde_json::json!({
+                "engineKey": "duckDb",
+                "maxRunningQueries": 2,
+                "config": {}
+            }))
+            .unwrap();
+        store.upsert_cluster_config("duck", &upsert).await.unwrap();
+        let g: queryflux_persistence::cluster_config::UpsertClusterGroupConfig =
+            serde_json::from_value(serde_json::json!({
+                "members": ["duck"],
+                "maxRunningQueries": 5
+            }))
+            .unwrap();
+        store.upsert_group_config("g", &g).await.unwrap();
+
+        let snap = build_worker_snapshot(&store, ("g", &[]), CredentialMode::Embedded)
+            .await
+            .expect("publishable");
+        assert!(snap.is_sealed());
+        assert_eq!(snap.routing_fallback, "g");
+        let live = compile(
+            &inputs_from_snapshot(&snap),
+            &ConfigIds::default(),
+            CompileMode::Strict,
+        )
+        .await
+        .expect("worker compiles");
+        let states = live.cluster_manager.all_cluster_states().await.unwrap();
+        assert_eq!(states[0].max_running_queries, 2);
+
+        let bad = build_worker_snapshot(&store, ("missing", &[]), CredentialMode::Embedded).await;
+        assert!(bad.is_err(), "dangling fallback is not publishable");
     }
 
     /// Variant clusters have no row of their own; they get their parent's id.

@@ -529,12 +529,239 @@ impl QueryHistoryStore for PostgresStore {
 // ---------------------------------------------------------------------------
 
 #[async_trait]
-impl ClusterConfigStore for PostgresStore {
-    async fn list_cluster_configs(&self) -> Result<Vec<ClusterConfigRecord>> {
+impl crate::ConfigSnapshotStore for PostgresStore {
+    async fn load_config_snapshot_rows(&self) -> Result<crate::ConfigSnapshotRows> {
+        let err = |what: &str, e: sqlx::Error| {
+            QueryFluxError::Persistence(format!("load_config_snapshot_rows {what}: {e}"))
+        };
+        let mut tx = self.begin_snapshot_tx().await?;
+        let rows = crate::ConfigSnapshotRows {
+            clusters: Self::list_cluster_configs_in(&mut tx).await?,
+            groups: Self::list_group_configs_in(&mut tx).await?,
+            routing: Self::load_routing_config_in(&mut tx).await?,
+            group_translation_bodies: Self::load_group_translation_bodies_in(&mut tx).await?,
+            guardrails: Self::get_proxy_setting_in(&mut tx, "guardrails_config").await?,
+            security: Self::get_proxy_setting_in(&mut tx, "security_config").await?,
+            catalog: Self::get_proxy_setting_in(&mut tx, "catalog_config").await?,
+            access_control: Self::get_proxy_setting_in(&mut tx, "access_control_config").await?,
+            guard_scripts: Self::list_user_scripts_in(
+                &mut tx,
+                Some(crate::script_library::KIND_GUARD),
+            )
+            .await?,
+        };
+        tx.commit().await.map_err(|e| err("commit", e))?;
+        Ok(rows)
+    }
+}
+
+impl PostgresStore {
+    /// A read-only transaction in which every read sees the same committed state, even if
+    /// an admin edit commits in between.
+    async fn begin_snapshot_tx(&self) -> Result<sqlx::Transaction<'static, sqlx::Postgres>> {
+        let mut tx = self.admin_pool.begin().await.map_err(|e| {
+            QueryFluxError::Persistence(format!("load_config_snapshot_rows begin: {e}"))
+        })?;
+        sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| {
+                QueryFluxError::Persistence(format!("load_config_snapshot_rows isolation: {e}"))
+            })?;
+        Ok(tx)
+    }
+}
+
+/// Config reads that take a connection, so they can run alone (through the pool) or
+/// together inside one transaction (`load_config_snapshot_rows`).
+impl PostgresStore {
+    async fn list_cluster_configs_in(
+        conn: &mut sqlx::PgConnection,
+    ) -> Result<Vec<ClusterConfigRecord>> {
         sqlx::query_as::<_, ClusterConfigRecord>("SELECT * FROM cluster_configs ORDER BY name")
-            .fetch_all(&self.admin_pool)
+            .fetch_all(&mut *conn)
             .await
             .map_err(|e| QueryFluxError::Persistence(format!("list_cluster_configs: {e}")))
+    }
+
+    async fn list_group_configs_in(
+        conn: &mut sqlx::PgConnection,
+    ) -> Result<Vec<ClusterGroupConfigRecord>> {
+        let q = format!("{CLUSTER_GROUP_CONFIG_SELECT} ORDER BY g.name");
+        sqlx::query_as::<_, ClusterGroupConfigRecord>(&q)
+            .fetch_all(&mut *conn)
+            .await
+            .map_err(|e| QueryFluxError::Persistence(format!("list_group_configs: {e}")))
+    }
+
+    async fn load_group_translation_bodies_in(
+        conn: &mut sqlx::PgConnection,
+    ) -> Result<HashMap<String, Vec<String>>> {
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            r#"SELECT g.name, s.body
+               FROM cluster_group_configs g
+               CROSS JOIN LATERAL unnest(g.translation_script_ids) WITH ORDINALITY AS u(sid, ord)
+               JOIN user_scripts s ON s.id = u.sid AND s.kind = 'translation_fixup'
+               ORDER BY g.name, u.ord"#,
+        )
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(|e| QueryFluxError::Persistence(format!("load_group_translation_bodies: {e}")))?;
+
+        let mut map: HashMap<String, Vec<String>> = HashMap::new();
+        for (name, body) in rows {
+            map.entry(name).or_default().push(body);
+        }
+        Ok(map)
+    }
+
+    async fn get_proxy_setting_in(
+        conn: &mut sqlx::PgConnection,
+        key: &str,
+    ) -> Result<Option<serde_json::Value>> {
+        match key {
+            "security_config" => {
+                let row: Option<(serde_json::Value,)> = sqlx::query_as(
+                    r#"SELECT config FROM security_settings WHERE singleton = TRUE"#,
+                )
+                .fetch_optional(&mut *conn)
+                .await
+                .map_err(|e| QueryFluxError::Persistence(format!("get_proxy_setting: {e}")))?;
+                Ok(row.map(|(v,)| v))
+            }
+            "guardrails_config" => {
+                let rows: Vec<(String, serde_json::Value)> =
+                    sqlx::query_as(r#"SELECT kind, guards FROM guardrails ORDER BY kind"#)
+                        .fetch_all(&mut *conn)
+                        .await
+                        .map_err(|e| QueryFluxError::Persistence(format!("get guardrails: {e}")))?;
+                if rows.is_empty() {
+                    return Ok(None);
+                }
+                let mut global = serde_json::Value::Array(vec![]);
+                let mut groups = serde_json::Map::new();
+                for (kind, guards) in rows {
+                    if kind == "global" {
+                        global = guards;
+                    } else {
+                        groups.insert(kind, guards);
+                    }
+                }
+                Ok(Some(
+                    serde_json::json!({ "global": global, "groups": groups }),
+                ))
+            }
+            other => {
+                let row: Option<(serde_json::Value,)> =
+                    sqlx::query_as(r#"SELECT value FROM proxy_settings WHERE key = $1"#)
+                        .bind(other)
+                        .fetch_optional(&mut *conn)
+                        .await
+                        .map_err(|e| {
+                            QueryFluxError::Persistence(format!("get_proxy_setting: {e}"))
+                        })?;
+                Ok(row.map(|(v,)| v))
+            }
+        }
+    }
+
+    async fn load_routing_config_in(
+        conn: &mut sqlx::PgConnection,
+    ) -> Result<Option<LoadedRoutingConfig>> {
+        let row: Option<(bool, String, Option<i64>)> = sqlx::query_as(
+            r#"SELECT routing_persist_active, routing_fallback, fallback_group_id
+                 FROM routing_settings
+                WHERE singleton = true"#,
+        )
+        .fetch_optional(&mut *conn)
+        .await
+        .map_err(|e| QueryFluxError::Persistence(format!("load_routing_config settings: {e}")))?;
+
+        let Some((persist_active, fallback, fallback_gid)) = row else {
+            return Ok(None);
+        };
+        if !persist_active {
+            return Ok(None);
+        }
+
+        let id_rows: Vec<(i64, String)> =
+            sqlx::query_as(r#"SELECT id, name FROM cluster_group_configs"#)
+                .fetch_all(&mut *conn)
+                .await
+                .map_err(|e| {
+                    QueryFluxError::Persistence(format!("load_routing_config groups: {e}"))
+                })?;
+        let id_to_name: HashMap<i64, String> = id_rows.into_iter().collect();
+
+        // (sort_order, router_logical_index, slice_index, target_group_id, definition)
+        type RoutingRuleRow = (
+            i32,
+            i32,
+            i32,
+            Option<i64>,
+            sqlx::types::Json<serde_json::Value>,
+        );
+        let sql_rows: Vec<RoutingRuleRow> = sqlx::query_as(
+            r#"SELECT sort_order, router_logical_index, slice_index, target_group_id, definition
+                     FROM routing_rules
+                    ORDER BY sort_order ASC, id ASC"#,
+        )
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(|e| QueryFluxError::Persistence(format!("load_routing_config rules: {e}")))?;
+
+        let persist_rows: Vec<RoutingRulePersistRow> = sql_rows
+            .into_iter()
+            .map(
+                |(sort_order, router_logical_index, slice_index, target_group_id, def)| {
+                    RoutingRulePersistRow {
+                        sort_order,
+                        router_logical_index,
+                        slice_index,
+                        target_group_id,
+                        definition: def.0,
+                    }
+                },
+            )
+            .collect();
+
+        let routers = collapse_rows_to_routers(&persist_rows, &id_to_name)?;
+
+        Ok(Some(LoadedRoutingConfig {
+            routing_fallback: fallback,
+            routing_fallback_group_id: fallback_gid,
+            routers,
+        }))
+    }
+
+    async fn list_user_scripts_in(
+        conn: &mut sqlx::PgConnection,
+        kind: Option<&str>,
+    ) -> Result<Vec<UserScriptRecord>> {
+        let rows = if let Some(k) = kind {
+            sqlx::query_as::<_, UserScriptRecord>(
+                "SELECT * FROM user_scripts WHERE kind = $1 ORDER BY name",
+            )
+            .bind(k)
+            .fetch_all(&mut *conn)
+            .await
+        } else {
+            sqlx::query_as::<_, UserScriptRecord>("SELECT * FROM user_scripts ORDER BY name")
+                .fetch_all(&mut *conn)
+                .await
+        }
+        .map_err(|e| QueryFluxError::Persistence(format!("list_user_scripts: {e}")))?;
+        Ok(rows)
+    }
+}
+
+#[async_trait]
+impl ClusterConfigStore for PostgresStore {
+    async fn list_cluster_configs(&self) -> Result<Vec<ClusterConfigRecord>> {
+        let mut conn = self.admin_pool.acquire().await.map_err(|e| {
+            QueryFluxError::Persistence(format!("list_cluster_configs acquire: {e}"))
+        })?;
+        Self::list_cluster_configs_in(&mut conn).await
     }
 
     async fn get_cluster_config(&self, name: &str) -> Result<Option<ClusterConfigRecord>> {
@@ -722,11 +949,11 @@ impl ClusterConfigStore for PostgresStore {
     }
 
     async fn list_group_configs(&self) -> Result<Vec<ClusterGroupConfigRecord>> {
-        let q = format!("{CLUSTER_GROUP_CONFIG_SELECT} ORDER BY g.name");
-        sqlx::query_as::<_, ClusterGroupConfigRecord>(&q)
-            .fetch_all(&self.admin_pool)
-            .await
-            .map_err(|e| QueryFluxError::Persistence(format!("list_group_configs: {e}")))
+        let mut conn =
+            self.admin_pool.acquire().await.map_err(|e| {
+                QueryFluxError::Persistence(format!("list_group_configs acquire: {e}"))
+            })?;
+        Self::list_group_configs_in(&mut conn).await
     }
 
     async fn get_group_config(&self, name: &str) -> Result<Option<ClusterGroupConfigRecord>> {
@@ -1067,20 +1294,11 @@ impl ClusterConfigStore for PostgresStore {
 #[async_trait]
 impl ScriptLibraryStore for PostgresStore {
     async fn list_user_scripts(&self, kind: Option<&str>) -> Result<Vec<UserScriptRecord>> {
-        let rows = if let Some(k) = kind {
-            sqlx::query_as::<_, UserScriptRecord>(
-                "SELECT * FROM user_scripts WHERE kind = $1 ORDER BY name",
-            )
-            .bind(k)
-            .fetch_all(&self.admin_pool)
-            .await
-        } else {
-            sqlx::query_as::<_, UserScriptRecord>("SELECT * FROM user_scripts ORDER BY name")
-                .fetch_all(&self.admin_pool)
-                .await
-        }
-        .map_err(|e| QueryFluxError::Persistence(format!("list_user_scripts: {e}")))?;
-        Ok(rows)
+        let mut conn =
+            self.admin_pool.acquire().await.map_err(|e| {
+                QueryFluxError::Persistence(format!("list_user_scripts acquire: {e}"))
+            })?;
+        Self::list_user_scripts_in(&mut conn, kind).await
     }
 
     async fn get_user_script(&self, id: i64) -> Result<Option<UserScriptRecord>> {
@@ -1154,22 +1372,10 @@ impl ScriptLibraryStore for PostgresStore {
     }
 
     async fn load_group_translation_bodies(&self) -> Result<HashMap<String, Vec<String>>> {
-        let rows: Vec<(String, String)> = sqlx::query_as(
-            r#"SELECT g.name, s.body
-               FROM cluster_group_configs g
-               CROSS JOIN LATERAL unnest(g.translation_script_ids) WITH ORDINALITY AS u(sid, ord)
-               JOIN user_scripts s ON s.id = u.sid AND s.kind = 'translation_fixup'
-               ORDER BY g.name, u.ord"#,
-        )
-        .fetch_all(&self.admin_pool)
-        .await
-        .map_err(|e| QueryFluxError::Persistence(format!("load_group_translation_bodies: {e}")))?;
-
-        let mut map: HashMap<String, Vec<String>> = HashMap::new();
-        for (name, body) in rows {
-            map.entry(name).or_default().push(body);
-        }
-        Ok(map)
+        let mut conn = self.admin_pool.acquire().await.map_err(|e| {
+            QueryFluxError::Persistence(format!("load_group_translation_bodies acquire: {e}"))
+        })?;
+        Self::load_group_translation_bodies_in(&mut conn).await
     }
 }
 
@@ -1180,50 +1386,11 @@ impl ScriptLibraryStore for PostgresStore {
 #[async_trait]
 impl ProxySettingsStore for PostgresStore {
     async fn get_proxy_setting(&self, key: &str) -> Result<Option<serde_json::Value>> {
-        match key {
-            "security_config" => {
-                let row: Option<(serde_json::Value,)> = sqlx::query_as(
-                    r#"SELECT config FROM security_settings WHERE singleton = TRUE"#,
-                )
-                .fetch_optional(&self.admin_pool)
-                .await
-                .map_err(|e| QueryFluxError::Persistence(format!("get_proxy_setting: {e}")))?;
-                Ok(row.map(|(v,)| v))
-            }
-            "guardrails_config" => {
-                let rows: Vec<(String, serde_json::Value)> =
-                    sqlx::query_as(r#"SELECT kind, guards FROM guardrails ORDER BY kind"#)
-                        .fetch_all(&self.admin_pool)
-                        .await
-                        .map_err(|e| QueryFluxError::Persistence(format!("get guardrails: {e}")))?;
-                if rows.is_empty() {
-                    return Ok(None);
-                }
-                let mut global = serde_json::Value::Array(vec![]);
-                let mut groups = serde_json::Map::new();
-                for (kind, guards) in rows {
-                    if kind == "global" {
-                        global = guards;
-                    } else {
-                        groups.insert(kind, guards);
-                    }
-                }
-                Ok(Some(
-                    serde_json::json!({ "global": global, "groups": groups }),
-                ))
-            }
-            other => {
-                let row: Option<(serde_json::Value,)> =
-                    sqlx::query_as(r#"SELECT value FROM proxy_settings WHERE key = $1"#)
-                        .bind(other)
-                        .fetch_optional(&self.admin_pool)
-                        .await
-                        .map_err(|e| {
-                            QueryFluxError::Persistence(format!("get_proxy_setting: {e}"))
-                        })?;
-                Ok(row.map(|(v,)| v))
-            }
-        }
+        let mut conn =
+            self.admin_pool.acquire().await.map_err(|e| {
+                QueryFluxError::Persistence(format!("get_proxy_setting acquire: {e}"))
+            })?;
+        Self::get_proxy_setting_in(&mut conn, key).await
     }
 
     async fn set_proxy_setting(&self, key: &str, value: serde_json::Value) -> Result<()> {
@@ -1346,68 +1513,10 @@ impl ProxySettingsStore for PostgresStore {
 #[async_trait]
 impl RoutingConfigStore for PostgresStore {
     async fn load_routing_config(&self) -> Result<Option<LoadedRoutingConfig>> {
-        let row: Option<(bool, String, Option<i64>)> = sqlx::query_as(
-            r#"SELECT routing_persist_active, routing_fallback, fallback_group_id
-                 FROM routing_settings
-                WHERE singleton = true"#,
-        )
-        .fetch_optional(&self.admin_pool)
-        .await
-        .map_err(|e| QueryFluxError::Persistence(format!("load_routing_config settings: {e}")))?;
-
-        let Some((persist_active, fallback, fallback_gid)) = row else {
-            return Ok(None);
-        };
-        if !persist_active {
-            return Ok(None);
-        }
-
-        let id_rows: Vec<(i64, String)> =
-            sqlx::query_as(r#"SELECT id, name FROM cluster_group_configs"#)
-                .fetch_all(&self.admin_pool)
-                .await
-                .map_err(|e| {
-                    QueryFluxError::Persistence(format!("load_routing_config groups: {e}"))
-                })?;
-        let id_to_name: HashMap<i64, String> = id_rows.into_iter().collect();
-
-        let sql_rows: Vec<(
-            i32,
-            i32,
-            i32,
-            Option<i64>,
-            sqlx::types::Json<serde_json::Value>,
-        )> = sqlx::query_as(
-            r#"SELECT sort_order, router_logical_index, slice_index, target_group_id, definition
-                     FROM routing_rules
-                    ORDER BY sort_order ASC, id ASC"#,
-        )
-        .fetch_all(&self.admin_pool)
-        .await
-        .map_err(|e| QueryFluxError::Persistence(format!("load_routing_config rules: {e}")))?;
-
-        let persist_rows: Vec<RoutingRulePersistRow> = sql_rows
-            .into_iter()
-            .map(
-                |(sort_order, router_logical_index, slice_index, target_group_id, def)| {
-                    RoutingRulePersistRow {
-                        sort_order,
-                        router_logical_index,
-                        slice_index,
-                        target_group_id,
-                        definition: def.0,
-                    }
-                },
-            )
-            .collect();
-
-        let routers = collapse_rows_to_routers(&persist_rows, &id_to_name)?;
-
-        Ok(Some(LoadedRoutingConfig {
-            routing_fallback: fallback,
-            routing_fallback_group_id: fallback_gid,
-            routers,
-        }))
+        let mut conn = self.admin_pool.acquire().await.map_err(|e| {
+            QueryFluxError::Persistence(format!("load_routing_config acquire: {e}"))
+        })?;
+        Self::load_routing_config_in(&mut conn).await
     }
 
     async fn replace_routing_config(
@@ -2355,6 +2464,91 @@ mod tests {
     /// the whole `cluster_capacity_leases` table, so tests running in parallel would
     /// delete or renew each other's leases.
     static CAPACITY_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    // -- ConfigSnapshotStore ------------------------------------------------
+
+    async fn seed_snapshot_pair(store: &PostgresStore, cluster: &str, group: &str) {
+        let upsert: crate::cluster_config::UpsertClusterConfig =
+            serde_json::from_value(serde_json::json!({
+                "engineKey": "duckDb",
+                "maxRunningQueries": 1,
+                "config": {}
+            }))
+            .unwrap();
+        store.upsert_cluster_config(cluster, &upsert).await.unwrap();
+        let g: crate::cluster_config::UpsertClusterGroupConfig =
+            serde_json::from_value(serde_json::json!({
+                "members": [cluster],
+                "maxRunningQueries": 1
+            }))
+            .unwrap();
+        store.upsert_group_config(group, &g).await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn pg_config_snapshot_rows_include_written_config() {
+        use crate::ConfigSnapshotStore;
+        let store = test_store().await;
+        let cluster = unique_id("snap-c");
+        let group = unique_id("snap-g");
+        seed_snapshot_pair(&store, &cluster, &group).await;
+
+        let rows = store.load_config_snapshot_rows().await.unwrap();
+        assert!(rows.clusters.iter().any(|c| c.name == cluster));
+        assert!(rows.groups.iter().any(|g| g.name == group));
+
+        store.delete_group_config(&group).await.unwrap();
+        store.delete_cluster_config(&cluster).await.unwrap();
+    }
+
+    /// A cluster's limit and its group's limit change together in one commit that lands
+    /// between the snapshot's cluster read and its group read. The group read must still
+    /// see the old value: reads in the snapshot transaction cannot straddle a commit.
+    #[tokio::test]
+    #[ignore]
+    async fn pg_config_snapshot_reads_do_not_straddle_a_commit() {
+        let store = test_store().await;
+        let cluster = unique_id("snap-mix-c");
+        let group = unique_id("snap-mix-g");
+        seed_snapshot_pair(&store, &cluster, &group).await;
+
+        let mut tx = store.begin_snapshot_tx().await.unwrap();
+        let clusters = PostgresStore::list_cluster_configs_in(&mut tx)
+            .await
+            .unwrap();
+        let c = clusters.iter().find(|c| c.name == cluster).unwrap();
+        assert_eq!(c.max_running_queries, Some(1));
+
+        // A separate connection, like an admin edit from another replica.
+        let url = std::env::var("DATABASE_URL").unwrap();
+        let mut other = <sqlx::PgConnection as sqlx::Connection>::connect(&url)
+            .await
+            .unwrap();
+        let mut writer = sqlx::Connection::begin(&mut other).await.unwrap();
+        sqlx::query("UPDATE cluster_configs SET max_running_queries = 2 WHERE name = $1")
+            .bind(&cluster)
+            .execute(&mut *writer)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE cluster_group_configs SET max_running_queries = 2 WHERE name = $1")
+            .bind(&group)
+            .execute(&mut *writer)
+            .await
+            .unwrap();
+        writer.commit().await.unwrap();
+
+        let groups = PostgresStore::list_group_configs_in(&mut tx).await.unwrap();
+        let g = groups.iter().find(|g| g.name == group).unwrap();
+        assert_eq!(
+            g.max_running_queries, 1,
+            "snapshot saw a commit made after it began"
+        );
+        tx.commit().await.unwrap();
+
+        store.delete_group_config(&group).await.unwrap();
+        store.delete_cluster_config(&cluster).await.unwrap();
+    }
 
     // -- ConfigRevisionStore ------------------------------------------------
 

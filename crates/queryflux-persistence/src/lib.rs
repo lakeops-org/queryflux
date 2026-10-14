@@ -526,6 +526,33 @@ pub trait BackendStore: Persistence + MetricsStore + AdminStore + CacheStore + S
 impl<T: Persistence + MetricsStore + AdminStore + CacheStore + Send + Sync> BackendStore for T {}
 
 // ---------------------------------------------------------------------------
+// ConfigSnapshotStore — every config row, read at one point in time
+// ---------------------------------------------------------------------------
+
+/// Every row a worker config snapshot is built from (#255), read at one point in time
+/// so an edit landing mid-read cannot produce a mix of old and new config.
+#[derive(Debug, Clone)]
+pub struct ConfigSnapshotRows {
+    pub clusters: Vec<cluster_config::ClusterConfigRecord>,
+    pub groups: Vec<cluster_config::ClusterGroupConfigRecord>,
+    /// `None` when routing was never saved through the admin API (YAML routing).
+    pub routing: Option<LoadedRoutingConfig>,
+    pub group_translation_bodies: HashMap<String, Vec<String>>,
+    pub guardrails: Option<serde_json::Value>,
+    pub security: Option<serde_json::Value>,
+    pub catalog: Option<serde_json::Value>,
+    pub access_control: Option<serde_json::Value>,
+    /// Script library entries of kind `guard`.
+    pub guard_scripts: Vec<script_library::UserScriptRecord>,
+}
+
+#[async_trait]
+pub trait ConfigSnapshotStore: Send + Sync {
+    /// Read every config row consistently (one transaction where the backend has them).
+    async fn load_config_snapshot_rows(&self) -> Result<ConfigSnapshotRows>;
+}
+
+// ---------------------------------------------------------------------------
 // CoordinationStore — the coordination a query path and its background tasks need
 // ---------------------------------------------------------------------------
 

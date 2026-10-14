@@ -904,6 +904,27 @@ impl ScriptLibraryStore for InMemoryPersistence {
 // ---------------------------------------------------------------------------
 
 #[async_trait]
+impl crate::ConfigSnapshotStore for InMemoryPersistence {
+    /// No concurrent writers to guard against beyond the individual locks, so the rows
+    /// are read with the regular methods.
+    async fn load_config_snapshot_rows(&self) -> Result<crate::ConfigSnapshotRows> {
+        Ok(crate::ConfigSnapshotRows {
+            clusters: self.list_cluster_configs().await?,
+            groups: self.list_group_configs().await?,
+            routing: self.load_routing_config().await?,
+            group_translation_bodies: self.load_group_translation_bodies().await?,
+            guardrails: self.get_proxy_setting("guardrails_config").await?,
+            security: self.get_proxy_setting("security_config").await?,
+            catalog: self.get_proxy_setting("catalog_config").await?,
+            access_control: self.get_proxy_setting("access_control_config").await?,
+            guard_scripts: self
+                .list_user_scripts(Some(crate::script_library::KIND_GUARD))
+                .await?,
+        })
+    }
+}
+
+#[async_trait]
 impl ConfigRevisionStore for InMemoryPersistence {
     async fn current_revision(&self) -> Result<u64> {
         Ok(self.config_revision.load(Ordering::Relaxed))
