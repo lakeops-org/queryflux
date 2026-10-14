@@ -158,6 +158,7 @@ async fn main() -> Result<()> {
         distributed_backend,
         coordination,
         snapshot_store,
+        worker_registry,
     } = startup::stores::build_stores(&config).await?;
 
     // Filled when Postgres loads cluster/group rows — used for query_history FKs on ClusterState.
@@ -749,7 +750,15 @@ async fn main() -> Result<()> {
              Set queryflux.adminApi.corsAllowedOrigins to restrict cross-origin access in production."
         );
     }
-    let worker_api = startup::worker_api::worker_api(&config, snapshot_store, &inputs)?;
+    // Bumped after every config reload; wakes workers' long-polls.
+    let (config_changed_tx, config_changed_rx) = tokio::sync::watch::channel(0u64);
+    let worker_api = startup::worker_api::worker_api(
+        &config,
+        snapshot_store,
+        &inputs,
+        worker_registry,
+        config_changed_rx,
+    )?;
     let admin = AdminFrontend::new(
         prometheus.clone(),
         live.clone(),
@@ -876,8 +885,12 @@ async fn main() -> Result<()> {
             live: live.clone(),
             cache: adapter_reload_cache.clone(),
             metrics: app_state.metrics.clone(),
+            changed: Some(config_changed_tx),
         };
         tokio::spawn(run_reload_loop(source, handles, shutdown_rx.clone()));
+        if is_worker {
+            startup::tasks::spawn_worker_heartbeat(&config, &worker_sync_state, &shutdown_rx);
+        }
     }
 
     startup::tasks::spawn_health_checks(&app_state, &shutdown_rx);

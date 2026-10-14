@@ -22,6 +22,8 @@ pub(crate) fn worker_api(
     config: &ProxyConfig,
     store: Option<Arc<dyn ConfigSnapshotStore>>,
     startup_inputs: &LiveConfigInputs,
+    registry: Arc<dyn queryflux_persistence::WorkerRegistryStore>,
+    changes: tokio::sync::watch::Receiver<u64>,
 ) -> Result<Option<WorkerApi>> {
     let Some(api_cfg) = config.queryflux.worker_api.as_ref().filter(|a| a.enabled) else {
         return Ok(None);
@@ -67,5 +69,7 @@ pub(crate) fn worker_api(
     Ok(Some(WorkerApi {
         shared_secret,
         snapshot,
+        registry: Some(registry),
+        changes: Some(changes),
     }))
 }

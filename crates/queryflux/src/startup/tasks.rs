@@ -697,3 +697,77 @@ pub(crate) fn apply_reconcile_to_cluster_state(
         }
     }
 }
+
+/// A worker's name for the control plane: `workerName`, else the hostname.
+pub(crate) fn worker_name(config: &ProxyConfig) -> String {
+    config
+        .queryflux
+        .worker_name
+        .clone()
+        .or_else(|| std::env::var("HOSTNAME").ok())
+        .unwrap_or_else(|| format!("worker-{}", std::process::id()))
+}
+
+/// Register with the control plane, then report sync state every heartbeat interval.
+/// Best effort: failures are logged and retried on the next tick.
+pub(crate) fn spawn_worker_heartbeat(
+    config: &ProxyConfig,
+    sync_state: &Arc<std::sync::Mutex<crate::config_source::WorkerSyncState>>,
+    shutdown_rx: &watch::Receiver<bool>,
+) {
+    let Some(cp) = config.queryflux.control_plane.clone() else {
+        return;
+    };
+    let base = cp.url.trim_end_matches('/').to_string();
+    let name = worker_name(config);
+    let labels = config.queryflux.worker_labels.clone();
+    let coordination_mode = match config.queryflux.coordination.as_ref().map(|c| c.mode) {
+        Some(queryflux_core::config::CoordinationMode::Local) => "local",
+        _ => "controlPlane",
+    };
+    let sync_state = sync_state.clone();
+    let mut shutdown_rx = shutdown_rx.clone();
+    tokio::spawn(async move {
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+            .unwrap_or_default();
+        let mut registered = false;
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(
+            cp.heartbeat_interval_secs.max(1),
+        ));
+        loop {
+            if !tick_or_shutdown(&mut interval, &mut shutdown_rx).await {
+                break;
+            }
+            let st = sync_state.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            let report = queryflux_persistence::WorkerRecord {
+                name: name.clone(),
+                version: env!("CARGO_PKG_VERSION").to_string(),
+                labels: labels.clone(),
+                coordination_mode: coordination_mode.to_string(),
+                downloaded_revision: st.downloaded_revision,
+                active_revision: st.active_revision,
+                last_error: st.last_error,
+                last_seen: chrono::Utc::now(),
+            };
+            let path = if registered { "heartbeat" } else { "register" };
+            match client
+                .post(format!("{base}/worker/{path}"))
+                .bearer_auth(cp.auth.bearer())
+                .json(&report)
+                .send()
+                .await
+            {
+                Ok(r) if r.status().is_success() => {
+                    if !registered {
+                        tracing::info!(worker = %name, "Registered with the control plane");
+                    }
+                    registered = true;
+                }
+                Ok(r) => tracing::debug!(status = %r.status(), "Worker {path} rejected"),
+                Err(e) => tracing::debug!("Worker {path} failed: {e}"),
+            }
+        }
+    });
+}

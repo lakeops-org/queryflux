@@ -526,6 +526,41 @@ pub trait BackendStore: Persistence + MetricsStore + AdminStore + CacheStore + S
 impl<T: Persistence + MetricsStore + AdminStore + CacheStore + Send + Sync> BackendStore for T {}
 
 // ---------------------------------------------------------------------------
+// WorkerRegistryStore — workers that pull config from this control plane
+// ---------------------------------------------------------------------------
+
+/// What a worker reported in its last registration or heartbeat (#255).
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkerRecord {
+    pub name: String,
+    #[serde(default)]
+    pub version: String,
+    #[serde(default)]
+    pub labels: std::collections::BTreeMap<String, String>,
+    /// `controlPlane` or `local`.
+    #[serde(default)]
+    pub coordination_mode: String,
+    #[serde(default)]
+    pub downloaded_revision: Option<String>,
+    #[serde(default)]
+    pub active_revision: Option<String>,
+    #[serde(default)]
+    pub last_error: Option<String>,
+    /// Set by the store.
+    #[serde(default = "Utc::now")]
+    pub last_seen: DateTime<Utc>,
+}
+
+#[async_trait]
+pub trait WorkerRegistryStore: Send + Sync {
+    /// Insert or update a worker's report; sets `last_seen` to now.
+    async fn upsert_worker(&self, worker: &WorkerRecord) -> Result<()>;
+    /// Workers seen at or after `since`, by name.
+    async fn list_workers(&self, since: DateTime<Utc>) -> Result<Vec<WorkerRecord>>;
+}
+
+// ---------------------------------------------------------------------------
 // ConfigSnapshotStore — every config row, read at one point in time
 // ---------------------------------------------------------------------------
 

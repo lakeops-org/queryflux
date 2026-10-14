@@ -67,6 +67,9 @@ pub struct InMemoryPersistence {
 
     // --- cache entry metadata ---
     cache_entries: DashMap<String, crate::cache_store::CacheEntryMeta>,
+
+    // --- workers registered with this control plane ---
+    workers: DashMap<String, crate::WorkerRecord>,
 }
 
 impl Default for InMemoryPersistence {
@@ -87,6 +90,7 @@ impl Default for InMemoryPersistence {
             config_revision: AtomicU64::new(0),
             published_running_counts: DashMap::default(),
             cache_entries: DashMap::default(),
+            workers: DashMap::default(),
         }
     }
 }
@@ -902,6 +906,27 @@ impl ScriptLibraryStore for InMemoryPersistence {
 // ---------------------------------------------------------------------------
 // ConfigRevisionStore — local atomic counter (single-instance, no push)
 // ---------------------------------------------------------------------------
+
+#[async_trait]
+impl crate::WorkerRegistryStore for InMemoryPersistence {
+    async fn upsert_worker(&self, worker: &crate::WorkerRecord) -> Result<()> {
+        let mut w = worker.clone();
+        w.last_seen = Utc::now();
+        self.workers.insert(w.name.clone(), w);
+        Ok(())
+    }
+
+    async fn list_workers(&self, since: DateTime<Utc>) -> Result<Vec<crate::WorkerRecord>> {
+        let mut workers: Vec<_> = self
+            .workers
+            .iter()
+            .filter(|w| w.last_seen >= since)
+            .map(|w| w.value().clone())
+            .collect();
+        workers.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(workers)
+    }
+}
 
 #[async_trait]
 impl crate::ConfigSnapshotStore for InMemoryPersistence {

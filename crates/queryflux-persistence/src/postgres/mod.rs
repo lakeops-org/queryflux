@@ -529,6 +529,77 @@ impl QueryHistoryStore for PostgresStore {
 // ---------------------------------------------------------------------------
 
 #[async_trait]
+impl crate::WorkerRegistryStore for PostgresStore {
+    async fn upsert_worker(&self, w: &crate::WorkerRecord) -> Result<()> {
+        sqlx::query(
+            r#"INSERT INTO worker_registry
+                   (name, version, labels, coordination_mode, downloaded_revision,
+                    active_revision, last_error, last_seen)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, now())
+               ON CONFLICT (name) DO UPDATE SET
+                   version             = EXCLUDED.version,
+                   labels              = EXCLUDED.labels,
+                   coordination_mode   = EXCLUDED.coordination_mode,
+                   downloaded_revision = EXCLUDED.downloaded_revision,
+                   active_revision     = EXCLUDED.active_revision,
+                   last_error          = EXCLUDED.last_error,
+                   last_seen           = now()"#,
+        )
+        .bind(&w.name)
+        .bind(&w.version)
+        .bind(sqlx::types::Json(&w.labels))
+        .bind(&w.coordination_mode)
+        .bind(&w.downloaded_revision)
+        .bind(&w.active_revision)
+        .bind(&w.last_error)
+        .execute(&self.admin_pool)
+        .await
+        .map_err(|e| QueryFluxError::Persistence(format!("upsert_worker: {e}")))?;
+        Ok(())
+    }
+
+    async fn list_workers(
+        &self,
+        since: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Vec<crate::WorkerRecord>> {
+        type Row = (
+            String,
+            String,
+            sqlx::types::Json<std::collections::BTreeMap<String, String>>,
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            chrono::DateTime<chrono::Utc>,
+        );
+        let rows: Vec<Row> = sqlx::query_as(
+            r#"SELECT name, version, labels, coordination_mode, downloaded_revision,
+                      active_revision, last_error, last_seen
+                 FROM worker_registry
+                WHERE last_seen >= $1
+                ORDER BY name"#,
+        )
+        .bind(since)
+        .fetch_all(&self.admin_pool)
+        .await
+        .map_err(|e| QueryFluxError::Persistence(format!("list_workers: {e}")))?;
+        Ok(rows
+            .into_iter()
+            .map(|r| crate::WorkerRecord {
+                name: r.0,
+                version: r.1,
+                labels: r.2 .0,
+                coordination_mode: r.3,
+                downloaded_revision: r.4,
+                active_revision: r.5,
+                last_error: r.6,
+                last_seen: r.7,
+            })
+            .collect())
+    }
+}
+
+#[async_trait]
 impl crate::ConfigSnapshotStore for PostgresStore {
     async fn load_config_snapshot_rows(&self) -> Result<crate::ConfigSnapshotRows> {
         let err = |what: &str, e: sqlx::Error| {
@@ -2548,6 +2619,51 @@ mod tests {
 
         store.delete_group_config(&group).await.unwrap();
         store.delete_cluster_config(&cluster).await.unwrap();
+    }
+
+    // -- WorkerRegistryStore ------------------------------------------------
+
+    #[tokio::test]
+    #[ignore]
+    async fn pg_worker_registry_upserts_and_lists_recent_workers() {
+        use crate::WorkerRegistryStore;
+        let store = test_store().await;
+        let name = unique_id("worker");
+        let mut w = crate::WorkerRecord {
+            name: name.clone(),
+            version: "0.4.0".into(),
+            labels: [("app".to_string(), "checkout".to_string())].into(),
+            coordination_mode: "local".into(),
+            downloaded_revision: Some("a".into()),
+            active_revision: Some("a".into()),
+            last_error: None,
+            last_seen: chrono::Utc::now(),
+        };
+        store.upsert_worker(&w).await.unwrap();
+        w.active_revision = Some("b".into());
+        store.upsert_worker(&w).await.unwrap();
+
+        let since = chrono::Utc::now() - chrono::Duration::seconds(60);
+        let found: Vec<_> = store
+            .list_workers(since)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.name == name)
+            .collect();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].active_revision.as_deref(), Some("b"));
+        assert_eq!(
+            found[0].labels.get("app").map(String::as_str),
+            Some("checkout")
+        );
+        let future = chrono::Utc::now() + chrono::Duration::seconds(60);
+        assert!(store
+            .list_workers(future)
+            .await
+            .unwrap()
+            .iter()
+            .all(|r| r.name != name));
     }
 
     // -- ConfigRevisionStore ------------------------------------------------

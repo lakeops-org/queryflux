@@ -27,6 +27,8 @@ pub(crate) struct LiveHandles {
     pub(crate) live: Arc<RwLock<LiveConfig>>,
     pub(crate) cache: Arc<Mutex<AdapterReloadCache>>,
     pub(crate) metrics: Arc<dyn MetricsStore>,
+    /// Bumped after every reload attempt; the worker API's long-polls wait on it.
+    pub(crate) changed: Option<watch::Sender<u64>>,
 }
 
 #[async_trait]
@@ -47,6 +49,9 @@ pub(crate) async fn run_reload_loop(
 ) {
     while source.changed(&mut shutdown).await {
         source.reload(&handles).await;
+        if let Some(tx) = &handles.changed {
+            tx.send_modify(|n| *n = n.wrapping_add(1));
+        }
     }
 }
 
@@ -303,6 +308,8 @@ pub(crate) struct RemoteConfigSource {
     url: String,
     bearer: String,
     poll_interval: std::time::Duration,
+    /// How long the control plane may hold a long-poll.
+    wait_secs: u64,
     state: Arc<std::sync::Mutex<WorkerSyncState>>,
     first: bool,
 }
@@ -312,17 +319,29 @@ impl RemoteConfigSource {
         control_plane: &queryflux_core::config::ControlPlaneClientConfig,
         state: Arc<std::sync::Mutex<WorkerSyncState>>,
     ) -> Self {
+        let wait_secs = control_plane.poll_timeout_secs.clamp(1, 60);
         Self {
             client: reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(30))
+                // The long-poll is held up to `wait_secs`; leave room for the response.
+                .timeout(std::time::Duration::from_secs(wait_secs + 15))
                 .build()
                 .unwrap_or_default(),
             url: format!("{}/worker/config", control_plane.url.trim_end_matches('/')),
             bearer: control_plane.auth.bearer().to_string(),
+            // Only used when the control plane does not support long-poll.
             poll_interval: std::time::Duration::from_secs(5),
+            wait_secs,
             state,
             first: true,
         }
+    }
+
+    /// Long-polling once a config is active (the request waits on the control plane).
+    fn long_polling(&self) -> bool {
+        self.state
+            .lock()
+            .map(|s| s.active_revision.is_some())
+            .unwrap_or(false)
     }
 
     fn record_failure(&self, message: String) {
@@ -339,7 +358,12 @@ impl RemoteConfigSource {
             .map(|s| s.consecutive_failures)
             .unwrap_or(0);
         if failures == 0 {
-            return self.poll_interval;
+            // A long-poll already waited on the control plane; ask again right away.
+            return if self.long_polling() {
+                std::time::Duration::ZERO
+            } else {
+                self.poll_interval
+            };
         }
         let base = 2u64.saturating_pow(failures.min(6)).min(60);
         let jitter_ms = (uuid::Uuid::new_v4().as_u128() % 1000) as u64;
@@ -401,10 +425,19 @@ impl ConfigSource for RemoteConfigSource {
             .lock()
             .ok()
             .and_then(|s| s.active_revision.clone());
-        let mut req = self.client.get(&self.url).bearer_auth(&self.bearer);
-        if let Some(rev) = &active {
-            req = req.header(reqwest::header::IF_NONE_MATCH, format!("\"{rev}\""));
-        }
+        // With an active revision, long-poll for the next one; otherwise fetch now.
+        let mut req = match &active {
+            Some(rev) => self
+                .client
+                .get(format!("{}/wait", self.url))
+                .query(&[
+                    ("since", rev.as_str()),
+                    ("timeoutSecs", &self.wait_secs.to_string()),
+                ])
+                .header(reqwest::header::IF_NONE_MATCH, format!("\"{rev}\"")),
+            None => self.client.get(&self.url),
+        };
+        req = req.bearer_auth(&self.bearer);
         let resp = match req.send().await {
             Ok(r) => r,
             Err(e) => return self.record_failure(format!("control plane unreachable: {e}")),
@@ -553,6 +586,7 @@ mod tests {
                 strategies: HashMap::new(),
             })),
             metrics: Arc::new(queryflux_metrics::NoopMetricsStore),
+            changed: None,
         }
     }
 
@@ -595,6 +629,8 @@ mod tests {
                 let s = current.lock().unwrap().clone();
                 Box::pin(async move { Ok(s) })
             }),
+            registry: None,
+            changes: None,
         };
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -614,6 +650,7 @@ mod tests {
             serde_json::from_value(serde_json::json!({
                 "url": url,
                 "allowInsecureHttp": true,
+                "pollTimeoutSecs": 1,
                 "auth": { "mode": "sharedSecret", "sharedSecret": secret }
             }))
             .unwrap();

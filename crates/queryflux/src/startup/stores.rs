@@ -27,6 +27,8 @@ pub(crate) struct Stores {
     pub(crate) coordination: Option<Arc<dyn CoordinationStore>>,
     /// Consistent config reads for the worker API; `None` in in-memory mode.
     pub(crate) snapshot_store: Option<Arc<dyn queryflux_persistence::ConfigSnapshotStore>>,
+    /// Where worker registrations and heartbeats are recorded.
+    pub(crate) worker_registry: Arc<dyn queryflux_persistence::WorkerRegistryStore>,
 }
 
 /// When Postgres is configured we seed cluster/group config on first run and read from
@@ -105,6 +107,12 @@ pub(crate) async fn build_stores(config: &ProxyConfig) -> Result<Stores> {
         pg_store.clone().map(|pg| pg as _);
     let snapshot_store: Option<Arc<dyn queryflux_persistence::ConfigSnapshotStore>> =
         pg_store.clone().map(|pg| pg as _);
+    let worker_registry: Arc<dyn queryflux_persistence::WorkerRegistryStore> =
+        match (&pg_store, &mem_store) {
+            (Some(pg), _) => pg.clone(),
+            (None, Some(mem)) => mem.clone(),
+            (None, None) => Arc::new(InMemoryPersistence::new()),
+        };
     // The narrower view admission and the lease/reconcile/sweep tasks use: leases, sweep
     // locks and published engine counts, without config or history storage.
     let coordination: Option<Arc<dyn CoordinationStore>> = pg_store.map(|pg| pg as _);
@@ -118,6 +126,7 @@ pub(crate) async fn build_stores(config: &ProxyConfig) -> Result<Stores> {
         distributed_backend,
         coordination,
         snapshot_store,
+        worker_registry,
     })
 }
 
