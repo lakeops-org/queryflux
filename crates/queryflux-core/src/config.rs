@@ -149,6 +149,103 @@ pub struct ProxyConfig {
 }
 
 impl ProxyConfig {
+    /// Check the settings that depend on `queryflux.role`. Returns every problem found.
+    ///
+    /// A worker owns no config: it rejects settings that the control plane provides
+    /// (clusters, groups, routing, auth, authorization, guardrails, access control,
+    /// catalog provider) and a Postgres persistence block, instead of silently merging
+    /// them. Worker-only settings are rejected on the other roles.
+    pub fn validate_role(&self) -> std::result::Result<(), Vec<String>> {
+        fn is_set<T: Serialize + Default>(v: &T) -> bool {
+            serde_json::to_value(v).ok() != serde_json::to_value(T::default()).ok()
+        }
+        let q = &self.queryflux;
+        let mut issues = Vec::new();
+        match q.role {
+            Role::Worker => {
+                match &q.control_plane {
+                    None => issues.push("role: worker requires queryflux.controlPlane".to_string()),
+                    Some(cp) => {
+                        let url = cp.url.trim();
+                        if !(url.starts_with("https://")
+                            || (cp.allow_insecure_http && url.starts_with("http://")))
+                        {
+                            issues.push(format!(
+                                "queryflux.controlPlane.url must be https:// (got '{url}'); set allowInsecureHttp: true for development only"
+                            ));
+                        }
+                        if cp.auth.bearer().trim().is_empty() {
+                            issues.push(
+                                "queryflux.controlPlane.auth.sharedSecret is empty".to_string(),
+                            );
+                        }
+                    }
+                }
+                if !matches!(q.persistence, PersistenceConfig::InMemory) {
+                    issues.push(
+                        "a worker owns no database: remove queryflux.persistence".to_string(),
+                    );
+                }
+                let owned_by_control_plane = [
+                    ("clusters", !self.clusters.is_empty()),
+                    ("clusterGroups", !self.cluster_groups.is_empty()),
+                    ("routers", !self.routers.is_empty()),
+                    ("routingFallback", !self.routing_fallback.is_empty()),
+                    ("auth", is_set(&self.auth)),
+                    ("authorization", is_set(&self.authorization)),
+                    ("catalogProvider", is_set(&self.catalog_provider)),
+                    ("guardrails", self.guardrails.is_some()),
+                    ("accessControl", self.access_control.is_some()),
+                ];
+                for (key, set) in owned_by_control_plane {
+                    if set {
+                        issues.push(format!(
+                            "'{key}' comes from the control plane on a worker; remove it from this file"
+                        ));
+                    }
+                }
+                if q.worker_api.is_some() {
+                    issues.push(
+                        "queryflux.workerApi is for standalone or controlPlane, not worker"
+                            .to_string(),
+                    );
+                }
+            }
+            Role::Standalone | Role::ControlPlane => {
+                let worker_only = [
+                    ("controlPlane", q.control_plane.is_some()),
+                    ("workerName", q.worker_name.is_some()),
+                    ("workerLabels", !q.worker_labels.is_empty()),
+                    ("history", q.history.is_some()),
+                    ("coordination", q.coordination.is_some()),
+                ];
+                for (key, set) in worker_only {
+                    if set {
+                        issues.push(format!("queryflux.{key} only applies to role: worker"));
+                    }
+                }
+                if let Some(api) = &q.worker_api {
+                    if api.enabled
+                        && api
+                            .shared_secret
+                            .as_deref()
+                            .is_none_or(|s| s.trim().is_empty())
+                    {
+                        issues.push(
+                            "queryflux.workerApi.enabled requires workerApi.sharedSecret"
+                                .to_string(),
+                        );
+                    }
+                }
+            }
+        }
+        if issues.is_empty() {
+            Ok(())
+        } else {
+            Err(issues)
+        }
+    }
+
     /// Fail-closed checks run before auth providers are constructed at startup.
     pub fn validate_startup_security(&self) -> std::result::Result<(), String> {
         self.auth.validate_for_required()?;
@@ -747,6 +844,145 @@ pub struct QueryFluxConfig {
     /// Per-group cache settings live on each `ClusterGroupConfig.cache`.
     #[serde(default)]
     pub cache_backend: Option<CacheBackendConfig>,
+    /// What this process does (#255). `standalone` (default) is a regular proxy; `worker`
+    /// serves queries with config pulled from a control plane; `controlPlane` serves
+    /// config to workers.
+    #[serde(default)]
+    pub role: Role,
+    /// Worker only: where to pull config from.
+    #[serde(default)]
+    pub control_plane: Option<ControlPlaneClientConfig>,
+    /// Worker only: name reported to the control plane (default: the hostname).
+    #[serde(default)]
+    pub worker_name: Option<String>,
+    /// Worker only: labels stamped on this worker's queries as tags (they win over a
+    /// client-set tag with the same key) and reported to the control plane.
+    #[serde(default)]
+    pub worker_labels: std::collections::BTreeMap<String, String>,
+    /// Worker only: where query records go.
+    #[serde(default)]
+    pub history: Option<WorkerHistoryConfig>,
+    /// Worker only: how shared capacity is coordinated.
+    #[serde(default)]
+    pub coordination: Option<WorkerCoordinationConfig>,
+    /// Standalone or control plane: accept workers on the admin listener.
+    #[serde(default)]
+    pub worker_api: Option<WorkerApiConfig>,
+}
+
+/// What a QueryFlux process does.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum Role {
+    /// A regular proxy: owns its config and serves queries (today's behavior).
+    #[default]
+    Standalone,
+    /// Owns config and serves it to workers; can also serve queries.
+    ControlPlane,
+    /// Serves queries with config pulled from a control plane; owns no database.
+    Worker,
+}
+
+/// How a worker reaches its control plane.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ControlPlaneClientConfig {
+    pub url: String,
+    pub auth: WorkerAuthConfig,
+    /// How long a config long-poll may wait for a new revision.
+    #[serde(default = "default_poll_timeout_secs")]
+    pub poll_timeout_secs: u64,
+    #[serde(default = "default_heartbeat_interval_secs")]
+    pub heartbeat_interval_secs: u64,
+    /// Allow `http://` (development only: snapshots can carry engine credentials).
+    #[serde(default)]
+    pub allow_insecure_http: bool,
+}
+
+fn default_poll_timeout_secs() -> u64 {
+    30
+}
+
+fn default_heartbeat_interval_secs() -> u64 {
+    10
+}
+
+/// How workers authenticate to the control plane (sent as `Authorization: Bearer`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", tag = "mode")]
+pub enum WorkerAuthConfig {
+    /// One pre-shared secret for every worker (a trusted single fleet).
+    SharedSecret {
+        #[serde(rename = "sharedSecret")]
+        shared_secret: String,
+    },
+}
+
+impl WorkerAuthConfig {
+    pub fn bearer(&self) -> &str {
+        match self {
+            WorkerAuthConfig::SharedSecret { shared_secret } => shared_secret,
+        }
+    }
+}
+
+/// Where a worker sends query records. The control plane stores history.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkerHistoryConfig {
+    /// Override the ingest endpoint (default: the one the snapshot names, else the
+    /// control plane's `/worker/query-records`).
+    #[serde(default)]
+    pub endpoint: Option<String>,
+    /// Records buffered while the endpoint is unreachable; the oldest are dropped first.
+    #[serde(default = "default_spool_max_records")]
+    pub spool_max_records: usize,
+}
+
+fn default_spool_max_records() -> usize {
+    50_000
+}
+
+/// How a worker coordinates shared capacity.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkerCoordinationConfig {
+    #[serde(default)]
+    pub mode: CoordinationMode,
+    #[serde(default)]
+    pub on_unavailable: OnCoordinationUnavailable,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum CoordinationMode {
+    /// Capacity leases come from the control plane, shared with every worker and the
+    /// control plane's own queries.
+    #[default]
+    ControlPlane,
+    /// Limits apply to this worker alone. Only correct when one worker serves a group.
+    Local,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum OnCoordinationUnavailable {
+    /// New queries on shared groups wait until the capacity wait timeout.
+    #[default]
+    FailClosed,
+    /// Admit against this worker's own limit (can exceed the global cap).
+    LocalLimits,
+}
+
+/// Control-plane side: accept workers on the admin listener.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkerApiConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// The secret workers present (`controlPlane.auth.sharedSecret` on the worker).
+    #[serde(default)]
+    pub shared_secret: Option<String>,
 }
 
 impl QueryFluxConfig {
@@ -3696,5 +3932,119 @@ mod translation_mode_tests {
             serde_json::from_value::<TranslationConfig>(serde_json::json!({"mode": "Strict"}))
                 .is_err()
         );
+    }
+}
+
+#[cfg(test)]
+mod role_tests {
+    use super::*;
+
+    fn parse(yaml: &str) -> ProxyConfig {
+        serde_yaml::from_str(yaml).expect("valid config")
+    }
+
+    const WORKER: &str = r#"
+queryflux:
+  role: worker
+  controlPlane:
+    url: https://queryflux-control.queryflux-system.svc
+    auth: { mode: sharedSecret, sharedSecret: s3cret }
+  workerLabels: { app: checkout }
+  coordination: { mode: local }
+  frontends:
+    trinoHttp: { enabled: true, port: 8080 }
+"#;
+
+    #[test]
+    fn standalone_is_the_default_role() {
+        let c = parse("queryflux: {}\n");
+        assert_eq!(c.queryflux.role, Role::Standalone);
+        assert!(c.validate_role().is_ok());
+    }
+
+    #[test]
+    fn a_minimal_worker_config_is_valid() {
+        let c = parse(WORKER);
+        assert_eq!(c.queryflux.role, Role::Worker);
+        let cp = c.queryflux.control_plane.as_ref().unwrap();
+        assert_eq!(cp.auth.bearer(), "s3cret");
+        assert_eq!(cp.poll_timeout_secs, 30);
+        assert_eq!(cp.heartbeat_interval_secs, 10);
+        assert_eq!(
+            c.queryflux.coordination.as_ref().unwrap().mode,
+            CoordinationMode::Local
+        );
+        assert_eq!(
+            c.queryflux.coordination.as_ref().unwrap().on_unavailable,
+            OnCoordinationUnavailable::FailClosed
+        );
+        assert_eq!(c.validate_role(), Ok(()));
+    }
+
+    #[test]
+    fn a_worker_rejects_settings_the_control_plane_owns() {
+        let c = parse(&format!(
+            "{WORKER}{}",
+            r#"
+clusters:
+  duck: { engine: duckDb }
+clusterGroups:
+  g: { members: [duck], maxRunningQueries: 1 }
+routingFallback: g
+auth: { provider: static, required: true }
+"#
+        ));
+        let issues = c.validate_role().unwrap_err();
+        for key in ["clusters", "clusterGroups", "routingFallback", "auth"] {
+            assert!(
+                issues.iter().any(|i| i.contains(&format!("'{key}'"))),
+                "{key} not reported: {issues:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_worker_needs_https_and_a_secret() {
+        let c = parse(
+            &WORKER
+                .replace("https://", "http://")
+                .replace("s3cret", "\"\""),
+        );
+        let issues = c.validate_role().unwrap_err();
+        assert!(
+            issues.iter().any(|i| i.contains("must be https://")),
+            "{issues:?}"
+        );
+        assert!(
+            issues.iter().any(|i| i.contains("sharedSecret is empty")),
+            "{issues:?}"
+        );
+
+        let dev =
+            parse(&WORKER.replace("url: https://", "allowInsecureHttp: true\n    url: http://"));
+        assert!(dev.validate_role().is_ok());
+    }
+
+    #[test]
+    fn a_worker_needs_a_control_plane() {
+        let c = parse("queryflux:\n  role: worker\n");
+        assert!(c.validate_role().unwrap_err()[0].contains("requires queryflux.controlPlane"));
+    }
+
+    #[test]
+    fn worker_settings_are_rejected_on_other_roles() {
+        let c = parse("queryflux:\n  workerLabels: { app: x }\n  coordination: { mode: local }\n");
+        let issues = c.validate_role().unwrap_err();
+        assert_eq!(issues.len(), 2, "{issues:?}");
+    }
+
+    #[test]
+    fn the_worker_api_needs_a_secret() {
+        let c = parse("queryflux:\n  role: controlPlane\n  workerApi: { enabled: true }\n");
+        assert!(c.validate_role().unwrap_err()[0].contains("requires workerApi.sharedSecret"));
+        let ok = parse(
+            "queryflux:\n  role: controlPlane\n  workerApi: { enabled: true, sharedSecret: s }\n",
+        );
+        assert!(ok.validate_role().is_ok());
     }
 }

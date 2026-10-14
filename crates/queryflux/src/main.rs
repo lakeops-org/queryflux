@@ -115,6 +115,18 @@ async fn main() -> Result<()> {
 
     info!("QueryFlux starting — loaded config from: {}", config_path);
 
+    // --- Role (#255): check the settings that depend on what this process does ---
+    if let Err(issues) = config.validate_role() {
+        for issue in &issues {
+            tracing::error!("Config: {issue}");
+        }
+        anyhow::bail!("Config has {} role error(s) — aborting", issues.len());
+    }
+    info!(role = ?config.queryflux.role, "Process role");
+    if config.queryflux.role == queryflux_core::config::Role::Worker {
+        anyhow::bail!("role: worker is not available in this build yet");
+    }
+
     let external_address = config
         .queryflux
         .external_address

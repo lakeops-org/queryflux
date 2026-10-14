@@ -341,6 +341,20 @@ async fn handle_validation(config_path: &str) -> anyhow::Result<()> {
         }
     };
 
+    if let Err(issues) = config.validate_role() {
+        for issue in &issues {
+            eprintln!("✗ {issue}");
+        }
+        return Err(anyhow::anyhow!(
+            "configuration has {} role error(s)",
+            issues.len()
+        ));
+    }
+    println!(
+        "✓ Role settings are consistent (role: {:?}).",
+        config.queryflux.role
+    );
+
     let requires_translation = config_requires_translation(&config);
 
     println!("Validating Python & sqlglot environment...");
