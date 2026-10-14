@@ -14,3 +14,4 @@ pub mod security_setting;
 pub mod session;
 pub mod sql_classify;
 pub mod tags;
+pub mod worker_snapshot;

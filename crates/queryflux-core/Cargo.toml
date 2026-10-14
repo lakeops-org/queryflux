@@ -18,3 +18,4 @@ anyhow = { workspace = true }
 bytes = { workspace = true }
 polyglot-sql = { workspace = true }
 tokio = { workspace = true }
+xxhash-rust = { workspace = true }

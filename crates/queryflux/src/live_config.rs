@@ -333,6 +333,130 @@ impl SectionError {
     }
 }
 
+/// Build the worker config snapshot for these inputs.
+///
+/// YAML clusters are converted with the same conversion that seeds Postgres from YAML
+/// (`UpsertClusterConfig::from_core`), which drops key-pair private keys, `driver` and
+/// `maxWaitSecs`; a YAML-only control plane should use `CredentialMode::Stripped` and
+/// secret resolution on workers for those.
+// Wired up by the control plane's worker API and the worker's config sync (#255).
+#[allow(dead_code)]
+pub(crate) fn snapshot_from_inputs(
+    inputs: &LiveConfigInputs,
+    credentials: queryflux_core::worker_snapshot::CredentialMode,
+) -> Result<queryflux_core::worker_snapshot::WorkerSnapshotV1> {
+    use queryflux_core::worker_snapshot::{
+        SnapshotCluster, SnapshotSettings, WorkerSnapshotV1, WORKER_SNAPSHOT_SCHEMA_VERSION,
+    };
+    let mut clusters = Vec::with_capacity(inputs.clusters.len());
+    for spec in &inputs.clusters {
+        let cluster = match &spec.source {
+            ClusterSource::Persisted {
+                engine_key,
+                max_running_queries,
+                config,
+                variants,
+            } => SnapshotCluster {
+                name: spec.name.clone(),
+                enabled: spec.enabled,
+                engine_key: engine_key.clone(),
+                max_running_queries: *max_running_queries,
+                config: config.clone(),
+                variants: variants.clone(),
+            },
+            ClusterSource::Yaml(cfg) => {
+                let Some(upsert) =
+                    queryflux_persistence::cluster_config::UpsertClusterConfig::from_core(cfg)
+                        .with_context(|| format!("cluster '{}': serializing", spec.name))?
+                else {
+                    tracing::warn!(cluster = %spec.name, "cluster has no engine; left out of the snapshot");
+                    continue;
+                };
+                SnapshotCluster {
+                    name: spec.name.clone(),
+                    enabled: spec.enabled,
+                    engine_key: upsert.engine_key,
+                    max_running_queries: upsert.max_running_queries,
+                    config: upsert.config,
+                    variants: upsert.variants,
+                }
+            }
+        };
+        clusters.push(cluster);
+    }
+    Ok(WorkerSnapshotV1 {
+        schema_version: WORKER_SNAPSHOT_SCHEMA_VERSION,
+        revision: String::new(),
+        credentials,
+        clusters,
+        groups: inputs.groups.clone().into_iter().collect(),
+        routers: inputs.routers.clone(),
+        routing_fallback: inputs.routing_fallback.clone(),
+        group_translation_scripts: inputs
+            .group_translation_scripts
+            .clone()
+            .into_iter()
+            .collect(),
+        settings: SnapshotSettings {
+            guardrails: inputs.settings.guardrails.clone(),
+            security: inputs.settings.security.clone(),
+            catalog: inputs.settings.catalog.clone(),
+            access_control: inputs.settings.access_control.clone(),
+            guard_script_bodies: inputs
+                .settings
+                .guard_script_bodies
+                .clone()
+                .into_iter()
+                .collect(),
+        },
+    }
+    .seal())
+}
+
+/// The inputs a worker compiles from a snapshot it received.
+// Wired up by the control plane's worker API and the worker's config sync (#255).
+#[allow(dead_code)]
+pub(crate) fn inputs_from_snapshot(
+    snapshot: &queryflux_core::worker_snapshot::WorkerSnapshotV1,
+) -> LiveConfigInputs {
+    LiveConfigInputs {
+        clusters: snapshot
+            .clusters
+            .iter()
+            .map(|c| ClusterSpec {
+                name: c.name.clone(),
+                enabled: c.enabled,
+                source: ClusterSource::Persisted {
+                    engine_key: c.engine_key.clone(),
+                    max_running_queries: c.max_running_queries,
+                    config: c.config.clone(),
+                    variants: c.variants.clone(),
+                },
+            })
+            .collect(),
+        groups: snapshot.groups.clone().into_iter().collect(),
+        routers: snapshot.routers.clone(),
+        routing_fallback: snapshot.routing_fallback.clone(),
+        group_translation_scripts: snapshot
+            .group_translation_scripts
+            .clone()
+            .into_iter()
+            .collect(),
+        settings: SettingsInputs {
+            guardrails: snapshot.settings.guardrails.clone(),
+            security: snapshot.settings.security.clone(),
+            catalog: snapshot.settings.catalog.clone(),
+            access_control: snapshot.settings.access_control.clone(),
+            guard_script_bodies: snapshot
+                .settings
+                .guard_script_bodies
+                .clone()
+                .into_iter()
+                .collect(),
+        },
+    }
+}
+
 /// Postgres row ids, used only for `query_history` foreign keys on `ClusterState`.
 /// Empty for YAML-only startup (and for workers).
 #[derive(Clone, Default)]
@@ -1502,6 +1626,67 @@ mod tests {
         .expect("nothing to fail");
         assert!(errors.is_empty());
         assert!(Arc::ptr_eq(&live.auth_provider, &prev_auth));
+    }
+
+    /// Inputs to snapshot to inputs is lossless for persisted clusters, and the
+    /// revision is the same each way round.
+    #[tokio::test]
+    async fn snapshot_round_trips_inputs() {
+        use queryflux_core::worker_snapshot::CredentialMode;
+        let mut i = inputs(
+            vec![persisted(
+                "duck",
+                serde_json::json!({ "poolSize": 2 }),
+                serde_json::json!([{ "name": "a" }]),
+            )],
+            vec![("g", group(serde_json::json!({ "members": ["duck::a"] })))],
+        );
+        i.settings.catalog = Some(serde_json::json!({ "type": "none" }));
+        i.settings.guard_script_bodies = HashMap::from([(3, "def check(q): pass".to_string())]);
+
+        let snap = snapshot_from_inputs(&i, CredentialMode::Embedded).expect("snapshot");
+        let back = inputs_from_snapshot(&snap);
+        let again = snapshot_from_inputs(&back, CredentialMode::Embedded).expect("snapshot");
+        assert_eq!(snap.revision, again.revision);
+        assert_eq!(
+            back.settings
+                .guard_script_bodies
+                .get(&3)
+                .map(String::as_str),
+            Some("def check(q): pass")
+        );
+
+        // A worker can compile what it received.
+        let live = compile(&back, &ConfigIds::default(), CompileMode::Strict)
+            .await
+            .expect("worker compiles the snapshot");
+        assert!(live.adapters.contains_key("duck::a"));
+    }
+
+    #[tokio::test]
+    async fn yaml_clusters_go_into_the_snapshot_in_persisted_form() {
+        use queryflux_core::worker_snapshot::CredentialMode;
+        let yaml: queryflux_core::config::ClusterConfig =
+            serde_json::from_value(serde_json::json!({
+                "engine": "duckDb",
+                "maxRunningQueries": 3
+            }))
+            .expect("valid cluster fixture");
+        let i = inputs(
+            vec![ClusterSpec::from_yaml("duck", &yaml)],
+            vec![("g", group(serde_json::json!({ "members": ["duck"] })))],
+        );
+        let snap = snapshot_from_inputs(&i, CredentialMode::Embedded).expect("snapshot");
+        assert_eq!(snap.clusters.len(), 1);
+        assert_eq!(snap.clusters[0].engine_key, "duckDb");
+        assert_eq!(snap.clusters[0].max_running_queries, Some(3));
+        compile(
+            &inputs_from_snapshot(&snap),
+            &ConfigIds::default(),
+            CompileMode::Strict,
+        )
+        .await
+        .expect("worker compiles the snapshot");
     }
 
     /// Variant clusters have no row of their own; they get their parent's id.

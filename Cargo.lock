@@ -5507,6 +5507,7 @@ dependencies = [
  "tokio",
  "url",
  "uuid",
+ "xxhash-rust",
 ]
 
 [[package]]
