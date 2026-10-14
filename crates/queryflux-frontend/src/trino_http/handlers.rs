@@ -168,7 +168,8 @@ fn client_safe_message(e: &QueryFluxError) -> &'static str {
         | ClusterNotFound(_)
         | Denied(_)
         | QueueFull { .. }
-        | CapacityWaitTimeout { .. } => "",
+        | CapacityWaitTimeout { .. }
+        | NotConfigured(_) => "",
         _ => "Internal error",
     }
 }
@@ -549,7 +550,18 @@ pub async fn post_statement(
 
     // 1. Authenticate — derive AuthContext from request credentials.
     let creds = extract_credentials(&headers);
-    let live = state.snapshot().await;
+    let live = match state.query_snapshot().await {
+        Ok(live) => live,
+        // 503 + Retry-After: Trino clients retry the submit.
+        Err(e) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                [(axum::http::header::RETRY_AFTER, "1")],
+                e.to_string(),
+            )
+                .into_response()
+        }
+    };
     let auth_provider = live.auth_provider.clone();
     let auth_ctx = match auth_provider.authenticate(&creds).await {
         Ok(ctx) => ctx,
@@ -1939,6 +1951,26 @@ mod auth_fast_path_tests {
 
     use super::post_statement;
     use crate::state::test_fixtures;
+
+    /// A worker without config answers the submit with a retryable 503, before
+    /// authentication (it has no auth provider yet).
+    #[tokio::test]
+    async fn submit_before_configuration_is_a_retryable_503() {
+        let state = test_fixtures::app_state(true);
+        {
+            let mut live = state.live.write().await;
+            live.group_order.clear();
+            live.group_members.clear();
+        }
+        let resp = post_statement(State(state), HeaderMap::new(), Bytes::from("SELECT 1"))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            resp.headers().get(axum::http::header::RETRY_AFTER),
+            Some(&HeaderValue::from_static("1"))
+        );
+    }
 
     #[tokio::test]
     async fn set_session_fast_path_rejects_unauthenticated_when_required() {

@@ -89,6 +89,13 @@ pub struct LiveConfig {
 }
 
 impl LiveConfig {
+    /// False until the instance has at least one cluster group: a worker before its first
+    /// config snapshot. Every valid standalone config has a group (startup rejects one
+    /// whose routing fallback names no group).
+    pub fn is_configured(&self) -> bool {
+        !self.group_order.is_empty()
+    }
+
     /// Returns true if any cluster in the group supports async execution (e.g. Trino).
     pub fn group_supports_async(&self, group: &str) -> bool {
         self.group_members
@@ -118,6 +125,10 @@ impl LiveConfig {
         .await
     }
 }
+
+/// Client-facing message when an instance has no config yet.
+pub const NOT_CONFIGURED_MESSAGE: &str =
+    "this QueryFlux instance has not received its configuration yet; retry shortly";
 
 /// Shared application state — passed to every handler via `axum::extract::State`.
 /// Shared across all frontend protocol implementations (Trino HTTP, PG wire, etc.).
@@ -204,6 +215,22 @@ impl AppState {
     /// before any routing, authorization, or backend I/O.
     pub async fn snapshot(&self) -> LiveConfig {
         self.live.read().await.clone()
+    }
+
+    /// The config generation for a new query, or `NotConfigured` when there is none yet.
+    /// Checked before authentication, because an unconfigured instance has no auth
+    /// provider to authenticate against.
+    pub async fn query_snapshot(
+        &self,
+    ) -> Result<LiveConfig, queryflux_core::error::QueryFluxError> {
+        let live = self.snapshot().await;
+        if live.is_configured() {
+            Ok(live)
+        } else {
+            Err(queryflux_core::error::QueryFluxError::NotConfigured(
+                NOT_CONFIGURED_MESSAGE.to_string(),
+            ))
+        }
     }
 
     /// Capture only the current identity provider for authentication-only requests.
@@ -682,6 +709,25 @@ pub mod test_fixtures {
     use tokio::sync::RwLock;
 
     use super::{AppState, LiveConfig};
+
+    #[tokio::test]
+    async fn query_snapshot_is_not_configured_until_there_is_a_group() {
+        let state = app_state(false);
+        assert!(state.query_snapshot().await.is_ok());
+        {
+            let mut live = state.live.write().await;
+            live.group_order.clear();
+            live.group_members.clear();
+        }
+        let err = state.query_snapshot().await.err().expect("unconfigured");
+        assert!(matches!(
+            err,
+            queryflux_core::error::QueryFluxError::NotConfigured(_)
+        ));
+        assert!(err
+            .to_string()
+            .contains("not received its configuration yet"));
+    }
 
     pub fn app_state(auth_required: bool) -> Arc<AppState> {
         app_state_with_metrics(Arc::new(NoopMetricsStore), auth_required)

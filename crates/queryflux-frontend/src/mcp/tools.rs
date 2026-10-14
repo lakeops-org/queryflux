@@ -403,7 +403,14 @@ impl QueryFluxMcpServer {
     ) -> Result<CallToolResult, McpError> {
         let dialect = resolve_dialect_override(dialect.as_deref())?;
         let headers = extract_headers(&ctx);
-        let live = self.state.snapshot().await;
+        let live = match self.state.query_snapshot().await {
+            Ok(live) => live,
+            Err(e) => {
+                return Ok(CallToolResult::error(vec![ContentBlock::text(
+                    e.to_string(),
+                )]))
+            }
+        };
         let auth = authenticate(live.auth_provider.as_ref(), &headers).await?;
         let agent_context = resolve_agent_context(&headers, &agent, &auth);
         let conversation_id = agent_context.conversation_id.clone();
@@ -436,7 +443,14 @@ impl QueryFluxMcpServer {
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         let headers = extract_headers(&ctx);
-        let live = self.state.snapshot().await;
+        let live = match self.state.query_snapshot().await {
+            Ok(live) => live,
+            Err(e) => {
+                return Ok(CallToolResult::error(vec![ContentBlock::text(
+                    e.to_string(),
+                )]))
+            }
+        };
         let auth = authenticate(live.auth_provider.as_ref(), &headers).await?;
         let agent_context = resolve_agent_context(&headers, &agent, &auth);
         let conversation_id = agent_context.conversation_id.clone();
@@ -472,7 +486,14 @@ impl QueryFluxMcpServer {
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         let headers = extract_headers(&ctx);
-        let live = self.state.snapshot().await;
+        let live = match self.state.query_snapshot().await {
+            Ok(live) => live,
+            Err(e) => {
+                return Ok(CallToolResult::error(vec![ContentBlock::text(
+                    e.to_string(),
+                )]))
+            }
+        };
         let auth = authenticate(live.auth_provider.as_ref(), &headers).await?;
         let agent_context = resolve_agent_context(&headers, &agent, &auth);
         let conversation_id = agent_context.conversation_id.clone();
@@ -569,7 +590,14 @@ impl QueryFluxMcpServer {
     ) -> Result<CallToolResult, McpError> {
         let dialect = resolve_dialect_override(dialect.as_deref())?;
         let headers = extract_headers(&ctx);
-        let live = self.state.snapshot().await;
+        let live = match self.state.query_snapshot().await {
+            Ok(live) => live,
+            Err(e) => {
+                return Ok(CallToolResult::error(vec![ContentBlock::text(
+                    e.to_string(),
+                )]))
+            }
+        };
         let auth = authenticate(live.auth_provider.as_ref(), &headers).await?;
         let agent_context = resolve_agent_context(&headers, &agent, &auth);
         let conversation_id = agent_context.conversation_id.clone();

@@ -18,6 +18,11 @@ pub async fn resolve_routed_group(
     trace: &mut RoutingTrace,
     auth_ctx: &AuthContext,
 ) -> Result<ClusterGroupName, QueryFluxError> {
+    if group_order.is_empty() {
+        return Err(QueryFluxError::NotConfigured(
+            crate::state::NOT_CONFIGURED_MESSAGE.to_string(),
+        ));
+    }
     if !trace.used_fallback {
         return Ok(routed);
     }
@@ -57,6 +62,27 @@ mod tests {
 
     use super::*;
     use crate::state::LiveConfig;
+
+    /// No groups at all is "not configured yet", not an authorization failure.
+    #[tokio::test]
+    async fn no_groups_is_not_configured_rather_than_unauthorized() {
+        let mut trace = RoutingTrace {
+            decisions: vec![],
+            final_group: String::new(),
+            used_fallback: true,
+            denied: None,
+        };
+        let err = resolve_routed_group(
+            &[],
+            &AllowAllAuthorization::default(),
+            ClusterGroupName(String::new()),
+            &mut trace,
+            &auth("alice", &[]),
+        )
+        .await
+        .expect_err("no groups");
+        assert!(matches!(err, QueryFluxError::NotConfigured(_)), "{err}");
+    }
 
     fn auth(user: &str, groups: &[&str]) -> AuthContext {
         AuthContext {

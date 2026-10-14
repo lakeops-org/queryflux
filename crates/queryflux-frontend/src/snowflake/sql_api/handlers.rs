@@ -235,7 +235,10 @@ pub async fn submit_statement(
     let params = bindings_to_params(body_json.get("bindings"));
 
     // Stateless auth: Bearer token in Authorization header.
-    let live = state.app.snapshot().await;
+    let live = match state.app.query_snapshot().await {
+        Ok(live) => live,
+        Err(e) => return sql_api_error(StatusCode::SERVICE_UNAVAILABLE, "000000", &e.to_string()),
+    };
     let auth_ctx = match authenticate(&state.app, live.auth_provider.as_ref(), &headers).await {
         Ok(ctx) => ctx,
         Err(e) => return sql_api_error(StatusCode::UNAUTHORIZED, "390002", &e.to_string()),

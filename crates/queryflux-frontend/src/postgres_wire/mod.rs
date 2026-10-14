@@ -317,7 +317,15 @@ async fn handle_simple_query(
         username: session.user().map(|s| s.to_string()),
         ..Default::default()
     };
-    let live = state.snapshot().await;
+    let live = match state.query_snapshot().await {
+        Ok(live) => live,
+        Err(e) => {
+            // 57P03 = cannot_connect_now: clients treat it as "try again later".
+            write_error_response(writer, "57P03", &e.to_string()).await?;
+            write_msg(writer, b'Z', b"I").await?;
+            return Ok(());
+        }
+    };
     let auth_provider = live.auth_provider.clone();
     let auth_ctx = match auth_provider.authenticate(&creds).await {
         Ok(ctx) => ctx,

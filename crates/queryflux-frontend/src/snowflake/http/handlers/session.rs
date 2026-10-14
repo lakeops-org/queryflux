@@ -65,7 +65,21 @@ pub async fn login_request(
         .filter(|s| !s.is_empty())
         .cloned();
 
-    let live = state.app.snapshot().await;
+    let live = match state.app.query_snapshot().await {
+        Ok(live) => live,
+        Err(e) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                axum::Json(json!({
+                    "data": null,
+                    "message": e.to_string(),
+                    "success": false,
+                    "code": "000000"
+                })),
+            )
+                .into_response();
+        }
+    };
     let auth_provider = live.auth_provider.clone();
     let auth_ctx = match auth_provider
         .authenticate(&Credentials {

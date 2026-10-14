@@ -303,7 +303,14 @@ async fn handle_com_query(
         username: session.user().map(|s| s.to_string()),
         ..Default::default()
     };
-    let live = state.snapshot().await;
+    let live = match state.query_snapshot().await {
+        Ok(live) => live,
+        Err(e) => {
+            // 1053 = ER_SERVER_SHUTDOWN: the server cannot take queries right now.
+            write_packet(writer, start_seq, &build_err(1053, &e.to_string())).await?;
+            return Ok(());
+        }
+    };
     let auth_provider = live.auth_provider.clone();
     let auth_ctx = match auth_provider.authenticate(&creds).await {
         Ok(ctx) => ctx,

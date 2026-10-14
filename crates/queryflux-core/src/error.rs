@@ -44,6 +44,10 @@ pub enum QueryFluxError {
     #[error("Cluster not found: {0}")]
     ClusterNotFound(String),
 
+    /// This instance has no config yet (a worker before its first snapshot). Retryable.
+    #[error("QueryFlux is not configured yet: {0}")]
+    NotConfigured(String),
+
     #[error("No cluster group available: {0}")]
     NoClusterGroupAvailable(String),
 

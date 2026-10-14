@@ -201,7 +201,11 @@ impl FlightSqlService for QueryFluxFlightSql {
             bearer_token: bearer,
             ..Default::default()
         };
-        let live = self.state.snapshot().await;
+        let live = self
+            .state
+            .query_snapshot()
+            .await
+            .map_err(|e| Status::unavailable(e.to_string()))?;
         let auth_provider = live.auth_provider.clone();
         let auth_ctx = match auth_provider.authenticate(&creds).await {
             Ok(ctx) => ctx,
