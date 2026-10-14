@@ -213,8 +213,10 @@ async fn sync_dispatch_dropped_during_global_acquire_releases_slot() {
     let capacity = Arc::new(HangingCapacity::default());
     let (state, cluster) = test_state(capacity.clone());
     let task = tokio::spawn(async move {
+        let live = state.snapshot().await;
         let _ = execute_to_sink(
             &state,
+            &live,
             "SELECT 1".into(),
             vec![],
             SessionContext::default(),
@@ -233,8 +235,10 @@ async fn async_dispatch_dropped_during_global_acquire_releases_slot() {
     let capacity = Arc::new(HangingCapacity::default());
     let (state, cluster) = test_state(capacity.clone());
     let task = tokio::spawn(async move {
+        let live = state.snapshot().await;
         let _ = dispatch_query(
             &state,
+            &live,
             ProxyQueryId::new(),
             "SELECT 1".into(),
             vec![],
