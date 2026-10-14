@@ -327,6 +327,45 @@ pub(crate) struct SettingsInputs {
     pub(crate) guard_script_bodies: HashMap<i64, String>,
 }
 
+impl SettingsInputs {
+    /// The settings a process's own YAML configures, in the same JSON form as the stored
+    /// rows: guardrails in their row format, auth and authorization wrapped as
+    /// `{authConfig, authorizationConfig}`, catalog provider and access control as-is.
+    pub(crate) fn from_yaml(config: &queryflux_core::config::ProxyConfig) -> Self {
+        Self {
+            guardrails: config
+                .guardrails
+                .as_ref()
+                .and_then(|g| serde_json::to_value(g).ok()),
+            security: Some(serde_json::json!({
+                "authConfig": config.auth,
+                "authorizationConfig": config.authorization,
+            })),
+            catalog: serde_json::to_value(&config.catalog_provider).ok(),
+            access_control: config
+                .access_control
+                .as_ref()
+                .and_then(|a| serde_json::to_value(a).ok()),
+            guard_script_bodies: HashMap::new(),
+        }
+    }
+
+    /// Stored sections win; a section with no stored row (or a blank security row) falls
+    /// back to `yaml`. This is the precedence a standalone process applies at startup.
+    pub(crate) fn or_yaml(self, yaml: SettingsInputs) -> Self {
+        let security = self
+            .security
+            .filter(|v| !queryflux_core::security_setting::is_blank_security_setting(v));
+        Self {
+            guardrails: self.guardrails.or(yaml.guardrails),
+            security: security.or(yaml.security),
+            catalog: self.catalog.or(yaml.catalog),
+            access_control: self.access_control.or(yaml.access_control),
+            guard_script_bodies: self.guard_script_bodies,
+        }
+    }
+}
+
 /// A settings section that failed to apply. `metric` is the
 /// `queryflux_config_reload_failures_total` reason label.
 #[derive(Clone, Debug)]
@@ -423,8 +462,6 @@ pub(crate) fn snapshot_from_inputs(
 }
 
 /// The inputs a worker compiles from a snapshot it received.
-// Wired up by the control plane's worker API and the worker's config sync (#255).
-#[allow(dead_code)]
 pub(crate) fn inputs_from_snapshot(
     snapshot: &queryflux_core::worker_snapshot::WorkerSnapshotV1,
 ) -> LiveConfigInputs {
@@ -467,12 +504,13 @@ pub(crate) fn inputs_from_snapshot(
 }
 
 /// Read every config row in one consistent read and turn it into the inputs a worker
-/// snapshot is built from. `yaml_routing` is used when routing was never saved through
-/// the admin API (it lives in the control plane's YAML).
+/// snapshot is built from. The control plane's own YAML fills in what was never saved
+/// through the admin API: routing, and any settings section without a stored row.
 pub(crate) async fn load_snapshot_inputs(
     store: &dyn queryflux_persistence::ConfigSnapshotStore,
-    yaml_routing: (&str, &[queryflux_core::config::RouterConfig]),
+    yaml: &queryflux_core::config::ProxyConfig,
 ) -> Result<(LiveConfigInputs, ConfigIds)> {
+    let yaml_routing = (yaml.routing_fallback.as_str(), yaml.routers.as_slice());
     let rows = store
         .load_config_snapshot_rows()
         .await
@@ -512,7 +550,8 @@ pub(crate) async fn load_snapshot_inputs(
             .into_iter()
             .map(|s| (s.id, s.body))
             .collect(),
-    };
+    }
+    .or_yaml(SettingsInputs::from_yaml(yaml));
     Ok((inputs, ids))
 }
 
@@ -591,10 +630,10 @@ pub(crate) fn validate_snapshot_inputs(inputs: &LiveConfigInputs) -> Vec<String>
 /// read, scripts inlined, validation, then the sealed snapshot.
 pub(crate) async fn build_worker_snapshot(
     store: &dyn queryflux_persistence::ConfigSnapshotStore,
-    yaml_routing: (&str, &[queryflux_core::config::RouterConfig]),
+    yaml: &queryflux_core::config::ProxyConfig,
     credentials: queryflux_core::worker_snapshot::CredentialMode,
 ) -> Result<queryflux_core::worker_snapshot::WorkerSnapshotV1> {
-    let (mut inputs, _ids) = load_snapshot_inputs(store, yaml_routing).await?;
+    let (mut inputs, _ids) = load_snapshot_inputs(store, yaml).await?;
     inline_script_files(&mut inputs)?;
     let issues = validate_snapshot_inputs(&inputs);
     if !issues.is_empty() {
@@ -605,6 +644,35 @@ pub(crate) async fn build_worker_snapshot(
         );
     }
     snapshot_from_inputs(&inputs, credentials)
+}
+
+/// The config a worker holds before its first snapshot: no groups, no adapters. Queries
+/// get a retryable "not configured yet" error and readiness reports 503.
+pub(crate) fn empty_live_config() -> LiveConfig {
+    LiveConfig {
+        router_chain: RouterChain::new(Vec::new(), ClusterGroupName(String::new())),
+        guard_chain: None,
+        group_guard_chains: HashMap::new(),
+        access_control_guard: None,
+        cluster_manager: Arc::new(
+            queryflux_cluster_manager::simple::SimpleClusterGroupManager::new(HashMap::new()),
+        ),
+        adapters: HashMap::new(),
+        health_check_targets: Vec::new(),
+        custom_health_queries: HashMap::new(),
+        custom_reconcile_queries: HashMap::new(),
+        cluster_configs: HashMap::new(),
+        group_members: HashMap::new(),
+        group_order: Vec::new(),
+        group_translation_scripts: HashMap::new(),
+        group_default_tags: HashMap::new(),
+        group_max_queued_queries: HashMap::new(),
+        group_capacity_wait_timeout_secs: HashMap::new(),
+        group_cache_settings: HashMap::new(),
+        auth_provider: Arc::new(NoneAuthProvider::new(true)),
+        authorization: Arc::new(AllowAllAuthorization::default()),
+        catalog: Arc::new(queryflux_core::catalog::NullCatalogProvider),
+    }
 }
 
 /// Postgres row ids, used only for `query_history` foreign keys on `ClusterState`.
@@ -1962,7 +2030,11 @@ mod tests {
             .unwrap();
         store.upsert_group_config("g", &g).await.unwrap();
 
-        let snap = build_worker_snapshot(&store, ("g", &[]), CredentialMode::Embedded)
+        let yaml = |fallback: &str| -> queryflux_core::config::ProxyConfig {
+            serde_yaml::from_str(&format!("queryflux: {{}}\nroutingFallback: {fallback}\n"))
+                .unwrap()
+        };
+        let snap = build_worker_snapshot(&store, &yaml("g"), CredentialMode::Embedded)
             .await
             .expect("publishable");
         assert!(snap.is_sealed());
@@ -1977,8 +2049,47 @@ mod tests {
         let states = live.cluster_manager.all_cluster_states().await.unwrap();
         assert_eq!(states[0].max_running_queries, 2);
 
-        let bad = build_worker_snapshot(&store, ("missing", &[]), CredentialMode::Embedded).await;
+        let bad = build_worker_snapshot(&store, &yaml("missing"), CredentialMode::Embedded).await;
         assert!(bad.is_err(), "dangling fallback is not publishable");
+    }
+
+    /// Settings with no stored row come from the control plane's YAML, in a form the
+    /// worker applies: here, static-user auth from YAML becomes the worker's provider.
+    #[tokio::test]
+    async fn settings_without_a_row_fall_back_to_the_control_planes_yaml() {
+        let yaml: queryflux_core::config::ProxyConfig = serde_yaml::from_str(
+            r#"
+queryflux: {}
+auth:
+  provider: static
+  required: true
+  staticUsers:
+    users:
+      alice: { password: pw }
+catalogProvider: { type: "null" }
+"#,
+        )
+        .unwrap();
+        let stored = SettingsInputs {
+            catalog: Some(serde_json::json!({ "type": "null" })),
+            security: Some(serde_json::json!({})), // blank row: not an override
+            ..SettingsInputs::default()
+        };
+        let merged = stored.or_yaml(SettingsInputs::from_yaml(&yaml));
+        assert_eq!(
+            merged.security.as_ref().unwrap()["authConfig"]["provider"],
+            "static"
+        );
+
+        let mut live = compiled().await;
+        let before = live.auth_provider.clone();
+        apply_settings(&mut live, &merged, &HashMap::new(), CompileMode::Strict)
+            .await
+            .expect("YAML settings apply on the worker");
+        assert!(
+            !Arc::ptr_eq(&live.auth_provider, &before),
+            "auth came from YAML"
+        );
     }
 
     /// Variant clusters have no row of their own; they get their parent's id.

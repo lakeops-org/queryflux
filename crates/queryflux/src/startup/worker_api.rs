@@ -10,7 +10,7 @@ use queryflux_persistence::ConfigSnapshotStore;
 
 use crate::live_config::{
     build_worker_snapshot, inline_script_files, snapshot_from_inputs, validate_snapshot_inputs,
-    LiveConfigInputs,
+    LiveConfigInputs, SettingsInputs,
 };
 
 /// The worker API for this process, if `queryflux.workerApi.enabled`.
@@ -33,14 +33,12 @@ pub(crate) fn worker_api(
 
     let snapshot: queryflux_frontend::worker_api::WorkerSnapshotFn = match store {
         Some(store) => {
-            let fallback = config.routing_fallback.clone();
-            let routers = config.routers.clone();
+            let yaml = Arc::new(config.clone());
             Arc::new(move || {
                 let store = store.clone();
-                let fallback = fallback.clone();
-                let routers = routers.clone();
+                let yaml = yaml.clone();
                 Box::pin(async move {
-                    build_worker_snapshot(store.as_ref(), (&fallback, &routers), credentials)
+                    build_worker_snapshot(store.as_ref(), &yaml, credentials)
                         .await
                         .map_err(|e| format!("{e:#}"))
                 })
@@ -48,6 +46,7 @@ pub(crate) fn worker_api(
         }
         None => {
             let mut inputs = startup_inputs.clone();
+            inputs.settings = SettingsInputs::from_yaml(config);
             inline_script_files(&mut inputs)?;
             let issues = validate_snapshot_inputs(&inputs);
             if !issues.is_empty() {

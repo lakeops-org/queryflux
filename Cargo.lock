@@ -5333,6 +5333,7 @@ version = "0.3.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "axum",
  "chrono",
  "opentelemetry",
  "opentelemetry-otlp",
@@ -5353,7 +5354,9 @@ dependencies = [
  "queryflux-routing",
  "queryflux-translation",
  "reqwest 0.12.28",
+ "serde",
  "serde_json",
+ "serde_yaml",
  "tokio",
  "tracing",
  "tracing-opentelemetry",

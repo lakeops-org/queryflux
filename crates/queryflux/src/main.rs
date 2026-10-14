@@ -123,8 +123,21 @@ async fn main() -> Result<()> {
         anyhow::bail!("Config has {} role error(s) — aborting", issues.len());
     }
     info!(role = ?config.queryflux.role, "Process role");
-    if config.queryflux.role == queryflux_core::config::Role::Worker {
-        anyhow::bail!("role: worker is not available in this build yet");
+    // A worker owns no config: it starts empty and pulls its config from the control
+    // plane (`RemoteConfigSource`), serves an ops-only listener instead of the admin API,
+    // and skips the config-loading and security checks below, which describe config it
+    // does not have.
+    let is_worker = config.queryflux.role == queryflux_core::config::Role::Worker;
+    if is_worker
+        && config.queryflux.coordination.as_ref().map_or(
+            queryflux_core::config::CoordinationMode::ControlPlane,
+            |c| c.mode,
+        ) == queryflux_core::config::CoordinationMode::ControlPlane
+    {
+        tracing::warn!(
+            "coordination.mode: controlPlane is not available in this build yet; limits apply \
+             to this worker alone (as with coordination.mode: local)"
+        );
     }
 
     let external_address = config
@@ -343,94 +356,96 @@ async fn main() -> Result<()> {
         operators_from_auth(&config.auth),
     )?;
 
-    // --- Production safety warnings ---
-    if matches!(
-        config.auth.provider,
-        queryflux_core::config::AuthProviderConfig::None
-    ) {
-        tracing::warn!(
-            "SECURITY: auth.provider is 'none' — all query frontends accept unauthenticated traffic. \
-             Set auth.provider to 'oidc', 'ldap', or 'static' and auth.required = true for production."
-        );
-    }
-    if !config.auth.required {
-        tracing::warn!(
-            "SECURITY: auth.required is false — unauthenticated requests are allowed even when \
-             an auth provider is configured. Set auth.required = true for production."
-        );
-    }
-    {
-        let effective_user = std::env::var("QUERYFLUX_ADMIN_USER")
-            .unwrap_or_else(|_| config.queryflux.admin_api.username.clone());
-        let effective_pass = std::env::var("QUERYFLUX_ADMIN_PASSWORD")
-            .unwrap_or_else(|_| config.queryflux.admin_api.password.clone());
-        if effective_user == "admin" && effective_pass == "admin" {
+    if !is_worker {
+        // --- Production safety warnings ---
+        if matches!(
+            config.auth.provider,
+            queryflux_core::config::AuthProviderConfig::None
+        ) {
             tracing::warn!(
-                "SECURITY: admin API is using default credentials (admin/admin). \
-                 Change via QUERYFLUX_ADMIN_USER / QUERYFLUX_ADMIN_PASSWORD or the Studio UI."
+                "SECURITY: auth.provider is 'none' — all query frontends accept unauthenticated traffic. \
+                 Set auth.provider to 'oidc', 'ldap', or 'static' and auth.required = true for production."
             );
         }
-    }
-
-    // --- Startup validation: engine × queryAuth support matrix ---
-    // Centralized in `query_auth_supported` so YAML load, Studio PUT, and this check can't
-    // drift apart. `passthrough`/`impersonate` are Trino-only; `tokenExchange` is Trino or
-    // ADBC-with-an-OAuth-capable-driver (`cfg.driver`, only ever set for admin-API-created
-    // ADBC clusters — see `ClusterConfig::driver`).
-    for (name, cfg) in &config.clusters {
-        if let Some(mode) = &cfg.query_auth {
-            if let Err(msg) = queryflux_core::config::query_auth_supported(
-                cfg.engine.as_ref(),
-                cfg.driver.as_deref(),
-                mode,
-            ) {
-                anyhow::bail!("cluster '{name}': {msg}");
+        if !config.auth.required {
+            tracing::warn!(
+                "SECURITY: auth.required is false — unauthenticated requests are allowed even when \
+                 an auth provider is configured. Set auth.required = true for production."
+            );
+        }
+        {
+            let effective_user = std::env::var("QUERYFLUX_ADMIN_USER")
+                .unwrap_or_else(|_| config.queryflux.admin_api.username.clone());
+            let effective_pass = std::env::var("QUERYFLUX_ADMIN_PASSWORD")
+                .unwrap_or_else(|_| config.queryflux.admin_api.password.clone());
+            if effective_user == "admin" && effective_pass == "admin" {
+                tracing::warn!(
+                    "SECURITY: admin API is using default credentials (admin/admin). \
+                     Change via QUERYFLUX_ADMIN_USER / QUERYFLUX_ADMIN_PASSWORD or the Studio UI."
+                );
             }
         }
-    }
 
-    // Deprecation warning: a cluster with no explicit `queryAuth` (or `serviceAccount`) and
-    // no HTTP-setting cluster auth still implicitly forwards the client's own Authorization
-    // header today, for backward compatibility. Operators should migrate to an explicit
-    // `queryAuth: passthrough` — this fallback may be removed in a future release.
-    for (name, cfg) in &config.clusters {
-        let is_implicit_passthrough_eligible = matches!(
-            cfg.query_auth,
-            None | Some(queryflux_core::config::QueryAuthConfig::ServiceAccount)
-        ) && matches!(
-            cfg.engine,
-            Some(queryflux_core::config::EngineConfig::Trino)
-        ) && !cfg
-            .auth
-            .as_ref()
-            .is_some_and(|a| a.sets_http_authorization());
-        if is_implicit_passthrough_eligible {
+        // --- Startup validation: engine × queryAuth support matrix ---
+        // Centralized in `query_auth_supported` so YAML load, Studio PUT, and this check can't
+        // drift apart. `passthrough`/`impersonate` are Trino-only; `tokenExchange` is Trino or
+        // ADBC-with-an-OAuth-capable-driver (`cfg.driver`, only ever set for admin-API-created
+        // ADBC clusters — see `ClusterConfig::driver`).
+        for (name, cfg) in &config.clusters {
+            if let Some(mode) = &cfg.query_auth {
+                if let Err(msg) = queryflux_core::config::query_auth_supported(
+                    cfg.engine.as_ref(),
+                    cfg.driver.as_deref(),
+                    mode,
+                ) {
+                    anyhow::bail!("cluster '{name}': {msg}");
+                }
+            }
+        }
+
+        // Deprecation warning: a cluster with no explicit `queryAuth` (or `serviceAccount`) and
+        // no HTTP-setting cluster auth still implicitly forwards the client's own Authorization
+        // header today, for backward compatibility. Operators should migrate to an explicit
+        // `queryAuth: passthrough` — this fallback may be removed in a future release.
+        for (name, cfg) in &config.clusters {
+            let is_implicit_passthrough_eligible = matches!(
+                cfg.query_auth,
+                None | Some(queryflux_core::config::QueryAuthConfig::ServiceAccount)
+            ) && matches!(
+                cfg.engine,
+                Some(queryflux_core::config::EngineConfig::Trino)
+            ) && !cfg
+                .auth
+                .as_ref()
+                .is_some_and(|a| a.sets_http_authorization());
+            if is_implicit_passthrough_eligible {
+                tracing::warn!(
+                    "DEPRECATED: cluster '{name}' has no HTTP cluster auth and no explicit \
+                     queryAuth — it still implicitly forwards the client's Authorization header \
+                     (legacy behavior). Set queryAuth.type: passthrough explicitly; the implicit \
+                     fallback may be removed in a future release."
+                );
+            }
+        }
+
+        // Startup warning: with no gateway-level authorization policy, `passthrough` forwards
+        // whatever the client sent straight to the backend. The gap exists regardless of how
+        // many cluster groups there are — a single-group deployment is the common default, so
+        // gating on `cluster_groups.len() > 1` hid the warning for exactly the most likely
+        // misconfiguration. Group count only changes the blast radius, not whether the gap
+        // exists, so it's now informational in the message rather than a gate.
+        let passthrough_clusters = unauthenticated_passthrough_clusters(&config);
+        if !passthrough_clusters.is_empty() {
             tracing::warn!(
-                "DEPRECATED: cluster '{name}' has no HTTP cluster auth and no explicit \
-                 queryAuth — it still implicitly forwards the client's Authorization header \
-                 (legacy behavior). Set queryAuth.type: passthrough explicitly; the implicit \
-                 fallback may be removed in a future release."
+                clusters = ?passthrough_clusters,
+                "SECURITY: authorization.provider is 'none' and queryAuth: passthrough is set \
+                 on {} cluster(s) across {} cluster group(s) — QueryFlux is not enforcing any \
+                 access policy, so a client's own credential decides what it can reach on \
+                 every group it can route to. Configure authorization or narrow routing.",
+                passthrough_clusters.len(),
+                config.cluster_groups.len()
             );
         }
-    }
-
-    // Startup warning: with no gateway-level authorization policy, `passthrough` forwards
-    // whatever the client sent straight to the backend. The gap exists regardless of how
-    // many cluster groups there are — a single-group deployment is the common default, so
-    // gating on `cluster_groups.len() > 1` hid the warning for exactly the most likely
-    // misconfiguration. Group count only changes the blast radius, not whether the gap
-    // exists, so it's now informational in the message rather than a gate.
-    let passthrough_clusters = unauthenticated_passthrough_clusters(&config);
-    if !passthrough_clusters.is_empty() {
-        tracing::warn!(
-            clusters = ?passthrough_clusters,
-            "SECURITY: authorization.provider is 'none' and queryAuth: passthrough is set \
-             on {} cluster(s) across {} cluster group(s) — QueryFlux is not enforcing any \
-             access policy, so a client's own credential decides what it can reach on \
-             every group it can route to. Configure authorization or narrow routing.",
-            passthrough_clusters.len(),
-            config.cluster_groups.len()
-        );
     }
 
     let identity_resolver = Arc::new(BackendIdentityResolver::new());
@@ -498,10 +513,13 @@ async fn main() -> Result<()> {
         routers_cfg: config.routers.clone(),
         strategies: HashMap::new(),
     };
-    let mut live_config =
+    let mut live_config = if is_worker {
+        crate::live_config::empty_live_config()
+    } else {
         compile_live_config(&inputs, &ids, &mut reload_cache, CompileMode::Strict)
             .await
-            .context("Startup config is invalid — aborting")?;
+            .context("Startup config is invalid — aborting")?
+    };
     live_config.guard_chain = guard_chain;
     live_config.group_guard_chains = group_guard_chains;
     live_config.access_control_guard = access_control_guard;
@@ -510,6 +528,9 @@ async fn main() -> Result<()> {
     live_config.catalog = catalog;
     let adapter_reload_cache = Arc::new(tokio::sync::Mutex::new(reload_cache));
     let live = Arc::new(tokio::sync::RwLock::new(live_config));
+    let worker_sync_state = Arc::new(std::sync::Mutex::new(
+        crate::config_source::WorkerSyncState::default(),
+    ));
 
     // Replica identity for capacity leases and queue claims. Must be unique per
     // *process incarnation*: PIDs collide across containers (the main process is
@@ -840,9 +861,13 @@ async fn main() -> Result<()> {
             config.queryflux.periodic_config_reload_interval_secs(),
         )
         .await;
-        let source: Box<dyn ConfigSource> = match &backend {
-            Some(backend) => Box::new(PostgresConfigSource::new(backend.clone(), triggers)),
-            None => Box::new(AdminStoreConfigSource::new(
+        let source: Box<dyn ConfigSource> = match (&config.queryflux.control_plane, &backend) {
+            (Some(cp), _) if is_worker => Box::new(crate::config_source::RemoteConfigSource::new(
+                cp,
+                worker_sync_state.clone(),
+            )),
+            (_, Some(backend)) => Box::new(PostgresConfigSource::new(backend.clone(), triggers)),
+            (_, None) => Box::new(AdminStoreConfigSource::new(
                 admin_store_for_reload,
                 triggers,
             )),
@@ -865,10 +890,29 @@ async fn main() -> Result<()> {
     // tonic (Flight SQL) uses `serve_with_shutdown`.
     let mut frontend_tasks = startup::frontends::FrontendTasks::default();
 
-    frontend_tasks.spawn("Admin", {
-        let rx = shutdown_rx.clone();
-        async move { admin.listen(rx).await }
-    });
+    if is_worker {
+        let ops = queryflux_frontend::ops::OpsFrontend::new(
+            prometheus.clone(),
+            live.clone(),
+            config.queryflux.admin_api.port,
+            {
+                let state = worker_sync_state.clone();
+                Arc::new(move || {
+                    let st = state.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                    serde_json::to_value(st).unwrap_or_default()
+                })
+            },
+        );
+        frontend_tasks.spawn("Ops", {
+            let rx = shutdown_rx.clone();
+            async move { ops.listen(rx).await }
+        });
+    } else {
+        frontend_tasks.spawn("Admin", {
+            let rx = shutdown_rx.clone();
+            async move { admin.listen(rx).await }
+        });
+    }
     startup::frontends::spawn_query_frontends(
         &mut frontend_tasks,
         &app_state,

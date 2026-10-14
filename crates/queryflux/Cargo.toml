@@ -31,6 +31,7 @@ tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
 chrono = { workspace = true }
 reqwest = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
 uuid = { version = "1", features = ["v4"] }
 opentelemetry = { workspace = true, optional = true }
@@ -41,3 +42,7 @@ tracing-opentelemetry = { workspace = true, optional = true }
 [features]
 default = []
 otlp = ["opentelemetry", "opentelemetry_sdk", "opentelemetry-otlp", "tracing-opentelemetry"]
+
+[dev-dependencies]
+axum = { workspace = true }
+serde_yaml = { workspace = true }

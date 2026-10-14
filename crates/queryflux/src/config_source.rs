@@ -274,6 +274,197 @@ impl ConfigSource for AdminStoreConfigSource {
     }
 }
 
+/// What a worker knows about its config sync, for `/worker/status` and logs.
+#[derive(Debug, Default, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct WorkerSyncState {
+    /// Last revision fetched from the control plane (may have failed to activate).
+    pub(crate) downloaded_revision: Option<String>,
+    /// Revision currently serving queries.
+    pub(crate) active_revision: Option<String>,
+    pub(crate) activated_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub(crate) last_successful_sync: Option<chrono::DateTime<chrono::Utc>>,
+    /// Why the last fetch or activation failed; cleared on the next success.
+    pub(crate) last_error: Option<String>,
+    pub(crate) consecutive_failures: u32,
+}
+
+/// A worker's config source: the control plane's `GET /worker/config` (#255).
+///
+/// Polls with `If-None-Match` set to the last downloaded revision, so an unchanged
+/// config costs a 304, and a revision that failed to activate is not fetched again until
+/// the control plane publishes a new one. A new snapshot is verified (schema version,
+/// sealed revision), compiled and applied in strict mode, then swapped in atomically;
+/// any failure keeps the active config. While the control plane is unreachable the
+/// interval backs off with jitter, up to 60 seconds.
+pub(crate) struct RemoteConfigSource {
+    client: reqwest::Client,
+    url: String,
+    bearer: String,
+    poll_interval: std::time::Duration,
+    state: Arc<std::sync::Mutex<WorkerSyncState>>,
+    first: bool,
+}
+
+impl RemoteConfigSource {
+    pub(crate) fn new(
+        control_plane: &queryflux_core::config::ControlPlaneClientConfig,
+        state: Arc<std::sync::Mutex<WorkerSyncState>>,
+    ) -> Self {
+        Self {
+            client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(30))
+                .build()
+                .unwrap_or_default(),
+            url: format!("{}/worker/config", control_plane.url.trim_end_matches('/')),
+            bearer: control_plane.auth.bearer().to_string(),
+            poll_interval: std::time::Duration::from_secs(5),
+            state,
+            first: true,
+        }
+    }
+
+    fn record_failure(&self, message: String) {
+        tracing::warn!("Worker config sync: {message}");
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        st.last_error = Some(message);
+        st.consecutive_failures = st.consecutive_failures.saturating_add(1);
+    }
+
+    fn next_delay(&self) -> std::time::Duration {
+        let failures = self
+            .state
+            .lock()
+            .map(|s| s.consecutive_failures)
+            .unwrap_or(0);
+        if failures == 0 {
+            return self.poll_interval;
+        }
+        let base = 2u64.saturating_pow(failures.min(6)).min(60);
+        let jitter_ms = (uuid::Uuid::new_v4().as_u128() % 1000) as u64;
+        std::time::Duration::from_secs(base) + std::time::Duration::from_millis(jitter_ms)
+    }
+
+    /// Compile and apply a received snapshot strictly, then swap it in.
+    async fn activate(
+        &self,
+        snapshot: &queryflux_core::worker_snapshot::WorkerSnapshotV1,
+        handles: &LiveHandles,
+    ) -> anyhow::Result<()> {
+        use crate::live_config::{
+            apply_settings, compile_live_config, inputs_from_snapshot, CompileMode, ConfigIds,
+        };
+        let inputs = inputs_from_snapshot(snapshot);
+        let mut cache_guard = handles.cache.lock().await;
+        let mut candidate_cache = cache_guard.clone();
+        let mut new_live = compile_live_config(
+            &inputs,
+            &ConfigIds::default(),
+            &mut candidate_cache,
+            CompileMode::Strict,
+        )
+        .await?;
+        apply_settings(
+            &mut new_live,
+            &inputs.settings,
+            &inputs.groups,
+            CompileMode::Strict,
+        )
+        .await?;
+        let mut live_guard = handles.live.write().await;
+        *cache_guard = candidate_cache;
+        *live_guard = new_live;
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl ConfigSource for RemoteConfigSource {
+    async fn changed(&mut self, shutdown: &mut watch::Receiver<bool>) -> bool {
+        if std::mem::take(&mut self.first) {
+            return !*shutdown.borrow();
+        }
+        let delay = self.next_delay();
+        tokio::select! {
+            _ = shutdown.wait_for(|v| *v) => false,
+            _ = tokio::time::sleep(delay) => true,
+        }
+    }
+
+    async fn reload(&self, handles: &LiveHandles) {
+        use queryflux_core::worker_snapshot::{WorkerSnapshotV1, WORKER_SNAPSHOT_SCHEMA_VERSION};
+        let downloaded = self
+            .state
+            .lock()
+            .ok()
+            .and_then(|s| s.downloaded_revision.clone());
+        let mut req = self.client.get(&self.url).bearer_auth(&self.bearer);
+        if let Some(rev) = &downloaded {
+            req = req.header(reqwest::header::IF_NONE_MATCH, format!("\"{rev}\""));
+        }
+        let resp = match req.send().await {
+            Ok(r) => r,
+            Err(e) => return self.record_failure(format!("control plane unreachable: {e}")),
+        };
+        match resp.status() {
+            reqwest::StatusCode::NOT_MODIFIED => {
+                let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                st.last_successful_sync = Some(chrono::Utc::now());
+                st.consecutive_failures = 0;
+                return;
+            }
+            reqwest::StatusCode::OK => {}
+            status => {
+                let body = resp.text().await.unwrap_or_default();
+                return self.record_failure(format!("control plane answered {status}: {body}"));
+            }
+        }
+        let snapshot: WorkerSnapshotV1 = match resp.json().await {
+            Ok(s) => s,
+            Err(e) => return self.record_failure(format!("snapshot does not parse: {e}")),
+        };
+        if snapshot.schema_version != WORKER_SNAPSHOT_SCHEMA_VERSION {
+            return self.record_failure(format!(
+                "unsupported_snapshot_version: {} (this worker supports {})",
+                snapshot.schema_version, WORKER_SNAPSHOT_SCHEMA_VERSION
+            ));
+        }
+        if !snapshot.is_sealed() {
+            return self.record_failure(format!(
+                "snapshot {} failed its integrity check",
+                snapshot.revision
+            ));
+        }
+        {
+            let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            st.downloaded_revision = Some(snapshot.revision.clone());
+            st.last_successful_sync = Some(chrono::Utc::now());
+            st.consecutive_failures = 0;
+        }
+        match self.activate(&snapshot, handles).await {
+            Ok(()) => {
+                let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                st.active_revision = Some(snapshot.revision.clone());
+                st.activated_at = Some(chrono::Utc::now());
+                st.last_error = None;
+                tracing::info!(revision = %snapshot.revision, "Worker config activated");
+            }
+            Err(e) => {
+                handles.metrics.on_config_reload_failure("worker_activate");
+                let message = format!(
+                    "snapshot {} rejected, keeping the active config: {e:#}",
+                    snapshot.revision
+                );
+                tracing::warn!("{message}");
+                self.state
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .last_error = Some(message);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -347,5 +538,155 @@ mod tests {
                 .await
                 .expect("timer fires")
         );
+    }
+
+    // -- RemoteConfigSource against an in-process control plane ----------------
+
+    fn handles() -> LiveHandles {
+        LiveHandles {
+            live: Arc::new(RwLock::new(crate::live_config::empty_live_config())),
+            cache: Arc::new(Mutex::new(AdapterReloadCache {
+                adapters: HashMap::new(),
+                config_json: HashMap::new(),
+                cluster_states: HashMap::new(),
+                routing_fallback: String::new(),
+                routers_cfg: Vec::new(),
+                strategies: HashMap::new(),
+            })),
+            metrics: Arc::new(queryflux_metrics::NoopMetricsStore),
+        }
+    }
+
+    fn snapshot(max_running: i64) -> queryflux_core::worker_snapshot::WorkerSnapshotV1 {
+        use queryflux_core::worker_snapshot::*;
+        WorkerSnapshotV1 {
+            schema_version: WORKER_SNAPSHOT_SCHEMA_VERSION,
+            revision: String::new(),
+            credentials: CredentialMode::Embedded,
+            clusters: vec![SnapshotCluster {
+                name: "duck".into(),
+                enabled: true,
+                engine_key: "duckDb".into(),
+                max_running_queries: Some(max_running),
+                config: serde_json::json!({}),
+                variants: serde_json::json!([]),
+            }],
+            groups: std::collections::BTreeMap::from([(
+                "g".to_string(),
+                serde_json::from_value(serde_json::json!({
+                    "members": ["duck"], "maxRunningQueries": 10
+                }))
+                .unwrap(),
+            )]),
+            routers: vec![],
+            routing_fallback: "g".into(),
+            group_translation_scripts: Default::default(),
+            settings: SnapshotSettings::default(),
+        }
+        .seal()
+    }
+
+    /// Serve whatever is in `current` as the control plane's snapshot; return its URL.
+    async fn control_plane(
+        current: Arc<std::sync::Mutex<queryflux_core::worker_snapshot::WorkerSnapshotV1>>,
+    ) -> String {
+        let api = queryflux_frontend::worker_api::WorkerApi {
+            shared_secret: "s3cret".into(),
+            snapshot: Arc::new(move || {
+                let s = current.lock().unwrap().clone();
+                Box::pin(async move { Ok(s) })
+            }),
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, queryflux_frontend::worker_api::router(api))
+                .await
+                .unwrap();
+        });
+        format!("http://{addr}")
+    }
+
+    fn source(
+        url: &str,
+        secret: &str,
+    ) -> (RemoteConfigSource, Arc<std::sync::Mutex<WorkerSyncState>>) {
+        let cp: queryflux_core::config::ControlPlaneClientConfig =
+            serde_json::from_value(serde_json::json!({
+                "url": url,
+                "allowInsecureHttp": true,
+                "auth": { "mode": "sharedSecret", "sharedSecret": secret }
+            }))
+            .unwrap();
+        let state = Arc::new(std::sync::Mutex::new(WorkerSyncState::default()));
+        (RemoteConfigSource::new(&cp, state.clone()), state)
+    }
+
+    async fn group_limit(h: &LiveHandles) -> Option<u64> {
+        let live = h.live.read().await;
+        let states = live.cluster_manager.all_cluster_states().await.ok()?;
+        states.first().map(|s| s.max_running_queries)
+    }
+
+    #[tokio::test]
+    async fn worker_activates_a_snapshot_then_tracks_changes() {
+        let current = Arc::new(std::sync::Mutex::new(snapshot(3)));
+        let url = control_plane(current.clone()).await;
+        let (src, state) = source(&url, "s3cret");
+        let h = handles();
+
+        src.reload(&h).await;
+        let first = current.lock().unwrap().revision.clone();
+        {
+            let st = state.lock().unwrap();
+            assert_eq!(st.active_revision.as_deref(), Some(first.as_str()));
+            assert!(st.last_error.is_none(), "{:?}", st.last_error);
+        }
+        assert!(h.live.read().await.is_configured());
+        assert_eq!(group_limit(&h).await, Some(3));
+
+        // Unchanged: a 304, nothing re-activated.
+        let activated_at = state.lock().unwrap().activated_at;
+        src.reload(&h).await;
+        assert_eq!(state.lock().unwrap().activated_at, activated_at);
+
+        // A new revision on the control plane is picked up.
+        *current.lock().unwrap() = snapshot(7);
+        src.reload(&h).await;
+        assert_eq!(group_limit(&h).await, Some(7));
+    }
+
+    #[tokio::test]
+    async fn a_tampered_snapshot_is_rejected_and_the_active_config_kept() {
+        let current = Arc::new(std::sync::Mutex::new(snapshot(3)));
+        let url = control_plane(current.clone()).await;
+        let (src, state) = source(&url, "s3cret");
+        let h = handles();
+        src.reload(&h).await;
+        let active = state.lock().unwrap().active_revision.clone();
+
+        let mut tampered = snapshot(9);
+        tampered.clusters[0].max_running_queries = Some(99); // after sealing
+        *current.lock().unwrap() = tampered;
+        src.reload(&h).await;
+
+        let st = state.lock().unwrap().clone();
+        assert_eq!(st.active_revision, active);
+        assert!(st.last_error.unwrap().contains("integrity"));
+        assert_eq!(group_limit(&h).await, Some(3));
+    }
+
+    #[tokio::test]
+    async fn a_wrong_secret_leaves_the_worker_unconfigured() {
+        let current = Arc::new(std::sync::Mutex::new(snapshot(3)));
+        let url = control_plane(current).await;
+        let (src, state) = source(&url, "wrong");
+        let h = handles();
+        src.reload(&h).await;
+        let st = state.lock().unwrap().clone();
+        assert!(st.active_revision.is_none());
+        assert_eq!(st.consecutive_failures, 1);
+        assert!(st.last_error.unwrap().contains("401"));
+        assert!(!h.live.read().await.is_configured());
     }
 }

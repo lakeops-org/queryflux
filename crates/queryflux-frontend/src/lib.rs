@@ -6,6 +6,7 @@ pub mod dispatch;
 pub mod flight_sql;
 pub mod mcp;
 pub mod mysql_wire;
+pub mod ops;
 pub mod postgres_wire;
 pub mod routing_resolve;
 pub mod snowflake;

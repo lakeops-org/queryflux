@@ -1083,7 +1083,13 @@ async fn health_handler() -> impl IntoResponse {
     )
 )]
 async fn readiness_handler(State(state): State<Arc<AdminState>>) -> impl IntoResponse {
-    let live = state.live.read().await;
+    readiness(&state.live).await
+}
+
+/// 200 once at least one cluster group has a built adapter; 503 before (for a worker,
+/// until its first config snapshot is active).
+pub(crate) async fn readiness(live: &tokio::sync::RwLock<LiveConfig>) -> Response {
+    let live = live.read().await;
     if live.adapters.is_empty() {
         return (StatusCode::SERVICE_UNAVAILABLE, "no adapters loaded").into_response();
     }
