@@ -3,7 +3,6 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use queryflux_auth::BackendIdentityResolver;
-use queryflux_cluster_manager::cluster_state::ClusterState;
 use queryflux_config::{yaml::YamlFileConfigProvider, ConfigProvider};
 use queryflux_core::query::{ClusterGroupName, ClusterName};
 use queryflux_frontend::{
@@ -11,22 +10,10 @@ use queryflux_frontend::{
         build_frontends_status, AdminFrontend, RoutingConfigDto as AdminRoutingConfigDto,
         SecurityConfigDto as AdminSecurityConfigDto, TestCatalogProviderFn, TestClusterFn,
     },
-    flight_sql::FlightSqlFrontend,
-    mcp::McpFrontend,
-    mysql_wire::MysqlWireFrontend,
-    postgres_wire::PostgresWireFrontend,
-    snowflake::SnowflakeFrontend,
-    trino_http::{state::AppState, TrinoHttpFrontend},
+    trino_http::state::AppState,
     FrontendListenerTrait,
 };
-use queryflux_metrics::{
-    buffered_store::BufferedMetricsStore, prometheus_store::PrometheusMetrics, MetricsStore,
-    MultiMetricsStore,
-};
-use queryflux_persistence::{
-    in_memory::InMemoryPersistence, postgres::PostgresStore, AdminStore, BackendStore,
-    CoordinationStore, DistributedBackendStore,
-};
+use queryflux_persistence::AdminStore;
 use queryflux_translation::TranslationService;
 use tracing::info;
 
@@ -34,6 +21,7 @@ mod config_source;
 mod guards;
 mod live_config;
 mod registered_engines;
+mod startup;
 
 use crate::config_source::{
     run_reload_loop, AdminStoreConfigSource, ConfigSource, LiveHandles, PostgresConfigSource,
@@ -48,93 +36,6 @@ use crate::live_config::{
     cluster_configs_from_specs, compile_live_config, AdapterReloadCache, ClusterSpec, CompileMode,
     ConfigIds, LiveConfigInputs,
 };
-
-type FrontendTaskResult = queryflux_core::error::Result<()>;
-
-/// Owns only the frontend listeners that are actually running.
-///
-/// Keeping disabled frontends out of the task set is important for graceful
-/// shutdown: a placeholder future that never completes would make the drain
-/// timeout the only way to leave the process.
-#[derive(Default)]
-struct FrontendTasks {
-    tasks: tokio::task::JoinSet<FrontendTaskResult>,
-    names: HashMap<tokio::task::Id, &'static str>,
-}
-
-struct FrontendTaskExit {
-    name: &'static str,
-    result: std::result::Result<FrontendTaskResult, tokio::task::JoinError>,
-}
-
-impl FrontendTasks {
-    fn spawn<F>(&mut self, name: &'static str, task: F)
-    where
-        F: std::future::Future<Output = FrontendTaskResult> + Send + 'static,
-    {
-        let handle = self.tasks.spawn(task);
-        self.names.insert(handle.id(), name);
-    }
-
-    fn spawn_if_enabled<F, Fut>(&mut self, name: &'static str, enabled: bool, task: F)
-    where
-        F: FnOnce() -> Fut,
-        Fut: std::future::Future<Output = FrontendTaskResult> + Send + 'static,
-    {
-        if enabled {
-            self.spawn(name, task());
-        }
-    }
-
-    async fn join_next(&mut self) -> Option<FrontendTaskExit> {
-        let result = self.tasks.join_next_with_id().await?;
-        Some(match result {
-            Ok((id, result)) => FrontendTaskExit {
-                name: self.names.remove(&id).unwrap_or("unknown frontend"),
-                result: Ok(result),
-            },
-            Err(error) => FrontendTaskExit {
-                name: self.names.remove(&error.id()).unwrap_or("unknown frontend"),
-                result: Err(error),
-            },
-        })
-    }
-
-    async fn drain(&mut self) {
-        while let Some(exit) = self.join_next().await {
-            match exit.result {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => {
-                    tracing::warn!(
-                        frontend = exit.name,
-                        "Frontend failed while draining: {error}"
-                    )
-                }
-                Err(error) => tracing::warn!(
-                    frontend = exit.name,
-                    "Frontend task failed while draining: {error}"
-                ),
-            }
-        }
-    }
-
-    fn outstanding_names(&self) -> Vec<&'static str> {
-        let mut names: Vec<_> = self.names.values().copied().collect();
-        names.sort_unstable();
-        names
-    }
-}
-
-/// Returns `true` when the interval fired (continue work), `false` on shutdown.
-async fn tick_or_shutdown(
-    interval: &mut tokio::time::Interval,
-    shutdown: &mut tokio::sync::watch::Receiver<bool>,
-) -> bool {
-    tokio::select! {
-        _ = shutdown.wait_for(|v| *v) => false,
-        _ = interval.tick() => true,
-    }
-}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -223,80 +124,15 @@ async fn main() -> Result<()> {
         .to_string();
 
     // --- Build persistence + metrics stores (must happen before cluster building) ---
-    // When Postgres is configured we seed cluster/group config on first run and read
-    // from the DB on subsequent starts, so persistence must be ready before the
-    // two-pass cluster/adapter construction below.
-    let prometheus = Arc::new(
-        PrometheusMetrics::new_with_deny_list(config.queryflux.metrics.tags_deny_list.clone())
-            .context("Failed to init Prometheus metrics")?,
-    );
-    let mut pg_store: Option<Arc<PostgresStore>> = None;
-    let mut mem_store: Option<Arc<InMemoryPersistence>> = None;
-
-    let (persistence, metrics): (
-        Arc<dyn queryflux_persistence::Persistence>,
-        Arc<dyn MetricsStore>,
-    ) = match &config.queryflux.persistence {
-        queryflux_core::config::PersistenceConfig::Postgres { conn } => {
-            let url = conn
-                .connection_url()
-                .map_err(|m| anyhow::anyhow!("Invalid postgres persistence config: {m}"))?;
-            let pg = Arc::new(
-                PostgresStore::connect_from_config(&url, conn)
-                    .await
-                    .context("Failed to connect to Postgres")?,
-            );
-            if conn.auto_migrate {
-                pg.migrate().await.context("Migration failed")?;
-            } else {
-                info!(
-                    "persistence.autoMigrate=false — skipping startup migrations \
-                     (apply with `queryflux migrate` or a Job)"
-                );
-            }
-            let buffered = Arc::new(BufferedMetricsStore::new(
-                pg.clone() as Arc<dyn MetricsStore>,
-                100,
-                std::time::Duration::from_secs(5),
-            ));
-            let metrics = Arc::new(MultiMetricsStore::new(vec![
-                prometheus.clone() as Arc<dyn MetricsStore>,
-                buffered as Arc<dyn MetricsStore>,
-            ]));
-            pg_store = Some(pg.clone());
-            (
-                pg as Arc<dyn queryflux_persistence::Persistence>,
-                metrics as Arc<dyn MetricsStore>,
-            )
-        }
-        queryflux_core::config::PersistenceConfig::Redis { url } => {
-            anyhow::bail!(
-                "persistence.type = redis is not implemented (configured url: {url}). \
-                 Use type: postgres or type: inMemory."
-            );
-        }
-        queryflux_core::config::PersistenceConfig::InMemory => {
-            let mem = Arc::new(InMemoryPersistence::new());
-            mem_store = Some(mem.clone());
-            (
-                mem.clone() as Arc<dyn queryflux_persistence::Persistence>,
-                in_memory_metrics(prometheus.clone(), mem),
-            )
-        }
-    };
-
-    // The durable backend behind the proxy, type-erased so that everything south
-    // of this point is wired against traits. Redis is intentionally rejected above
-    // until a real `BackendStore` implementation exists (no silent in-memory fallback).
-    // `None` in in-memory mode, which intentionally has no durable config source.
-    let backend: Option<Arc<dyn BackendStore>> = pg_store.clone().map(|pg| pg as _);
-    // Multi-replica coordination is optional: only backends that also implement
-    // `DistributedBackendStore` (Postgres today) are stored here.
-    let distributed_backend: Option<Arc<dyn DistributedBackendStore>> =
-        pg_store.clone().map(|pg| pg as _);
-    // The narrower view admission and the lease/reconcile/sweep tasks use: leases, sweep
-    // locks and published engine counts, without config or history storage.
-    let coordination: Option<Arc<dyn CoordinationStore>> = pg_store.map(|pg| pg as _);
+    let startup::stores::Stores {
+        prometheus,
+        persistence,
+        metrics,
+        mem_store,
+        backend,
+        distributed_backend,
+        coordination,
+    } = startup::stores::build_stores(&config).await?;
 
     // Filled when Postgres loads cluster/group rows — used for query_history FKs on ClusterState.
     let mut cluster_ids_by_name: HashMap<String, i64> = HashMap::new();
@@ -944,355 +780,23 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Background task: push cluster utilization snapshots every 5s.
-    // In distributed mode, overlay the last published engine reconcile counts so
-    // every replica's metrics reflect the same backend ground truth.
-    //
-    // Every replica refreshes its *local* Prometheus gauges (each replica's
-    // /metrics is scraped independently), but only the replica holding the
-    // sweep lock persists history rows to the backend — otherwise R replicas
-    // write R duplicate rows per cluster per tick and Studio's history tables
-    // grow R times faster.
-    tokio::spawn({
-        let state = app_state.clone();
-        let prometheus = prometheus.clone();
-        let backend = backend.clone();
-        let coordination = coordination.clone();
-        let mut shutdown_rx = shutdown_rx.clone();
-        async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
-            loop {
-                if !tick_or_shutdown(&mut interval, &mut shutdown_rx).await {
-                    break;
-                }
-                let cluster_manager = state.live.read().await.cluster_manager.clone();
-                let Ok(snapshots) = cluster_manager.all_cluster_states().await else {
-                    continue;
-                };
-                let breaker_states: Vec<_> = snapshots
-                    .iter()
-                    .map(|snap| {
-                        let state = snap.breaker_state.map(|state| match state {
-                            queryflux_cluster_manager::circuit_breaker::CircuitState::Closed => 0,
-                            queryflux_cluster_manager::circuit_breaker::CircuitState::Open => 1,
-                            queryflux_cluster_manager::circuit_breaker::CircuitState::HalfOpen => 2,
-                        });
-                        (
-                            snap.group_name.0.clone(),
-                            snap.cluster_name.0.clone(),
-                            state,
-                        )
-                    })
-                    .collect();
-                prometheus.sync_circuit_breaker_states(&breaker_states);
-                let mut records = Vec::with_capacity(snapshots.len());
-                for snap in snapshots {
-                    let global_running = if let Some(db) = &coordination {
-                        let store = db.clone() as Arc<dyn queryflux_persistence::CapacityStore>;
-                        store
-                            .active_count(&snap.cluster_name.0)
-                            .await
-                            .unwrap_or(snap.running_queries)
-                    } else {
-                        snap.running_queries
-                    };
-                    records.push(queryflux_metrics::ClusterSnapshot {
-                        cluster_name: snap.cluster_name,
-                        group_name: snap.group_name,
-                        engine_type: snap.engine_type,
-                        running_queries: global_running,
-                        queued_queries: snap.queued_queries,
-                        max_running_queries: snap.max_running_queries,
-                        recorded_at: chrono::Utc::now(),
-                    });
-                }
-                for record in &records {
-                    let _ = prometheus.record_cluster_snapshot(record.clone()).await;
-                }
-                // History rows go to the durable backend. When the backend can
-                // coordinate, only the sweep-lock owner persists this cycle; a
-                // coordination failure fails open (duplicate rows beat no rows).
-                // A non-coordinating backend persists unconditionally — it
-                // cannot dedup across replicas anyway.
-                let lock = match &coordination {
-                    Some(db) => match db.try_sweep_lock("cluster-snapshots").await {
-                        Ok(Some(lock)) => Some(Some(lock)),
-                        Ok(None) => None, // another replica persists this cycle
-                        Err(e) => {
-                            tracing::debug!("Snapshot sweep lock failed: {e}");
-                            Some(None)
-                        }
-                    },
-                    None => Some(None),
-                };
-                if let Some(lock) = lock {
-                    if let Some(backend) = &backend {
-                        for record in records {
-                            let _ = backend.record_cluster_snapshot(record).await;
-                        }
-                    }
-                    if let Some(lock) = lock {
-                        lock.release().await;
-                    }
-                }
-            }
-        }
-    });
+    startup::tasks::spawn_cluster_snapshots(
+        &app_state,
+        &prometheus,
+        &backend,
+        &coordination,
+        &shutdown_rx,
+    );
 
-    // Background task: renew capacity lease heartbeats for this replica every 60s so that
-    // long-running queries on a live instance are never reclaimed by `expire_stale` (cutoff
-    // is 300s — five missed beats). Leases of crashed replicas stop heartbeating and expire.
-    if let Some(cap) = app_state.capacity_store.clone() {
-        let state = app_state.clone();
-        let mut shutdown_rx = shutdown_rx.clone();
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
-            loop {
-                if !tick_or_shutdown(&mut interval, &mut shutdown_rx).await {
-                    break;
-                }
-                if let Err(e) = cap.heartbeat(&state.instance_id).await {
-                    state.metrics.on_coordination_failure("capacity_heartbeat");
-                    tracing::warn!("Capacity lease heartbeat failed: {e}");
-                }
-            }
-        });
-    }
+    startup::tasks::spawn_lease_heartbeat(&app_state, &shutdown_rx);
 
-    // Background task: release capacity for zombie executing queries (client disconnected
-    // before polling to completion). Runs every 120s; evicts entries not polled for > 5 min.
-    //
-    // Uses `last_accessed` from persistence — updated by any proxy instance that handles
-    // a poll, throttled to at most one write per 120s. Safe across multiple instances.
-    // Also expires stale capacity leases from crashed replicas.
-    tokio::spawn({
-        let state = app_state.clone();
-        let coordination = coordination.clone();
-        let mut shutdown_rx = shutdown_rx.clone();
-        async move {
-            const CLIENT_TIMEOUT_SECS: i64 = 300; // matches Trino's query.client.timeout default
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(120));
-            loop {
-                if !tick_or_shutdown(&mut interval, &mut shutdown_rx).await {
-                    break;
-                }
+    startup::tasks::spawn_zombie_sweep(&app_state, &coordination, &shutdown_rx);
 
-                // Single-owner sweep: the eviction and lease expiry below are global
-                // (idempotent, but redundant on every replica), so only the replica
-                // holding the advisory lock runs them this cycle. A crashed owner's
-                // lock is released with its connection, so another replica takes
-                // over on its next tick. On lock errors, fail open and sweep anyway.
-                let sweep_lock = match &coordination {
-                    Some(backend) => match backend.try_sweep_lock("zombie-eviction").await {
-                        Ok(Some(lock)) => Some(lock),
-                        Ok(None) => continue, // another replica owns this cycle
-                        Err(e) => {
-                            state.metrics.on_coordination_failure("sweep_lock");
-                            tracing::warn!("Sweep lock failed, sweeping anyway: {e}");
-                            None
-                        }
-                    },
-                    None => None,
-                };
+    startup::tasks::spawn_stale_queue_sweep(&app_state, &coordination, &shutdown_rx);
 
-                let cutoff = chrono::Utc::now() - chrono::Duration::seconds(CLIENT_TIMEOUT_SECS);
+    startup::tasks::spawn_cache_cleanup(&app_state, &shutdown_rx, &config);
 
-                // Expire stale capacity leases (crashed replicas).
-                if let Some(cap) = &state.capacity_store {
-                    match cap.expire_stale(cutoff).await {
-                        Ok(0) => {}
-                        Ok(n) => tracing::info!("Expired {n} stale capacity leases"),
-                        Err(e) => {
-                            state.metrics.on_coordination_failure("capacity_expire");
-                            tracing::warn!("Capacity lease expiry failed: {e}");
-                        }
-                    }
-                }
-
-                let Ok(all) = state.persistence.list_all().await else {
-                    continue;
-                };
-                for q in all {
-                    if q.last_accessed < cutoff {
-                        tracing::warn!(
-                            id = %q.backend_query_id,
-                            cluster = %q.cluster_name,
-                            group = %q.cluster_group,
-                            last_accessed = %q.last_accessed,
-                            "Evicting zombie executing query — not polled for >5 min"
-                        );
-
-                        // Best-effort cancel on the backend with cluster credentials
-                        // (same path as client/admin cancel). The previous unauthenticated
-                        // DELETE on `/v1/statement/executing/...` did not stop secured Trino.
-                        let backend_id = q.backend_query_id.clone();
-                        let wire_auth = q.wire_auth.clone();
-                        let cluster = q.cluster_name.0.clone();
-                        let (engine_type, tgt_dialect) =
-                            if let Some(adapter) = state.adapter(&cluster).await {
-                                (adapter.engine_type(), adapter.translation_target_dialect())
-                            } else {
-                                state.engine_type_for_cluster(&cluster).await
-                            };
-                        state.record_executing_cancelled(
-                            &q,
-                            queryflux_core::query::FrontendProtocol::TrinoHttp,
-                            engine_type,
-                            tgt_dialect,
-                            "zombie_evicted: not polled for >5 min",
-                        );
-                        if let Some(adapter) = state.adapter(&cluster).await {
-                            tokio::spawn(async move {
-                                if let Err(e) =
-                                    adapter.cancel_query(&backend_id, wire_auth.as_ref()).await
-                                {
-                                    tracing::debug!(
-                                        "Zombie cancel request failed (best-effort): {e}"
-                                    );
-                                }
-                            });
-                        } else {
-                            tracing::debug!(
-                                cluster = %cluster,
-                                id = %q.backend_query_id,
-                                "No adapter available for zombie cancel"
-                            );
-                        }
-
-                        state
-                            .release_query_slot(&q.cluster_group, &q.cluster_name, &q.id.0)
-                            .await;
-                        let _ = state.persistence.delete(&q.backend_query_id).await;
-                    }
-                }
-
-                if let Some(lock) = sweep_lock {
-                    lock.release().await;
-                }
-            }
-        }
-    });
-
-    // Background task: clean up stale queued queries (client disconnected before getting
-    // cluster capacity). Runs every 120s;
-    // deletes queued entries not accessed for > 5 minutes.
-    tokio::spawn({
-        let state = app_state.clone();
-        let coordination = coordination.clone();
-        let mut shutdown_rx = shutdown_rx.clone();
-        async move {
-            const CLIENT_TIMEOUT_SECS: i64 = 300;
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(120));
-            loop {
-                if !tick_or_shutdown(&mut interval, &mut shutdown_rx).await {
-                    break;
-                }
-
-                let sweep_lock = match &coordination {
-                    Some(backend) => match backend.try_sweep_lock("stale-queued-eviction").await {
-                        Ok(Some(lock)) => Some(lock),
-                        Ok(None) => continue,
-                        Err(e) => {
-                            state.metrics.on_coordination_failure("sweep_lock");
-                            tracing::warn!("Stale queued sweep lock failed, sweeping anyway: {e}");
-                            None
-                        }
-                    },
-                    None => None,
-                };
-
-                let cutoff = chrono::Utc::now() - chrono::Duration::seconds(CLIENT_TIMEOUT_SECS);
-                let Ok(queued) = state.persistence.list_queued().await else {
-                    if let Some(lock) = sweep_lock {
-                        lock.release().await;
-                    }
-                    continue;
-                };
-                let mut cleaned = 0u64;
-                for q in queued {
-                    if q.last_accessed < cutoff {
-                        if let Ok(Some(taken)) = state.persistence.take_queued(&q.id).await {
-                            state.record_queued_terminal(
-                                &taken,
-                                queryflux_core::query::QueryStatus::Failed,
-                                "stale_queued_evicted: client disconnected before dispatch",
-                            );
-                            cleaned += 1;
-                        }
-                    }
-                }
-                if cleaned > 0 {
-                    tracing::info!("Cleaned up {cleaned} stale queued queries");
-                }
-
-                if let Some(lock) = sweep_lock {
-                    lock.release().await;
-                }
-            }
-        }
-    });
-
-    // Background task: periodically clean up expired cache entries.
-    {
-        let cache = app_state.result_cache.clone();
-        let interval_secs = config
-            .queryflux
-            .cache_backend
-            .as_ref()
-            .map(|c| c.cleanup_interval_secs)
-            .unwrap_or(300);
-        if interval_secs > 0 {
-            let mut shutdown_rx = shutdown_rx.clone();
-            tokio::spawn(async move {
-                let mut interval =
-                    tokio::time::interval(std::time::Duration::from_secs(interval_secs));
-                if !tick_or_shutdown(&mut interval, &mut shutdown_rx).await {
-                    return;
-                }
-                loop {
-                    if !tick_or_shutdown(&mut interval, &mut shutdown_rx).await {
-                        break;
-                    }
-                    match cache.cleanup_expired().await {
-                        Ok(0) => {}
-                        Ok(n) => {
-                            tracing::info!(deleted = n, "Cache cleanup: removed expired entries")
-                        }
-                        Err(e) => tracing::warn!(error = %e, "Cache cleanup failed"),
-                    }
-                }
-            });
-        }
-    }
-
-    // Background task: enforce query_history_retention_days — runs hourly and deletes
-    // query_records, query_digest_stats, and cluster_snapshots older than the window.
-    // Only active when Postgres is configured and retention_days is set.
-    if let (Some(backend), Some(retention_days)) = (
-        backend.clone(),
-        config.queryflux.query_history_retention_days,
-    ) {
-        let mut shutdown_rx = shutdown_rx.clone();
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600));
-            if !tick_or_shutdown(&mut interval, &mut shutdown_rx).await {
-                return;
-            }
-            loop {
-                if !tick_or_shutdown(&mut interval, &mut shutdown_rx).await {
-                    break;
-                }
-                let cutoff = chrono::Utc::now() - chrono::Duration::days(retention_days as i64);
-                match backend.purge_old_query_records(cutoff).await {
-                    Ok(0) => {}
-                    Ok(n) => {
-                        tracing::info!("Purged {n} history rows older than {retention_days} days")
-                    }
-                    Err(e) => tracing::warn!("Query history purge failed: {e}"),
-                }
-            }
-        });
-    }
+    startup::tasks::spawn_history_retention(&backend, &shutdown_rx, &config);
 
     // Background task: hot-reload config. The source decides when (admin writes on this
     // replica, revision changes from other replicas, a periodic safety-net timer) and how
@@ -1333,348 +837,36 @@ async fn main() -> Result<()> {
         tokio::spawn(run_reload_loop(source, handles, shutdown_rx.clone()));
     }
 
-    // Background task: health-check each cluster every 30s via its adapter.
-    // Clusters with a custom `healthCheckQuery` use that SQL instead of `SELECT 1`.
-    // ADBC SaaS backends without a custom query skip health checks (always healthy).
-    tokio::spawn({
-        let state = app_state.clone();
-        let mut shutdown_rx = shutdown_rx.clone();
-        async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
-            loop {
-                if !tick_or_shutdown(&mut interval, &mut shutdown_rx).await {
-                    break;
-                }
-                let (targets, custom_health) = {
-                    let live = state.live.read().await;
-                    (
-                        live.health_check_targets.clone(),
-                        live.custom_health_queries.clone(),
-                    )
-                };
-                for (adapter, cstate) in &targets {
-                    let cluster_name = &cstate.cluster_name.0;
-                    let breaker_probe = BreakerProbeGuard::reserve(cstate);
-                    let healthy = if let Some(custom_sql) = custom_health.get(cluster_name) {
-                        adapter.execute_custom_health_check(custom_sql).await
-                    } else {
-                        adapter.health_check().await
-                    };
-                    if let Some(probe) = breaker_probe {
-                        let state = probe.finish(healthy);
-                        tracing::info!(
-                            cluster = %cluster_name,
-                            group = %cstate.group_name.0,
-                            breaker_state = ?state,
-                            "Circuit breaker health probe completed"
-                        );
-                    }
-                    if !healthy {
-                        tracing::warn!(
-                            cluster = %cluster_name,
-                            group = %cstate.group_name.0,
-                            "Health check failed — marking cluster unhealthy"
-                        );
-                    } else if !cstate.is_healthy() {
-                        tracing::info!(
-                            cluster = %cluster_name,
-                            group = %cstate.group_name.0,
-                            "Health check recovered — marking cluster healthy"
-                        );
-                    }
-                    cstate.set_healthy(healthy);
-                }
-            }
-        }
-    });
+    startup::tasks::spawn_health_checks(&app_state, &shutdown_rx);
 
-    // Background task: reconcile in-memory running_queries counters with ground truth
-    // from each engine (engines that implement fetch_running_query_count). Runs every 30s.
-    // Corrects drift caused by proxy crashes, client disconnects, or any other leak.
-    // In distributed mode, only the replica holding the `engine-reconcile` sweep lock
-    // queries backends; it publishes counts to Postgres and other replicas sync locally.
-    tokio::spawn({
-        let state = app_state.clone();
-        let coordination = coordination.clone();
-        let mut shutdown_rx = shutdown_rx.clone();
-        async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
-            loop {
-                if !tick_or_shutdown(&mut interval, &mut shutdown_rx).await {
-                    break;
-                }
-                let (targets, custom_reconcile) = {
-                    let live = state.live.read().await;
-                    (
-                        live.health_check_targets.clone(),
-                        live.custom_reconcile_queries.clone(),
-                    )
-                };
-                let targets = reconcile_targets_from_health_targets(&targets);
-
-                if let Some(ref db) = coordination {
-                    let capacity_store =
-                        db.clone() as Arc<dyn queryflux_persistence::CapacityStore>;
-                    match db.try_sweep_lock("engine-reconcile").await {
-                        Ok(Some(lock)) => {
-                            for (adapter, states) in &targets {
-                                let cluster_name = &states[0].cluster_name.0;
-                                let tracked = observe_running(states);
-                                let actual = fetch_engine_running_count(
-                                    adapter,
-                                    cluster_name,
-                                    &custom_reconcile,
-                                )
-                                .await;
-                                if let Some(count) = actual {
-                                    if let Err(e) = capacity_store
-                                        .publish_running_count(cluster_name, count)
-                                        .await
-                                    {
-                                        state
-                                            .metrics
-                                            .on_coordination_failure("engine_reconcile_publish");
-                                        tracing::warn!(
-                                            cluster = %cluster_name,
-                                            "Failed to publish engine running count: {e}"
-                                        );
-                                    }
-                                }
-                                for (cstate, tracked) in states.iter().zip(tracked) {
-                                    apply_reconcile_to_cluster_state(cstate, tracked, actual);
-                                }
-                            }
-                            let _ = lock.release().await;
-                        }
-                        Ok(None) => {
-                            for (_, states) in &targets {
-                                let cluster_name = &states[0].cluster_name.0;
-                                let tracked = observe_running(states);
-                                match capacity_store.active_count(cluster_name).await {
-                                    Ok(count) => {
-                                        for (cstate, tracked) in states.iter().zip(tracked) {
-                                            apply_reconcile_to_cluster_state(
-                                                cstate,
-                                                tracked,
-                                                Some(count),
-                                            );
-                                        }
-                                    }
-                                    Err(e) => {
-                                        state
-                                            .metrics
-                                            .on_coordination_failure("engine_reconcile_read");
-                                        tracing::warn!(
-                                            cluster = %cluster_name,
-                                            "Failed to read engine running count: {e}"
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            state
-                                .metrics
-                                .on_coordination_failure("engine_reconcile_sweep_lock");
-                            tracing::warn!("Engine reconcile sweep lock failed: {e}");
-                        }
-                    }
-                } else {
-                    for (adapter, states) in &targets {
-                        let cluster_name = &states[0].cluster_name.0;
-                        let tracked = observe_running(states);
-                        let actual =
-                            fetch_engine_running_count(adapter, cluster_name, &custom_reconcile)
-                                .await;
-                        for (cstate, tracked) in states.iter().zip(tracked) {
-                            apply_reconcile_to_cluster_state(cstate, tracked, actual);
-                        }
-                    }
-                }
-            }
-        }
-    });
+    startup::tasks::spawn_engine_reconcile(&app_state, &coordination, &shutdown_rx);
 
     // Spawn all enabled frontends as tasks. Each frontend observes `shutdown_rx`
     // internally: axum-based frontends use `with_graceful_shutdown` (stop accepting,
     // finish in-flight requests), wire-based frontends break their accept loop, and
     // tonic (Flight SQL) uses `serve_with_shutdown`.
-    let mut frontend_tasks = FrontendTasks::default();
+    let mut frontend_tasks = startup::frontends::FrontendTasks::default();
 
-    frontend_tasks.spawn_if_enabled("Trino HTTP", trino_cfg.enabled, || {
-        let state = app_state.clone();
-        let rx = shutdown_rx.clone();
-        let cfg = trino_cfg;
-        async move {
-            TrinoHttpFrontend::new(state, cfg.port, cfg.max_connections)
-                .listen(rx)
-                .await
-        }
-    });
     frontend_tasks.spawn("Admin", {
         let rx = shutdown_rx.clone();
         async move { admin.listen(rx).await }
     });
-    if let Some(cfg) = config.queryflux.frontends.mysql_wire.clone() {
-        frontend_tasks.spawn_if_enabled("MySQL wire", cfg.enabled, || {
-            let state = app_state.clone();
-            let rx = shutdown_rx.clone();
-            async move {
-                MysqlWireFrontend::new(state, cfg.port, cfg.max_connections)
-                    .listen(rx)
-                    .await
-            }
-        });
-    }
-    if let Some(cfg) = config.queryflux.frontends.postgres_wire.clone() {
-        frontend_tasks.spawn_if_enabled("Postgres wire", cfg.enabled, || {
-            let state = app_state.clone();
-            let rx = shutdown_rx.clone();
-            async move {
-                PostgresWireFrontend::new(state, cfg.port, cfg.max_connections)
-                    .listen(rx)
-                    .await
-            }
-        });
-    }
-    if let Some(cfg) = config.queryflux.frontends.flight_sql.clone() {
-        frontend_tasks.spawn_if_enabled("Flight SQL", cfg.enabled, || {
-            let state = app_state.clone();
-            let rx = shutdown_rx.clone();
-            async move {
-                FlightSqlFrontend::new(state, cfg.port, cfg.max_connections)
-                    .listen(rx)
-                    .await
-            }
-        });
-    }
-    if let Some(cfg) = config.queryflux.frontends.snowflake_http.clone() {
-        frontend_tasks.spawn_if_enabled("Snowflake", cfg.enabled, || {
-            let state = app_state.clone();
-            let rx = shutdown_rx.clone();
-            async move { SnowflakeFrontend::new(state, cfg).listen(rx).await }
-        });
-    }
-    if let Some(cfg) = config.queryflux.frontends.mcp.clone() {
-        frontend_tasks.spawn_if_enabled("MCP", cfg.enabled, || {
-            let state = app_state.clone();
-            let rx = shutdown_rx.clone();
-            async move {
-                McpFrontend::new(state, cfg.port, cfg.max_connections)
-                    .listen(rx)
-                    .await
-            }
-        });
-    }
+    startup::frontends::spawn_query_frontends(
+        &mut frontend_tasks,
+        &app_state,
+        &config,
+        trino_cfg,
+        &shutdown_rx,
+    );
 
-    // Wait for either a shutdown signal or an unexpected frontend exit.
-    let shutdown_signal = async {
-        let ctrl_c = tokio::signal::ctrl_c();
-        #[cfg(unix)]
-        {
-            let mut sigterm =
-                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                    .expect("register SIGTERM handler");
-            tokio::select! {
-                _ = ctrl_c => tracing::info!("Received SIGINT — initiating graceful shutdown"),
-                _ = sigterm.recv() => tracing::info!("Received SIGTERM — initiating graceful shutdown"),
-            }
-        }
-        #[cfg(not(unix))]
-        {
-            ctrl_c.await.ok();
-            tracing::info!("Received Ctrl-C — initiating graceful shutdown");
-        }
-    };
-
-    tokio::select! {
-        _ = shutdown_signal => {},
-        exit = frontend_tasks.join_next() => {
-            if let Some(exit) = exit {
-                match exit.result {
-                    Ok(Ok(())) => tracing::warn!(frontend = exit.name, "Frontend exited unexpectedly"),
-                    Ok(Err(error)) => tracing::error!(frontend = exit.name, "Frontend exited unexpectedly: {error}"),
-                    Err(error) => tracing::error!(frontend = exit.name, "Frontend task failed: {error}"),
-                }
-            }
-        },
-    }
-
-    // --- Phase 1: signal all frontends to stop accepting new connections ---
-    let _ = shutdown_tx.send(true);
-
-    // --- Phase 2: drain in-flight requests ---
-    let drain_timeout_secs = config.queryflux.shutdown_drain_timeout_secs();
-    let drain_timeout = std::time::Duration::from_secs(drain_timeout_secs);
-    tracing::info!("Draining in-flight requests (timeout: {drain_timeout_secs}s)...");
-
-    let drain_future = async {
-        // Wait for enabled frontends to finish processing in-flight requests.
-        // Axum frontends complete when all connections are done; wire frontends
-        // return immediately from their accept loop but spawned connection tasks
-        // continue running.
-        frontend_tasks.drain().await;
-
-        // Poll persistence until no executing or queued queries remain (or until
-        // the outer timeout fires). This covers spawned wire-protocol connection
-        // handlers that are still mid-query after the accept loop exited.
-        let mut interval = tokio::time::interval(std::time::Duration::from_millis(500));
-        loop {
-            interval.tick().await;
-            let executing = app_state
-                .persistence
-                .list_all()
-                .await
-                .map(|v| v.len())
-                .unwrap_or(0);
-            let queued = app_state
-                .persistence
-                .list_queued()
-                .await
-                .map(|v| v.len())
-                .unwrap_or(0);
-            if executing == 0 && queued == 0 {
-                tracing::info!("All in-flight queries drained");
-                break;
-            }
-            tracing::info!(executing, queued, "Waiting for queries to drain...");
-        }
-    };
-
-    if tokio::time::timeout(drain_timeout, drain_future)
-        .await
-        .is_err()
-    {
-        let outstanding_frontends = frontend_tasks.outstanding_names();
-        let executing = app_state
-            .persistence
-            .list_all()
-            .await
-            .map(|v| v.len())
-            .unwrap_or(0);
-        let queued = app_state
-            .persistence
-            .list_queued()
-            .await
-            .map(|v| v.len())
-            .unwrap_or(0);
-        tracing::warn!(
-            executing,
-            queued,
-            ?outstanding_frontends,
-            "Drain timeout reached after {drain_timeout_secs}s — forcing shutdown"
-        );
-    }
-
-    // --- Phase 3: release capacity leases owned by this replica ---
-    tracing::info!("Releasing capacity leases for this replica...");
-    if let Some(cap) = &app_state.capacity_store {
-        if let Err(e) = cap.release_all_for_instance(&app_state.instance_id).await {
-            tracing::warn!("Failed to release capacity leases on shutdown: {e}");
-        } else {
-            tracing::info!("Capacity leases released");
-        }
-    }
+    startup::shutdown::wait_for_shutdown(&mut frontend_tasks).await;
+    startup::shutdown::graceful_shutdown(
+        &shutdown_tx,
+        &mut frontend_tasks,
+        &app_state,
+        config.queryflux.shutdown_drain_timeout_secs(),
+    )
+    .await;
 
     tracing::info!("QueryFlux shutdown complete");
     Ok(())
@@ -1720,131 +912,6 @@ fn unauthenticated_passthrough_clusters(
         .collect()
 }
 
-/// A cancelled health-check future must not leave its member HalfOpen forever.
-struct BreakerProbeGuard {
-    state: Arc<ClusterState>,
-    completed: bool,
-}
-
-impl BreakerProbeGuard {
-    fn reserve(state: &Arc<ClusterState>) -> Option<Self> {
-        state.begin_breaker_probe().then(|| Self {
-            state: state.clone(),
-            completed: false,
-        })
-    }
-
-    fn finish(
-        mut self,
-        healthy: bool,
-    ) -> Option<queryflux_cluster_manager::circuit_breaker::CircuitState> {
-        let result = self.state.finish_breaker_probe(healthy);
-        self.completed = true;
-        result
-    }
-}
-
-impl Drop for BreakerProbeGuard {
-    fn drop(&mut self) {
-        if !self.completed {
-            // The probe did not finish (for example, its task was cancelled).
-            // Treat it as a failed check and retry after the usual backoff.
-            self.state.finish_breaker_probe(false);
-        }
-    }
-}
-
-/// Health probes are per group/member; engine reconciliation is per backend.
-/// Keep every member state so the single fetched count reaches all groups.
-fn reconcile_targets_from_health_targets<A: Clone>(
-    targets: &[(A, Arc<ClusterState>)],
-) -> Vec<(A, Vec<Arc<ClusterState>>)> {
-    let mut positions: HashMap<String, usize> = HashMap::new();
-    let mut grouped: Vec<(_, Vec<Arc<ClusterState>>)> = Vec::new();
-    for (adapter, state) in targets {
-        let name = &state.cluster_name.0;
-        if let Some(&index) = positions.get(name) {
-            grouped[index].1.push(state.clone());
-        } else {
-            positions.insert(name.clone(), grouped.len());
-            grouped.push((adapter.clone(), vec![state.clone()]));
-        }
-    }
-    grouped
-}
-
-async fn fetch_engine_running_count(
-    adapter: &queryflux_engine_adapters::AdapterKind,
-    cluster_name: &str,
-    custom_reconcile: &HashMap<String, String>,
-) -> Option<u64> {
-    if let Some(custom_sql) = custom_reconcile.get(cluster_name) {
-        adapter.execute_custom_reconcile_query(custom_sql).await
-    } else {
-        adapter.fetch_running_query_count().await
-    }
-}
-
-/// Read every state's running counter before the (slow) engine fetch, so the correction can
-/// be applied relative to what was observed — see [`apply_reconcile_to_cluster_state`].
-fn observe_running(
-    states: &[Arc<queryflux_cluster_manager::cluster_state::ClusterState>],
-) -> Vec<u64> {
-    states.iter().map(|s| s.running_queries()).collect()
-}
-
-/// `tracked` is the counter value observed *before* the engine count was fetched. The fix is
-/// applied as a relative correction (`ClusterState::reconcile_running`), so queries admitted or
-/// released while the fetch was in flight — including through a newer config generation that
-/// shares this counter after a reload — are not overwritten by a stale count.
-fn apply_reconcile_to_cluster_state(
-    cstate: &queryflux_cluster_manager::cluster_state::ClusterState,
-    tracked: u64,
-    actual: Option<u64>,
-) {
-    let cluster_name = &cstate.cluster_name.0;
-    let max = cstate.max_running_queries();
-    if tracked > max {
-        let fix = actual.unwrap_or(0);
-        tracing::warn!(
-            cluster = %cluster_name,
-            group = %cstate.group_name.0,
-            tracked,
-            max,
-            fix,
-            "running_queries above group capacity; resetting from engine count"
-        );
-        cstate.reconcile_running(tracked, fix);
-        return;
-    }
-    if let Some(actual) = actual {
-        if actual != tracked {
-            tracing::info!(
-                cluster = %cluster_name,
-                group = %cstate.group_name.0,
-                tracked,
-                actual,
-                "Reconciling running_queries counter with engine ground truth"
-            );
-            cstate.reconcile_running(tracked, actual);
-        }
-    }
-}
-
-/// Metrics chain for in-memory persistence: Prometheus plus the in-memory store
-/// itself. The in-memory store must be part of the chain — the admin API serves
-/// `/admin/queries` and `/admin/stats` from it, so recording only to Prometheus
-/// leaves query history and the Studio dashboard permanently empty.
-fn in_memory_metrics(
-    prometheus: Arc<PrometheusMetrics>,
-    mem: Arc<InMemoryPersistence>,
-) -> Arc<dyn MetricsStore> {
-    Arc::new(MultiMetricsStore::new(vec![
-        prometheus as Arc<dyn MetricsStore>,
-        mem as Arc<dyn MetricsStore>,
-    ]))
-}
-
 #[cfg(test)]
 mod tests {
     mod circuit_breaker_reload {
@@ -1857,10 +924,9 @@ mod tests {
         use queryflux_core::config::{CircuitBreakerConfig, ClusterGroupConfig};
         use queryflux_core::query::{ClusterGroupName, ClusterName, EngineType};
 
-        use super::super::{
-            reconcile_targets_from_health_targets, AdapterReloadCache, BreakerProbeGuard,
-        };
+        use super::super::AdapterReloadCache;
         use crate::live_config::{compile_live_config, CompileMode, ConfigIds, LiveConfigInputs};
+        use crate::startup::tasks::{reconcile_targets_from_health_targets, BreakerProbeGuard};
 
         fn state(group: &str, name: &str, breaker: bool) -> Arc<ClusterState> {
             let state = ClusterState::new(
@@ -2063,7 +1129,7 @@ mod tests {
 
             // The engine count (0, taken before the admission) lands through the stale state:
             // only the leaked slot is removed, the new admission survives.
-            super::super::apply_reconcile_to_cluster_state(&gen1_state, tracked, Some(0));
+            crate::startup::tasks::apply_reconcile_to_cluster_state(&gen1_state, tracked, Some(0));
             assert_eq!(running(&gen2).await, 1);
         }
 
@@ -2160,7 +1226,7 @@ mod tests {
     mod frontend_tasks {
         use std::time::Duration;
 
-        use super::super::FrontendTasks;
+        use crate::startup::frontends::FrontendTasks;
 
         #[tokio::test]
         async fn disabled_frontend_does_not_block_shutdown_drain() {
@@ -2597,7 +1663,7 @@ mod tests {
         async fn records_query_history_in_backing_store() {
             let prometheus = Arc::new(PrometheusMetrics::new().expect("prometheus init"));
             let mem = Arc::new(InMemoryPersistence::new());
-            let metrics = super::super::in_memory_metrics(prometheus, mem.clone());
+            let metrics = crate::startup::stores::in_memory_metrics(prometheus, mem.clone());
 
             metrics
                 .record_query(sample_record())
