@@ -2939,10 +2939,11 @@ async fn build_live_config(
             } else {
                 None
             };
-            // Load counters are shared (not copied) with the previous generation: queries
-            // admitted before this reload release through the old cluster manager, so a copied
-            // count would never be decremented and the slots would leak (#299). With a changed
-            // config the new state starts at zero and the old one drains on its own.
+            // Load counters are shared (not copied) with the previous generation, whether or not
+            // the config changed. Queries admitted before this reload are still running on this
+            // member and release through either generation: sync dispatch through the manager
+            // that admitted them (a copied count would leak, #299), async terminals through the
+            // current one (a fresh counter would miss them and over-admit, #301).
             let state = Arc::new(
                 ClusterState::new(
                     ClusterName(member_name.clone()),
@@ -2955,7 +2956,7 @@ async fn build_live_config(
                     record.enabled,
                 )
                 .with_circuit_breaker(group_config.circuit_breaker.clone(), previous_unchanged)
-                .with_shared_load_counters(previous_unchanged),
+                .with_shared_load_counters(previous.map(Arc::as_ref)),
             );
             if let Some(prev) = previous {
                 state.set_healthy(prev.is_healthy());
@@ -4276,29 +4277,46 @@ mod tests {
             assert_eq!(running(&gen2).await, 1);
         }
 
-        /// With a changed cluster config the new generation starts empty and the old one
-        /// drains independently — neither leaks nor underflows.
+        /// A query admitted before a config-changing reload still counts against the member,
+        /// and is released correctly through either generation (#301).
         #[tokio::test]
-        async fn changed_config_reload_starts_fresh_and_old_generation_drains() {
+        async fn changed_config_reload_keeps_counting_in_flight_queries() {
             let mut cache = empty_cache();
             let group = ClusterGroupName("g".to_string());
 
             let gen1 = reload(&duck_record(serde_json::json!({})), &mut cache).await;
-            let cluster = gen1
+            let sync_slot = gen1
+                .cluster_manager
+                .acquire_cluster(&group)
+                .await
+                .unwrap()
+                .unwrap();
+            let async_slot = gen1
                 .cluster_manager
                 .acquire_cluster(&group)
                 .await
                 .unwrap()
                 .unwrap();
             let gen2 = reload(&duck_record(serde_json::json!({"poolSize": 2})), &mut cache).await;
-            assert_eq!(running(&gen2).await, 0);
+            assert_eq!(
+                running(&gen2).await,
+                2,
+                "in-flight queries still occupy the member"
+            );
 
+            // Sync dispatch releases through the manager that admitted the query.
             gen1.cluster_manager
-                .release_cluster(&group, &cluster)
+                .release_cluster(&group, &sync_slot)
                 .await
                 .unwrap();
-            assert_eq!(running(&gen1).await, 0);
+            assert_eq!(running(&gen2).await, 1);
+            // Async terminals (poll, cancel) release through the current manager.
+            gen2.cluster_manager
+                .release_cluster(&group, &async_slot)
+                .await
+                .unwrap();
             assert_eq!(running(&gen2).await, 0);
+            assert_eq!(running(&gen1).await, 0);
         }
 
         #[test]
