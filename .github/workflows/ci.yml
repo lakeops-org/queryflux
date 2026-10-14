@@ -262,7 +262,10 @@ jobs:
         if: github.event_name == 'push' || steps.paths.outputs.e2e == 'true'
         env:
           TRINO_URL: http://localhost:18081
-          TRINO_ADBC_URI: http://localhost:18081
+          # Trino rejects statements without a user; the test Trino has no auth, so any name works.
+          TRINO_ADBC_URI: http://queryflux@localhost:18081
+          # The driver is installed and Trino is up in CI — a skip here would hide a real failure.
+          TRINO_ADBC_REQUIRED: "1"
           STARROCKS_URL: mysql://root@localhost:9030
           CLICKHOUSE_URL: http://localhost:18123
           LAKEKEEPER_URL: http://localhost:18181

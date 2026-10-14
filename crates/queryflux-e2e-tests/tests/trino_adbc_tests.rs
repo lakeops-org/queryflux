@@ -4,7 +4,8 @@
 /// - Trino reachable at `TRINO_ADBC_URI` (default `http://127.0.0.1:18081`, same port as `TRINO_URL` in docker-compose.test.yml).
 /// - The Trino ADBC shared library installed where `adbc_driver_manager` can find it (e.g. `dbc install trino`).
 ///
-/// If the driver is not installed, tests skip with a message instead of failing.
+/// If the driver is not installed or Trino is unreachable, tests skip with a message
+/// instead of failing — unless `TRINO_ADBC_REQUIRED` is set (CI), where a skip is a failure.
 ///
 /// Run with the same flow as other e2e tests: `make test-e2e` or
 /// `cargo test -p queryflux-e2e-tests --test trino_adbc_tests -- --include-ignored`.
@@ -16,8 +17,20 @@ use queryflux_core::tags::QueryTags;
 use queryflux_engine_adapters::adbc::{AdbcAdapter, AdbcConfig};
 use queryflux_engine_adapters::{EngineConfigParseable, SyncAdapter};
 
+/// Trino rejects statements that carry neither credentials nor a user, so the default
+/// URI names one; an unauthenticated test Trino accepts any user.
 fn trino_adbc_uri() -> String {
-    std::env::var("TRINO_ADBC_URI").unwrap_or_else(|_| "http://127.0.0.1:18081".to_string())
+    std::env::var("TRINO_ADBC_URI")
+        .unwrap_or_else(|_| "http://queryflux@127.0.0.1:18081".to_string())
+}
+
+/// Skip the current test with `msg`, or panic when `TRINO_ADBC_REQUIRED` is set so a
+/// broken driver or Trino setup cannot pass CI as a silent skip.
+fn skip(msg: &str) {
+    if std::env::var_os("TRINO_ADBC_REQUIRED").is_some() {
+        panic!("TRINO_ADBC_REQUIRED is set but the test would skip: {msg}");
+    }
+    eprintln!("SKIP: {msg}");
 }
 
 fn maybe_trino_adbc_adapter() -> Option<AdbcAdapter> {
@@ -44,7 +57,7 @@ fn maybe_trino_adbc_adapter() -> Option<AdbcAdapter> {
         Err(e) => {
             let msg = e.to_string();
             if msg.contains("failed to load ADBC driver") {
-                eprintln!("SKIP trino ADBC: install the Trino ADBC driver (e.g. bash scripts/install-adbc-trino-driver.sh or `dbc install trino`). Detail: {msg}");
+                skip(&format!("install the Trino ADBC driver (e.g. bash scripts/install-adbc-trino-driver.sh or `dbc install trino`). Detail: {msg}"));
                 return None;
             }
             panic!("unexpected adapter error: {e}");
@@ -56,10 +69,10 @@ fn maybe_trino_adbc_adapter() -> Option<AdbcAdapter> {
 async fn trino_adbc_adapter_ready() -> Option<AdbcAdapter> {
     let adapter = maybe_trino_adbc_adapter()?;
     if !adapter.health_check().await {
-        eprintln!(
-            "SKIP: Trino ADBC health check failed — is Trino up at {}?",
+        skip(&format!(
+            "Trino ADBC health check failed — is Trino up at {}?",
             trino_adbc_uri()
-        );
+        ));
         return None;
     }
     Some(adapter)
@@ -109,10 +122,10 @@ async fn trino_adbc_health_check() {
         return;
     };
     if !adapter.health_check().await {
-        eprintln!(
-            "SKIP: Trino ADBC health check failed — start Trino (e.g. docker compose -f docker/docker-compose.test.yml) at {}",
+        skip(&format!(
+            "Trino ADBC health check failed — start Trino (e.g. docker compose -f docker/docker-compose.test.yml) at {}",
             trino_adbc_uri()
-        );
+        ));
         return;
     }
 }
@@ -204,7 +217,7 @@ async fn trino_adbc_from_admin_json_config() {
         Err(e) => {
             let msg = e.to_string();
             if msg.contains("failed to load ADBC driver") {
-                eprintln!("SKIP trino ADBC (from_json): {msg}");
+                skip(&format!("trino ADBC (from_json): {msg}"));
                 return;
             }
             panic!("unexpected adapter error: {e}");
@@ -212,10 +225,10 @@ async fn trino_adbc_from_admin_json_config() {
     };
 
     if !adapter.health_check().await {
-        eprintln!(
-            "SKIP: Trino not reachable for from_json test at {}",
+        skip(&format!(
+            "Trino not reachable for from_json test at {}",
             trino_adbc_uri()
-        );
+        ));
         return;
     }
 
