@@ -303,7 +303,8 @@ async fn handle_com_query(
         username: session.user().map(|s| s.to_string()),
         ..Default::default()
     };
-    let auth_provider = state.live.read().await.auth_provider.clone();
+    let live = state.snapshot().await;
+    let auth_provider = live.auth_provider.clone();
     let auth_ctx = match auth_provider.authenticate(&creds).await {
         Ok(ctx) => ctx,
         Err(e) => {
@@ -384,7 +385,6 @@ async fn handle_com_query(
     }
 
     let routing_result = {
-        let live = state.live.read().await;
         live.router_chain
             .route_with_trace(sql, session, &protocol, Some(&auth_ctx))
             .await
@@ -405,7 +405,7 @@ async fn handle_com_query(
             return Ok(());
         }
     };
-    group = match state
+    group = match live
         .resolve_routed_group(group, &mut routing_trace, &auth_ctx)
         .await
     {
@@ -431,6 +431,7 @@ async fn handle_com_query(
     let exec_task = AbortOnDrop::new(tokio::spawn(async move {
         execute_to_sink(
             &state2,
+            &live,
             sql2,
             vec![],
             session2,

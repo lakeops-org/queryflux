@@ -10,7 +10,7 @@ use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
-use queryflux_auth::Credentials;
+use queryflux_auth::AuthProvider;
 use queryflux_core::{
     error::{QueryFluxError, Result},
     query::{FrontendProtocol, QueryStats},
@@ -235,7 +235,8 @@ pub async fn submit_statement(
     let params = bindings_to_params(body_json.get("bindings"));
 
     // Stateless auth: Bearer token in Authorization header.
-    let auth_ctx = match authenticate(&state.app, &headers).await {
+    let live = state.app.snapshot().await;
+    let auth_ctx = match authenticate(&state.app, live.auth_provider.as_ref(), &headers).await {
         Ok(ctx) => ctx,
         Err(e) => return sql_api_error(StatusCode::UNAUTHORIZED, "390002", &e.to_string()),
     };
@@ -268,7 +269,6 @@ pub async fn submit_statement(
         agent_context: None,
     };
     let routing_result = {
-        let live = state.app.live.read().await;
         live.router_chain
             .route_with_trace(
                 &sql,
@@ -295,8 +295,7 @@ pub async fn submit_statement(
             return sql_api_error(StatusCode::FORBIDDEN, "390201", &message);
         }
     };
-    group = match state
-        .app
+    group = match live
         .resolve_routed_group(group, &mut routing_trace, &auth_ctx)
         .await
     {
@@ -310,6 +309,7 @@ pub async fn submit_statement(
     let handle = Uuid::new_v4().to_string();
 
     let exec = SnowflakeExecParams {
+        live,
         sql,
         params,
         session_ctx,
@@ -376,7 +376,8 @@ pub async fn cancel_statement(
     headers: HeaderMap,
     axum::extract::Path(handle): axum::extract::Path<String>,
 ) -> Response {
-    let auth_ctx = match authenticate(&state.app, &headers).await {
+    let auth_provider = state.app.auth_provider().await;
+    let auth_ctx = match authenticate(&state.app, auth_provider.as_ref(), &headers).await {
         Ok(ctx) => ctx,
         Err(e) => return sql_api_error(StatusCode::UNAUTHORIZED, "390002", &e.to_string()),
     };
@@ -404,28 +405,20 @@ pub async fn cancel_statement(
 
 async fn authenticate(
     state: &std::sync::Arc<crate::state::AppState>,
+    auth_provider: &dyn AuthProvider,
     headers: &HeaderMap,
 ) -> std::result::Result<queryflux_auth::AuthContext, String> {
-    let bearer = headers
-        .get("authorization")
-        .and_then(|v| v.to_str().ok())
-        .and_then(crate::strip_bearer_prefix)
-        .map(|s| s.to_string());
-
-    let auth_provider = state.live.read().await.auth_provider.clone();
-    auth_provider
-        .authenticate(&Credentials {
-            username: None,
-            password: None,
-            bearer_token: bearer,
-        })
-        .await
-        .map_err(|e| {
-            state
-                .metrics
-                .on_auth_failure(&format!("{:?}", FrontendProtocol::SnowflakeSqlApi));
-            e.to_string()
-        })
+    crate::auth::authenticate_bearer(
+        auth_provider,
+        headers.get("authorization").and_then(|v| v.to_str().ok()),
+    )
+    .await
+    .map_err(|e| {
+        state
+            .metrics
+            .on_auth_failure(&format!("{:?}", FrontendProtocol::SnowflakeSqlApi));
+        e.to_string()
+    })
 }
 
 #[cfg(test)]

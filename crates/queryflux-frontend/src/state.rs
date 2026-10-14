@@ -27,7 +27,12 @@ use queryflux_translation::TranslationService;
 ///
 /// Wrapped in `Arc<tokio::sync::RwLock<LiveConfig>>` inside `AppState` so
 /// that any handler can cheaply read a consistent snapshot, and a background
-/// task can atomically swap the whole bundle on each reload tick.
+/// task can atomically swap the whole bundle on each reload tick. Query handlers
+/// clone this bundle once before routing and pass that generation through fallback
+/// resolution and dispatch. Runtime health and capacity counters remain live; config
+/// membership, limits, strategies, and adapters belong to the captured reload generation.
+/// Direct runtime cluster overrides remain mutable independently of DB config reloads.
+#[derive(Clone)]
 pub struct LiveConfig {
     pub router_chain: RouterChain,
     /// Global guard chain — runs for every query regardless of cluster group.
@@ -81,6 +86,37 @@ pub struct LiveConfig {
     /// `catalogProvider` is configured; every call site treats that identically to
     /// "catalog lookup found nothing," never as an error.
     pub catalog: Arc<dyn CatalogProvider>,
+}
+
+impl LiveConfig {
+    /// Returns true if any cluster in the group supports async execution (e.g. Trino).
+    pub fn group_supports_async(&self, group: &str) -> bool {
+        self.group_members
+            .get(group)
+            .map(|members| {
+                members
+                    .iter()
+                    .any(|name| matches!(self.adapters.get(name), Some(AdapterKind::Async(_))))
+            })
+            .unwrap_or(false)
+    }
+
+    /// Apply authorization-aware first-fit when the router chain used fallback.
+    pub async fn resolve_routed_group(
+        &self,
+        routed: ClusterGroupName,
+        trace: &mut queryflux_routing::chain::RoutingTrace,
+        auth_ctx: &queryflux_auth::AuthContext,
+    ) -> queryflux_core::error::Result<ClusterGroupName> {
+        crate::routing_resolve::resolve_routed_group(
+            &self.group_order,
+            self.authorization.as_ref(),
+            routed,
+            trace,
+            auth_ctx,
+        )
+        .await
+    }
 }
 
 /// Shared application state — passed to every handler via `axum::extract::State`.
@@ -162,10 +198,27 @@ pub struct QueryOutcome {
 }
 
 impl AppState {
+    /// Capture one config generation before routing; retain it through dispatch.
+    /// Cloning shares services and router implementations, and releases the lock
+    /// before any routing, authorization, or backend I/O.
+    pub async fn snapshot(&self) -> LiveConfig {
+        self.live.read().await.clone()
+    }
+
+    /// Capture only the current identity provider for authentication-only requests.
+    /// Use `snapshot()` when authentication must agree with authorization or routing.
+    pub async fn auth_provider(&self) -> Arc<dyn AuthProvider> {
+        self.live.read().await.auth_provider.clone()
+    }
+
+    /// Read an adapter from the current generation independently of other config reads.
+    /// Dispatch paths requiring generation consistency must use their `LiveConfig` snapshot.
     pub async fn adapter(&self, cluster: &str) -> Option<AdapterKind> {
         self.live.read().await.adapters.get(cluster).cloned()
     }
 
+    /// Read cluster config independently of other config reads. Use the captured
+    /// `LiveConfig` for dispatch paths that require generation consistency.
     pub async fn cluster_config_cloned(&self, cluster: &str) -> Option<ClusterConfig> {
         self.live.read().await.cluster_configs.get(cluster).cloned()
     }
@@ -184,23 +237,14 @@ impl AppState {
         (EngineType::Undispatched, SqlDialect::Generic)
     }
 
-    /// Returns true if any cluster in the group supports async execution (e.g. Trino).
-    pub async fn group_supports_async(&self, group: &str) -> bool {
-        let live = self.live.read().await;
-        live.group_members
-            .get(group)
-            .map(|members| {
-                members
-                    .iter()
-                    .any(|name| matches!(live.adapters.get(name), Some(AdapterKind::Async(_))))
-            })
-            .unwrap_or(false)
-    }
-
     /// Release a query's cluster capacity slot — local counter, global Postgres lease,
     /// and metrics. Call this **once** at every terminal path (success, failure, cancel,
     /// error) instead of manually calling `release_cluster` + `capacity_store.release`
     /// + `on_query_finished` separately.
+    ///
+    /// This uses the current manager, independently of any dispatch snapshot. Callers
+    /// that still own a `ClusterSlotGuard` must release through that guard so cleanup
+    /// reaches the manager that acquired the slot, even after a reload.
     pub async fn release_query_slot(
         &self,
         group: &ClusterGroupName,
@@ -421,30 +465,6 @@ impl AppState {
             },
         );
         query_id
-    }
-
-    /// Apply authorization-aware first-fit when the router chain used fallback.
-    pub async fn resolve_routed_group(
-        &self,
-        routed: ClusterGroupName,
-        trace: &mut queryflux_routing::chain::RoutingTrace,
-        auth_ctx: &queryflux_auth::AuthContext,
-    ) -> queryflux_core::error::Result<ClusterGroupName> {
-        let (group_order, authorization) = {
-            let live = self.live.read().await;
-            if !trace.used_fallback {
-                return Ok(routed);
-            }
-            (live.group_order.clone(), live.authorization.clone())
-        };
-        crate::routing_resolve::resolve_routed_group(
-            &group_order,
-            authorization.as_ref(),
-            routed,
-            trace,
-            auth_ctx,
-        )
-        .await
     }
 
     /// Persist a terminal audit row for a queued query that never reached an engine

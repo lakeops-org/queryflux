@@ -89,6 +89,10 @@ Clients that stop polling are cleaned up by the stale queued-query sweeper (idle
 
 Reload keeps **last-good** LiveConfig on failure. Alert on `queryflux_config_reload_failures_total{stage=…}` (`reload`, `auth_rebuild`, `authz_rebuild`, `guard_reload`).
 
+Each dispatch captures one LiveConfig snapshot before routing and uses it for the router chain, fallback resolution, authorization, group membership, selection strategy, capacity limits, and adapters. Reload publishes a complete replacement without changing an in-flight decision or holding a config lock during I/O. Runtime health observations, capacity usage, and direct runtime cluster overrides (`PATCH /admin/clusters/{group}/{cluster}`) can still change while a request runs; the snapshot guarantee concerns publication of Postgres config reloads.
+
+A queued Trino HTTP poll starts a new dispatch attempt with a fresh snapshot and the previously selected group. A synchronous capacity wait retains its original snapshot through admission and adapter selection. Replicas may observe different generations until reload propagates; this guarantee is per dispatch, not a fleet-wide config barrier.
+
 ## Session affinity by frontend
 
 | Frontend | Multi-replica affinity needed? |
