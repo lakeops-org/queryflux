@@ -313,12 +313,24 @@ pub async fn dispatch_query(
         });
     }
 
-    let cluster_name = match cluster_manager.acquire_cluster(&group).await? {
+    let (cluster_name, mut slot) = match cluster_manager.acquire_cluster(&group).await? {
         Some(c) => {
+            // RAII guard: from here on the local slot and global lease are released on
+            // every exit — including the future being dropped when the client
+            // disconnects mid-dispatch (even while `acquire_global_capacity` is still
+            // awaiting), which would otherwise leak the slot or lease permanently.
+            let mut slot = ClusterSlotGuard::new(
+                cluster_manager.clone(),
+                group.clone(),
+                c.clone(),
+                state.metrics.clone(),
+                state.capacity_store.clone(),
+                query_id.0.clone(),
+            );
             match acquire_global_capacity(state, &cluster_manager, &group, &c, &query_id.0).await {
                 CapacityGrant::Denied => {
                     // Global capacity full — release local slot and queue.
-                    let _ = cluster_manager.release_cluster(&group, &c).await;
+                    slot.release().await;
                     let uri = persist_queued_query(
                         state,
                         query_id,
@@ -336,7 +348,7 @@ pub async fn dispatch_query(
                         queued_next_uri: uri,
                     });
                 }
-                CapacityGrant::Granted => c,
+                CapacityGrant::Granted => (c, slot),
             }
         }
         None => {
@@ -364,23 +376,10 @@ pub async fn dispatch_query(
         .map(|t| (Utc::now() - t).num_milliseconds().max(0) as u64)
         .unwrap_or(0);
 
-    // RAII guard: from here on the local slot and global lease are released on
-    // every exit — including the future being dropped when the client
-    // disconnects mid-dispatch, which previously leaked the lease permanently
-    // (the owning replica keeps heartbeating, so expiry never reclaims it).
-    let mut slot = ClusterSlotGuard::new(
-        cluster_manager.clone(),
-        group.clone(),
-        cluster_name.clone(),
-        state.metrics.clone(),
-        state.capacity_store.clone(),
-        query_id.0.clone(),
-    );
-
     let (cluster_group_config_id, cluster_config_id) =
         cluster_db_ids(&cluster_manager, &group, &cluster_name).await;
 
-    state.metrics.on_query_started(&group.0, &cluster_name.0);
+    slot.mark_started();
 
     let this_cluster_cfg = cluster_cfg.get(&cluster_name.0).cloned();
     let credentials = match state
@@ -1124,8 +1123,12 @@ async fn queued_backoff_delay(seq: u64) {
 // ClusterSlotGuard — RAII wrapper ensuring the cluster slot is always released
 // ---------------------------------------------------------------------------
 
-/// Holds a cluster slot acquired from the ClusterGroupManager.
-/// Releases the slot automatically on drop — even on tokio future cancellation.
+/// Holds a cluster slot acquired from the ClusterGroupManager, plus the global
+/// capacity lease for the same query id when coordination is enabled.
+/// Releases both automatically on drop — even on tokio future cancellation.
+/// Create it immediately after `acquire_cluster` succeeds, before any further
+/// await; the global release is an idempotent delete, so it is safe even when
+/// the lease was never granted.
 ///
 /// On the normal path, call `release().await` explicitly. On cancellation,
 /// the `Drop` impl spawns a best-effort release so the slot is never leaked.
@@ -1136,6 +1139,9 @@ struct ClusterSlotGuard {
     metrics: Arc<dyn MetricsStore>,
     capacity_store: Option<Arc<dyn queryflux_persistence::CapacityStore>>,
     query_id: String,
+    /// Set by [`ClusterSlotGuard::mark_started`]; `on_query_finished` is only
+    /// emitted on release when the matching `on_query_started` was.
+    started: bool,
     released: bool,
 }
 
@@ -1155,7 +1161,18 @@ impl ClusterSlotGuard {
             metrics,
             capacity_store,
             query_id,
+            started: false,
             released: false,
+        }
+    }
+
+    /// Record the query as started in metrics. Call once the slot (and global
+    /// lease, when coordination is on) is fully held and dispatch proceeds.
+    fn mark_started(&mut self) {
+        if !self.started {
+            self.started = true;
+            self.metrics
+                .on_query_started(&self.group.0, &self.cluster.0);
         }
     }
 
@@ -1188,8 +1205,10 @@ impl ClusterSlotGuard {
                     );
                 }
             }
-            self.metrics
-                .on_query_finished(&self.group.0, &self.cluster.0);
+            if self.started {
+                self.metrics
+                    .on_query_finished(&self.group.0, &self.cluster.0);
+            }
         }
     }
 }
@@ -1211,6 +1230,7 @@ impl Drop for ClusterSlotGuard {
             let metrics = self.metrics.clone();
             let cap = self.capacity_store.clone();
             let qid = self.query_id.clone();
+            let started = self.started;
             tokio::spawn(async move {
                 let _ = mgr.release_cluster(&group, &cluster).await;
                 if let Some(cap) = cap {
@@ -1219,7 +1239,9 @@ impl Drop for ClusterSlotGuard {
                         tracing::warn!("CapacityStore release failed for query {qid}: {e}");
                     }
                 }
-                metrics.on_query_finished(&group.0, &cluster.0);
+                if started {
+                    metrics.on_query_finished(&group.0, &cluster.0);
+                }
             });
         }
     }
@@ -1541,7 +1563,7 @@ async fn setup_sync_query(
     let wait_start = Utc::now();
     let deadline = wait_start + chrono::Duration::seconds(wait_timeout_secs as i64);
     let mut seq: u64 = 0;
-    let (cluster_name, adapter, this_cluster_cfg) = loop {
+    let (cluster_name, adapter, this_cluster_cfg, mut slot) = loop {
         if Utc::now() >= deadline {
             return Err(QueryFluxError::CapacityWaitTimeout {
                 group: group.0.clone(),
@@ -1555,13 +1577,25 @@ async fn setup_sync_query(
         }
         match cluster_manager.acquire_cluster(&group).await? {
             Some(name) => {
+                // RAII guard: from here on the local slot and global lease are released
+                // on every exit — including the future being dropped (client timeout or
+                // disconnect) while `acquire_global_capacity` or the lookups below are
+                // still awaiting, which would otherwise leak the local slot permanently.
+                let mut slot = ClusterSlotGuard::new(
+                    cluster_manager.clone(),
+                    group.clone(),
+                    name.clone(),
+                    state.metrics.clone(),
+                    state.capacity_store.clone(),
+                    query_id.0.clone(),
+                );
                 match acquire_global_capacity(state, &cluster_manager, &group, &name, &query_id.0)
                     .await
                 {
                     CapacityGrant::Denied => {
                         // Global capacity full or coordination unavailable (fail-closed) —
                         // release local slot and retry with backoff.
-                        let _ = cluster_manager.release_cluster(&group, &name).await;
+                        slot.release().await;
                         queued_backoff_delay(seq).await;
                         seq += 1;
                         continue;
@@ -1581,16 +1615,23 @@ async fn setup_sync_query(
                 };
                 match adapter_for_cluster {
                     Some(AdapterKind::Sync(a)) => {
-                        break (name, DispatchAdapter::Sync(a), cluster_cfg_for_cluster)
+                        break (
+                            name,
+                            DispatchAdapter::Sync(a),
+                            cluster_cfg_for_cluster,
+                            slot,
+                        )
                     }
                     Some(AdapterKind::Async(a)) => {
-                        break (name, DispatchAdapter::Async(a), cluster_cfg_for_cluster)
+                        break (
+                            name,
+                            DispatchAdapter::Async(a),
+                            cluster_cfg_for_cluster,
+                            slot,
+                        )
                     }
                     None => {
-                        let _ = cluster_manager.release_cluster(&group, &name).await;
-                        if let Some(cap) = &state.capacity_store {
-                            let _ = cap.release(&name.0, &query_id.0).await;
-                        }
+                        slot.release().await;
                         return Err(QueryFluxError::Engine(format!(
                             "No adapter for {group}/{name}"
                         )));
@@ -1608,17 +1649,8 @@ async fn setup_sync_query(
         cluster_db_ids(&cluster_manager, &group, &cluster_name).await;
 
     // Fix Bug A: on_query_started was missing from the sync path.
-    state.metrics.on_query_started(&group.0, &cluster_name.0);
+    slot.mark_started();
     info!(id = %query_id, group = %group, cluster = %cluster_name, "Query executing (sync)");
-
-    let mut slot = ClusterSlotGuard::new(
-        cluster_manager.clone(),
-        group.clone(),
-        cluster_name.clone(),
-        state.metrics.clone(),
-        state.capacity_store.clone(),
-        query_id.0.clone(),
-    );
 
     let tgt_dialect = adapter.translation_target_dialect();
     let src_dialect = resolve_src_dialect(&session, &protocol);
