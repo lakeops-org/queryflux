@@ -965,6 +965,26 @@ async fn main() -> Result<()> {
                 })
             },
         );
+        // With peer bootstrap on, serve the active config to workers starting while the
+        // control plane is unreachable.
+        let ops = match config
+            .queryflux
+            .control_plane
+            .as_ref()
+            .filter(|cp| cp.peer_bootstrap.is_some())
+        {
+            Some(cp) => ops.with_peer_config(queryflux_frontend::ops::PeerConfigEndpoint {
+                shared_secret: cp.auth.bearer().to_string(),
+                config: {
+                    let state = worker_sync_state.clone();
+                    Arc::new(move || {
+                        let st = state.lock().unwrap_or_else(|e| e.into_inner());
+                        st.peer_config().and_then(|c| serde_json::to_value(c).ok())
+                    })
+                },
+            }),
+            None => ops,
+        };
         frontend_tasks.spawn("Ops", {
             let rx = shutdown_rx.clone();
             async move { ops.listen(rx).await }

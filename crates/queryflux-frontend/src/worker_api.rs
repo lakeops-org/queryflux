@@ -123,7 +123,7 @@ fn secret_matches(given: &str, expected: &str) -> bool {
     a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
-fn authorized(headers: &HeaderMap, secret: &str) -> bool {
+pub(crate) fn authorized(headers: &HeaderMap, secret: &str) -> bool {
     headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())

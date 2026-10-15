@@ -52,6 +52,9 @@ pub struct PrometheusMetrics {
     auth_failures_total: CounterVec,
     /// queryflux_config_reload_failures_total{stage}
     config_reload_failures_total: CounterVec,
+    /// queryflux_worker_config_stale: 1 while a worker serves a config it did not get from
+    /// its control plane (copied from a peer), 0 otherwise.
+    worker_config_stale: prometheus::IntGauge,
     /// queryflux_queue_rejections_total{cluster_group}
     queue_rejections_total: CounterVec,
     /// queryflux_queue_duration_seconds{cluster_group}
@@ -189,6 +192,11 @@ impl PrometheusMetrics {
             &["stage"],
         )?;
 
+        let worker_config_stale = prometheus::IntGauge::new(
+            "queryflux_worker_config_stale",
+            "1 while a worker serves a config not confirmed by its control plane",
+        )?;
+
         let queue_rejections_total = CounterVec::new(
             Opts::new(
                 "queryflux_queue_rejections_total",
@@ -236,6 +244,7 @@ impl PrometheusMetrics {
         registry.register(Box::new(capacity_degraded_total.clone()))?;
         registry.register(Box::new(auth_failures_total.clone()))?;
         registry.register(Box::new(config_reload_failures_total.clone()))?;
+        registry.register(Box::new(worker_config_stale.clone()))?;
         registry.register(Box::new(queue_rejections_total.clone()))?;
         registry.register(Box::new(queue_duration_seconds.clone()))?;
         registry.register(Box::new(cache_hits_total.clone()))?;
@@ -259,6 +268,7 @@ impl PrometheusMetrics {
             capacity_degraded_total,
             auth_failures_total,
             config_reload_failures_total,
+            worker_config_stale,
             queue_rejections_total,
             queue_duration_seconds,
             cache_hits_total,
@@ -368,6 +378,10 @@ impl MetricsStore for PrometheusMetrics {
         self.config_reload_failures_total
             .with_label_values(&[stage])
             .inc();
+    }
+
+    fn on_worker_config_stale(&self, stale: bool) {
+        self.worker_config_stale.set(i64::from(stale));
     }
 
     fn on_queue_full(&self, cluster_group: &str) {

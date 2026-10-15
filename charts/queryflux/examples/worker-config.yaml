@@ -26,6 +26,12 @@ queryflux:
       sharedSecret: <long-random-secret>   # the control plane's workerApi.sharedSecret
     pollTimeoutSecs: 30
     heartbeatIntervalSecs: 10
+    # Start from a running worker's config when the control plane is unreachable. The
+    # worker Service routes only to ready workers, which all have a config.
+    peerBootstrap:
+      address: queryflux-workers:9000
+      afterSecs: 10
+      maxAgeSecs: 86400
   coordination:
     mode: controlPlane       # controlPlane | local (only when one worker serves a group)
     onUnavailable: failClosed # failClosed | localLimits

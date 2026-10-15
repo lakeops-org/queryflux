@@ -71,6 +71,12 @@ impl MetricsStore for MultiMetricsStore {
         }
     }
 
+    fn on_worker_config_stale(&self, stale: bool) {
+        for s in &self.stores {
+            s.on_worker_config_stale(stale);
+        }
+    }
+
     fn on_queue_full(&self, cluster_group: &str) {
         for s in &self.stores {
             s.on_queue_full(cluster_group);

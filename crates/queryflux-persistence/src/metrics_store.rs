@@ -177,6 +177,10 @@ pub trait MetricsStore: Send + Sync {
     /// `authz_rebuild`, or `guard_reload`.
     fn on_config_reload_failure(&self, _stage: &str) {}
 
+    /// Called when a worker starts or stops serving a config its control plane has not
+    /// confirmed (one copied from a peer at startup).
+    fn on_worker_config_stale(&self, _stale: bool) {}
+
     /// Called when a queue admission is rejected because `maxQueuedQueries` was reached.
     fn on_queue_full(&self, _cluster_group: &str) {}
 
