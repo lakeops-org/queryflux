@@ -101,6 +101,9 @@ docker run -e ADBC_DRIVER_PATH=/opt/adbc -v ./my-drivers:/opt/adbc:ro \
 
 If you also declare drivers, the install directory goes first and your path is searched after it.
 
+Manifests written by `dbc` contain **absolute** library paths. If you prepare a directory with `dbc install`
+on another machine or in another container, mount it at the same path it was installed to.
+
 ## Network access
 
 `dbc` downloads from `dbc-cdn.columnar.tech` and `dbc-cdn-private.columnar.tech` over HTTPS. If you restrict

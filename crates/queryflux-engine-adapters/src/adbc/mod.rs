@@ -737,7 +737,10 @@ impl AdbcAdapter {
             None,
         )
         .map_err(|e| {
-            let hint = if e.status == Status::NotFound {
+            // With no `duckdb` manifest, the driver manager falls back to the image's
+            // `libduckdb.so` (bundled for the native DuckDB engine), which has no ADBC entry
+            // point — that's a missing driver too.
+            let hint = if e.status == Status::NotFound || e.message.contains("AdbcDriverInit") {
                 driver_not_found_hint(std::env::var("ADBC_DRIVER_PATH").ok().as_deref())
             } else {
                 String::new()
