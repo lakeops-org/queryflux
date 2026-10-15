@@ -4,6 +4,9 @@
 set -e
 export PYTHONPATH="$(/opt/venv/bin/python3 -c 'import site; print(site.getsitepackages()[0])')"
 
+# Install the ADBC drivers declared in QUERYFLUX_ADBC_DRIVERS(_FILE), if any; exports ADBC_DRIVER_PATH.
+. /app/adbc-drivers.sh
+
 ADMIN_PORT="${QUERYFLUX_ADMIN_PORT:-9000}"
 export ADMIN_API_URL="${ADMIN_API_URL:-http://127.0.0.1:${ADMIN_PORT}}"
 

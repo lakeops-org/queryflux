@@ -3,7 +3,7 @@
 # Canonical QueryFlux Docker build (server + optional Studio). Edit this file only.
 #
 # Targets (use --target for non-default):
-#   runtime-server   — Rust server + Python venv + DuckDB + ADBC drivers (default final stage)
+#   runtime-server   — Rust server + Python venv + DuckDB + dbc CLI (default final stage)
 #   runtime-unified  — server + bundled QueryFlux Studio (Next.js)
 #
 # Examples (repo root as context):
@@ -16,6 +16,9 @@
 # Rust: rustup 1.91.1. DuckDB: DUCKDB_DOWNLOAD_LIB links a prebuilt libduckdb.
 #
 # Final `cargo build` has no `--locked` (stub vs full crate sources); `cargo chef cook` uses `--locked`.
+#
+# ADBC drivers are not baked in. Declare them at run time with QUERYFLUX_ADBC_DRIVERS or
+# QUERYFLUX_ADBC_DRIVERS_FILE; docker/adbc-drivers.sh installs them with the pinned dbc CLI.
 
 ARG QUERYFLUX_STUDIO_IMAGE=ghcr.io/lakeops-org/queryflux-studio:latest
 
@@ -117,26 +120,31 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,id=queryflux-registry \
     cp target/release/deps/libduckdb.so /queryflux-libduckdb.so'
 
 # =============================================================================
-# ADBC drivers (dbc CLI → ~/.config/adbc/drivers on Linux)
+# dbc CLI (pinned, checksum-verified) — installs ADBC drivers at container start
 # =============================================================================
-FROM debian:trixie-slim AS adbc-drivers
+FROM debian:trixie-slim AS dbc
+
+ARG DBC_VERSION=0.3.1
+ARG DBC_SHA256_AMD64=d394fe15226c3db4a980568f2b3aff049c58ef2badea6cbb711bc4cf3b7b2ed7
+ARG DBC_SHA256_ARM64=1a875bb6b1c76c83141a6a3aa0ce8510b1715c220ddbe88399377871abbe6982
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
-RUN curl -LsSf https://dbc.columnar.tech/install.sh | sh
-
-ENV PATH="/root/.local/bin:/root/.cargo/bin:${PATH}"
-
-RUN set -eu; command -v dbc; dbc install trino \
- && dbc install postgresql \
- && dbc install duckdb \
- && dbc install snowflake \
- && dbc install mysql \
- && dbc install databricks \
- && dbc install bigquery
+RUN set -eu; \
+    case "$(dpkg --print-architecture)" in \
+      amd64) arch=amd64; sha="${DBC_SHA256_AMD64}" ;; \
+      arm64) arch=arm64; sha="${DBC_SHA256_ARM64}" ;; \
+      *) echo "unsupported arch: $(dpkg --print-architecture)"; exit 1 ;; \
+    esac; \
+    tarball="dbc-linux-${arch}-${DBC_VERSION}.tar.gz"; \
+    curl -fsSLo "/tmp/${tarball}" "https://github.com/columnar-tech/dbc/releases/download/v${DBC_VERSION}/${tarball}"; \
+    echo "${sha}  /tmp/${tarball}" | sha256sum -c -; \
+    tar -xzf "/tmp/${tarball}" -C /tmp dbc; \
+    install -m 0755 /tmp/dbc /usr/local/bin/dbc; \
+    dbc --version
 
 # =============================================================================
 # QueryFlux Studio — pre-built standalone image used by runtime-unified
@@ -177,14 +185,16 @@ RUN python3 -m venv /opt/venv && \
 
 COPY --from=builder /queryflux-binary /app/queryflux
 COPY --from=builder /queryflux-libduckdb.so /usr/local/lib/libduckdb.so
-COPY --from=adbc-drivers /root/.config/adbc/drivers/ /usr/local/lib/adbc/
+COPY --from=dbc /usr/local/bin/dbc /usr/local/bin/dbc
 COPY --from=studio-image --chown=queryflux:queryflux /app/ /app/studio/
 
 COPY docker/queryflux-unified/entrypoint-unified.sh /app/entrypoint-unified.sh
-RUN chmod +x /app/queryflux /app/entrypoint-unified.sh
+COPY docker/adbc-drivers.sh /app/adbc-drivers.sh
+RUN chmod +x /app/queryflux /app/entrypoint-unified.sh /app/adbc-drivers.sh \
+    && mkdir -p /var/lib/queryflux/adbc \
+    && chown -R queryflux:queryflux /var/lib/queryflux
 
 ENV LD_LIBRARY_PATH=/usr/local/lib
-ENV ADBC_DRIVER_PATH=/usr/local/lib/adbc
 ENV PYO3_PYTHON=/opt/venv/bin/python3
 WORKDIR /app
 USER queryflux
@@ -213,12 +223,14 @@ RUN python3 -m venv /opt/venv && \
 
 COPY --from=builder /queryflux-binary /app/queryflux
 COPY --from=builder /queryflux-libduckdb.so /usr/local/lib/libduckdb.so
-COPY --from=adbc-drivers /root/.config/adbc/drivers/ /usr/local/lib/adbc/
+COPY --from=dbc /usr/local/bin/dbc /usr/local/bin/dbc
 COPY docker/queryflux/entrypoint.sh /app/entrypoint.sh
-RUN chmod +x /app/queryflux /app/entrypoint.sh
+COPY docker/adbc-drivers.sh /app/adbc-drivers.sh
+RUN chmod +x /app/queryflux /app/entrypoint.sh /app/adbc-drivers.sh \
+    && mkdir -p /var/lib/queryflux/adbc \
+    && chown -R queryflux:queryflux /var/lib/queryflux
 
 ENV LD_LIBRARY_PATH=/usr/local/lib
-ENV ADBC_DRIVER_PATH=/usr/local/lib/adbc
 ENV PYO3_PYTHON=/opt/venv/bin/python3
 WORKDIR /app
 USER queryflux

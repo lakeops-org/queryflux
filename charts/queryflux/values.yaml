@@ -238,6 +238,29 @@ serviceMonitor:
   path: /metrics
   port: admin
 
+# ADBC drivers (#297). The image ships none; declare the ones your ADBC clusters use.
+# Empty install + empty dbcToml → nothing is rendered or installed.
+adbcDrivers:
+  # `dbc install` specs, passed to the container as QUERYFLUX_ADBC_DRIVERS.
+  # Pin exact versions for reproducible pods, e.g. ["trino=0.6.0", "postgresql=1.12.0"].
+  install: []
+  # Or a dbc.toml driver list (and optional dbc.lock), rendered into a ConfigMap and passed as
+  # QUERYFLUX_ADBC_DRIVERS_FILE. Takes precedence over `install`.
+  dbcToml: ""
+  dbcLock: ""
+  # fail: the pod does not start if a driver can't be installed. warn: start anyway.
+  onFailure: fail
+  # initContainer: an init container installs into the volume and the server mounts it read-only,
+  #   so the serving container needs no registry egress.
+  # entrypoint: the server container installs at startup into a writable volume.
+  mode: initContainer
+  # Where drivers are installed. Must be a volume: the root filesystem is read-only.
+  volume:
+    emptyDir: {}
+  # The init container (or the server, in entrypoint mode) downloads from dbc-cdn.columnar.tech
+  # and dbc-cdn-private.columnar.tech over HTTPS. Allow 443 egress if networkPolicy is enabled.
+  initContainerResources: {}
+
 env: []
 envFrom: []
 extraVolumes: []

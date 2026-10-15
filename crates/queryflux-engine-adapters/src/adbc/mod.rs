@@ -27,6 +27,20 @@ fn adbc_backend_error(message: String, status: Status) -> QueryFluxError {
     }
 }
 
+/// Appended to a "driver not found" load error. The QueryFlux image ships no ADBC drivers, so the
+/// usual cause is a driver that was never declared.
+fn driver_not_found_hint(adbc_driver_path: Option<&str>) -> String {
+    let searched = match adbc_driver_path {
+        Some(p) if !p.is_empty() => format!("ADBC_DRIVER_PATH={p}"),
+        _ => "ADBC_DRIVER_PATH is not set".to_string(),
+    };
+    format!(
+        " ({searched}). The QueryFlux image does not include ADBC drivers: declare the driver with \
+         QUERYFLUX_ADBC_DRIVERS (e.g. \"trino=0.6.0\") or QUERYFLUX_ADBC_DRIVERS_FILE, or point \
+         ADBC_DRIVER_PATH at a directory with its manifest"
+    )
+}
+
 fn adbc_read_error(error: ArrowError) -> QueryFluxError {
     let message = format!("ADBC: failed to read results: {error}");
     match &error {
@@ -723,8 +737,13 @@ impl AdbcAdapter {
             None,
         )
         .map_err(|e| {
+            let hint = if e.status == Status::NotFound {
+                driver_not_found_hint(std::env::var("ADBC_DRIVER_PATH").ok().as_deref())
+            } else {
+                String::new()
+            };
             QueryFluxError::Engine(format!(
-                "cluster '{}': failed to load ADBC driver '{}': {e}",
+                "cluster '{}': failed to load ADBC driver '{}': {e}{hint}",
                 cluster_name.0, driver_name
             ))
         })?;
@@ -1704,9 +1723,9 @@ impl EngineAdapterFactory for AdbcFactory {
 mod tests {
     use super::{
         adbc_backend_error, adbc_read_error, compute_scoped_pool_key, compute_scoped_pool_size,
-        jwt_auth_options, list_catalogs_sql, list_databases_sql, list_tables_sql,
-        normalize_to_pkcs8_pem, oauth_token_options, AdbcAdapter, AdbcConfig, PoolScopeKey,
-        IDENTITY_POOL_MAX_SIZE,
+        driver_not_found_hint, jwt_auth_options, list_catalogs_sql, list_databases_sql,
+        list_tables_sql, normalize_to_pkcs8_pem, oauth_token_options, AdbcAdapter, AdbcConfig,
+        PoolScopeKey, IDENTITY_POOL_MAX_SIZE,
     };
     use crate::EngineConfigParseable;
     use adbc_core::error::Status;
@@ -2301,6 +2320,16 @@ mod tests {
         assert_eq!(cfg.engine_type(), EngineType::Trino);
         assert_eq!(cfg.db_kwargs.len(), 1);
         assert_eq!(cfg.db_kwargs[0].0, "session_properties");
+    }
+
+    #[test]
+    fn driver_not_found_hint_names_search_path_and_env_vars() {
+        let hint = driver_not_found_hint(Some("/var/lib/queryflux/adbc:/opt/adbc"));
+        assert!(hint.contains("ADBC_DRIVER_PATH=/var/lib/queryflux/adbc:/opt/adbc"));
+        assert!(hint.contains("QUERYFLUX_ADBC_DRIVERS"));
+
+        assert!(driver_not_found_hint(None).contains("ADBC_DRIVER_PATH is not set"));
+        assert!(driver_not_found_hint(Some("")).contains("ADBC_DRIVER_PATH is not set"));
     }
 
     #[test]

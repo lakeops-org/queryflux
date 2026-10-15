@@ -196,6 +196,8 @@ clusterGroups:
 
 ## Cluster variants (multi-warehouse)
 
+ADBC clusters (`engine: adbc`) need their driver installed. The QueryFlux image ships none: declare them with `QUERYFLUX_ADBC_DRIVERS` (see **[ADBC drivers](./operations/adbc-drivers)**).
+
 A single cluster config can define **`variants`**: named overrides that expand into separate runtime clusters at load time. Use this when one credential set targets multiple Snowflake warehouses, Databricks SQL warehouses, BigQuery projects, or similar.
 
 ```yaml

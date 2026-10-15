@@ -8,7 +8,7 @@
 #   TRINO_ADBC_URI=http://localhost:18081 cargo test -p queryflux-e2e-tests -- --include-ignored
 #   docker compose -f docker-compose.test.yml down
 #
-# Trino ADBC e2e tests also need the Trino ADBC driver installed on the host (see scripts/install-adbc-trino-driver.sh).
+# Trino ADBC e2e tests also need the pinned Trino ADBC driver installed on the host: bash scripts/install-adbc-trino-driver.sh
 
 networks:
   test_net:

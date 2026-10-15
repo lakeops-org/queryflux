@@ -95,11 +95,35 @@ existingSecret:
 
 The chart also supports `env`, `envFrom`, `extraVolumes`, `extraVolumeMounts`, `extraContainers`, `nodeSelector`, `tolerations`, `affinity`, and `topologySpreadConstraints` for platform-specific integration.
 
+## ADBC drivers
+
+The image ships no ADBC drivers. List the ones your `engine: adbc` clusters use:
+
+```yaml
+adbcDrivers:
+  install: ["trino=0.6.0", "snowflake=1.14.0"]   # `dbc install` specs; pin exact versions
+  # or: dbcToml / dbcLock — a dbc driver list rendered into a ConfigMap (takes precedence)
+  onFailure: fail          # fail | warn
+  mode: initContainer      # initContainer | entrypoint
+  volume:
+    emptyDir: {}           # or a persistentVolumeClaim to keep drivers across restarts
+```
+
+- `mode: initContainer` (default): an init container installs the drivers into `volume`, and the server mounts it read-only with `ADBC_DRIVER_PATH` set. The server container needs no registry egress.
+- `mode: entrypoint`: the server container installs at startup into `volume`, mounted read-write.
+- Changing `dbcToml`/`dbcLock` rolls the pods (checksum annotation). Changing `install` changes the pod spec directly.
+- With `networkPolicy` egress rules, allow HTTPS (443) to `dbc-cdn.columnar.tech` and `dbc-cdn-private.columnar.tech`.
+- Nothing is rendered when `install` and `dbcToml` are both empty.
+- Drivers you supply yourself: mount them with `extraVolumes`/`extraVolumeMounts` and set `ADBC_DRIVER_PATH` in `env`.
+
+See [ADBC drivers](https://queryflux.dev/docs/operations/adbc-drivers) for the full reference.
+
 ## Examples
 
 - `examples/external-config-values.yaml`: use a pre-created ConfigMap and Secret, and run the server-only image.
 - `examples/production-values.yaml`: production checklist — TLS ingress, HPA, PDB, ServiceMonitor, NetworkPolicy, topology spread, `config.existingSecret`, and pre-created admin Secret (no default password in values).
 - `examples/production-config.yaml`: template for the config Secret referenced by production-values (`auth.required: true`, OIDC, Postgres URL). Create with `kubectl create secret generic queryflux-config --from-file=config.yaml=...`.
+- `examples/adbc-drivers-values.yaml`: install pinned ADBC drivers with an init container.
 - `examples/networkpolicy-values.yaml`: starter NetworkPolicy allowing clients, DNS, Postgres, and engines (tighten selectors before production).
 
 ## Validation

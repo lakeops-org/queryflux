@@ -180,6 +180,44 @@
           "type": "array"
         }
       }
+    },
+    "adbcDrivers": {
+      "type": "object",
+      "properties": {
+        "install": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "dbcToml": {
+          "type": "string"
+        },
+        "dbcLock": {
+          "type": "string"
+        },
+        "onFailure": {
+          "type": "string",
+          "enum": [
+            "fail",
+            "warn"
+          ]
+        },
+        "mode": {
+          "type": "string",
+          "enum": [
+            "initContainer",
+            "entrypoint"
+          ]
+        },
+        "volume": {
+          "type": "object"
+        },
+        "initContainerResources": {
+          "type": "object"
+        }
+      }
     }
   }
 }

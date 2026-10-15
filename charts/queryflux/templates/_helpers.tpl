@@ -70,3 +70,34 @@ Admin Secret name.
 {{- define "queryflux.secretName" -}}
 {{- default (printf "%s-admin" (include "queryflux.fullname" .)) .Values.existingSecret.name -}}
 {{- end -}}
+
+{{/*
+ADBC drivers (#297): true when the user declared any.
+*/}}
+{{- define "queryflux.adbcDrivers.enabled" -}}
+{{- if or .Values.adbcDrivers.dbcToml .Values.adbcDrivers.install -}}true{{- end -}}
+{{- end -}}
+
+{{/*
+ADBC drivers ConfigMap name (only rendered when dbcToml is set).
+*/}}
+{{- define "queryflux.adbcDrivers.configMapName" -}}
+{{- printf "%s-adbc-drivers" (include "queryflux.fullname" .) | trunc 63 | trimSuffix "-" -}}
+{{- end -}}
+
+{{/*
+Env for the container that runs docker/adbc-drivers.sh.
+*/}}
+{{- define "queryflux.adbcDrivers.installEnv" -}}
+{{- if .Values.adbcDrivers.dbcToml }}
+- name: QUERYFLUX_ADBC_DRIVERS_FILE
+  value: /etc/queryflux/adbc/dbc.toml
+{{- else }}
+- name: QUERYFLUX_ADBC_DRIVERS
+  value: {{ join " " .Values.adbcDrivers.install | quote }}
+{{- end }}
+- name: QUERYFLUX_ADBC_DRIVER_DIR
+  value: /var/lib/queryflux/adbc
+- name: QUERYFLUX_ADBC_ON_FAILURE
+  value: {{ .Values.adbcDrivers.onFailure | quote }}
+{{- end -}}

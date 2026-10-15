@@ -1,0 +1,19 @@
+# ADBC drivers for the ADBC clusters in your config (#297). The image ships none.
+#
+# Either list `dbc install` specs (pin exact versions for reproducible pods)…
+adbcDrivers:
+  install:
+    - trino=0.6.0
+    - snowflake=1.14.0
+  # …or supply a dbc.toml (and optionally the dbc.lock it produced) instead:
+  # dbcToml: |
+  #   [drivers]
+  #   [drivers.trino]
+  #   version = '=0.6.0'
+  # dbcLock: |
+  #   ...
+  #
+  # Keep drivers across pod restarts instead of re-downloading them:
+  # volume:
+  #   persistentVolumeClaim:
+  #     claimName: queryflux-adbc-drivers

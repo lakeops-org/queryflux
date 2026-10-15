@@ -86,6 +86,29 @@ jobs:
       - uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4.3.1
       - run: make helm-check
 
+  # docker/adbc-drivers.sh against the real dbc registry, in containers built from the
+  # Dockerfile's `dbc` stage — cheap, needs no QueryFlux build.
+  adbc-drivers:
+    name: ADBC driver install script
+    needs: [gate, fmt]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@44c2b7a8a4ea60a981eaca3cf939b5f4305c123b # v4.1.5
+        with:
+          persist-credentials: false
+      - uses: dorny/paths-filter@v3
+        id: paths
+        with:
+          filters: |
+            adbc:
+              - 'docker/**'
+              - 'scripts/test-adbc-drivers.sh'
+              - '.github/workflows/ci.yml'
+      - if: github.event_name == 'push' || steps.paths.outputs.adbc == 'true'
+        run: bash scripts/test-adbc-drivers.sh
+
   # The `rust` job below is expensive (up to 120min: compile, clippy, unit, Postgres, and a
   # Docker-based e2e stack) — a PR needs a maintainer's approval before it runs, so it
   # doesn't burn CI minutes on every push before anyone has looked at the PR. A push to

@@ -1,0 +1,15 @@
+{{- if .Values.adbcDrivers.dbcToml }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "queryflux.adbcDrivers.configMapName" . }}
+  labels:
+    {{- include "queryflux.labels" . | nindent 4 }}
+data:
+  dbc.toml: |
+    {{- .Values.adbcDrivers.dbcToml | nindent 4 }}
+  {{- with .Values.adbcDrivers.dbcLock }}
+  dbc.lock: |
+    {{- . | nindent 4 }}
+  {{- end }}
+{{- end }}

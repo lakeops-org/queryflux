@@ -1,3 +1,4 @@
+{{- $adbcDrivers := include "queryflux.adbcDrivers.enabled" . }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -13,10 +14,13 @@ spec:
       {{- include "queryflux.selectorLabels" . | nindent 6 }}
   template:
     metadata:
-      {{- if or (and .Values.config.create (not .Values.config.existingSecret)) (not .Values.existingSecret.name) .Values.podAnnotations }}
+      {{- if or (and .Values.config.create (not .Values.config.existingSecret)) (not .Values.existingSecret.name) .Values.adbcDrivers.dbcToml .Values.podAnnotations }}
       annotations:
         {{- if and .Values.config.create (not .Values.config.existingSecret) }}
         checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- end }}
+        {{- if .Values.adbcDrivers.dbcToml }}
+        checksum/adbc-drivers: {{ include (print $.Template.BasePath "/adbc-drivers-configmap.yaml") . | sha256sum }}
         {{- end }}
         {{- if not .Values.existingSecret.name }}
         checksum/admin-secret: {{ include (print $.Template.BasePath "/secret.yaml") . | sha256sum }}
@@ -41,6 +45,32 @@ spec:
       {{- end }}
       securityContext:
         {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      {{- if and $adbcDrivers (eq .Values.adbcDrivers.mode "initContainer") }}
+      initContainers:
+        # Installs the declared ADBC drivers into the shared volume; the server mounts it read-only.
+        - name: adbc-drivers
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["/app/adbc-drivers.sh"]
+          env:
+            {{- include "queryflux.adbcDrivers.installEnv" . | nindent 12 }}
+          {{- with .Values.adbcDrivers.initContainerResources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - name: adbc-drivers
+              mountPath: /var/lib/queryflux/adbc
+            - name: tmp
+              mountPath: /tmp
+            {{- if .Values.adbcDrivers.dbcToml }}
+            - name: adbc-drivers-config
+              mountPath: /etc/queryflux/adbc
+              readOnly: true
+            {{- end }}
+      {{- end }}
       containers:
         - name: {{ .Chart.Name }}
           securityContext:
@@ -64,6 +94,14 @@ spec:
                   key: {{ .Values.existingSecret.passwordKey }}
             - name: TMPDIR
               value: /tmp
+            {{- if $adbcDrivers }}
+            {{- if eq .Values.adbcDrivers.mode "initContainer" }}
+            - name: ADBC_DRIVER_PATH
+              value: /var/lib/queryflux/adbc
+            {{- else }}
+            {{- include "queryflux.adbcDrivers.installEnv" . | nindent 12 }}
+            {{- end }}
+            {{- end }}
             {{- with .Values.env }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
@@ -99,6 +137,16 @@ spec:
               readOnly: true
             - name: tmp
               mountPath: /tmp
+            {{- if $adbcDrivers }}
+            - name: adbc-drivers
+              mountPath: /var/lib/queryflux/adbc
+              readOnly: {{ eq .Values.adbcDrivers.mode "initContainer" }}
+            {{- if and .Values.adbcDrivers.dbcToml (eq .Values.adbcDrivers.mode "entrypoint") }}
+            - name: adbc-drivers-config
+              mountPath: /etc/queryflux/adbc
+              readOnly: true
+            {{- end }}
+            {{- end }}
             {{- with .Values.extraVolumeMounts }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
@@ -126,6 +174,15 @@ spec:
           {{- end }}
         - name: tmp
           emptyDir: {}
+        {{- if $adbcDrivers }}
+        - name: adbc-drivers
+          {{- toYaml .Values.adbcDrivers.volume | nindent 10 }}
+        {{- if .Values.adbcDrivers.dbcToml }}
+        - name: adbc-drivers-config
+          configMap:
+            name: {{ include "queryflux.adbcDrivers.configMapName" . }}
+        {{- end }}
+        {{- end }}
         {{- with .Values.extraVolumes }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
