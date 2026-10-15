@@ -931,6 +931,7 @@ async fn main() -> Result<()> {
             cache: adapter_reload_cache.clone(),
             metrics: app_state.metrics.clone(),
             changed: Some(config_changed_tx),
+            translation: is_worker.then(|| app_state.translation.clone()),
         };
         tokio::spawn(run_reload_loop(source, handles, shutdown_rx.clone()));
         if is_worker {

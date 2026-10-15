@@ -196,6 +196,14 @@ impl ProxyConfig {
                     ("catalogProvider", is_set(&self.catalog_provider)),
                     ("guardrails", self.guardrails.is_some()),
                     ("accessControl", self.access_control.is_some()),
+                    (
+                        "translation.mode",
+                        self.translation.mode != TranslationMode::default(),
+                    ),
+                    (
+                        "translation.errorOnUnsupported",
+                        self.translation.error_on_unsupported,
+                    ),
                 ];
                 for (key, set) in owned_by_control_plane {
                     if set {
@@ -3981,6 +3989,21 @@ queryflux:
             c.queryflux.coordination.as_ref().unwrap().on_unavailable,
             OnCoordinationUnavailable::FailClosed
         );
+        assert_eq!(c.validate_role(), Ok(()));
+    }
+
+    #[test]
+    fn a_worker_takes_its_translation_policy_from_the_control_plane() {
+        let c = parse(&format!("{WORKER}translation:\n  mode: strict\n"));
+        let issues = c.validate_role().unwrap_err();
+        assert!(
+            issues.iter().any(|i| i.contains("translation.mode")),
+            "{issues:?}"
+        );
+        // Local translation settings that are not policy stay allowed.
+        let c = parse(&format!(
+            "{WORKER}translation:\n  schemaResolutionTimeoutMs: 500\n"
+        ));
         assert_eq!(c.validate_role(), Ok(()));
     }
 

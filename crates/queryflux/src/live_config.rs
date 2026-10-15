@@ -446,6 +446,7 @@ pub(crate) fn snapshot_from_inputs(
             .into_iter()
             .collect(),
         history: None,
+        translation: None,
         settings: SnapshotSettings {
             guardrails: inputs.settings.guardrails.clone(),
             security: inputs.settings.security.clone(),
@@ -646,7 +647,18 @@ pub(crate) async fn build_worker_snapshot(
     }
     let mut snapshot = snapshot_from_inputs(&inputs, credentials)?;
     snapshot.history = history_policy(yaml);
+    snapshot.translation = Some(translation_policy(yaml));
     Ok(snapshot.seal())
+}
+
+/// The translation failure policy a control plane hands its workers (its `translation`).
+pub(crate) fn translation_policy(
+    yaml: &queryflux_core::config::ProxyConfig,
+) -> queryflux_core::worker_snapshot::TranslationPolicy {
+    queryflux_core::worker_snapshot::TranslationPolicy {
+        mode: yaml.translation.mode,
+        error_on_unsupported: yaml.translation.error_on_unsupported,
+    }
 }
 
 /// The history policy a control plane hands its workers (`workerApi.history`).

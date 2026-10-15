@@ -29,6 +29,8 @@ pub(crate) struct LiveHandles {
     pub(crate) metrics: Arc<dyn MetricsStore>,
     /// Bumped after every reload attempt; the worker API's long-polls wait on it.
     pub(crate) changed: Option<watch::Sender<u64>>,
+    /// A worker applies its snapshot's translation policy here.
+    pub(crate) translation: Option<Arc<queryflux_translation::TranslationService>>,
 }
 
 #[async_trait]
@@ -403,6 +405,9 @@ impl RemoteConfigSource {
         let mut live_guard = handles.live.write().await;
         *cache_guard = candidate_cache;
         *live_guard = new_live;
+        if let (Some(service), Some(policy)) = (&handles.translation, snapshot.translation) {
+            service.set_policy(policy.mode, policy.error_on_unsupported);
+        }
         Ok(())
     }
 }
@@ -592,6 +597,7 @@ mod tests {
             })),
             metrics: Arc::new(queryflux_metrics::NoopMetricsStore),
             changed: None,
+            translation: None,
         }
     }
 
@@ -621,6 +627,7 @@ mod tests {
             group_translation_scripts: Default::default(),
             settings: SnapshotSettings::default(),
             history: None,
+            translation: None,
         }
         .seal()
     }
@@ -698,6 +705,27 @@ mod tests {
         *current.lock().unwrap() = snapshot(7);
         src.reload(&h).await;
         assert_eq!(group_limit(&h).await, Some(7));
+    }
+
+    #[tokio::test]
+    async fn worker_applies_the_control_planes_translation_policy() {
+        use queryflux_core::config::TranslationMode;
+        let mut snap = snapshot(3);
+        snap.translation = Some(queryflux_core::worker_snapshot::TranslationPolicy {
+            mode: TranslationMode::Strict,
+            error_on_unsupported: false,
+        });
+        let current = Arc::new(std::sync::Mutex::new(snap.seal()));
+        let url = control_plane(current).await;
+        let (src, _state) = source(&url, "s3cret");
+        let service = Arc::new(queryflux_translation::TranslationService::disabled());
+        let h = LiveHandles {
+            translation: Some(service.clone()),
+            ..handles()
+        };
+        assert_eq!(service.policy(), (TranslationMode::BestEffort, false));
+        src.reload(&h).await;
+        assert_eq!(service.policy(), (TranslationMode::Strict, false));
     }
 
     #[tokio::test]

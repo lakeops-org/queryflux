@@ -95,13 +95,13 @@ queryflux:
     port: 9000                   # ops listener: /health, /readyz, /metrics, /worker/status
 ```
 
-Everything the control plane owns is rejected in a worker config: `persistence` (other than `inMemory`), clusters, groups, routers, `routingFallback`, `auth`, `authorization`, `catalogProvider`, `guardrails`, `accessControl` and `workerApi`. `queryflux validate` lists any such settings it finds.
+Everything the control plane owns is rejected in a worker config: `persistence` (other than `inMemory`), clusters, groups, routers, `routingFallback`, `auth`, `authorization`, `catalogProvider`, `guardrails`, `accessControl`, `translation.mode`, `translation.errorOnUnsupported` and `workerApi`. Other `translation` settings (`pythonScripts`, `schemaResolutionTimeoutMs`) stay local to the worker for now. `queryflux validate` lists any such settings it finds.
 
 QueryFlux does not expand environment variables in its config file. Mount a worker config that holds the shared secret from a Kubernetes Secret.
 
 ## How config reaches workers
 
-1. **Snapshot.** The control plane serves `GET /worker/config`. The response is everything a worker needs to compile its live config: clusters, groups, routers, translation scripts, settings and the history policy. Its `revision` is a content hash, so the same config has the same revision on every control plane replica.
+1. **Snapshot.** The control plane serves `GET /worker/config`. The response is everything a worker needs to compile its live config: clusters, groups, routers, translation scripts, settings, the history policy and the translation failure policy (`translation.mode` and `errorOnUnsupported`, applied without a restart). Its `revision` is a content hash, so the same config has the same revision on every control plane replica.
 2. **Change detection.** The worker long-polls `GET /worker/config/wait?since=<revision>`. The control plane answers as soon as its config changes, usually in under a second. Otherwise it answers after `pollTimeoutSecs` with `304 Not Modified`.
 3. **Activation.** A new snapshot is verified (schema version, revision hash) and compiled strictly: an invalid adapter or script rejects the whole snapshot. Only then is it swapped in atomically. A rejected snapshot leaves the previous one active, and the worker reports the error in its heartbeat and in `/worker/status`.
 4. **Before the first snapshot.** The worker accepts connections, but queries get a retryable "not configured" error:

@@ -573,6 +573,7 @@ mod tests {
             group_translation_scripts: Default::default(),
             settings: SnapshotSettings::default(),
             history: None,
+            translation: None,
         }
         .seal()
     }

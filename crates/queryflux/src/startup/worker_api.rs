@@ -10,7 +10,7 @@ use queryflux_persistence::ConfigSnapshotStore;
 
 use crate::live_config::{
     build_worker_snapshot, history_policy, inline_script_files, snapshot_from_inputs,
-    validate_snapshot_inputs, LiveConfigInputs, SettingsInputs,
+    translation_policy, validate_snapshot_inputs, LiveConfigInputs, SettingsInputs,
 };
 
 /// The worker API for this process, if `queryflux.workerApi.enabled`.
@@ -77,6 +77,7 @@ pub(crate) fn worker_api(
             }
             let mut fixed = snapshot_from_inputs(&inputs, credentials)?;
             fixed.history = history_policy(config);
+            fixed.translation = Some(translation_policy(config));
             let fixed = fixed.seal();
             tracing::info!(revision = %fixed.revision, "Serving a fixed worker config snapshot (no Postgres)");
             Arc::new(move || {
