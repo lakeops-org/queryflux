@@ -124,8 +124,14 @@ impl Fixture {
         }
     }
     /// Build the same cache key dispatch uses for this fixture's identity and database.
-    fn key(&self, sql: &str) -> CacheKey {
-        CacheKey::new(sql, "duckdb", &self.session, "alice", &[])
+    async fn key(&self, sql: &str) -> CacheKey {
+        let scope = self
+            .state
+            .live
+            .read()
+            .await
+            .group_config_fingerprint("duckdb");
+        CacheKey::new_scoped(sql, "duckdb", &scope, &self.session, "alice", &[])
     }
     /// Dispatch one separate request, returning its results or propagating execution errors.
     async fn try_run(&self, sql: &str) -> Result<Sink> {
@@ -178,7 +184,7 @@ impl Fixture {
         let mut writer = self
             .state
             .result_cache
-            .writer(&self.key(sql), 300)
+            .writer(&self.key(sql).await, 300)
             .await
             .unwrap();
         writer.write_schema(&schema).await.unwrap();
@@ -189,7 +195,7 @@ impl Fixture {
     /// Check whether unexpired cache metadata exists for this exact request.
     async fn cached(&self, sql: &str) -> bool {
         self.store
-            .cache_get_valid(&self.key(sql).hex)
+            .cache_get_valid(&self.key(sql).await.hex)
             .await
             .unwrap()
             .is_some()
@@ -440,6 +446,47 @@ async fn global_translation_fixups_bypass_cache() {
 }
 
 /// Fixups on another group must not disable this group's deterministic read cache.
+#[tokio::test]
+async fn editing_a_member_cluster_stops_serving_earlier_results() {
+    let f = Fixture::new().await;
+    let sql = "SELECT CAST(42 AS BIGINT)";
+    assert_eq!(f.scalar(sql).await, 42);
+    assert!(f.cached(sql).await);
+
+    // The group's cluster now points somewhere else: earlier results must not be served.
+    f.state.live.write().await.cluster_configs.insert(
+        "duckdb-1".into(),
+        serde_json::from_value(
+            serde_json::json!({ "engine": "duckDb", "databasePath": "/tmp/other.db" }),
+        )
+        .unwrap(),
+    );
+    assert!(
+        !f.cached(sql).await,
+        "the old entry is keyed on the old cluster config"
+    );
+    assert_eq!(f.scalar(sql).await, 42);
+    assert_eq!(f.hits(), 0);
+}
+
+#[tokio::test]
+async fn editing_another_group_keeps_cache_hits() {
+    let f = Fixture::new().await;
+    let sql = "SELECT CAST(42 AS BIGINT)";
+    assert_eq!(f.scalar(sql).await, 42);
+    {
+        let mut live = f.state.live.write().await;
+        live.group_members
+            .insert("other".into(), vec!["other-1".into()]);
+        live.cluster_configs.insert(
+            "other-1".into(),
+            serde_json::from_value(serde_json::json!({ "engine": "duckDb" })).unwrap(),
+        );
+    }
+    assert_eq!(f.scalar(sql).await, 42);
+    assert_eq!(f.hits(), 1);
+}
+
 #[tokio::test]
 async fn unrelated_group_fixups_preserve_cache_hits() {
     let mut f = Fixture::new().await;

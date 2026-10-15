@@ -2445,8 +2445,16 @@ pub async fn execute_to_sink(
     } else {
         false
     };
-    let cache_key = cache_eligible
-        .then(|| queryflux_cache::CacheKey::new(&sql, &group.0, &session, &auth_ctx.user, &params));
+    let cache_key = cache_eligible.then(|| {
+        queryflux_cache::CacheKey::new_scoped(
+            &sql,
+            &group.0,
+            &live.group_config_fingerprint(&group.0),
+            &session,
+            &auth_ctx.user,
+            &params,
+        )
+    });
     // Set inside the `cache_key` block below when access control rewrites the query (row
     // filters/masks may since have changed for this user/group, so a cached entry can't be
     // trusted). Read again after that block, by the cache-write path: a rewritten query's

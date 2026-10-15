@@ -78,6 +78,21 @@ impl CacheKey {
         user: &str,
         params: &[QueryParam],
     ) -> Self {
+        Self::new_scoped(sql, group, &[], session, user, params)
+    }
+
+    /// Like [`CacheKey::new`], also keyed on `scope`: bytes describing what the result
+    /// depends on beyond the query, such as the group's member clusters and their config.
+    /// When the scope changes, earlier entries stop matching and expire normally. An empty
+    /// scope gives the same key as [`CacheKey::new`].
+    pub fn new_scoped(
+        sql: &str,
+        group: &str,
+        scope: &[u8],
+        session: &SessionContext,
+        user: &str,
+        params: &[QueryParam],
+    ) -> Self {
         let mut hasher = Xxh64::new(0);
         // Version the hash input, keeping the persisted hex key and group/hex.arrow
         // path layout intact (including cleanup of legacy entries). Old entries
@@ -93,6 +108,9 @@ impl CacheKey {
         hasher.update(&(params.len() as u64).to_le_bytes());
         for param in params {
             hash_param(&mut hasher, param);
+        }
+        if !scope.is_empty() {
+            hash_field(&mut hasher, b'N', scope);
         }
         let digest = hasher.digest();
         Self {
@@ -259,6 +277,21 @@ mod tests {
             a.hex, b.hex,
             "text parameter boundaries must affect the key"
         );
+    }
+
+    #[test]
+    fn cache_key_scope() {
+        let s = SessionContext::default();
+        let plain = CacheKey::new("SELECT 1", "g", &s, "u", &[]);
+        assert_eq!(
+            CacheKey::new_scoped("SELECT 1", "g", &[], &s, "u", &[]).hex,
+            plain.hex,
+            "an empty scope keeps the unscoped key"
+        );
+        let a = CacheKey::new_scoped("SELECT 1", "g", b"cluster-a", &s, "u", &[]);
+        let b = CacheKey::new_scoped("SELECT 1", "g", b"cluster-b", &s, "u", &[]);
+        assert_ne!(a.hex, plain.hex);
+        assert_ne!(a.hex, b.hex);
     }
 
     #[test]

@@ -99,7 +99,7 @@ pub enum HistoryRedaction {
 /// insertion order when any crate in the build enables `serde_json/preserve_order`, and
 /// `HashMap` fields insert in a per-process random order, so plain serialization would give
 /// the same config different revisions on different control plane replicas.
-fn write_canonical(value: &serde_json::Value, out: &mut Vec<u8>) {
+pub fn write_canonical(value: &serde_json::Value, out: &mut Vec<u8>) {
     match value {
         serde_json::Value::Object(map) => {
             let mut entries: Vec<_> = map.iter().collect();

@@ -89,6 +89,38 @@ pub struct LiveConfig {
 }
 
 impl LiveConfig {
+    /// What a group's query results depend on besides the query: its member clusters and
+    /// their config (endpoint, catalog, credentials, variants). Part of the result-cache
+    /// key, so repointing a group or editing one of its clusters stops serving earlier
+    /// results, while edits to other groups leave its cache alone. Canonical JSON, so it is
+    /// the same on every process for the same config.
+    pub fn group_config_fingerprint(&self, group: &str) -> Vec<u8> {
+        let mut members: Vec<&String> = self
+            .group_members
+            .get(group)
+            .map(|m| m.iter().collect())
+            .unwrap_or_default();
+        members.sort();
+        members.dedup();
+        let clusters: serde_json::Map<String, serde_json::Value> = members
+            .iter()
+            .map(|name| {
+                let config = self
+                    .cluster_configs
+                    .get(name.as_str())
+                    .and_then(|c| serde_json::to_value(c).ok())
+                    .unwrap_or(serde_json::Value::Null);
+                (name.to_string(), config)
+            })
+            .collect();
+        let mut out = Vec::new();
+        queryflux_core::worker_snapshot::write_canonical(
+            &serde_json::Value::Object(clusters),
+            &mut out,
+        );
+        out
+    }
+
     /// False until the instance has at least one cluster group: a worker before its first
     /// config snapshot. Every valid standalone config has a group (startup rejects one
     /// whose routing fallback names no group).
