@@ -1107,7 +1107,10 @@ async fn acquire_global_capacity(
         .await
     {
         Ok(true) => CapacityGrant::Granted,
-        Ok(false) => CapacityGrant::Denied,
+        Ok(false) => {
+            state.metrics.on_capacity_lease_denied(&group.0, &cluster.0);
+            CapacityGrant::Denied
+        }
         Err(e) => {
             state.metrics.on_coordination_failure("capacity_acquire");
             tracing::warn!(
@@ -1548,6 +1551,9 @@ struct SyncQuerySetup {
     /// The wire auth resolved at submit time — reused by `SyncCancelGuard` so a client
     /// disconnect cancels with the same identity the query was submitted under.
     wire_auth: Option<StoredWireAuth>,
+    /// Time spent waiting for a local slot or a shared-capacity lease; 0 when a slot was
+    /// free on the first try.
+    queue_duration_ms: u64,
 }
 
 /// The outcome of executing a sync query — everything record_query needs.
@@ -1705,6 +1711,14 @@ async fn setup_sync_query(
                 seq += 1;
             }
         }
+    };
+
+    // Capacity wait only, like the async path's `queued_since`: 0 when the first attempt
+    // got a slot and a lease.
+    let queue_duration_ms = if seq > 0 {
+        (Utc::now() - wait_start).num_milliseconds().max(0) as u64
+    } else {
+        0
     };
 
     let (cluster_group_config_id, cluster_config_id) =
@@ -2030,6 +2044,7 @@ async fn setup_sync_query(
         params: effective_params,
         guard_actions: pre_guard_actions,
         wire_auth,
+        queue_duration_ms,
     })
 }
 
@@ -2784,7 +2799,7 @@ async fn execute_to_sink_inner(
                         engine_stats: None,
                         guard_actions: all_actions,
                         was_guard_blocked: true,
-                        queue_duration_ms: 0,
+                        queue_duration_ms: setup.queue_duration_ms,
                         cache_hit: false,
                     },
                 );
@@ -2842,6 +2857,7 @@ async fn execute_to_sink_inner(
     setup.slot.release().await;
     let mut final_outcome: QueryOutcome = outcome.into();
     final_outcome.backend_query_id = id_slot.get().map(|id| id.0);
+    final_outcome.queue_duration_ms = setup.queue_duration_ms;
     // Prepend guard actions (allow/warn) collected before execution.
     if !setup.guard_actions.is_empty() {
         setup.guard_actions.extend(final_outcome.guard_actions);

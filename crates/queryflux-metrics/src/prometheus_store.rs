@@ -48,6 +48,13 @@ pub struct PrometheusMetrics {
     /// replica fell back to local limits. Non-zero means global max_running_queries
     /// was not enforced for those admits. Pair with coordination_failures_total.
     capacity_degraded_total: CounterVec,
+    /// queryflux_capacity_lease_denied_total{cluster_group, cluster_name}
+    ///
+    /// Times this process had a free local slot but the shared limit was full, so the
+    /// query waited in the queue. Compared across workers with
+    /// `queryflux_queue_duration_seconds`, it shows whether some workers wait more than
+    /// others for the same group.
+    capacity_lease_denied_total: CounterVec,
     /// queryflux_auth_failures_total{protocol}
     auth_failures_total: CounterVec,
     /// queryflux_config_reload_failures_total{stage}
@@ -176,6 +183,14 @@ impl PrometheusMetrics {
             &["cluster_group", "cluster_name"],
         )?;
 
+        let capacity_lease_denied_total = CounterVec::new(
+            Opts::new(
+                "queryflux_capacity_lease_denied_total",
+                "Queries queued because the shared (fleet-wide) limit was full",
+            ),
+            &["cluster_group", "cluster_name"],
+        )?;
+
         let auth_failures_total = CounterVec::new(
             Opts::new(
                 "queryflux_auth_failures_total",
@@ -245,6 +260,7 @@ impl PrometheusMetrics {
         registry.register(Box::new(auth_failures_total.clone()))?;
         registry.register(Box::new(config_reload_failures_total.clone()))?;
         registry.register(Box::new(worker_config_stale.clone()))?;
+        registry.register(Box::new(capacity_lease_denied_total.clone()))?;
         registry.register(Box::new(queue_rejections_total.clone()))?;
         registry.register(Box::new(queue_duration_seconds.clone()))?;
         registry.register(Box::new(cache_hits_total.clone()))?;
@@ -266,6 +282,7 @@ impl PrometheusMetrics {
             query_tags_total,
             coordination_failures_total,
             capacity_degraded_total,
+            capacity_lease_denied_total,
             auth_failures_total,
             config_reload_failures_total,
             worker_config_stale,
@@ -364,6 +381,12 @@ impl MetricsStore for PrometheusMetrics {
 
     fn on_capacity_degraded(&self, cluster_group: &str, cluster_name: &str) {
         self.capacity_degraded_total
+            .with_label_values(&[cluster_group, cluster_name])
+            .inc();
+    }
+
+    fn on_capacity_lease_denied(&self, cluster_group: &str, cluster_name: &str) {
+        self.capacity_lease_denied_total
             .with_label_values(&[cluster_group, cluster_name])
             .inc();
     }
@@ -472,6 +495,23 @@ impl MetricsStore for PrometheusMetrics {
 mod tests {
     use super::*;
     use queryflux_persistence::MetricsStore;
+
+    #[test]
+    fn worker_fleet_metrics() {
+        let metrics = PrometheusMetrics::new().expect("prometheus init");
+        metrics.on_capacity_lease_denied("analytics", "trino-a");
+        metrics.on_capacity_lease_denied("analytics", "trino-a");
+        metrics.on_worker_config_stale(true);
+        let text = metrics.gather_text();
+        assert!(text.contains(
+            "queryflux_capacity_lease_denied_total{cluster_group=\"analytics\",cluster_name=\"trino-a\"} 2"
+        ));
+        assert!(text.contains("queryflux_worker_config_stale 1"));
+        metrics.on_worker_config_stale(false);
+        assert!(metrics
+            .gather_text()
+            .contains("queryflux_worker_config_stale 0"));
+    }
 
     #[test]
     fn circuit_state_gauge_tracks_transitions_and_disabled_policy() {

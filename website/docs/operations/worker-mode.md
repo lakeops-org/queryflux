@@ -157,6 +157,18 @@ One `maxRunningQueries` therefore holds across the control plane and every worke
 | Control plane down, `onUnavailable: localLimits` | New queries are admitted against the worker's own limit. The fleet can exceed the global limit until the control plane returns. |
 | `mode: local` | Limits apply to each worker alone. Use this only when one worker serves a group. |
 
+**Fairness.** The shared limit is a hard cap, but queries waiting on different workers are not served in one global order: each worker retries for its own waiting queries. To check whether some workers wait more than others for the same group, compare per worker (per scraped pod):
+
+```promql
+# 95th percentile time spent waiting for capacity, per worker
+histogram_quantile(0.95, sum by (pod, cluster_group, le) (rate(queryflux_queue_duration_seconds_bucket[10m])))
+
+# how often each worker had local room but the shared limit was full
+sum by (pod, cluster_group) (rate(queryflux_capacity_lease_denied_total[10m]))
+```
+
+A consistently higher wait on some workers for the same group means waiters are being starved. An ordered wait queue on the control plane is planned for that case.
+
 Each worker sweeps its own zombie and stale queued queries. Those live in its memory.
 
 If two or more workers share clusters with `coordination.mode: local`, the control plane logs a warning, because the effective limit is then multiplied by the number of workers.

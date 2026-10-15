@@ -177,6 +177,10 @@ pub trait MetricsStore: Send + Sync {
     /// `authz_rebuild`, or `guard_reload`.
     fn on_config_reload_failure(&self, _stage: &str) {}
 
+    /// Called when a query had a free local slot but the shared limit (distributed mode or
+    /// a worker's control plane) was full, so it waits in the queue.
+    fn on_capacity_lease_denied(&self, _cluster_group: &str, _cluster_name: &str) {}
+
     /// Called when a worker starts or stops serving a config its control plane has not
     /// confirmed (one copied from a peer at startup).
     fn on_worker_config_stale(&self, _stale: bool) {}
