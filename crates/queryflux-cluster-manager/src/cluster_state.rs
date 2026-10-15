@@ -77,6 +77,18 @@ impl ClusterState {
         self
     }
 
+    /// Share the running/queued counters of the previous generation's state across a config
+    /// reload. Queries admitted before the reload release through the cluster manager that
+    /// admitted them, i.e. the previous state; copying the counts instead would leave the new
+    /// state holding those slots forever.
+    pub fn with_shared_load_counters(mut self, previous: Option<&ClusterState>) -> Self {
+        if let Some(state) = previous.filter(|state| state.group_name == self.group_name) {
+            self.running_queries = state.running_queries.clone();
+            self.queued_queries = state.queued_queries.clone();
+        }
+        self
+    }
+
     pub fn breaker_state(&self) -> Option<CircuitState> {
         self.breaker.as_ref().map(|breaker| breaker.state())
     }
@@ -147,6 +159,31 @@ impl ClusterState {
     pub fn set_running_queries(&self, count: u64) {
         let clamped = count.min(self.max_running_queries());
         self.running_queries.store(clamped, Ordering::Relaxed);
+    }
+
+    /// Correct the running counter by the drift measured against the engine:
+    /// `counter += target - observed`, clamped to `[0, max_running_queries]`.
+    ///
+    /// `observed` is the counter value read *before* the (slow) engine fetch. Applying the
+    /// correction relative to it keeps admissions and releases that happened during the fetch,
+    /// which an absolute `set_running_queries(target)` would overwrite — including those made
+    /// by a newer config generation that shares this counter. Returns the new value.
+    pub fn reconcile_running(&self, observed: u64, target: u64) -> u64 {
+        let max = self.max_running_queries();
+        let adjust = |current: u64| {
+            let corrected = if target >= observed {
+                current.saturating_add(target - observed)
+            } else {
+                current.saturating_sub(observed - target)
+            };
+            corrected.min(max)
+        };
+        match self
+            .running_queries
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |c| Some(adjust(c)))
+        {
+            Ok(previous) | Err(previous) => adjust(previous),
+        }
     }
 
     pub fn set_queued_queries(&self, count: u64) {
@@ -345,5 +382,62 @@ mod circuit_breaker_tests {
                 .breaker_state(),
             Some(CircuitState::Closed)
         );
+    }
+}
+
+#[cfg(test)]
+mod reload_counter_tests {
+    use super::*;
+
+    fn state(group: &str) -> ClusterState {
+        ClusterState::new(
+            ClusterName("shared".into()),
+            ClusterGroupName(group.into()),
+            None,
+            None,
+            EngineType::Trino,
+            None,
+            10,
+            true,
+        )
+    }
+
+    #[test]
+    fn reload_shares_load_counters_within_the_same_group() {
+        let previous = state("first");
+        assert!(previous.try_increment_running());
+        previous.increment_queued();
+
+        let next = state("first").with_shared_load_counters(Some(&previous));
+        assert_eq!(next.running_queries(), 1);
+        assert_eq!(next.queued_queries(), 1);
+
+        // A query admitted before the reload releases through the previous state.
+        previous.decrement_running();
+        assert_eq!(next.running_queries(), 0);
+
+        let other_group = state("second").with_shared_load_counters(Some(&previous));
+        assert!(other_group.try_increment_running());
+        assert_eq!(previous.running_queries(), 0);
+    }
+
+    #[test]
+    fn reconcile_keeps_admissions_made_during_the_engine_fetch() {
+        let state = state("first");
+        for _ in 0..3 {
+            assert!(state.try_increment_running());
+        }
+        let observed = state.running_queries(); // 3, of which 2 leaked
+        assert!(state.try_increment_running()); // admitted while the fetch is in flight
+        assert_eq!(state.reconcile_running(observed, 1), 2);
+        assert_eq!(state.running_queries(), 2);
+    }
+
+    #[test]
+    fn reconcile_is_clamped_to_zero_and_max() {
+        let state = state("first");
+        assert!(state.try_increment_running());
+        assert_eq!(state.reconcile_running(5, 0), 0, "never underflows");
+        assert_eq!(state.reconcile_running(0, 50), 10, "never exceeds max");
     }
 }

@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use queryflux_auth::AuthContext;
 use queryflux_core::{
     error::Result,
@@ -34,14 +36,19 @@ pub struct RoutingTrace {
 
 /// Evaluates a list of routers in order; first Route or Deny wins.
 /// Falls back to the configured default group if all routers return NoMatch.
+/// Clones share router implementations so requests can retain a reload generation.
+#[derive(Clone)]
 pub struct RouterChain {
-    routers: Vec<Box<dyn RouterTrait>>,
+    routers: Arc<Vec<Box<dyn RouterTrait>>>,
     fallback: ClusterGroupName,
 }
 
 impl RouterChain {
     pub fn new(routers: Vec<Box<dyn RouterTrait>>, fallback: ClusterGroupName) -> Self {
-        Self { routers, fallback }
+        Self {
+            routers: Arc::new(routers),
+            fallback,
+        }
     }
 
     /// Route and return only the chain result (no trace overhead).
@@ -52,7 +59,7 @@ impl RouterChain {
         frontend_protocol: &FrontendProtocol,
         auth_ctx: Option<&AuthContext>,
     ) -> Result<ChainRouteResult> {
-        for router in &self.routers {
+        for router in self.routers.iter() {
             match router
                 .route(sql, session, frontend_protocol, auth_ctx)
                 .await?
@@ -77,7 +84,7 @@ impl RouterChain {
     ) -> Result<(ChainRouteResult, RoutingTrace)> {
         let mut decisions = Vec::with_capacity(self.routers.len());
 
-        for router in &self.routers {
+        for router in self.routers.iter() {
             match router
                 .route(sql, session, frontend_protocol, auth_ctx)
                 .await?

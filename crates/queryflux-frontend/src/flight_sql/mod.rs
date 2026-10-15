@@ -201,7 +201,8 @@ impl FlightSqlService for QueryFluxFlightSql {
             bearer_token: bearer,
             ..Default::default()
         };
-        let auth_provider = self.state.live.read().await.auth_provider.clone();
+        let live = self.state.snapshot().await;
+        let auth_provider = live.auth_provider.clone();
         let auth_ctx = match auth_provider.authenticate(&creds).await {
             Ok(ctx) => ctx,
             Err(e) => {
@@ -213,7 +214,6 @@ impl FlightSqlService for QueryFluxFlightSql {
         };
 
         let routing_result = {
-            let live = self.state.live.read().await;
             live.router_chain
                 .route_with_trace(&sql, &session, &protocol, Some(&auth_ctx))
                 .await
@@ -233,8 +233,7 @@ impl FlightSqlService for QueryFluxFlightSql {
                 return Err(Status::permission_denied(message));
             }
         };
-        group = self
-            .state
+        group = live
             .resolve_routed_group(group, &mut routing_trace, &auth_ctx)
             .await
             .map_err(|e| match e {
@@ -253,6 +252,7 @@ impl FlightSqlService for QueryFluxFlightSql {
         let exec_task = AbortOnDrop::new(tokio::spawn(async move {
             let _ = execute_to_sink(
                 &state2,
+                &live,
                 sql2,
                 vec![],
                 session,
