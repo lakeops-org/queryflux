@@ -120,31 +120,20 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,id=queryflux-registry \
     cp target/release/deps/libduckdb.so /queryflux-libduckdb.so'
 
 # =============================================================================
-# dbc CLI (pinned, checksum-verified) — installs ADBC drivers at container start
+# dbc CLI — installs the ADBC drivers users declare, at container start
 # =============================================================================
 FROM debian:trixie-slim AS dbc
 
 ARG DBC_VERSION=0.3.1
-ARG DBC_SHA256_AMD64=d394fe15226c3db4a980568f2b3aff049c58ef2badea6cbb711bc4cf3b7b2ed7
-ARG DBC_SHA256_ARM64=1a875bb6b1c76c83141a6a3aa0ce8510b1715c220ddbe88399377871abbe6982
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
-RUN set -eu; \
-    case "$(dpkg --print-architecture)" in \
-      amd64) arch=amd64; sha="${DBC_SHA256_AMD64}" ;; \
-      arm64) arch=arm64; sha="${DBC_SHA256_ARM64}" ;; \
-      *) echo "unsupported arch: $(dpkg --print-architecture)"; exit 1 ;; \
-    esac; \
-    tarball="dbc-linux-${arch}-${DBC_VERSION}.tar.gz"; \
-    curl -fsSLo "/tmp/${tarball}" "https://github.com/columnar-tech/dbc/releases/download/v${DBC_VERSION}/${tarball}"; \
-    echo "${sha}  /tmp/${tarball}" | sha256sum -c -; \
-    tar -xzf "/tmp/${tarball}" -C /tmp dbc; \
-    install -m 0755 /tmp/dbc /usr/local/bin/dbc; \
-    dbc --version
+RUN curl -LsSf https://dbc.columnar.tech/install.sh \
+    | DBC_UNMANAGED_INSTALL=/usr/local/bin sh -s -- --version "${DBC_VERSION}" \
+    && dbc --version
 
 # =============================================================================
 # QueryFlux Studio — pre-built standalone image used by runtime-unified
