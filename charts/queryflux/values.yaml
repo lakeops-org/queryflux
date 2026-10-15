@@ -109,6 +109,11 @@ config:
 service:
   type: ClusterIP
   annotations: {}
+  # "" (Kubernetes default: None) or ClientIP. Workers need ClientIP when more than one
+  # replica sits behind this Service: a running query (Trino polls, Snowflake and MCP
+  # sessions) lives in the memory of the worker that started it.
+  sessionAffinity: ""
+  sessionAffinityTimeoutSeconds: 10800
   ports:
     trinoHttp:
       enabled: true

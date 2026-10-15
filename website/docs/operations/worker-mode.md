@@ -230,5 +230,8 @@ See the [Helm chart README](https://github.com/lakeops-org/queryflux/blob/main/c
 
 ## Limitations
 
-- Snowflake HTTP sessions and MCP sessions live in each worker's memory. For a shared-service worker with more than one replica, use sticky sessions, as described in [Multi-replica operations](./multi-replica).
+- A running query lives in the memory of the worker that started it. That covers Trino result polls (`nextUri` points at the address the client used) and Snowflake and MCP sessions.
+  - For a shared-service worker with more than one replica, set `service.sessionAffinity: ClientIP` in the Helm values (`worker-values.yaml` does), and use sticky sessions on any external load balancer.
+  - Sidecar workers are not affected.
+  - Forwarding a request to the worker that owns the query, so that any load balancer works, is planned.
 - Per-worker credentials, secret references in snapshots, and a site agent that forwards for many workers are planned.

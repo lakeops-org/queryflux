@@ -85,6 +85,15 @@
           "type": "string",
           "enum": ["ClusterIP", "NodePort", "LoadBalancer", "ExternalName"]
         },
+        "sessionAffinity": {
+          "type": "string",
+          "enum": ["", "None", "ClientIP"]
+        },
+        "sessionAffinityTimeoutSeconds": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 86400
+        },
         "ports": {
           "type": "object",
           "additionalProperties": {

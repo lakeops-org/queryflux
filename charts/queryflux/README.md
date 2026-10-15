@@ -136,6 +136,7 @@ The same chart deploys a control plane or workers. The role comes from the confi
 - **Control plane:** `role: controlPlane`, Postgres, `workerApi.enabled: true`. Workers connect to its admin port (`9000`), so put TLS in front of that port. Snapshots carry cluster credentials.
 - **Workers:** `role: worker`, `controlPlane.url` and the shared secret. A worker never connects to Postgres, serves no Studio, and its admin port serves only `/health`, `/readyz`, `/metrics` and `/worker/status`.
 - **Probes:** `/readyz` returns 200 once the worker's first config snapshot is active. The startup probe keeps a new pod out of the Service until then. In a native sidecar, it also holds the application container back until then.
+- **Session affinity:** a running query lives in the memory of the worker that started it: Trino result polls, Snowflake and MCP sessions. Shared-service workers with more than one replica therefore need `service.sessionAffinity: ClientIP`, which `examples/worker-values.yaml` sets. An external load balancer in front needs sticky sessions too. Sidecar workers are not affected.
 - **Secrets:** QueryFlux does not expand environment variables in its config file, so put the worker config, which holds the shared secret, in a Secret (`config.existingSecret`).
 
 ## Validation
