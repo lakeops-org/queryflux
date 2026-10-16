@@ -300,6 +300,11 @@ impl QueryHistoryStore for InMemoryPersistence {
                         return false;
                     }
                 }
+                if let Some(w) = &filters.worker {
+                    if r.worker.as_deref() != Some(w.as_str()) {
+                        return false;
+                    }
+                }
                 if let Some(e) = &filters.engine {
                     if !r.engine_type.eq_ignore_ascii_case(e) {
                         return false;
@@ -912,7 +917,13 @@ impl ScriptLibraryStore for InMemoryPersistence {
 impl crate::WorkerRegistryStore for InMemoryPersistence {
     async fn upsert_worker(&self, worker: &crate::WorkerRecord) -> Result<()> {
         let mut w = worker.clone();
-        w.last_seen = Utc::now();
+        let now = Utc::now();
+        w.last_seen = now;
+        w.registered_at = self
+            .workers
+            .get(&w.name)
+            .and_then(|existing| existing.registered_at)
+            .or(Some(now));
         self.workers.insert(w.name.clone(), w);
         Ok(())
     }

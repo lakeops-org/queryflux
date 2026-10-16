@@ -186,6 +186,8 @@ pub struct QueryFilters {
     pub cluster_group: Option<String>,
     /// Filter by engine type, e.g. `DuckDb`, `Trino`.
     pub engine: Option<String>,
+    /// Filter by the worker that ran the query.
+    pub worker: Option<String>,
     /// Max rows to return (default 50).
     #[serde(default = "default_limit")]
     pub limit: i64,

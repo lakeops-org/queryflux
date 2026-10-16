@@ -533,7 +533,7 @@ impl<T: Persistence + MetricsStore + AdminStore + CacheStore + Send + Sync> Back
 // ---------------------------------------------------------------------------
 
 /// What a worker reported in its last registration or heartbeat (#255).
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkerRecord {
     pub name: String,
@@ -553,6 +553,52 @@ pub struct WorkerRecord {
     /// Set by the store.
     #[serde(default = "Utc::now")]
     pub last_seen: DateTime<Utc>,
+    /// When the worker first registered. Set by the store.
+    #[serde(default)]
+    pub registered_at: Option<DateTime<Utc>>,
+    /// Everything else the worker reports about its state.
+    #[serde(default)]
+    pub status: WorkerStatus,
+}
+
+/// A worker's reported state beyond its revisions. Every field is optional on the wire,
+/// so older and newer workers can report to the same control plane.
+#[derive(
+    Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize, utoipa::ToSchema,
+)]
+#[serde(rename_all = "camelCase", default)]
+pub struct WorkerStatus {
+    /// `controlPlane`, or `peer` for a config copied from another worker at startup.
+    pub config_source: Option<String>,
+    /// True while the active config has not been confirmed by the control plane.
+    pub stale: bool,
+    /// When the control plane last confirmed the active config.
+    pub confirmed_at: Option<DateTime<Utc>>,
+    pub activated_at: Option<DateTime<Utc>>,
+    pub last_successful_sync: Option<DateTime<Utc>>,
+    /// Failed config syncs in a row; 0 when the last one succeeded.
+    pub consecutive_failures: u32,
+    /// `failClosed` or `localLimits`.
+    pub on_unavailable: Option<String>,
+    pub heartbeat_interval_secs: Option<u64>,
+    /// Query history delivery.
+    pub history: Option<WorkerHistoryStatus>,
+    /// Enabled query frontends, e.g. `trinoHttp:8080`.
+    pub frontends: Vec<String>,
+}
+
+#[derive(
+    Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize, utoipa::ToSchema,
+)]
+#[serde(rename_all = "camelCase", default)]
+pub struct WorkerHistoryStatus {
+    /// `full`, `maskLiterals` or `metadata`.
+    pub redaction: Option<String>,
+    pub endpoint: Option<String>,
+    pub queued: u64,
+    pub sent: u64,
+    pub dropped: u64,
+    pub last_error: Option<String>,
 }
 
 #[async_trait]

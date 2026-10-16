@@ -290,6 +290,7 @@ impl QueryHistoryStore for PostgresStore {
                  AND ($2::text IS NULL OR qr.status = $2)
                  AND ($3::text IS NULL OR COALESCE(cg.name, qr.cluster_group) = $3)
                  AND ($4::text IS NULL OR qr.engine_type = $4)
+                 AND ($7::text IS NULL OR qr.worker = $7)
                ORDER BY qr.created_at DESC
                LIMIT $5 OFFSET $6"#,
         )
@@ -299,6 +300,7 @@ impl QueryHistoryStore for PostgresStore {
         .bind(&filters.engine)
         .bind(filters.limit)
         .bind(filters.offset)
+        .bind(&filters.worker)
         .fetch_all(&self.admin_pool)
         .await
         .map_err(|e| QueryFluxError::Persistence(format!("list_queries: {e}")))
@@ -534,8 +536,8 @@ impl crate::WorkerRegistryStore for PostgresStore {
         sqlx::query(
             r#"INSERT INTO worker_registry
                    (name, version, labels, coordination_mode, downloaded_revision,
-                    active_revision, last_error, last_seen)
-               VALUES ($1, $2, $3, $4, $5, $6, $7, now())
+                    active_revision, last_error, status, last_seen)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, now())
                ON CONFLICT (name) DO UPDATE SET
                    version             = EXCLUDED.version,
                    labels              = EXCLUDED.labels,
@@ -543,6 +545,7 @@ impl crate::WorkerRegistryStore for PostgresStore {
                    downloaded_revision = EXCLUDED.downloaded_revision,
                    active_revision     = EXCLUDED.active_revision,
                    last_error          = EXCLUDED.last_error,
+                   status              = EXCLUDED.status,
                    last_seen           = now()"#,
         )
         .bind(&w.name)
@@ -552,6 +555,7 @@ impl crate::WorkerRegistryStore for PostgresStore {
         .bind(&w.downloaded_revision)
         .bind(&w.active_revision)
         .bind(&w.last_error)
+        .bind(sqlx::types::Json(&w.status))
         .execute(&self.admin_pool)
         .await
         .map_err(|e| QueryFluxError::Persistence(format!("upsert_worker: {e}")))?;
@@ -571,10 +575,12 @@ impl crate::WorkerRegistryStore for PostgresStore {
             Option<String>,
             Option<String>,
             chrono::DateTime<chrono::Utc>,
+            chrono::DateTime<chrono::Utc>,
+            sqlx::types::Json<serde_json::Value>,
         );
         let rows: Vec<Row> = sqlx::query_as(
             r#"SELECT name, version, labels, coordination_mode, downloaded_revision,
-                      active_revision, last_error, last_seen
+                      active_revision, last_error, last_seen, registered_at, status
                  FROM worker_registry
                 WHERE last_seen >= $1
                 ORDER BY name"#,
@@ -594,6 +600,9 @@ impl crate::WorkerRegistryStore for PostgresStore {
                 active_revision: r.5,
                 last_error: r.6,
                 last_seen: r.7,
+                registered_at: Some(r.8),
+                // A row written by a different version may not match; show what we can.
+                status: serde_json::from_value(r.9 .0).unwrap_or_default(),
             })
             .collect())
     }
@@ -2649,6 +2658,18 @@ mod tests {
             active_revision: Some("a".into()),
             last_error: None,
             last_seen: chrono::Utc::now(),
+            registered_at: None,
+            status: crate::WorkerStatus {
+                config_source: Some("peer".into()),
+                stale: true,
+                consecutive_failures: 2,
+                frontends: vec!["trinoHttp:8080".into()],
+                history: Some(crate::WorkerHistoryStatus {
+                    sent: 7,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
         };
         store.upsert_worker(&w).await.unwrap();
         w.active_revision = Some("b".into());
@@ -2664,6 +2685,8 @@ mod tests {
             .collect();
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].active_revision.as_deref(), Some("b"));
+        assert_eq!(found[0].status, w.status);
+        assert!(found[0].registered_at.is_some());
         assert_eq!(
             found[0].labels.get("app").map(String::as_str),
             Some("checkout")
