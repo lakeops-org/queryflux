@@ -1,0 +1,35 @@
+# Template for a worker's config Secret (examples/worker-values.yaml and
+# examples/worker-sidecar-manifest.yaml).
+#
+#   kubectl create secret generic queryflux-worker-config \
+#     --from-file=config.yaml=./worker-config.yaml
+#
+# A worker holds no config of its own and never connects to Postgres. It pulls its
+# config from the control plane, takes capacity leases from it and sends it query
+# history.
+
+queryflux:
+  role: worker
+  # workerName defaults to the pod name (HOSTNAME).
+  workerLabels:
+    team: checkout
+  controlPlane:
+    url: https://queryflux-control.queryflux.svc:9000
+    auth:
+      mode: sharedSecret
+      sharedSecret: <long-random-secret>   # the control plane's workerApi.sharedSecret
+    pollTimeoutSecs: 30
+    heartbeatIntervalSecs: 10
+  coordination:
+    mode: controlPlane       # controlPlane | local (only when one worker serves a group)
+    onUnavailable: failClosed # failClosed | localLimits
+  history:
+    spoolMaxRecords: 50000   # buffered while the history endpoint is unreachable
+  shutdownDrainTimeoutSecs: 30
+  frontends:
+    trinoHttp:
+      enabled: true
+      port: 8080
+  # The ops listener: /health, /readyz, /metrics, /worker/status.
+  adminApi:
+    port: 9000

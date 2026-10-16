@@ -1,0 +1,82 @@
+# One worker per application pod, as a native sidecar (Kubernetes 1.29+): an init
+# container with restartPolicy: Always. Kubernetes starts the application container only
+# after the sidecar's startupProbe passes, i.e. once the worker has its config, and stops
+# the sidecar after the application at shutdown.
+#
+# This is a plain manifest, not Helm values. Create the worker config Secret first (see
+# worker-config.yaml); the application then connects to http://localhost:8080.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: checkout
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: checkout
+  template:
+    metadata:
+      labels:
+        app: checkout
+    spec:
+      terminationGracePeriodSeconds: 45
+      initContainers:
+        - name: queryflux
+          image: ghcr.io/lakeops-org/queryflux:<release>
+          restartPolicy: Always
+          args: ["--config", "/etc/queryflux/config.yaml"]
+          ports:
+            - name: trino-http
+              containerPort: 8080
+            - name: admin
+              containerPort: 9000
+          startupProbe:
+            httpGet:
+              path: /readyz
+              port: admin
+            periodSeconds: 2
+            failureThreshold: 150
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: admin
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: admin
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              memory: 1Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 1000
+            capabilities:
+              drop: [ALL]
+          env:
+            - name: TMPDIR
+              value: /tmp
+          volumeMounts:
+            - name: queryflux-config
+              mountPath: /etc/queryflux
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+      containers:
+        - name: app
+          image: example.com/checkout:latest
+          env:
+            - name: TRINO_URL
+              value: http://localhost:8080
+      volumes:
+        - name: queryflux-config
+          secret:
+            secretName: queryflux-worker-config
+        - name: tmp
+          emptyDir: {}

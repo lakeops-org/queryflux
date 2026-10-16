@@ -125,6 +125,18 @@ See [ADBC drivers](https://queryflux.dev/docs/operations/adbc-drivers) for the f
 - `examples/production-config.yaml`: template for the config Secret referenced by production-values (`auth.required: true`, OIDC, Postgres URL). Create with `kubectl create secret generic queryflux-config --from-file=config.yaml=...`.
 - `examples/adbc-drivers-values.yaml`: install pinned ADBC drivers with an init container.
 - `examples/networkpolicy-values.yaml`: starter NetworkPolicy allowing clients, DNS, Postgres, and engines (tighten selectors before production).
+- `examples/control-plane-values.yaml` + `examples/control-plane-config.yaml`: a worker-mode control plane (Postgres, `workerApi`).
+- `examples/worker-values.yaml` + `examples/worker-config.yaml`: shared-service workers that pull config from the control plane.
+- `examples/worker-sidecar-manifest.yaml`: a worker as a native sidecar (Kubernetes 1.29+) next to an application container. This is a plain manifest, not Helm values.
+
+## Worker mode
+
+The same chart deploys a control plane or workers. The role comes from the config, not from the chart. See [Worker mode](https://github.com/lakeops-org/queryflux/blob/main/website/docs/operations/worker-mode.md) for the design.
+
+- **Control plane:** `role: controlPlane`, Postgres, `workerApi.enabled: true`. Workers connect to its admin port (`9000`), so put TLS in front of that port. Snapshots carry cluster credentials.
+- **Workers:** `role: worker`, `controlPlane.url` and the shared secret. A worker never connects to Postgres, serves no Studio, and its admin port serves only `/health`, `/readyz`, `/metrics` and `/worker/status`.
+- **Probes:** `/readyz` returns 200 once the worker's first config snapshot is active. The startup probe keeps a new pod out of the Service until then. In a native sidecar, it also holds the application container back until then.
+- **Secrets:** QueryFlux does not expand environment variables in its config file, so put the worker config, which holds the shared secret, in a Secret (`config.existingSecret`).
 
 ## Validation
 

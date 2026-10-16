@@ -1,0 +1,36 @@
+# Shared-service workers: a Deployment of workers that applications reach through a
+# Service. Run the following from the repository root.
+#
+#   1. Fill in ./charts/queryflux/examples/worker-config.yaml and create its Secret:
+#        kubectl create secret generic queryflux-worker-config \
+#          --from-file=config.yaml=./charts/queryflux/examples/worker-config.yaml
+#   2. helm install queryflux-workers ./charts/queryflux \
+#        -f ./charts/queryflux/examples/worker-values.yaml
+#
+# For one worker per application pod, see worker-sidecar-manifest.yaml instead.
+
+replicaCount: 3
+
+config:
+  existingSecret: queryflux-worker-config
+
+service:
+  ports:
+    # Workers serve no Studio and no admin API; port 9000 is the ops listener.
+    studio:
+      enabled: false
+
+# /readyz turns 200 once the first config snapshot is active. Until then queries get a
+# retryable "not configured" error, so the pod stays out of the Service. Allow time for
+# a slow control plane on first start.
+startupProbe:
+  httpGet:
+    path: /readyz
+    port: admin
+  periodSeconds: 2
+  timeoutSeconds: 2
+  failureThreshold: 150
+
+pdb:
+  enabled: true
+  maxUnavailable: 1

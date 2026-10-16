@@ -13,6 +13,7 @@ Several stacks for **QueryFlux** + **Trino** (and optional add-ons). Run command
 | [`with-opa-oidc/`](with-opa-oidc/) | No | Same OPA demo as `with-opa/`, identity from **Keycloak (OIDC)** instead of a static user list; LDAP config shape documented too |
 | [`with-keycloak-oidc/`](with-keycloak-oidc/) | Yes | OIDC authentication with Keycloak as the identity provider — no access control, just auth |
 | [`with-prometheus-grafana/`](with-prometheus-grafana/) | Yes | Same workload as minimal + **Prometheus** + **Grafana** (repo [`grafana/`](../grafana/), local scrape config); **no Studio** |
+| [`worker-mode/`](worker-mode/) | Yes (host **5435**) | A control plane and two workers: config, capacity limits and query history shared through the control plane; workers never touch Postgres |
 | [`full-stack/`](full-stack/) | Yes (host **5433**) | Trino + StarRocks + Iceberg/Lakekeeper + RustFS + TPCH loader |
 | [`full-stack-with-prometheus-grafana/`](full-stack-with-prometheus-grafana/) | Yes (host **5433**) | **`full-stack`** + **Prometheus** + **Grafana**; Grafana on **3001** |
 

@@ -1,0 +1,20 @@
+# Control plane for worker mode. Run the following from the repository root.
+#
+#   1. Fill in ./charts/queryflux/examples/control-plane-config.yaml and create its Secret:
+#        kubectl create secret generic queryflux-control-plane-config \
+#          --from-file=config.yaml=./charts/queryflux/examples/control-plane-config.yaml
+#   2. helm install queryflux-control ./charts/queryflux \
+#        -f ./charts/queryflux/examples/control-plane-values.yaml
+#
+# Workers reach the control plane at http(s)://queryflux-control:9000 (the admin port).
+# Snapshots carry cluster credentials: terminate TLS in front of that port (mesh, or an
+# ingress) for anything but a trusted network.
+
+replicaCount: 2
+
+config:
+  existingSecret: queryflux-control-plane-config
+
+pdb:
+  enabled: true
+  maxUnavailable: 1

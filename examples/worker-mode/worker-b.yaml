@@ -1,0 +1,24 @@
+# Worker: holds no config of its own. It pulls config from the control plane, takes
+# capacity leases from it and sends it query history. It never connects to Postgres.
+queryflux:
+  role: worker
+  workerName: worker-b
+  workerLabels:
+    app: demo-b
+  controlPlane:
+    url: http://control-plane:9000
+    # Plain HTTP is for this local demo only: snapshots carry cluster credentials.
+    allowInsecureHttp: true
+    auth:
+      mode: sharedSecret
+      sharedSecret: change-me-worker-secret
+  coordination:
+    mode: controlPlane        # share maxRunningQueries with the fleet
+    onUnavailable: failClosed # new queries wait while the control plane is down
+  frontends:
+    trinoHttp:
+      enabled: true
+      port: 8080
+  # Ops listener only: /health, /readyz, /metrics, /worker/status.
+  adminApi:
+    port: 9000

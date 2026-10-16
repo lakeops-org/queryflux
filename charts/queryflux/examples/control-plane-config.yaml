@@ -1,0 +1,39 @@
+# Template for the control plane's config Secret (examples/control-plane-values.yaml).
+#
+#   kubectl create secret generic queryflux-control-plane-config \
+#     --from-file=config.yaml=./control-plane-config.yaml
+#
+# The control plane owns the config (Postgres) and serves it to workers on its admin
+# port: /worker/config, capacity leases and query-history ingest. It can also run
+# queries itself.
+
+queryflux:
+  role: controlPlane
+  externalAddress: https://queryflux.example.com
+  shutdownDrainTimeoutSecs: 30
+  frontends:
+    trinoHttp:
+      enabled: true
+      port: 8080
+  persistence:
+    type: postgres
+    url: postgres://queryflux:<password>@postgres.example.internal:5432/queryflux
+  adminApi:
+    port: 9000
+  workerApi:
+    enabled: true
+    # The same value goes into every worker's controlPlane.auth.sharedSecret.
+    sharedSecret: <long-random-secret>
+    history:
+      # full | maskLiterals | metadata. Workers apply it before records leave them.
+      redaction: full
+
+clusters:
+  trino-1:
+    engine: trino
+    endpoint: http://trino.example.internal:8080
+clusterGroups:
+  analytics:
+    members: [trino-1]
+    maxRunningQueries: 20
+routingFallback: analytics

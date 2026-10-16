@@ -786,7 +786,8 @@ async fn main() -> Result<()> {
 
     let admin_store_for_reload = admin_store.clone();
     let cors_origins = config.queryflux.admin_api.cors_allowed_origins.clone();
-    if cors_origins.is_empty() {
+    // A worker serves only the ops listener, which has no admin API to protect.
+    if cors_origins.is_empty() && !is_worker {
         tracing::warn!(
             "Admin API CORS allows any origin (corsAllowedOrigins is empty). \
              Set queryflux.adminApi.corsAllowedOrigins to restrict cross-origin access in production."
