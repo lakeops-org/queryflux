@@ -27,9 +27,10 @@ queryflux:
     pollTimeoutSecs: 30
     heartbeatIntervalSecs: 10
     # Start from a running worker's config when the control plane is unreachable. The
-    # worker Service routes only to ready workers, which all have a config.
+    # headless Service (service.headless.enabled) lists every ready worker, all of which
+    # have a config; the plain Service (queryflux-workers:9000) also works, one peer a try.
     peerBootstrap:
-      address: queryflux-workers:9000
+      address: queryflux-workers-headless:9000
       afterSecs: 10
       maxAgeSecs: 86400
   coordination:

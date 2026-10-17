@@ -101,3 +101,12 @@ Env for the container that runs docker/adbc-drivers.sh.
 - name: QUERYFLUX_ADBC_ON_FAILURE
   value: {{ .Values.adbcDrivers.onFailure | quote }}
 {{- end -}}
+
+{{/*
+The process role (#255): `.Values.role` when set, else `queryflux.role` from the inline
+config, else standalone. Set `.Values.role` when the config comes from a Secret or an
+existing ConfigMap, which the chart cannot read.
+*/}}
+{{- define "queryflux.role" -}}
+{{- .Values.role | default (dig "data" "queryflux" "role" "standalone" .Values.config) -}}
+{{- end -}}

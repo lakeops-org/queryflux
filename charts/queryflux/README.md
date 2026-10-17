@@ -131,12 +131,23 @@ See [ADBC drivers](https://queryflux.dev/docs/operations/adbc-drivers) for the f
 
 ## Worker mode
 
-The same chart deploys a control plane or workers. The role comes from the config, not from the chart. See [Worker mode](https://github.com/lakeops-org/queryflux/blob/main/website/docs/operations/worker-mode.md) for the design.
+The same chart deploys a control plane or workers: one release for the control plane, and one release per pool of workers. QueryFlux reads the role from its config (`queryflux.role`). When that config comes from a Secret, also set the chart's `role` value (`controlPlane` or `worker`), so the install notes and warnings match the role. See [Worker mode](https://github.com/lakeops-org/queryflux/blob/main/website/docs/operations/worker-mode.md) for the design.
+
+```bash
+# Control plane (Postgres, Studio, admin API, worker API)
+helm install queryflux-control ./charts/queryflux -f ./charts/queryflux/examples/control-plane-values.yaml
+# A pool of shared-service workers, scaled on load
+helm install queryflux-workers ./charts/queryflux \
+  -f ./charts/queryflux/examples/worker-values.yaml \
+  -f ./charts/queryflux/examples/worker-autoscaling-values.yaml
+```
 
 - **Control plane:** `role: controlPlane`, Postgres, `workerApi.enabled: true`. Workers connect to its admin port (`9000`), so put TLS in front of that port. Snapshots carry cluster credentials.
 - **Workers:** `role: worker`, `controlPlane.url` and the shared secret. A worker never connects to Postgres, serves no Studio, and its admin port serves only `/health`, `/readyz`, `/metrics` and `/worker/status`.
 - **Probes:** `/readyz` returns 200 once the worker's first config snapshot is active. The startup probe keeps a new pod out of the Service until then. In a native sidecar, it also holds the application container back until then.
 - **Session affinity:** a running query lives in the memory of the worker that started it: Trino result polls, Snowflake and MCP sessions. Shared-service workers with more than one replica therefore need `service.sessionAffinity: ClientIP`, which `examples/worker-values.yaml` sets. An external load balancer in front needs sticky sessions too. Sidecar workers are not affected.
+- **Adding and scaling workers:** add a pool with another release, or scale one with `replicaCount` or `autoscaling`. Each pod is named after itself (`workerName` defaults to the pod name), so scaling needs no config change. Adding workers does not raise any limit: with shared capacity, `maxRunningQueries` holds across the whole fleet. `examples/worker-autoscaling-values.yaml` scales on CPU, shows a custom metric through `autoscaling.extraMetrics`, and scales down slowly so draining workers finish their queries (`autoscaling.behavior`).
+- **Peer bootstrap:** `service.headless.enabled: true` adds `<release>-headless`, which resolves to every ready worker. Point `controlPlane.peerBootstrap.address` at it, so a worker starting while the control plane is down copies its config from a running peer.
 - **Secrets:** QueryFlux does not expand environment variables in its config file, so put the worker config, which holds the shared secret, in a Secret (`config.existingSecret`).
 
 ## Validation

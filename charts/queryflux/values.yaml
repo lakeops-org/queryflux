@@ -16,6 +16,12 @@
 
 replicaCount: 1
 
+# The process role: standalone (default), controlPlane or worker (worker mode, #255).
+# Only needed when the config comes from config.existingSecret or an existing ConfigMap,
+# which the chart cannot read; otherwise it is taken from config.data.queryflux.role.
+# Used for the install notes and role-specific warnings, not passed to QueryFlux.
+role: ""
+
 image:
   repository: ghcr.io/lakeops-org/queryflux
   pullPolicy: IfNotPresent
@@ -114,6 +120,11 @@ service:
   # sessions) lives in the memory of the worker that started it.
   sessionAffinity: ""
   sessionAffinityTimeoutSeconds: 10800
+  # A second, headless Service (<fullname>-headless) that resolves to every ready pod.
+  # Workers use it for controlPlane.peerBootstrap.address, to copy their config from a
+  # running peer when the control plane is unreachable at startup.
+  headless:
+    enabled: false
   ports:
     trinoHttp:
       enabled: true
@@ -217,6 +228,11 @@ autoscaling:
   maxReplicas: 3
   targetCPUUtilizationPercentage: 80
   targetMemoryUtilizationPercentage: null
+  # Additional HPA metrics, appended as-is (autoscaling/v2 MetricSpec), e.g. queue wait
+  # exported by QueryFlux through prometheus-adapter. See examples/worker-autoscaling-values.yaml.
+  extraMetrics: []
+  # HPA scaling behavior (autoscaling/v2 HorizontalPodAutoscalerBehavior), as-is.
+  behavior: {}
 
 pdb:
   enabled: false

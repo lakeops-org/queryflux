@@ -7,6 +7,10 @@
       "type": "integer",
       "minimum": 1
     },
+    "role": {
+      "type": "string",
+      "enum": ["", "standalone", "controlPlane", "worker"]
+    },
     "image": {
       "type": "object",
       "required": ["repository", "pullPolicy"],
@@ -94,6 +98,14 @@
           "minimum": 1,
           "maximum": 86400
         },
+        "headless": {
+          "type": "object",
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            }
+          }
+        },
         "ports": {
           "type": "object",
           "additionalProperties": {
@@ -149,6 +161,15 @@
           "type": ["integer", "null"],
           "minimum": 1,
           "maximum": 100
+        },
+        "extraMetrics": {
+          "type": "array",
+          "items": {
+            "type": "object"
+          }
+        },
+        "behavior": {
+          "type": "object"
         }
       }
     },

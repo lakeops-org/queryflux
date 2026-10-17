@@ -1,0 +1,23 @@
+{{- if .Values.service.headless.enabled }}
+{{- /*
+One DNS record per ready pod, for workers that copy their config from a peer when the
+control plane is unreachable (controlPlane.peerBootstrap.address). Not-ready pods are
+left out, so a starting worker never finds itself.
+*/}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "queryflux.fullname" . }}-headless
+  labels:
+    {{- include "queryflux.labels" . | nindent 4 }}
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: false
+  ports:
+    - port: {{ .Values.service.ports.admin.port }}
+      targetPort: {{ .Values.service.ports.admin.targetPort }}
+      protocol: TCP
+      name: {{ .Values.service.ports.admin.name }}
+  selector:
+    {{- include "queryflux.selectorLabels" . | nindent 4 }}
+{{- end }}

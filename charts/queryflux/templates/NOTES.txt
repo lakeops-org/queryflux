@@ -1,3 +1,29 @@
+{{- $role := include "queryflux.role" . -}}
+{{- $multi := or .Values.autoscaling.enabled (gt (int .Values.replicaCount) 1) -}}
+{{- if eq $role "worker" -}}
+QueryFlux has been installed as a worker. It takes its config, capacity limits and
+history endpoint from its control plane, and never connects to a database.
+
+Trino HTTP frontend:
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "queryflux.fullname" . }} {{ .Values.service.ports.trinoHttp.port }}:{{ .Values.service.ports.trinoHttp.port }}
+
+Ops listener (port {{ .Values.service.ports.admin.port }}): /health, /readyz, /metrics and /worker/status.
+A pod is ready once it has activated its first config from the control plane:
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "queryflux.fullname" . }} {{ .Values.service.ports.admin.port }}:{{ .Values.service.ports.admin.port }}
+  curl -s localhost:{{ .Values.service.ports.admin.port }}/worker/status
+{{- if .Values.service.headless.enabled }}
+
+Peer bootstrap address for controlPlane.peerBootstrap.address:
+  {{ include "queryflux.fullname" . }}-headless.{{ .Release.Namespace }}.svc:{{ .Values.service.ports.admin.port }}
+{{- end }}
+{{- if and $multi (ne .Values.service.sessionAffinity "ClientIP") }}
+
+WARNING: more than one worker replica without service.sessionAffinity: ClientIP.
+A running query lives in the memory of the worker that started it, so Trino result
+polls and Snowflake/MCP sessions must keep reaching the same pod. Set
+service.sessionAffinity: ClientIP (and sticky sessions on any external load balancer).
+{{- end }}
+{{- else -}}
 QueryFlux has been installed.
 
 Admin API:
@@ -16,8 +42,14 @@ Admin credentials are stored in:
 
 Read the generated password with:
   kubectl -n {{ .Release.Namespace }} get secret {{ include "queryflux.secretName" . }} -o jsonpath="{.data['{{ .Values.existingSecret.passwordKey }}']}" | base64 --decode
+{{- if eq $role "controlPlane" }}
+
+Workers connect to the worker API on the admin port:
+  http(s)://{{ include "queryflux.fullname" . }}.{{ .Release.Namespace }}.svc:{{ .Values.service.ports.admin.port }}
+Worker configs carry engine credentials: serve that port over TLS outside a trusted network.
+{{- end }}
 {{- $persistence := dig "data" "queryflux" "persistence" "type" "inMemory" .Values.config }}
-{{- if and (eq $persistence "inMemory") (or .Values.autoscaling.enabled (gt (int .Values.replicaCount) 1)) }}
+{{- if and (eq $persistence "inMemory") $multi }}
 
 WARNING: persistence.type is "inMemory" but you are running more than one replica
 (replicaCount > 1 or autoscaling enabled). In-memory state is per-pod and will
@@ -43,4 +75,5 @@ NOTE: NetworkPolicy is enabled. Confirm ingress allows clients (and metrics
 scrape on the admin port) and egress allows DNS, Postgres, and your engines.
 Empty rule lists are rejected by the chart; see
 charts/queryflux/examples/networkpolicy-values.yaml.
+{{- end }}
 {{- end }}

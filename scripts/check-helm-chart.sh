@@ -25,6 +25,9 @@ required_files=(
   "examples/production-values.yaml"
   "examples/production-config.yaml"
   "examples/networkpolicy-values.yaml"
+  "examples/control-plane-values.yaml"
+  "examples/worker-values.yaml"
+  "examples/worker-autoscaling-values.yaml"
   "values.yaml"
   "values.schema.json"
   "templates/_helpers.tpl"
@@ -38,6 +41,7 @@ required_files=(
   "templates/pdb.yaml"
   "templates/networkpolicy.yaml"
   "templates/servicemonitor.yaml"
+  "templates/service-headless.yaml"
   "templates/tests/test-connection.yaml"
 )
 for rel in "${required_files[@]}"; do

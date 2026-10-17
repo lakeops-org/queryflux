@@ -8,7 +8,11 @@
 #   2. helm install queryflux-workers ./charts/queryflux -n queryflux \
 #        -f ./charts/queryflux/examples/worker-values.yaml
 #
-# For one worker per application pod, see worker-sidecar-manifest.yaml instead.
+# For one worker per application pod, see worker-sidecar-manifest.yaml instead. To scale
+# on load rather than a fixed count, add worker-autoscaling-values.yaml.
+
+# The config is in a Secret the chart cannot read; this tells the install notes.
+role: worker
 
 replicaCount: 3
 
@@ -19,6 +23,9 @@ service:
   # A running query lives in the memory of the worker that started it, so its client must
   # keep reaching that worker: Trino result polls, Snowflake and MCP sessions.
   sessionAffinity: ClientIP
+  # queryflux-workers-headless: every ready worker, for controlPlane.peerBootstrap.address.
+  headless:
+    enabled: true
   ports:
     # Workers serve no Studio and no admin API; port 9000 is the ops listener.
     studio:

@@ -16,6 +16,9 @@
 # roots only. Inside a service mesh with mTLS (Istio, Linkerd) you can instead skip the
 # ingress and point workers at the in-cluster address (see worker-config.yaml).
 
+# The config is in a Secret the chart cannot read; this tells the install notes.
+role: controlPlane
+
 replicaCount: 2
 
 config:
