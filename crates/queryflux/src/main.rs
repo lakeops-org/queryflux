@@ -24,6 +24,7 @@ mod live_config;
 mod registered_engines;
 mod remote_coordination;
 mod startup;
+mod worker_labels;
 
 use crate::config_source::{
     run_reload_loop, AdminStoreConfigSource, ConfigSource, LiveHandles, PostgresConfigSource,

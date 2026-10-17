@@ -743,7 +743,8 @@ pub(crate) fn spawn_worker_heartbeat(
     };
     let base = cp.url.trim_end_matches('/').to_string();
     let name = worker_name(config);
-    let labels = config.queryflux.worker_labels.clone();
+    let config_labels = config.queryflux.worker_labels.clone();
+    let labels_file = config.queryflux.worker_labels_file.clone();
     let coordination_mode = match config.queryflux.coordination.as_ref().map(|c| c.mode) {
         Some(queryflux_core::config::CoordinationMode::Local) => "local",
         _ => "controlPlane",
@@ -777,7 +778,7 @@ pub(crate) fn spawn_worker_heartbeat(
             let report = queryflux_persistence::WorkerRecord {
                 name: name.clone(),
                 version: env!("CARGO_PKG_VERSION").to_string(),
-                labels: labels.clone(),
+                labels: crate::worker_labels::current(&config_labels, labels_file.as_deref()),
                 coordination_mode: coordination_mode.to_string(),
                 downloaded_revision: st.downloaded_revision,
                 active_revision: st.active_revision,

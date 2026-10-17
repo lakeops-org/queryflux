@@ -224,6 +224,7 @@ impl ProxyConfig {
                     ("controlPlane", q.control_plane.is_some()),
                     ("workerName", q.worker_name.is_some()),
                     ("workerLabels", !q.worker_labels.is_empty()),
+                    ("workerLabelsFile", q.worker_labels_file.is_some()),
                     ("history", q.history.is_some()),
                     ("coordination", q.coordination.is_some()),
                 ];
@@ -863,10 +864,16 @@ pub struct QueryFluxConfig {
     /// Worker only: name reported to the control plane (default: the hostname).
     #[serde(default)]
     pub worker_name: Option<String>,
-    /// Worker only: labels stamped on this worker's queries as tags (they win over a
-    /// client-set tag with the same key) and reported to the control plane.
+    /// Worker only: labels reported to the control plane, shown in Studio and searchable
+    /// there (e.g. team, app, region).
     #[serde(default)]
     pub worker_labels: std::collections::BTreeMap<String, String>,
+    /// Worker only: a file of `key="value"` lines merged over `workerLabels`, re-read on
+    /// every heartbeat. Point it at a Kubernetes downward API volume of `metadata.labels`
+    /// (e.g. `/etc/podinfo/labels`), so every pod reports its own labels while sharing one
+    /// worker config. Kubernetes bookkeeping labels such as `pod-template-hash` are skipped.
+    #[serde(default)]
+    pub worker_labels_file: Option<String>,
     /// Worker only: where query records go.
     #[serde(default)]
     pub history: Option<WorkerHistoryConfig>,
