@@ -13,6 +13,9 @@ queryflux:
   # workerName defaults to the pod name (HOSTNAME).
   workerLabels:
     team: checkout
+  # Sidecars: report the application pod's own labels (a downward API volume of
+  # metadata.labels, see worker-sidecar-manifest.yaml). Merged over workerLabels.
+  # workerLabelsFile: /etc/podinfo/labels
   controlPlane:
     # The control plane's TLS ingress (examples/control-plane-values.yaml), which serves
     # only /worker/*.

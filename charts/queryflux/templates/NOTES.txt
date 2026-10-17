@@ -16,7 +16,18 @@ A pod is ready once it has activated its first config from the control plane:
 Peer bootstrap address for controlPlane.peerBootstrap.address:
   {{ include "queryflux.fullname" . }}-headless.{{ .Release.Namespace }}.svc:{{ .Values.service.ports.admin.port }}
 {{- end }}
-{{- if and $multi (ne .Values.service.sessionAffinity "ClientIP") }}
+{{- if eq .Values.workload.kind "DaemonSet" }}
+
+Running one worker per node (DaemonSet).
+{{- if eq .Values.service.internalTrafficPolicy "Local" }} Apps reach their own node's worker at
+  {{ include "queryflux.fullname" . }}.{{ .Release.Namespace }}.svc ({{ .Values.service.ports.trinoHttp.port }} for Trino HTTP).
+While a node's worker restarts, apps on that node cannot connect (no fallback).
+{{- else }}
+
+WARNING: workload.kind is DaemonSet but service.internalTrafficPolicy is not Local,
+so apps reach any node's worker, not their own. Set service.internalTrafficPolicy: Local.
+{{- end }}
+{{- else if and $multi (ne .Values.service.sessionAffinity "ClientIP") }}
 
 WARNING: more than one worker replica without service.sessionAffinity: ClientIP.
 A running query lives in the memory of the worker that started it, so Trino result

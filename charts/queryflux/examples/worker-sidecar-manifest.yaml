@@ -68,6 +68,10 @@ spec:
               readOnly: true
             - name: tmp
               mountPath: /tmp
+            # This pod's labels, for workerLabelsFile: /etc/podinfo/labels in the config.
+            - name: podinfo
+              mountPath: /etc/podinfo
+              readOnly: true
       containers:
         - name: app
           image: example.com/checkout:latest
@@ -80,3 +84,9 @@ spec:
             secretName: queryflux-worker-config
         - name: tmp
           emptyDir: {}
+        - name: podinfo
+          downwardAPI:
+            items:
+              - path: labels
+                fieldRef:
+                  fieldPath: metadata.labels

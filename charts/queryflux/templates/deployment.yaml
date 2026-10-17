@@ -1,12 +1,21 @@
 {{- $adbcDrivers := include "queryflux.adbcDrivers.enabled" . }}
+{{- $daemonSet := eq .Values.workload.kind "DaemonSet" }}
+{{- if and $daemonSet .Values.autoscaling.enabled }}
+{{- fail "workload.kind: DaemonSet runs one pod per node; disable autoscaling" }}
+{{- end }}
 apiVersion: apps/v1
-kind: Deployment
+kind: {{ .Values.workload.kind }}
 metadata:
   name: {{ include "queryflux.fullname" . }}
   labels:
     {{- include "queryflux.labels" . | nindent 4 }}
 spec:
-  {{- if not .Values.autoscaling.enabled }}
+  {{- if $daemonSet }}
+  {{- with .Values.workload.daemonSetUpdateStrategy }}
+  updateStrategy:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- else if not .Values.autoscaling.enabled }}
   replicas: {{ .Values.replicaCount }}
   {{- end }}
   selector:

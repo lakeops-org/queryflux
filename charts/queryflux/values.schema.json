@@ -11,6 +11,18 @@
       "type": "string",
       "enum": ["", "standalone", "controlPlane", "worker"]
     },
+    "workload": {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": ["Deployment", "DaemonSet"]
+        },
+        "daemonSetUpdateStrategy": {
+          "type": "object"
+        }
+      }
+    },
     "image": {
       "type": "object",
       "required": ["repository", "pullPolicy"],
@@ -97,6 +109,10 @@
           "type": "integer",
           "minimum": 1,
           "maximum": 86400
+        },
+        "internalTrafficPolicy": {
+          "type": "string",
+          "enum": ["", "Cluster", "Local"]
         },
         "headless": {
           "type": "object",

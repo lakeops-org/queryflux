@@ -20,7 +20,7 @@ const sidebars: SidebarsConfig = {
       type: 'category',
       label: 'Operations',
       collapsed: false,
-      items: ['operations/multi-replica', 'operations/worker-mode', 'operations/adbc-drivers'],
+      items: ['operations/multi-replica', 'operations/worker-mode', 'operations/worker-sidecar', 'operations/adbc-drivers'],
     },
     {
       type: 'category',

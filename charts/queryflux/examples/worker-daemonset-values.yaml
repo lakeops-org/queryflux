@@ -1,0 +1,57 @@
+# One worker per node. Apps keep one address, queryflux-workers:<port>, and Kubernetes
+# sends each connection to the worker on the app's own node
+# (service.internalTrafficPolicy: Local). Run from the repository root:
+#
+#   1. Fill in ./charts/queryflux/examples/worker-config.yaml and create its Secret in
+#      the workers' namespace (here `queryflux`):
+#        kubectl -n queryflux create secret generic queryflux-worker-config \
+#          --from-file=config.yaml=./charts/queryflux/examples/worker-config.yaml
+#   2. helm install queryflux-workers ./charts/queryflux -n queryflux \
+#        -f ./charts/queryflux/examples/worker-daemonset-values.yaml
+#
+# Trade-offs: one worker serves every app on its node, so size it for the node's peak;
+# while a node's worker restarts, that node's apps cannot connect (Local has no
+# fallback), so rollouts replace one node's worker at a time. Attribute queries per app
+# with the user or query tags: workerLabels describe the node's worker, not an app.
+
+role: worker
+
+workload:
+  kind: DaemonSet
+  daemonSetUpdateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+
+config:
+  existingSecret: queryflux-worker-config
+
+service:
+  internalTrafficPolicy: Local
+  # Peers for controlPlane.peerBootstrap.address: queryflux-workers-headless:9000.
+  headless:
+    enabled: true
+  ports:
+    studio:
+      enabled: false
+
+# Ready once the first config is active; a fresh node's apps wait for it.
+startupProbe:
+  httpGet:
+    path: /readyz
+    port: admin
+  periodSeconds: 2
+  timeoutSeconds: 2
+  failureThreshold: 150
+
+resources:
+  requests:
+    cpu: 250m
+    memory: 512Mi
+  limits:
+    memory: 2Gi
+
+# Run on every node that hosts query clients; add tolerations for tainted node pools.
+tolerations: []
+# nodeSelector:
+#   workload: apps

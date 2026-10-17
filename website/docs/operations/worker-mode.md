@@ -79,6 +79,7 @@ queryflux:
   role: worker
   workerName: checkout-7f9c      # optional; defaults to the hostname (the pod name)
   workerLabels: { team: checkout }
+  workerLabelsFile: /etc/podinfo/labels   # optional: the pod's own labels (downward API), merged over workerLabels
   controlPlane:
     url: https://queryflux-control:9000
     auth: { mode: sharedSecret, sharedSecret: <long-random-secret> }
@@ -232,7 +233,8 @@ The migrations are forward-only: once they've run, an older QueryFlux won't star
 
 - **Docker Compose:** [`examples/worker-mode`](https://github.com/lakeops-org/queryflux/tree/main/examples/worker-mode) runs a control plane, Postgres, Studio and two workers.
 - **Helm, shared-service workers:** `charts/queryflux/examples/control-plane-values.yaml` and `worker-values.yaml`, one release each. Add `worker-autoscaling-values.yaml` to scale workers on load. Adding workers never raises a limit: with shared capacity, `maxRunningQueries` holds across the fleet.
-- **Native sidecar** (Kubernetes 1.29+): `charts/queryflux/examples/worker-sidecar-manifest.yaml`. Run the worker as an init container with `restartPolicy: Always` and a `/readyz` startup probe. Kubernetes then starts the application only once its worker has a config, and stops the worker after the application.
+- **Native sidecar** (Kubernetes 1.29+): one worker inside each application pod. Step by step: [Add a worker as a sidecar](./worker-sidecar). The example manifest is `charts/queryflux/examples/worker-sidecar-manifest.yaml`.
+- **One worker per node:** `charts/queryflux/examples/worker-daemonset-values.yaml` runs workers as a DaemonSet. With `service.internalTrafficPolicy: Local`, apps keep one Service address, and each connection goes to the worker on the app's own node. There's no fallback while a node's worker restarts, so rollouts replace one node's worker at a time.
 
 See the [Helm chart README](https://github.com/lakeops-org/queryflux/blob/main/charts/queryflux/README.md#worker-mode).
 

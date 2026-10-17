@@ -28,6 +28,8 @@ required_files=(
   "examples/control-plane-values.yaml"
   "examples/worker-values.yaml"
   "examples/worker-autoscaling-values.yaml"
+  "examples/worker-daemonset-values.yaml"
+  "examples/worker-sidecar-manifest.yaml"
   "values.yaml"
   "values.schema.json"
   "templates/_helpers.tpl"
