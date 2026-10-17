@@ -70,6 +70,7 @@ const sidebars: SidebarsConfig = {
         'architecture/catalog-integration',
         'architecture/routing-and-clusters',
         'architecture/cluster-variants-and-health',
+        'architecture/worker-mode',
         'architecture/caching',
         'architecture/query-tags',
         'architecture/query-params',

@@ -6,6 +6,8 @@ image: img/queryflux-hero-banner.png
 
 # Worker mode
 
+This page is about running worker mode. For how it works and why, see the [Worker mode design](../architecture/worker-mode).
+
 In worker mode, one QueryFlux deployment owns the config and the others run queries with it:
 
 - The **control plane** owns the config in Postgres. It serves Studio and the admin API, and can run queries itself.
