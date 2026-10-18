@@ -161,10 +161,11 @@ impl WorkerSnapshotV1 {
 }
 
 /// Whether a JSON object key names a credential: passwords, tokens, secrets, private
-/// keys and passphrases, matched case-insensitively. Deliberately broad, because some
-/// engines (ADBC) accept free-form driver options.
+/// keys, passphrases and API keys, matched case-insensitively with `-` treated as `_`
+/// (so `X-API-Key` matches `api_key`). Deliberately broad, because some engines (ADBC)
+/// accept free-form driver options.
 pub fn is_credential_key(key: &str) -> bool {
-    let k = key.to_ascii_lowercase();
+    let k = key.to_ascii_lowercase().replace('-', "_");
     [
         "password",
         "passwd",
@@ -176,24 +177,38 @@ pub fn is_credential_key(key: &str) -> bool {
         "credential",
         "apikey",
         "api_key",
+        "auth_key",
     ]
     .iter()
     .any(|needle| k.contains(needle))
         && !matches!(k.as_str(), "authtype" | "tokenexchange")
 }
 
+/// HTTP headers that carry credentials whatever their value, e.g. a guardrail webhook's
+/// `Authorization: Bearer ...`. Matched only inside a `headers` map: elsewhere, keys such
+/// as `authorizationConfig` are ordinary configuration.
+const CREDENTIAL_HEADERS: &[&str] = &["authorization", "proxy-authorization", "cookie"];
+
 /// Remove every credential-like key, recursively, from objects inside `value`.
 pub fn strip_credentials(value: &mut serde_json::Value) {
+    strip_credentials_in(value, false);
+}
+
+fn strip_credentials_in(value: &mut serde_json::Value, in_headers: bool) {
     match value {
         serde_json::Value::Object(map) => {
-            map.retain(|k, _| !is_credential_key(k));
-            for v in map.values_mut() {
-                strip_credentials(v);
+            map.retain(|k, _| {
+                let credential_header =
+                    in_headers && CREDENTIAL_HEADERS.iter().any(|h| k.eq_ignore_ascii_case(h));
+                !(is_credential_key(k) || credential_header)
+            });
+            for (k, v) in map.iter_mut() {
+                strip_credentials_in(v, in_headers || k.eq_ignore_ascii_case("headers"));
             }
         }
         serde_json::Value::Array(items) => {
             for v in items {
-                strip_credentials(v);
+                strip_credentials_in(v, in_headers);
             }
         }
         _ => {}
@@ -323,6 +338,34 @@ mod tests {
         let adbc = s.clusters.iter().find(|c| c.name == "adbc-a").unwrap();
         assert_eq!(adbc.config["queryAuth"]["type"], "tokenExchange");
         assert_eq!(adbc.config["dbKwargs"]["warehouse"], "WH");
+    }
+
+    /// Guardrail webhook headers carry credentials under arbitrary names.
+    #[test]
+    fn stripping_removes_credential_headers_but_keeps_authorization_config() {
+        let mut v = serde_json::json!({
+            "guardrails": [{
+                "type": "http_webhook",
+                "url": "https://guard.example/check",
+                "headers": {
+                    "Authorization": "Bearer t0k",
+                    "X-API-Key": "k1",
+                    "X-Auth-Key": "k2",
+                    "Cookie": "session=c",
+                    "X-Request-Source": "queryflux"
+                }
+            }],
+            "authorizationConfig": { "provider": "allowAll" }
+        });
+        strip_credentials(&mut v);
+        let headers = &v["guardrails"][0]["headers"];
+        assert_eq!(
+            headers,
+            &serde_json::json!({ "X-Request-Source": "queryflux" }),
+            "only the non-credential header survives"
+        );
+        assert_eq!(v["guardrails"][0]["url"], "https://guard.example/check");
+        assert_eq!(v["authorizationConfig"]["provider"], "allowAll");
     }
 
     #[test]
