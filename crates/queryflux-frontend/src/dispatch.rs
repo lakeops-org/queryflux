@@ -342,8 +342,11 @@ pub async fn dispatch_query(
             );
             match acquire_global_capacity(state, &cluster_manager, &group, &c, &query_id.0).await {
                 CapacityGrant::Denied => {
-                    // Global capacity full — release local slot and queue.
-                    slot.release().await;
+                    // Global capacity full — release the local slot and queue. The query
+                    // holds no lease, so there is nothing to release in the capacity store
+                    // (a queued release could otherwise remove the lease its next poll
+                    // is granted under the same id).
+                    slot.release_local().await;
                     let uri = persist_queued_query(
                         state,
                         query_id,
@@ -1262,6 +1265,24 @@ impl ClusterSlotGuard {
             .record_backend_outcome(&self.group, &self.cluster, outcome);
     }
 
+    /// Give back only the local slot, after the fleet-wide lease was denied: the query
+    /// holds no lease. Releasing it from the capacity store as well would be a wasted
+    /// round trip, and with releases sent in the background it could arrive after the
+    /// query's retry was granted under the same id and remove that lease.
+    async fn release_local(&mut self) {
+        if !self.released {
+            self.released = true;
+            let _ = self
+                .cluster_manager
+                .release_cluster(&self.group, &self.cluster)
+                .await;
+            if self.started {
+                self.metrics
+                    .on_query_finished(&self.group.0, &self.cluster.0);
+            }
+        }
+    }
+
     /// Release the slot on the normal path. Idempotent — safe to call twice.
     async fn release(&mut self) {
         if !self.released {
@@ -1671,8 +1692,9 @@ async fn setup_sync_query(
                 {
                     CapacityGrant::Denied => {
                         // Global capacity full or coordination unavailable (fail-closed) —
-                        // release local slot and retry with backoff.
-                        slot.release().await;
+                        // release the local slot (the query holds no lease) and retry with
+                        // backoff.
+                        slot.release_local().await;
                         queued_backoff_delay(seq).await;
                         seq += 1;
                         continue;

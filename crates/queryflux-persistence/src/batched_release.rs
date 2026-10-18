@@ -39,6 +39,9 @@ pub struct BatchedReleaseStore {
     inner: Arc<dyn CapacityStore>,
     tx: mpsc::UnboundedSender<Msg>,
     pending: Arc<AtomicUsize>,
+    /// Query ids with a release queued and not yet sent, so an acquire for the same id
+    /// can wait for it instead of having its new lease removed by it.
+    queued_ids: Arc<dashmap::DashMap<String, usize>>,
     metrics: Arc<dyn MetricsStore>,
 }
 
@@ -48,11 +51,19 @@ impl BatchedReleaseStore {
     pub fn new(inner: Arc<dyn CapacityStore>, metrics: Arc<dyn MetricsStore>) -> Self {
         let (tx, rx) = mpsc::unbounded_channel();
         let pending = Arc::new(AtomicUsize::new(0));
-        tokio::spawn(flusher(inner.clone(), rx, pending.clone(), metrics.clone()));
+        let queued_ids: Arc<dashmap::DashMap<String, usize>> = Arc::default();
+        tokio::spawn(flusher(
+            inner.clone(),
+            rx,
+            pending.clone(),
+            queued_ids.clone(),
+            metrics.clone(),
+        ));
         Self {
             inner,
             tx,
             pending,
+            queued_ids,
             metrics,
         }
     }
@@ -77,6 +88,7 @@ async fn flusher(
     inner: Arc<dyn CapacityStore>,
     mut rx: mpsc::UnboundedReceiver<Msg>,
     pending: Arc<AtomicUsize>,
+    queued_ids: Arc<dashmap::DashMap<String, usize>>,
     metrics: Arc<dyn MetricsStore>,
 ) {
     let mut batch: Vec<(String, String)> = Vec::new();
@@ -98,7 +110,12 @@ async fn flusher(
             match inner.release_many(&batch).await {
                 Ok(()) => {
                     pending.fetch_sub(batch.len(), Ordering::Relaxed);
-                    batch.clear();
+                    for (_, query_id) in batch.drain(..) {
+                        queued_ids.remove_if_mut(&query_id, |_, n| {
+                            *n -= 1;
+                            *n == 0
+                        });
+                    }
                 }
                 Err(e) => {
                     metrics.on_coordination_failure("capacity_release");
@@ -128,6 +145,14 @@ impl CapacityStore for BatchedReleaseStore {
         instance_id: &str,
         query_id: &str,
     ) -> Result<bool> {
+        // A release for this id is still queued: send it first, so it can't remove the
+        // lease this acquire is about to take. Callers don't normally release an id and
+        // acquire it again, so this is rare.
+        if self.queued_ids.contains_key(query_id) && !self.flush(Duration::from_secs(5)).await {
+            return Err(queryflux_core::error::QueryFluxError::Persistence(format!(
+                "a release for query {query_id} is still queued; retry"
+            )));
+        }
         self.inner
             .try_acquire(cluster_name, max_running_queries, instance_id, query_id)
             .await
@@ -136,6 +161,7 @@ impl CapacityStore for BatchedReleaseStore {
     async fn release(&self, cluster_name: &str, query_id: &str) -> Result<()> {
         if self.pending.load(Ordering::Relaxed) < MAX_PENDING {
             self.pending.fetch_add(1, Ordering::Relaxed);
+            *self.queued_ids.entry(query_id.to_string()).or_insert(0) += 1;
             if self
                 .tx
                 .send(Msg::Release(cluster_name.to_string(), query_id.to_string()))
@@ -144,6 +170,10 @@ impl CapacityStore for BatchedReleaseStore {
                 return Ok(());
             }
             self.pending.fetch_sub(1, Ordering::Relaxed);
+            self.queued_ids.remove_if_mut(query_id, |_, n| {
+                *n -= 1;
+                *n == 0
+            });
         } else {
             self.metrics
                 .on_coordination_failure("capacity_release_backlog");
@@ -295,6 +325,24 @@ mod tests {
         store.release("c", "q1").await.unwrap();
         assert!(!store.flush(Duration::from_millis(200)).await);
         assert_eq!(store.pending(), 1);
+    }
+
+    /// Release then acquire the same id: the release reaches the store first.
+    #[tokio::test]
+    async fn an_acquire_waits_for_a_queued_release_of_the_same_id() {
+        let rec = Arc::new(Recorder {
+            fail: AtomicUsize::new(2),
+            ..Default::default()
+        });
+        let store = BatchedReleaseStore::new(rec.clone(), no_metrics());
+        store.release("c", "q1").await.unwrap();
+        assert!(store.try_acquire("c", 10, "i", "q1").await.unwrap());
+        assert_eq!(
+            released(&rec),
+            vec!["q1"],
+            "sent before the acquire returned"
+        );
+        assert!(store.queued_ids.is_empty());
     }
 
     #[tokio::test]
