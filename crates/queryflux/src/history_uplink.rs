@@ -145,7 +145,7 @@ impl RemoteMetricsStore {
             records,
         };
         let mut req = self.client.post(endpoint).json(&batch);
-        if endpoint.starts_with(&self.control_plane) {
+        if same_origin(endpoint, &self.control_plane) {
             req = req.bearer_auth(&self.bearer);
         }
         let result = match req.send().await {
@@ -277,6 +277,16 @@ pub(crate) fn redact(record: &mut QueryRecord, redaction: HistoryRedaction) {
                 .clone()
                 .or_else(|| record.translated_sql.as_deref().map(mask_literals));
             record.error_message = record.error_message.as_deref().map(mask_literals);
+            if let Some(trace) = record.routing_trace.as_mut() {
+                mask_json_strings(trace);
+            }
+            // Webhook and script guards return free-form text that can quote the query.
+            for g in &mut record.guard_actions {
+                g.reason = g.reason.as_deref().map(mask_literals);
+                if let Some(metadata) = g.metadata.as_mut() {
+                    metadata.values_mut().for_each(|v| *v = mask_literals(v));
+                }
+            }
         }
         HistoryRedaction::Metadata => {
             record.sql_preview = String::new();
@@ -287,7 +297,33 @@ pub(crate) fn redact(record: &mut QueryRecord, redaction: HistoryRedaction) {
             record.error_message = None;
             // Router decisions can quote the SQL they matched on.
             record.routing_trace = None;
+            // Guard text can quote the query or its error; keep which guard did what.
+            for g in &mut record.guard_actions {
+                g.reason = None;
+                g.metadata = None;
+            }
         }
+    }
+}
+
+/// Whether two URLs share scheme, host and port. Decides whether the control plane's
+/// secret may be sent; a string prefix would also match `https://cp.example.com.evil.net`
+/// or another port on the same host.
+pub(crate) fn same_origin(a: &str, b: &str) -> bool {
+    match (reqwest::Url::parse(a), reqwest::Url::parse(b)) {
+        (Ok(a), Ok(b)) => a.origin() == b.origin(),
+        _ => false,
+    }
+}
+
+/// Mask literals in every string inside `value` (a routing trace can quote the SQL it
+/// matched on).
+fn mask_json_strings(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::String(s) => *s = mask_literals(s),
+        serde_json::Value::Array(items) => items.iter_mut().for_each(mask_json_strings),
+        serde_json::Value::Object(map) => map.values_mut().for_each(mask_json_strings),
+        _ => {}
     }
 }
 
@@ -379,7 +415,13 @@ mod tests {
             step_index: None,
             tool_call_id: None,
             query_intent: None,
-            guard_actions: vec![],
+            guard_actions: vec![queryflux_persistence::GuardAction {
+                guard: "pii-webhook".into(),
+                action: "warn".into(),
+                reason: Some("query filters on name = 'bob'".into()),
+                code: Some("PII".into()),
+                metadata: Some([("matched".to_string(), "'bob' at 42".to_string())].into()),
+            }],
             was_guard_blocked: false,
             cache_hit: false,
             worker: None,
@@ -404,6 +446,17 @@ mod tests {
             Some("SELECT * FROM t WHERE id = ?")
         );
         assert_eq!(r.error_message.as_deref(), Some("no row with id ? for ?"));
+        assert_eq!(
+            r.routing_trace,
+            Some(serde_json::json!({"matched": "name = ?"}))
+        );
+        let g = &r.guard_actions[0];
+        assert_eq!(g.reason.as_deref(), Some("query filters on name = ?"));
+        assert_eq!(g.metadata.as_ref().unwrap()["matched"], "? at ?");
+        assert_eq!(
+            (g.guard.as_str(), g.code.as_deref()),
+            ("pii-webhook", Some("PII"))
+        );
 
         let mut r = record("q");
         redact(&mut r, HistoryRedaction::Metadata);
@@ -411,6 +464,29 @@ mod tests {
         assert!(r.translated_sql.is_none() && r.error_message.is_none());
         assert!(r.routing_trace.is_none() && r.digest_text.is_none());
         assert_eq!(r.query_parameterized_hash, Some(2), "fingerprints are kept");
+        let g = &r.guard_actions[0];
+        assert!(g.reason.is_none() && g.metadata.is_none());
+        assert_eq!(
+            (g.action.as_str(), g.code.as_deref()),
+            ("warn", Some("PII"))
+        );
+    }
+
+    #[test]
+    fn the_secret_goes_only_to_the_control_planes_origin() {
+        let cp = "https://cp.example.com";
+        assert!(same_origin(
+            "https://cp.example.com/worker/query-records",
+            cp
+        ));
+        assert!(same_origin("https://cp.example.com:443/x", cp));
+        assert!(!same_origin(
+            "https://cp.example.com.attacker.net/ingest",
+            cp
+        ));
+        assert!(!same_origin("https://cp.example.com:9443/ingest", cp));
+        assert!(!same_origin("http://cp.example.com/ingest", cp));
+        assert!(!same_origin("not a url", cp));
     }
 
     async fn control_plane(
