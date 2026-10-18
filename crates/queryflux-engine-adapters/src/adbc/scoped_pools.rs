@@ -399,8 +399,21 @@ mod tests {
             .await
             .unwrap();
         drop(guard);
-        cache.sweep();
-        assert!(cache.state.lock().unwrap().builds.is_empty());
+        // The build thread's guard unlocks the mutex before it drops its `Arc` to it, so
+        // right after `lock_owned` succeeds that thread may still hold the last other
+        // reference, and the entry is not prunable yet. Wait for it rather than racing it.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            cache.sweep();
+            if cache.state.lock().unwrap().builds.is_empty() {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "build lock entries were not released after the build finished"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
     }
 
     #[tokio::test]
