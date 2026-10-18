@@ -176,7 +176,7 @@ sequenceDiagram
     alt granted
         CP-->>W: granted: true
         W->>E: execute
-        W->>CP: POST /worker/capacity/release
+        W-)CP: POST /worker/capacity/release-batch (queued, with other releases)
     else fleet full
         CP-->>W: granted: false
         Note over W: queue, retry with backoff<br/>(queryflux_capacity_lease_denied_total)
@@ -188,7 +188,7 @@ sequenceDiagram
 - **Leases of dead workers expire.** Workers renew their leases on a timer, and the control plane's stale-lease sweep reclaims a worker's leases once its renewals stop. Sweep locks held for a worker are dropped after 5 minutes if never released.
 - **Releases are batched.** A worker queues each release and sends them together (`POST /worker/capacity/release-batch`), so a finishing query doesn't wait on the control plane. What a lease costs: [Capacity and throughput](./capacity-and-throughput).
 - **Local work stays local.** A worker's zombie and stale-queue sweeps clean its own memory, so they never take fleet-wide locks.
-- **Cost:** one round trip per query to acquire a lease, with a 5-second timeout. Releases don't add a round trip per query.
+- **Cost:** one round trip per query to acquire a lease, with a 5-second timeout. The release is off the query path: a finishing query doesn't wait for it. Releases that finish together share one request; a query that finishes alone still sends its own.
 
 | | `coordination.mode: controlPlane` (default) | `coordination.mode: local` |
 |---|---|---|

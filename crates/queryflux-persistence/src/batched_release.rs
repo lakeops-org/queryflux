@@ -84,6 +84,22 @@ impl BatchedReleaseStore {
     }
 }
 
+/// Releases that failed and wait for their retry. New releases don't wait behind them:
+/// each round sends what newly arrived at once, and retries the failed ones on their own
+/// backoff. After a few failed retries they are sent one at a time, so a single lease the
+/// store keeps rejecting can't hold the others back.
+struct Retry {
+    leases: Vec<(String, String)>,
+    at: tokio::time::Instant,
+    delay: Duration,
+    attempts: u32,
+}
+
+enum Wake {
+    Msg(Msg),
+    Retry,
+}
+
 async fn flusher(
     inner: Arc<dyn CapacityStore>,
     mut rx: mpsc::UnboundedReceiver<Msg>,
@@ -91,49 +107,132 @@ async fn flusher(
     queued_ids: Arc<dashmap::DashMap<String, usize>>,
     metrics: Arc<dyn MetricsStore>,
 ) {
-    let mut batch: Vec<(String, String)> = Vec::new();
+    let mut retry = Retry {
+        leases: Vec::new(),
+        at: tokio::time::Instant::now(),
+        delay: RETRY_MIN,
+        attempts: 0,
+    };
     let mut flushes: Vec<oneshot::Sender<()>> = Vec::new();
-    while let Some(first) = rx.recv().await {
-        let mut next = Some(first);
-        // Take whatever queued up while the previous batch was being sent.
-        while let Some(msg) = next.take().or_else(|| rx.try_recv().ok()) {
-            match msg {
-                Msg::Release(cluster, query_id) => batch.push((cluster, query_id)),
-                Msg::Flush(done) => flushes.push(done),
+    let mut closed = false;
+    loop {
+        let wake = match (retry.leases.is_empty(), closed) {
+            (true, true) => return,
+            (true, false) => match rx.recv().await {
+                Some(m) => Wake::Msg(m),
+                None => return,
+            },
+            (false, true) => {
+                tokio::time::sleep_until(retry.at).await;
+                Wake::Retry
             }
-            if batch.len() >= MAX_BATCH {
-                break;
-            }
-        }
-        let mut delay = RETRY_MIN;
-        while !batch.is_empty() {
-            match inner.release_many(&batch).await {
-                Ok(()) => {
-                    pending.fetch_sub(batch.len(), Ordering::Relaxed);
-                    for (_, query_id) in batch.drain(..) {
-                        queued_ids.remove_if_mut(&query_id, |_, n| {
-                            *n -= 1;
-                            *n == 0
-                        });
+            (false, false) => tokio::select! {
+                m = rx.recv() => match m {
+                    Some(m) => Wake::Msg(m),
+                    None => {
+                        closed = true;
+                        continue;
+                    }
+                },
+                _ = tokio::time::sleep_until(retry.at) => Wake::Retry,
+            },
+        };
+
+        let mut failed = Vec::new();
+        match wake {
+            Wake::Msg(first) => {
+                // Send what queued up while the previous round was busy.
+                let mut fresh = Vec::new();
+                let mut next = Some(first);
+                while let Some(msg) = next.take().or_else(|| rx.try_recv().ok()) {
+                    match msg {
+                        Msg::Release(cluster, query_id) => fresh.push((cluster, query_id)),
+                        Msg::Flush(done) => flushes.push(done),
+                    }
+                    if fresh.len() >= MAX_BATCH {
+                        break;
                     }
                 }
-                Err(e) => {
-                    metrics.on_coordination_failure("capacity_release");
-                    tracing::warn!(
-                        leases = batch.len(),
-                        "Capacity release failed, retrying in {delay:?}: {e}"
-                    );
-                    tokio::time::sleep(delay).await;
-                    delay = (delay * 2).min(RETRY_MAX);
+                failed = send(inner.as_ref(), fresh, false, &pending, &queued_ids).await;
+                if !failed.is_empty() && retry.leases.is_empty() {
+                    retry.at = tokio::time::Instant::now() + retry.delay;
                 }
             }
+            Wake::Retry => {
+                let leases = std::mem::take(&mut retry.leases);
+                let one_by_one = retry.attempts >= 3;
+                let still = send(inner.as_ref(), leases, one_by_one, &pending, &queued_ids).await;
+                retry.attempts += 1;
+                retry.delay = (retry.delay * 2).min(RETRY_MAX);
+                retry.at = tokio::time::Instant::now() + retry.delay;
+                retry.leases = still;
+            }
         }
-        // Messages are read in order, so every release queued before a flush message read
-        // in this round was in this batch or an earlier one: all sent now.
-        for done in flushes.drain(..) {
-            let _ = done.send(());
+        if !failed.is_empty() {
+            retry.leases.extend(failed);
+        }
+        if !retry.leases.is_empty() {
+            metrics.on_coordination_failure("capacity_release");
+            tracing::warn!(
+                leases = retry.leases.len(),
+                "Capacity releases failed, retrying in {:?}",
+                retry.delay
+            );
+        } else {
+            retry.attempts = 0;
+            retry.delay = RETRY_MIN;
+            // Everything read so far has been sent, including every release queued before
+            // any flush message read so far.
+            for done in flushes.drain(..) {
+                let _ = done.send(());
+            }
         }
     }
+}
+
+/// Send `leases` (in one call, or one at a time) and return the ones that failed.
+async fn send(
+    inner: &dyn CapacityStore,
+    leases: Vec<(String, String)>,
+    one_by_one: bool,
+    pending: &AtomicUsize,
+    queued_ids: &dashmap::DashMap<String, usize>,
+) -> Vec<(String, String)> {
+    let sent = |done: &[(String, String)]| {
+        pending.fetch_sub(done.len(), Ordering::Relaxed);
+        for (_, query_id) in done {
+            queued_ids.remove_if_mut(query_id, |_, n| {
+                *n -= 1;
+                *n == 0
+            });
+        }
+    };
+    if leases.is_empty() {
+        return leases;
+    }
+    if !one_by_one || leases.len() == 1 {
+        return match inner.release_many(&leases).await {
+            Ok(()) => {
+                sent(&leases);
+                Vec::new()
+            }
+            Err(e) => {
+                tracing::debug!(leases = leases.len(), "Capacity release batch failed: {e}");
+                leases
+            }
+        };
+    }
+    let mut failed = Vec::new();
+    for lease in leases {
+        match inner.release(&lease.0, &lease.1).await {
+            Ok(()) => sent(std::slice::from_ref(&lease)),
+            Err(e) => {
+                tracing::debug!(query_id = %lease.1, "Capacity release failed: {e}");
+                failed.push(lease);
+            }
+        }
+    }
+    failed
 }
 
 #[async_trait]
@@ -313,6 +412,70 @@ mod tests {
         assert!(store.flush(Duration::from_secs(5)).await);
         assert_eq!(released(&rec), vec!["q1", "q2"]);
         assert_eq!(store.pending(), 0);
+    }
+
+    /// Rejects one lease forever; releases everything else.
+    #[derive(Default)]
+    struct Poisoned {
+        released: Mutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl CapacityStore for Poisoned {
+        async fn try_acquire(&self, _: &str, _: u64, _: &str, _: &str) -> Result<bool> {
+            Ok(true)
+        }
+        async fn release(&self, _: &str, q: &str) -> Result<()> {
+            if q == "bad" {
+                return Err(QueryFluxError::Persistence("rejected".into()));
+            }
+            self.released.lock().unwrap().push(q.to_string());
+            Ok(())
+        }
+        async fn release_many(&self, leases: &[(String, String)]) -> Result<()> {
+            if leases.iter().any(|(_, q)| q == "bad") {
+                return Err(QueryFluxError::Persistence("rejected".into()));
+            }
+            for (c, q) in leases {
+                self.release(c, q).await?;
+            }
+            Ok(())
+        }
+        async fn heartbeat(&self, _: &str) -> Result<u64> {
+            Ok(0)
+        }
+        async fn expire_stale(&self, _: DateTime<Utc>) -> Result<u64> {
+            Ok(0)
+        }
+        async fn active_count(&self, _: &str) -> Result<u64> {
+            Ok(0)
+        }
+        async fn publish_running_count(&self, _: &str, _: u64) -> Result<()> {
+            Ok(())
+        }
+        async fn active_lease_count(&self, _: &str) -> Result<u64> {
+            Ok(0)
+        }
+        async fn release_all_for_instance(&self, _: &str) -> Result<u64> {
+            Ok(0)
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_lease_the_store_keeps_rejecting_does_not_hold_up_the_rest() {
+        let store_ = Arc::new(Poisoned::default());
+        let store = BatchedReleaseStore::new(store_.clone(), no_metrics());
+        store.release("c", "bad").await.unwrap();
+        store.release("c", "q1").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        // Released later, while the first batch is failing: sent on arrival.
+        store.release("c", "q2").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert_eq!(*store_.released.lock().unwrap(), vec!["q2"]);
+        // After a few retries the failed batch is split, and q1 goes through.
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        assert_eq!(*store_.released.lock().unwrap(), vec!["q2", "q1"]);
+        assert_eq!(store.pending(), 1, "only the rejected one is left");
     }
 
     #[tokio::test]
