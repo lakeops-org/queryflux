@@ -1,7 +1,8 @@
 # Manually build and push multi-arch images from a chosen Git ref with explicit GHCR tags.
 # Does not run Release Please and does not move :latest / :latest-slim (those stay for automated releases).
 #
-# Example: image_tag = v0.1.2  →  ghcr.io/.../queryflux:v0.1.2 (server + Studio) and ...:v0.1.2-slim (server-only)
+# Example: image_tag = v0.1.2  →  ghcr.io/.../queryflux:v0.1.2-slim (server-only, built here); then
+# lakeops-org/queryflux-studio builds ...:v0.1.2 (server + Studio) on top of it.
 
 name: Docker — publish ref with tag
 
@@ -9,7 +10,7 @@ on:
   workflow_dispatch:
     inputs:
       image_tag:
-        description: "Version tag for unified image, e.g. v0.1.2 (publishes :v0.1.2 and :v0.1.2-slim)"
+        description: "Version tag, e.g. v0.1.2 (publishes :v0.1.2-slim here; queryflux-studio then publishes :v0.1.2)"
         required: true
         type: string
       git_ref:
@@ -142,104 +143,26 @@ jobs:
             $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
             $(printf '${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@sha256:%s ' *)
 
-  build-full:
-    name: Build server + Studio (${{ matrix.suffix }})
-    needs: [validate]
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - platform: linux/amd64
-            runs-on: ubuntu-latest
-            suffix: amd64
-          - platform: linux/arm64
-            runs-on: ubuntu-24.04-arm
-            suffix: arm64
-    runs-on: ${{ matrix.runs-on }}
-    steps:
-      - uses: actions/checkout@44c2b7a8a4ea60a981eaca3cf939b5f4305c123b # v4.1.5
-        with:
-          ref: ${{ inputs.git_ref }}
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v3
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Build and push by digest
-        id: build
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: docker/queryflux/Dockerfile
-          target: runtime-unified
-          platforms: ${{ matrix.platform }}
-          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
-          build-args: |
-            CARGO_BUILD_JOBS=4
-            QUERYFLUX_STUDIO_IMAGE=ghcr.io/lakeops-org/queryflux-studio:latest
-          cache-from: type=gha,scope=queryflux-full-${{ matrix.suffix }}
-          cache-to: type=gha,mode=max,scope=queryflux-full-${{ matrix.suffix }}
-
-      - name: Export digest
-        run: |
-          mkdir -p /tmp/digests
-          digest="${{ steps.build.outputs.digest }}"
-          touch "/tmp/digests/${digest#sha256:}"
-
-      - name: Upload digest
-        uses: actions/upload-artifact@v4
-        with:
-          name: digests-full-${{ matrix.suffix }}
-          path: /tmp/digests/*
-          if-no-files-found: error
-          retention-days: 1
-
-  manifest-full:
-    name: Manifest server + Studio image
-    needs: [validate, build-full]
+  # The server + Studio image is built by lakeops-org/queryflux-studio on top of the slim image.
+  studio-image:
+    name: Request server + Studio image
+    needs: [manifest-slim]
     runs-on: ubuntu-latest
     steps:
-      - name: Download digests
-        uses: actions/download-artifact@v4
-        with:
-          path: /tmp/digests
-          pattern: digests-full-*
-          merge-multiple: true
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v3
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Docker metadata
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          tags: |
-            type=raw,value=${{ inputs.image_tag }}
-
-      - name: Create and push manifest
-        working-directory: /tmp/digests
+      - name: Dispatch queryflux-image to queryflux-studio
+        env:
+          GH_TOKEN: ${{ secrets.STUDIO_DISPATCH_TOKEN || secrets.RELEASE_PLEASE_TOKEN }}
+          STUDIO_REPO: ${{ vars.STUDIO_REPOSITORY || 'lakeops-org/queryflux-studio' }}
+          VERSION: ${{ inputs.image_tag }}
         run: |
-          docker buildx imagetools create \
-            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
-            $(printf '${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@sha256:%s ' *)
+          set -eu
+          jq -n --arg version "$VERSION" \
+            '{event_type: "queryflux-image", client_payload: {version: $version, latest: false}}' \
+            | gh api "repos/${STUDIO_REPO}/dispatches" --input -
 
   summary:
     name: Summary
-    needs: [manifest-slim, manifest-full]
+    needs: [manifest-slim, studio-image]
     runs-on: ubuntu-latest
     steps:
       - name: Job summary
@@ -249,4 +172,4 @@ jobs:
           echo "| Variant | Tag |" >> "$GITHUB_STEP_SUMMARY"
           echo "|---------|-----|" >> "$GITHUB_STEP_SUMMARY"
           echo "| Server only | \`:${{ inputs.image_tag }}-slim\` |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Server + Studio | \`:${{ inputs.image_tag }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Server + Studio | \`:${{ inputs.image_tag }}\` (built by queryflux-studio) |" >> "$GITHUB_STEP_SUMMARY"

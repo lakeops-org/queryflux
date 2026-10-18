@@ -47,7 +47,9 @@ Maintainers cut **git tags** to publish **two** multi-arch images to **GitHub Co
 | Variant | Build | Meaning |
 |---------|-------|---------|
 | **Server only** | [`docker/queryflux/Dockerfile`](docker/queryflux/Dockerfile) (default target `runtime-server`) | QueryFlux API; no Studio UI |
-| **Server + Studio** | same file, `--target runtime-unified` | API + bundled Studio |
+| **Server + Studio** | [`queryflux-studio` Dockerfile](https://github.com/lakeops-org/queryflux-studio/blob/main/Dockerfile), `--target bundled`, on top of the server-only image | API + bundled Studio |
+
+This repo builds only the server-only image. When its manifest is pushed, the release workflows send a `queryflux-image` [repository dispatch](https://docs.github.com/en/rest/repos/repos#create-a-repository-dispatch-event) to [lakeops-org/queryflux-studio](https://github.com/lakeops-org/queryflux-studio). Studio then builds the server + Studio image from `:<version>-slim` and pushes it to this package. Studio pushes to `main` also rebuild `:latest`, so a UI change never needs a Rust build. Two pieces of setup are needed: the dispatch uses `STUDIO_DISPATCH_TOKEN` (falling back to `RELEASE_PLEASE_TOKEN`), which must be able to dispatch to the Studio repo, and the Studio repo needs write access to this package (*Manage Actions access*).
 
 Release images are built for **linux/amd64** and **linux/arm64** only.
 
@@ -59,11 +61,11 @@ Release images are built for **linux/amd64** and **linux/arm64** only.
 
 **Per-arch tags** (for pinning): e.g. `:<git-tag>-amd64`, `:<git-tag>-arm64`, `:<git-tag>-full-amd64`, `:latest-amd64`, `:latest-slim-amd64`, etc. Multi-arch **manifest** tags are assembled with `docker buildx imagetools create`, similar to [lakekeeper/lakekeeper’s release workflow](https://github.com/lakekeeper/lakekeeper/blob/main/.github/workflows/release.yml).
 
-**How builds run:** **linux/amd64** images build on **`ubuntu-latest`**; **linux/arm64** on **`ubuntu-24.04-arm64`** (native ARM — no QEMU for compiles). Then manifest jobs merge the two digests. **Floating tags:** `:latest` = unified; `:latest-slim` = server-only. RC builds do **not** update `:latest` / `:latest-slim`.
+**How builds run:** **linux/amd64** images build on **`ubuntu-latest`**; **linux/arm64** on **`ubuntu-24.04-arm64`** (native ARM — no QEMU for compiles). Then manifest jobs merge the two digests. **Floating tags:** `:latest` = unified; `:latest-slim` = server-only. RC builds do **not** update `:latest` / `:latest-slim`. The server + Studio tags are pushed by the Studio repo's `bundled-image.yml`.
 
-Release workflows use **`GITHUB_TOKEN`** with **`packages: write`** (push + manifests), **`actions: write`** (BuildKit **GHA cache**, per-arch scopes `queryflux-slim-amd64` / `queryflux-slim-arm64` / `queryflux-full-*`), and **`contents: write`** on the publish job. Optional **`GHCR_IMAGE_NAME`**. PRs verify Dockerfiles in [docker-verify.yml](.github/workflows/docker-verify.yml).
+Release workflows use **`GITHUB_TOKEN`** with **`packages: write`** (push + manifests), **`actions: write`** (BuildKit **GHA cache**, per-arch scopes `queryflux-slim-amd64` / `queryflux-slim-arm64`), and **`contents: write`** on the publish job. Optional **`GHCR_IMAGE_NAME`**. PRs verify Dockerfiles in [docker-verify.yml](.github/workflows/docker-verify.yml).
 
-**Cold or slow runs:** First push after dependency changes may still be heavy (Rust + PyO3 + DuckDB + Next.js on both arches). Caches speed repeat runs. ARM64 requires **GitHub-hosted ARM runners** available for the repo (public repos typically have `ubuntu-24.04-arm64`).
+**Cold or slow runs:** First push after dependency changes may still be heavy (Rust + PyO3 + DuckDB on both arches). Caches speed repeat runs. ARM64 requires **GitHub-hosted ARM runners** available for the repo (public repos typically have `ubuntu-24.04-arm64`).
 
 After the first push, open the package in the org/repo **Packages** settings and set visibility to **public** if you want anonymous `docker pull`. Private packages require `docker login ghcr.io` with a PAT or `GITHUB_TOKEN` that has `read:packages`.
 
@@ -71,7 +73,9 @@ Local build then push to GHCR (replace `OWNER/REPO`):
 
 ```bash
 echo "$GITHUB_TOKEN" | docker login ghcr.io -u OWNER --password-stdin
-docker buildx build -f docker/queryflux/Dockerfile --target runtime-unified -t ghcr.io/OWNER/REPO:latest --push .
+docker buildx build -f docker/queryflux/Dockerfile -t ghcr.io/OWNER/REPO:latest-slim --push .
+# server + Studio, from a queryflux-studio checkout:
+docker buildx build --target bundled --build-arg QUERYFLUX_IMAGE=ghcr.io/OWNER/REPO:latest-slim -t ghcr.io/OWNER/REPO:latest --push .
 ```
 
 Release notes come from Release Please ([`.github/workflows/release.yml`](.github/workflows/release.yml)): squash-merged `feat:` / `fix:` / `ui:` PR titles land in the next `CHANGELOG.md` and GitHub Release. `chore(deps):` and `docs:` do not.
