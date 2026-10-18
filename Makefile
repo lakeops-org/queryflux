@@ -20,8 +20,13 @@ TPCH_SCALE ?= tiny
 export TPCH_SCALE
 
 # Prefer nextest when installed (CI); fall back to cargo test for local dev.
+# The nextest run *builds* queryflux-e2e-tests too (but skips its `tests/` binaries, which
+# need the Docker stack): keeping the e2e crate in the package selection keeps cargo's feature
+# unification identical to CI's E2E step (same `cargo test --no-run` selection), so that step
+# reuses this build instead of recompiling every workspace crate with a different feature set.
+# Runs unit tests in `src/` as well as integration tests in `tests/`.
 ifneq ($(shell command -v cargo-nextest 2>/dev/null),)
-TEST_RUNNER = cargo nextest run --workspace --exclude queryflux-e2e-tests --exclude queryflux-bench -E 'kind(test)'
+TEST_RUNNER = cargo nextest run --workspace --exclude queryflux-bench -E 'not (package(queryflux-e2e-tests) and kind(test))'
 else
 TEST_RUNNER = $(CARGO) test --tests --workspace --exclude queryflux-e2e-tests --exclude queryflux-bench
 endif
@@ -78,7 +83,7 @@ clippy:
 helm-check:
 	scripts/check-helm-chart.sh
 
-## Run integration tests in `tests/` (no external services needed).
+## Run unit tests (`src/`) and integration tests (`tests/`) — no external services needed.
 ## Same command as CI `.github/workflows/ci.yml` (`make test`); uses nextest when installed.
 ## PYO3_PYTHON + PYTHONPATH: PyO3 (routing + translation). The venv must include `sqlglot`
 ## (`pip install -r requirements.txt` via `make setup`) for `queryflux-translation` transform tests.

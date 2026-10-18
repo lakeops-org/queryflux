@@ -194,6 +194,29 @@ jobs:
               - 'scripts/**'
               - '.github/workflows/ci.yml'
 
+      # E2E prep, in the background so it overlaps the Rust build instead of running after it:
+      #  - free disk: e2e once ran the runner out of disk (Mar 2026). Deleting the Android SDK,
+      #    .NET and GHC frees ~20GiB; a blocking jlumbroso/free-disk-space step took 2-4.5 min.
+      #  - pull the e2e images (~55s of the ~75s it took to bring the stack up).
+      # Background processes outlive their step (the runner reaps them at job end); "Wait for
+      # e2e prep" below blocks on the marker files before the stack starts.
+      - name: Start e2e prep in background (free disk, pull images)
+        if: github.event_name == 'push' || steps.paths.outputs.e2e == 'true'
+        run: |
+          prep="${RUNNER_TEMP}/e2e-prep"
+          mkdir -p "$prep"
+          nohup bash -c '
+            df -h /
+            sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup
+            df -h /
+            touch "$0/cleanup.done"
+          ' "$prep" > "$prep/cleanup.log" 2>&1 &
+          nohup bash -c '
+            docker compose -f docker/docker-compose.test.yml --project-directory . \
+              pull --quiet --include-deps trino starrocks clickhouse sentinel
+            echo $? > "$0/pull.exit"
+          ' "$prep" > "$prep/pull.log" 2>&1 &
+
       - name: Install mold linker
         run: sudo apt-get update && sudo apt-get install -y mold
 
@@ -246,18 +269,19 @@ jobs:
           DATABASE_URL: postgres://queryflux:queryflux@localhost:5432/queryflux_test
         run: cargo test -p queryflux-persistence -- --include-ignored
 
-      # E2E: same target dir as clippy/tests — only compiles queryflux-e2e-tests if not already built.
-      # Always on main pushes; on PRs only when runtime/docker paths change.
-      - name: Free disk space (e2e)
+      # E2E: always on main pushes; on PRs only when runtime/docker paths change.
+      - name: Wait for e2e prep (disk cleanup, image pull)
         if: github.event_name == 'push' || steps.paths.outputs.e2e == 'true'
-        uses: jlumbroso/free-disk-space@v1.3.1
-        with:
-          tool-cache: false
-          android: true
-          dotnet: true
-          haskell: true
-          large-packages: true
-          swap-storage: true
+        run: |
+          prep="${RUNNER_TEMP}/e2e-prep"
+          timeout 600 bash -c "until [ -e '$prep/cleanup.done' ] && [ -e '$prep/pull.exit' ]; do sleep 2; done" \
+            || echo "::warning::e2e prep still running after 10 min — continuing"
+          echo "--- disk cleanup"; cat "$prep/cleanup.log" || true
+          echo "--- image pull"; cat "$prep/pull.log" || true
+          # A failed pull isn't fatal: `up` below pulls whatever is missing, with retries.
+          if [ "$(cat "$prep/pull.exit" 2>/dev/null)" != "0" ]; then
+            echo "::warning::background image pull failed — docker compose up will retry the pull"
+          fi
 
       - name: Install Trino ADBC driver (dbc)
         if: github.event_name == 'push' || steps.paths.outputs.e2e == 'true'
@@ -294,8 +318,39 @@ jobs:
           CLICKHOUSE_URL: http://localhost:18123
           LAKEKEEPER_URL: http://localhost:18181
           RUSTFS_ENDPOINT: localhost:19000
+        # Reuse `make test`'s build: `cargo test --no-run` with exactly the selection nextest used
+        # is a no-op, and its JSON lists the e2e test binaries, which we then run directly.
+        # Any narrower selection (`-p queryflux-e2e-tests`, or `--workspace --test=<e2e target>`)
+        # changes feature unification — via package selection or other crates' dev-dependencies —
+        # and recompiles every workspace crate (~60s).
+        # One process per binary with --test-threads=1 (like `cargo test`), not nextest: each e2e
+        # binary shares one in-process TestHarness / Iceberg seed across its tests.
         run: |
-          cargo test -p queryflux-e2e-tests --manifest-path Cargo.toml -- --test-threads=1 --include-ignored
+          mapfile -t e2e_bins < <(cargo test --no-run --workspace --exclude queryflux-bench \
+              --message-format json-render-diagnostics \
+            | jq -r 'select(.reason == "compiler-artifact" and .profile.test
+                       and (.target.kind | index("test"))
+                       and (.package_id | contains("queryflux-e2e-tests"))) | .executable')
+          if [ "${#e2e_bins[@]}" -eq 0 ]; then
+            echo "::error::no queryflux-e2e-tests test binaries found"; exit 1
+          fi
+          failed=()
+          for bin in "${e2e_bins[@]}"; do
+            echo "::group::$(basename "$bin")"
+            (cd crates/queryflux-e2e-tests && "$bin" --test-threads=1 --include-ignored) || failed+=("$(basename "$bin")")
+            echo "::endgroup::"
+          done
+          if [ "${#failed[@]}" -gt 0 ]; then
+            echo "::error::failed e2e binaries: ${failed[*]}"; exit 1
+          fi
+
+      # Peak disk usage, to know how much headroom the background cleanup actually leaves.
+      - name: Disk usage
+        if: always() && (github.event_name == 'push' || steps.paths.outputs.e2e == 'true')
+        run: |
+          df -h /
+          du -sh target 2>/dev/null || true
+          docker system df || true
 
       - name: Engine logs (debug on failure)
         if: failure() && (github.event_name == 'push' || steps.paths.outputs.e2e == 'true')
