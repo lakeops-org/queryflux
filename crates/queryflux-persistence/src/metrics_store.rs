@@ -143,6 +143,19 @@ pub trait MetricsStore: Send + Sync {
     fn on_translation(&self, _outcome: queryflux_core::query::TranslationOutcome) {}
 
     async fn record_query(&self, record: QueryRecord) -> Result<()>;
+
+    /// Record many queries at once, with the same semantics as calling
+    /// [`Self::record_query`] for each in order: the first record per `proxy_query_id`
+    /// wins and repeats are ignored. Backends that can write a batch in one statement
+    /// (Postgres) override this; the default writes one record at a time and stops at
+    /// the first error.
+    async fn record_queries(&self, records: Vec<QueryRecord>) -> Result<()> {
+        for record in records {
+            self.record_query(record).await?;
+        }
+        Ok(())
+    }
+
     async fn record_cluster_snapshot(&self, snapshot: ClusterSnapshot) -> Result<()>;
 
     /// Called synchronously when a cluster slot is acquired (query starts executing).

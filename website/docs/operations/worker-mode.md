@@ -186,7 +186,8 @@ worker ──► history endpoint     (workerApi.history.endpoint, or the worker
 ```
 
 - **Delivery.** Records are batched (up to 200 per request), queued in a bounded spool (`spoolMaxRecords`) and retried with backoff. When the spool is full, the oldest records are dropped and counted. The query path never waits on the network. A final flush runs after the shutdown drain.
-- **Idempotent ingest.** A retried batch is safe: the control plane keeps the first record per proxy query id.
+- **Idempotent ingest.** A retried batch is safe: the control plane keeps the first record per proxy query id, and counts it once in digest stats.
+- **Throughput.** The control plane stores each batch with one insert and one digest-stats upsert, so Postgres sees two statements per batch, not two per query. It writes up to 4 batches at once, using connections from the admin pool (`queryflux.persistence.adminPoolSize`). When ingest falls behind, it answers `503` with `Retry-After`, and workers keep the batch spooled and retry. Watch `historyUplink.queued` and `lastError` on workers: a queue that keeps growing means the control plane's Postgres cannot keep up.
 - **Attribution.** Every record is stored with the worker's name (`query_records.worker`, shown in query history). Labels are in `worker_registry`.
 - **Redaction**, applied on the worker before a record leaves it:
 

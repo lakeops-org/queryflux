@@ -4,7 +4,9 @@
 //! is redacted under the policy in the active snapshot and queued in a bounded spool; a
 //! flusher task posts batches ([`QueryRecordBatchV1`]) to the history endpoint. The query
 //! path never waits on the network: when the endpoint is down the spool fills, the oldest
-//! records are dropped and counted, and delivery resumes with backoff.
+//! records are dropped and counted, and delivery resumes with backoff. Any non-2xx answer
+//! keeps the batch spooled; a `503` with `Retry-After` (the control plane's ingest is busy)
+//! sets the next attempt's delay instead of the exponential backoff.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
@@ -26,6 +28,48 @@ const BATCH_SIZE: usize = 200;
 /// How long a record may wait for a batch to fill.
 const FLUSH_INTERVAL: Duration = Duration::from_secs(2);
 const MAX_BACKOFF: Duration = Duration::from_secs(60);
+
+/// A failed upload. The batch is back in the spool.
+#[derive(Debug)]
+pub(crate) struct UploadError {
+    message: String,
+    /// The endpoint's `Retry-After`, when it sent one.
+    retry_after: Option<Duration>,
+}
+
+impl std::fmt::Display for UploadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+/// `Retry-After` in seconds (the HTTP-date form is not used by QueryFlux), capped.
+fn retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+    let secs: u64 = headers
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse()
+        .ok()?;
+    Some(Duration::from_secs(secs).min(MAX_BACKOFF))
+}
+
+/// The delay before the next attempt: the endpoint's `Retry-After` plus up to half again
+/// (so a fleet told to wait does not come back in one wave), else exponential backoff.
+fn next_backoff(previous: Duration, retry_after: Option<Duration>) -> Duration {
+    match retry_after {
+        Some(after) => {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.subsec_nanos())
+                .unwrap_or(0);
+            let jitter = after.mul_f64(f64::from(nanos % 1000) / 2000.0);
+            (after + jitter).clamp(Duration::from_millis(100), MAX_BACKOFF)
+        }
+        None => (previous * 2).clamp(Duration::from_secs(1), MAX_BACKOFF),
+    }
+}
 
 /// Delivery counters, shown in `/worker/status`.
 #[derive(Debug, Default, Clone, serde::Serialize)]
@@ -138,7 +182,7 @@ impl RemoteMetricsStore {
         &self,
         endpoint: &str,
         records: Vec<QueryRecord>,
-    ) -> std::result::Result<(), (String, Vec<QueryRecord>)> {
+    ) -> std::result::Result<(), (UploadError, Vec<QueryRecord>)> {
         let batch = QueryRecordBatchV1 {
             schema_version: QUERY_RECORDS_SCHEMA_VERSION,
             worker: self.worker.clone(),
@@ -152,16 +196,23 @@ impl RemoteMetricsStore {
             Ok(resp) if resp.status().is_success() => Ok(()),
             Ok(resp) => {
                 let status = resp.status();
+                let retry_after = retry_after(resp.headers());
                 let body = resp.text().await.unwrap_or_default();
-                Err(format!("history endpoint returned {status}: {body}"))
+                Err(UploadError {
+                    message: format!("history endpoint returned {status}: {body}"),
+                    retry_after,
+                })
             }
-            Err(e) => Err(format!("history endpoint unreachable: {e}")),
+            Err(e) => Err(UploadError {
+                message: format!("history endpoint unreachable: {e}"),
+                retry_after: None,
+            }),
         };
         result.map_err(|e| (e, batch.records))
     }
 
     /// Send everything queued. Stops at the first failure, re-queuing that batch.
-    async fn flush(&self) -> std::result::Result<(), String> {
+    async fn flush(&self) -> std::result::Result<(), UploadError> {
         loop {
             let batch = self.take_batch();
             if batch.is_empty() {
@@ -182,7 +233,7 @@ impl RemoteMetricsStore {
                     self.enqueue(records, true);
                     let mut st = self.lock_state();
                     st.history_uplink.endpoint = Some(endpoint);
-                    st.history_uplink.last_error = Some(e.clone());
+                    st.history_uplink.last_error = Some(e.message.clone());
                     return Err(e);
                 }
             }
@@ -213,7 +264,7 @@ impl RemoteMetricsStore {
                 match this.flush().await {
                     Ok(()) => backoff = Duration::ZERO,
                     Err(e) => {
-                        backoff = (backoff * 2).clamp(Duration::from_secs(1), MAX_BACKOFF);
+                        backoff = next_backoff(backoff, e.retry_after);
                         tracing::warn!(retry_in = ?backoff, "Query history upload failed: {e}");
                     }
                 }
@@ -575,5 +626,75 @@ mod tests {
             .map(|r| r.proxy_query_id.clone())
             .collect();
         assert_eq!(ids, ["q2", "q3", "q4"], "the failed batch keeps its place");
+    }
+
+    /// A busy control plane answers 503 with `Retry-After`: the batch stays spooled, in
+    /// order, the next attempt waits as told, and the retry delivers it.
+    #[tokio::test]
+    async fn a_busy_control_plane_keeps_the_batch_spooled_for_retry() {
+        use axum::http::{header, StatusCode};
+        use axum::response::IntoResponse;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        let busy = Arc::new(AtomicBool::new(true));
+        let received = Arc::new(AtomicUsize::new(0));
+        let app = axum::Router::new().route(
+            "/worker/query-records",
+            axum::routing::post({
+                let (busy, received) = (busy.clone(), received.clone());
+                move |axum::Json(batch): axum::Json<QueryRecordBatchV1>| async move {
+                    if busy.load(Ordering::SeqCst) {
+                        return (
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            [(header::RETRY_AFTER, "3")],
+                        )
+                            .into_response();
+                    }
+                    received.fetch_add(batch.records.len(), Ordering::SeqCst);
+                    StatusCode::ACCEPTED.into_response()
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let state = Arc::new(Mutex::new(WorkerSyncState::default()));
+        let up = uplink(&format!("http://{addr}"), 100, state.clone());
+        up.record_query(record("q1")).await.unwrap();
+        up.record_query(record("q2")).await.unwrap();
+
+        let err = up.flush().await.unwrap_err();
+        assert!(err.message.contains("503"), "{err}");
+        assert_eq!(err.retry_after, Some(Duration::from_secs(3)));
+        let wait = next_backoff(Duration::ZERO, err.retry_after);
+        assert!(wait >= Duration::from_secs(3) && wait <= Duration::from_millis(4500));
+        let ids: Vec<String> = up
+            .spool
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|r| r.proxy_query_id.clone())
+            .collect();
+        assert_eq!(ids, ["q1", "q2"]);
+        let st = state.lock().unwrap().history_uplink.clone();
+        assert_eq!((st.sent, st.queued, st.dropped), (0, 2, 0));
+
+        busy.store(false, Ordering::SeqCst);
+        up.flush().await.unwrap();
+        assert_eq!(received.load(Ordering::SeqCst), 2);
+        let st = state.lock().unwrap().history_uplink.clone();
+        assert_eq!((st.sent, st.queued), (2, 0));
+        assert!(st.last_error.is_none());
+    }
+
+    #[test]
+    fn backoff_without_retry_after_doubles_up_to_the_cap() {
+        assert_eq!(next_backoff(Duration::ZERO, None), Duration::from_secs(1));
+        assert_eq!(
+            next_backoff(Duration::from_secs(4), None),
+            Duration::from_secs(8)
+        );
+        assert_eq!(next_backoff(Duration::from_secs(50), None), MAX_BACKOFF);
     }
 }
