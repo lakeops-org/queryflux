@@ -1,10 +1,11 @@
 # Shared-service workers: a Deployment of workers that applications reach through a
 # Service. Run the following from the repository root.
 #
-#   1. Fill in ./charts/queryflux/examples/worker-config.yaml and create its Secret:
-#        kubectl create secret generic queryflux-worker-config \
+#   1. Fill in ./charts/queryflux/examples/worker-config.yaml and create its Secret in
+#      the workers' namespace (here `queryflux`, next to the control plane):
+#        kubectl -n queryflux create secret generic queryflux-worker-config \
 #          --from-file=config.yaml=./charts/queryflux/examples/worker-config.yaml
-#   2. helm install queryflux-workers ./charts/queryflux \
+#   2. helm install queryflux-workers ./charts/queryflux -n queryflux \
 #        -f ./charts/queryflux/examples/worker-values.yaml
 #
 # For one worker per application pod, see worker-sidecar-manifest.yaml instead.

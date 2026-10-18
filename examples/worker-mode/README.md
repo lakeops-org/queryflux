@@ -19,8 +19,9 @@ docker compose up -d --wait
 Worker mode needs an image that includes it. To run a local build:
 
 ```bash
-docker build -f docker/queryflux/Dockerfile --target runtime-server -t queryflux:dev .   # from the repo root
-QUERYFLUX_IMAGE=queryflux:dev docker compose up -d --wait
+# from the repo root
+docker build -f docker/queryflux/Dockerfile --target runtime-server -t queryflux:dev .
+cd examples/worker-mode && QUERYFLUX_IMAGE=queryflux:dev docker compose up -d --wait
 ```
 
 | Service | URL |

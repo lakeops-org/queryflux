@@ -1,14 +1,20 @@
-# Control plane for worker mode. Run the following from the repository root.
+# Control plane for worker mode, in namespace `queryflux`. Run the following from the
+# repository root.
 #
-#   1. Fill in ./charts/queryflux/examples/control-plane-config.yaml and create its Secret:
-#        kubectl create secret generic queryflux-control-plane-config \
+#   1. kubectl create namespace queryflux
+#   2. Fill in ./charts/queryflux/examples/control-plane-config.yaml and create its Secret:
+#        kubectl -n queryflux create secret generic queryflux-control-plane-config \
 #          --from-file=config.yaml=./charts/queryflux/examples/control-plane-config.yaml
-#   2. helm install queryflux-control ./charts/queryflux \
+#   3. helm install queryflux-control ./charts/queryflux -n queryflux \
 #        -f ./charts/queryflux/examples/control-plane-values.yaml
 #
-# Workers reach the control plane at http(s)://queryflux-control:9000 (the admin port).
-# Snapshots carry cluster credentials: terminate TLS in front of that port (mesh, or an
-# ingress) for anything but a trusted network.
+# Workers talk to the worker API on the admin port (9000), which QueryFlux serves over
+# plain HTTP, and worker configs carry engine credentials. The ingress below terminates
+# TLS and exposes only `/worker/*` (not the admin API or Studio); workers then use
+# `https://queryflux-control.example.com` (examples/worker-config.yaml). Its certificate
+# must come from a public CA (e.g. cert-manager with Let's Encrypt): workers trust public
+# roots only. Inside a service mesh with mTLS (Istio, Linkerd) you can instead skip the
+# ingress and point workers at the in-cluster address (see worker-config.yaml).
 
 replicaCount: 2
 
@@ -18,3 +24,16 @@ config:
 pdb:
   enabled: true
   maxUnavailable: 1
+
+ingress:
+  enabled: true
+  className: nginx
+  hosts:
+    - host: queryflux-control.example.com
+      paths:
+        - path: /worker
+          pathType: Prefix
+          servicePortName: admin
+  tls:
+    - hosts: [queryflux-control.example.com]
+      secretName: queryflux-control-tls

@@ -183,6 +183,14 @@ Cluster snapshots are not sent upstream. With shared capacity, the control plane
 
 **Upgrades.** The snapshot and history formats are versioned (`schemaVersion`). Upgrade the control plane first. A worker rejects a snapshot version it does not understand and keeps its active config.
 
+**Database migrations.** Upgrading to worker mode runs migrations V18–V20 at startup (with `persistence.autoMigrate`, the default):
+- **V18 and V20** add the worker registry and its status column. They're quick.
+- **V19** adds `query_records.worker` and builds an index on it. On a large `query_records` table, inserts into query history wait until that index is built.
+
+To avoid a pause in history writes, run `queryflux migrate` in a maintenance window before upgrading, or create the index yourself first with `CREATE INDEX CONCURRENTLY IF NOT EXISTS query_records_worker ON query_records (worker, created_at DESC) WHERE worker IS NOT NULL`. The migration then finds it already there.
+
+The migrations are forward-only: once they've run, an older QueryFlux won't start against that database. Back it up before upgrading.
+
 ## Deploying
 
 - **Docker Compose:** [`examples/worker-mode`](https://github.com/lakeops-org/queryflux/tree/main/examples/worker-mode) runs a control plane, Postgres, Studio and two workers.

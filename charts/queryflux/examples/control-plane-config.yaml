@@ -1,6 +1,6 @@
 # Template for the control plane's config Secret (examples/control-plane-values.yaml).
 #
-#   kubectl create secret generic queryflux-control-plane-config \
+#   kubectl -n queryflux create secret generic queryflux-control-plane-config \
 #     --from-file=config.yaml=./control-plane-config.yaml
 #
 # The control plane owns the config (Postgres) and serves it to workers on its admin

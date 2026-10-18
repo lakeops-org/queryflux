@@ -1,7 +1,7 @@
 # Template for a worker's config Secret (examples/worker-values.yaml and
 # examples/worker-sidecar-manifest.yaml).
 #
-#   kubectl create secret generic queryflux-worker-config \
+#   kubectl -n queryflux create secret generic queryflux-worker-config \
 #     --from-file=config.yaml=./worker-config.yaml
 #
 # A worker holds no config of its own and never connects to Postgres. It pulls its
@@ -14,7 +14,13 @@ queryflux:
   workerLabels:
     team: checkout
   controlPlane:
-    url: https://queryflux-control.queryflux.svc:9000
+    # The control plane's TLS ingress (examples/control-plane-values.yaml), which serves
+    # only /worker/*.
+    url: https://queryflux-control.example.com
+    # Inside a service mesh with mTLS (Istio, Linkerd), the mesh encrypts pod traffic
+    # instead, and workers can use the in-cluster address:
+    #   url: http://queryflux-control.queryflux.svc.cluster.local:9000
+    #   allowInsecureHttp: true   # only with mesh mTLS: configs carry engine credentials
     auth:
       mode: sharedSecret
       sharedSecret: <long-random-secret>   # the control plane's workerApi.sharedSecret
