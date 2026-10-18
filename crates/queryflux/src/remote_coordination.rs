@@ -247,6 +247,51 @@ impl CapacityStore for RemoteCoordinationStore {
     }
 }
 
+/// Quotas through the control plane's `POST /worker/capacity/quota`. A 404 means it has
+/// none (an older version, or `capacity.mode: leases`), and the worker keeps using
+/// per-query leases.
+#[async_trait]
+impl queryflux_persistence::quota::QuotaStore for RemoteCoordinationStore {
+    async fn report_demand(
+        &self,
+        instance_id: &str,
+        reports: &[queryflux_persistence::quota::DemandReport],
+    ) -> Result<Option<queryflux_persistence::quota::QuotaResponse>> {
+        let resp = self
+            .client
+            .post(format!("{}/worker/capacity/quota", self.base))
+            .json(&json!({ "instanceId": instance_id, "clusters": reports }))
+            .bearer_auth(&self.bearer)
+            .send()
+            .await
+            .map_err(|e| QueryFluxError::Persistence(format!("control plane unreachable: {e}")))?;
+        let status = resp.status();
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(QueryFluxError::Persistence(format!(
+                "control plane quota report returned {status}: {body}"
+            )));
+        }
+        resp.json()
+            .await
+            .map(Some)
+            .map_err(|e| QueryFluxError::Persistence(format!("control plane response: {e}")))
+    }
+
+    async fn release_holder(&self, instance_id: &str) -> Result<u64> {
+        let r: Released = self
+            .post(
+                "/worker/capacity/quota/release",
+                json!({ "instanceId": instance_id }),
+            )
+            .await?;
+        Ok(r.released)
+    }
+}
+
 #[async_trait]
 impl SweepCoordinator for RemoteCoordinationStore {
     async fn try_sweep_lock(&self, name: &str) -> Result<Option<Box<dyn SweepGuard>>> {
@@ -295,7 +340,7 @@ impl SweepGuard for RemoteSweepGuard {
 pub(crate) fn remote_coordination(
     control_plane: &ControlPlaneClientConfig,
     on_unavailable: OnCoordinationUnavailable,
-) -> Arc<dyn queryflux_persistence::CoordinationStore> {
+) -> Arc<RemoteCoordinationStore> {
     Arc::new(RemoteCoordinationStore::new(control_plane, on_unavailable))
 }
 
@@ -394,6 +439,7 @@ mod tests {
             changes: None,
             coordination,
             history: None,
+            quotas: None,
         });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -506,6 +552,207 @@ mod tests {
         a.release_many(&[("c".into(), "q3".into())]).await.unwrap();
         assert_eq!(*released.lock().unwrap(), vec!["q1", "q2", "q3"]);
         assert!(!a.batch_release.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    /// Grants each reported cluster a fixed quota.
+    struct FixedQuotas;
+
+    #[async_trait]
+    impl queryflux_persistence::quota::QuotaStore for FixedQuotas {
+        async fn report_demand(
+            &self,
+            _: &str,
+            reports: &[queryflux_persistence::quota::DemandReport],
+        ) -> Result<Option<queryflux_persistence::quota::QuotaResponse>> {
+            Ok(Some(queryflux_persistence::quota::QuotaResponse {
+                grants: reports
+                    .iter()
+                    .map(|r| queryflux_persistence::quota::QuotaGrant {
+                        cluster: r.cluster.clone(),
+                        quota: 4,
+                        seq: 7,
+                    })
+                    .collect(),
+                lease_secs: 15,
+                report_interval_ms: 750,
+            }))
+        }
+        async fn release_holder(&self, _: &str) -> Result<u64> {
+            Ok(2)
+        }
+    }
+
+    async fn control_plane_with_quotas(
+        quotas: Option<Arc<dyn queryflux_persistence::quota::QuotaStore>>,
+    ) -> String {
+        let app = router(WorkerApi {
+            shared_secret: "s3cret".into(),
+            snapshot: Arc::new(|| Box::pin(async { Err("unused".to_string()) })),
+            registry: None,
+            changes: None,
+            coordination: leases(),
+            history: None,
+            quotas,
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn quota_reports_return_grants_when_the_control_plane_has_quotas() {
+        use queryflux_persistence::quota::{DemandReport, QuotaStore};
+        let url = control_plane_with_quotas(Some(Arc::new(FixedQuotas))).await;
+        let w = client(&url, OnCoordinationUnavailable::FailClosed);
+        let resp = w
+            .report_demand(
+                "w1",
+                &[DemandReport {
+                    cluster: "c".into(),
+                    running: 1,
+                    waiting: 2,
+                    seen_seq: 0,
+                    max_running_queries: 10,
+                }],
+            )
+            .await
+            .unwrap()
+            .expect("quotas on");
+        assert_eq!(resp.grants[0].quota, 4);
+        assert_eq!(resp.grants[0].seq, 7);
+        assert_eq!(resp.report_interval_ms, 750);
+        assert_eq!(w.release_holder("w1").await.unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn quota_reports_are_declined_when_quotas_are_off() {
+        use queryflux_persistence::quota::QuotaStore;
+        let url = control_plane_with_quotas(None).await;
+        let w = client(&url, OnCoordinationUnavailable::FailClosed);
+        assert!(w.report_demand("w1", &[]).await.unwrap().is_none());
+    }
+
+    /// A control plane on Postgres with quotas on, and two workers: each turns quotas on
+    /// by itself, gets a share after an allocator pass, admits within it without leases,
+    /// and the two together never exceed the limit. Needs `DATABASE_URL`.
+    #[tokio::test]
+    #[ignore]
+    async fn quotas_end_to_end_with_postgres() {
+        use queryflux_persistence::quota::{AllocatorPolicy, QuotaAllocator};
+        use queryflux_persistence::quota_admission::QuotaAdmission;
+        let url = std::env::var("DATABASE_URL").expect("DATABASE_URL");
+        let pg = Arc::new(
+            queryflux_persistence::postgres::PostgresStore::connect(&url)
+                .await
+                .unwrap(),
+        );
+        pg.migrate().await.unwrap();
+        let cluster = format!("e2e-{}", uuid::Uuid::new_v4());
+        let app = router(WorkerApi {
+            shared_secret: "s3cret".into(),
+            snapshot: Arc::new(|| Box::pin(async { Err("unused".to_string()) })),
+            registry: None,
+            changes: None,
+            coordination: Some(pg.clone()),
+            history: None,
+            quotas: Some(pg.clone()),
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let cp = format!("http://{addr}");
+
+        let metrics: Arc<dyn queryflux_persistence::MetricsStore> =
+            Arc::new(queryflux_persistence::in_memory::InMemoryPersistence::new());
+        let workers: Vec<Arc<QuotaAdmission>> = (0..2)
+            .map(|i| {
+                let remote = Arc::new(client(&cp, OnCoordinationUnavailable::FailClosed));
+                let qa = QuotaAdmission::new(
+                    remote.clone(),
+                    remote,
+                    format!("{cluster}-w{i}"),
+                    metrics.clone(),
+                );
+                qa.follow_source();
+                qa
+            })
+            .collect();
+        // Each worker probes, finds quotas on, and starts reporting.
+        for _ in 0..50 {
+            if workers.iter().all(|w| w.enabled()) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(workers.iter().all(|w| w.enabled()));
+
+        const MAX: u64 = 40;
+        // Demand: 30 queries each, denied at first (no grant yet, the reserve is 6).
+        let mut held = [Vec::new(), Vec::new()];
+        for (i, w) in workers.iter().enumerate() {
+            for q in 0..30 {
+                let id = format!("{cluster}-w{i}-q{q}");
+                if w.try_acquire(&cluster, MAX, &format!("{cluster}-w{i}"), &id)
+                    .await
+                    .unwrap()
+                {
+                    held[i].push(id);
+                }
+            }
+        }
+        // Before any grant, per-query leases may use the whole limit: 40 run as leases,
+        // 20 wait. Those queries finish; the waiters stay as demand.
+        assert_eq!(pg.active_lease_count(&cluster).await.unwrap(), MAX);
+        for (i, w) in workers.iter().enumerate() {
+            for id in held[i].drain(..) {
+                w.release(&cluster, &id).await.unwrap();
+            }
+        }
+        let policy = AllocatorPolicy::default();
+        for _ in 0..3 {
+            for w in &workers {
+                w.report_now().await;
+            }
+            pg.run_allocation(&policy, metrics.as_ref()).await.unwrap();
+        }
+        for w in &workers {
+            w.report_now().await;
+        }
+        // A new round of 30 each: grants first, then leases for what quotas leave.
+        for (i, w) in workers.iter().enumerate() {
+            for q in 0..30 {
+                let id = format!("{cluster}-w{i}-r{q}");
+                if w.try_acquire(&cluster, MAX, &format!("{cluster}-w{i}"), &id)
+                    .await
+                    .unwrap()
+                {
+                    held[i].push(id);
+                }
+            }
+        }
+        let leases = pg.active_lease_count(&cluster).await.unwrap();
+        let on_quota: u64 = workers
+            .iter()
+            .map(|w| w.snapshot(&cluster).unwrap().1)
+            .sum();
+        let total = (held[0].len() + held[1].len()) as u64;
+        assert_eq!(total, on_quota + leases);
+        assert!(on_quota > 0, "admissions ran on quota");
+        assert!(total <= MAX, "admitted {total} > limit {MAX}");
+        assert_eq!(
+            total, MAX,
+            "demand (60) exceeds the limit, so all of it is used"
+        );
+
+        for (i, w) in workers.iter().enumerate() {
+            for id in &held[i] {
+                w.release(&cluster, id).await.unwrap();
+            }
+            w.release_all_for_instance(&format!("{cluster}-w{i}"))
+                .await
+                .unwrap();
+        }
     }
 
     #[tokio::test]

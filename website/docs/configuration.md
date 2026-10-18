@@ -175,6 +175,19 @@ With **Postgres persistence** and **`distributed: true`** (the default when Post
 
 Set `distributed: false` to run Postgres-backed persistence without cross-replica coordination (single replica or explicit opt-out).
 
+**Capacity quotas.** By default every admission takes a per-query lease (one call into Postgres or the control plane). With quotas, each process gets a share of every cluster's limit and admits within it locally. Set it on standalone replicas or the control plane; workers follow their control plane.
+
+```yaml
+queryflux:
+  capacity:
+    mode: quotas            # leases (default) | quotas
+    reserveFraction: 0.15   # share of each limit kept for per-query leases
+    quotaLeaseSecs: 15      # how long a process may admit on its quota without reporting
+    reportIntervalMs: 1000  # how often each process reports demand
+```
+
+Turn it on only once every standalone or control-plane replica runs a version with quotas. How it works: [Capacity and throughput](./architecture/capacity-and-throughput#capacity-quotas).
+
 **Connection pools.** Each process opens three pools: query state (`queryPoolSize`, default 7), coordination for capacity leases, queue claims and sweep locks (`coordinationPoolSize`, default 8), and admin (`adminPoolSize`, default 2), plus one `LISTEN` connection. Connections open on demand. Size `coordinationPoolSize` to the admissions per second you expect × about 1 ms. The legacy `poolSize` instead sets one budget split 60/20/20, and is ignored when any of the three is set.
 
 Helm / Kubernetes: see **[charts/queryflux/README.md](https://github.com/lakeops-org/queryflux/blob/main/charts/queryflux/README.md#persistence-and-replicas)**. Full behavior: **[Cluster variants, health checks & reconciliation](./architecture/cluster-variants-and-health#distributed-mode-and-capacitystore)**.

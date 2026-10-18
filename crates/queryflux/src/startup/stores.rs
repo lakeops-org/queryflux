@@ -32,6 +32,10 @@ pub(crate) struct Stores {
     pub(crate) snapshot_store: Option<Arc<dyn queryflux_persistence::ConfigSnapshotStore>>,
     /// Where worker registrations and heartbeats are recorded.
     pub(crate) worker_registry: Arc<dyn queryflux_persistence::WorkerRegistryStore>,
+    /// Capacity quotas (Postgres only): where this process and its workers report demand,
+    /// and the allocator that turns demand into quotas.
+    pub(crate) quota_store: Option<Arc<dyn queryflux_persistence::quota::QuotaStore>>,
+    pub(crate) quota_allocator: Option<Arc<dyn queryflux_persistence::quota::QuotaAllocator>>,
 }
 
 /// When Postgres is configured we seed cluster/group config on first run and read from
@@ -61,6 +65,8 @@ pub(crate) async fn build_stores(config: &ProxyConfig) -> Result<Stores> {
                     .await
                     .context("Failed to connect to Postgres")?,
             );
+            let cap = &config.queryflux.capacity;
+            pg.set_quota_timing(cap.quota_lease_secs, cap.report_interval_ms);
             if conn.auto_migrate {
                 pg.migrate().await.context("Migration failed")?;
             } else {
@@ -125,6 +131,10 @@ pub(crate) async fn build_stores(config: &ProxyConfig) -> Result<Stores> {
         };
     // The narrower view admission and the lease/reconcile/sweep tasks use: leases, sweep
     // locks and published engine counts, without config or history storage.
+    let quota_store: Option<Arc<dyn queryflux_persistence::quota::QuotaStore>> =
+        pg_store.clone().map(|pg| pg as _);
+    let quota_allocator: Option<Arc<dyn queryflux_persistence::quota::QuotaAllocator>> =
+        pg_store.clone().map(|pg| pg as _);
     let coordination: Option<Arc<dyn CoordinationStore>> = pg_store.map(|pg| pg as _);
 
     Ok(Stores {
@@ -138,6 +148,8 @@ pub(crate) async fn build_stores(config: &ProxyConfig) -> Result<Stores> {
         snapshot_store,
         worker_registry,
         history_store,
+        quota_store,
+        quota_allocator,
     })
 }
 

@@ -57,6 +57,9 @@ pub struct WorkerApi {
     /// Where worker query records are stored (history only, not Prometheus: each worker
     /// exports its own metrics). `None` refuses them.
     pub history: Option<Arc<dyn MetricsStore>>,
+    /// Capacity quotas for workers (`capacity.mode: quotas`); `None` answers 404, and
+    /// workers keep using per-query leases.
+    pub quotas: Option<Arc<dyn queryflux_persistence::quota::QuotaStore>>,
 }
 
 /// Largest query-record batch accepted. Workers send at most a few hundred records.
@@ -78,6 +81,11 @@ pub fn router(api: WorkerApi) -> Router {
         .route(
             "/worker/capacity/release-batch",
             post(capacity_release_batch),
+        )
+        .route("/worker/capacity/quota", post(capacity_quota))
+        .route(
+            "/worker/capacity/quota/release",
+            post(capacity_quota_release),
         )
         .route("/worker/capacity/heartbeat", post(capacity_heartbeat))
         .route("/worker/capacity/release-all", post(capacity_release_all))
@@ -439,6 +447,65 @@ async fn capacity_release(
     }
 }
 
+/// Authorize the worker and return the quota store, or 404 when this control plane has
+/// no quotas (`capacity.mode: leases`): the worker then keeps per-query leases.
+#[allow(clippy::result_large_err)]
+fn quotas(
+    st: &WorkerApiState,
+    headers: &HeaderMap,
+) -> Result<Arc<dyn queryflux_persistence::quota::QuotaStore>, Response> {
+    if !authorized(headers, &st.api.shared_secret) {
+        return Err(unauthorized());
+    }
+    st.api.quotas.clone().ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            "capacity quotas are off on this control plane (capacity.mode: leases)",
+        )
+            .into_response()
+    })
+}
+
+#[derive(serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QuotaReportRequest {
+    pub instance_id: String,
+    #[serde(default)]
+    pub clusters: Vec<queryflux_persistence::quota::DemandReport>,
+}
+
+/// A worker's demand report; the response carries its current quotas (capacity quotas).
+async fn capacity_quota(
+    State(st): State<Arc<WorkerApiState>>,
+    headers: HeaderMap,
+    Json(req): Json<QuotaReportRequest>,
+) -> Response {
+    let store = match quotas(&st, &headers) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    match store.report_demand(&req.instance_id, &req.clusters).await {
+        Ok(Some(resp)) => Json(resp).into_response(),
+        Ok(None) => (StatusCode::NOT_FOUND, "capacity quotas are off").into_response(),
+        Err(e) => store_error(e),
+    }
+}
+
+async fn capacity_quota_release(
+    State(st): State<Arc<WorkerApiState>>,
+    headers: HeaderMap,
+    Json(req): Json<InstanceRequest>,
+) -> Response {
+    let store = match quotas(&st, &headers) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    match store.release_holder(&req.instance_id).await {
+        Ok(n) => Json(serde_json::json!({ "released": n })).into_response(),
+        Err(e) => store_error(e),
+    }
+}
+
 /// Releases from one worker, sent together (`BatchedReleaseStore` on the worker).
 async fn capacity_release_batch(
     State(st): State<Arc<WorkerApiState>>,
@@ -620,6 +687,7 @@ mod tests {
             changes: None,
             coordination: None,
             history: None,
+            quotas: None,
         })
     }
 
@@ -700,6 +768,7 @@ mod tests {
             changes: Some(changes),
             coordination: None,
             history: None,
+            quotas: None,
         })
     }
 
@@ -796,6 +865,7 @@ mod tests {
             changes: None,
             coordination: Some(store),
             history: None,
+            quotas: None,
         });
         let post = |path: &str, body: serde_json::Value| {
             Request::post(path.to_string())
@@ -858,6 +928,7 @@ mod tests {
             changes: None,
             coordination: None,
             history: Some(store.clone()),
+            quotas: None,
         });
         let record = serde_json::json!({
             "proxyQueryId": "q-1",

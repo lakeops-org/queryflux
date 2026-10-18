@@ -820,6 +820,7 @@ mod tests {
             changes: None,
             coordination: None,
             history: None,
+            quotas: None,
         };
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -917,6 +918,7 @@ mod tests {
             changes: None,
             coordination: None,
             history: None,
+            quotas: None,
         };
         let app = queryflux_frontend::worker_api::router(api).layer(axum::middleware::from_fn(
             move |req: axum::extract::Request, next: axum::middleware::Next| {

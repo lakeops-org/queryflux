@@ -141,6 +141,73 @@ pub(crate) fn spawn_lease_heartbeat(
     }
 }
 
+/// Run the capacity-quota allocator on whichever replica holds the `capacity-allocator`
+/// lock: every 200 ms, turn holders' demand reports into quotas. The lock is a session
+/// lock on one coordination connection, so if this replica dies another takes over on
+/// its next try.
+pub(crate) fn spawn_capacity_allocator(
+    allocator: Arc<dyn queryflux_persistence::quota::QuotaAllocator>,
+    sweeps: Arc<dyn CoordinationStore>,
+    capacity: &queryflux_core::config::CapacityConfig,
+    metrics: Arc<dyn MetricsStore>,
+    shutdown_rx: &watch::Receiver<bool>,
+) {
+    let policy = queryflux_persistence::quota::AllocatorPolicy {
+        reserve_fraction: capacity.reserve_fraction,
+        lease_secs: capacity.quota_lease_secs,
+        ..Default::default()
+    };
+    let mut shutdown_rx = shutdown_rx.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_millis(200));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut lock: Option<Box<dyn queryflux_persistence::SweepGuard>> = None;
+        let mut failures = 0u32;
+        loop {
+            if !tick_or_shutdown(&mut interval, &mut shutdown_rx).await {
+                break;
+            }
+            if lock.is_none() {
+                match sweeps.try_sweep_lock("capacity-allocator").await {
+                    Ok(Some(l)) => {
+                        tracing::info!("This replica now runs the capacity-quota allocator");
+                        lock = Some(l);
+                    }
+                    // Another replica allocates. Check again in a while.
+                    Ok(None) => {
+                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                        continue;
+                    }
+                    Err(e) => {
+                        metrics.on_coordination_failure("sweep_lock");
+                        tracing::warn!("Capacity allocator lock failed: {e}");
+                        continue;
+                    }
+                }
+            }
+            match allocator.run_allocation(&policy, metrics.as_ref()).await {
+                Ok(_) => failures = 0,
+                Err(e) => {
+                    failures += 1;
+                    metrics.on_coordination_failure("capacity_allocate");
+                    tracing::warn!("Capacity quota allocation failed: {e}");
+                    // Persistent failure (e.g. the lock's connection is gone): let go, so
+                    // this or another replica starts over with a fresh lock.
+                    if failures >= 5 {
+                        if let Some(l) = lock.take() {
+                            l.release().await;
+                        }
+                        failures = 0;
+                    }
+                }
+            }
+        }
+        if let Some(l) = lock.take() {
+            l.release().await;
+        }
+    });
+}
+
 /// Release capacity held by executing queries whose client stopped polling.
 pub(crate) fn spawn_zombie_sweep(
     app_state: &Arc<AppState>,

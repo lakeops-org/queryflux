@@ -82,7 +82,67 @@ Size it to the capacity calls in flight at peak: admissions per second × the ti
 
 Each cluster's admissions are serialized by its advisory lock, so one hot cluster tops out at roughly one acquire per lock hold time (the function plus its commit). The whole control plane is limited by its coordination pool and by Postgres.
 
-Per-query leases still cost one round trip per admission. Quota assignment, where each worker gets a share of a cluster's limit and admits locally, removes it.
+Per-query leases still cost one round trip per admission. Capacity quotas remove it.
+
+## Capacity quotas
+
+With `capacity.mode: quotas`, each process that admits queries (a *holder*: a worker, or a replica serving queries itself) gets a share of every cluster's limit and admits within it with an atomic counter, with no round trip. Control-plane load then depends on the number of holders, not on the query rate. The design follows Google's [Doorman](https://github.com/youtube/doorman).
+
+```mermaid
+sequenceDiagram
+    participant H as Holder (worker or replica)
+    participant CP as Control plane
+    participant DB as Postgres
+    participant A as Allocator (one replica)
+    loop every second (every 250 ms while queries wait)
+        H->>CP: POST /worker/capacity/quota (running, waiting per cluster)
+        CP->>DB: upsert capacity_holders
+        DB-->>H: current grant and its sequence
+    end
+    loop every 200 ms
+        A->>DB: lock clusters, read demand and leases
+        A->>A: fair share, headroom, shrink rule
+        A->>DB: write grants, quota_committed
+    end
+    Note over H: admit while running < grant (no I/O)<br/>beyond the grant: one per-query lease (the reserve)
+```
+
+**Demand and grants.** Every holder reports, per cluster, the queries it runs on quota and the queries waiting for capacity. The allocator, run by whichever replica holds the `capacity-allocator` lock, gives each holder a max-min fair share of `maxRunningQueries - leases - reserve` by demand, plus up to a quarter of its demand as headroom from what is left. The grant comes back on the holder's next report.
+
+**The reserve.** A share of each limit (`reserveFraction`, default 0.15) is never handed out as quota. Admissions above a holder's grant take a per-query lease, as before, so bursts are served at once while quotas catch up. The same path serves workers from before quotas, so a mixed fleet shares one limit. A per-query acquire checks `leased + quota_committed < max`.
+
+**The limit stays hard.** A holder can't stop queries it already runs, and it hears about a smaller grant only on its next report. So the allocator counts each holder as `max(ceiling, running)`, where `ceiling` is the largest grant the holder may still be enforcing:
+- a grant increase raises the ceiling at once;
+- a decrease lowers the grant at once, but the ceiling only when the holder reports the new grant's sequence number;
+- capacity freed by a decrease goes to others only after that.
+
+The allocator writes `sum(commit)` as `quota_committed` under the clusters' advisory locks, so `quota_committed + leased <= maxRunningQueries` always holds. A randomized test drives holders through lagging reports, late confirmations, silences and leases, and checks that no state ever exceeds the limit.
+
+**Expiry and outages.** A holder trusts a grant for `quotaLeaseSecs` (default 15) from when it sent the report that returned it. The allocator keeps counting the ceiling for `quotaLeaseSecs + 5` seconds after it processed that report. That's always later, so the holder stops first. After that:
+- only the holder's last reported running queries count;
+- its grant is cleared, so a holder that comes back starts from nothing;
+- its row is dropped after 5 minutes, like stale leases.
+
+During a control-plane or Postgres outage, holders keep admitting within their grants until the lease runs out. Then admissions fall back to per-query leases, which follow `coordination.onUnavailable` on workers and fail closed on replicas.
+
+**Small limits.** A cluster whose limit is below twice the number of active holders gets no quotas: every admission takes a per-query lease, which is exact for small limits.
+
+**Turning it on.** Set `capacity.mode: quotas` on the control plane (or standalone replicas).
+- Workers don't need a setting. Each one asks its control plane every 30 seconds and switches when the control plane answers.
+- An older control plane, or one with quotas off, answers 404, and its workers keep per-query leases.
+- An older worker never asks, so it keeps using leases from the reserve.
+- **Upgrade every replica first.** Replicas (standalone or control plane) from before quotas don't know about `quota_committed` and would admit past it. Turn quotas on only once every replica runs this version. Workers aren't affected: they acquire through the control plane.
+
+**Costs.**
+- Admission within a grant is an atomic counter.
+- A holder sends one report per second (four per second while it has waiting queries).
+- The allocator runs one transaction per pass for all clusters.
+- Capacity moves between holders within about a second: one report, one allocator pass, one more report. The reserve covers the gap.
+
+**Metrics.**
+- On holders: `queryflux_capacity_quota{cluster_name, kind="quota"|"running"|"waiting"}`.
+- On the allocator: `queryflux_capacity_quota_committed{cluster_name}` and `queryflux_capacity_quota_holders{cluster_name}`.
+- Failures count in `queryflux_coordination_failures_total` (`capacity_quota_report`, `capacity_allocate`).
 
 ## Code map
 
@@ -94,3 +154,7 @@ Per-query leases still cost one round trip per admission. Quota assignment, wher
 | Batched releases | `crates/queryflux-persistence/src/batched_release.rs` |
 | Admission in dispatch (`acquire_global_capacity`, `ClusterSlotGuard`) | `crates/queryflux-frontend/src/dispatch.rs` |
 | Worker client, control-plane endpoints | `crates/queryflux/src/remote_coordination.rs`, `crates/queryflux-frontend/src/worker_api.rs` |
+| Allocation algorithm and invariant tests | `crates/queryflux-persistence/src/quota.rs` |
+| Holder (admission on quota, demand reports) | `crates/queryflux-persistence/src/quota_admission.rs` |
+| Holder rows, `quota_committed`, quota-aware acquire | `crates/queryflux-persistence/migrations/postgres/V22__capacity_quotas.sql` |
+| Allocator task | `crates/queryflux/src/startup/tasks.rs` (`spawn_capacity_allocator`) |
