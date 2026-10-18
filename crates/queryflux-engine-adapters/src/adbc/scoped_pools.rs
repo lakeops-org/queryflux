@@ -402,7 +402,12 @@ mod tests {
         // The build thread's guard unlocks the mutex before it drops its `Arc` to it, so
         // right after `lock_owned` succeeds that thread may still hold the last other
         // reference, and the entry is not prunable yet. Wait for it rather than racing it.
-        let deadline = Instant::now() + Duration::from_secs(2);
+        // The test cannot await `build` instead: like `AdbcAdapter`, which hands the
+        // handle to `tokio::time::timeout`, the caller has dropped it, so the runtime
+        // drops the guard on the build thread when the work finishes. That detached path
+        // is what this test covers. The window is microseconds; the deadline is a
+        // generous bound, not a wait (the loop exits as soon as the entry is pruned).
+        let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             cache.sweep();
             if cache.state.lock().unwrap().builds.is_empty() {
