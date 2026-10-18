@@ -14,15 +14,30 @@
 ALTER TABLE cluster_capacity_leases
     ADD COLUMN IF NOT EXISTS claimed BOOLEAN NOT NULL DEFAULT TRUE;
 
+-- Unclaimed leases are few and short-lived; acquires look for stale ones per cluster.
+CREATE INDEX IF NOT EXISTS cluster_capacity_leases_unclaimed
+    ON cluster_capacity_leases (cluster_name, acquired_at) WHERE NOT claimed;
+
 -- The cluster's limit as last passed by an acquire, so a release can tell how many
 -- slots it freed.
 ALTER TABLE cluster_capacity_counters
     ADD COLUMN IF NOT EXISTS max_running BIGINT;
 
+-- Capacity the quota allocator wants to grant but leases hold (see quota.rs,
+-- `quota_wanted`). Per-query acquires and hand-overs leave it alone, so it goes to quotas
+-- as leases end, instead of every freed slot going back to the line.
+ALTER TABLE cluster_capacity_counters
+    ADD COLUMN IF NOT EXISTS quota_wanted BIGINT NOT NULL DEFAULT 0;
+
 CREATE TABLE IF NOT EXISTS capacity_waiters (
     query_id      TEXT        PRIMARY KEY,
     cluster_name  TEXT        NOT NULL,
     instance_id   TEXT        NOT NULL,
+    -- Set when the query actually waits for a hand-over (wait_for_grant). Only parked
+    -- waiters are handed slots or hold the line: an older client that releases its query
+    -- right after a denial instead of waiting never parks, so slots aren't handed to a
+    -- query that is about to give them straight back.
+    parked        BOOLEAN     NOT NULL DEFAULT FALSE,
     enqueued_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
     -- Each retry refreshes it. A waiter that stops retrying (gave up, client gone) stops
     -- counting after a few seconds and is deleted by the expiry sweep.
@@ -47,7 +62,7 @@ DECLARE
     v_id TEXT;
 BEGIN
     PERFORM pg_advisory_xact_lock(hashtext('capacity:' || p_cluster)::bigint);
-    SELECT max_running - leased - quota_committed INTO v_free
+    SELECT max_running - leased - quota_committed - quota_wanted INTO v_free
     FROM cluster_capacity_counters WHERE cluster_name = p_cluster;
     IF v_free IS NULL OR v_free <= 0 THEN
         RETURN 0;
@@ -57,6 +72,7 @@ BEGIN
         WHERE query_id IN (
             SELECT query_id FROM capacity_waiters
             WHERE cluster_name = p_cluster
+              AND parked
               AND refreshed_at > now() - queryflux_capacity_waiter_ttl()
             ORDER BY enqueued_at, query_id
             LIMIT v_free
@@ -137,6 +153,12 @@ BEGIN
 
     PERFORM pg_advisory_xact_lock(hashtext('capacity:' || p_cluster)::bigint);
 
+    -- Slots handed to queries that never came back for them, older than 10 s. The
+    -- expiry sweep removes these too, but only every couple of minutes.
+    DELETE FROM cluster_capacity_leases
+    WHERE cluster_name = p_cluster AND NOT claimed
+      AND acquired_at < now() - interval '10 seconds';
+
     UPDATE cluster_capacity_leases SET claimed = TRUE
     WHERE query_id = p_query_id AND cluster_name = p_cluster;
     IF FOUND THEN
@@ -144,7 +166,7 @@ BEGIN
         RETURN TRUE;
     END IF;
 
-    SELECT leased, quota_committed, max_running INTO v_leased, v_quota, v_limit
+    SELECT leased, quota_committed + quota_wanted, max_running INTO v_leased, v_quota, v_limit
     FROM cluster_capacity_counters WHERE cluster_name = p_cluster;
     IF v_limit IS DISTINCT FROM p_max THEN
         INSERT INTO cluster_capacity_counters (cluster_name, max_running)
@@ -159,6 +181,7 @@ BEGIN
     IF v_free > 0 THEN
         SELECT COUNT(*) INTO v_older FROM capacity_waiters
         WHERE cluster_name = p_cluster
+          AND parked
           AND query_id <> p_query_id
           AND enqueued_at < v_since
           AND refreshed_at > now() - queryflux_capacity_waiter_ttl();
@@ -181,5 +204,22 @@ BEGIN
             cluster_name = EXCLUDED.cluster_name,
             instance_id = EXCLUDED.instance_id;
     RETURN FALSE;
+END
+$$;
+
+-- Release queries: leave the line, then drop their leases. Two statements, so the lease
+-- delete takes a fresh snapshot: if a release elsewhere is handing one of these queries
+-- a slot right now, the waiter delete waits for it, and the lease delete then sees and
+-- removes the lease it created. (One statement would use one snapshot and miss it,
+-- leaving the slot held by nobody until the unclaimed lease expired.)
+CREATE OR REPLACE FUNCTION queryflux_capacity_release(p_query_ids TEXT[]) RETURNS BIGINT
+LANGUAGE plpgsql AS $$
+DECLARE
+    v_n BIGINT;
+BEGIN
+    DELETE FROM capacity_waiters WHERE query_id = ANY(p_query_ids);
+    DELETE FROM cluster_capacity_leases WHERE query_id = ANY(p_query_ids);
+    GET DIAGNOSTICS v_n = ROW_COUNT;
+    RETURN v_n;
 END
 $$;

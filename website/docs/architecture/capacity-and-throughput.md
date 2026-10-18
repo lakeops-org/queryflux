@@ -125,6 +125,8 @@ The allocator writes `sum(commit)` as `quota_committed` under the clusters' advi
 
 During a control-plane or Postgres outage, holders keep admitting within their grants until the lease runs out. Then admissions fall back to per-query leases, which follow `coordination.onUnavailable` on workers and fail closed on replicas.
 
+**Quotas and the line.** When leases hold a cluster, for example because a long line was served from the reserve, the allocator can't grant quotas yet. It records what it wants (`quota_wanted`, at most `max - reserve - quota_committed`). Per-query acquires and hand-overs leave that capacity alone, so as leases end it goes to quotas on the next pass instead of back to the line. The reserve always stays available to leases.
+
 **Small limits.** A cluster whose limit is below twice the number of active holders gets no quotas: every admission takes a per-query lease, which is exact for small limits.
 
 **Turning it on.** Set `capacity.mode: quotas` on the control plane (or standalone replicas).
@@ -152,20 +154,20 @@ Now waiting is a line, kept in Postgres:
 
 1. **A denied acquire joins the line.** `queryflux_capacity_try_acquire` records the query in `capacity_waiters`, with when it first waited. Each retry refreshes the row; a query that stops retrying stops counting after 6 seconds.
 2. **First come, first served.** A query, new or retrying, gets a free slot only if fewer live waiters joined before it than there are free slots. Newcomers don't jump the line.
-3. **Releases hand slots over.** When leases are released, the delete trigger gives the freed slots to the oldest live waiters right away, as leases created for them, and notifies only those queries (`queryflux_capacity_granted`). The allocator does the same when a quota shrinks.
-4. **Waiters wake on the hand-over.** After a denial, dispatch calls `wait_for_grant` instead of sleeping.
+3. **Releases hand slots over.** When leases are released, the delete trigger gives the freed slots to the oldest live *parked* waiters right away, as leases created for them, and notifies only those queries (`queryflux_capacity_granted`). The allocator does the same when a quota shrinks.
+4. **Waiters park and wake on the hand-over.** After a denial, dispatch calls `wait_for_grant` instead of sleeping. That parks the query: only parked queries are handed slots or hold up others.
    - On a replica, it waits for the notification for its query id.
    - On a worker, it long-polls `POST /worker/capacity/wait` on the control plane, for up to 3 seconds per request.
    - With quotas, a quota slot freeing up on the same process wakes it too.
 
    Either way the wait is capped by the old backoff, and the query retries when it wakes. That retry claims the lease created for it.
 
-**Leases nobody claims.** A slot handed to a query that has since given up (timed out, client gone) stays unclaimed. The expiry sweep deletes unclaimed leases after 10 seconds. A query that times out waiting leaves the line at once.
+**Leases nobody claims.** A slot handed to a query that has since given up (timed out, client gone) stays unclaimed. An unclaimed lease older than 10 seconds is deleted by the next acquire on that cluster, and by the expiry sweep. A query that times out waiting leaves the line at once. Releasing a query is two statements (leave the line, then drop the lease), so a release that races a hand-over to the same query also removes the slot just handed to it.
 
 **Locks.** The release trigger takes each cluster's advisory lock before its counter row, in cluster-name order: the same order as acquires and the allocator. A hand-over never races an acquire past the limit.
 
 **Compatibility.**
-- An older worker gets 404 from `/worker/capacity/wait` and keeps retrying on its timer. It still takes its turn in the line, because the line is kept by the acquire function.
+- An older worker gets 404 from `/worker/capacity/wait` and keeps retrying on its timer. It also releases its query right after every denial. It never parks, so it is never handed a slot it would give straight back, and it doesn't hold up others: it competes for free slots as before.
 - Replicas from before this change don't use the line, and could take a slot ahead of waiters until they are upgraded.
 
 **Not built: grouping acquires.** The plan also proposed sending acquires that arrive together on one worker as one request. With quotas, most admissions don't reach the control plane, and with the line, waiters no longer poll, so the remaining reserve traffic is small. It will be revisited if the capacity benchmark shows the reserve path is the limit.
