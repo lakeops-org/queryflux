@@ -175,6 +175,13 @@ With **Postgres persistence** and **`distributed: true`** (the default when Post
 
 Set `distributed: false` to run Postgres-backed persistence without cross-replica coordination (single replica or explicit opt-out).
 
+**Query history retention.** `queryHistoryRetentionDays` deletes query records, digest stats and cluster snapshots older than that many days. With Postgres it runs hourly, on every replica (deleting the same rows twice is harmless), in batches of 10,000 rows, each its own short transaction. A large backlog, such as after turning retention on for an existing database, is worked through over successive batches. Each statement stays short, and autovacuum keeps up. Omit it to keep history forever.
+
+```yaml
+queryflux:
+  queryHistoryRetentionDays: 30
+```
+
 Helm / Kubernetes: see **[charts/queryflux/README.md](https://github.com/lakeops-org/queryflux/blob/main/charts/queryflux/README.md#persistence-and-replicas)**. Full behavior: **[Cluster variants, health checks & reconciliation](./architecture/cluster-variants-and-health#distributed-mode-and-capacitystore)**.
 
 ## Worker mode

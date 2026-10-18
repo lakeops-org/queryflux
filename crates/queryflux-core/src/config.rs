@@ -827,7 +827,8 @@ pub struct QueryFluxConfig {
     /// Number of days to retain query history. When set, a background task runs
     /// hourly and deletes `query_records` (`created_at`), `query_digest_stats`
     /// (`last_seen`), and `cluster_snapshots` (`recorded_at`) older than this many days.
-    /// Only takes effect when Postgres persistence is configured.
+    /// Only takes effect when Postgres persistence is configured. Runs hourly and deletes
+    /// in batches of 10,000 rows, each its own short transaction.
     /// Omit or set to `null` to keep history indefinitely.
     #[serde(default)]
     pub query_history_retention_days: Option<u64>,
