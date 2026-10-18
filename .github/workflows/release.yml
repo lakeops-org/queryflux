@@ -31,6 +31,8 @@ jobs:
     outputs:
       releases_created: ${{ steps.release.outputs.releases_created }}
       tag_name: ${{ steps.release.outputs.tag_name }}
+      prs_created: ${{ steps.release.outputs.prs_created }}
+      pr: ${{ steps.release.outputs.pr }}
     steps:
       - uses: googleapis/release-please-action@v4
         id: release
@@ -38,6 +40,40 @@ jobs:
           token: ${{ secrets.RELEASE_PLEASE_TOKEN }}
           config-file: release-please/release-please-config.json
           manifest-file: release-please/.release-please-manifest.json
+
+  # Release Please bumps the workspace version in Cargo.toml but not Cargo.lock, which then
+  # still lists the workspace crates at the previous version: releases shipped a stale
+  # lockfile and `cargo build --locked` failed. After every run that creates or updates the
+  # release PR, re-sync the lockfile on that PR's branch. Only workspace versions change
+  # (`--workspace` updates no dependency). Pushing with RELEASE_PLEASE_TOKEN lets CI run on
+  # the commit; Release Please rewrites the branch on its next update, and this job runs
+  # again after it.
+  sync_cargo_lock:
+    name: Sync Cargo.lock on the release PR
+    needs: [release_please]
+    if: ${{ needs.release_please.outputs.prs_created == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@44c2b7a8a4ea60a981eaca3cf939b5f4305c123b # v4.1.5
+        with:
+          ref: ${{ fromJSON(needs.release_please.outputs.pr).headBranchName }}
+          token: ${{ secrets.RELEASE_PLEASE_TOKEN }}
+
+      - name: Update workspace versions in Cargo.lock
+        run: cargo update --workspace
+
+      - name: Commit and push
+        run: |
+          set -eu
+          if git diff --quiet -- Cargo.lock; then
+            echo "Cargo.lock already matches the workspace version"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Cargo.lock
+          git commit -m "chore(release): sync Cargo.lock with the workspace version"
+          git push
 
   # Release Please uses tags like queryflux-v0.1.2; Docker uses v0.1.2 (unified) and v0.1.2-slim (server-only).
   docker_tag_base:
