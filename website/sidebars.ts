@@ -71,6 +71,7 @@ const sidebars: SidebarsConfig = {
         'architecture/routing-and-clusters',
         'architecture/cluster-variants-and-health',
         'architecture/worker-mode',
+        'architecture/capacity-and-throughput',
         'architecture/caching',
         'architecture/query-tags',
         'architecture/query-params',

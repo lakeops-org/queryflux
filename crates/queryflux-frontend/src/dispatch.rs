@@ -1102,6 +1102,11 @@ async fn acquire_global_capacity(
         return CapacityGrant::Granted;
     };
     let max_rq = effective_max_running(cluster_manager, group, cluster).await;
+    // Unlimited: nothing to coordinate, so skip the round trip. The release at the end
+    // still runs (it is idempotent), because the limit may change before then.
+    if max_rq == u64::MAX {
+        return CapacityGrant::Granted;
+    }
     match cap
         .try_acquire(&cluster.0, max_rq, &state.instance_id, query_id)
         .await

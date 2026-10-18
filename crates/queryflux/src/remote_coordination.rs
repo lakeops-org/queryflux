@@ -22,6 +22,9 @@ pub(crate) struct RemoteCoordinationStore {
     base: String,
     bearer: String,
     on_unavailable: OnCoordinationUnavailable,
+    /// Cleared when the control plane answers 404 to a batch release (a version before
+    /// `/worker/capacity/release-batch`); releases are then sent one by one.
+    batch_release: std::sync::atomic::AtomicBool,
 }
 
 impl RemoteCoordinationStore {
@@ -37,6 +40,7 @@ impl RemoteCoordinationStore {
             base: control_plane.url.trim_end_matches('/').to_string(),
             bearer: control_plane.auth.bearer().to_string(),
             on_unavailable,
+            batch_release: std::sync::atomic::AtomicBool::new(true),
         }
     }
 
@@ -156,6 +160,47 @@ impl CapacityStore for RemoteCoordinationStore {
             json!({ "cluster": cluster_name, "queryId": query_id }),
         )
         .await
+    }
+
+    async fn release_many(&self, leases: &[(String, String)]) -> Result<()> {
+        use std::sync::atomic::Ordering;
+        if leases.is_empty() {
+            return Ok(());
+        }
+        if self.batch_release.load(Ordering::Relaxed) {
+            let body = json!({
+                "leases": leases
+                    .iter()
+                    .map(|(cluster, query_id)| json!({ "cluster": cluster, "queryId": query_id }))
+                    .collect::<Vec<_>>(),
+            });
+            let resp = self
+                .client
+                .post(format!("{}/worker/capacity/release-batch", self.base))
+                .json(&body)
+                .bearer_auth(&self.bearer)
+                .send()
+                .await
+                .map_err(|e| {
+                    QueryFluxError::Persistence(format!("control plane unreachable: {e}"))
+                })?;
+            let status = resp.status();
+            if status.is_success() {
+                return Ok(());
+            }
+            if status != reqwest::StatusCode::NOT_FOUND {
+                let body = resp.text().await.unwrap_or_default();
+                return Err(QueryFluxError::Persistence(format!(
+                    "control plane coordination returned {status}: {body}"
+                )));
+            }
+            tracing::info!("Control plane has no batch release endpoint; releasing one by one");
+            self.batch_release.store(false, Ordering::Relaxed);
+        }
+        for (cluster, query_id) in leases {
+            self.release(cluster, query_id).await?;
+        }
+        Ok(())
     }
 
     async fn heartbeat(&self, instance_id: &str) -> Result<u64> {
@@ -408,6 +453,59 @@ mod tests {
         assert!(closed.try_acquire("c", 1, "w", "q").await.is_err());
         let local = client(url, OnCoordinationUnavailable::LocalLimits);
         assert!(local.try_acquire("c", 1, "w", "q").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn releases_go_in_one_batch_request() {
+        let store = Arc::new(Leases::default());
+        let url = control_plane(Some(store.clone())).await;
+        let a = client(&url, OnCoordinationUnavailable::FailClosed);
+        for q in ["q1", "q2", "q3"] {
+            assert!(a.try_acquire("c", 3, "wa", q).await.unwrap());
+        }
+        a.release_many(&[("c".into(), "q1".into()), ("c".into(), "q3".into())])
+            .await
+            .unwrap();
+        assert_eq!(a.active_lease_count("c").await.unwrap(), 1);
+        assert!(a.batch_release.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    /// A control plane from before `/worker/capacity/release-batch` answers 404: the
+    /// worker falls back to one release per lease, and stops trying the batch endpoint.
+    #[tokio::test]
+    async fn batch_release_falls_back_on_an_older_control_plane() {
+        use axum::{routing::post, Json, Router};
+        let released: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
+        let app = Router::new().route(
+            "/worker/capacity/release",
+            post({
+                let released = released.clone();
+                move |Json(v): Json<serde_json::Value>| {
+                    let released = released.clone();
+                    async move {
+                        released
+                            .lock()
+                            .unwrap()
+                            .push(v["queryId"].as_str().unwrap().to_string());
+                        axum::http::StatusCode::NO_CONTENT
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let a = client(
+            &format!("http://{addr}"),
+            OnCoordinationUnavailable::FailClosed,
+        );
+        a.release_many(&[("c".into(), "q1".into()), ("c".into(), "q2".into())])
+            .await
+            .unwrap();
+        a.release_many(&[("c".into(), "q3".into())]).await.unwrap();
+        assert_eq!(*released.lock().unwrap(), vec!["q1", "q2", "q3"]);
+        assert!(!a.batch_release.load(std::sync::atomic::Ordering::Relaxed));
     }
 
     #[tokio::test]

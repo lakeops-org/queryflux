@@ -1177,13 +1177,16 @@ pub struct PostgresPersistenceConfig {
     /// dedicated `PgListener` connection. When the per-workload pool sizes below
     /// are omitted, one slot is reserved for LISTEN and the remainder is split
     /// 60% query / 20% coordination / 20% admin (minimum 1 each). Must be at least
-    /// 4. Ignored when any workload-specific pool size is set.
+    /// 4. Ignored when any workload-specific pool size is set. When neither this nor
+    /// the workload sizes are set, the pools are 7 query, 8 coordination, 2 admin.
     #[serde(default)]
     pub pool_size: Option<u32>,
     /// Hot-path pool for executing/queued query state (`queryPoolSize`).
     #[serde(default)]
     pub query_pool_size: Option<u32>,
     /// Pool for distributed capacity, queue claims, and sweep locks (`coordinationPoolSize`).
+    /// Default 8. Size it to the capacity calls in flight at peak: admissions per second
+    /// times the time one call holds a connection (about 1 ms).
     #[serde(default)]
     pub coordination_pool_size: Option<u32>,
     /// Pool for admin API, metrics, cache metadata, and config reload reads (`adminPoolSize`).
@@ -1284,26 +1287,37 @@ impl PostgresPersistenceConfig {
     pub const LISTENER_CONNECTIONS: u32 = 1;
     /// Minimum legacy `poolSize`: 3 isolated pools (1 each) + 1 LISTEN connection.
     pub const MIN_LEGACY_POOL_SIZE: u32 = 4;
+    /// Coordination pool size when `coordinationPoolSize` and `poolSize` are unset. A
+    /// capacity acquire is one short call (V21), so eight connections carry thousands of
+    /// admissions per second.
+    pub const DEFAULT_COORDINATION_POOL: u32 = 8;
 
     /// Resolve isolated pool sizes for query, coordination, and admin workloads.
     ///
     /// Legacy `poolSize` is inclusive of [`Self::LISTENER_CONNECTIONS`]. Workload-specific
     /// sizes (`queryPoolSize` / …) are pool-only; the listener is extra in that mode.
     pub fn resolve_pool_sizes(&self) -> Result<(u32, u32, u32), String> {
-        const DEFAULT_TOTAL: u32 = 10;
-
         if self.query_pool_size.is_some()
             || self.coordination_pool_size.is_some()
             || self.admin_pool_size.is_some()
         {
             return Ok((
                 self.query_pool_size.unwrap_or(6).max(1),
-                self.coordination_pool_size.unwrap_or(2).max(1),
+                self.coordination_pool_size
+                    .unwrap_or(Self::DEFAULT_COORDINATION_POOL)
+                    .max(1),
                 self.admin_pool_size.unwrap_or(2).max(1),
             ));
         }
 
-        let total = self.pool_size.unwrap_or(DEFAULT_TOTAL);
+        // Nothing set. The legacy split of 10 connections left coordination one
+        // connection, which capped admissions for the whole process at a few hundred per
+        // second (every query takes and releases a lease on it in distributed mode).
+        // Pools open connections on demand, so a larger coordination pool costs nothing
+        // unless it's used.
+        let Some(total) = self.pool_size else {
+            return Ok((7, Self::DEFAULT_COORDINATION_POOL, 2));
+        };
         if total < Self::MIN_LEGACY_POOL_SIZE {
             return Err(format!(
                 "postgres persistence: poolSize must be at least {} \
@@ -2970,7 +2984,7 @@ guardrails:
     }
 
     fn assert_legacy_budget_inclusive_of_listener(cfg: &PostgresPersistenceConfig) {
-        let total = cfg.pool_size.unwrap_or(10);
+        let total = cfg.pool_size.expect("legacy poolSize");
         let (query, coordination, admin) = cfg.resolve_pool_sizes().unwrap();
         assert!(
             query + coordination + admin + PostgresPersistenceConfig::LISTENER_CONNECTIONS <= total,
@@ -2989,9 +3003,18 @@ guardrails:
     }
 
     #[test]
-    fn postgres_pool_sizes_default_total_includes_listener() {
+    fn postgres_pool_sizes_default_gives_coordination_room() {
         let c = PostgresPersistenceConfig::default();
-        assert_eq!(c.resolve_pool_sizes().unwrap(), (7, 1, 1));
+        assert_eq!(c.resolve_pool_sizes().unwrap(), (7, 8, 2));
+        let only_query = PostgresPersistenceConfig {
+            query_pool_size: Some(4),
+            ..Default::default()
+        };
+        assert_eq!(only_query.resolve_pool_sizes().unwrap(), (4, 8, 2));
+    }
+
+    #[test]
+    fn postgres_pool_sizes_legacy_ten_unchanged() {
         let with_ten = PostgresPersistenceConfig {
             pool_size: Some(10),
             ..Default::default()

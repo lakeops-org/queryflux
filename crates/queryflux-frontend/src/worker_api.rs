@@ -75,6 +75,10 @@ pub fn router(api: WorkerApi) -> Router {
         .route("/worker/heartbeat", post(report))
         .route("/worker/capacity/acquire", post(capacity_acquire))
         .route("/worker/capacity/release", post(capacity_release))
+        .route(
+            "/worker/capacity/release-batch",
+            post(capacity_release_batch),
+        )
         .route("/worker/capacity/heartbeat", post(capacity_heartbeat))
         .route("/worker/capacity/release-all", post(capacity_release_all))
         .route(
@@ -352,6 +356,12 @@ pub struct ReleaseRequest {
 
 #[derive(serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct ReleaseBatchRequest {
+    pub leases: Vec<ReleaseRequest>,
+}
+
+#[derive(serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct InstanceRequest {
     pub instance_id: String,
 }
@@ -424,6 +434,27 @@ async fn capacity_release(
         Err(r) => return r,
     };
     match store.release(&req.cluster, &req.query_id).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => store_error(e),
+    }
+}
+
+/// Releases from one worker, sent together (`BatchedReleaseStore` on the worker).
+async fn capacity_release_batch(
+    State(st): State<Arc<WorkerApiState>>,
+    headers: HeaderMap,
+    Json(req): Json<ReleaseBatchRequest>,
+) -> Response {
+    let store = match coordination(&st, &headers) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    let leases: Vec<(String, String)> = req
+        .leases
+        .into_iter()
+        .map(|l| (l.cluster, l.query_id))
+        .collect();
+    match store.release_many(&leases).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => store_error(e),
     }

@@ -613,11 +613,19 @@ async fn main() -> Result<()> {
         );
     }
 
+    // Releases are queued and sent in batches in the background, so a finishing query
+    // never waits on Postgres or the control plane. Shutdown's `release_all_for_instance`
+    // frees anything still queued.
     let capacity_store: Option<Arc<dyn queryflux_persistence::CapacityStore>> = distributed
         .then(|| {
-            coordination
-                .clone()
-                .map(|b| b as Arc<dyn queryflux_persistence::CapacityStore>)
+            coordination.clone().map(|b| {
+                Arc::new(
+                    queryflux_persistence::batched_release::BatchedReleaseStore::new(
+                        b as Arc<dyn queryflux_persistence::CapacityStore>,
+                        metrics.clone(),
+                    ),
+                ) as Arc<dyn queryflux_persistence::CapacityStore>
+            })
         })
         .flatten();
     let queue_coordinator: Option<Arc<dyn queryflux_persistence::QueueCoordinator>> = distributed
