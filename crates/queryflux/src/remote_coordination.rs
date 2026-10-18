@@ -16,6 +16,8 @@ use serde_json::json;
 /// Requests sit on the admission path, so they get a short timeout: a slow control plane
 /// is treated as an unavailable one.
 const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+/// Longest capacity wait held on the control plane in one request.
+const MAX_REMOTE_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
 
 pub(crate) struct RemoteCoordinationStore {
     client: reqwest::Client,
@@ -25,6 +27,9 @@ pub(crate) struct RemoteCoordinationStore {
     /// Cleared when the control plane answers 404 to a batch release (a version before
     /// `/worker/capacity/release-batch`); releases are then sent one by one.
     batch_release: std::sync::atomic::AtomicBool,
+    /// Cleared when the control plane answers 404 to `/worker/capacity/wait` (a version
+    /// before it); waits then fall back to sleeping.
+    wait_endpoint: std::sync::atomic::AtomicBool,
 }
 
 impl RemoteCoordinationStore {
@@ -41,6 +46,7 @@ impl RemoteCoordinationStore {
             bearer: control_plane.auth.bearer().to_string(),
             on_unavailable,
             batch_release: std::sync::atomic::AtomicBool::new(true),
+            wait_endpoint: std::sync::atomic::AtomicBool::new(true),
         }
     }
 
@@ -160,6 +166,53 @@ impl CapacityStore for RemoteCoordinationStore {
             json!({ "cluster": cluster_name, "queryId": query_id }),
         )
         .await
+    }
+
+    /// Long-poll the control plane until it hands this query a slot, for at most
+    /// [`MAX_REMOTE_WAIT`] so the request stays well inside its timeout.
+    async fn wait_for_grant(
+        &self,
+        cluster_name: &str,
+        query_id: &str,
+        timeout: std::time::Duration,
+    ) -> Result<bool> {
+        use std::sync::atomic::Ordering;
+        let timeout = timeout.min(MAX_REMOTE_WAIT);
+        if !self.wait_endpoint.load(Ordering::Relaxed) {
+            tokio::time::sleep(timeout).await;
+            return Ok(false);
+        }
+        let resp = self
+            .client
+            .post(format!("{}/worker/capacity/wait", self.base))
+            .json(&json!({
+                "cluster": cluster_name,
+                "queryId": query_id,
+                "waitMs": timeout.as_millis() as u64,
+            }))
+            .bearer_auth(&self.bearer)
+            .send()
+            .await
+            .map_err(|e| QueryFluxError::Persistence(format!("control plane unreachable: {e}")))?;
+        match resp.status() {
+            s if s.is_success() => resp
+                .json::<Granted>()
+                .await
+                .map(|g| g.granted)
+                .map_err(|e| QueryFluxError::Persistence(format!("control plane response: {e}"))),
+            reqwest::StatusCode::NOT_FOUND => {
+                tracing::info!("Control plane has no capacity wait endpoint; retrying on a timer");
+                self.wait_endpoint.store(false, Ordering::Relaxed);
+                tokio::time::sleep(timeout).await;
+                Ok(false)
+            }
+            s => {
+                let body = resp.text().await.unwrap_or_default();
+                Err(QueryFluxError::Persistence(format!(
+                    "control plane capacity wait returned {s}: {body}"
+                )))
+            }
+        }
     }
 
     async fn release_many(&self, leases: &[(String, String)]) -> Result<()> {
@@ -704,9 +757,11 @@ mod tests {
         // Before any grant, per-query leases may use the whole limit: 40 run as leases,
         // 20 wait. Those queries finish; the waiters stay as demand.
         assert_eq!(pg.active_lease_count(&cluster).await.unwrap(), MAX);
+        let mut released = [Vec::new(), Vec::new()];
         for (i, w) in workers.iter().enumerate() {
             for id in held[i].drain(..) {
                 w.release(&cluster, &id).await.unwrap();
+                released[i].push(id);
             }
         }
         let policy = AllocatorPolicy::default();
@@ -719,18 +774,54 @@ mod tests {
         for w in &workers {
             w.report_now().await;
         }
-        // A new round of 30 each: grants first, then leases for what quotas leave.
-        for (i, w) in workers.iter().enumerate() {
-            for q in 0..30 {
-                let id = format!("{cluster}-w{i}-r{q}");
-                if w.try_acquire(&cluster, MAX, &format!("{cluster}-w{i}"), &id)
-                    .await
-                    .unwrap()
-                {
-                    held[i].push(id);
+        // The queries denied in the first round retry first (the releases above handed
+        // them slots, first come first served), then a new round fills what is left:
+        // grants first, then leases.
+        let retry: Vec<Vec<String>> = (0..2)
+            .map(|i| {
+                (0..30)
+                    .map(|q| format!("{cluster}-w{i}-q{q}"))
+                    .filter(|id| !released[i].contains(id))
+                    .collect()
+            })
+            .collect();
+        let mut pending: Vec<Vec<String>> = (0..2)
+            .map(|i| {
+                retry[i]
+                    .iter()
+                    .cloned()
+                    .chain((0..30).map(|q| format!("{cluster}-w{i}-r{q}")))
+                    .collect()
+            })
+            .collect();
+        // Waiting queries keep retrying, as dispatch does; a few passes let slots handed
+        // to waiters be claimed and queued releases reach Postgres.
+        for _ in 0..10 {
+            for (i, w) in workers.iter().enumerate() {
+                let mut still = Vec::new();
+                for id in pending[i].drain(..) {
+                    if w.try_acquire(&cluster, MAX, &format!("{cluster}-w{i}"), &id)
+                        .await
+                        .unwrap()
+                    {
+                        held[i].push(id);
+                    } else {
+                        still.push(id);
+                    }
                 }
+                pending[i] = still;
+            }
+            let total = (held[0].len() + held[1].len()) as u64;
+            assert!(total <= MAX, "admitted {total} > limit {MAX}");
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        // Stop waiting: the rest give up and leave the line.
+        for (i, w) in workers.iter().enumerate() {
+            for id in pending[i].drain(..) {
+                w.release(&cluster, &id).await.unwrap();
             }
         }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         let leases = pg.active_lease_count(&cluster).await.unwrap();
         let on_quota: u64 = workers
             .iter()

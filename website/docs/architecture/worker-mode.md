@@ -15,7 +15,7 @@ This page explains how worker mode works and why it is built this way. To run it
 - **Workers never touch the database.** A worker needs network access to its clients, its engines and its control plane, nothing else. That makes it safe to run in networks that must not reach the config database.
 - **Today's deployments keep working unchanged.** The default role is `standalone`, and a standalone proxy can also serve workers.
 
-**Non-goals:** moving query results through the control plane; a global queue that orders every waiting query across the fleet (see [Fairness](#fairness)).
+**Non-goals:** moving query results through the control plane.
 
 ## Roles and topology
 
@@ -201,11 +201,11 @@ The control plane warns, in its log and in Studio, when two or more workers are 
 
 ### Fairness
 
-The cap is a hard limit, but waiting queries on different workers aren't served in one global order: each worker retries for its own waiting queries. Rather than build a global queue up front, the design measures whether this matters:
-- `queryflux_queue_duration_seconds`, per worker. Synchronous dispatch now records its wait too; it used to record 0.
-- `queryflux_capacity_lease_denied_total`, per worker.
+Waiting queries are served first come, first served across the fleet. A query denied a lease joins a line kept in Postgres, and a release hands the freed slot to the oldest query in it. A waiting worker long-polls `POST /worker/capacity/wait` and is woken when its query gets a slot. Details: [Waiting for capacity](./capacity-and-throughput#waiting-for-capacity).
 
-An ordered wait queue on the control plane, which grants slots to long-polling acquires in arrival order, is the planned follow-up if these show workers being starved.
+To compare workers, watch, per worker:
+- `queryflux_queue_duration_seconds`. Synchronous dispatch records its wait too; it used to record 0.
+- `queryflux_capacity_lease_denied_total`.
 
 ## Query history
 
@@ -296,7 +296,6 @@ The cache key includes a fingerprint of the group's member clusters and their co
 ## Future work
 
 - **Forward to the owning worker.** Put the worker id in query ids, and forward a request to the worker that owns the query, so shared-service workers work behind any load balancer without sticky sessions.
-- **An ordered wait queue on the control plane,** if the fairness metrics call for it.
 - **Per-worker credentials, secret references and signed snapshots,** for lower-trust workers.
 - **Translation scripts and timeout from the control plane:** `translation.pythonScripts` and `schemaResolutionTimeoutMs` still come from each worker's own config.
 - **Site agent:** a local control-plane role for a hosted control plane. It caches config, holds the lease table, and buffers, redacts and forwards history for every worker at a site.

@@ -343,9 +343,8 @@ pub async fn dispatch_query(
             match acquire_global_capacity(state, &cluster_manager, &group, &c, &query_id.0).await {
                 CapacityGrant::Denied => {
                     // Global capacity full — release the local slot and queue. The query
-                    // holds no lease, so there is nothing to release in the capacity store
-                    // (a queued release could otherwise remove the lease its next poll
-                    // is granted under the same id).
+                    // holds no lease, and its place in the fleet-wide line (kept by the
+                    // backend under its id) carries over to its next poll.
                     slot.release_local().await;
                     let uri = persist_queued_query(
                         state,
@@ -1191,9 +1190,12 @@ async fn persist_queued_query(
 // ---------------------------------------------------------------------------
 
 /// How long to wait between queue retries (exponential backoff, capped at 2s).
+fn queued_backoff(seq: u64) -> std::time::Duration {
+    std::time::Duration::from_millis((100u64 * (1 << seq.min(4))).min(2000))
+}
+
 async fn queued_backoff_delay(seq: u64) {
-    let ms = (100u64 * (1 << seq.min(4))).min(2000);
-    tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+    tokio::time::sleep(queued_backoff(seq)).await;
 }
 
 // ---------------------------------------------------------------------------
@@ -1266,9 +1268,9 @@ impl ClusterSlotGuard {
     }
 
     /// Give back only the local slot, after the fleet-wide lease was denied: the query
-    /// holds no lease. Releasing it from the capacity store as well would be a wasted
-    /// round trip, and with releases sent in the background it could arrive after the
-    /// query's retry was granted under the same id and remove that lease.
+    /// holds no lease. Releasing it from the capacity store as well would take it out of
+    /// the line it now waits in there, and with releases sent in the background it could
+    /// arrive after the query's retry was granted under the same id and remove that lease.
     async fn release_local(&mut self) {
         if !self.released {
             self.released = true;
@@ -1661,8 +1663,13 @@ async fn setup_sync_query(
     let wait_start = Utc::now();
     let deadline = wait_start + chrono::Duration::seconds(wait_timeout_secs as i64);
     let mut seq: u64 = 0;
+    // The cluster this query last waited in line for, so a timeout can leave the line.
+    let mut waited_on: Option<ClusterName> = None;
     let (cluster_name, adapter, this_cluster_cfg, mut slot) = loop {
         if Utc::now() >= deadline {
+            if let (Some(cap), Some(c)) = (&state.capacity_store, &waited_on) {
+                let _ = cap.release(&c.0, &query_id.0).await;
+            }
             return Err(QueryFluxError::CapacityWaitTimeout {
                 group: group.0.clone(),
                 timeout_secs: wait_timeout_secs,
@@ -1692,10 +1699,21 @@ async fn setup_sync_query(
                 {
                     CapacityGrant::Denied => {
                         // Global capacity full or coordination unavailable (fail-closed) —
-                        // release the local slot (the query holds no lease) and retry with
-                        // backoff.
+                        // release the local slot, then wait for the backend to hand this
+                        // query a slot (it is in line under its id), at most the backoff.
                         slot.release_local().await;
-                        queued_backoff_delay(seq).await;
+                        waited_on = Some(name.clone());
+                        if let Some(cap) = &state.capacity_store {
+                            if let Err(e) = cap
+                                .wait_for_grant(&name.0, &query_id.0, queued_backoff(seq))
+                                .await
+                            {
+                                tracing::debug!("Capacity wait failed, retrying: {e}");
+                                queued_backoff_delay(seq).await;
+                            }
+                        } else {
+                            queued_backoff_delay(seq).await;
+                        }
                         seq += 1;
                         continue;
                     }

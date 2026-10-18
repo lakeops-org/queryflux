@@ -353,6 +353,21 @@ pub trait CapacityStore: Send + Sync {
         Ok(())
     }
 
+    /// After `try_acquire` denied `query_id`, wait until capacity may be free for it:
+    /// the backend handed it a slot while it waited, or `timeout` passed. Returns true
+    /// when the next `try_acquire` should succeed. The caller retries either way.
+    ///
+    /// The default sleeps for `timeout`, which is the old retry-on-a-timer behavior.
+    async fn wait_for_grant(
+        &self,
+        _cluster_name: &str,
+        _query_id: &str,
+        timeout: std::time::Duration,
+    ) -> Result<bool> {
+        tokio::time::sleep(timeout).await;
+        Ok(false)
+    }
+
     /// Renew the heartbeat on every lease held by `instance_id` so that
     /// [`Self::expire_stale`] does not reclaim slots of long-running queries
     /// on live replicas. Each replica must call this on a timer well inside

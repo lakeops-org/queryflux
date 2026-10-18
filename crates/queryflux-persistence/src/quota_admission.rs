@@ -46,6 +46,8 @@ struct ClusterQuota {
     /// Queries denied capacity, by id, with when they last asked.
     waiting: Mutex<HashMap<String, Instant>>,
     last_active: Mutex<Option<Instant>>,
+    /// Woken when a quota slot frees or the grant grows, for queries in `wait_for_grant`.
+    freed: Notify,
 }
 
 pub struct QuotaAdmission {
@@ -221,6 +223,9 @@ impl QuotaAdmission {
                 for r in &reports {
                     let (quota, seq) = granted.get(r.cluster.as_str()).copied().unwrap_or((0, 0));
                     let cq = self.cluster(&r.cluster);
+                    if quota > cq.quota.load(Ordering::Relaxed) {
+                        cq.freed.notify_waiters();
+                    }
                     cq.quota.store(quota, Ordering::Relaxed);
                     cq.seq.store(seq, Ordering::Relaxed);
                     cq.valid_until_ms.store(until, Ordering::Relaxed);
@@ -306,10 +311,19 @@ impl CapacityStore for QuotaAdmission {
             if self.admit_on_quota(cq) {
                 self.on_quota
                     .insert(query_id.to_string(), cluster_name.to_string());
-                cq.waiting
+                let was_waiting = cq
+                    .waiting
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
-                    .remove(query_id);
+                    .remove(query_id)
+                    .is_some();
+                if was_waiting {
+                    // It may still be in the reserve's line, or have been handed a lease
+                    // there meanwhile: give both back.
+                    if let Err(e) = self.inner.release(cluster_name, query_id).await {
+                        tracing::debug!("Clearing a reserve wait for {query_id}: {e}");
+                    }
+                }
                 return Ok(true);
             }
         }
@@ -341,6 +355,7 @@ impl CapacityStore for QuotaAdmission {
                     .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |r| {
                         Some(r.saturating_sub(1))
                     });
+                cq.freed.notify_one();
             }
             return Ok(());
         }
@@ -357,6 +372,35 @@ impl CapacityStore for QuotaAdmission {
             }
         }
         self.inner.release_many(&rest).await
+    }
+
+    /// Wake on whichever comes first: the reserve handing this query a slot, or a quota
+    /// slot freeing up on this process.
+    async fn wait_for_grant(
+        &self,
+        cluster_name: &str,
+        query_id: &str,
+        timeout: Duration,
+    ) -> Result<bool> {
+        if !self.enabled() {
+            return self
+                .inner
+                .wait_for_grant(cluster_name, query_id, timeout)
+                .await;
+        }
+        let cq = self.cluster(cluster_name);
+        let freed = cq.freed.notified();
+        tokio::pin!(freed);
+        freed.as_mut().enable();
+        if cq.valid_until_ms.load(Ordering::Relaxed) > self.now_ms()
+            && cq.running.load(Ordering::Relaxed) < cq.quota.load(Ordering::Relaxed)
+        {
+            return Ok(true);
+        }
+        tokio::select! {
+            r = self.inner.wait_for_grant(cluster_name, query_id, timeout) => r,
+            _ = &mut freed => Ok(true),
+        }
     }
 
     async fn heartbeat(&self, instance_id: &str) -> Result<u64> {
@@ -616,6 +660,32 @@ mod tests {
         qa.report_now().await;
         assert!(src.reports.lock().unwrap().is_empty());
         assert_eq!(res.held.lock().unwrap().as_slice(), ["q1"]);
+    }
+
+    #[tokio::test]
+    async fn a_quota_slot_freeing_up_wakes_a_waiter() {
+        let (qa, _src, _res) = setup(1, 0);
+        qa.try_acquire("c", 10, "inst", "q0").await.unwrap();
+        qa.report_now().await;
+        assert!(qa.try_acquire("c", 10, "inst", "q1").await.unwrap());
+        assert!(!qa.try_acquire("c", 10, "inst", "q2").await.unwrap());
+        let waiter = {
+            let qa = qa.clone();
+            tokio::spawn(async move {
+                let start = Instant::now();
+                let r = qa
+                    .wait_for_grant("c", "q2", Duration::from_secs(10))
+                    .await
+                    .unwrap();
+                (r, start.elapsed())
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        qa.release("c", "q1").await.unwrap();
+        let (woken, waited) = waiter.await.unwrap();
+        assert!(woken);
+        assert!(waited < Duration::from_secs(2));
+        assert!(qa.try_acquire("c", 10, "inst", "q2").await.unwrap());
     }
 
     #[tokio::test]

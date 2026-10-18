@@ -1,0 +1,185 @@
+-- Waiting for capacity (high-throughput plan, WS3).
+--
+-- A query denied capacity used to retry on a timer (100 ms doubling to 2 s): a freed slot
+-- could sit idle for up to 2 s, and every waiter retried whether or not anything freed.
+-- Now a denied acquire leaves a waiter row, and when leases are released (or the
+-- allocator frees quota), the freed slots go straight to the oldest live waiters, as
+-- leases created for them. Only those queries are notified
+-- (`queryflux_capacity_granted`, payload: their query ids), so a release wakes exactly
+-- as many waiters as it freed slots, first come first served across the fleet.
+--
+-- A lease created for a waiter is unclaimed until that query's next acquire claims it.
+-- If the query gave up first, the expiry sweep deletes the unclaimed lease after 10 s.
+
+ALTER TABLE cluster_capacity_leases
+    ADD COLUMN IF NOT EXISTS claimed BOOLEAN NOT NULL DEFAULT TRUE;
+
+-- The cluster's limit as last passed by an acquire, so a release can tell how many
+-- slots it freed.
+ALTER TABLE cluster_capacity_counters
+    ADD COLUMN IF NOT EXISTS max_running BIGINT;
+
+CREATE TABLE IF NOT EXISTS capacity_waiters (
+    query_id      TEXT        PRIMARY KEY,
+    cluster_name  TEXT        NOT NULL,
+    instance_id   TEXT        NOT NULL,
+    enqueued_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    -- Each retry refreshes it. A waiter that stops retrying (gave up, client gone) stops
+    -- counting after a few seconds and is deleted by the expiry sweep.
+    refreshed_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS capacity_waiters_cluster
+    ON capacity_waiters (cluster_name, enqueued_at);
+
+-- How long a waiter counts without retrying.
+CREATE OR REPLACE FUNCTION queryflux_capacity_waiter_ttl() RETURNS INTERVAL
+LANGUAGE sql IMMUTABLE AS $$ SELECT interval '6 seconds' $$;
+
+-- Give a cluster's free slots to its oldest live waiters. Takes the cluster's advisory
+-- lock, like every acquire, so it never grants past the limit.
+CREATE OR REPLACE FUNCTION queryflux_capacity_grant_waiters(p_cluster TEXT) RETURNS INTEGER
+LANGUAGE plpgsql AS $$
+DECLARE
+    v_free BIGINT;
+    v_ids TEXT[];
+    v_payload TEXT := '';
+    v_id TEXT;
+BEGIN
+    PERFORM pg_advisory_xact_lock(hashtext('capacity:' || p_cluster)::bigint);
+    SELECT max_running - leased - quota_committed INTO v_free
+    FROM cluster_capacity_counters WHERE cluster_name = p_cluster;
+    IF v_free IS NULL OR v_free <= 0 THEN
+        RETURN 0;
+    END IF;
+    WITH chosen AS (
+        DELETE FROM capacity_waiters
+        WHERE query_id IN (
+            SELECT query_id FROM capacity_waiters
+            WHERE cluster_name = p_cluster
+              AND refreshed_at > now() - queryflux_capacity_waiter_ttl()
+            ORDER BY enqueued_at, query_id
+            LIMIT v_free
+        )
+        RETURNING query_id, instance_id
+    ),
+    granted AS (
+        INSERT INTO cluster_capacity_leases (query_id, cluster_name, instance_id, claimed)
+        SELECT query_id, p_cluster, instance_id, FALSE FROM chosen
+        ON CONFLICT (query_id) DO NOTHING
+        RETURNING query_id
+    )
+    SELECT array_agg(query_id) INTO v_ids FROM granted;
+    IF v_ids IS NULL THEN
+        RETURN 0;
+    END IF;
+    -- Notification payloads are limited to 8000 bytes: send in pieces.
+    FOREACH v_id IN ARRAY v_ids LOOP
+        IF length(v_payload) + length(v_id) > 7000 THEN
+            PERFORM pg_notify('queryflux_capacity_granted', v_payload);
+            v_payload := '';
+        END IF;
+        v_payload := v_payload || CASE WHEN v_payload = '' THEN '' ELSE ' ' END || v_id;
+    END LOOP;
+    IF v_payload <> '' THEN
+        PERFORM pg_notify('queryflux_capacity_granted', v_payload);
+    END IF;
+    RETURN array_length(v_ids, 1);
+END
+$$;
+
+-- V21's delete trigger, now handing freed slots to waiters. Takes each cluster's advisory
+-- lock before its counter row, in name order: the same order as acquires and the
+-- allocator, so none of them deadlock with a release.
+CREATE OR REPLACE FUNCTION queryflux_capacity_leases_deleted() RETURNS trigger
+LANGUAGE plpgsql AS $$
+DECLARE
+    r RECORD;
+BEGIN
+    FOR r IN SELECT cluster_name, COUNT(*) AS n FROM old_leases
+             GROUP BY cluster_name ORDER BY cluster_name LOOP
+        PERFORM pg_advisory_xact_lock(hashtext('capacity:' || r.cluster_name)::bigint);
+        UPDATE cluster_capacity_counters
+        SET leased = GREATEST(leased - r.n, 0)
+        WHERE cluster_name = r.cluster_name;
+        PERFORM queryflux_capacity_grant_waiters(r.cluster_name);
+    END LOOP;
+    RETURN NULL;
+END
+$$;
+
+-- V22's acquire, first come first served, and claiming leases created for waiters.
+--
+-- - A lease this query already holds on the cluster (created for it while it waited)
+--   is claimed and granted.
+-- - Otherwise grant only if fewer live waiters were enqueued before this query than
+--   there are free slots. A query never seen before counts as enqueued now, so it
+--   doesn't jump ahead of queries already waiting.
+-- - Otherwise record or refresh this query as a waiter.
+CREATE OR REPLACE FUNCTION queryflux_capacity_try_acquire(
+    p_cluster TEXT, p_instance TEXT, p_query_id TEXT, p_max BIGINT
+) RETURNS BOOLEAN
+LANGUAGE plpgsql AS $$
+DECLARE
+    v_leased BIGINT;
+    v_quota BIGINT;
+    v_limit BIGINT;
+    v_free BIGINT;
+    v_since TIMESTAMPTZ;
+    v_older BIGINT;
+BEGIN
+    -- A lease created for this query on another cluster (it waited there, then routing
+    -- picked another member of the group): give it back first. This takes that
+    -- cluster's lock before this one's, out of name order; it is rare, and Postgres
+    -- breaks the deadlock it could cause by failing one call, which the caller retries.
+    DELETE FROM cluster_capacity_leases
+    WHERE query_id = p_query_id AND cluster_name <> p_cluster AND NOT claimed;
+
+    PERFORM pg_advisory_xact_lock(hashtext('capacity:' || p_cluster)::bigint);
+
+    UPDATE cluster_capacity_leases SET claimed = TRUE
+    WHERE query_id = p_query_id AND cluster_name = p_cluster;
+    IF FOUND THEN
+        DELETE FROM capacity_waiters WHERE query_id = p_query_id;
+        RETURN TRUE;
+    END IF;
+
+    SELECT leased, quota_committed, max_running INTO v_leased, v_quota, v_limit
+    FROM cluster_capacity_counters WHERE cluster_name = p_cluster;
+    IF v_limit IS DISTINCT FROM p_max THEN
+        INSERT INTO cluster_capacity_counters (cluster_name, max_running)
+        VALUES (p_cluster, p_max)
+        ON CONFLICT (cluster_name) DO UPDATE SET max_running = EXCLUDED.max_running;
+    END IF;
+    v_free := p_max - COALESCE(v_leased, 0) - COALESCE(v_quota, 0);
+
+    SELECT enqueued_at INTO v_since FROM capacity_waiters WHERE query_id = p_query_id;
+    v_since := COALESCE(v_since, now());
+
+    IF v_free > 0 THEN
+        SELECT COUNT(*) INTO v_older FROM capacity_waiters
+        WHERE cluster_name = p_cluster
+          AND query_id <> p_query_id
+          AND enqueued_at < v_since
+          AND refreshed_at > now() - queryflux_capacity_waiter_ttl();
+        IF v_older < v_free THEN
+            INSERT INTO cluster_capacity_leases (query_id, cluster_name, instance_id)
+            VALUES (p_query_id, p_cluster, p_instance)
+            ON CONFLICT (query_id) DO NOTHING;
+            IF FOUND THEN
+                DELETE FROM capacity_waiters WHERE query_id = p_query_id;
+                RETURN TRUE;
+            END IF;
+            RETURN FALSE;
+        END IF;
+    END IF;
+
+    INSERT INTO capacity_waiters (query_id, cluster_name, instance_id, enqueued_at, refreshed_at)
+    VALUES (p_query_id, p_cluster, p_instance, v_since, now())
+    ON CONFLICT (query_id) DO UPDATE
+        SET refreshed_at = now(),
+            cluster_name = EXCLUDED.cluster_name,
+            instance_id = EXCLUDED.instance_id;
+    RETURN FALSE;
+END
+$$;

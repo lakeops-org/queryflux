@@ -284,6 +284,17 @@ impl CapacityStore for BatchedReleaseStore {
         self.inner.release_many(leases).await
     }
 
+    async fn wait_for_grant(
+        &self,
+        cluster_name: &str,
+        query_id: &str,
+        timeout: Duration,
+    ) -> Result<bool> {
+        self.inner
+            .wait_for_grant(cluster_name, query_id, timeout)
+            .await
+    }
+
     async fn heartbeat(&self, instance_id: &str) -> Result<u64> {
         self.inner.heartbeat(instance_id).await
     }
