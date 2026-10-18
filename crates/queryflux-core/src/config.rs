@@ -2239,10 +2239,47 @@ pub struct TranslationConfig {
     /// falling back to dialect-only translation. Default 1500ms.
     #[serde(default = "default_schema_resolution_timeout_ms")]
     pub schema_resolution_timeout_ms: u64,
+    /// In-process caches for repeated queries (`translation.cache`).
+    #[serde(default)]
+    pub cache: SqlCacheConfig,
 }
 
 fn default_schema_resolution_timeout_ms() -> u64 {
     1500
+}
+
+/// Entry limits for the per-process caches that let a repeated query skip SQL work. Each
+/// is a bounded LRU; 0 disables that cache. Local to each process (a worker reads its own
+/// file), never sent by a control plane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SqlCacheConfig {
+    /// Translated SQL (sqlglot + fixup scripts).
+    #[serde(default = "default_sql_cache_entries")]
+    pub translations: usize,
+    /// Table extraction: access-control resources and the table references that
+    /// schema-aware translation looks up in the catalog.
+    #[serde(default = "default_sql_cache_entries")]
+    pub table_extraction: usize,
+    /// Query-history fingerprints (normalized digest and hashes).
+    #[serde(default = "default_sql_cache_entries")]
+    pub fingerprints: usize,
+}
+
+pub const DEFAULT_SQL_CACHE_ENTRIES: usize = 4096;
+
+fn default_sql_cache_entries() -> usize {
+    DEFAULT_SQL_CACHE_ENTRIES
+}
+
+impl Default for SqlCacheConfig {
+    fn default() -> Self {
+        Self {
+            translations: DEFAULT_SQL_CACHE_ENTRIES,
+            table_extraction: DEFAULT_SQL_CACHE_ENTRIES,
+            fingerprints: DEFAULT_SQL_CACHE_ENTRIES,
+        }
+    }
 }
 
 // --- Catalog provider ---

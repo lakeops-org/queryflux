@@ -1,6 +1,7 @@
 pub mod adbc;
 pub mod buffered_store;
 pub mod prometheus_store;
+mod sql_cache;
 
 use std::sync::Arc;
 

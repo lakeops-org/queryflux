@@ -94,7 +94,7 @@ queryflux-cli = { path = "crates/queryflux-cli" }
 
 # OpenDAL — storage abstraction for cache backend
 opendal = { version = "0.53", features = ["services-fs", "services-s3", "services-gcs"] }
-xxhash-rust = { version = "0.8", features = ["xxh64"] }
+xxhash-rust = { version = "0.8", features = ["xxh64", "xxh3"] }
 regex = "1"
 
 # Arrow ecosystem — version must match what duckdb uses (bundled duckdb crate pins arrow)

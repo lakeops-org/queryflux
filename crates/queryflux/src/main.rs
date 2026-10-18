@@ -356,8 +356,14 @@ async fn main() -> Result<()> {
             )
             .with_schema_resolution_timeout(std::time::Duration::from_millis(
                 config.translation.schema_resolution_timeout_ms,
-            )),
+            ))
+            .with_cache_config(&config.translation.cache),
     );
+    // Process-wide caches used outside the translation service: access-control table
+    // extraction and query-history fingerprints.
+    queryflux_translation::extraction_cache()
+        .set_capacity(config.translation.cache.table_extraction);
+    queryflux_fingerprint::fingerprint_cache().set_capacity(config.translation.cache.fingerprints);
 
     // --- Build catalog provider ---
     // Feeds `translation.resolve_schema_context` so sqlglot's optimizer can qualify

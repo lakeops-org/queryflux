@@ -104,6 +104,12 @@ Client SQL (source dialect)
 
 Access control runs **before** dialect translation so filter and mask expressions are authored once in the client's dialect and ride the existing translation pass. After a rewrite, QueryFlux re-classifies the statement and denies if a read somehow became a write.
 
+### Caching
+
+Step 2 is cached: a repeated query reuses the tables and columns extracted the first time, instead of parsing again. The key is the exact SQL text, the source dialect, and a hash of the schema context (catalog, database, tables, columns and types), so a statement never gets another statement's tables, and a catalog change gives a new key. Only the extraction is cached. Steps 3 and 4 run for every query: the provider is asked each time (unless its own `cacheTtlMs` decision cache answers), and the row-filter and mask rewrite is not cached. A query that cannot be parsed is not cached and is denied each time.
+
+The size is `translation.cache.tableExtraction` (default 4096 entries, 0 disables), shared with the table references used for schema-aware translation. See [Query translation](../architecture/query-translation#caching). Hits, misses and evictions are on `/metrics` as `queryflux_sql_cache_*_total{cache="access_extraction"}`.
+
 ---
 
 ## Identity vs session context

@@ -86,6 +86,7 @@ impl PrometheusMetrics {
     ) -> std::result::Result<Self, prometheus::Error> {
         let registry = Registry::new();
         crate::adbc::register(&registry)?;
+        crate::sql_cache::register(&registry)?;
         let translation_skipped_total = CounterVec::new(
             Opts::new(
                 "queryflux_translation_skipped_total",
@@ -495,6 +496,30 @@ impl MetricsStore for PrometheusMetrics {
 mod tests {
     use super::*;
     use queryflux_persistence::MetricsStore;
+
+    #[test]
+    fn sql_cache_counters_are_exported() {
+        use queryflux_core::bounded_cache::BoundedCache;
+        let cache: BoundedCache<u32, u32> = BoundedCache::new("metrics_test_cache", 1);
+        cache.get(&1);
+        cache.insert(1, 1);
+        cache.get(&1);
+        cache.insert(2, 2);
+        let metrics = PrometheusMetrics::new().expect("prometheus init");
+        let text = metrics.gather_text();
+        for name in ["hits", "misses", "evictions"] {
+            assert!(
+                text.contains(&format!(
+                    "queryflux_sql_cache_{name}_total{{cache=\"metrics_test_cache\"}} 1"
+                )),
+                "{name} missing in:\n{text}"
+            );
+        }
+        // A second scrape does not double-count.
+        cache.get(&2);
+        let text = metrics.gather_text();
+        assert!(text.contains("queryflux_sql_cache_hits_total{cache=\"metrics_test_cache\"} 2"));
+    }
 
     #[test]
     fn worker_fleet_metrics() {

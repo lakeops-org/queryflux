@@ -1,5 +1,6 @@
 pub mod access_config;
 pub mod access_model;
+pub mod bounded_cache;
 pub mod catalog;
 pub mod config;
 pub mod config_json;
