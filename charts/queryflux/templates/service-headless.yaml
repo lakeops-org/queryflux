@@ -7,7 +7,7 @@ left out, so a starting worker never finds itself.
 apiVersion: v1
 kind: Service
 metadata:
-  name: {{ include "queryflux.fullname" . }}-headless
+  name: {{ include "queryflux.fullname" . | trunc 54 | trimSuffix "-" }}-headless
   labels:
     {{- include "queryflux.labels" . | nindent 4 }}
 spec:
