@@ -2,7 +2,7 @@ apiVersion: v2
 name: queryflux
 description: Universal SQL multi-engine query router and proxy.
 type: application
-version: 0.2.0
+version: 0.3.0
 appVersion: "0.2.0"
 home: https://queryflux.dev/
 sources:

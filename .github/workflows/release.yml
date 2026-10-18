@@ -39,8 +39,8 @@ jobs:
           config-file: release-please/release-please-config.json
           manifest-file: release-please/.release-please-manifest.json
 
-  # Release Please uses tags like queryflux-v0.1.2; Docker uses v0.1.2 (server + Studio, built by
-  # queryflux-studio) and v0.1.2-slim (server-only, built here).
+  # Release Please uses tags like queryflux-v0.1.2; Docker uses v0.1.2 (and the v0.1.2-slim alias).
+  # The image is server-only; Studio is ghcr.io/lakeops-org/queryflux-studio, run alongside it.
   docker_tag_base:
     name: Docker image version base
     needs: [release_please]
@@ -107,7 +107,7 @@ jobs:
           git push origin HEAD:main
 
   build-slim:
-    name: Build server-only (${{ matrix.suffix }})
+    name: Build server image (${{ matrix.suffix }})
     needs: [release_please]
     strategy:
       fail-fast: false
@@ -161,7 +161,7 @@ jobs:
           retention-days: 1
 
   manifest-slim:
-    name: Manifest server-only image
+    name: Manifest server image
     needs: [release_please, build-slim, docker_tag_base]
     runs-on: ubuntu-latest
     steps:
@@ -188,7 +188,9 @@ jobs:
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
+            type=raw,value=latest
             type=raw,value=latest-slim
+            type=raw,value=${{ needs.docker_tag_base.outputs.base }},enable=${{ needs.release_please.outputs.releases_created == 'true' }}
             type=raw,value=${{ needs.docker_tag_base.outputs.base }}-slim,enable=${{ needs.release_please.outputs.releases_created == 'true' }}
 
       - name: Create and push manifest
@@ -198,28 +200,9 @@ jobs:
             $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
             $(printf '${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@sha256:%s ' *)
 
-  # The server + Studio image (:latest / :<version>) is built by lakeops-org/queryflux-studio
-  # on top of the slim image pushed above, so Rust is compiled once and the UI is never built here.
-  studio-image:
-    name: Request server + Studio image
-    needs: [release_please, manifest-slim, docker_tag_base]
-    runs-on: ubuntu-latest
-    steps:
-      - name: Dispatch queryflux-image to queryflux-studio
-        env:
-          GH_TOKEN: ${{ secrets.STUDIO_DISPATCH_TOKEN || secrets.RELEASE_PLEASE_TOKEN }}
-          STUDIO_REPO: ${{ vars.STUDIO_REPOSITORY || 'lakeops-org/queryflux-studio' }}
-          VERSION: ${{ needs.release_please.outputs.releases_created == 'true' && needs.docker_tag_base.outputs.base || '' }}
-        run: |
-          set -eu
-          jq -n --arg version "$VERSION" \
-            '{event_type: "queryflux-image", client_payload: {version: $version, latest: true}}' \
-            | gh api "repos/${STUDIO_REPO}/dispatches" --input -
-          echo "Requested server + Studio image from ${STUDIO_REPO} (version: ${VERSION:-latest})" >> "$GITHUB_STEP_SUMMARY"
-
   publish:
     name: GitHub Release summary
-    needs: [release_please, manifest-slim, studio-image, docker_tag_base]
+    needs: [release_please, manifest-slim, docker_tag_base]
     if: ${{ needs.release_please.outputs.releases_created == 'true' }}
     runs-on: ubuntu-latest
     steps:
@@ -229,5 +212,4 @@ jobs:
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "| Variant | Tags |" >> "$GITHUB_STEP_SUMMARY"
           echo "|---------|------|" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Server only | \`:${{ needs.docker_tag_base.outputs.base }}-slim\`, \`:latest-slim\` |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Server + Studio | \`:${{ needs.docker_tag_base.outputs.base }}\`, \`:latest\` (built by queryflux-studio) |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Server | \`:${{ needs.docker_tag_base.outputs.base }}\`, \`:latest\` (aliases \`:${{ needs.docker_tag_base.outputs.base }}-slim\`, \`:latest-slim\`) |" >> "$GITHUB_STEP_SUMMARY"

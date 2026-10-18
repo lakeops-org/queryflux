@@ -2,12 +2,12 @@
 #
 # Canonical QueryFlux Docker build. Edit this file only.
 #
-# Builds the server-only image (runtime-server): Rust server + Python venv + DuckDB + dbc CLI.
-# Published as ghcr.io/lakeops-org/queryflux:<version>-slim.
+# Builds the QueryFlux server image (runtime-server): Rust server + Python venv + DuckDB + dbc CLI.
+# Published as ghcr.io/lakeops-org/queryflux:<version> / :latest (also :<version>-slim / :latest-slim).
 #
-# The server + Studio image (ghcr.io/lakeops-org/queryflux:<version>) is built by
-# lakeops-org/queryflux-studio on top of this image; the release workflows send it a
-# `queryflux-image` repository_dispatch once the slim image is pushed.
+# Studio is not part of this image: run ghcr.io/lakeops-org/queryflux-studio next to it
+# (a separate compose service, or the Helm chart's `studio` sidecar) with ADMIN_API_URL
+# pointing at the admin port.
 #
 # Examples (repo root as context):
 #   docker build -f docker/queryflux/Dockerfile -t queryflux:local .
@@ -140,8 +140,10 @@ RUN curl -LsSf https://dbc.columnar.tech/install.sh \
 # =============================================================================
 FROM python:3.12.13-slim-trixie AS runtime-server
 
+# curl: container healthchecks (docker compose examples) hit /health with it.
 RUN apt-get update && apt-get install --no-install-recommends -y \
     ca-certificates \
+    curl \
     && rm -rf /var/lib/apt/lists/* \
     && useradd -m -u 1000 queryflux \
     && mkdir -p /app \

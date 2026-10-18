@@ -42,26 +42,26 @@ By contributing, you agree that your contributions will be licensed under the sa
 ## Releases and container images
  
 
-Maintainers cut **git tags** to publish **two** multi-arch images to **GitHub Container Registry** ([GHCR](https://docs.github.com/en/packages/working-with-a-github-packages-registry/working-with-the-container-registry)) and to create entries on the GitHub [**Releases**](https://github.com/lakeops-org/query-flux/releases) page.
+Releases publish **one** multi-arch QueryFlux server image to **GitHub Container Registry** ([GHCR](https://docs.github.com/en/packages/working-with-a-github-packages-registry/working-with-the-container-registry)) and create entries on the GitHub [**Releases**](https://github.com/lakeops-org/queryflux/releases) page.
 
-| Variant | Build | Meaning |
-|---------|-------|---------|
-| **Server only** | [`docker/queryflux/Dockerfile`](docker/queryflux/Dockerfile) (default target `runtime-server`) | QueryFlux API; no Studio UI |
-| **Server + Studio** | [`queryflux-studio` Dockerfile](https://github.com/lakeops-org/queryflux-studio/blob/main/Dockerfile), `--target bundled`, on top of the server-only image | API + bundled Studio |
+| Image | Build | Meaning |
+|-------|-------|---------|
+| **`ghcr.io/lakeops-org/queryflux`** | [`docker/queryflux/Dockerfile`](docker/queryflux/Dockerfile) (`runtime-server`) | QueryFlux server (frontends + Admin API); no UI |
+| **`ghcr.io/lakeops-org/queryflux-studio`** | [lakeops-org/queryflux-studio](https://github.com/lakeops-org/queryflux-studio) | Studio admin UI, built and released in its own repo |
 
-This repo builds only the server-only image. When its manifest is pushed, the release workflows send a `queryflux-image` [repository dispatch](https://docs.github.com/en/rest/repos/repos#create-a-repository-dispatch-event) to [lakeops-org/queryflux-studio](https://github.com/lakeops-org/queryflux-studio). Studio then builds the server + Studio image from `:<version>-slim` and pushes it to this package. Studio pushes to `main` also rebuild `:latest`, so a UI change never needs a Rust build. Two pieces of setup are needed: the dispatch uses `STUDIO_DISPATCH_TOKEN` (falling back to `RELEASE_PLEASE_TOKEN`), which must be able to dispatch to the Studio repo, and the Studio repo needs write access to this package (*Manage Actions access*).
+Studio is never built here. Run it next to the server with `ADMIN_API_URL` pointing at the admin port. The compose examples do this with a `queryflux-studio` service, and the Helm chart does it with a `studio` sidecar container (`studio.enabled`).
 
 Release images are built for **linux/amd64** and **linux/arm64** only.
 
-**GHCR image** (default `ghcr.io/<owner>/<repo>`):
+| Trigger | Workflow | Tags |
+|---------|----------|------|
+| Push to `main` | [release.yml](.github/workflows/release.yml) | `:latest` (alias `:latest-slim`) |
+| Release Please release | [release.yml](.github/workflows/release.yml) | `:vX.Y.Z` (alias `:vX.Y.Z-slim`), plus `:latest` |
+| Manual, any ref | [docker-publish-tag.yml](.github/workflows/docker-publish-tag.yml) | `:<image_tag>` (alias `:<image_tag>-slim`) |
 
-| Git tag | Workflow | GitHub | Server-only manifest tags | Unified manifest tags |
-|---------|----------|--------|---------------------------|------------------------|
-| `vX.Y.Z` (no `-rc`) | [docker-release-prod.yml](.github/workflows/docker-release-prod.yml) | Release + auto notes | `:<git-tag>`, `:latest-slim` | `:<git-tag>-full`, `:latest` |
+The `-slim` aliases exist because `:latest` / `:vX.Y.Z` used to be a server + Studio image and `-slim` the server-only one. They point at the same image now, so existing `-slim` pins keep working. Images up to `v0.4.0` still have the old meaning.
 
-**Per-arch tags** (for pinning): e.g. `:<git-tag>-amd64`, `:<git-tag>-arm64`, `:<git-tag>-full-amd64`, `:latest-amd64`, `:latest-slim-amd64`, etc. Multi-arch **manifest** tags are assembled with `docker buildx imagetools create`, similar to [lakekeeper/lakekeeper’s release workflow](https://github.com/lakekeeper/lakekeeper/blob/main/.github/workflows/release.yml).
-
-**How builds run:** **linux/amd64** images build on **`ubuntu-latest`**; **linux/arm64** on **`ubuntu-24.04-arm64`** (native ARM — no QEMU for compiles). Then manifest jobs merge the two digests. **Floating tags:** `:latest` = unified; `:latest-slim` = server-only. RC builds do **not** update `:latest` / `:latest-slim`. The server + Studio tags are pushed by the Studio repo's `bundled-image.yml`.
+**How builds run:** **linux/amd64** images build on **`ubuntu-latest`**; **linux/arm64** on **`ubuntu-24.04-arm`** (native ARM, so no QEMU for compiles). A manifest job then merges the two digests with `docker buildx imagetools create`, similar to [lakekeeper/lakekeeper’s release workflow](https://github.com/lakekeeper/lakekeeper/blob/main/.github/workflows/release.yml).
 
 Release workflows use **`GITHUB_TOKEN`** with **`packages: write`** (push + manifests), **`actions: write`** (BuildKit **GHA cache**, per-arch scopes `queryflux-slim-amd64` / `queryflux-slim-arm64`), and **`contents: write`** on the publish job. Optional **`GHCR_IMAGE_NAME`**. PRs verify Dockerfiles in [docker-verify.yml](.github/workflows/docker-verify.yml).
 
@@ -73,9 +73,7 @@ Local build then push to GHCR (replace `OWNER/REPO`):
 
 ```bash
 echo "$GITHUB_TOKEN" | docker login ghcr.io -u OWNER --password-stdin
-docker buildx build -f docker/queryflux/Dockerfile -t ghcr.io/OWNER/REPO:latest-slim --push .
-# server + Studio, from a queryflux-studio checkout:
-docker buildx build --target bundled --build-arg QUERYFLUX_IMAGE=ghcr.io/OWNER/REPO:latest-slim -t ghcr.io/OWNER/REPO:latest --push .
+docker buildx build --platform linux/amd64,linux/arm64 -f docker/queryflux/Dockerfile -t ghcr.io/OWNER/REPO:latest --push .
 ```
 
 Release notes come from Release Please ([`.github/workflows/release.yml`](.github/workflows/release.yml)): squash-merged `feat:` / `fix:` / `ui:` PR titles land in the next `CHANGELOG.md` and GitHub Release. `chore(deps):` and `docs:` do not.

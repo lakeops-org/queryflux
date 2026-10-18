@@ -1,8 +1,7 @@
 # Manually build and push multi-arch images from a chosen Git ref with explicit GHCR tags.
 # Does not run Release Please and does not move :latest / :latest-slim (those stay for automated releases).
 #
-# Example: image_tag = v0.1.2  →  ghcr.io/.../queryflux:v0.1.2-slim (server-only, built here); then
-# lakeops-org/queryflux-studio builds ...:v0.1.2 (server + Studio) on top of it.
+# Example: image_tag = v0.1.2  →  ghcr.io/.../queryflux:v0.1.2 (and the :v0.1.2-slim alias).
 
 name: Docker — publish ref with tag
 
@@ -10,7 +9,7 @@ on:
   workflow_dispatch:
     inputs:
       image_tag:
-        description: "Version tag, e.g. v0.1.2 (publishes :v0.1.2-slim here; queryflux-studio then publishes :v0.1.2)"
+        description: "Version tag, e.g. v0.1.2 (publishes :v0.1.2 and :v0.1.2-slim)"
         required: true
         type: string
       git_ref:
@@ -51,7 +50,7 @@ jobs:
           fi
 
   build-slim:
-    name: Build server-only (${{ matrix.suffix }})
+    name: Build server image (${{ matrix.suffix }})
     needs: [validate]
     strategy:
       fail-fast: false
@@ -107,7 +106,7 @@ jobs:
           retention-days: 1
 
   manifest-slim:
-    name: Manifest server-only image
+    name: Manifest server image
     needs: [validate, build-slim]
     runs-on: ubuntu-latest
     steps:
@@ -134,6 +133,7 @@ jobs:
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
+            type=raw,value=${{ inputs.image_tag }}
             type=raw,value=${{ inputs.image_tag }}-slim
 
       - name: Create and push manifest
@@ -143,26 +143,9 @@ jobs:
             $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
             $(printf '${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@sha256:%s ' *)
 
-  # The server + Studio image is built by lakeops-org/queryflux-studio on top of the slim image.
-  studio-image:
-    name: Request server + Studio image
-    needs: [manifest-slim]
-    runs-on: ubuntu-latest
-    steps:
-      - name: Dispatch queryflux-image to queryflux-studio
-        env:
-          GH_TOKEN: ${{ secrets.STUDIO_DISPATCH_TOKEN || secrets.RELEASE_PLEASE_TOKEN }}
-          STUDIO_REPO: ${{ vars.STUDIO_REPOSITORY || 'lakeops-org/queryflux-studio' }}
-          VERSION: ${{ inputs.image_tag }}
-        run: |
-          set -eu
-          jq -n --arg version "$VERSION" \
-            '{event_type: "queryflux-image", client_payload: {version: $version, latest: false}}' \
-            | gh api "repos/${STUDIO_REPO}/dispatches" --input -
-
   summary:
     name: Summary
-    needs: [manifest-slim, studio-image]
+    needs: [manifest-slim]
     runs-on: ubuntu-latest
     steps:
       - name: Job summary
@@ -171,5 +154,4 @@ jobs:
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "| Variant | Tag |" >> "$GITHUB_STEP_SUMMARY"
           echo "|---------|-----|" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Server only | \`:${{ inputs.image_tag }}-slim\` |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Server + Studio | \`:${{ inputs.image_tag }}\` (built by queryflux-studio) |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Server | \`:${{ inputs.image_tag }}\`, \`:${{ inputs.image_tag }}-slim\` |" >> "$GITHUB_STEP_SUMMARY"
