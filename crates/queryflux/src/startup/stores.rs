@@ -76,13 +76,17 @@ pub(crate) async fn build_stores(config: &ProxyConfig) -> Result<Stores> {
             ));
             let metrics = Arc::new(MultiMetricsStore::new(vec![
                 prometheus.clone() as Arc<dyn MetricsStore>,
-                buffered.clone() as Arc<dyn MetricsStore>,
+                buffered as Arc<dyn MetricsStore>,
             ]));
             pg_store = Some(pg.clone());
             (
-                pg as Arc<dyn queryflux_persistence::Persistence>,
+                pg.clone() as Arc<dyn queryflux_persistence::Persistence>,
                 metrics as Arc<dyn MetricsStore>,
-                buffered as Arc<dyn MetricsStore>,
+                // Worker history goes straight to Postgres, not through the buffer: the
+                // ingest endpoint acknowledges a batch only once its records are stored,
+                // and the buffer accepts records it may later drop (full channel, failed
+                // write). Retried batches stay idempotent (ON CONFLICT on proxy_query_id).
+                pg as Arc<dyn MetricsStore>,
             )
         }
         queryflux_core::config::PersistenceConfig::Redis { url } => {
