@@ -133,19 +133,39 @@ fn validate_tags(iter: impl Iterator<Item = (String, Option<String>)>) -> (Query
 // Serde helpers for config (HashMap<String, Option<String>> in YAML)
 // ---------------------------------------------------------------------------
 
-/// Deserialize a flat `HashMap<String, String>` (from YAML config) into `QueryTags`.
-/// Config uses plain string values; there is no `null` in YAML for this use case.
+/// Deserialize config tags into `QueryTags`. Values are strings (YAML config), or `null`
+/// for a key-only tag: groups stored through the admin API can have those, and a worker
+/// config snapshot carries them as `null`, so rejecting `null` here would make the whole
+/// snapshot unreadable on the worker.
 pub fn deserialize_config_tags<'de, D>(deserializer: D) -> Result<QueryTags, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
-    let map = HashMap::<String, String>::deserialize(deserializer)?;
-    Ok(map.into_iter().map(|(k, v)| (k, Some(v))).collect())
+    HashMap::<String, Option<String>>::deserialize(deserializer)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(serde::Deserialize)]
+    struct Holder {
+        #[serde(default, deserialize_with = "deserialize_config_tags")]
+        tags: QueryTags,
+    }
+
+    #[test]
+    fn config_tags_accept_strings_and_key_only_entries() {
+        // YAML config: plain strings.
+        let h: Holder =
+            serde_yaml::from_str("tags:\n  team: eng\n  cost_center: \"701\"\n").unwrap();
+        assert_eq!(h.tags.get("team"), Some(&Some("eng".to_string())));
+        assert_eq!(h.tags.get("cost_center"), Some(&Some("701".to_string())));
+        // JSON from the admin API or a worker snapshot: `null` is a key-only tag.
+        let h: Holder = serde_json::from_str(r#"{"tags":{"team":"eng","batch":null}}"#).unwrap();
+        assert_eq!(h.tags.get("team"), Some(&Some("eng".to_string())));
+        assert_eq!(h.tags.get("batch"), Some(&None));
+    }
 
     #[test]
     fn parse_kv_style() {

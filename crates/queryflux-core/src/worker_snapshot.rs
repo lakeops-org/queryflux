@@ -341,6 +341,26 @@ mod tests {
         assert_eq!(back.revision, s.revision);
     }
 
+    /// Groups stored through the admin API can have key-only default tags (`null` value).
+    /// The snapshot must carry them to workers intact, or the worker cannot parse it.
+    #[test]
+    fn key_only_default_tags_round_trip() {
+        let mut s = snapshot(CredentialMode::Embedded);
+        s.groups.get_mut("analytics").unwrap().default_tags = [
+            ("team".to_string(), Some("analytics".to_string())),
+            ("batch".to_string(), None),
+        ]
+        .into();
+        let s = s.seal();
+        let json = serde_json::to_string(&s).unwrap();
+        let back: WorkerSnapshotV1 =
+            serde_json::from_str(&json).expect("a key-only default tag must not break parsing");
+        assert!(back.is_sealed());
+        let tags = &back.groups["analytics"].default_tags;
+        assert_eq!(tags.get("team"), Some(&Some("analytics".to_string())));
+        assert_eq!(tags.get("batch"), Some(&None));
+    }
+
     /// Golden check on the wire field names: renaming one breaks every deployed worker.
     #[test]
     fn wire_field_names_are_stable() {
