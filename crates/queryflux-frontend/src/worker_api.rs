@@ -65,8 +65,9 @@ pub struct WorkerApi {
 /// Largest query-record batch accepted. Workers send at most a few hundred records.
 const MAX_RECORD_BATCH_BYTES: usize = 32 * 1024 * 1024;
 /// Query-record batches written at once. Each holds one connection of the admin pool
-/// for one transaction; more would only queue on the pool.
-pub const MAX_CONCURRENT_RECORD_BATCHES: usize = 4;
+/// (2 by default) for one short transaction; more would only queue on the pool and delay
+/// the admin API sharing it.
+pub const MAX_CONCURRENT_RECORD_BATCHES: usize = 2;
 /// How long a batch may wait for a write slot before it is refused with 503.
 pub const RECORD_BATCH_QUEUE_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 /// `Retry-After` (seconds) on a refused or failed query-record batch.
