@@ -19,10 +19,12 @@ use tracing::info;
 
 mod config_source;
 mod guards;
+mod history_uplink;
 mod live_config;
 mod registered_engines;
 mod remote_coordination;
 mod startup;
+mod worker_labels;
 
 use crate::config_source::{
     run_reload_loop, AdminStoreConfigSource, ConfigSource, LiveHandles, PostgresConfigSource,
@@ -149,6 +151,7 @@ async fn main() -> Result<()> {
         coordination,
         snapshot_store,
         worker_registry,
+        history_store,
     } = startup::stores::build_stores(&config).await?;
     // Coordination the control plane serves to workers: its own, only when it enforces
     // capacity with it (otherwise dead workers' leases would never expire).
@@ -550,6 +553,28 @@ async fn main() -> Result<()> {
     let worker_sync_state = Arc::new(std::sync::Mutex::new(
         crate::config_source::WorkerSyncState::default(),
     ));
+    // A worker keeps no durable history: its records go upstream, to the control plane
+    // or the endpoint its snapshot names.
+    let history_uplink = match (&config.queryflux.control_plane, is_worker) {
+        (Some(cp), true) => {
+            let history = config.queryflux.history.clone().unwrap_or_default();
+            Some(history_uplink::RemoteMetricsStore::new(
+                cp,
+                startup::tasks::worker_name(&config),
+                history.endpoint,
+                history.spool_max_records,
+                worker_sync_state.clone(),
+            ))
+        }
+        _ => None,
+    };
+    let metrics: Arc<dyn queryflux_metrics::MetricsStore> = match &history_uplink {
+        Some(uplink) => Arc::new(queryflux_metrics::MultiMetricsStore::new(vec![
+            metrics,
+            uplink.clone() as Arc<dyn queryflux_metrics::MetricsStore>,
+        ])),
+        None => metrics,
+    };
 
     // Replica identity for capacity leases and queue claims. Must be unique per
     // *process incarnation*: PIDs collide across containers (the main process is
@@ -762,7 +787,8 @@ async fn main() -> Result<()> {
 
     let admin_store_for_reload = admin_store.clone();
     let cors_origins = config.queryflux.admin_api.cors_allowed_origins.clone();
-    if cors_origins.is_empty() {
+    // A worker serves only the ops listener, which has no admin API to protect.
+    if cors_origins.is_empty() && !is_worker {
         tracing::warn!(
             "Admin API CORS allows any origin (corsAllowedOrigins is empty). \
              Set queryflux.adminApi.corsAllowedOrigins to restrict cross-origin access in production."
@@ -777,6 +803,7 @@ async fn main() -> Result<()> {
         worker_registry,
         config_changed_rx,
         served_coordination.filter(|_| distributed),
+        history_store,
     )?;
     let admin = AdminFrontend::new(
         prometheus.clone(),
@@ -905,10 +932,14 @@ async fn main() -> Result<()> {
             cache: adapter_reload_cache.clone(),
             metrics: app_state.metrics.clone(),
             changed: Some(config_changed_tx),
+            translation: is_worker.then(|| app_state.translation.clone()),
         };
         tokio::spawn(run_reload_loop(source, handles, shutdown_rx.clone()));
         if is_worker {
             startup::tasks::spawn_worker_heartbeat(&config, &worker_sync_state, &shutdown_rx);
+            if let Some(uplink) = &history_uplink {
+                uplink.spawn_flusher(shutdown_rx.clone());
+            }
         }
     }
 
@@ -935,6 +966,26 @@ async fn main() -> Result<()> {
                 })
             },
         );
+        // With peer bootstrap on, serve the active config to workers starting while the
+        // control plane is unreachable.
+        let ops = match config
+            .queryflux
+            .control_plane
+            .as_ref()
+            .filter(|cp| cp.peer_bootstrap.is_some())
+        {
+            Some(cp) => ops.with_peer_config(queryflux_frontend::ops::PeerConfigEndpoint {
+                shared_secret: cp.auth.bearer().to_string(),
+                config: {
+                    let state = worker_sync_state.clone();
+                    Arc::new(move || {
+                        let st = state.lock().unwrap_or_else(|e| e.into_inner());
+                        st.peer_config().and_then(|c| serde_json::to_value(c).ok())
+                    })
+                },
+            }),
+            None => ops,
+        };
         frontend_tasks.spawn("Ops", {
             let rx = shutdown_rx.clone();
             async move { ops.listen(rx).await }
@@ -961,6 +1012,9 @@ async fn main() -> Result<()> {
         config.queryflux.shutdown_drain_timeout_secs(),
     )
     .await;
+    if let Some(uplink) = &history_uplink {
+        uplink.final_flush(std::time::Duration::from_secs(10)).await;
+    }
 
     tracing::info!("QueryFlux shutdown complete");
     Ok(())
@@ -1746,6 +1800,7 @@ mod tests {
                 guard_actions: Vec::new(),
                 was_guard_blocked: false,
                 cache_hit: false,
+                worker: None,
             }
         }
 

@@ -77,8 +77,9 @@ const DEFAULT_SCHEMA_RESOLUTION_TIMEOUT: Duration = Duration::from_millis(1500);
 
 pub struct TranslationService {
     enabled: bool,
-    mode: TranslationMode,
-    error_on_unsupported: bool,
+    /// `mode == Strict`. Atomic so a worker can apply the policy its control plane sends.
+    strict_mode: std::sync::atomic::AtomicBool,
+    error_on_unsupported: std::sync::atomic::AtomicBool,
     python_scripts: Vec<String>,
     schema_resolution_timeout: Duration,
 }
@@ -98,8 +99,8 @@ impl TranslationService {
         }
         Ok(Self {
             enabled: true,
-            mode: TranslationMode::BestEffort,
-            error_on_unsupported: false,
+            strict_mode: std::sync::atomic::AtomicBool::new(false),
+            error_on_unsupported: std::sync::atomic::AtomicBool::new(false),
             python_scripts,
             schema_resolution_timeout: DEFAULT_SCHEMA_RESOLUTION_TIMEOUT,
         })
@@ -109,8 +110,8 @@ impl TranslationService {
     pub fn disabled() -> Self {
         Self {
             enabled: false,
-            mode: TranslationMode::BestEffort,
-            error_on_unsupported: false,
+            strict_mode: std::sync::atomic::AtomicBool::new(false),
+            error_on_unsupported: std::sync::atomic::AtomicBool::new(false),
             python_scripts: Vec::new(),
             schema_resolution_timeout: DEFAULT_SCHEMA_RESOLUTION_TIMEOUT,
         }
@@ -124,10 +125,29 @@ impl TranslationService {
         }
     }
 
-    pub fn with_policy(mut self, mode: TranslationMode, error_on_unsupported: bool) -> Self {
-        self.mode = mode;
-        self.error_on_unsupported = error_on_unsupported;
+    pub fn with_policy(self, mode: TranslationMode, error_on_unsupported: bool) -> Self {
+        self.set_policy(mode, error_on_unsupported);
         self
+    }
+
+    /// The current failure policy: `(mode, error_on_unsupported)`.
+    pub fn policy(&self) -> (TranslationMode, bool) {
+        use std::sync::atomic::Ordering;
+        let mode = if self.strict_mode.load(Ordering::Relaxed) {
+            TranslationMode::Strict
+        } else {
+            TranslationMode::BestEffort
+        };
+        (mode, self.error_on_unsupported.load(Ordering::Relaxed))
+    }
+
+    /// Replace the failure policy at runtime (a worker applying its control plane's).
+    pub fn set_policy(&self, mode: TranslationMode, error_on_unsupported: bool) {
+        use std::sync::atomic::Ordering;
+        self.strict_mode
+            .store(mode == TranslationMode::Strict, Ordering::Relaxed);
+        self.error_on_unsupported
+            .store(error_on_unsupported, Ordering::Relaxed);
     }
 
     /// Global scripts can change SQL semantics after result-cache eligibility checks.
@@ -178,7 +198,10 @@ impl TranslationService {
                 outcome: TranslationOutcome::not_needed(),
             };
         }
-        let strict = self.mode == TranslationMode::Strict || self.error_on_unsupported;
+        let strict = self.strict_mode.load(std::sync::atomic::Ordering::Relaxed)
+            || self
+                .error_on_unsupported
+                .load(std::sync::atomic::Ordering::Relaxed);
         let result = if self.enabled {
             let translator = SqlglotTranslator::new(src.clone(), tgt.clone(), combined)
                 .with_error_on_unsupported(strict);

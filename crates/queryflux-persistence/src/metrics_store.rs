@@ -27,7 +27,11 @@ pub struct GuardAction {
 
 /// A record of one completed (or failed/cancelled) query execution.
 /// Written to the metrics store at the end of every query, regardless of outcome.
-#[derive(Debug, Clone)]
+///
+/// Its JSON form (camelCase) is also what workers send their control plane, inside a
+/// [`QueryRecordBatchV1`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct QueryRecord {
     pub proxy_query_id: String,
     /// The query ID assigned by the backend engine (e.g. Trino's `20240319_123456_00001_xxxxx`).
@@ -54,6 +58,7 @@ pub struct QueryRecord {
     pub catalog: Option<String>,
     pub database: Option<String>,
     /// First 500 chars of the original SQL.
+    #[serde(default)]
     pub sql_preview: String,
     pub status: QueryStatus,
     /// Full routing trace serialized as JSON. Stored in the `routing_trace` JSONB column.
@@ -67,6 +72,7 @@ pub struct QueryRecord {
     pub engine_stats: Option<QueryEngineStats>,
     /// Effective query tags: group default_tags merged with session tags.
     /// Session tags win on key conflicts. Empty map when no tags were set.
+    #[serde(default)]
     pub query_tags: QueryTags,
     /// xxHash-64 of the normalized original SQL (no literal replacement).
     /// Stored as i64 in Postgres (reinterpret the bit pattern; use to_hex() in queries).
@@ -87,11 +93,31 @@ pub struct QueryRecord {
     pub query_intent: Option<String>,
     // --- Guard fields ---
     /// All guards that evaluated this query and their verdicts.
+    #[serde(default)]
     pub guard_actions: Vec<GuardAction>,
     /// True if any guard returned Deny.
+    #[serde(default)]
     pub was_guard_blocked: bool,
     /// True when the result was served from the query result cache.
+    #[serde(default)]
     pub cache_hit: bool,
+    /// The worker that ran the query (#255); `None` when this process ran it.
+    #[serde(default)]
+    pub worker: Option<String>,
+}
+
+/// `schemaVersion` of [`QueryRecordBatchV1`].
+pub const QUERY_RECORDS_SCHEMA_VERSION: u32 = 1;
+
+/// Query records a worker sends upstream (`POST /worker/query-records`). Delivery is
+/// at least once; ingestion de-duplicates on `proxyQueryId`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QueryRecordBatchV1 {
+    pub schema_version: u32,
+    /// The sending worker's name; stamped on every record on ingest.
+    pub worker: String,
+    pub records: Vec<QueryRecord>,
 }
 
 /// A periodic snapshot of one cluster's live utilization.
@@ -150,6 +176,14 @@ pub trait MetricsStore: Send + Sync {
     /// `stage` is a low-cardinality label such as `reload`, `auth_rebuild`,
     /// `authz_rebuild`, or `guard_reload`.
     fn on_config_reload_failure(&self, _stage: &str) {}
+
+    /// Called when a query had a free local slot but the shared limit (distributed mode or
+    /// a worker's control plane) was full, so it waits in the queue.
+    fn on_capacity_lease_denied(&self, _cluster_group: &str, _cluster_name: &str) {}
+
+    /// Called when a worker starts or stops serving a config its control plane has not
+    /// confirmed (one copied from a peer at startup).
+    fn on_worker_config_stale(&self, _stale: bool) {}
 
     /// Called when a queue admission is rejected because `maxQueuedQueries` was reached.
     fn on_queue_full(&self, _cluster_group: &str) {}

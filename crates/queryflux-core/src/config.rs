@@ -196,6 +196,14 @@ impl ProxyConfig {
                     ("catalogProvider", is_set(&self.catalog_provider)),
                     ("guardrails", self.guardrails.is_some()),
                     ("accessControl", self.access_control.is_some()),
+                    (
+                        "translation.mode",
+                        self.translation.mode != TranslationMode::default(),
+                    ),
+                    (
+                        "translation.errorOnUnsupported",
+                        self.translation.error_on_unsupported,
+                    ),
                 ];
                 for (key, set) in owned_by_control_plane {
                     if set {
@@ -216,6 +224,7 @@ impl ProxyConfig {
                     ("controlPlane", q.control_plane.is_some()),
                     ("workerName", q.worker_name.is_some()),
                     ("workerLabels", !q.worker_labels.is_empty()),
+                    ("workerLabelsFile", q.worker_labels_file.is_some()),
                     ("history", q.history.is_some()),
                     ("coordination", q.coordination.is_some()),
                 ];
@@ -855,10 +864,16 @@ pub struct QueryFluxConfig {
     /// Worker only: name reported to the control plane (default: the hostname).
     #[serde(default)]
     pub worker_name: Option<String>,
-    /// Worker only: labels stamped on this worker's queries as tags (they win over a
-    /// client-set tag with the same key) and reported to the control plane.
+    /// Worker only: labels reported to the control plane, shown in Studio and searchable
+    /// there (e.g. team, app, region).
     #[serde(default)]
     pub worker_labels: std::collections::BTreeMap<String, String>,
+    /// Worker only: a file of `key="value"` lines merged over `workerLabels`, re-read on
+    /// every heartbeat. Point it at a Kubernetes downward API volume of `metadata.labels`
+    /// (e.g. `/etc/podinfo/labels`), so every pod reports its own labels while sharing one
+    /// worker config. Kubernetes bookkeeping labels such as `pod-template-hash` are skipped.
+    #[serde(default)]
+    pub worker_labels_file: Option<String>,
     /// Worker only: where query records go.
     #[serde(default)]
     pub history: Option<WorkerHistoryConfig>,
@@ -897,6 +912,33 @@ pub struct ControlPlaneClientConfig {
     /// Allow `http://` (development only: snapshots can carry engine credentials).
     #[serde(default)]
     pub allow_insecure_http: bool,
+    /// Copy the active config from a running worker when the control plane cannot be
+    /// reached at startup. Off unless set.
+    #[serde(default)]
+    pub peer_bootstrap: Option<PeerBootstrapConfig>,
+}
+
+/// Where a worker finds peers to copy its config from, and how old a copy may be.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PeerBootstrapConfig {
+    /// `host:port` of the workers' ops listeners, usually a headless Service that resolves
+    /// to every worker pod (e.g. `queryflux-workers-headless:9000`).
+    pub address: String,
+    /// How long to try the control plane at startup before asking peers.
+    #[serde(default = "default_peer_after_secs")]
+    pub after_secs: u64,
+    /// Refuse a copy whose config the control plane last confirmed longer ago than this.
+    #[serde(default = "default_peer_max_age_secs")]
+    pub max_age_secs: u64,
+}
+
+fn default_peer_after_secs() -> u64 {
+    10
+}
+
+fn default_peer_max_age_secs() -> u64 {
+    24 * 60 * 60
 }
 
 fn default_poll_timeout_secs() -> u64 {
@@ -983,6 +1025,9 @@ pub struct WorkerApiConfig {
     /// The secret workers present (`controlPlane.auth.sharedSecret` on the worker).
     #[serde(default)]
     pub shared_secret: Option<String>,
+    /// Sent to workers in the snapshot: where they send query history and its redaction.
+    #[serde(default)]
+    pub history: Option<crate::worker_snapshot::HistoryPolicy>,
 }
 
 impl QueryFluxConfig {
@@ -3978,6 +4023,21 @@ queryflux:
             c.queryflux.coordination.as_ref().unwrap().on_unavailable,
             OnCoordinationUnavailable::FailClosed
         );
+        assert_eq!(c.validate_role(), Ok(()));
+    }
+
+    #[test]
+    fn a_worker_takes_its_translation_policy_from_the_control_plane() {
+        let c = parse(&format!("{WORKER}translation:\n  mode: strict\n"));
+        let issues = c.validate_role().unwrap_err();
+        assert!(
+            issues.iter().any(|i| i.contains("translation.mode")),
+            "{issues:?}"
+        );
+        // Local translation settings that are not policy stay allowed.
+        let c = parse(&format!(
+            "{WORKER}translation:\n  schemaResolutionTimeoutMs: 500\n"
+        ));
         assert_eq!(c.validate_role(), Ok(()));
     }
 

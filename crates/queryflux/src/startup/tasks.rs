@@ -710,6 +710,29 @@ pub(crate) fn worker_name(config: &ProxyConfig) -> String {
 
 /// Register with the control plane, then report sync state every heartbeat interval.
 /// Best effort: failures are logged and retried on the next tick.
+/// Enabled query frontends as `name:port`, for the worker's heartbeat.
+fn enabled_frontends(f: &queryflux_core::config::FrontendsConfig) -> Vec<String> {
+    let mut out = Vec::new();
+    if f.trino_http.enabled {
+        out.push(format!("trinoHttp:{}", f.trino_http.port));
+    }
+    for (name, cfg) in [
+        ("postgresWire", &f.postgres_wire),
+        ("mysqlWire", &f.mysql_wire),
+        ("clickhouseHttp", &f.clickhouse_http),
+        ("flightSql", &f.flight_sql),
+        ("mcp", &f.mcp),
+    ] {
+        if let Some(c) = cfg.as_ref().filter(|c| c.enabled) {
+            out.push(format!("{name}:{}", c.port));
+        }
+    }
+    if let Some(c) = f.snowflake_http.as_ref().filter(|c| c.enabled) {
+        out.push(format!("snowflakeHttp:{}", c.port));
+    }
+    out
+}
+
 pub(crate) fn spawn_worker_heartbeat(
     config: &ProxyConfig,
     sync_state: &Arc<std::sync::Mutex<crate::config_source::WorkerSyncState>>,
@@ -720,11 +743,22 @@ pub(crate) fn spawn_worker_heartbeat(
     };
     let base = cp.url.trim_end_matches('/').to_string();
     let name = worker_name(config);
-    let labels = config.queryflux.worker_labels.clone();
+    let config_labels = config.queryflux.worker_labels.clone();
+    let labels_file = config.queryflux.worker_labels_file.clone();
     let coordination_mode = match config.queryflux.coordination.as_ref().map(|c| c.mode) {
         Some(queryflux_core::config::CoordinationMode::Local) => "local",
         _ => "controlPlane",
     };
+    let on_unavailable = match config
+        .queryflux
+        .coordination
+        .as_ref()
+        .map(|c| c.on_unavailable)
+    {
+        Some(queryflux_core::config::OnCoordinationUnavailable::LocalLimits) => "localLimits",
+        _ => "failClosed",
+    };
+    let frontends = enabled_frontends(&config.queryflux.frontends);
     let sync_state = sync_state.clone();
     let mut shutdown_rx = shutdown_rx.clone();
     tokio::spawn(async move {
@@ -744,12 +778,40 @@ pub(crate) fn spawn_worker_heartbeat(
             let report = queryflux_persistence::WorkerRecord {
                 name: name.clone(),
                 version: env!("CARGO_PKG_VERSION").to_string(),
-                labels: labels.clone(),
+                labels: crate::worker_labels::current(&config_labels, labels_file.as_deref()),
                 coordination_mode: coordination_mode.to_string(),
                 downloaded_revision: st.downloaded_revision,
                 active_revision: st.active_revision,
                 last_error: st.last_error,
                 last_seen: chrono::Utc::now(),
+                registered_at: None,
+                status: queryflux_persistence::WorkerStatus {
+                    config_source: st.config_source.map(|s| match s {
+                        crate::config_source::ConfigOrigin::ControlPlane => "controlPlane".into(),
+                        crate::config_source::ConfigOrigin::Peer => "peer".into(),
+                    }),
+                    stale: st.stale,
+                    confirmed_at: st.confirmed_at,
+                    activated_at: st.activated_at,
+                    last_successful_sync: st.last_successful_sync,
+                    consecutive_failures: st.consecutive_failures,
+                    on_unavailable: Some(on_unavailable.to_string()),
+                    heartbeat_interval_secs: Some(cp.heartbeat_interval_secs),
+                    history: Some(queryflux_persistence::WorkerHistoryStatus {
+                        redaction: st.history.as_ref().map(|h| {
+                            serde_json::to_value(h.redaction)
+                                .ok()
+                                .and_then(|v| v.as_str().map(str::to_string))
+                                .unwrap_or_default()
+                        }),
+                        endpoint: st.history_uplink.endpoint.clone(),
+                        queued: st.history_uplink.queued as u64,
+                        sent: st.history_uplink.sent,
+                        dropped: st.history_uplink.dropped,
+                        last_error: st.history_uplink.last_error.clone(),
+                    }),
+                    frontends: frontends.clone(),
+                },
             };
             let path = if registered { "heartbeat" } else { "register" };
             match client

@@ -282,7 +282,7 @@ impl QueryHistoryStore for PostgresStore {
                       qr.physical_input_bytes, qr.peak_memory_bytes, qr.spilled_bytes, qr.total_splits,
                       qr.query_tags, qr.query_hash, qr.query_parameterized_hash, qr.translated_query_hash,
                       qr.agent_id, qr.conversation_id, qr.step_index, qr.tool_call_id, qr.query_intent,
-                      qr.guard_actions, qr.was_guard_blocked, qr.cache_hit
+                      qr.guard_actions, qr.was_guard_blocked, qr.cache_hit, qr.worker
                FROM query_records qr
                LEFT JOIN cluster_group_configs cg ON cg.id = qr.cluster_group_id
                LEFT JOIN cluster_configs cc ON cc.id = qr.cluster_id
@@ -290,6 +290,7 @@ impl QueryHistoryStore for PostgresStore {
                  AND ($2::text IS NULL OR qr.status = $2)
                  AND ($3::text IS NULL OR COALESCE(cg.name, qr.cluster_group) = $3)
                  AND ($4::text IS NULL OR qr.engine_type = $4)
+                 AND ($7::text IS NULL OR qr.worker = $7)
                ORDER BY qr.created_at DESC
                LIMIT $5 OFFSET $6"#,
         )
@@ -299,6 +300,7 @@ impl QueryHistoryStore for PostgresStore {
         .bind(&filters.engine)
         .bind(filters.limit)
         .bind(filters.offset)
+        .bind(&filters.worker)
         .fetch_all(&self.admin_pool)
         .await
         .map_err(|e| QueryFluxError::Persistence(format!("list_queries: {e}")))
@@ -477,7 +479,7 @@ impl QueryHistoryStore for PostgresStore {
                       qr.physical_input_bytes, qr.peak_memory_bytes, qr.spilled_bytes, qr.total_splits,
                       qr.query_tags, qr.query_hash, qr.query_parameterized_hash, qr.translated_query_hash,
                       qr.agent_id, qr.conversation_id, qr.step_index, qr.tool_call_id, qr.query_intent,
-                      qr.guard_actions, qr.was_guard_blocked, qr.cache_hit
+                      qr.guard_actions, qr.was_guard_blocked, qr.cache_hit, qr.worker
                FROM query_records qr
                LEFT JOIN cluster_group_configs cg ON cg.id = qr.cluster_group_id
                LEFT JOIN cluster_configs cc ON cc.id = qr.cluster_id
@@ -534,8 +536,8 @@ impl crate::WorkerRegistryStore for PostgresStore {
         sqlx::query(
             r#"INSERT INTO worker_registry
                    (name, version, labels, coordination_mode, downloaded_revision,
-                    active_revision, last_error, last_seen)
-               VALUES ($1, $2, $3, $4, $5, $6, $7, now())
+                    active_revision, last_error, status, last_seen)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, now())
                ON CONFLICT (name) DO UPDATE SET
                    version             = EXCLUDED.version,
                    labels              = EXCLUDED.labels,
@@ -543,6 +545,7 @@ impl crate::WorkerRegistryStore for PostgresStore {
                    downloaded_revision = EXCLUDED.downloaded_revision,
                    active_revision     = EXCLUDED.active_revision,
                    last_error          = EXCLUDED.last_error,
+                   status              = EXCLUDED.status,
                    last_seen           = now()"#,
         )
         .bind(&w.name)
@@ -552,6 +555,7 @@ impl crate::WorkerRegistryStore for PostgresStore {
         .bind(&w.downloaded_revision)
         .bind(&w.active_revision)
         .bind(&w.last_error)
+        .bind(sqlx::types::Json(&w.status))
         .execute(&self.admin_pool)
         .await
         .map_err(|e| QueryFluxError::Persistence(format!("upsert_worker: {e}")))?;
@@ -571,10 +575,12 @@ impl crate::WorkerRegistryStore for PostgresStore {
             Option<String>,
             Option<String>,
             chrono::DateTime<chrono::Utc>,
+            chrono::DateTime<chrono::Utc>,
+            sqlx::types::Json<serde_json::Value>,
         );
         let rows: Vec<Row> = sqlx::query_as(
             r#"SELECT name, version, labels, coordination_mode, downloaded_revision,
-                      active_revision, last_error, last_seen
+                      active_revision, last_error, last_seen, registered_at, status
                  FROM worker_registry
                 WHERE last_seen >= $1
                 ORDER BY name"#,
@@ -594,6 +600,9 @@ impl crate::WorkerRegistryStore for PostgresStore {
                 active_revision: r.5,
                 last_error: r.6,
                 last_seen: r.7,
+                registered_at: Some(r.8),
+                // A row written by a different version may not match; show what we can.
+                status: serde_json::from_value(r.9 .0).unwrap_or_default(),
             })
             .collect())
     }
@@ -1918,10 +1927,20 @@ impl MetricsStore for PostgresStore {
                  total_splits, cluster_group_id, cluster_id, query_tags,
                  query_hash, query_parameterized_hash, translated_query_hash,
                  agent_id, conversation_id, step_index, tool_call_id, query_intent,
-                 guard_actions, was_guard_blocked, cache_hit, translation)
+                 guard_actions, was_guard_blocked, cache_hit, translation, worker)
                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,
-                       $21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,$37,$38,
-                       $39,$40,$41,$42,$43,$44,$45,$46)
+                       $21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,
+                       -- Records from workers (#255) carry names, not this database's
+                       -- ids, and may arrive after a cluster was deleted: resolve by name
+                       -- for those, and store a missing row as NULL rather than failing
+                       -- the foreign key.
+                       COALESCE((SELECT id FROM cluster_group_configs WHERE id = $32),
+                                (SELECT id FROM cluster_group_configs
+                                  WHERE $47::text IS NOT NULL AND name = $3)),
+                       COALESCE((SELECT id FROM cluster_configs WHERE id = $33),
+                                (SELECT id FROM cluster_configs
+                                  WHERE $47::text IS NOT NULL AND name = $4)),
+                       $34,$35,$36,$37,$38,$39,$40,$41,$42,$43,$44,$45,$46,$47)
                ON CONFLICT (proxy_query_id) DO NOTHING"#,
         )
         .bind(&r.proxy_query_id)
@@ -1972,6 +1991,7 @@ impl MetricsStore for PostgresStore {
         .bind(r.translation.map(|outcome| {
             serde_json::to_value(outcome).expect("serializable translation outcome")
         }))
+        .bind(&r.worker)
         .execute(&self.admin_pool)
         .await
         .map_err(|e| QueryFluxError::Persistence(format!("Insert query_records: {e}")))?;
@@ -2638,6 +2658,18 @@ mod tests {
             active_revision: Some("a".into()),
             last_error: None,
             last_seen: chrono::Utc::now(),
+            registered_at: None,
+            status: crate::WorkerStatus {
+                config_source: Some("peer".into()),
+                stale: true,
+                consecutive_failures: 2,
+                frontends: vec!["trinoHttp:8080".into()],
+                history: Some(crate::WorkerHistoryStatus {
+                    sent: 7,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
         };
         store.upsert_worker(&w).await.unwrap();
         w.active_revision = Some("b".into());
@@ -2653,6 +2685,8 @@ mod tests {
             .collect();
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].active_revision.as_deref(), Some("b"));
+        assert_eq!(found[0].status, w.status);
+        assert!(found[0].registered_at.is_some());
         assert_eq!(
             found[0].labels.get("app").map(String::as_str),
             Some("checkout")
@@ -3394,6 +3428,7 @@ mod tests {
             guard_actions: vec![],
             was_guard_blocked: false,
             cache_hit: false,
+            worker: None,
         };
         first.was_rewritten = true;
         first.rewritten_sql = Some("SELECT 1 WHERE tenant_id = 42".into());

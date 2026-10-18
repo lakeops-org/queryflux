@@ -20,7 +20,7 @@ const sidebars: SidebarsConfig = {
       type: 'category',
       label: 'Operations',
       collapsed: false,
-      items: ['operations/multi-replica', 'operations/adbc-drivers'],
+      items: ['operations/multi-replica', 'operations/worker-mode', 'operations/worker-sidecar', 'operations/adbc-drivers'],
     },
     {
       type: 'category',
@@ -70,6 +70,7 @@ const sidebars: SidebarsConfig = {
         'architecture/catalog-integration',
         'architecture/routing-and-clusters',
         'architecture/cluster-variants-and-health',
+        'architecture/worker-mode',
         'architecture/caching',
         'architecture/query-tags',
         'architecture/query-params',

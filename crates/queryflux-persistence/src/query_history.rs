@@ -90,6 +90,10 @@ pub struct QuerySummary {
     #[serde(default)]
     #[sqlx(default)]
     pub cache_hit: bool,
+    /// The worker that ran the query; `None` when the proxy itself ran it.
+    #[serde(default)]
+    #[sqlx(default)]
+    pub worker: Option<String>,
 }
 
 /// Aggregated stats for the last hour, shown on the dashboard.
@@ -182,6 +186,8 @@ pub struct QueryFilters {
     pub cluster_group: Option<String>,
     /// Filter by engine type, e.g. `DuckDb`, `Trino`.
     pub engine: Option<String>,
+    /// Filter by the worker that ran the query.
+    pub worker: Option<String>,
     /// Max rows to return (default 50).
     #[serde(default = "default_limit")]
     pub limit: i64,

@@ -59,6 +59,12 @@ impl MetricsStore for MultiMetricsStore {
         }
     }
 
+    fn on_capacity_lease_denied(&self, cluster_group: &str, cluster_name: &str) {
+        for s in &self.stores {
+            s.on_capacity_lease_denied(cluster_group, cluster_name);
+        }
+    }
+
     fn on_auth_failure(&self, protocol: &str) {
         for s in &self.stores {
             s.on_auth_failure(protocol);
@@ -68,6 +74,12 @@ impl MetricsStore for MultiMetricsStore {
     fn on_config_reload_failure(&self, stage: &str) {
         for s in &self.stores {
             s.on_config_reload_failure(stage);
+        }
+    }
+
+    fn on_worker_config_stale(&self, stale: bool) {
+        for s in &self.stores {
+            s.on_worker_config_stale(stale);
         }
     }
 

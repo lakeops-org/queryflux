@@ -19,6 +19,9 @@ pub(crate) struct Stores {
     pub(crate) prometheus: Arc<PrometheusMetrics>,
     pub(crate) persistence: Arc<dyn queryflux_persistence::Persistence>,
     pub(crate) metrics: Arc<dyn MetricsStore>,
+    /// History storage without Prometheus: where a control plane stores the query
+    /// records workers send (their metrics are exported by the workers themselves).
+    pub(crate) history_store: Arc<dyn MetricsStore>,
     /// The in-memory store, in in-memory mode (it also backs the admin API there).
     pub(crate) mem_store: Option<Arc<InMemoryPersistence>>,
     /// The durable backend; `None` in in-memory mode.
@@ -44,8 +47,9 @@ pub(crate) async fn build_stores(config: &ProxyConfig) -> Result<Stores> {
     let mut pg_store: Option<Arc<PostgresStore>> = None;
     let mut mem_store: Option<Arc<InMemoryPersistence>> = None;
 
-    let (persistence, metrics): (
+    let (persistence, metrics, history_store): (
         Arc<dyn queryflux_persistence::Persistence>,
+        Arc<dyn MetricsStore>,
         Arc<dyn MetricsStore>,
     ) = match &config.queryflux.persistence {
         queryflux_core::config::PersistenceConfig::Postgres { conn } => {
@@ -76,8 +80,13 @@ pub(crate) async fn build_stores(config: &ProxyConfig) -> Result<Stores> {
             ]));
             pg_store = Some(pg.clone());
             (
-                pg as Arc<dyn queryflux_persistence::Persistence>,
+                pg.clone() as Arc<dyn queryflux_persistence::Persistence>,
                 metrics as Arc<dyn MetricsStore>,
+                // Worker history goes straight to Postgres, not through the buffer: the
+                // ingest endpoint acknowledges a batch only once its records are stored,
+                // and the buffer accepts records it may later drop (full channel, failed
+                // write). Retried batches stay idempotent (ON CONFLICT on proxy_query_id).
+                pg as Arc<dyn MetricsStore>,
             )
         }
         queryflux_core::config::PersistenceConfig::Redis { url } => {
@@ -91,7 +100,8 @@ pub(crate) async fn build_stores(config: &ProxyConfig) -> Result<Stores> {
             mem_store = Some(mem.clone());
             (
                 mem.clone() as Arc<dyn queryflux_persistence::Persistence>,
-                in_memory_metrics(prometheus.clone(), mem),
+                in_memory_metrics(prometheus.clone(), mem.clone()),
+                mem as Arc<dyn MetricsStore>,
             )
         }
     };
@@ -127,6 +137,7 @@ pub(crate) async fn build_stores(config: &ProxyConfig) -> Result<Stores> {
         coordination,
         snapshot_store,
         worker_registry,
+        history_store,
     })
 }
 

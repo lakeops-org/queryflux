@@ -7,6 +7,22 @@
       "type": "integer",
       "minimum": 1
     },
+    "role": {
+      "type": "string",
+      "enum": ["", "standalone", "controlPlane", "worker"]
+    },
+    "workload": {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": ["Deployment", "DaemonSet"]
+        },
+        "daemonSetUpdateStrategy": {
+          "type": "object"
+        }
+      }
+    },
     "image": {
       "type": "object",
       "required": ["repository", "pullPolicy"],
@@ -114,6 +130,27 @@
           "type": "string",
           "enum": ["ClusterIP", "NodePort", "LoadBalancer", "ExternalName"]
         },
+        "sessionAffinity": {
+          "type": "string",
+          "enum": ["", "None", "ClientIP"]
+        },
+        "sessionAffinityTimeoutSeconds": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 86400
+        },
+        "internalTrafficPolicy": {
+          "type": "string",
+          "enum": ["", "Cluster", "Local"]
+        },
+        "headless": {
+          "type": "object",
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            }
+          }
+        },
         "ports": {
           "type": "object",
           "additionalProperties": {
@@ -169,6 +206,15 @@
           "type": ["integer", "null"],
           "minimum": 1,
           "maximum": 100
+        },
+        "extraMetrics": {
+          "type": "array",
+          "items": {
+            "type": "object"
+          }
+        },
+        "behavior": {
+          "type": "object"
         }
       }
     },

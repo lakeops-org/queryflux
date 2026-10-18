@@ -16,6 +16,22 @@
 
 replicaCount: 1
 
+# Deployment (default), or DaemonSet for one worker per node: apps on a node reach their
+# node's worker through the Service with service.internalTrafficPolicy: Local.
+workload:
+  kind: Deployment
+  # DaemonSet only. One node's worker restarts at a time; its apps cannot connect meanwhile.
+  daemonSetUpdateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+
+# The process role: standalone (default), controlPlane or worker (worker mode, #255).
+# Only needed when the config comes from config.existingSecret or an existing ConfigMap,
+# which the chart cannot read; otherwise it is taken from config.data.queryflux.role.
+# Used for the install notes and role-specific warnings, not passed to QueryFlux.
+role: ""
+
 image:
   repository: ghcr.io/lakeops-org/queryflux
   pullPolicy: IfNotPresent
@@ -152,6 +168,20 @@ config:
 service:
   type: ClusterIP
   annotations: {}
+  # "" (Kubernetes default: None) or ClientIP. Workers need ClientIP when more than one
+  # replica sits behind this Service: a running query (Trino polls, Snowflake and MCP
+  # sessions) lives in the memory of the worker that started it.
+  sessionAffinity: ""
+  sessionAffinityTimeoutSeconds: 10800
+  # "" (Kubernetes default: Cluster) or Local. Local sends a pod's traffic only to the
+  # QueryFlux pod on its own node: use it with workload.kind: DaemonSet. There is no
+  # fallback, so a node's apps cannot connect while that node's worker restarts.
+  internalTrafficPolicy: ""
+  # A second, headless Service (<fullname>-headless) that resolves to every ready pod.
+  # Workers use it for controlPlane.peerBootstrap.address, to copy their config from a
+  # running peer when the control plane is unreachable at startup.
+  headless:
+    enabled: false
   ports:
     trinoHttp:
       enabled: true
@@ -256,6 +286,11 @@ autoscaling:
   maxReplicas: 3
   targetCPUUtilizationPercentage: 80
   targetMemoryUtilizationPercentage: null
+  # Additional HPA metrics, appended as-is (autoscaling/v2 MetricSpec), e.g. queue wait
+  # exported by QueryFlux through prometheus-adapter. See examples/worker-autoscaling-values.yaml.
+  extraMetrics: []
+  # HPA scaling behavior (autoscaling/v2 HorizontalPodAutoscalerBehavior), as-is.
+  behavior: {}
 
 pdb:
   enabled: false

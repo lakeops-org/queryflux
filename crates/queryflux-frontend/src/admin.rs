@@ -167,6 +167,7 @@ mod circuit_breaker_dto_tests {
     paths(
         health_handler,
         clusters_handler,
+        list_workers_handler,
         update_cluster_handler,
         engine_registry_handler,
         list_queries_handler,
@@ -216,6 +217,11 @@ mod circuit_breaker_dto_tests {
     ),
     components(schemas(
         ClusterStateDto,
+        WorkerFleetDto,
+        WorkerView,
+        queryflux_persistence::WorkerRecord,
+        queryflux_persistence::WorkerStatus,
+        queryflux_persistence::WorkerHistoryStatus,
         ClusterUpdateRequest,
         AccessControlDryRunRequest,
         DryRunIdentity,
@@ -648,6 +654,8 @@ struct AdminState {
     result_cache: Arc<dyn queryflux_cache::QueryResultCache>,
     /// Shared proxy state — in-flight queries, adapters, slot release.
     app: Arc<AppState>,
+    /// The worker API this listener serves, for the fleet view.
+    worker_api: Option<crate::worker_api::WorkerApi>,
 }
 
 // ---------------------------------------------------------------------------
@@ -741,6 +749,7 @@ impl AdminFrontend {
             test_catalog_provider_fn: self.test_catalog_provider_fn.clone(),
             result_cache: self.result_cache.clone(),
             app: self.app.clone(),
+            worker_api: self.worker_api.clone(),
         });
 
         let spec_json =
@@ -773,6 +782,7 @@ impl AdminFrontend {
             .route("/admin/queries/running", get(list_running_queries_handler))
             .route("/admin/queries/{id}", delete(cancel_query_handler))
             .route("/admin/agents", get(list_agents_handler))
+            .route("/admin/workers", get(list_workers_handler))
             .route("/admin/conversations", get(list_conversations_handler))
             .route("/admin/conversations/{id}", get(get_conversation_handler))
             .route("/admin/stats", get(get_stats_handler))
@@ -1390,6 +1400,100 @@ pub(crate) async fn cancel_executing_query(
         "Cancelled executing query"
     );
     Ok(())
+}
+
+/// Workers registered with this control plane (#255), with their reported state.
+#[derive(Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkerFleetDto {
+    /// Whether this process serves workers (`workerApi.enabled`).
+    pub enabled: bool,
+    /// The config revision this process serves workers right now.
+    pub control_plane_revision: Option<String>,
+    /// Why the current revision could not be computed, if it could not.
+    pub revision_error: Option<String>,
+    /// Workers seen within the last 7 days, by name.
+    pub workers: Vec<WorkerView>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkerView {
+    #[serde(flatten)]
+    pub worker: queryflux_persistence::WorkerRecord,
+    /// `online` when it reported within three heartbeat intervals (at least 30s),
+    /// otherwise `offline`.
+    pub state: String,
+    /// Whether the worker runs the control plane's current revision. `None` when the
+    /// current revision is unknown or the worker has no config yet.
+    pub in_sync: Option<bool>,
+    pub seconds_since_seen: i64,
+}
+
+/// How long a worker stays listed after its last report.
+const WORKER_LIST_WINDOW_DAYS: i64 = 7;
+
+#[utoipa::path(
+    get,
+    path = "/admin/workers",
+    tag = "admin",
+    responses(
+        (status = 200, description = "Registered workers and their state", body = WorkerFleetDto),
+        (status = 500, description = "Internal error", body = str),
+    )
+)]
+async fn list_workers_handler(State(state): State<Arc<AdminState>>) -> impl IntoResponse {
+    let Some(api) = &state.worker_api else {
+        return Json(WorkerFleetDto {
+            enabled: false,
+            control_plane_revision: None,
+            revision_error: None,
+            workers: vec![],
+        })
+        .into_response();
+    };
+    let (control_plane_revision, revision_error) = match (api.snapshot)().await {
+        Ok(s) => (Some(s.revision), None),
+        Err(e) => (None, Some(e)),
+    };
+    let workers = match &api.registry {
+        Some(registry) => {
+            let since = chrono::Utc::now() - chrono::Duration::days(WORKER_LIST_WINDOW_DAYS);
+            match registry.list_workers(since).await {
+                Ok(w) => w,
+                Err(e) => {
+                    return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+                }
+            }
+        }
+        None => vec![],
+    };
+    let now = chrono::Utc::now();
+    let workers = workers
+        .into_iter()
+        .map(|worker| {
+            let seconds_since_seen = (now - worker.last_seen).num_seconds().max(0);
+            let interval = worker.status.heartbeat_interval_secs.unwrap_or(10) as i64;
+            let online = seconds_since_seen <= (interval * 3).max(30);
+            let in_sync = match (&control_plane_revision, &worker.active_revision) {
+                (Some(cp), Some(active)) => Some(cp == active),
+                _ => None,
+            };
+            WorkerView {
+                worker,
+                state: if online { "online" } else { "offline" }.into(),
+                in_sync,
+                seconds_since_seen,
+            }
+        })
+        .collect();
+    Json(WorkerFleetDto {
+        enabled: true,
+        control_plane_revision,
+        revision_error,
+        workers,
+    })
+    .into_response()
 }
 
 /// Distinct agents that have run queries, with aggregate stats.

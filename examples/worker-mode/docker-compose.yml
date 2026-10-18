@@ -1,0 +1,92 @@
+# Worker mode: one control plane (with Postgres) and two workers.
+#
+# From this directory:
+#   docker compose up -d --wait
+#
+# SQL via the control plane: http://localhost:8080 · worker-a: :8090 · worker-b: :8091
+# Studio (control plane): http://localhost:3000 · Admin API: http://localhost:9000
+# Worker status: http://localhost:9090/worker/status · http://localhost:9091/worker/status
+#
+# Worker mode needs a QueryFlux image built from a release that includes it. To use a
+# local build: QUERYFLUX_IMAGE=queryflux:dev docker compose up -d --wait
+
+name: queryflux-example-worker-mode
+
+x-readyz: &readyz
+  test:
+    - CMD
+    - python3
+    - -c
+    - "import urllib.request; urllib.request.urlopen('http://localhost:9000/readyz')"
+  interval: 3s
+  timeout: 3s
+  retries: 40
+
+services:
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: queryflux
+      POSTGRES_PASSWORD: queryflux
+      POSTGRES_DB: queryflux
+    ports:
+      - "5435:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U queryflux"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  control-plane:
+    image: ${QUERYFLUX_IMAGE:-ghcr.io/lakeops-org/queryflux:latest}
+    ports:
+      - "8080:8080"
+      - "9000:9000"
+    volumes:
+      - ./control-plane.yaml:/etc/queryflux/config.yaml:ro
+    environment:
+      RUST_LOG: ${RUST_LOG:-queryflux=info}
+    healthcheck: *readyz
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  worker-a:
+    image: ${QUERYFLUX_IMAGE:-ghcr.io/lakeops-org/queryflux:latest}
+    ports:
+      - "8090:8080"
+      - "9090:9000"
+    volumes:
+      - ./worker-a.yaml:/etc/queryflux/config.yaml:ro
+    environment:
+      RUST_LOG: ${RUST_LOG:-queryflux=info}
+    # Ready once the first snapshot is active; before that queries get a retryable 503.
+    healthcheck: *readyz
+    depends_on:
+      - control-plane
+    restart: unless-stopped
+
+  worker-b:
+    image: ${QUERYFLUX_IMAGE:-ghcr.io/lakeops-org/queryflux:latest}
+    ports:
+      - "8091:8080"
+      - "9091:9000"
+    volumes:
+      - ./worker-b.yaml:/etc/queryflux/config.yaml:ro
+    environment:
+      RUST_LOG: ${RUST_LOG:-queryflux=info}
+    healthcheck: *readyz
+    depends_on:
+      - control-plane
+    restart: unless-stopped
+
+  queryflux-studio:
+    image: ghcr.io/lakeops-org/queryflux-studio:latest
+    ports:
+      - "3000:3000"
+    environment:
+      ADMIN_API_URL: http://control-plane:9000
+    depends_on:
+      - control-plane
+    restart: unless-stopped

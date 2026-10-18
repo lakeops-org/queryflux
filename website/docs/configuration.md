@@ -177,6 +177,21 @@ Set `distributed: false` to run Postgres-backed persistence without cross-replic
 
 Helm / Kubernetes: see **[charts/queryflux/README.md](https://github.com/lakeops-org/queryflux/blob/main/charts/queryflux/README.md#persistence-and-replicas)**. Full behavior: **[Cluster variants, health checks & reconciliation](./architecture/cluster-variants-and-health#distributed-mode-and-capacitystore)**.
 
+## Worker mode
+
+`queryflux.role` selects how a process gets its config: `standalone` (the default), `controlPlane`, or `worker`. A worker pulls its config, capacity leases and history endpoint from a control plane, and never connects to Postgres:
+
+```yaml
+queryflux:
+  role: worker
+  controlPlane:
+    url: https://queryflux-control:9000
+    auth: { mode: sharedSecret, sharedSecret: <secret> }
+  coordination: { mode: controlPlane, onUnavailable: failClosed }
+```
+
+The control plane enables `queryflux.workerApi` (`enabled`, `sharedSecret`, `history.endpoint`, `history.redaction`). Every key, and how config, capacity and history flow: **[Worker mode](./operations/worker-mode)**.
+
 ## Query Cache
 
 QueryFlux can cache deterministic query results to avoid repeated backend roundtrips. See the dedicated **[Caching](./architecture/caching)** page for full documentation.

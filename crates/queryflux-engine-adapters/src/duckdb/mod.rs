@@ -761,28 +761,46 @@ mod tests {
             queryflux_core::sql_classify::ExecutionHints::default(),
             &slot,
         );
-        let cancel = async {
-            for _ in 0..200 {
-                if slot.get().is_some() {
+        let done = std::sync::atomic::AtomicBool::new(false);
+        let run = async {
+            let mut exec = exec_fut.await.expect("execute returns stream handle");
+            let mut failed = false;
+            while let Some(item) = exec.stream.next().await {
+                if item.is_err() {
+                    failed = true;
                     break;
                 }
-                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            let id = slot.get().expect("backend id published");
-            adapter.cancel_query(&id).await.expect("cancel");
+            done.store(true, std::sync::atomic::Ordering::SeqCst);
+            failed
         };
-
-        let (exec_result, _) = tokio::join!(exec_fut, cancel);
-        let mut exec = exec_result.expect("execute returns stream handle");
-        let mut failed = false;
-        while let Some(item) = exec.stream.next().await {
-            if item.is_err() {
-                failed = true;
-                break;
-            }
-        }
+        let (failed, ()) = tokio::join!(run, interrupt_until_done(&adapter, &slot, &done));
         assert!(failed, "interrupted range() query stream should error");
+    }
+
+    /// Interrupt the query whose id `slot` publishes, again every 10ms, until `done` (or
+    /// 10s pass). One interrupt is not enough: the id is published before DuckDB starts
+    /// executing, and DuckDB clears a pending interrupt when a query begins, so an
+    /// interrupt sent too early (a busy CI runner) is lost and the query completes.
+    async fn interrupt_until_done(
+        adapter: &DuckDbAdapter,
+        slot: &BackendQueryIdSlot,
+        done: &std::sync::atomic::AtomicBool,
+    ) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let id = loop {
+            if let Some(id) = slot.get() {
+                break id;
+            }
+            assert!(std::time::Instant::now() < deadline, "backend id published");
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        };
+        while !done.load(std::sync::atomic::Ordering::SeqCst)
+            && std::time::Instant::now() < deadline
+        {
+            adapter.cancel_query(&id).await.expect("cancel");
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
     }
 
     #[tokio::test]
@@ -812,6 +830,7 @@ mod tests {
 
         let slot_a = BackendQueryIdSlot::new();
         let slot_b = BackendQueryIdSlot::new();
+        let done_a = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         let exec_a = {
             let adapter = Arc::clone(&adapter);
@@ -820,8 +839,9 @@ mod tests {
             let tags = tags.clone();
             let params = params.clone();
             let slot_a = slot_a.clone();
+            let done_a = Arc::clone(&done_a);
             async move {
-                adapter
+                let mut exec = adapter
                     .execute_as_arrow(
                         "SELECT count(*) FROM range(1000000000)",
                         &session,
@@ -832,6 +852,16 @@ mod tests {
                         &slot_a,
                     )
                     .await
+                    .expect("first query stream handle");
+                let mut failed = false;
+                while let Some(item) = exec.stream.next().await {
+                    if item.is_err() {
+                        failed = true;
+                        break;
+                    }
+                }
+                done_a.store(true, std::sync::atomic::Ordering::SeqCst);
+                failed
             }
         };
         let exec_b = {
@@ -857,30 +887,10 @@ mod tests {
                     .await
             }
         };
-        let cancel_a = {
-            let adapter = Arc::clone(&adapter);
-            async move {
-                for _ in 0..200 {
-                    if slot_a.get().is_some() {
-                        break;
-                    }
-                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                let id = slot_a.get().expect("backend id published");
-                adapter.cancel_query(&id).await.expect("cancel");
-            }
-        };
+        // Interrupts carry A's id, so repeating them never touches B.
+        let cancel_a = interrupt_until_done(&adapter, &slot_a, &done_a);
 
-        let (result_a, result_b, _) = tokio::join!(exec_a, exec_b, cancel_a);
-        let mut exec_a = result_a.expect("first query stream handle");
-        let mut a_failed = false;
-        while let Some(item) = exec_a.stream.next().await {
-            if item.is_err() {
-                a_failed = true;
-                break;
-            }
-        }
+        let (a_failed, result_b, ()) = tokio::join!(exec_a, exec_b, cancel_a);
         assert!(a_failed, "canceled first query stream should error");
 
         let mut exec_b = result_b.expect("second query stream handle");

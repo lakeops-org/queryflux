@@ -29,6 +29,8 @@ pub(crate) struct LiveHandles {
     pub(crate) metrics: Arc<dyn MetricsStore>,
     /// Bumped after every reload attempt; the worker API's long-polls wait on it.
     pub(crate) changed: Option<watch::Sender<u64>>,
+    /// A worker applies its snapshot's translation policy here.
+    pub(crate) translation: Option<Arc<queryflux_translation::TranslationService>>,
 }
 
 #[async_trait]
@@ -292,6 +294,46 @@ pub(crate) struct WorkerSyncState {
     /// Why the last fetch or activation failed; cleared on the next success.
     pub(crate) last_error: Option<String>,
     pub(crate) consecutive_failures: u32,
+    /// The active snapshot's history policy (endpoint and redaction).
+    pub(crate) history: Option<queryflux_core::worker_snapshot::HistoryPolicy>,
+    /// Query history delivery to the control plane or the named endpoint.
+    pub(crate) history_uplink: crate::history_uplink::HistoryUplinkStatus,
+    /// Where the active config came from.
+    pub(crate) config_source: Option<ConfigOrigin>,
+    /// True while the active config has not been confirmed by the control plane since this
+    /// worker started (it was copied from a peer).
+    pub(crate) stale: bool,
+    /// When the control plane last confirmed the active config. For a config copied from a
+    /// peer, the peer's confirmation time.
+    pub(crate) confirmed_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// The active snapshot, served to peers.
+    #[serde(skip)]
+    pub(crate) active_snapshot: Option<Arc<queryflux_core::worker_snapshot::WorkerSnapshotV1>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) enum ConfigOrigin {
+    ControlPlane,
+    Peer,
+}
+
+/// What a worker serves a peer at `/worker/peer-config`.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct PeerConfig {
+    pub(crate) snapshot: queryflux_core::worker_snapshot::WorkerSnapshotV1,
+    pub(crate) confirmed_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl WorkerSyncState {
+    /// The active config for a peer, once the control plane has confirmed it.
+    pub(crate) fn peer_config(&self) -> Option<PeerConfig> {
+        Some(PeerConfig {
+            snapshot: self.active_snapshot.as_deref()?.clone(),
+            confirmed_at: self.confirmed_at?,
+        })
+    }
 }
 
 /// A worker's config source: the control plane's `GET /worker/config` (#255).
@@ -312,6 +354,8 @@ pub(crate) struct RemoteConfigSource {
     wait_secs: u64,
     state: Arc<std::sync::Mutex<WorkerSyncState>>,
     first: bool,
+    peer: Option<queryflux_core::config::PeerBootstrapConfig>,
+    started: std::time::Instant,
 }
 
 impl RemoteConfigSource {
@@ -333,7 +377,118 @@ impl RemoteConfigSource {
             wait_secs,
             state,
             first: true,
+            peer: control_plane.peer_bootstrap.clone(),
+            started: std::time::Instant::now(),
         }
+    }
+
+    /// The control plane answered for the active config: it is no longer stale.
+    fn confirmed(&self, handles: &LiveHandles) {
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if st.active_revision.is_none() {
+            return;
+        }
+        if st.stale {
+            tracing::info!("Control plane confirmed the config copied from a peer");
+        }
+        st.config_source = Some(ConfigOrigin::ControlPlane);
+        st.stale = false;
+        st.confirmed_at = Some(chrono::Utc::now());
+        drop(st);
+        handles.metrics.on_worker_config_stale(false);
+    }
+
+    /// With no config yet and the control plane still unreachable after `afterSecs`, copy
+    /// the active config from a running worker.
+    async fn bootstrap_from_peer(&self, handles: &LiveHandles) {
+        use queryflux_core::worker_snapshot::WORKER_SNAPSHOT_SCHEMA_VERSION;
+        let Some(peer) = &self.peer else { return };
+        if self
+            .state
+            .lock()
+            .map(|s| s.active_revision.is_some())
+            .unwrap_or(true)
+            || self.started.elapsed() < std::time::Duration::from_secs(peer.after_secs)
+        {
+            return;
+        }
+        let mut addrs: Vec<std::net::SocketAddr> =
+            match tokio::net::lookup_host(&peer.address).await {
+                Ok(a) => a.collect(),
+                Err(e) => {
+                    tracing::warn!(address = %peer.address, "Peer lookup failed: {e}");
+                    return;
+                }
+            };
+        // Spread starting workers across peers.
+        if !addrs.is_empty() {
+            let start = (uuid::Uuid::new_v4().as_u128() % addrs.len() as u128) as usize;
+            addrs.rotate_left(start);
+        }
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .unwrap_or_default();
+        let max_age = chrono::Duration::seconds(peer.max_age_secs as i64);
+        for addr in addrs {
+            let url = format!("http://{addr}/worker/peer-config");
+            let config: PeerConfig = match client.get(&url).bearer_auth(&self.bearer).send().await {
+                Ok(r) if r.status().is_success() => match r.json().await {
+                    Ok(c) => c,
+                    Err(e) => {
+                        tracing::debug!(%addr, "Peer config does not parse: {e}");
+                        continue;
+                    }
+                },
+                Ok(r) => {
+                    tracing::debug!(%addr, status = %r.status(), "Peer has no config to share");
+                    continue;
+                }
+                Err(e) => {
+                    tracing::debug!(%addr, "Peer unreachable: {e}");
+                    continue;
+                }
+            };
+            let snapshot = config.snapshot;
+            if snapshot.schema_version != WORKER_SNAPSHOT_SCHEMA_VERSION || !snapshot.is_sealed() {
+                tracing::warn!(%addr, "Peer config failed its version or integrity check");
+                continue;
+            }
+            let age = chrono::Utc::now() - config.confirmed_at;
+            if age > max_age {
+                tracing::warn!(
+                    %addr,
+                    revision = %snapshot.revision,
+                    confirmed_at = %config.confirmed_at,
+                    "Peer config is older than peerBootstrap.maxAgeSecs; not using it"
+                );
+                continue;
+            }
+            match self.activate(&snapshot, handles).await {
+                Ok(()) => {
+                    let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                    st.downloaded_revision = Some(snapshot.revision.clone());
+                    st.active_revision = Some(snapshot.revision.clone());
+                    st.activated_at = Some(chrono::Utc::now());
+                    st.history = snapshot.history.clone();
+                    st.config_source = Some(ConfigOrigin::Peer);
+                    st.stale = true;
+                    st.confirmed_at = Some(config.confirmed_at);
+                    st.active_snapshot = Some(Arc::new(snapshot.clone()));
+                    drop(st);
+                    handles.metrics.on_worker_config_stale(true);
+                    tracing::warn!(
+                        %addr,
+                        revision = %snapshot.revision,
+                        confirmed_at = %config.confirmed_at,
+                        "Serving a config copied from a peer until the control plane answers"
+                    );
+                    return;
+                }
+                Err(e) => tracing::warn!(%addr, "Peer config failed to activate: {e:#}"),
+            }
+        }
+        tracing::warn!(address = %peer.address, "No peer could share a usable config");
     }
 
     /// Long-polling once a config is active (the request waits on the control plane).
@@ -344,11 +499,13 @@ impl RemoteConfigSource {
             .unwrap_or(false)
     }
 
-    fn record_failure(&self, message: String) {
+    /// Record a failed sync with the control plane. Returns `false` (no answer).
+    fn record_failure(&self, message: String) -> bool {
         tracing::warn!("Worker config sync: {message}");
         let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
         st.last_error = Some(message);
         st.consecutive_failures = st.consecutive_failures.saturating_add(1);
+        false
     }
 
     fn next_delay(&self) -> std::time::Duration {
@@ -399,6 +556,9 @@ impl RemoteConfigSource {
         let mut live_guard = handles.live.write().await;
         *cache_guard = candidate_cache;
         *live_guard = new_live;
+        if let (Some(service), Some(policy)) = (&handles.translation, snapshot.translation) {
+            service.set_policy(policy.mode, policy.error_on_unsupported);
+        }
         Ok(())
     }
 }
@@ -417,16 +577,32 @@ impl ConfigSource for RemoteConfigSource {
     }
 
     async fn reload(&self, handles: &LiveHandles) {
+        if !self.sync(handles).await {
+            self.bootstrap_from_peer(handles).await;
+        }
+    }
+}
+
+impl RemoteConfigSource {
+    /// One exchange with the control plane. Returns `true` if it answered with a usable
+    /// response (a new snapshot, or "unchanged").
+    async fn sync(&self, handles: &LiveHandles) -> bool {
         use queryflux_core::worker_snapshot::{WorkerSnapshotV1, WORKER_SNAPSHOT_SCHEMA_VERSION};
         // The active revision, not the last downloaded one: a snapshot that failed to
         // activate must be fetched and tried again rather than answered with a 304.
-        let active = self
+        let (active, stale) = self
             .state
             .lock()
-            .ok()
-            .and_then(|s| s.active_revision.clone());
-        // With an active revision, long-poll for the next one; otherwise fetch now.
+            .map(|s| (s.active_revision.clone(), s.stale))
+            .unwrap_or_default();
+        // With an active revision, long-poll for the next one; otherwise fetch now. A config
+        // copied from a peer is checked with a plain conditional GET instead, so the control
+        // plane confirms it at once rather than at the end of a long-poll.
         let mut req = match &active {
+            Some(rev) if stale => self
+                .client
+                .get(&self.url)
+                .header(reqwest::header::IF_NONE_MATCH, format!("\"{rev}\"")),
             Some(rev) => self
                 .client
                 .get(format!("{}/wait", self.url))
@@ -444,10 +620,13 @@ impl ConfigSource for RemoteConfigSource {
         };
         match resp.status() {
             reqwest::StatusCode::NOT_MODIFIED => {
-                let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
-                st.last_successful_sync = Some(chrono::Utc::now());
-                st.consecutive_failures = 0;
-                return;
+                {
+                    let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                    st.last_successful_sync = Some(chrono::Utc::now());
+                    st.consecutive_failures = 0;
+                }
+                self.confirmed(handles);
+                return true;
             }
             reqwest::StatusCode::OK => {}
             status => {
@@ -481,8 +660,12 @@ impl ConfigSource for RemoteConfigSource {
                 let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
                 st.active_revision = Some(snapshot.revision.clone());
                 st.activated_at = Some(chrono::Utc::now());
+                st.history = snapshot.history.clone();
                 st.last_error = None;
                 st.consecutive_failures = 0;
+                st.active_snapshot = Some(Arc::new(snapshot.clone()));
+                drop(st);
+                self.confirmed(handles);
                 tracing::info!(revision = %snapshot.revision, "Worker config activated");
             }
             Err(e) => {
@@ -494,6 +677,7 @@ impl ConfigSource for RemoteConfigSource {
                 ));
             }
         }
+        true
     }
 }
 
@@ -587,6 +771,7 @@ mod tests {
             })),
             metrics: Arc::new(queryflux_metrics::NoopMetricsStore),
             changed: None,
+            translation: None,
         }
     }
 
@@ -615,6 +800,8 @@ mod tests {
             routing_fallback: "g".into(),
             group_translation_scripts: Default::default(),
             settings: SnapshotSettings::default(),
+            history: None,
+            translation: None,
         }
         .seal()
     }
@@ -632,6 +819,7 @@ mod tests {
             registry: None,
             changes: None,
             coordination: None,
+            history: None,
         };
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -691,6 +879,175 @@ mod tests {
         *current.lock().unwrap() = snapshot(7);
         src.reload(&h).await;
         assert_eq!(group_limit(&h).await, Some(7));
+    }
+
+    #[tokio::test]
+    async fn worker_applies_the_control_planes_translation_policy() {
+        use queryflux_core::config::TranslationMode;
+        let mut snap = snapshot(3);
+        snap.translation = Some(queryflux_core::worker_snapshot::TranslationPolicy {
+            mode: TranslationMode::Strict,
+            error_on_unsupported: false,
+        });
+        let current = Arc::new(std::sync::Mutex::new(snap.seal()));
+        let url = control_plane(current).await;
+        let (src, _state) = source(&url, "s3cret");
+        let service = Arc::new(queryflux_translation::TranslationService::disabled());
+        let h = LiveHandles {
+            translation: Some(service.clone()),
+            ..handles()
+        };
+        assert_eq!(service.policy(), (TranslationMode::BestEffort, false));
+        src.reload(&h).await;
+        assert_eq!(service.policy(), (TranslationMode::Strict, false));
+    }
+
+    /// A control plane that answers 503 while `up` is false.
+    async fn switchable_control_plane(
+        current: Arc<std::sync::Mutex<queryflux_core::worker_snapshot::WorkerSnapshotV1>>,
+        up: Arc<std::sync::atomic::AtomicBool>,
+    ) -> String {
+        let api = queryflux_frontend::worker_api::WorkerApi {
+            shared_secret: "s3cret".into(),
+            snapshot: Arc::new(move || {
+                let s = current.lock().unwrap().clone();
+                Box::pin(async move { Ok(s) })
+            }),
+            registry: None,
+            changes: None,
+            coordination: None,
+            history: None,
+        };
+        let app = queryflux_frontend::worker_api::router(api).layer(axum::middleware::from_fn(
+            move |req: axum::extract::Request, next: axum::middleware::Next| {
+                let up = up.clone();
+                async move {
+                    if up.load(std::sync::atomic::Ordering::SeqCst) {
+                        next.run(req).await
+                    } else {
+                        axum::response::IntoResponse::into_response(
+                            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                        )
+                    }
+                }
+            },
+        ));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        format!("http://{addr}")
+    }
+
+    /// A worker's ops listener serving its peer config; returns `host:port`.
+    async fn peer(state: Arc<std::sync::Mutex<WorkerSyncState>>, secret: &str) -> String {
+        let ops = queryflux_frontend::ops::OpsFrontend::new(
+            Arc::new(queryflux_metrics::prometheus_store::PrometheusMetrics::new().unwrap()),
+            Arc::new(RwLock::new(crate::live_config::empty_live_config())),
+            0,
+            Arc::new(|| serde_json::json!({})),
+        )
+        .with_peer_config(queryflux_frontend::ops::PeerConfigEndpoint {
+            shared_secret: secret.into(),
+            config: Arc::new(move || {
+                let st = state.lock().unwrap();
+                st.peer_config().and_then(|c| serde_json::to_value(c).ok())
+            }),
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = ops.router();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        addr.to_string()
+    }
+
+    fn peer_source(
+        url: &str,
+        peer_addr: &str,
+        max_age_secs: u64,
+    ) -> (RemoteConfigSource, Arc<std::sync::Mutex<WorkerSyncState>>) {
+        let cp: queryflux_core::config::ControlPlaneClientConfig =
+            serde_json::from_value(serde_json::json!({
+                "url": url,
+                "allowInsecureHttp": true,
+                "pollTimeoutSecs": 1,
+                "auth": { "mode": "sharedSecret", "sharedSecret": "s3cret" },
+                "peerBootstrap": { "address": peer_addr, "afterSecs": 0, "maxAgeSecs": max_age_secs }
+            }))
+            .unwrap();
+        let state = Arc::new(std::sync::Mutex::new(WorkerSyncState::default()));
+        (RemoteConfigSource::new(&cp, state.clone()), state)
+    }
+
+    #[tokio::test]
+    async fn a_worker_starts_from_a_peer_until_the_control_plane_answers() {
+        let current = Arc::new(std::sync::Mutex::new(snapshot(3)));
+        let up = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let url = switchable_control_plane(current.clone(), up.clone()).await;
+
+        // Worker A syncs from the control plane and serves its config to peers.
+        let (a, a_state) = source(&url, "s3cret");
+        a.reload(&handles()).await;
+        assert!(a_state.lock().unwrap().peer_config().is_some());
+        let a_addr = peer(a_state.clone(), "s3cret").await;
+
+        // The control plane goes down; worker B starts and copies A's config.
+        up.store(false, std::sync::atomic::Ordering::SeqCst);
+        let (b, b_state) = peer_source(&url, &a_addr, 3600);
+        let h = handles();
+        b.reload(&h).await;
+        {
+            let st = b_state.lock().unwrap();
+            assert_eq!(st.config_source, Some(ConfigOrigin::Peer));
+            assert!(st.stale);
+            assert_eq!(st.active_revision, a_state.lock().unwrap().active_revision);
+        }
+        assert!(h.live.read().await.is_configured());
+        assert_eq!(group_limit(&h).await, Some(3));
+
+        // The control plane returns: B's config is confirmed, no longer stale.
+        up.store(true, std::sync::atomic::Ordering::SeqCst);
+        b.reload(&h).await;
+        let st = b_state.lock().unwrap();
+        assert_eq!(st.config_source, Some(ConfigOrigin::ControlPlane));
+        assert!(!st.stale);
+    }
+
+    #[tokio::test]
+    async fn a_peer_config_older_than_max_age_is_refused() {
+        let current = Arc::new(std::sync::Mutex::new(snapshot(3)));
+        let up = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let url = switchable_control_plane(current.clone(), up).await;
+        let snap = current.lock().unwrap().clone();
+        let old = Arc::new(std::sync::Mutex::new(WorkerSyncState {
+            active_revision: Some(snap.revision.clone()),
+            active_snapshot: Some(Arc::new(snap)),
+            confirmed_at: Some(chrono::Utc::now() - chrono::Duration::hours(2)),
+            ..Default::default()
+        }));
+        let old_addr = peer(old, "s3cret").await;
+        let (b, b_state) = peer_source(&url, &old_addr, 3600);
+        let h = handles();
+        b.reload(&h).await;
+        assert!(b_state.lock().unwrap().active_revision.is_none());
+        assert!(!h.live.read().await.is_configured());
+    }
+
+    #[tokio::test]
+    async fn a_peer_requires_the_shared_secret() {
+        let current = Arc::new(std::sync::Mutex::new(snapshot(3)));
+        let up = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let url = switchable_control_plane(current.clone(), up).await;
+        let snap = current.lock().unwrap().clone();
+        let a_state = Arc::new(std::sync::Mutex::new(WorkerSyncState {
+            active_revision: Some(snap.revision.clone()),
+            active_snapshot: Some(Arc::new(snap)),
+            confirmed_at: Some(chrono::Utc::now()),
+            ..Default::default()
+        }));
+        let a_addr = peer(a_state, "other-fleet-secret").await;
+        let (b, b_state) = peer_source(&url, &a_addr, 3600);
+        b.reload(&handles()).await;
+        assert!(b_state.lock().unwrap().active_revision.is_none());
     }
 
     #[tokio::test]

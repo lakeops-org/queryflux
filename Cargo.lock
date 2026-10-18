@@ -5329,7 +5329,7 @@ checksum = "5a651516ddc9168ebd67b24afd085a718be02f8858fe406591b013d101ce2f40"
 
 [[package]]
 name = "queryflux"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5366,7 +5366,7 @@ dependencies = [
 
 [[package]]
 name = "queryflux-access-control"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -5382,7 +5382,7 @@ dependencies = [
 
 [[package]]
 name = "queryflux-auth"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "bcrypt",
@@ -5400,7 +5400,7 @@ dependencies = [
 
 [[package]]
 name = "queryflux-bench"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5414,7 +5414,7 @@ dependencies = [
 
 [[package]]
 name = "queryflux-cache"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "arrow",
@@ -5435,7 +5435,7 @@ dependencies = [
 
 [[package]]
 name = "queryflux-catalog"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "aws-config",
@@ -5459,7 +5459,7 @@ dependencies = [
 
 [[package]]
 name = "queryflux-cli"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -5470,7 +5470,7 @@ dependencies = [
 
 [[package]]
 name = "queryflux-cluster-manager"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "pyo3",
@@ -5483,7 +5483,7 @@ dependencies = [
 
 [[package]]
 name = "queryflux-config"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "queryflux-core",
@@ -5495,7 +5495,7 @@ dependencies = [
 
 [[package]]
 name = "queryflux-core"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5551,7 +5551,7 @@ dependencies = [
 
 [[package]]
 name = "queryflux-engine-adapters"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "adbc_core",
  "adbc_driver_manager",
@@ -5585,7 +5585,7 @@ dependencies = [
 
 [[package]]
 name = "queryflux-fingerprint"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "polyglot-sql",
  "queryflux-core",
@@ -5596,7 +5596,7 @@ dependencies = [
 
 [[package]]
 name = "queryflux-frontend"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "arrow",
@@ -5645,7 +5645,7 @@ dependencies = [
 
 [[package]]
 name = "queryflux-guardrails"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "polyglot-sql",
@@ -5663,7 +5663,7 @@ dependencies = [
 
 [[package]]
 name = "queryflux-metrics"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "prometheus",
@@ -5675,7 +5675,7 @@ dependencies = [
 
 [[package]]
 name = "queryflux-persistence"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -5692,7 +5692,7 @@ dependencies = [
 
 [[package]]
 name = "queryflux-routing"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "pyo3",
@@ -5706,7 +5706,7 @@ dependencies = [
 
 [[package]]
 name = "queryflux-translation"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "pyo3",

@@ -1,0 +1,38 @@
+# Scale shared-service workers on load. Use together with worker-values.yaml:
+#
+#   helm install queryflux-workers ./charts/queryflux -n queryflux \
+#     -f ./charts/queryflux/examples/worker-values.yaml \
+#     -f ./charts/queryflux/examples/worker-autoscaling-values.yaml
+#
+# CPU is a fair first signal: a worker spends its CPU on protocol handling, translation
+# and result streaming. The commented metric below scales on how long queries wait for
+# capacity instead. It needs prometheus-adapter (or KEDA) exposing the worker's own
+# queryflux_queue_duration_seconds as a per-pod metric. Note that adding workers does not
+# raise maxRunningQueries: with shared capacity the limit is fleet-wide, so waiting caused
+# by a full engine is not fixed by more workers. Scale on wait only for groups whose
+# workers, not the engine, are the bottleneck.
+
+autoscaling:
+  enabled: true
+  minReplicas: 2
+  maxReplicas: 10
+  targetCPUUtilizationPercentage: 70
+  extraMetrics: []
+  #  - type: Pods
+  #    pods:
+  #      metric:
+  #        name: queryflux_queue_duration_seconds_p95
+  #      target:
+  #        type: AverageValue
+  #        averageValue: "2"
+  # Scale down slowly: a worker drains its running queries on shutdown
+  # (shutdownDrainTimeoutSecs), and its clients' sessions move to other workers.
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 60
+    scaleUp:
+      stabilizationWindowSeconds: 30

@@ -1,0 +1,35 @@
+# Control plane: owns the config (Postgres), serves it to workers, shares capacity with
+# them and stores their query history. It also serves queries itself on :8080.
+queryflux:
+  role: controlPlane
+  externalAddress: http://localhost:8080
+  frontends:
+    trinoHttp:
+      enabled: true
+      port: 8080
+  persistence:
+    type: postgres
+    url: postgres://queryflux:queryflux@postgres:5432/queryflux
+  configReloadIntervalSecs: 5
+  adminApi:
+    port: 9000
+  workerApi:
+    enabled: true
+    # Workers present this as controlPlane.auth.sharedSecret. Use a long random value.
+    sharedSecret: change-me-worker-secret
+    history:
+      # full | maskLiterals | metadata. Applied by each worker before records leave it.
+      redaction: maskLiterals
+
+# Seeded into Postgres on first start; afterwards edit through Studio or the admin API,
+# and workers pick the change up within a second.
+clusters:
+  duckdb-1:
+    engine: duckDb
+    # One limit for the control plane and every worker together.
+    maxRunningQueries: 2
+clusterGroups:
+  analytics:
+    members: [duckdb-1]
+    maxRunningQueries: 2
+routingFallback: analytics

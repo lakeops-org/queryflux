@@ -1,0 +1,42 @@
+# Control plane for worker mode, in namespace `queryflux`. Run the following from the
+# repository root.
+#
+#   1. kubectl create namespace queryflux
+#   2. Fill in ./charts/queryflux/examples/control-plane-config.yaml and create its Secret:
+#        kubectl -n queryflux create secret generic queryflux-control-plane-config \
+#          --from-file=config.yaml=./charts/queryflux/examples/control-plane-config.yaml
+#   3. helm install queryflux-control ./charts/queryflux -n queryflux \
+#        -f ./charts/queryflux/examples/control-plane-values.yaml
+#
+# Workers talk to the worker API on the admin port (9000), which QueryFlux serves over
+# plain HTTP, and worker configs carry engine credentials. The ingress below terminates
+# TLS and exposes only `/worker/*` (not the admin API or Studio); workers then use
+# `https://queryflux-control.example.com` (examples/worker-config.yaml). Its certificate
+# must come from a public CA (e.g. cert-manager with Let's Encrypt): workers trust public
+# roots only. Inside a service mesh with mTLS (Istio, Linkerd) you can instead skip the
+# ingress and point workers at the in-cluster address (see worker-config.yaml).
+
+# The config is in a Secret the chart cannot read; this tells the install notes.
+role: controlPlane
+
+replicaCount: 2
+
+config:
+  existingSecret: queryflux-control-plane-config
+
+pdb:
+  enabled: true
+  maxUnavailable: 1
+
+ingress:
+  enabled: true
+  className: nginx
+  hosts:
+    - host: queryflux-control.example.com
+      paths:
+        - path: /worker
+          pathType: Prefix
+          servicePortName: admin
+  tls:
+    - hosts: [queryflux-control.example.com]
+      secretName: queryflux-control-tls

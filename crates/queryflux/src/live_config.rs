@@ -445,6 +445,8 @@ pub(crate) fn snapshot_from_inputs(
             .clone()
             .into_iter()
             .collect(),
+        history: None,
+        translation: None,
         settings: SnapshotSettings {
             guardrails: inputs.settings.guardrails.clone(),
             security: inputs.settings.security.clone(),
@@ -643,7 +645,30 @@ pub(crate) async fn build_worker_snapshot(
             issues.join("; ")
         );
     }
-    snapshot_from_inputs(&inputs, credentials)
+    let mut snapshot = snapshot_from_inputs(&inputs, credentials)?;
+    snapshot.history = history_policy(yaml);
+    snapshot.translation = Some(translation_policy(yaml));
+    Ok(snapshot.seal())
+}
+
+/// The translation failure policy a control plane hands its workers (its `translation`).
+pub(crate) fn translation_policy(
+    yaml: &queryflux_core::config::ProxyConfig,
+) -> queryflux_core::worker_snapshot::TranslationPolicy {
+    queryflux_core::worker_snapshot::TranslationPolicy {
+        mode: yaml.translation.mode,
+        error_on_unsupported: yaml.translation.error_on_unsupported,
+    }
+}
+
+/// The history policy a control plane hands its workers (`workerApi.history`).
+pub(crate) fn history_policy(
+    yaml: &queryflux_core::config::ProxyConfig,
+) -> Option<queryflux_core::worker_snapshot::HistoryPolicy> {
+    yaml.queryflux
+        .worker_api
+        .as_ref()
+        .and_then(|w| w.history.clone())
 }
 
 /// The config a worker holds before its first snapshot: no groups, no adapters. Queries
