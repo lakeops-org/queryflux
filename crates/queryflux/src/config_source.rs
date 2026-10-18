@@ -291,12 +291,13 @@ pub(crate) struct WorkerSyncState {
 
 /// A worker's config source: the control plane's `GET /worker/config` (#255).
 ///
-/// Polls with `If-None-Match` set to the last downloaded revision, so an unchanged
-/// config costs a 304, and a revision that failed to activate is not fetched again until
-/// the control plane publishes a new one. A new snapshot is verified (schema version,
-/// sealed revision), compiled and applied in strict mode, then swapped in atomically;
-/// any failure keeps the active config. While the control plane is unreachable the
-/// interval backs off with jitter, up to 60 seconds.
+/// Polls with `If-None-Match` set to the active revision, so an unchanged config costs a
+/// 304. A new snapshot is verified (schema version, sealed revision), compiled and applied
+/// in strict mode, then swapped in atomically; any failure keeps the active config. A
+/// snapshot that fails to activate is fetched and tried again, because activation can
+/// fail for transient reasons (an identity provider or catalog briefly unreachable while
+/// building the auth or catalog provider). Every failure, unreachable control plane or
+/// rejected snapshot alike, backs the interval off with jitter, up to 60 seconds.
 pub(crate) struct RemoteConfigSource {
     client: reqwest::Client,
     url: String,
@@ -393,13 +394,15 @@ impl ConfigSource for RemoteConfigSource {
 
     async fn reload(&self, handles: &LiveHandles) {
         use queryflux_core::worker_snapshot::{WorkerSnapshotV1, WORKER_SNAPSHOT_SCHEMA_VERSION};
-        let downloaded = self
+        // The active revision, not the last downloaded one: a snapshot that failed to
+        // activate must be fetched and tried again rather than answered with a 304.
+        let active = self
             .state
             .lock()
             .ok()
-            .and_then(|s| s.downloaded_revision.clone());
+            .and_then(|s| s.active_revision.clone());
         let mut req = self.client.get(&self.url).bearer_auth(&self.bearer);
-        if let Some(rev) = &downloaded {
+        if let Some(rev) = &active {
             req = req.header(reqwest::header::IF_NONE_MATCH, format!("\"{rev}\""));
         }
         let resp = match req.send().await {
@@ -439,7 +442,6 @@ impl ConfigSource for RemoteConfigSource {
             let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
             st.downloaded_revision = Some(snapshot.revision.clone());
             st.last_successful_sync = Some(chrono::Utc::now());
-            st.consecutive_failures = 0;
         }
         match self.activate(&snapshot, handles).await {
             Ok(()) => {
@@ -447,19 +449,16 @@ impl ConfigSource for RemoteConfigSource {
                 st.active_revision = Some(snapshot.revision.clone());
                 st.activated_at = Some(chrono::Utc::now());
                 st.last_error = None;
+                st.consecutive_failures = 0;
                 tracing::info!(revision = %snapshot.revision, "Worker config activated");
             }
             Err(e) => {
                 handles.metrics.on_config_reload_failure("worker_activate");
-                let message = format!(
+                // Counted as a failure so the retry of this snapshot backs off.
+                self.record_failure(format!(
                     "snapshot {} rejected, keeping the active config: {e:#}",
                     snapshot.revision
-                );
-                tracing::warn!("{message}");
-                self.state
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .last_error = Some(message);
+                ));
             }
         }
     }
@@ -674,6 +673,40 @@ mod tests {
         assert_eq!(st.active_revision, active);
         assert!(st.last_error.unwrap().contains("integrity"));
         assert_eq!(group_limit(&h).await, Some(3));
+    }
+
+    /// Activation can fail for transient reasons, so a rejected snapshot is fetched and
+    /// tried again (not answered with a 304), each failure growing the backoff, until it
+    /// or a newer one activates.
+    #[tokio::test]
+    async fn a_snapshot_that_fails_to_activate_is_retried_with_backoff() {
+        let mut bad = snapshot(3);
+        bad.clusters[0].engine_key = "noSuchEngine".into();
+        let current = Arc::new(std::sync::Mutex::new(bad.seal()));
+        let url = control_plane(current.clone()).await;
+        let (src, state) = source(&url, "s3cret");
+        let h = handles();
+
+        src.reload(&h).await;
+        src.reload(&h).await;
+        {
+            let st = state.lock().unwrap();
+            assert!(st.active_revision.is_none());
+            assert_eq!(
+                st.consecutive_failures, 2,
+                "both syncs tried to activate it; a 304 would have reset the count"
+            );
+            assert!(st.last_error.as_deref().unwrap_or("").contains("rejected"));
+        }
+        assert!(src.next_delay() >= std::time::Duration::from_secs(4));
+        assert!(!h.live.read().await.is_configured());
+
+        *current.lock().unwrap() = snapshot(3);
+        src.reload(&h).await;
+        let st = state.lock().unwrap().clone();
+        assert!(st.active_revision.is_some());
+        assert_eq!(st.consecutive_failures, 0);
+        assert!(h.live.read().await.is_configured());
     }
 
     #[tokio::test]
