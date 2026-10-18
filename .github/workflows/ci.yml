@@ -254,7 +254,7 @@ jobs:
           echo "PYTHONPATH=$(.venv/bin/python3 -c 'import site; print(site.getsitepackages()[0])')" >> "$GITHUB_ENV"
 
       # Clippy first — fail fast before tests or E2E. --all-targets compiles test crates once for later steps.
-      # Exclude queryflux-bench: duplicate link of main stack; benchmark.yml builds it.
+      # Exclude queryflux-bench: duplicate link of main stack; bench.yml builds it weekly.
       - name: Clippy
         run: cargo clippy --workspace --all-targets --all-features --exclude queryflux-bench -- -D warnings
 
