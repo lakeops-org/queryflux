@@ -179,12 +179,17 @@ BEGIN
     v_since := COALESCE(v_since, now());
 
     IF v_free > 0 THEN
-        SELECT COUNT(*) INTO v_older FROM capacity_waiters
-        WHERE cluster_name = p_cluster
-          AND parked
-          AND query_id <> p_query_id
-          AND enqueued_at < v_since
-          AND refreshed_at > now() - queryflux_capacity_waiter_ttl();
+        -- Only whether at least v_free waiters are ahead matters, so stop counting
+        -- there: the cost follows the free slots, not the length of the line.
+        SELECT COUNT(*) INTO v_older FROM (
+            SELECT 1 FROM capacity_waiters
+            WHERE cluster_name = p_cluster
+              AND parked
+              AND query_id <> p_query_id
+              AND enqueued_at < v_since
+              AND refreshed_at > now() - queryflux_capacity_waiter_ttl()
+            LIMIT v_free
+        ) ahead;
         IF v_older < v_free THEN
             INSERT INTO cluster_capacity_leases (query_id, cluster_name, instance_id)
             VALUES (p_query_id, p_cluster, p_instance)
@@ -207,19 +212,55 @@ BEGIN
 END
 $$;
 
--- Release queries: leave the line, then drop their leases. Two statements, so the lease
--- delete takes a fresh snapshot: if a release elsewhere is handing one of these queries
--- a slot right now, the waiter delete waits for it, and the lease delete then sees and
--- removes the lease it created. (One statement would use one snapshot and miss it,
--- leaving the slot held by nobody until the unclaimed lease expired.)
+-- Release queries: leave the line, then drop their leases.
+--
+-- First take the advisory lock of every cluster involved, in name order. A hand-over
+-- (queryflux_capacity_grant_waiters) holds a cluster's lock while it deletes waiter rows,
+-- so a release must hold it before touching those rows, or the two deadlock.
+--
+-- Then two statements, so the lease delete takes a fresh snapshot: if a release that
+-- started earlier is handing one of these queries a slot, the waiter delete waits for
+-- it, and the lease delete then sees and removes the lease it created. (One statement
+-- would use one snapshot and miss it, leaving the slot held by nobody.)
 CREATE OR REPLACE FUNCTION queryflux_capacity_release(p_query_ids TEXT[]) RETURNS BIGINT
 LANGUAGE plpgsql AS $$
 DECLARE
     v_n BIGINT;
 BEGIN
+    PERFORM pg_advisory_xact_lock(hashtext('capacity:' || c)::bigint)
+    FROM (
+        SELECT cluster_name AS c FROM capacity_waiters WHERE query_id = ANY(p_query_ids)
+        UNION
+        SELECT cluster_name FROM cluster_capacity_leases WHERE query_id = ANY(p_query_ids)
+        ORDER BY 1
+    ) clusters;
     DELETE FROM capacity_waiters WHERE query_id = ANY(p_query_ids);
     DELETE FROM cluster_capacity_leases WHERE query_id = ANY(p_query_ids);
     GET DIAGNOSTICS v_n = ROW_COUNT;
     RETURN v_n;
+END
+$$;
+
+-- A parked query renewing its wait: refresh its place in line, and if the cluster has
+-- free capacity that nobody was handed (its limit went up, or capacity freed without a
+-- release), hand it out now. Returns whether the query holds a lease on the cluster.
+-- Cheap while the cluster is full: no lock, one row update and two lookups.
+CREATE OR REPLACE FUNCTION queryflux_capacity_park(p_cluster TEXT, p_query_id TEXT)
+RETURNS BOOLEAN
+LANGUAGE plpgsql AS $$
+DECLARE
+    v_free BIGINT;
+BEGIN
+    UPDATE capacity_waiters SET parked = TRUE, refreshed_at = now()
+    WHERE query_id = p_query_id;
+    SELECT max_running - leased - quota_committed - quota_wanted INTO v_free
+    FROM cluster_capacity_counters WHERE cluster_name = p_cluster;
+    IF v_free > 0 THEN
+        PERFORM queryflux_capacity_grant_waiters(p_cluster);
+    END IF;
+    RETURN EXISTS (
+        SELECT 1 FROM cluster_capacity_leases
+        WHERE query_id = p_query_id AND cluster_name = p_cluster
+    );
 END
 $$;

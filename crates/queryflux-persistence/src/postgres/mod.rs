@@ -2564,22 +2564,12 @@ impl CapacityStore for PostgresStore {
         notified.as_mut().enable();
         // Park in the line (only parked waiters are handed slots), and check for a slot
         // handed over before we started listening, which is already a lease.
-        let already: bool = sqlx::query_scalar(
-            r#"
-            WITH parked AS (
-                UPDATE capacity_waiters SET parked = TRUE, refreshed_at = now()
-                WHERE query_id = $1
-            )
-            SELECT EXISTS (
-                SELECT 1 FROM cluster_capacity_leases WHERE query_id = $1 AND cluster_name = $2
-            )
-            "#,
-        )
-        .bind(query_id)
-        .bind(cluster_name)
-        .fetch_one(&self.coordination_pool)
-        .await
-        .map_err(|e| QueryFluxError::Persistence(format!("wait_for_grant: {e}")))?;
+        let already: bool = sqlx::query_scalar("SELECT queryflux_capacity_park($1, $2)")
+            .bind(cluster_name)
+            .bind(query_id)
+            .fetch_one(&self.coordination_pool)
+            .await
+            .map_err(|e| QueryFluxError::Persistence(format!("wait_for_grant: {e}")))?;
         Ok(already || tokio::time::timeout(timeout, notified).await.is_ok())
     }
 
@@ -2615,10 +2605,16 @@ impl CapacityStore for PostgresStore {
             .map_err(|e| QueryFluxError::Persistence(format!("expire_stale: {e}")))?;
         // Leases handed to waiters that never came back for them, and waiters that
         // stopped retrying long ago.
-        let unclaimed = sqlx::query(
-            "DELETE FROM cluster_capacity_leases WHERE NOT claimed AND acquired_at < now() - interval '10 seconds'",
+        // Through the release function, which takes the clusters' locks first.
+        let unclaimed: i64 = sqlx::query_scalar(
+            r#"
+            SELECT queryflux_capacity_release(ARRAY(
+                SELECT query_id FROM cluster_capacity_leases
+                WHERE NOT claimed AND acquired_at < now() - interval '10 seconds'
+            ))
+            "#,
         )
-        .execute(&self.coordination_pool)
+        .fetch_one(&self.coordination_pool)
         .await
         .map_err(|e| QueryFluxError::Persistence(format!("expire unclaimed grants: {e}")))?;
         sqlx::query(
@@ -2627,9 +2623,9 @@ impl CapacityStore for PostgresStore {
         .execute(&self.coordination_pool)
         .await
         .map_err(|e| QueryFluxError::Persistence(format!("expire waiters: {e}")))?;
-        if unclaimed.rows_affected() > 0 {
+        if unclaimed > 0 {
             tracing::info!(
-                leases = unclaimed.rows_affected(),
+                leases = unclaimed,
                 "Expired capacity handed to queries that stopped waiting"
             );
         }
@@ -4002,6 +3998,91 @@ mod tests {
             0,
             "no unclaimed slot left behind"
         );
+    }
+
+    /// Many parked waiters leave the line at once while releases hand slots over, across
+    /// two clusters: releases take the clusters' locks before the waiter rows, so none
+    /// deadlocks (Postgres would fail one of them), and nothing is left behind.
+    #[tokio::test]
+    #[ignore]
+    async fn pg_capacity_mass_departure_during_hand_overs_does_not_deadlock() {
+        let _guard = CAPACITY_TEST_LOCK.lock().await;
+        let store = std::sync::Arc::new(test_store().await);
+        for round in 0..5 {
+            let clusters = [
+                unique_id(&format!("md{round}a")),
+                unique_id(&format!("md{round}b")),
+            ];
+            let mut holders = Vec::new();
+            let mut waiters = Vec::new();
+            for c in &clusters {
+                for i in 0..2 {
+                    let q = format!("{c}-h{i}");
+                    assert!(store.try_acquire(c, 2, "i", &q).await.unwrap());
+                    holders.push((c.clone(), q));
+                }
+                for i in 0..20 {
+                    let q = format!("{c}-w{i}");
+                    assert!(!store.try_acquire(c, 2, "i", &q).await.unwrap());
+                    park(&store, c, &q).await;
+                    waiters.push((c.clone(), q));
+                }
+            }
+            let mut tasks = Vec::new();
+            for chunk in holders
+                .into_iter()
+                .chain(waiters)
+                .collect::<Vec<_>>()
+                .chunks(3)
+            {
+                let (store, chunk) = (store.clone(), chunk.to_vec());
+                tasks.push(tokio::spawn(
+                    async move { store.release_many(&chunk).await },
+                ));
+            }
+            for t in tasks {
+                t.await
+                    .unwrap()
+                    .expect("no release fails (a deadlock would)");
+            }
+            for c in &clusters {
+                assert_eq!(lease_rows(&store, c).await, 0);
+                assert_eq!(waiter_rows(&store, c).await, 0);
+                assert_eq!(store.active_lease_count(c).await.unwrap(), 0);
+            }
+        }
+    }
+
+    /// Capacity that frees without a release (here the limit goes up) reaches a parked
+    /// waiter when it renews its wait.
+    #[tokio::test]
+    #[ignore]
+    async fn pg_capacity_renewing_a_wait_picks_up_free_capacity() {
+        let _guard = CAPACITY_TEST_LOCK.lock().await;
+        let store = test_store().await;
+        let c = unique_id("renew");
+        let (q1, q2) = (format!("{c}-1"), format!("{c}-2"));
+        assert!(store.try_acquire(&c, 1, "i", &q1).await.unwrap());
+        assert!(!store.try_acquire(&c, 1, "i", &q2).await.unwrap());
+        assert!(!park(&store, &c, &q2).await);
+        // Another query's acquire records the higher limit; q2 is ahead of it in line.
+        assert!(!store
+            .try_acquire(&c, 2, "i", &format!("{c}-3"))
+            .await
+            .unwrap());
+        assert!(
+            park(&store, &c, &q2).await,
+            "handed the new slot on renewal"
+        );
+        assert!(store.try_acquire(&c, 2, "i", &q2).await.unwrap());
+        store
+            .release_many(&[
+                (c.clone(), q1),
+                (c.clone(), q2),
+                (c.clone(), format!("{c}-3")),
+            ])
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

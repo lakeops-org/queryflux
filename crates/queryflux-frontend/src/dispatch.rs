@@ -1189,6 +1189,12 @@ async fn persist_queued_query(
 // execute_to_sink — shared Arrow execution driver for non-Trino-HTTP frontends
 // ---------------------------------------------------------------------------
 
+/// A query waiting in the capacity line retries its acquire at least this often, even
+/// if it isn't handed a slot.
+const RENEW_WAITS_FOR: chrono::Duration = chrono::Duration::seconds(5);
+/// Longest single `wait_for_grant`; each one also renews the query's place in line.
+const MAX_SINGLE_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// How long to wait between queue retries (exponential backoff, capped at 2s).
 fn queued_backoff(seq: u64) -> std::time::Duration {
     std::time::Duration::from_millis((100u64 * (1 << seq.min(4))).min(2000))
@@ -1699,20 +1705,36 @@ async fn setup_sync_query(
                 {
                     CapacityGrant::Denied => {
                         // Global capacity full or coordination unavailable (fail-closed) —
-                        // release the local slot, then wait for the backend to hand this
-                        // query a slot (it is in line under its id), at most the backoff.
+                        // release the local slot, then wait in line (under the query's
+                        // id) until the backend hands this query a slot. Each wait renews
+                        // its place cheaply; a full retry only comes when it was handed a
+                        // slot, or every RENEW_WAITS_FOR as a fallback (an older control
+                        // plane that can't hand over, a missed notification).
                         slot.release_local().await;
                         waited_on = Some(name.clone());
-                        if let Some(cap) = &state.capacity_store {
-                            if let Err(e) = cap
-                                .wait_for_grant(&name.0, &query_id.0, queued_backoff(seq))
-                                .await
-                            {
-                                tracing::debug!("Capacity wait failed, retrying: {e}");
-                                queued_backoff_delay(seq).await;
+                        match &state.capacity_store {
+                            Some(cap) => {
+                                let retry_at = (Utc::now() + RENEW_WAITS_FOR).min(deadline);
+                                loop {
+                                    let left = (retry_at - Utc::now())
+                                        .to_std()
+                                        .unwrap_or_default()
+                                        .min(MAX_SINGLE_WAIT);
+                                    if left.is_zero() {
+                                        break;
+                                    }
+                                    match cap.wait_for_grant(&name.0, &query_id.0, left).await {
+                                        Ok(true) => break,
+                                        Ok(false) => {}
+                                        Err(e) => {
+                                            tracing::debug!("Capacity wait failed, retrying: {e}");
+                                            queued_backoff_delay(seq).await;
+                                            break;
+                                        }
+                                    }
+                                }
                             }
-                        } else {
-                            queued_backoff_delay(seq).await;
+                            None => queued_backoff_delay(seq).await,
                         }
                         seq += 1;
                         continue;

@@ -160,11 +160,13 @@ Now waiting is a line, kept in Postgres:
    - On a worker, it long-polls `POST /worker/capacity/wait` on the control plane, for up to 3 seconds per request.
    - With quotas, a quota slot freeing up on the same process wakes it too.
 
-   Either way the wait is capped by the old backoff, and the query retries when it wakes. That retry claims the lease created for it.
+   Each wait lasts up to 2 seconds and renews the query's place in line. A renewal is cheap: no lock while the cluster is full. If the cluster has free capacity nobody was handed (its limit went up), the renewal hands it out. The query retries its acquire when it is handed a slot, which claims it, or every 5 seconds as a fallback.
 
 **Leases nobody claims.** A slot handed to a query that has since given up (timed out, client gone) stays unclaimed. An unclaimed lease older than 10 seconds is deleted by the next acquire on that cluster, and by the expiry sweep. A query that times out waiting leaves the line at once. Releasing a query is two statements (leave the line, then drop the lease), so a release that races a hand-over to the same query also removes the slot just handed to it.
 
-**Locks.** The release trigger takes each cluster's advisory lock before its counter row, in cluster-name order: the same order as acquires and the allocator. A hand-over never races an acquire past the limit.
+**Locks.** Everything that changes a cluster's leases or line takes the cluster's advisory lock first, in cluster-name order when there are several: acquires, the release trigger, the release function (before it touches waiter rows) and the allocator. A hand-over never races an acquire past the limit, and releases don't deadlock with hand-overs.
+
+**Cost of the line.** An acquire only counts the waiters ahead of it up to the number of free slots, so its cost doesn't grow with the length of the line.
 
 **Compatibility.**
 - An older worker gets 404 from `/worker/capacity/wait` and keeps retrying on its timer. It also releases its query right after every denial. It never parks, so it is never handed a slot it would give straight back, and it doesn't hold up others: it competes for free slots as before.
