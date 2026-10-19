@@ -1,63 +1,15 @@
 import type {ReactNode} from 'react';
-import clsx from 'clsx';
-import Link from '@docusaurus/Link';
-import useBaseUrl from '@docusaurus/useBaseUrl';
-import useDocusaurusContext from '@docusaurus/useDocusaurusContext';
 import Layout from '@theme/Layout';
-import Heading from '@theme/Heading';
-import ThemedImage from '@theme/ThemedImage';
 
-import HomepageFeatures from '@site/src/components/HomepageFeatures';
-import HomepageUseCases from '@site/src/components/HomepageUseCases';
-import HomepageBenefits from '@site/src/components/HomepageBenefits';
-import HomepageNextSteps from '@site/src/components/HomepageNextSteps';
-import StatsStrip from '@site/src/components/StatsStrip';
+import HomeHero from '@site/src/components/Home/HomeHero';
+import EngineStrip from '@site/src/components/Home/EngineStrip';
+import HomeComparison from '@site/src/components/Home/HomeComparison';
+import HomeArchitecture from '@site/src/components/Home/HomeArchitecture';
+import HomePillars from '@site/src/components/Home/HomePillars';
+import HomeUseCases from '@site/src/components/Home/HomeUseCases';
+import HomeCommunity from '@site/src/components/Home/HomeCommunity';
 import PageSeo from '@site/src/components/PageSeo';
-import styles from './index.module.css';
-
-function HomepageHeader(): ReactNode {
-  const {siteConfig} = useDocusaurusContext();
-
-  return (
-    <header className={styles.hero}>
-      <div className={styles.heroGlow} aria-hidden />
-      <div className={clsx('container', styles.heroInner)}>
-        <ThemedImage
-          className={styles.heroImage}
-          sources={{
-            light: useBaseUrl('/img/queryflux-hero-banner.png'),
-            dark: useBaseUrl('/img/queryflux-hero-banner.svg'),
-          }}
-          alt="QueryFlux — multi-engine SQL routing in Rust, connecting clients to Trino, DuckDB, StarRocks, Snowflake, Databricks, and more"
-          width={1024}
-          height={682}
-          decoding="async"
-        />
-        {/* The image already carries the "QueryFlux" wordmark + "One Query. Any
-            Engine." tagline — an H1 repeating the name right below it would just
-            be noise. The H1 is the one thing the image can't say: what it does. */}
-        <Heading as="h1" className={styles.heroTitle}>
-          {siteConfig.tagline}
-        </Heading>
-        <p className={styles.heroLeadin}>
-          One front door for SQL clients — Trino, PostgreSQL, MySQL, and Flight on
-          the wire; Trino, DuckDB, StarRocks, and more behind it. Route by rules,
-          translate dialects with sqlglot, and run with metrics and queueing.
-        </p>
-        <div className={styles.ctaRow}>
-          <Link className={clsx('button button--lg', styles.ctaPrimary)} to="/docs/intro">
-            Documentation
-          </Link>
-          <Link
-            className={clsx('button button--lg button--outline', styles.ctaGhost)}
-            href="https://github.com/lakeops-org/queryflux">
-            GitHub
-          </Link>
-        </div>
-      </div>
-    </header>
-  );
-}
+import styles from '@site/src/components/Home/styles.module.css';
 
 /** Homepage meta description; keep concise for search-result snippets (~155 chars / ~1000px). */
 const HOME_DESCRIPTION =
@@ -78,14 +30,17 @@ export default function Home(): ReactNode {
         pathname="/"
         image="img/queryflux-hero-banner.png"
       />
-      <HomepageHeader />
-      <main className={styles.mainBelowFold}>
-        <StatsStrip />
-        <HomepageFeatures />
-        <HomepageUseCases />
-        <HomepageBenefits />
-        <HomepageNextSteps />
-      </main>
+      <div className={styles.home}>
+        <HomeHero />
+        <main>
+          <EngineStrip />
+          <HomeComparison />
+          <HomeArchitecture />
+          <HomePillars />
+          <HomeUseCases />
+          <HomeCommunity />
+        </main>
+      </div>
     </Layout>
   );
 }

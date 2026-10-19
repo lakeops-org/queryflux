@@ -12,26 +12,52 @@ const sidebars: SidebarsConfig = {
     },
     {
       type: 'category',
-      label: 'Guides',
-      collapsed: false,
-      items: ['getting-started', 'studio', 'authentication'],
+      label: 'Quickstarts',
+      collapsed: true,
+      link: {type: 'doc', id: 'getting-started'},
+      items: [
+        'quickstart/first-query',
+        'quickstart/local-duckdb',
+        'quickstart/multi-engine',
+        'quickstart/observability',
+        'quickstart/ai-agent-mcp',
+        'quickstart/oidc',
+      ],
     },
     {
       type: 'category',
-      label: 'Operations',
-      collapsed: false,
-      items: ['operations/multi-replica', 'operations/worker-mode', 'operations/worker-sidecar', 'operations/adbc-drivers'],
+      label: 'Installation & Deployment',
+      collapsed: true,
+      link: {type: 'doc', id: 'installation/overview'},
+      items: [
+        'installation/binary',
+        'installation/docker',
+        'installation/kubernetes',
+        'operations/adbc-drivers',
+        {
+          type: 'category',
+          label: 'Scaling out',
+          collapsed: true,
+          items: ['operations/multi-replica', 'operations/worker-mode', 'operations/worker-sidecar'],
+        },
+      ],
+    },
+    {
+      type: 'category',
+      label: 'Guides',
+      collapsed: true,
+      items: ['studio', 'authentication'],
     },
     {
       type: 'category',
       label: 'Reference',
-      collapsed: false,
+      collapsed: true,
       items: ['configuration'],
     },
     {
       type: 'category',
       label: 'Agentic AI',
-      collapsed: false,
+      collapsed: true,
       items: [
         'agentic/overview',
         'agentic/agent-context',
@@ -41,7 +67,7 @@ const sidebars: SidebarsConfig = {
     {
       type: 'category',
       label: 'Access Control',
-      collapsed: false,
+      collapsed: true,
       items: [
         'access-control/overview',
         'access-control/opa',
@@ -49,7 +75,7 @@ const sidebars: SidebarsConfig = {
         {
           type: 'category',
           label: 'Use cases',
-          collapsed: false,
+          collapsed: true,
           items: [
             'access-control/customer-api-row-filters',
             'access-control/internal-analysts',
