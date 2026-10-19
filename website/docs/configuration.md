@@ -177,7 +177,7 @@ Set `distributed: false` to run Postgres-backed persistence without cross-replic
 
 **Connection pools.** Each process opens three pools: query state (`queryPoolSize`, default 7), coordination for capacity leases, queue claims and sweep locks (`coordinationPoolSize`, default 8), and admin (`adminPoolSize`, default 2), plus one `LISTEN` connection. Connections open on demand. Size `coordinationPoolSize` to the admissions per second you expect × about 1 ms. The legacy `poolSize` instead sets one budget split 60/20/20, and is ignored when any of the three is set.
 
-Helm / Kubernetes: see **[charts/queryflux/README.md](https://github.com/lakeops-org/queryflux/blob/main/charts/queryflux/README.md#persistence-and-replicas)**. Full behavior: **[Cluster variants, health checks & reconciliation](./architecture/cluster-variants-and-health#distributed-mode-and-capacitystore)**.
+Helm / Kubernetes: see **[Run multiple replicas](./installation/kubernetes.md#run-multiple-replicas)**. Full behavior: **[Cluster variants, health checks & reconciliation](./architecture/cluster-variants-and-health#distributed-mode-and-capacitystore)**.
 
 ## Worker mode
 
