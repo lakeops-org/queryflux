@@ -10,3 +10,10 @@ xxhash-rust = { version = "0.8", features = ["xxh64"] }
 polyglot-sql = { workspace = true, features = ["all-dialects"] }
 regex = "1"
 tracing = { workspace = true }
+
+[dev-dependencies]
+divan = { version = "5.0.3", package = "codspeed-divan-compat" }
+
+[[bench]]
+name = "fingerprint"
+harness = false

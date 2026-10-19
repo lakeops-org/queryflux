@@ -1,0 +1,61 @@
+name: CodSpeed
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - 'website/**'
+      - 'docs/**'
+      - '**/*.md'
+      - 'LICENSE*'
+  pull_request:
+    paths-ignore:
+      - 'website/**'
+      - 'docs/**'
+      - '**/*.md'
+      - 'LICENSE*'
+  # Allows CodSpeed to trigger backtest performance analysis to generate initial data.
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+  id-token: write # OpenID Connect authentication with CodSpeed
+
+env:
+  RUST_TOOLCHAIN_VERSION: "1.91.1"
+  CARGO_TERM_COLOR: always
+
+jobs:
+  benchmarks:
+    name: Run benchmarks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@44c2b7a8a4ea60a981eaca3cf939b5f4305c123b # v4.1.5
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@d8352f6b1d2e870bc5716e7a6d9b65c4cc244a1a
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN_VERSION }}
+
+      - uses: taiki-e/install-action@742a3317eac7bd62f91cd888b4eead5e784ba833 # v2
+        with:
+          tool: cargo-codspeed
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: codspeed
+          cache-on-failure: true
+
+      - name: Build the benchmark targets
+        run: cargo codspeed build -m simulation -p queryflux-fingerprint
+
+      - name: Run the benchmarks
+        uses: CodSpeedHQ/action@821a40cd6c80e3cfe387caf55668287addd808da # v5.5.0
+        with:
+          mode: simulation
+          run: cargo codspeed run

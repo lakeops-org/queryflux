@@ -21,6 +21,7 @@
   <a href="https://github.com/lakeops-org/queryflux/blob/main/LICENSE"><img src="https://img.shields.io/github/license/lakeops-org/queryflux?style=for-the-badge&amp;logo=apache&amp;logoColor=white" alt="License" /></a>
   <a href="https://github.com/lakeops-org/queryflux/issues"><img src="https://img.shields.io/github/issues/lakeops-org/queryflux?style=for-the-badge&amp;logo=github&amp;logoColor=white&amp;label=issues" alt="Open issues" /></a>
   <a href="https://github.com/lakeops-org/queryflux/stargazers"><img src="https://img.shields.io/github/stars/lakeops-org/queryflux?style=for-the-badge&amp;logo=github&amp;logoColor=white&amp;label=stars" alt="GitHub stars" /></a>
+  <a href="https://app.codspeed.io/lakeops-org/queryflux?utm_source=badge"><img src="https://img.shields.io/endpoint?url=https://codspeed.io/badge.json" alt="CodSpeed"/></a>
 </p>
 <p align="center">
   <a href="https://join.slack.com/t/queryfluxworkspace/shared_invite/zt-3v7qedxj9-o8ElCLGK0UXT8xBU0_bD8w">Slack community</a>
