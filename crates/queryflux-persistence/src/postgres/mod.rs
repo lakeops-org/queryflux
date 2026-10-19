@@ -2543,11 +2543,18 @@ mod tests {
         assert_eq!(cfg.resolve_pool_sizes().unwrap(), (12, 3, 5));
     }
 
+    /// Migrations run once per test process. Tests run in parallel, and on a fresh
+    /// database concurrent `migrate()` calls race to create Refinery's history table
+    /// ("error asserting migrations table").
+    static MIGRATED: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
+
     async fn test_store() -> PostgresStore {
         let url = std::env::var("DATABASE_URL")
             .expect("DATABASE_URL must be set for Postgres integration tests");
         let store = PostgresStore::connect(&url).await.unwrap();
-        store.migrate().await.unwrap();
+        MIGRATED
+            .get_or_init(|| async { store.migrate().await.unwrap() })
+            .await;
         store
     }
 
@@ -3452,10 +3459,17 @@ mod tests {
 
         let store = test_store().await;
         let proxy_id = unique_id("dedup");
+        // Its own group and digest hash, so rows other tests left in the table don't count.
+        let group = unique_id("dedup-g");
+        let hash = (SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+            % i64::MAX as u128) as i64;
         let mut first = QueryRecord {
             proxy_query_id: proxy_id.clone(),
             backend_query_id: None,
-            cluster_group: ClusterGroupName("g".into()),
+            cluster_group: ClusterGroupName(group.clone()),
             cluster_name: ClusterName("c".into()),
             cluster_group_config_id: None,
             cluster_config_id: None,
@@ -3485,7 +3499,7 @@ mod tests {
             engine_stats: None,
             query_tags: Default::default(),
             query_hash: None,
-            query_parameterized_hash: Some(42),
+            query_parameterized_hash: Some(hash),
             translated_query_hash: None,
             digest_text: Some("select 1".into()),
             translated_digest_text: None,
@@ -3508,6 +3522,7 @@ mod tests {
 
         let rows = store
             .list_queries(&QueryFilters {
+                cluster_group: Some(group.clone()),
                 limit: 50,
                 ..Default::default()
             })
@@ -3531,7 +3546,7 @@ mod tests {
         let digest_count: (i64,) = sqlx::query_as(
             "SELECT call_count FROM query_digest_stats WHERE query_parameterized_hash = $1",
         )
-        .bind(42_i64)
+        .bind(hash)
         .fetch_one(&store.admin_pool)
         .await
         .unwrap();
