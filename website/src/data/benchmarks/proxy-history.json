@@ -1,0 +1,39 @@
+[
+ {
+  "commit": "b405e7f2d0f45cd8a474bf5e3365b62c2408edaf",
+  "date": "2026-10-19T08:38:08+00:00",
+  "runner": "a developer laptop (Apple Silicon, macOS) — placeholder until the first CI run on main",
+  "metrics": {
+   "Trino — Direct p50 (ms)": 0.0744,
+   "Trino — Direct p95 (ms)": 0.1145,
+   "Trino — Direct p99 (ms)": 0.1436,
+   "Trino — Direct mean (ms)": 0.0766,
+   "Trino — Direct stddev (ms)": 0.0208,
+   "Trino — Via QueryFlux p50 (ms)": 0.1875,
+   "Trino — Via QueryFlux p95 (ms)": 0.2571,
+   "Trino — Via QueryFlux p99 (ms)": 0.3037,
+   "Trino — Via QueryFlux mean (ms)": 0.193,
+   "Trino — Via QueryFlux stddev (ms)": 0.0364,
+   "Trino — Overhead p50 (ms)": 0.1199,
+   "Trino — Overhead p95 (ms)": 0.1408,
+   "Trino — Overhead p99 (ms)": 0.1624,
+   "Trino — Overhead mean (ms)": 0.1227,
+   "Trino — Overhead vs direct p50 (%)": 157.5042,
+   "StarRocks — Direct p50 (ms)": 0.0486,
+   "StarRocks — Direct p95 (ms)": 0.088,
+   "StarRocks — Direct p99 (ms)": 0.1267,
+   "StarRocks — Direct mean (ms)": 0.0522,
+   "StarRocks — Direct stddev (ms)": 0.0265,
+   "StarRocks — Via QueryFlux p50 (ms)": 0.3493,
+   "StarRocks — Via QueryFlux p95 (ms)": 0.4512,
+   "StarRocks — Via QueryFlux p99 (ms)": 0.6063,
+   "StarRocks — Via QueryFlux mean (ms)": 0.356,
+   "StarRocks — Via QueryFlux stddev (ms)": 0.0747,
+   "StarRocks — Overhead p50 (ms)": 0.2969,
+   "StarRocks — Overhead p95 (ms)": 0.3665,
+   "StarRocks — Overhead p99 (ms)": 0.4783,
+   "StarRocks — Overhead mean (ms)": 0.2995,
+   "StarRocks — Overhead vs direct p50 (%)": 598.3437
+  }
+ }
+]

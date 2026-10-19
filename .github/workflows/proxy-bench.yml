@@ -1,0 +1,141 @@
+# End-to-end proxy overhead (crates/queryflux-bench: mock Trino / MySQL backends, direct vs
+# through QueryFlux). Wall-clock, so it's noisy on shared runners and costs two release
+# builds — it does NOT run on every PR:
+#
+#  * PRs: opt-in. A maintainer adds the `benchmark` label (only triage/write access can, so
+#    the label doubles as the run approval). Base and head are built and alternated on this
+#    one runner (scripts/bench/proxy-ab.sh); benchmark-comment.yml posts the report as a
+#    sticky PR comment. To re-run after new commits, remove and re-add the label.
+#  * main: called by ci.yml on every merge that touches Rust (head-only). ci.yml's
+#    `bench-publish` records the result and flags jumps against recent main history.
+#
+# Regressions only warn — they never fail a check.
+name: Proxy benchmark
+
+on:
+  pull_request:
+    types: [labeled]
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  proxy-bench:
+    name: Proxy overhead benchmark
+    if: |
+      github.event_name != 'pull_request' ||
+      (github.event.label.name == 'benchmark' && github.event.pull_request.draft == false)
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    # PRs: a re-label cancels the previous run. main: unique group — ci.yml already queues
+    # main runs, and a shared group here would drop a pending run when a third merge lands.
+    concurrency:
+      group: proxy-bench-${{ github.event.pull_request.number || github.run_id }}
+      cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_INCREMENTAL: "0"
+      RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
+      DUCKDB_LIB_DIR: /usr/local/lib
+      DUCKDB_INCLUDE_DIR: /usr/local/include
+      QUERYFLUX_BENCH_WARMUP: "200"
+      QUERYFLUX_BENCH_ITERATIONS: "2000"
+      BENCH_ROUNDS: "6"
+      # See scripts/bench/compare.py for the full rule (p50 only, consistent across rounds).
+      BENCH_THRESHOLD_PCT: "10"
+    steps:
+      - uses: actions/checkout@44c2b7a8a4ea60a981eaca3cf939b5f4305c123b # v4.1.5
+        with:
+          persist-credentials: false
+          fetch-depth: 0 # base commit is checked out below for the A/B build
+
+      # ci.yml stays the single source of truth for toolchain and libduckdb pins.
+      - name: Read toolchain / libduckdb pins from ci.yml
+        run: |
+          for key in RUST_TOOLCHAIN_VERSION DUCKDB_VERSION DUCKDB_LIBDUCKDB_LINUX_AMD64_SHA256; do
+            val=$(sed -nE "s/^  ${key}: \"([^\"]+)\".*/\1/p" .github/workflows/ci.yml | head -1)
+            [ -n "$val" ] || { echo "::error::${key} not found in ci.yml env"; exit 1; }
+            echo "${key}=${val}" >> "$GITHUB_ENV"
+          done
+
+      - name: Install mold linker
+        run: sudo apt-get update && sudo apt-get install -y mold
+
+      - name: Install libduckdb
+        run: bash scripts/install-libduckdb.sh
+
+      - uses: dtolnay/rust-toolchain@d8352f6b1d2e870bc5716e7a6d9b65c4cc244a1a
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN_VERSION }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: queryflux-release
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Python venv (sqlglot / PyO3)
+        run: |
+          python3 -m venv --clear .venv
+          .venv/bin/python3 -m pip install -r requirements.txt
+          echo "PYO3_PYTHON=${GITHUB_WORKSPACE}/.venv/bin/python3" >> "$GITHUB_ENV"
+          echo "PYTHONPATH=$(.venv/bin/python3 -c 'import site; print(site.getsitepackages()[0])')" >> "$GITHUB_ENV"
+
+      # Head first: its harness drives both sides, so base needs only the `queryflux` binary.
+      # Building base in the same target dir recompiles just the crates the PR touched.
+      - name: Build head (release)
+        run: |
+          cargo build --release --bin queryflux --bin queryflux-bench
+          mkdir -p "$RUNNER_TEMP/bins"
+          cp target/release/queryflux "$RUNNER_TEMP/bins/queryflux-head"
+          cp target/release/queryflux-bench "$RUNNER_TEMP/bins/queryflux-bench"
+
+      - name: Build base (release)
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.sha }}
+        run: |
+          git checkout --quiet "$BASE_SHA"
+          cargo build --release --bin queryflux
+          cp target/release/queryflux "$RUNNER_TEMP/bins/queryflux-base"
+          # --force: the base build may have rewritten Cargo.lock.
+          git checkout --quiet --force "$HEAD_SHA"
+
+      - name: Run benchmark
+        run: |
+          base=-
+          [ -x "$RUNNER_TEMP/bins/queryflux-base" ] && base="$RUNNER_TEMP/bins/queryflux-base"
+          HARNESS="$RUNNER_TEMP/bins/queryflux-bench" scripts/bench/proxy-ab.sh \
+            "$base" "$RUNNER_TEMP/bins/queryflux-head" "$BENCH_ROUNDS" bench-results
+
+      - name: Report
+        id: report
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          mode=()
+          [ "$EVENT_NAME" = "pull_request" ] || mode=(--head-only)
+          python3 scripts/bench/compare.py bench-results "${mode[@]}" \
+            --threshold "$BENCH_THRESHOLD_PCT" \
+            --json-out bench-results/head-median.json > bench-results/report.md
+          cat bench-results/report.md >> "$GITHUB_STEP_SUMMARY"
+          # benchmark-comment.yml posts report.md to this PR (it can't read our event).
+          if [ -n "$PR_NUMBER" ]; then echo "$PR_NUMBER" > bench-results/pr-number; fi
+
+      - name: Warn on regression
+        if: steps.report.outputs.regressed == 'true'
+        run: echo "::warning title=Proxy benchmark::Possible proxy-overhead regression — see the job summary."
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: proxy-bench
+          path: bench-results/
+          retention-days: 30

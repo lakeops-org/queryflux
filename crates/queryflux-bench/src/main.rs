@@ -14,6 +14,9 @@
 //!   `QUERYFLUX_BENCH_TRINO_POLL` — if `1`/`true`, mock Trino uses `POST` + one `GET` on a
 //!   Trino-shaped `nextUri` (`/v1/statement/executing/…`, so QueryFlux can rewrite and forward
 //!   poll requests). Default `0`.
+//!   `QUERYFLUX_BENCH_BIN` — path to the `queryflux` binary to benchmark. Default: the one
+//!   built next to this harness. CI uses it to run one harness against base and head builds
+//!   (see `scripts/bench/proxy-ab.sh`).
 
 use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -25,7 +28,7 @@ use axum::extract::{Path, State};
 use axum::response::Json;
 use axum::{routing::get, routing::post, Router};
 use mysql_async::prelude::Queryable;
-use mysql_async::{Conn, Opts, OptsBuilder};
+use mysql_async::{Opts, OptsBuilder, Pool};
 use opensrv_mysql::{
     AsyncMysqlIntermediary, AsyncMysqlShim, Column, ColumnFlags, ColumnType, OkResponse,
     ParamParser, QueryResultWriter, StatementMetaWriter,
@@ -256,11 +259,15 @@ routingFallback: bench-sr-group
         .timeout(Duration::from_secs(10))
         .build()?;
 
-    let mysql_opts = mysql_opts_mock(&mysql_url)?;
+    // Pooled, like QueryFlux's own StarRocks adapter: the direct baseline must not pay a
+    // TCP + MySQL handshake per query that the proxied path doesn't. (A fresh `Conn` per
+    // query also left a TIME_WAIT socket each time and exhausted ephemeral ports across
+    // repeated CI rounds.)
+    let mysql_pool = Pool::new(mysql_opts_mock(&mysql_url)?);
 
     eprintln!("[StarRocks] Warming up ({} queries each)...", cfg.warmup);
     for _ in 0..cfg.warmup {
-        let _ = send_mysql_select_one(&mysql_opts).await;
+        let _ = send_mysql_select_one(&mysql_pool).await;
         let _ = send_trino_until_done(&client, qf_port).await;
     }
 
@@ -271,7 +278,7 @@ routingFallback: bench-sr-group
     let mut direct_ms = Vec::with_capacity(cfg.iterations);
     for _ in 0..cfg.iterations {
         let t = Instant::now();
-        send_mysql_select_one(&mysql_opts).await?;
+        send_mysql_select_one(&mysql_pool).await?;
         direct_ms.push(t.elapsed().as_secs_f64() * 1000.0);
     }
 
@@ -286,6 +293,7 @@ routingFallback: bench-sr-group
         proxy_ms.push(t.elapsed().as_secs_f64() * 1000.0);
     }
 
+    let _ = mysql_pool.disconnect().await;
     let _ = qf_proc.kill();
     let _ = std::fs::remove_file(&config_path);
 
@@ -298,8 +306,8 @@ fn mysql_opts_mock(url: &str) -> anyhow::Result<Opts> {
     Ok(opts)
 }
 
-async fn send_mysql_select_one(opts: &Opts) -> anyhow::Result<()> {
-    let mut conn = Conn::new(opts.clone()).await?;
+async fn send_mysql_select_one(pool: &Pool) -> anyhow::Result<()> {
+    let mut conn = pool.get_conn().await?;
     conn.query_drop("SELECT 1").await?;
     Ok(())
 }
@@ -580,6 +588,13 @@ fn free_port() -> u16 {
 }
 
 fn find_queryflux_bin() -> anyhow::Result<std::path::PathBuf> {
+    // Explicit override: CI A/B runs point one harness build at a base and a head binary.
+    if let Ok(path) = std::env::var("QUERYFLUX_BENCH_BIN") {
+        let path = std::path::PathBuf::from(path);
+        anyhow::ensure!(path.exists(), "QUERYFLUX_BENCH_BIN={path:?} does not exist");
+        return Ok(path);
+    }
+
     let current_exe = std::env::current_exe()?;
     let bin_dir = current_exe
         .parent()
@@ -629,6 +644,12 @@ fn percentile(sorted: &[f64], p: f64) -> f64 {
     }
     let idx = ((sorted.len() as f64 * p / 100.0) as usize).min(sorted.len() - 1);
     sorted[idx]
+}
+
+/// JSON values keep µs precision: at ~0.1 ms latencies, 0.01 ms steps are ~10% jumps,
+/// too coarse for base-vs-head comparisons.
+fn round4(v: f64) -> f64 {
+    (v * 10_000.0).round() / 10_000.0
 }
 
 fn round2(v: f64) -> f64 {
@@ -711,20 +732,20 @@ fn build_result_entries(engine: &str, direct_ms: &[f64], proxy_ms: &[f64]) -> Ve
 
     let prefix = format!("{engine} — ");
     vec![
-        json!({"name": format!("{prefix}Direct p50 (ms)"), "value": round2(d_p50), "unit": "ms"}),
-        json!({"name": format!("{prefix}Direct p95 (ms)"), "value": round2(d_p95), "unit": "ms"}),
-        json!({"name": format!("{prefix}Direct p99 (ms)"), "value": round2(d_p99), "unit": "ms"}),
-        json!({"name": format!("{prefix}Direct mean (ms)"), "value": round2(d_mean), "unit": "ms"}),
-        json!({"name": format!("{prefix}Direct stddev (ms)"), "value": round2(d_std), "unit": "ms"}),
-        json!({"name": format!("{prefix}Via QueryFlux p50 (ms)"), "value": round2(p_p50), "unit": "ms"}),
-        json!({"name": format!("{prefix}Via QueryFlux p95 (ms)"), "value": round2(p_p95), "unit": "ms"}),
-        json!({"name": format!("{prefix}Via QueryFlux p99 (ms)"), "value": round2(p_p99), "unit": "ms"}),
-        json!({"name": format!("{prefix}Via QueryFlux mean (ms)"), "value": round2(p_mean), "unit": "ms"}),
-        json!({"name": format!("{prefix}Via QueryFlux stddev (ms)"), "value": round2(p_std), "unit": "ms"}),
-        json!({"name": format!("{prefix}Overhead p50 (ms)"), "value": round2(p_p50 - d_p50), "unit": "ms"}),
-        json!({"name": format!("{prefix}Overhead p95 (ms)"), "value": round2(p_p95 - d_p95), "unit": "ms"}),
-        json!({"name": format!("{prefix}Overhead p99 (ms)"), "value": round2(p_p99 - d_p99), "unit": "ms"}),
-        json!({"name": format!("{prefix}Overhead mean (ms)"), "value": round2(p_mean - d_mean), "unit": "ms"}),
-        json!({"name": format!("{prefix}Overhead vs direct p50 (%)"), "value": round2(oh_ratio), "unit": "%"}),
+        json!({"name": format!("{prefix}Direct p50 (ms)"), "value": round4(d_p50), "unit": "ms"}),
+        json!({"name": format!("{prefix}Direct p95 (ms)"), "value": round4(d_p95), "unit": "ms"}),
+        json!({"name": format!("{prefix}Direct p99 (ms)"), "value": round4(d_p99), "unit": "ms"}),
+        json!({"name": format!("{prefix}Direct mean (ms)"), "value": round4(d_mean), "unit": "ms"}),
+        json!({"name": format!("{prefix}Direct stddev (ms)"), "value": round4(d_std), "unit": "ms"}),
+        json!({"name": format!("{prefix}Via QueryFlux p50 (ms)"), "value": round4(p_p50), "unit": "ms"}),
+        json!({"name": format!("{prefix}Via QueryFlux p95 (ms)"), "value": round4(p_p95), "unit": "ms"}),
+        json!({"name": format!("{prefix}Via QueryFlux p99 (ms)"), "value": round4(p_p99), "unit": "ms"}),
+        json!({"name": format!("{prefix}Via QueryFlux mean (ms)"), "value": round4(p_mean), "unit": "ms"}),
+        json!({"name": format!("{prefix}Via QueryFlux stddev (ms)"), "value": round4(p_std), "unit": "ms"}),
+        json!({"name": format!("{prefix}Overhead p50 (ms)"), "value": round4(p_p50 - d_p50), "unit": "ms"}),
+        json!({"name": format!("{prefix}Overhead p95 (ms)"), "value": round4(p_p95 - d_p95), "unit": "ms"}),
+        json!({"name": format!("{prefix}Overhead p99 (ms)"), "value": round4(p_p99 - d_p99), "unit": "ms"}),
+        json!({"name": format!("{prefix}Overhead mean (ms)"), "value": round4(p_mean - d_mean), "unit": "ms"}),
+        json!({"name": format!("{prefix}Overhead vs direct p50 (%)"), "value": round4(oh_ratio), "unit": "%"}),
     ]
 }

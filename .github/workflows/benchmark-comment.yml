@@ -1,0 +1,68 @@
+# Posts the proxy-overhead benchmark report (proxy-bench.yml, run when a PR gets the
+# `benchmark` label) as a sticky PR comment.
+#
+# Separate workflow because `pull_request` runs from forks get a read-only token and can't
+# comment. `workflow_run` runs in the base repo's context with a write token — so it must
+# treat the artifact as untrusted: it never checks out or runs PR code, only reads the PR
+# number (digits only, and verified to belong to the run's head SHA) and a Markdown body.
+name: Benchmark comment
+
+on:
+  workflow_run:
+    workflows: [Proxy benchmark]
+    types: [completed]
+
+permissions:
+  contents: read
+  actions: read
+  pull-requests: write
+
+jobs:
+  comment:
+    name: Post benchmark report
+    # Other labels also trigger proxy-bench.yml (as a skipped run) — only successful runs
+    # carry a report.
+    if: github.event.workflow_run.event == 'pull_request' && github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download report
+        id: download
+        continue-on-error: true # runs where proxy-bench was skipped have no artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: proxy-bench
+          path: bench-results
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ github.token }}
+
+      - name: Upsert sticky comment
+        if: steps.download.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          RUN_URL: ${{ github.event.workflow_run.html_url }}
+        run: |
+          pr=$(tr -dc '0-9' < bench-results/pr-number 2>/dev/null || true)
+          [ -n "$pr" ] || { echo "no PR number in artifact"; exit 0; }
+          pr_head=$(gh api "repos/$REPO/pulls/$pr" --jq .head.sha)
+          if [ "$pr_head" != "$HEAD_SHA" ]; then
+            echo "PR #$pr head is $pr_head, run was for $HEAD_SHA — stale or mismatched, skipping"
+            exit 0
+          fi
+
+          marker='<!-- queryflux-proxy-bench -->'
+          {
+            echo "$marker"
+            head -c 60000 bench-results/report.md
+            echo
+            echo "<sub>Base and head built and alternated on the same runner · \`${HEAD_SHA::12}\` · [run]($RUN_URL) · micro-benchmarks are reported separately by CodSpeed.</sub>"
+          } > body.md
+
+          existing=$(gh api --paginate "repos/$REPO/issues/$pr/comments" \
+            --jq "[.[] | select(.user.login == \"github-actions[bot]\" and (.body | startswith(\"$marker\")))][0].id // empty" | head -1)
+          if [ -n "$existing" ]; then
+            gh api -X PATCH "repos/$REPO/issues/comments/$existing" -F body=@body.md > /dev/null
+          else
+            gh api -X POST "repos/$REPO/issues/$pr/comments" -F body=@body.md > /dev/null
+          fi

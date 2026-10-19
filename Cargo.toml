@@ -104,6 +104,10 @@ futures = "0.3.32"
 # Python interop for sqlglot translation + routing scripts
 pyo3 = { version = "0.28.2", features = ["auto-initialize"] }
 
+# Micro-benchmarks (crates/*/benches). Criterion API; under `cargo codspeed` it switches to
+# CodSpeed's instruction-count measurement, plain `cargo bench` runs normal Criterion.
+criterion = { package = "codspeed-criterion-compat", version = "5.0.3", default-features = false, features = ["cargo_bench_support", "async_tokio"] }
+
 # MySQL wire protocol client (StarRocks backend — engine-adapters + bench)
 mysql_async = { version = "0.36.1", default-features = false, features = ["default-rustls"] }
 

@@ -1,0 +1,16 @@
+.lead {
+  font-size: 1.15rem;
+  max-width: 48rem;
+}
+
+.table {
+  display: table;
+  width: 100%;
+  margin-bottom: 2rem;
+}
+
+.table td:not(:first-child),
+.table th:not(:first-child) {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}

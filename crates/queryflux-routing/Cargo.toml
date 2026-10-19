@@ -13,3 +13,10 @@ serde = { workspace = true }
 regex = "1.12.3"
 pyo3 = { workspace = true }
 tracing = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+
+[[bench]]
+name = "routing"
+harness = false

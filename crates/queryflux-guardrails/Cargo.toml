@@ -17,3 +17,10 @@ pyo3 = { workspace = true }
 reqwest = { workspace = true }
 regex = "1.12.3"
 url = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+
+[[bench]]
+name = "guardrails"
+harness = false

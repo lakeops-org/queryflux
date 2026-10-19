@@ -51,7 +51,15 @@ cargo run --release -p queryflux-bench
 **Output**
 
 - Human-readable tables are printed to **stderr**.
-- A single **JSON array** is printed to **stdout** (`customSmallerIsBetter` shape for [github-action-benchmark](https://github.com/benchmark-action/github-action-benchmark)).
+- A single **JSON array** is printed to **stdout** (`[{"name", "value", "unit"}]`, values in ms with µs precision), consumed by `scripts/bench/compare.py`.
+
+| Variable | Meaning |
+|----------|---------|
+| `QUERYFLUX_BENCH_BIN` | Path of the `queryflux` binary to benchmark (default: the one built next to the harness). |
+
+## In CI
+
+Merges to `main` run this benchmark (`.github/workflows/proxy-bench.yml`, called from `ci.yml`) and record results on the `benchmark-data` branch, which feeds [queryflux.dev/benchmarks](https://queryflux.dev/benchmarks). `scripts/bench/publish.py` warns and comments on the merged PR when a run jumps against the last 10 `main` runs. On a PR, adding the `benchmark` label builds base and head in release mode and alternates them on the same runner (`scripts/bench/proxy-ab.sh`). `scripts/bench/compare.py` turns the runs into a sticky PR comment (warning only). Hot-path micro-benchmarks (`make bench-micro`) run under CodSpeed. Full description: [website/docs/benchmarks.md](website/docs/benchmarks.md).
 
 ## Sample results
 
