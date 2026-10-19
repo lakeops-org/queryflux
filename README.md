@@ -120,9 +120,9 @@ Once the password has been changed through the UI, YAML/env credentials are igno
 
 ## Benchmarks
 
-[![CodSpeed](https://img.shields.io/endpoint?url=https://codspeed.io/badge.json)](https://codspeed.io/lakeops-org/queryflux)
+[![CodSpeed Badge](https://img.shields.io/endpoint?url=https://app.codspeed.io/badge.json)](https://app.codspeed.io/lakeops-org/queryflux?utm_source=badge)
 
-- **Hot-path micro-benchmarks**, run on every PR that touches QueryFlux. Fingerprinting, routing, guardrails and SQL translation (`crates/*/benches`) run under [CodSpeed](https://codspeed.io/lakeops-org/queryflux), which counts CPU instructions, so even small regressions show up reliably.
+- **Hot-path micro-benchmarks**, run on every PR that touches QueryFlux. Fingerprinting, routing, guardrails and SQL translation (`crates/*/benches`) run under [CodSpeed](https://app.codspeed.io/lakeops-org/queryflux), which counts CPU instructions, so even small regressions show up reliably.
 - **Proxy overhead**, run on every merge to `main` and checked against recent history. [`queryflux-bench`](crates/queryflux-bench) sends `SELECT 1` to mock Trino / StarRocks backends, directly and through QueryFlux; the difference is the latency QueryFlux adds. For PRs that touch the request path, add the `benchmark` label to get an A/B comparison against the base. **Latest results: [queryflux.dev/benchmarks](https://queryflux.dev/benchmarks).**
 
 Regressions warn and never block a merge. Run locally with `make benchmark` (proxy) and `make bench-micro` (micro). See the [benchmarks docs](website/docs/benchmarks.md) for methodology.

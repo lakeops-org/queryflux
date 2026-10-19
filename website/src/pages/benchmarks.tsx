@@ -12,7 +12,7 @@ import styles from './benchmarks.module.css';
 type Run = {commit: string; date: string; runner?: string; metrics: Record<string, number>};
 
 const REPO_URL = 'https://github.com/lakeops-org/queryflux';
-const CODSPEED_URL = 'https://codspeed.io/lakeops-org/queryflux';
+const CODSPEED_URL = 'https://app.codspeed.io/lakeops-org/queryflux';
 const ENGINES = ['Trino', 'StarRocks'] as const;
 const HISTORY_ROWS = 15;
 

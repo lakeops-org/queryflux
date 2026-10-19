@@ -10,7 +10,7 @@ QueryFlux tracks performance at two levels. They run at different times because 
 
 | | What | How it's measured | When it runs | Where results go |
 | --- | --- | --- | --- | --- |
-| **Micro-benchmarks** | Per-function cost of the per-query hot paths | CPU instruction counts (CodSpeed simulation) | Every PR that touches QueryFlux code | PR comment, [CodSpeed dashboard](https://codspeed.io/lakeops-org/queryflux) |
+| **Micro-benchmarks** | Per-function cost of the per-query hot paths | CPU instruction counts (CodSpeed simulation) | Every PR that touches QueryFlux code | PR comment, [CodSpeed dashboard](https://app.codspeed.io/lakeops-org/queryflux) |
 | **Proxy overhead** | End-to-end latency a client sees through QueryFlux vs going direct | Wall-clock | Every merge to `main`, and PRs labelled `benchmark` | [**Live results**](/benchmarks), PR comment |
 
 Website and docs-only changes never trigger either.
