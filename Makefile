@@ -31,7 +31,7 @@ else
 TEST_RUNNER = $(CARGO) test --tests --workspace --exclude queryflux-e2e-tests --exclude queryflux-bench
 endif
 
-.PHONY: dev stop logs build lint clippy check helm-check test benchmark benchmark-build benchmark-run test-e2e clean setup
+.PHONY: dev stop logs build lint clippy check helm-check test benchmark benchmark-build benchmark-run bench-micro test-e2e clean setup
 
 
 
@@ -93,7 +93,7 @@ test:
 	PYTHONPATH=$(PYTHONPATH_VENV) \
 	$(TEST_RUNNER)
 
-## Micro-benchmark: mock Trino + StarRocks backends vs QueryFlux (release build).
+## Proxy-overhead benchmark: mock Trino + StarRocks backends vs QueryFlux (release build).
 ## Optional: QUERYFLUX_BENCH_WARMUP, QUERYFLUX_BENCH_ITERATIONS, QUERYFLUX_BENCH_TRINO_POLL.
 benchmark: benchmark-build benchmark-run
 
@@ -107,6 +107,15 @@ benchmark-run:
 	PYO3_PYTHON=$(shell pwd)/.venv/bin/python3 \
 	PYTHONPATH=$(PYTHONPATH_VENV) \
 	$(CARGO) run --release -p queryflux-bench
+
+## Hot-path micro-benchmarks (crates/*/benches, Criterion). CI runs the same targets under CodSpeed.
+## Narrow with e.g. `make bench-micro BENCH_ARGS='fingerprint/'`.
+bench-micro:
+	@test -f .venv/bin/python3 || (echo "Run 'make setup' first" && exit 1)
+	PYO3_PYTHON=$(shell pwd)/.venv/bin/python3 \
+	PYTHONPATH=$(PYTHONPATH_VENV) \
+	$(CARGO) bench --bench '*' -p queryflux-fingerprint -p queryflux-routing \
+		-p queryflux-guardrails -p queryflux-translation -- $(BENCH_ARGS)
 
 ## Run E2E tests. Spins up Trino + StarRocks + Lakekeeper stack via Docker.
 ## CI runs the same compose + `cargo test -p queryflux-e2e-tests` steps explicitly (see `e2e` job).

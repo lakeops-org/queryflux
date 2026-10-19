@@ -5,9 +5,11 @@ on:
     branches: [main]
     paths:
       - 'website/**'
-  # Rebuild nightly so sitemap lastmod stays fresh (seoConfig.ts sets lastmod to build date).
+  # Rebuild nightly so sitemap lastmod stays fresh (seoConfig.ts sets lastmod to build date)
+  # and /benchmarks picks up the latest main-branch results.
   schedule:
     - cron: '0 0 * * *'
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -35,6 +37,17 @@ jobs:
           node-version: 20
           cache: npm
           cache-dependency-path: website/package-lock.json
+
+      # ci.yml `bench-publish` keeps proxy benchmark results on the `benchmark-data` branch.
+      # Missing branch (e.g. forks) → keep the committed fallback data.
+      - name: Fetch benchmark results
+        run: |
+          if git fetch --depth 1 origin benchmark-data; then
+            git show FETCH_HEAD:proxy/latest.json > src/data/benchmarks/proxy-latest.json
+            git show FETCH_HEAD:proxy/history.json > src/data/benchmarks/proxy-history.json
+          else
+            echo "::notice::no benchmark-data branch — using committed benchmark data"
+          fi
 
       - name: Install dependencies
         run: npm ci

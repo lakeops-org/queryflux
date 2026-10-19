@@ -118,25 +118,14 @@ queryflux:
 
 Once the password has been changed through the UI, YAML/env credentials are ignored and the database record takes precedence. See the [Studio docs](website/docs/studio.md) for the full reference.
 
-## Benchmark (proxy overhead)
+## Benchmarks
 
-End-to-end overhead is measured by [`queryflux-bench`](crates/queryflux-bench) (`cargo run --bin queryflux-bench` after `cargo build --bin queryflux`). It uses **mock** backends (Trino HTTP + MySQL wire for StarRocks), **50** warmup queries per path, then **500** timed iterations of `SELECT 1` — direct to the mock vs the same request through QueryFlux (Trino HTTP frontend). Numbers vary by machine; CI tracks trends via [`.github/workflows/benchmark.yml`](.github/workflows/benchmark.yml).
+[![CodSpeed Badge](https://img.shields.io/endpoint?url=https://app.codspeed.io/badge.json)](https://app.codspeed.io/lakeops-org/queryflux?utm_source=badge)
 
-### Trino (mock HTTP coordinator)
+- **Hot-path micro-benchmarks**, run on every PR that touches QueryFlux. Fingerprinting, routing, guardrails and SQL translation (`crates/*/benches`) run under [CodSpeed](https://app.codspeed.io/lakeops-org/queryflux), which counts CPU instructions, so even small regressions show up reliably.
+- **Proxy overhead**, run on every merge to `main` and checked against recent history. [`queryflux-bench`](crates/queryflux-bench) sends `SELECT 1` to mock Trino / StarRocks backends, directly and through QueryFlux; the difference is the latency QueryFlux adds. For PRs that touch the request path, add the `benchmark` label to get an A/B comparison against the base. **Latest results: [queryflux.dev/benchmarks](https://queryflux.dev/benchmarks).**
 
-| | p50 | p95 | p99 |
-| --- | ---: | ---: | ---: |
-| Direct | 0.21 ms | 0.29 ms | 0.35 ms |
-| Via QueryFlux | 0.57 ms | 0.81 ms | 1.21 ms |
-| **Overhead** | **0.36 ms** | **0.52 ms** | **0.86 ms** |
-
-### StarRocks path (mock MySQL FE)
-
-| | p50 | p95 | p99 |
-| --- | ---: | ---: | ---: |
-| Direct (MySQL `SELECT 1`) | 0.36 ms | 0.54 ms | 1.20 ms |
-| Via QueryFlux | 0.70 ms | 1.21 ms | 4.20 ms |
-| **Overhead** | **0.34 ms** | **0.67 ms** | **3.01 ms** |
+Regressions warn and never block a merge. Run locally with `make benchmark` (proxy) and `make bench-micro` (micro). See the [benchmarks docs](website/docs/benchmarks.md) for methodology.
 
 ## Getting Started
 

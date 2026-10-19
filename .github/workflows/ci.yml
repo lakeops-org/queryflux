@@ -362,3 +362,177 @@ jobs:
       - name: Stop e2e Docker stack
         if: always() && (github.event_name == 'push' || steps.paths.outputs.e2e == 'true')
         run: docker compose -f docker/docker-compose.test.yml --project-directory . down
+
+  # ── Benchmarks ──────────────────────────────────────────────────────────────────────────
+  # Run only when QueryFlux itself changes. website/** and *.md never reach here (the
+  # workflow's paths-ignore); this narrows further so helm/docker-only PRs skip benches.
+  # PRs get CodSpeed (cheap, deterministic); the wall-clock proxy benchmark runs on main
+  # merges here and on PRs only via the `benchmark` label (proxy-bench.yml).
+  bench-changes:
+    name: Benchmark paths
+    needs: gate
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      rust: ${{ steps.paths.outputs.rust }}
+    steps:
+      - uses: actions/checkout@44c2b7a8a4ea60a981eaca3cf939b5f4305c123b # v4.1.5
+        with:
+          persist-credentials: false
+      - uses: dorny/paths-filter@0e4a8c6effa4802afeda77dc8d303f8176d7dfad # v3.0.4
+        id: paths
+        with:
+          filters: |
+            rust:
+              - 'crates/**'
+              - 'benches/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'rust-toolchain.toml'
+              - 'requirements.txt'
+              - 'scripts/bench/**'
+              - '.github/workflows/ci.yml'
+
+  # Micro-benchmarks (crates/*/benches) under CodSpeed's simulation mode: CPU instructions are
+  # counted, not wall-clock time, so results are deterministic on shared runners (<1% noise).
+  # CodSpeed compares each PR against main and posts its own PR comment; main pushes record
+  # the baseline. It never fails this job on a regression — it only reports.
+  codspeed:
+    name: Micro-benchmarks (CodSpeed)
+    needs: [gate, fmt, approval-gate-pr, approval-gate-push, bench-changes]
+    if: |
+      !cancelled() &&
+      needs.gate.result == 'success' &&
+      needs.fmt.result == 'success' &&
+      (needs.approval-gate-pr.result == 'success' || needs.approval-gate-pr.result == 'skipped') &&
+      (needs.approval-gate-push.result == 'success' || needs.approval-gate-push.result == 'skipped') &&
+      needs.bench-changes.outputs.rust == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      id-token: write # OIDC auth to CodSpeed — no token secret needed
+    steps:
+      - uses: actions/checkout@44c2b7a8a4ea60a981eaca3cf939b5f4305c123b # v4.1.5
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@d8352f6b1d2e870bc5716e7a6d9b65c4cc244a1a
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN_VERSION }}
+
+      - uses: taiki-e/install-action@742a3317eac7bd62f91cd888b4eead5e784ba833 # v2
+        with:
+          tool: cargo-codspeed@5.0.3
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: codspeed
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Python venv (sqlglot / PyO3)
+        run: |
+          python3 -m venv --clear .venv
+          .venv/bin/python3 -m pip install -r requirements.txt
+          echo "PYO3_PYTHON=${GITHUB_WORKSPACE}/.venv/bin/python3" >> "$GITHUB_ENV"
+          echo "PYTHONPATH=$(.venv/bin/python3 -c 'import site; print(site.getsitepackages()[0])')" >> "$GITHUB_ENV"
+
+      - name: Build benchmarks
+        run: >-
+          cargo codspeed build
+          -p queryflux-fingerprint -p queryflux-routing
+          -p queryflux-translation -p queryflux-guardrails
+
+      - uses: CodSpeedHQ/action@821a40cd6c80e3cfe387caf55668287addd808da # v5.5.0
+        with:
+          mode: simulation
+          run: cargo codspeed run
+
+  # End-to-end proxy overhead, head-only, on every main merge that touches Rust. On PRs it is
+  # opt-in via the `benchmark` label instead (wall-clock + two release builds is too costly
+  # and too noisy per PR) — see proxy-bench.yml.
+  proxy-bench:
+    name: Proxy benchmark (main)
+    needs: [gate, fmt, bench-changes]
+    if: |
+      !cancelled() &&
+      github.event_name == 'push' && github.ref == 'refs/heads/main' &&
+      needs.gate.result == 'success' &&
+      needs.fmt.result == 'success' &&
+      needs.bench-changes.outputs.rust == 'true'
+    permissions:
+      contents: read
+    uses: ./.github/workflows/proxy-bench.yml
+
+  # Main only: append this run to the `benchmark-data` branch (history.json / latest.json),
+  # which deploy-website.yml pulls into the Benchmarks page, and compare it with recent main
+  # history (scripts/bench/publish.py). On a jump, warn and comment on the merged PR — the
+  # safety net for PRs that didn't get the opt-in A/B. Separate job so the write token never
+  # shares a job with the benchmark build.
+  bench-publish:
+    name: Publish benchmark results
+    needs: proxy-bench
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.proxy-bench.result == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write # comment on the merged PR when the jump check fires
+    steps:
+      - uses: actions/checkout@44c2b7a8a4ea60a981eaca3cf939b5f4305c123b # v4.1.5
+        with:
+          sparse-checkout: scripts/bench
+          persist-credentials: false
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: proxy-bench
+          path: bench-results
+
+      - name: Push to benchmark-data branch
+        id: publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          remote="https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git"
+          for attempt in 1 2 3; do
+            rm -rf data jump.md && git init --quiet data
+            if git -C data fetch --quiet --depth 1 "$remote" benchmark-data; then
+              git -C data checkout --quiet -b benchmark-data FETCH_HEAD
+            else
+              git -C data checkout --quiet --orphan benchmark-data
+            fi
+            python3 scripts/bench/publish.py bench-results/head-median.json data \
+              --commit "$SHA" --report-out jump.md
+            git -C data add -A
+            git -C data commit --quiet -m "bench: proxy overhead @ ${SHA::12}"
+            git -C data push --quiet "$remote" benchmark-data && exit 0
+            echo "::warning::push to benchmark-data failed (attempt ${attempt}/3) — retrying"
+            sleep $((attempt * 5))
+          done
+          exit 1
+
+      - name: Flag jump on the merged PR
+        if: steps.publish.outputs.jump == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+        run: |
+          cat jump.md >> "$GITHUB_STEP_SUMMARY"
+          echo "::warning title=Proxy benchmark::Proxy overhead jumped vs recent main runs — see the job summary."
+          pr=$(gh api "repos/$REPO/commits/$SHA/pulls" --jq '.[0].number // empty')
+          if [ -n "$pr" ]; then
+            gh api -X POST "repos/$REPO/issues/$pr/comments" -F body=@jump.md > /dev/null
+          fi
