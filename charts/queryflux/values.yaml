@@ -48,7 +48,8 @@ studio:
   image:
     repository: ghcr.io/lakeops-org/queryflux-studio
     pullPolicy: IfNotPresent
-    # Studio publishes :latest on every main push; pin a release tag (or digest) for production.
+    # Studio publishes :latest on every main push; pin a release tag (or a digest,
+    # e.g. "sha256:…", rendered as repository@sha256:…) for production.
     tag: latest
   # Extra env, e.g. ADMIN_API_USERNAME / ADMIN_API_PASSWORD for bootstrap Basic auth.
   env: []

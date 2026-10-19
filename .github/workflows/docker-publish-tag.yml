@@ -1,7 +1,8 @@
 # Manually build and push multi-arch images from a chosen Git ref with explicit GHCR tags.
 # Does not run Release Please and does not move :latest / :latest-slim (those stay for automated releases).
 #
-# Example: image_tag = v0.1.2  →  ghcr.io/.../queryflux:v0.1.2 (and the :v0.1.2-slim alias).
+# Example: image_tag = v0.5.0  →  ghcr.io/.../queryflux:v0.5.0 (and the :v0.5.0-slim alias).
+# Tags up to v0.4.0 are rejected: those bare tags are server + Studio images and must keep that meaning.
 
 name: Docker — publish ref with tag
 
@@ -9,7 +10,7 @@ on:
   workflow_dispatch:
     inputs:
       image_tag:
-        description: "Version tag, e.g. v0.1.2 (publishes :v0.1.2 and :v0.1.2-slim)"
+        description: "Version tag after v0.4.0, e.g. v0.5.0 (publishes :v0.5.0 and :v0.5.0-slim)"
         required: true
         type: string
       git_ref:
@@ -47,6 +48,15 @@ jobs:
           if [[ "$TAG" == *"-slim" ]]; then
             echo "::error::image_tag must not end with -slim (server-only image is published as <tag>-slim automatically)"
             exit 1
+          fi
+          # Bare tags through v0.4.0 are the old server + Studio images. Republishing one
+          # would point it at the server-only image and drop Studio for anyone pinned to it.
+          if [[ "$TAG" =~ ^v?([0-9]+\.[0-9]+\.[0-9]+) ]]; then
+            version="${BASH_REMATCH[1]}"
+            if [ "$(printf '%s\n%s\n' "$version" 0.4.0 | sort -V | tail -n1)" = "0.4.0" ]; then
+              echo "::error::image_tag $TAG is a legacy tag (<= v0.4.0, server + Studio image); use a version after v0.4.0"
+              exit 1
+            fi
           fi
 
   build-slim:

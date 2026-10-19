@@ -9,6 +9,12 @@ helm install queryflux ./charts/queryflux
 kubectl port-forward svc/queryflux 3000:3000 8080:8080 9000:9000
 ```
 
+With `studio.enabled=false` the Service has no port 3000, so forward only the server ports:
+
+```bash
+kubectl port-forward svc/queryflux 8080:8080 9000:9000
+```
+
 The default release creates a starter DuckDB-backed QueryFlux configuration and generates the admin password in a Kubernetes Secret.
 Studio (the admin UI) runs as a `studio` sidecar container in each pod. It uses the separate image `ghcr.io/lakeops-org/queryflux-studio`, reaches the Admin API over `127.0.0.1`, and is served on service port `3000`. Pin `studio.image.tag` for production, and set `studio.enabled=false` to run the server alone.
 

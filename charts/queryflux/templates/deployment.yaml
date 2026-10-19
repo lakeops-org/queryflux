@@ -167,7 +167,8 @@ spec:
         - name: studio
           securityContext:
             {{- toYaml .Values.studio.securityContext | nindent 12 }}
-          image: "{{ .Values.studio.image.repository }}:{{ .Values.studio.image.tag }}"
+          {{- $studioTag := toString .Values.studio.image.tag }}
+          image: "{{ .Values.studio.image.repository }}{{ if hasPrefix "sha256:" $studioTag }}@{{ else }}:{{ end }}{{ $studioTag }}"
           imagePullPolicy: {{ .Values.studio.image.pullPolicy }}
           env:
             - name: ADMIN_API_URL
