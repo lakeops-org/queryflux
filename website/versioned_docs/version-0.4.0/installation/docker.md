@@ -19,10 +19,17 @@ QueryFlux publishes one image to GitHub Container Registry in two flavours:
 
 ## Run a container
 
+The example config below sends queries to a Trino at `http://trino:8080`. Put QueryFlux and Trino on one Docker network so that name resolves (skip the Trino container if you already have an engine reachable from Docker, and change `endpoint` to its address):
+
+```bash
+docker network create queryflux
+docker run -d --name trino --network queryflux trinodb/trino
+```
+
 The image reads its config from `/etc/queryflux/config.yaml`. Mount yours there:
 
 ```bash
-docker run -d --name queryflux \
+docker run -d --name queryflux --network queryflux \
   -p 8080:8080 -p 9000:9000 -p 3000:3000 \
   -v "$PWD/config.yaml:/etc/queryflux/config.yaml:ro" \
   -e QUERYFLUX_ADMIN_USER=admin \
@@ -116,7 +123,8 @@ services:
     environment:
       RUST_LOG: queryflux=info
       QUERYFLUX_ADMIN_USER: admin
-      QUERYFLUX_ADMIN_PASSWORD: change-me
+      # Required: compose refuses to start until you export a password
+      QUERYFLUX_ADMIN_PASSWORD: ${QUERYFLUX_ADMIN_PASSWORD:?set QUERYFLUX_ADMIN_PASSWORD}
     restart: unless-stopped
 ```
 

@@ -121,7 +121,20 @@ Add to `.cursor/mcp.json` (project-scoped) or Cursor's global MCP settings:
 
 ### Claude Desktop
 
-`claude_desktop_config.json` only accepts stdio server entries, so a streamable-HTTP URL pasted there is ignored. Use **Settings → Connectors → Add custom connector** instead, or bridge with [`mcp-remote`](https://www.npmjs.com/package/mcp-remote). Both options are covered in the [MCP frontend docs](../architecture/frontends/mcp.md#claude-desktop).
+`claude_desktop_config.json` only accepts stdio server entries, so bridge the local endpoint with [`mcp-remote`](https://www.npmjs.com/package/mcp-remote):
+
+```json title="claude_desktop_config.json"
+{
+  "mcpServers": {
+    "queryflux": {
+      "command": "npx",
+      "args": ["mcp-remote@latest", "http://localhost:8811/mcp"]
+    }
+  }
+}
+```
+
+**Settings → Connectors → Add custom connector** only works for a QueryFlux endpoint that Claude can reach over the internet, not `localhost`. See the [MCP frontend docs](../architecture/frontends/mcp.md#claude-desktop).
 
 :::tip With authentication enabled
 When QueryFlux requires auth, every client needs an `Authorization: Bearer <token>` header — for example `--header "Authorization: Bearer $QUERYFLUX_MCP_TOKEN"` on `claude mcp add`, or a `"headers"` object in Cursor's `mcp.json`. Read the token from an environment variable rather than committing it. See [Connecting a client](../architecture/frontends/mcp.md#connecting-a-client) for every client's exact syntax.

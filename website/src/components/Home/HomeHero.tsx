@@ -1,4 +1,4 @@
-import {useState, type ReactNode} from 'react';
+import {useRef, useState, type KeyboardEvent, type ReactNode} from 'react';
 import clsx from 'clsx';
 import Link from '@docusaurus/Link';
 import Heading from '@theme/Heading';
@@ -72,7 +72,26 @@ const TABS: Tab[] = [
 
 function CodeWindow(): ReactNode {
   const [active, setActive] = useState(TABS[0].id);
-  const tab = TABS.find((t) => t.id === active) ?? TABS[0];
+  const tabRefs = useRef<(HTMLButtonElement | null)[]>([]);
+  const activeIndex = Math.max(0, TABS.findIndex((t) => t.id === active));
+  const tab = TABS[activeIndex];
+
+  // WAI-ARIA tabs pattern: arrows move between tabs, Home/End jump to the ends.
+  const onKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
+    const last = TABS.length - 1;
+    const next = {
+      ArrowRight: activeIndex === last ? 0 : activeIndex + 1,
+      ArrowLeft: activeIndex === 0 ? last : activeIndex - 1,
+      Home: 0,
+      End: last,
+    }[event.key];
+    if (next === undefined) {
+      return;
+    }
+    event.preventDefault();
+    setActive(TABS[next].id);
+    tabRefs.current[next]?.focus();
+  };
 
   return (
     <div className={styles.codeWindow}>
@@ -82,13 +101,23 @@ function CodeWindow(): ReactNode {
           <i />
           <i />
         </span>
-        <div className={styles.codeTabs} role="tablist" aria-label="QueryFlux examples">
-          {TABS.map((t) => (
+        <div
+          className={styles.codeTabs}
+          role="tablist"
+          aria-label="QueryFlux examples"
+          onKeyDown={onKeyDown}>
+          {TABS.map((t, i) => (
             <button
               key={t.id}
+              ref={(el) => {
+                tabRefs.current[i] = el;
+              }}
+              id={`hero-tab-${t.id}`}
               type="button"
               role="tab"
               aria-selected={t.id === active}
+              aria-controls={`hero-panel-${t.id}`}
+              tabIndex={t.id === active ? 0 : -1}
               className={clsx(styles.codeTab, t.id === active && styles.codeTabActive)}
               onClick={() => setActive(t.id)}>
               {t.label}
@@ -96,7 +125,12 @@ function CodeWindow(): ReactNode {
           ))}
         </div>
       </div>
-      <pre className={styles.codeBody} role="tabpanel">
+      <pre
+        className={styles.codeBody}
+        role="tabpanel"
+        id={`hero-panel-${tab.id}`}
+        aria-labelledby={`hero-tab-${tab.id}`}
+        tabIndex={0}>
         {tab.lines.map((line, i) => (
           <div key={i} className={styles.codeLine}>
             <span className={styles.codeLineNo} aria-hidden>

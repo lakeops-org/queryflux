@@ -107,7 +107,7 @@ The full key reference is in [Configuration](../configuration.md).
 Point the Trino CLI at **QueryFlux** on port 8080, not at Trino on 8081. Use any username; this example has no authentication.
 
 ```bash
-./trino --server http://localhost:8080 --user test
+trino --server http://localhost:8080 --user test
 ```
 
 If you named the CLI JAR differently, use that filename, or `java -jar <file>` as in the Trino docs.

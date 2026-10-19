@@ -66,7 +66,13 @@ The `cli-quickstart` config uses the embedded **DuckDB** engine, so it works wit
 
 ## Run as a service
 
-A minimal systemd unit:
+`cargo install` puts the binary in `~/.cargo/bin`. Copy it somewhere system-wide first:
+
+```bash
+sudo install -m 755 ~/.cargo/bin/queryflux /usr/local/bin/queryflux
+```
+
+Then create a minimal systemd unit:
 
 ```ini title="/etc/systemd/system/queryflux.service"
 [Unit]

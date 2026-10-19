@@ -203,7 +203,7 @@ clusters:
     auth:
       type: basic
       username: root
-      password: ${STARROCKS_PASSWORD}
+      password: ""
 
 clusterGroups:
   trino-default:
@@ -234,10 +234,6 @@ routingFallback: trino-default
 - **`routingFallback`** is used when no router matches.
 
 Clients write SQL in the dialect of the protocol they use. When the target engine speaks a different dialect, QueryFlux translates with sqlglot. `translation.errorOnUnsupported: false` in this config means translation problems do not fail the query outright. See [Query translation](../architecture/query-translation.md).
-
-:::warning StarRocks password
-QueryFlux reads the YAML file as-is and does not expand `${...}` placeholders, so the StarRocks password above is the literal string `${STARROCKS_PASSWORD}`. The StarRocks all-in-one image's `root` user has no password (the loader connects with `mysql -u root` and no password). If MySQL wire queries fail with an authentication error, set `password: ""`, then recreate the stack with `docker compose down -v` and `docker compose up -d --wait`. A plain restart is not enough: with Postgres persistence, clusters and groups are seeded from YAML only when those tables are empty.
-:::
 
 ## Clean up
 

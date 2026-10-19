@@ -356,11 +356,29 @@
   to { transform: translateX(calc(-50% - 0.375rem)); }
 }
 
+/* No scrolling: wrap the chips so every name stays visible, and drop the
+   duplicate set that only exists to make the loop seamless. */
 @media (prefers-reduced-motion: reduce) {
   .marqueeTrack,
   .marqueeTrackReverse,
   .pulse {
     animation: none;
+  }
+
+  .marquee {
+    mask-image: none;
+    -webkit-mask-image: none;
+  }
+
+  .marqueeTrack,
+  .marqueeTrackReverse {
+    width: auto;
+    flex-wrap: wrap;
+    row-gap: 0.6rem;
+  }
+
+  .chip[aria-hidden='true'] {
+    display: none;
   }
 }
 

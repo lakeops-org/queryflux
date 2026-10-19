@@ -61,8 +61,7 @@ config:
           enabled: true
           port: 8080
       persistence:
-        type: postgres
-        url: postgres://queryflux:queryflux@postgres:5432/queryflux
+        type: inMemory   # single pod; for Postgres, see "Keep credentials out of ConfigMaps"
       adminApi:
         port: 9000
     clusters:
@@ -122,7 +121,7 @@ existingSecret:
 Multiple replicas need exactly two things:
 
 1. **A shared Postgres** that every pod connects to. The chart does not deploy one — use a managed database (RDS, Cloud SQL, …) or a Postgres chart in the cluster.
-2. **More than one pod** — `replicaCount > 1` or `autoscaling.enabled`.
+2. **More than one pod** — `replicaCount > 1`, or `autoscaling.enabled` with `autoscaling.minReplicas` of 2 or more (the chart default is 1).
 
 When all pods use the same Postgres, QueryFlux runs in distributed mode: config changes reach every pod, `maxRunningQueries` is one limit across all pods (not per pod), each queued query is dispatched by exactly one pod, and each pod derives its own instance ID.
 
