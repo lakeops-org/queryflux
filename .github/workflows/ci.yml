@@ -232,11 +232,14 @@ jobs:
         with:
           tool: nextest
 
+      # Only main saves: a PR cache is ~1.3 GB, and per-PR saves push the repo past the
+      # 10 GB Actions cache limit, evicting main's cache that every PR restores from.
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: queryflux
           cache-on-failure: true
           cache-all-crates: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - uses: actions/setup-python@v5
         with:
@@ -264,10 +267,14 @@ jobs:
       # Postgres ignored tests share one DATABASE_URL, migrate() on setup, and a static
       # CAPACITY_TEST_LOCK — they must run in one process (cargo test), not nextest
       # (which spawns each lib test in its own process).
+      # Same package selection as `make test` so features unify identically and the lib
+      # test binaries nextest just built are reused (`-p` alone rebuilt ~70 crates).
+      # Only queryflux-persistence has #[ignore] tests in lib targets; its other tests
+      # already ran under nextest.
       - name: Postgres integration tests (queryflux-persistence)
         env:
           DATABASE_URL: postgres://queryflux:queryflux@localhost:5432/queryflux_test
-        run: cargo test -p queryflux-persistence -- --include-ignored
+        run: cargo test --workspace --exclude queryflux-bench --lib -- --ignored
 
       # E2E: always on main pushes; on PRs only when runtime/docker paths change.
       - name: Wait for e2e prep (disk cleanup, image pull)
