@@ -1,0 +1,120 @@
+/*
+ * Blog posts — readable width, figure cards, lead paragraphs.
+ */
+
+.blog-wrapper .container.margin-vert--lg {
+  max-width: 52rem;
+}
+
+article .markdown {
+  --blog-lead: rgba(228, 228, 231, 0.92);
+  font-size: 1.0625rem;
+  line-height: 1.75;
+}
+
+article .markdown > p:first-of-type {
+  font-size: 1.125rem;
+  line-height: 1.8;
+  color: var(--blog-lead);
+}
+
+article .markdown > h2 {
+  margin-top: 2.75rem;
+  margin-bottom: 1rem;
+  padding-bottom: 0.35rem;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+article .markdown > h3 {
+  margin-top: 1.75rem;
+}
+
+article .markdown blockquote {
+  margin: 1.75rem 0;
+  padding: 1rem 1.25rem;
+  border-left: 3px solid #8b5cf6;
+  border-radius: 0 10px 10px 0;
+  background: rgba(139, 92, 246, 0.08);
+  color: rgba(228, 228, 231, 0.9);
+}
+
+article .markdown blockquote p {
+  margin: 0;
+}
+
+.blog-figure {
+  margin: 2rem 0;
+  padding: 0;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 14px;
+  overflow: hidden;
+  background: rgba(255, 255, 255, 0.02);
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.35);
+}
+
+.blog-figure img {
+  display: block;
+  width: 100%;
+  height: auto;
+  margin: 0;
+}
+
+.blog-figure figcaption {
+  padding: 0.75rem 1rem 1rem;
+  font-size: 0.875rem;
+  line-height: 1.5;
+  color: rgba(161, 161, 170, 0.95);
+  border-top: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+.blog-figure--pair {
+  display: grid;
+  gap: 1rem;
+}
+
+@media (min-width: 768px) {
+  .blog-figure--pair {
+    grid-template-columns: 1fr 1fr;
+  }
+}
+
+article .markdown .theme-admonition {
+  margin: 1.5rem 0;
+}
+
+article .markdown table {
+  display: table;
+  width: 100%;
+  margin: 1.5rem 0;
+  font-size: 0.9375rem;
+}
+
+article .markdown .mermaid {
+  margin: 2rem 0;
+  padding: 1rem;
+  border-radius: 14px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(255, 255, 255, 0.02);
+}
+
+.blog-list-page .hero--primary {
+  background: linear-gradient(180deg, #0b0614 0%, #000 100%);
+}
+
+article .markdown hr {
+  margin: 2.5rem 0;
+  border-color: rgba(255, 255, 255, 0.1);
+}
+
+article .markdown .blog-cta {
+  margin-top: 2.5rem;
+  padding: 1.25rem 1.5rem;
+  border-radius: 12px;
+  border: 1px solid rgba(196, 181, 253, 0.25);
+  background: rgba(139, 92, 246, 0.08);
+  text-align: center;
+}
+
+article .markdown .blog-cta p {
+  margin: 0;
+}

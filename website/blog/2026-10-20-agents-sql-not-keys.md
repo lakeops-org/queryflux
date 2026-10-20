@@ -3,101 +3,82 @@ slug: agents-sql-not-keys
 title: "Give agents SQL, not the keys to every engine"
 description: AI agents need live data, but a warehouse password and an open SQL prompt is the wrong interface. How to put agents behind QueryFlux, with routing, guardrails, identity and a record of every query, in one config file.
 authors: [amit]
-tags: [agents, mcp, guardrails, security]
-image: img/queryflux-hero-banner.png
+tags: [Guides]
+image: img/blog/agents-sql-hero.jpg
 ---
 
 The fastest way to give an AI agent data is also the worst one: hand it a warehouse connection string and let it write SQL. It works in a demo. In production it means one shared credential for every agent, no record of which agent ran what, and nothing between a generated `SELECT *` and your largest table.
 
-Agents shouldn't choose engines, and they shouldn't hold warehouse passwords. Something in the query path should decide where each query runs, what it may do, and keep the record. This post shows how to set that up with QueryFlux, using features that ship today.
+> **Agents shouldn't choose engines, and they shouldn't hold warehouse passwords.** Something in the query path should decide where each query runs, what it may do, and keep the record.
+
+This post shows how to set that up with QueryFlux using features that ship today.
 
 <!-- truncate -->
 
-## The setup
+<figure class="blog-figure">
+  <img src="/img/blog/agent-query-path.svg" alt="Flow diagram: agent connects via MCP to QueryFlux, which applies guardrails and impersonation before Trino, with query history in Studio" />
+  <figcaption>Agents see one endpoint. Operators keep routing, limits, guardrails, identity, and audit in the proxy.</figcaption>
+</figure>
 
-One QueryFlux config gives agents their own entry point, their own capacity, their own guardrails, and their user's identity on the engine:
+## The setup in one file
 
-```yaml title="config.yaml"
-queryflux:
-  frontends:
-    mcp:
-      enabled: true
-      port: 8811
+One QueryFlux config gives agents their own entry point, capacity pool, guardrails, and per-user identity on the engine:
 
-clusters:
-  trino-1:
-    engine: trino
-    endpoint: https://trino.internal:8443
-    auth:                  # QueryFlux's own service credential
-      type: basic
-      username: qf_svc
-      password: "..."
-    queryAuth:             # the identity each query runs as
-      type: impersonate
+<figure class="blog-figure">
+  <img src="/img/blog/agents-mcp-config.svg" alt="QueryFlux YAML: MCP frontend on port 8811, trino cluster with impersonation, separate analysts and agents cluster groups, protocol router sending MCP to agents group, read_only row_limit and require_predicate guardrails" />
+  <figcaption>Full example — adjust endpoints and limits for your environment. See <a href="/docs/configuration">configuration</a> and <a href="/docs/quickstart/ai-agent-mcp">MCP quickstart</a>.</figcaption>
+</figure>
 
-clusterGroups:
-  analysts: { maxRunningQueries: 40, members: [trino-1] }
-  agents:   { maxRunningQueries: 8,  members: [trino-1] }
-
-routers:
-  - type: protocolBased
-    mcp: agents            # everything that arrives over MCP
-routingFallback: analysts
-
-guardrails:
-  groups:
-    agents:
-      - kind: built_in
-        name: read_only
-      - kind: built_in
-        name: row_limit
-        max_rows: 5000
-      - kind: built_in
-        name: require_predicate
-        applies_to: ["fct_*", "events.*"]
-```
-
-Here is what each part does.
+The sections below map directly to that file.
 
 ## 1. One endpoint, any agent
 
 Agents connect over MCP (streamable HTTP):
 
-```bash
-claude mcp add --transport http queryflux http://localhost:8811/mcp
-```
+<figure class="blog-figure">
+  <img src="/img/blog/mcp-connect.svg" alt="Terminal command: claude mcp add with HTTP transport to localhost QueryFlux MCP endpoint" />
+  <figcaption>Cursor and Claude Desktop use the same MCP URL on port 8811.</figcaption>
+</figure>
 
-Cursor and Claude Desktop take the same URL. The agent gets tools to run a query, list schemas, describe a table, read the engine's plan, and check or cancel what it started. Agents that prefer a SQL driver can connect over Trino, PostgreSQL or MySQL instead; everything below applies to them too, because none of it lives in the MCP layer.
+The agent gets tools to run a query, list schemas, describe a table, read the engine's plan, and check or cancel what it started.
+
+Agents that prefer a SQL driver can connect over Trino, PostgreSQL, or MySQL instead — routing, guardrails, impersonation, and audit work the same because they live in the query path, not in the MCP layer.
 
 ## 2. Agents get their own lane
 
-The `protocolBased` router sends every MCP query to the `agents` group, which has its own `maxRunningQueries`. A burst of exploratory agent queries queues in its own lane instead of starving the dashboards in `analysts`. With Postgres persistence, the limit holds across every QueryFlux replica and worker, and waiting queries are served first come, first served.
+The `protocolBased` router sends every MCP query to the `agents` group, which has its own `maxRunningQueries`. A burst of exploratory agent queries queues in its own lane instead of starving dashboards in `analysts`.
+
+With Postgres persistence, the limit holds across every QueryFlux replica and worker, and waiting queries are served first come, first served.
 
 ## 3. Guardrails in the query path
 
 The `agents` group gets three built-in guards on top of any global ones:
 
-- `read_only` blocks anything that isn't a `SELECT`, `WITH`, `SHOW`, `DESCRIBE` or `EXPLAIN`.
-- `row_limit` denies queries whose outer `LIMIT` exceeds 5,000 rows, and records a warning when there is no `LIMIT` at all.
-- `require_predicate` rejects queries on fact and event tables that have no `WHERE` clause.
+| Guard | Effect |
+| --- | --- |
+| `read_only` | Blocks anything that isn't `SELECT`, `WITH`, `SHOW`, `DESCRIBE`, or `EXPLAIN` |
+| `row_limit` | Denies queries whose outer `LIMIT` exceeds 5,000 rows; warns when there is no `LIMIT` |
+| `require_predicate` | Rejects scans of fact/event tables with no `WHERE` |
 
-A blocked query gets an error explaining which rule it broke, so the agent can rewrite and retry. When the built-ins aren't enough, add a Python guard or call your own webhook; both receive the agent's context.
+A blocked query returns an error naming the rule that failed, so the agent can rewrite and retry. When the built-ins aren't enough, add a Python guard or call your own webhook — both receive the agent's context.
 
-These run in QueryFlux itself, before the query reaches an engine. That is the point: a guardrail that lives in an MCP wrapper only holds as long as the agent uses that wrapper. One in the data path holds however the agent connects.
+:::tip Why guardrails belong in QueryFlux
+A rule in an MCP wrapper only holds while the agent uses that wrapper. A rule in the **data path** holds for MCP, SQL drivers, and anything else that speaks to the proxy.
+:::
 
 ## 4. The engine sees the person, not a shared account
 
-With `queryAuth: impersonate`, QueryFlux authenticates to Trino with its own service account but runs each query as the user who sent it. When an agent connects with a person's token, the engine applies that person's permissions and writes that person into its own audit log. There is no shared password for an agent to leak or overreach with.
+With `queryAuth: impersonate`, QueryFlux authenticates to Trino with its own service account but runs each query as the user who sent it. When an agent connects with a person's token, the engine applies that person's permissions and writes that person into its audit log. There is no shared password for an agent to leak or overreach with.
 
-Trino and ClickHouse support impersonation. For Snowflake and Trino, QueryFlux can instead exchange the caller's OAuth token for one the engine accepts, or pass the caller's own credential straight through.
+Trino and ClickHouse support impersonation. For Snowflake and Trino, QueryFlux can instead exchange the caller's OAuth token for one the engine accepts, or pass the caller's credential through.
 
-For finer control, add row filters and column masks from OPA or Cerbos. They apply to agents exactly as they apply to people.
+For finer control, add row filters and column masks from OPA or Cerbos — they apply to agents exactly as they apply to people.
 
 ## 5. Every query has an owner
 
-Each query QueryFlux runs is stored with the agent, conversation, step and tool call that produced it. Over MCP these are filled in for you: the agent from the authenticated user, the conversation from the MCP session. Over Trino HTTP, the agent sends `X-Agent-Id` and `X-Conversation-Id` headers.
+Each query QueryFlux runs is stored with the agent, conversation, step, and tool call that produced it. Over MCP these fields are filled automatically from the authenticated user and MCP session. Over Trino HTTP, send `X-Agent-Id` and `X-Conversation-Id` headers.
 
-In Studio, the **Agents** and **Conversations** pages group history by agent and session, so you can replay a conversation step by step: every query, where it ran, how long it took, and which guardrail stopped it.
+In Studio, the **Agents** and **Conversations** pages group history by agent and session so you can replay a conversation step by step: every query, where it ran, how long it took, and which guardrail stopped it.
 
 ## What this adds up to
 
@@ -111,4 +92,8 @@ An agent gets one endpoint and the SQL it needs. You keep control of:
 
 It works the same over MCP and over a SQL driver, on the engines you already run.
 
-Start with the [MCP quickstart](/docs/quickstart/ai-agent-mcp), then read [guardrails](/docs/architecture/guardrails), [agent context](/docs/agentic/overview) and [authentication](/docs/authentication).
+<div class="blog-cta">
+
+Start with the [MCP quickstart](/docs/quickstart/ai-agent-mcp), then read [guardrails](/docs/architecture/guardrails), [agent context](/docs/agentic/overview), and [authentication](/docs/authentication).
+
+</div>
