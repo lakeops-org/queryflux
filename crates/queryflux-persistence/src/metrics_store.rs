@@ -143,6 +143,19 @@ pub trait MetricsStore: Send + Sync {
     fn on_translation(&self, _outcome: queryflux_core::query::TranslationOutcome) {}
 
     async fn record_query(&self, record: QueryRecord) -> Result<()>;
+
+    /// Record many queries at once, with the same semantics as calling
+    /// [`Self::record_query`] for each in order: the first record per `proxy_query_id`
+    /// wins and repeats are ignored. Backends that can write a batch in one statement
+    /// (Postgres) override this; the default writes one record at a time and stops at
+    /// the first error.
+    async fn record_queries(&self, records: Vec<QueryRecord>) -> Result<()> {
+        for record in records {
+            self.record_query(record).await?;
+        }
+        Ok(())
+    }
+
     async fn record_cluster_snapshot(&self, snapshot: ClusterSnapshot) -> Result<()>;
 
     /// Called synchronously when a cluster slot is acquired (query starts executing).
@@ -180,6 +193,13 @@ pub trait MetricsStore: Send + Sync {
     /// Called when a query had a free local slot but the shared limit (distributed mode or
     /// a worker's control plane) was full, so it waits in the queue.
     fn on_capacity_lease_denied(&self, _cluster_group: &str, _cluster_name: &str) {}
+
+    /// A holder's current quota for a cluster, the queries it runs on it, and the
+    /// queries waiting for capacity (capacity quotas). Called on every demand report.
+    fn on_capacity_quota(&self, _cluster_name: &str, _quota: u64, _running: u64, _waiting: u64) {}
+
+    /// The allocator's total committed quota for a cluster and how many holders share it.
+    fn on_capacity_allocation(&self, _cluster_name: &str, _quota_committed: u64, _holders: u64) {}
 
     /// Called when a worker starts or stops serving a config its control plane has not
     /// confirmed (one copied from a peer at startup).

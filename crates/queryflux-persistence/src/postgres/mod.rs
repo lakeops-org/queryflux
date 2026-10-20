@@ -27,9 +27,10 @@ use chrono::{DateTime, Utc};
 use queryflux_core::{
     error::{QueryFluxError, Result},
     query::{BackendQueryId, ExecutingQuery, ProxyQueryId, QueuedQuery},
-    tags::tags_to_json,
 };
 use sqlx::PgPool;
+
+mod history_batch;
 
 /// Select group rows with `members` as cluster **names** (joined from `cluster_configs` by id).
 const CLUSTER_GROUP_CONFIG_SELECT: &str = r#"
@@ -70,6 +71,10 @@ pub struct PostgresStore {
     coordination_pool: PgPool,
     admin_pool: PgPool,
     database_url: String,
+    /// `capacity.quotaLeaseSecs` and `capacity.reportIntervalMs`, returned to holders with
+    /// their grants.
+    quota_lease_secs: std::sync::atomic::AtomicU64,
+    quota_report_interval_ms: std::sync::atomic::AtomicU64,
 }
 
 impl PostgresStore {
@@ -136,6 +141,8 @@ impl PostgresStore {
             coordination_pool,
             admin_pool,
             database_url: database_url.to_string(),
+            quota_lease_secs: std::sync::atomic::AtomicU64::new(15),
+            quota_report_interval_ms: std::sync::atomic::AtomicU64::new(1000),
         })
     }
 
@@ -1917,149 +1924,13 @@ impl Persistence for PostgresStore {
 #[async_trait]
 impl MetricsStore for PostgresStore {
     async fn record_query(&self, r: QueryRecord) -> Result<()> {
-        let (
-            engine_elapsed_ms,
-            cpu_ms,
-            proc_rows,
-            proc_bytes,
-            phys_bytes,
-            peak_mem,
-            spilled,
-            splits,
-        ) = match &r.engine_stats {
-            Some(s) => (
-                s.engine_elapsed_time_ms.map(|v| v as i64),
-                s.cpu_time_ms.map(|v| v as i64),
-                s.processed_rows.map(|v| v as i64),
-                s.processed_bytes.map(|v| v as i64),
-                s.physical_input_bytes.map(|v| v as i64),
-                s.peak_memory_bytes.map(|v| v as i64),
-                s.spilled_bytes.map(|v| v as i64),
-                s.total_splits.map(|v| v as i32),
-            ),
-            None => (None, None, None, None, None, None, None, None),
-        };
+        self.insert_query_records(vec![r]).await.map(|_| ())
+    }
 
-        let query_tags_json = tags_to_json(&r.query_tags);
-        let guard_actions_json =
-            serde_json::to_value(&r.guard_actions).unwrap_or(serde_json::Value::Array(vec![]));
-        let insert_result = sqlx::query(
-            r#"INSERT INTO query_records
-                (proxy_query_id, backend_query_id, cluster_group, cluster_name, engine_type,
-                 frontend_protocol, source_dialect, target_dialect, was_rewritten, was_translated,
-                 username, catalog, db_name, sql_preview, rewritten_sql, translated_sql, status,
-                 routing_trace, queue_duration_ms, execution_duration_ms, rows_returned,
-                 error_message, created_at, engine_elapsed_time_ms, cpu_time_ms, processed_rows,
-                 processed_bytes, physical_input_bytes, peak_memory_bytes, spilled_bytes,
-                 total_splits, cluster_group_id, cluster_id, query_tags,
-                 query_hash, query_parameterized_hash, translated_query_hash,
-                 agent_id, conversation_id, step_index, tool_call_id, query_intent,
-                 guard_actions, was_guard_blocked, cache_hit, translation, worker)
-               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,
-                       $21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,
-                       -- Records from workers (#255) carry names, not this database's
-                       -- ids, and may arrive after a cluster was deleted: resolve by name
-                       -- for those, and store a missing row as NULL rather than failing
-                       -- the foreign key.
-                       COALESCE((SELECT id FROM cluster_group_configs WHERE id = $32),
-                                (SELECT id FROM cluster_group_configs
-                                  WHERE $47::text IS NOT NULL AND name = $3)),
-                       COALESCE((SELECT id FROM cluster_configs WHERE id = $33),
-                                (SELECT id FROM cluster_configs
-                                  WHERE $47::text IS NOT NULL AND name = $4)),
-                       $34,$35,$36,$37,$38,$39,$40,$41,$42,$43,$44,$45,$46,$47)
-               ON CONFLICT (proxy_query_id) DO NOTHING"#,
-        )
-        .bind(&r.proxy_query_id)
-        .bind(&r.backend_query_id)
-        .bind(&r.cluster_group.0)
-        .bind(&r.cluster_name.0)
-        .bind(format!("{:?}", r.engine_type))
-        .bind(format!("{:?}", r.frontend_protocol))
-        .bind(format!("{:?}", r.source_dialect))
-        .bind(format!("{:?}", r.target_dialect))
-        .bind(r.was_rewritten)
-        .bind(r.was_translated)
-        .bind(&r.user)
-        .bind(&r.catalog)
-        .bind(&r.database)
-        .bind(&r.sql_preview)
-        .bind(&r.rewritten_sql)
-        .bind(&r.translated_sql)
-        .bind(format!("{:?}", r.status))
-        .bind(&r.routing_trace)
-        .bind(r.queue_duration_ms as i64)
-        .bind(r.execution_duration_ms as i64)
-        .bind(r.rows_returned.map(|v| v as i64))
-        .bind(&r.error_message)
-        .bind(r.created_at)
-        .bind(engine_elapsed_ms)
-        .bind(cpu_ms)
-        .bind(proc_rows)
-        .bind(proc_bytes)
-        .bind(phys_bytes)
-        .bind(peak_mem)
-        .bind(spilled)
-        .bind(splits)
-        .bind(r.cluster_group_config_id)
-        .bind(r.cluster_config_id)
-        .bind(query_tags_json)
-        .bind(r.query_hash)
-        .bind(r.query_parameterized_hash)
-        .bind(r.translated_query_hash)
-        .bind(&r.agent_id)
-        .bind(&r.conversation_id)
-        .bind(r.step_index)
-        .bind(&r.tool_call_id)
-        .bind(&r.query_intent)
-        .bind(guard_actions_json)
-        .bind(r.was_guard_blocked)
-        .bind(r.cache_hit)
-        .bind(r.translation.map(|outcome| {
-            serde_json::to_value(outcome).expect("serializable translation outcome")
-        }))
-        .bind(&r.worker)
-        .execute(&self.admin_pool)
-        .await
-        .map_err(|e| QueryFluxError::Persistence(format!("Insert query_records: {e}")))?;
-        if insert_result.rows_affected() == 0 {
-            return Ok(());
-        }
-
-        // Upsert into query_digest_stats.
-        if let Some(phash) = r.query_parameterized_hash {
-            let rows = r.rows_returned.map(|v| v as i64).unwrap_or(0);
-            let exec_ms = r.execution_duration_ms as i64;
-            sqlx::query(
-                r#"INSERT INTO query_digest_stats
-                    (query_parameterized_hash, digest_text,
-                     translated_query_hash, translated_digest_text,
-                     first_seen, last_seen, call_count, sum_execution_ms, sum_rows_returned,
-                     cluster_group)
-                   VALUES ($1,$2,$3,$4,$5,$5,1,$6,$7,$8)
-                   ON CONFLICT (query_parameterized_hash) DO UPDATE SET
-                     last_seen = EXCLUDED.last_seen,
-                     call_count = query_digest_stats.call_count + 1,
-                     sum_execution_ms = query_digest_stats.sum_execution_ms + EXCLUDED.sum_execution_ms,
-                     sum_rows_returned = query_digest_stats.sum_rows_returned + EXCLUDED.sum_rows_returned,
-                     cluster_group = EXCLUDED.cluster_group,
-                     digest_text = CASE WHEN query_digest_stats.digest_text = '' THEN EXCLUDED.digest_text ELSE query_digest_stats.digest_text END,
-                     translated_digest_text = COALESCE(query_digest_stats.translated_digest_text, EXCLUDED.translated_digest_text)"#,
-            )
-            .bind(phash)
-            .bind(r.digest_text.as_deref().unwrap_or(""))
-            .bind(r.translated_query_hash)
-            .bind(r.translated_digest_text.as_deref())
-            .bind(r.created_at)
-            .bind(exec_ms)
-            .bind(rows)
-            .bind(&r.cluster_group.0)
-            .execute(&self.admin_pool)
-            .await
-            .map_err(|e| QueryFluxError::Persistence(format!("Upsert query_digest_stats: {e}")))?;
-        }
-
-        Ok(())
+    /// One insert and one digest upsert per chunk of up to
+    /// [`history_batch::MAX_RECORDS_PER_STATEMENT`] records, in one transaction.
+    async fn record_queries(&self, records: Vec<QueryRecord>) -> Result<()> {
+        self.insert_query_records(records).await.map(|_| ())
     }
 
     async fn record_cluster_snapshot(&self, s: ClusterSnapshot) -> Result<()> {
@@ -2166,6 +2037,295 @@ impl ConfigRevisionStore for PostgresStore {
 // CapacityStore — Postgres implementation
 // ---------------------------------------------------------------------------
 
+/// Holder rows silent this long are deleted, like stale leases.
+const QUOTA_HOLDER_EXPIRY_SECS: i64 = 300;
+
+#[async_trait]
+impl crate::quota::QuotaStore for PostgresStore {
+    async fn report_demand(
+        &self,
+        instance_id: &str,
+        reports: &[crate::quota::DemandReport],
+    ) -> Result<Option<crate::quota::QuotaResponse>> {
+        let clusters: Vec<&str> = reports.iter().map(|r| r.cluster.as_str()).collect();
+        let to_i64 = |v: u64| v.min(i64::MAX as u64) as i64;
+        let running: Vec<i64> = reports.iter().map(|r| to_i64(r.running)).collect();
+        let waiting: Vec<i64> = reports.iter().map(|r| to_i64(r.waiting)).collect();
+        let max: Vec<i64> = reports
+            .iter()
+            .map(|r| to_i64(r.max_running_queries))
+            .collect();
+        let seen: Vec<i64> = reports.iter().map(|r| to_i64(r.seen_seq)).collect();
+        // One statement for every cluster of this holder. A holder that has applied the
+        // latest grant (seen_seq >= grant_seq) is enforcing exactly the grant, so the
+        // ceiling drops to it.
+        let rows: Vec<(String, i64, i64)> = sqlx::query_as(
+            r#"
+            INSERT INTO capacity_holders
+                (cluster_name, instance_id, running, waiting, max_running, seen_seq, reported_at)
+            SELECT r.cluster, $1, r.running, r.waiting, r.max, r.seen, now()
+            FROM UNNEST($2::text[], $3::bigint[], $4::bigint[], $5::bigint[], $6::bigint[])
+                AS r(cluster, running, waiting, max, seen)
+            ON CONFLICT (cluster_name, instance_id) DO UPDATE SET
+                running = EXCLUDED.running,
+                waiting = EXCLUDED.waiting,
+                max_running = EXCLUDED.max_running,
+                seen_seq = EXCLUDED.seen_seq,
+                reported_at = now(),
+                ceiling = CASE
+                    WHEN EXCLUDED.seen_seq >= capacity_holders.grant_seq
+                        THEN capacity_holders.granted
+                    ELSE capacity_holders.ceiling
+                END
+            RETURNING cluster_name, granted, grant_seq
+            "#,
+        )
+        .bind(instance_id)
+        .bind(&clusters)
+        .bind(&running)
+        .bind(&waiting)
+        .bind(&max)
+        .bind(&seen)
+        .fetch_all(&self.coordination_pool)
+        .await
+        .map_err(|e| QueryFluxError::Persistence(format!("report_demand: {e}")))?;
+        Ok(Some(crate::quota::QuotaResponse {
+            grants: rows
+                .into_iter()
+                .map(|(cluster, granted, seq)| crate::quota::QuotaGrant {
+                    cluster,
+                    quota: granted.max(0) as u64,
+                    seq: seq.max(0) as u64,
+                })
+                .collect(),
+            lease_secs: self
+                .quota_lease_secs
+                .load(std::sync::atomic::Ordering::Relaxed),
+            report_interval_ms: self
+                .quota_report_interval_ms
+                .load(std::sync::atomic::Ordering::Relaxed),
+        }))
+    }
+
+    async fn release_holder(&self, instance_id: &str) -> Result<u64> {
+        let r = sqlx::query("DELETE FROM capacity_holders WHERE instance_id = $1")
+            .bind(instance_id)
+            .execute(&self.coordination_pool)
+            .await
+            .map_err(|e| QueryFluxError::Persistence(format!("release_holder: {e}")))?;
+        Ok(r.rows_affected())
+    }
+}
+
+impl PostgresStore {
+    /// What holders are told with every grant: how long they may admit on it
+    /// (`capacity.quotaLeaseSecs`) and how often to report (`capacity.reportIntervalMs`).
+    pub fn set_quota_timing(&self, lease_secs: u64, report_interval_ms: u64) {
+        use std::sync::atomic::Ordering;
+        self.quota_lease_secs
+            .store(lease_secs.max(1), Ordering::Relaxed);
+        self.quota_report_interval_ms
+            .store(report_interval_ms.clamp(100, 60_000), Ordering::Relaxed);
+    }
+}
+
+#[async_trait]
+impl crate::quota::QuotaAllocator for PostgresStore {
+    /// Recompute every cluster's quotas, in one transaction.
+    ///
+    /// Takes each cluster's advisory lock (in name order, so it can't deadlock with
+    /// another statement taking several), reads the lease counters and holder rows, runs
+    /// [`crate::quota::allocate`] per cluster, and writes changed grants and each
+    /// cluster's `quota_committed`. Per-query acquires on those clusters wait for the
+    /// transaction; it is a handful of statements. Run by one replica at a time (the
+    /// `capacity-allocator` sweep lock).
+    async fn run_allocation(
+        &self,
+        policy: &crate::quota::AllocatorPolicy,
+        metrics: &dyn crate::MetricsStore,
+    ) -> Result<crate::quota::AllocationPass> {
+        use crate::quota::{allocate, HolderState};
+        let err = |what: &str, e: sqlx::Error| QueryFluxError::Persistence(format!("{what}: {e}"));
+        let mut tx = self
+            .coordination_pool
+            .begin()
+            .await
+            .map_err(|e| err("allocation begin", e))?;
+
+        sqlx::query(
+            "DELETE FROM capacity_holders WHERE reported_at < now() - make_interval(secs => $1)",
+        )
+        .bind(QUOTA_HOLDER_EXPIRY_SECS as f64)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| err("expire holders", e))?;
+
+        // Clusters with holders, plus any that still have committed quota to clear.
+        let clusters: Vec<String> = sqlx::query_scalar(
+            r#"
+            SELECT cluster_name FROM capacity_holders
+            UNION
+            SELECT cluster_name FROM cluster_capacity_counters WHERE quota_committed > 0
+            ORDER BY 1
+            "#,
+        )
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|e| err("allocation clusters", e))?;
+        if clusters.is_empty() {
+            tx.commit().await.map_err(|e| err("allocation commit", e))?;
+            return Ok(crate::quota::AllocationPass::default());
+        }
+
+        sqlx::query(
+            "SELECT pg_advisory_xact_lock(hashtext('capacity:' || c)::bigint) FROM UNNEST($1::text[]) AS c ORDER BY c",
+        )
+        .bind(&clusters)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| err("allocation locks", e))?;
+
+        let leased: HashMap<String, i64> = sqlx::query_as::<_, (String, i64)>(
+            "SELECT cluster_name, leased FROM cluster_capacity_counters WHERE cluster_name = ANY($1)",
+        )
+        .bind(&clusters)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|e| err("allocation counters", e))?
+        .into_iter()
+        .collect();
+
+        #[allow(clippy::type_complexity)]
+        let rows: Vec<(String, String, i64, i64, i64, i64, i64, f64)> = sqlx::query_as(
+            r#"
+            SELECT cluster_name, instance_id, running, waiting, max_running, granted, ceiling,
+                   EXTRACT(EPOCH FROM now() - reported_at)::float8
+            FROM capacity_holders
+            WHERE cluster_name = ANY($1)
+            ORDER BY cluster_name, instance_id
+            FOR UPDATE
+            "#,
+        )
+        .bind(&clusters)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|e| err("allocation holders", e))?;
+
+        let mut by_cluster: HashMap<&str, Vec<(HolderState, u64)>> = HashMap::new();
+        for (cluster, instance, running, waiting, max, granted, ceiling, silent) in &rows {
+            by_cluster.entry(cluster.as_str()).or_default().push((
+                HolderState {
+                    instance_id: instance.clone(),
+                    running: (*running).max(0) as u64,
+                    waiting: (*waiting).max(0) as u64,
+                    granted: (*granted).max(0) as u64,
+                    ceiling: (*ceiling).max(0) as u64,
+                    silent_secs: silent.max(0.0) as u64,
+                },
+                (*max).max(0) as u64,
+            ));
+        }
+
+        let mut upd_cluster = Vec::new();
+        let mut upd_instance = Vec::new();
+        let mut upd_granted = Vec::new();
+        let mut upd_ceiling = Vec::new();
+        let mut committed_cluster = Vec::new();
+        let mut committed_value = Vec::new();
+        let mut pass = crate::quota::AllocationPass {
+            clusters: clusters.len(),
+            holders: rows.len(),
+            changed: 0,
+        };
+        for cluster in &clusters {
+            let entries = by_cluster.remove(cluster.as_str()).unwrap_or_default();
+            // The smallest limit any holder reports, so a holder with a stale config
+            // can't widen the limit for the others.
+            let max = entries.iter().map(|(_, m)| *m).min().unwrap_or(0);
+            let holders: Vec<HolderState> = entries.into_iter().map(|(h, _)| h).collect();
+            let leased = leased.get(cluster).copied().unwrap_or(0).max(0) as u64;
+            let a = allocate(max, leased, &holders, policy);
+            metrics.on_capacity_allocation(cluster, a.quota_committed, holders.len() as u64);
+            for c in a.changed {
+                upd_cluster.push(cluster.clone());
+                upd_instance.push(c.instance_id);
+                upd_granted.push(c.granted.min(i64::MAX as u64) as i64);
+                upd_ceiling.push(c.ceiling.min(i64::MAX as u64) as i64);
+            }
+            committed_cluster.push(cluster.clone());
+            committed_value.push(a.quota_committed.min(i64::MAX as u64) as i64);
+        }
+        pass.changed = upd_cluster.len();
+
+        if !upd_cluster.is_empty() {
+            sqlx::query(
+                r#"
+                UPDATE capacity_holders h SET
+                    grant_seq = CASE WHEN h.granted <> u.granted THEN h.grant_seq + 1 ELSE h.grant_seq END,
+                    granted = u.granted,
+                    ceiling = u.ceiling
+                FROM UNNEST($1::text[], $2::text[], $3::bigint[], $4::bigint[])
+                    AS u(cluster, instance, granted, ceiling)
+                WHERE h.cluster_name = u.cluster AND h.instance_id = u.instance
+                "#,
+            )
+            .bind(&upd_cluster)
+            .bind(&upd_instance)
+            .bind(&upd_granted)
+            .bind(&upd_ceiling)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| err("allocation grants", e))?;
+        }
+        sqlx::query(
+            r#"
+            INSERT INTO cluster_capacity_counters (cluster_name, quota_committed)
+            SELECT c, q FROM UNNEST($1::text[], $2::bigint[]) AS u(c, q)
+            ON CONFLICT (cluster_name) DO UPDATE SET quota_committed = EXCLUDED.quota_committed
+            "#,
+        )
+        .bind(&committed_cluster)
+        .bind(&committed_value)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| err("allocation committed", e))?;
+
+        tx.commit().await.map_err(|e| err("allocation commit", e))?;
+        Ok(pass)
+    }
+}
+
+impl PostgresStore {
+    /// Recount each cluster whose lease counter differs from its lease rows. The counter
+    /// only drifts when leases are removed without the delete trigger (`TRUNCATE`, or a
+    /// manual fix with triggers disabled). The comparison below is a hint taken without
+    /// locks; `queryflux_capacity_recount` redoes it under the cluster's locks.
+    async fn recount_drifted_counters(&self) -> Result<()> {
+        let drifted: Vec<String> = sqlx::query_scalar(
+            r#"
+            SELECT c.cluster_name
+            FROM cluster_capacity_counters c
+            LEFT JOIN (
+                SELECT cluster_name, COUNT(*) AS n FROM cluster_capacity_leases GROUP BY cluster_name
+            ) l ON l.cluster_name = c.cluster_name
+            WHERE c.leased <> COALESCE(l.n, 0)
+            "#,
+        )
+        .fetch_all(&self.coordination_pool)
+        .await
+        .map_err(|e| QueryFluxError::Persistence(format!("lease counter check: {e}")))?;
+        for cluster in drifted {
+            let count: i64 = sqlx::query_scalar("SELECT queryflux_capacity_recount($1)")
+                .bind(&cluster)
+                .fetch_one(&self.coordination_pool)
+                .await
+                .map_err(|e| QueryFluxError::Persistence(format!("lease recount: {e}")))?;
+            tracing::info!(cluster = %cluster, leases = count, "Corrected capacity lease counter");
+        }
+        Ok(())
+    }
+}
+
 #[async_trait]
 impl CapacityStore for PostgresStore {
     async fn try_acquire(
@@ -2175,60 +2335,24 @@ impl CapacityStore for PostgresStore {
         instance_id: &str,
         query_id: &str,
     ) -> Result<bool> {
+        // Unlimited: nothing to coordinate, and no lease row to write and delete.
+        if max_running_queries == u64::MAX {
+            return Ok(true);
+        }
         let max_rq = max_running_queries.min(i64::MAX as u64) as i64;
 
-        // Admission: grant a lease iff the current lease count is below the limit.
-        // Leases live in cluster_capacity_leases; cluster_capacity_counters.running
-        // is updated only by reconcile sweeps.
-        //
-        // The count-then-insert is not atomic on its own — a plain `SELECT COUNT(*)`
-        // takes no row lock, so two concurrent transactions could both observe
-        // "under limit" before either commits its INSERT and over-admit past
-        // max_running_queries. `pg_advisory_xact_lock` serializes acquires for the
-        // *same* cluster_name (held only for this transaction, released on
-        // commit/rollback) while leaving other clusters uncontended, same pattern
-        // as the `engine-reconcile` sweep lock.
-        let mut tx = self
-            .coordination_pool
-            .begin()
-            .await
-            .map_err(|e| QueryFluxError::Persistence(format!("try_acquire begin: {e}")))?;
-
-        sqlx::query("SELECT pg_advisory_xact_lock(hashtext('capacity:' || $1)::bigint)")
+        // Admission in one round trip (V21): the function takes the per-cluster advisory
+        // lock, reads the lease counter that triggers keep exact, and inserts the lease if
+        // the cluster is below the limit. The lock is held for the call and its commit
+        // only, instead of across BEGIN, a COUNT(*) scan, the INSERT and COMMIT.
+        sqlx::query_scalar::<_, bool>("SELECT queryflux_capacity_try_acquire($1, $2, $3, $4)")
             .bind(cluster_name)
-            .execute(&mut *tx)
+            .bind(instance_id)
+            .bind(query_id)
+            .bind(max_rq)
+            .fetch_one(&self.coordination_pool)
             .await
-            .map_err(|e| QueryFluxError::Persistence(format!("try_acquire lock: {e}")))?;
-
-        let result = sqlx::query_scalar::<_, bool>(
-            r#"
-            WITH up AS (
-                SELECT 1
-                WHERE (SELECT COUNT(*) FROM cluster_capacity_leases WHERE cluster_name = $1) < $4
-            ),
-            ins AS (
-                INSERT INTO cluster_capacity_leases (query_id, cluster_name, instance_id)
-                SELECT $3, $1, $2
-                WHERE EXISTS (SELECT 1 FROM up)
-                ON CONFLICT (query_id) DO NOTHING
-                RETURNING 1
-            )
-            SELECT EXISTS (SELECT 1 FROM ins)
-            "#,
-        )
-        .bind(cluster_name)
-        .bind(instance_id)
-        .bind(query_id)
-        .bind(max_rq)
-        .fetch_one(&mut *tx)
-        .await
-        .map_err(|e| QueryFluxError::Persistence(format!("try_acquire: {e}")))?;
-
-        tx.commit()
-            .await
-            .map_err(|e| QueryFluxError::Persistence(format!("try_acquire commit: {e}")))?;
-
-        Ok(result)
+            .map_err(|e| QueryFluxError::Persistence(format!("try_acquire: {e}")))
     }
 
     async fn release(&self, _cluster_name: &str, query_id: &str) -> Result<()> {
@@ -2237,6 +2361,19 @@ impl CapacityStore for PostgresStore {
             .execute(&self.coordination_pool)
             .await
             .map_err(|e| QueryFluxError::Persistence(format!("release: {e}")))?;
+        Ok(())
+    }
+
+    async fn release_many(&self, leases: &[(String, String)]) -> Result<()> {
+        if leases.is_empty() {
+            return Ok(());
+        }
+        let ids: Vec<&str> = leases.iter().map(|(_, q)| q.as_str()).collect();
+        sqlx::query("DELETE FROM cluster_capacity_leases WHERE query_id = ANY($1)")
+            .bind(&ids)
+            .execute(&self.coordination_pool)
+            .await
+            .map_err(|e| QueryFluxError::Persistence(format!("release_many: {e}")))?;
         Ok(())
     }
 
@@ -2257,6 +2394,11 @@ impl CapacityStore for PostgresStore {
             .execute(&self.coordination_pool)
             .await
             .map_err(|e| QueryFluxError::Persistence(format!("expire_stale: {e}")))?;
+        // This sweep runs on one replica at a time, every couple of minutes: also put
+        // right any lease counter that no longer matches its leases.
+        if let Err(e) = self.recount_drifted_counters().await {
+            tracing::warn!("Capacity lease counter check failed: {e}");
+        }
         Ok(result.rows_affected())
     }
 
@@ -2296,7 +2438,7 @@ impl CapacityStore for PostgresStore {
 
     async fn active_lease_count(&self, cluster_name: &str) -> Result<u64> {
         let count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*)::bigint FROM cluster_capacity_leases WHERE cluster_name = $1",
+            "SELECT COALESCE((SELECT leased FROM cluster_capacity_counters WHERE cluster_name = $1), 0)",
         )
         .bind(cluster_name)
         .fetch_one(&self.coordination_pool)
@@ -2543,18 +2685,11 @@ mod tests {
         assert_eq!(cfg.resolve_pool_sizes().unwrap(), (12, 3, 5));
     }
 
-    /// Migrations run once per test process. Tests run in parallel, and on a fresh
-    /// database concurrent `migrate()` calls race to create Refinery's history table
-    /// ("error asserting migrations table").
-    static MIGRATED: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
-
     async fn test_store() -> PostgresStore {
         let url = std::env::var("DATABASE_URL")
             .expect("DATABASE_URL must be set for Postgres integration tests");
         let store = PostgresStore::connect(&url).await.unwrap();
-        MIGRATED
-            .get_or_init(|| async { store.migrate().await.unwrap() })
-            .await;
+        store.migrate().await.unwrap();
         store
     }
 
@@ -2771,7 +2906,7 @@ mod tests {
         let qid = unique_id("cap");
 
         let acquired = store
-            .try_acquire("test-cluster", u64::MAX, "inst-1", &qid)
+            .try_acquire("test-cluster", 1_000_000, "inst-1", &qid)
             .await
             .unwrap();
         assert!(acquired);
@@ -2837,7 +2972,7 @@ mod tests {
         let qid = unique_id("exp");
 
         store
-            .try_acquire("test-cluster-exp", u64::MAX, "inst-stale", &qid)
+            .try_acquire("test-cluster-exp", 1_000_000, "inst-stale", &qid)
             .await
             .unwrap();
 
@@ -2951,7 +3086,7 @@ mod tests {
         let qid = unique_id("hb");
 
         store
-            .try_acquire("test-cluster-hb", u64::MAX, &inst, &qid)
+            .try_acquire("test-cluster-hb", 1_000_000, &inst, &qid)
             .await
             .unwrap();
 
@@ -3147,6 +3282,330 @@ mod tests {
             .execute(&store.admin_pool)
             .await
             .unwrap();
+    }
+
+    async fn lease_rows(store: &PostgresStore, cluster: &str) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM cluster_capacity_leases WHERE cluster_name = $1")
+            .bind(cluster)
+            .fetch_one(&store.coordination_pool)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn pg_capacity_unlimited_takes_no_lease() {
+        let _guard = CAPACITY_TEST_LOCK.lock().await;
+        let store = test_store().await;
+        let cluster = unique_id("unlimited");
+        assert!(store
+            .try_acquire(&cluster, u64::MAX, "inst-1", &format!("{cluster}-q"))
+            .await
+            .unwrap());
+        assert_eq!(lease_rows(&store, &cluster).await, 0);
+        assert_eq!(store.active_lease_count(&cluster).await.unwrap(), 0);
+        // Releasing a lease that was never written is a no-op.
+        store
+            .release(&cluster, &format!("{cluster}-q"))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn pg_capacity_release_many_frees_every_slot_in_one_call() {
+        let _guard = CAPACITY_TEST_LOCK.lock().await;
+        let store = test_store().await;
+        let a = unique_id("batch-a");
+        let b = unique_id("batch-b");
+        let mut held = Vec::new();
+        for (cluster, n) in [(&a, 3), (&b, 2)] {
+            for i in 0..n {
+                let q = format!("{cluster}-q{i}");
+                assert!(store.try_acquire(cluster, 3, "inst-1", &q).await.unwrap());
+                held.push((cluster.clone(), q));
+            }
+        }
+        assert!(!store
+            .try_acquire(&a, 3, "inst-1", &format!("{a}-full"))
+            .await
+            .unwrap());
+
+        // Includes an id with no lease: ignored.
+        held.push((a.clone(), format!("{a}-never")));
+        store.release_many(&held).await.unwrap();
+        assert_eq!(store.active_lease_count(&a).await.unwrap(), 0);
+        assert_eq!(store.active_lease_count(&b).await.unwrap(), 0);
+        assert!(store
+            .try_acquire(&a, 3, "inst-1", &format!("{a}-again"))
+            .await
+            .unwrap());
+        store.release(&a, &format!("{a}-again")).await.unwrap();
+    }
+
+    /// A replica still on the previous version writes lease rows directly (advisory
+    /// lock, COUNT(*), INSERT; DELETE on release). The triggers must count those too, or
+    /// a mixed fleet would admit past the limit during a rolling upgrade.
+    #[tokio::test]
+    #[ignore]
+    async fn pg_capacity_counter_includes_leases_written_by_older_replicas() {
+        let _guard = CAPACITY_TEST_LOCK.lock().await;
+        let store = test_store().await;
+        let cluster = unique_id("mixed");
+        const LIMIT: u64 = 2;
+
+        sqlx::query(
+            "INSERT INTO cluster_capacity_leases (query_id, cluster_name, instance_id) VALUES ($1, $2, 'old-replica')",
+        )
+        .bind(format!("{cluster}-old"))
+        .bind(&cluster)
+        .execute(&store.coordination_pool)
+        .await
+        .unwrap();
+        assert_eq!(store.active_lease_count(&cluster).await.unwrap(), 1);
+
+        assert!(store
+            .try_acquire(&cluster, LIMIT, "new", &format!("{cluster}-new1"))
+            .await
+            .unwrap());
+        assert!(
+            !store
+                .try_acquire(&cluster, LIMIT, "new", &format!("{cluster}-new2"))
+                .await
+                .unwrap(),
+            "the old replica's lease counts against the limit"
+        );
+
+        sqlx::query("DELETE FROM cluster_capacity_leases WHERE query_id = $1")
+            .bind(format!("{cluster}-old"))
+            .execute(&store.coordination_pool)
+            .await
+            .unwrap();
+        assert!(store
+            .try_acquire(&cluster, LIMIT, "new", &format!("{cluster}-new2"))
+            .await
+            .unwrap());
+        store
+            .release_many(&[
+                (cluster.clone(), format!("{cluster}-new1")),
+                (cluster.clone(), format!("{cluster}-new2")),
+            ])
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn pg_capacity_expiry_sweep_corrects_a_drifted_counter() {
+        let _guard = CAPACITY_TEST_LOCK.lock().await;
+        let store = test_store().await;
+        let cluster = unique_id("drift");
+        let q = format!("{cluster}-q");
+        assert!(store.try_acquire(&cluster, 5, "inst-1", &q).await.unwrap());
+
+        // Drift both ways: a counter too high blocks admission, one too low over-admits.
+        sqlx::query("UPDATE cluster_capacity_counters SET leased = 5 WHERE cluster_name = $1")
+            .bind(&cluster)
+            .execute(&store.coordination_pool)
+            .await
+            .unwrap();
+        assert!(!store
+            .try_acquire(&cluster, 5, "inst-1", &format!("{cluster}-blocked"))
+            .await
+            .unwrap());
+
+        // A cutoff in the past expires nothing, but the sweep still recounts.
+        let past = chrono::Utc::now() - chrono::Duration::hours(1);
+        store.expire_stale(past).await.unwrap();
+        assert_eq!(store.active_lease_count(&cluster).await.unwrap(), 1);
+
+        store.release(&cluster, &q).await.unwrap();
+        assert_eq!(store.active_lease_count(&cluster).await.unwrap(), 0);
+    }
+
+    /// Batches of releases spanning the same clusters in different orders, at the same
+    /// time: the triggers lock counter rows in name order, so none deadlocks, and the
+    /// counters end at zero.
+    #[tokio::test]
+    #[ignore]
+    async fn pg_capacity_concurrent_release_batches_do_not_deadlock() {
+        let _guard = CAPACITY_TEST_LOCK.lock().await;
+        let store = std::sync::Arc::new(test_store().await);
+        let clusters: Vec<String> = (0..4).map(|i| unique_id(&format!("dl{i}"))).collect();
+        let mut batches: Vec<Vec<(String, String)>> = Vec::new();
+        for w in 0..8 {
+            let mut batch = Vec::new();
+            for c in &clusters {
+                let q = format!("{c}-w{w}");
+                assert!(store.try_acquire(c, 1000, "inst-1", &q).await.unwrap());
+                batch.push((c.clone(), q));
+            }
+            if w % 2 == 1 {
+                batch.reverse();
+            }
+            batches.push(batch);
+        }
+        let handles: Vec<_> = batches
+            .into_iter()
+            .map(|b| {
+                let store = store.clone();
+                tokio::spawn(async move { store.release_many(&b).await })
+            })
+            .collect();
+        for h in handles {
+            h.await.unwrap().unwrap();
+        }
+        for c in &clusters {
+            assert_eq!(store.active_lease_count(c).await.unwrap(), 0);
+            assert_eq!(lease_rows(&store, c).await, 0);
+        }
+    }
+
+    fn demand(
+        cluster: &str,
+        running: u64,
+        waiting: u64,
+        seen: u64,
+        max: u64,
+    ) -> crate::quota::DemandReport {
+        crate::quota::DemandReport {
+            cluster: cluster.into(),
+            running,
+            waiting,
+            seen_seq: seen,
+            max_running_queries: max,
+        }
+    }
+
+    async fn grant(store: &PostgresStore, inst: &str, r: crate::quota::DemandReport) -> (u64, u64) {
+        use crate::quota::QuotaStore;
+        let resp = store.report_demand(inst, &[r]).await.unwrap().unwrap();
+        (resp.grants[0].quota, resp.grants[0].seq)
+    }
+
+    async fn allocate_now(store: &PostgresStore, reserve: f64) {
+        use crate::quota::QuotaAllocator;
+        let policy = crate::quota::AllocatorPolicy {
+            reserve_fraction: reserve,
+            ..Default::default()
+        };
+        store
+            .run_allocation(&policy, &crate::in_memory::InMemoryPersistence::new())
+            .await
+            .unwrap();
+    }
+
+    async fn quota_committed(store: &PostgresStore, cluster: &str) -> i64 {
+        sqlx::query_scalar(
+            "SELECT COALESCE((SELECT quota_committed FROM cluster_capacity_counters WHERE cluster_name = $1), 0)",
+        )
+        .bind(cluster)
+        .fetch_one(&store.coordination_pool)
+        .await
+        .unwrap()
+    }
+
+    /// Two holders report demand, the allocator splits the limit, per-query leases get
+    /// only what the quotas leave, and a holder's confirmation lowers its ceiling.
+    #[tokio::test]
+    #[ignore]
+    async fn pg_quota_allocation_shares_the_limit_with_leases() {
+        use crate::quota::QuotaStore;
+        let _guard = CAPACITY_TEST_LOCK.lock().await;
+        let store = test_store().await;
+        let c = unique_id("quota");
+        let (a, b) = (unique_id("qa"), unique_id("qb"));
+
+        // First reports: nothing granted yet.
+        assert_eq!(grant(&store, &a, demand(&c, 0, 30, 0, 100)).await, (0, 0));
+        assert_eq!(grant(&store, &b, demand(&c, 0, 30, 0, 100)).await, (0, 0));
+        allocate_now(&store, 0.2).await;
+
+        let (qa, sa) = grant(&store, &a, demand(&c, 0, 30, 0, 100)).await;
+        let (qb, _) = grant(&store, &b, demand(&c, 0, 30, 0, 100)).await;
+        assert_eq!(
+            (qa, qb),
+            (37, 37),
+            "demand fits: each gets its demand plus a quarter as headroom"
+        );
+        assert_eq!(sa, 1);
+        assert_eq!(quota_committed(&store, &c).await, 74);
+
+        // Per-query leases get the 26 the quotas leave.
+        let mut granted = 0;
+        for i in 0..50 {
+            if store
+                .try_acquire(&c, 100, "lease-holder", &format!("{c}-l{i}"))
+                .await
+                .unwrap()
+            {
+                granted += 1;
+            }
+        }
+        assert_eq!(granted, 26);
+        store
+            .release_many(
+                &(0..50)
+                    .map(|i| (c.clone(), format!("{c}-l{i}")))
+                    .collect::<Vec<_>>(),
+            )
+            .await
+            .unwrap();
+
+        // b's demand drops to 5: its grant drops at once, but its ceiling (37) stays
+        // until it confirms, so a's increase waits.
+        grant(&store, &b, demand(&c, 2, 3, 1, 100)).await;
+        grant(&store, &a, demand(&c, 30, 60, 1, 100)).await;
+        allocate_now(&store, 0.2).await;
+        let (qb2, sb2) = grant(&store, &b, demand(&c, 2, 3, 1, 100)).await;
+        assert!(qb2 < 37);
+        assert_eq!(sb2, 2);
+        let committed = quota_committed(&store, &c).await;
+        assert!(committed <= 100, "committed {committed}");
+
+        // b confirms its new grant; a can now grow into what b gave up.
+        grant(&store, &b, demand(&c, 2, 3, sb2, 100)).await;
+        allocate_now(&store, 0.2).await;
+        let (qa2, _) = grant(&store, &a, demand(&c, 30, 60, 1, 100)).await;
+        assert!(qa2 > qa, "a grew from {qa} to {qa2}");
+        assert!(quota_committed(&store, &c).await <= 100);
+
+        // Holders leaving free everything.
+        store.release_holder(&a).await.unwrap();
+        store.release_holder(&b).await.unwrap();
+        allocate_now(&store, 0.2).await;
+        assert_eq!(quota_committed(&store, &c).await, 0);
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn pg_quota_holder_that_goes_silent_loses_its_grant() {
+        let _guard = CAPACITY_TEST_LOCK.lock().await;
+        let store = test_store().await;
+        let c = unique_id("silent");
+        let h = unique_id("qh");
+        grant(&store, &h, demand(&c, 0, 10, 0, 50)).await;
+        allocate_now(&store, 0.0).await;
+        let (q, s) = grant(&store, &h, demand(&c, 4, 6, 0, 50)).await;
+        assert!(q > 0);
+        grant(&store, &h, demand(&c, 4, 6, s, 50)).await;
+
+        // Silent past its lease and margin (15 + 5 s).
+        sqlx::query("UPDATE capacity_holders SET reported_at = now() - interval '30 seconds' WHERE instance_id = $1")
+            .bind(&h)
+            .execute(&store.coordination_pool)
+            .await
+            .unwrap();
+        allocate_now(&store, 0.0).await;
+        assert_eq!(
+            quota_committed(&store, &c).await,
+            4,
+            "only its running queries count"
+        );
+
+        // It comes back: no stale grant is handed back.
+        let (q2, _) = grant(&store, &h, demand(&c, 4, 6, s, 50)).await;
+        assert_eq!(q2, 0);
     }
 
     // -- Admission fairness ---------------------------------------------------
@@ -3459,13 +3918,12 @@ mod tests {
 
         let store = test_store().await;
         let proxy_id = unique_id("dedup");
-        // Its own group and digest hash, so rows other tests left in the table don't count.
+        // Unique group: other tests write history concurrently to the same database.
         let group = unique_id("dedup-g");
-        let hash = (SystemTime::now()
+        let digest_hash = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
-            .as_nanos()
-            % i64::MAX as u128) as i64;
+            .as_nanos() as i64;
         let mut first = QueryRecord {
             proxy_query_id: proxy_id.clone(),
             backend_query_id: None,
@@ -3499,7 +3957,7 @@ mod tests {
             engine_stats: None,
             query_tags: Default::default(),
             query_hash: None,
-            query_parameterized_hash: Some(hash),
+            query_parameterized_hash: Some(digest_hash),
             translated_query_hash: None,
             digest_text: Some("select 1".into()),
             translated_digest_text: None,
@@ -3546,7 +4004,7 @@ mod tests {
         let digest_count: (i64,) = sqlx::query_as(
             "SELECT call_count FROM query_digest_stats WHERE query_parameterized_hash = $1",
         )
-        .bind(hash)
+        .bind(digest_hash)
         .fetch_one(&store.admin_pool)
         .await
         .unwrap();

@@ -90,6 +90,12 @@ translation:
   # Max time to spend on catalog lookup (see `catalogProvider` below) before
   # falling back to dialect-only translation. Default 1500ms.
   # schemaResolutionTimeoutMs: 1500
+  # In-process caches for repeated queries (bounded LRU, entries; 0 disables).
+  # Keys include the SQL text, dialects, fixup scripts, schema and strict mode.
+  # cache:
+  #   translations: 4096
+  #   tableExtraction: 4096   # access-control extraction + schema table references
+  #   fingerprints: 4096
 
 # Native catalog integration — discovers table/column metadata so schema-aware SQL
 # translation (sqlglot's optimizer) can qualify columns/types, not just transpile

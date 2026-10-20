@@ -52,6 +52,51 @@ Dispatch resolves schema through the configured catalog provider, with a bounded
 
 When the client dialect matches the engine (e.g. Trino client → Trino cluster) and no fixups are configured, `maybe_translate` returns immediately with **no Python work**. That keeps the common "Trino in, Trino out" case cheap.
 
+## Caching
+
+A repeated query skips sqlglot. Each process keeps bounded LRU caches in memory:
+
+- **Translations** — the sqlglot result (translated SQL and fallback reason) for one call.
+  The key is the SQL text, the source and target sqlglot dialects, a hash of the fixup
+  scripts that run (global then group, in order), a hash of the `SchemaContext`
+  (catalog, database, tables, columns and types), and whether strict mode is on (strict
+  asks sqlglot to raise for unsupported constructs). The best-effort or strict outcome is
+  still worked out per query from the cached result.
+- **Table references** — the tables schema resolution looks up in the catalog, keyed on
+  SQL text and source dialect. The catalog lookup itself is not part of this cache (the
+  catalog provider has its own `cache` setting).
+
+What is never cached: failures that might succeed on retry (sqlglot import errors, a
+failed blocking task, exceptions raised by fixup scripts), and catalog timeouts. A
+timed-out schema lookup gives that query an empty schema; its translation is stored under
+the empty-schema key, so a later query whose lookup succeeds gets the schema-aware
+result. Deterministic failures (parse errors, unsupported constructs in strict mode, a
+fixup that turns a read into a write) are cached. Statements longer than 64 KiB are not
+cached.
+
+Because group scripts, policy and schema are part of the key, a config reload or catalog
+change needs no cache flush; old entries age out. Caching assumes fixup scripts are pure:
+the same SQL and dialects always give the same output. A script that reads the clock,
+the environment or a remote service should run with `translations: 0`.
+
+```yaml
+translation:
+  cache:
+    translations: 4096     # entries; 0 disables
+    tableExtraction: 4096  # access-control extraction and schema table references
+    fingerprints: 4096     # query-history fingerprints
+```
+
+Sizes are read at startup and are local to each process; a worker reads its own file.
+`/metrics` exports `queryflux_sql_cache_hits_total`, `queryflux_sql_cache_misses_total`
+and `queryflux_sql_cache_evictions_total`, labeled `cache` (`translation`,
+`schema_table_refs`, `access_extraction`, `fingerprint`).
+
+Measured on a laptop (release build, three queries from a point lookup to a CTE with
+window functions): a miss costs 0.2 to 2 ms dialect-only and 1.7 to 12 ms schema-aware,
+all under the Python GIL, so one process does at most a few hundred to a few thousand
+translations per second. A hit costs under a microsecond.
+
 ## Configuration
 
 `translation` in the root config (`queryflux_core::config::TranslationConfig`) includes:
@@ -59,6 +104,7 @@ When the client dialect matches the engine (e.g. Trino client → Trino cluster)
 - **`mode`** — `bestEffort` (default) forwards the original SQL if required translation is unavailable or fails. `strict` rejects the query with a translation error before backend submission. Strict mode also asks sqlglot to raise errors for unsupported constructs. Translation is required when dialects differ or fixup scripts must run; compatible dialects without fixups and MCP queries without a declared dialect still bypass translation.
 - **`errorOnUnsupported`** — Legacy option. `true` enables the same fail-closed policy as `mode: strict`; `false` does not override strict mode.
 - **`pythonScripts`** — List of global Python transform scripts run after sqlglot translation. See the next section.
+- **`cache`** — Entry limits for the in-process caches. See [Caching](#caching).
 
 Required translation supports one SQL statement per query. Batches and syntax that
 sqlglot only understands as an opaque command are translation failures: strict mode

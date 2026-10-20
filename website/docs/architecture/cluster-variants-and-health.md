@@ -218,7 +218,7 @@ When QueryFlux runs **multiple replicas** with `queryflux.distributed: true` and
 
 ### Capacity admission (`CapacityStore`)
 
-Each query dispatch calls `try_acquire` / `release` on Postgres-backed **capacity leases** (`cluster_capacity_leases`). This enforces `max_running_queries` **across the fleet** for QueryFlux-routed queries only. Admission counts leases; it does not read `cluster_capacity_counters.running`.
+Each query dispatch calls `try_acquire` / `release` on Postgres-backed **capacity leases** (`cluster_capacity_leases`). This enforces `max_running_queries` **across the fleet** for QueryFlux-routed queries only. Admission reads the lease count in `cluster_capacity_counters.leased`, which triggers keep equal to the lease rows; it does not read `cluster_capacity_counters.running`. Details: [Capacity and throughput](./capacity-and-throughput).
 
 ### Engine reconcile (single-owner sweep)
 
@@ -235,6 +235,7 @@ Prometheus utilization snapshots (every 5s) also read `cluster_capacity_counters
 | Store / table | Source | Meaning |
 |---|---|---|
 | `cluster_capacity_leases` | `try_acquire` / `release` | QueryFlux admission slots fleet-wide |
+| `cluster_capacity_counters.leased` | Triggers on `cluster_capacity_leases` | Lease count per cluster, read by admission |
 | `cluster_capacity_counters.running` | Single-owner reconcile sweep | Backend warehouse/engine ground truth |
 
 A Snowflake warehouse may report 40 running queries (dbt, BI, etc.) while QueryFlux only holds 3 capacity leases. Admission uses leases; routing visibility and reconcile use `running`.

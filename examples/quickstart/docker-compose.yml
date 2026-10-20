@@ -30,7 +30,6 @@ services:
   queryflux:
     image: ghcr.io/lakeops-org/queryflux:latest
     ports:
-      - "3000:3000"  # Studio UI
       - "9000:9000"  # Admin API
       - "3306:3306"  # MySQL Wire frontend (optional, enabled in config.yaml)
     volumes:
@@ -47,6 +46,18 @@ services:
       timeout: 5s
       retries: 20
       start_period: 30s
+
+  # Studio (admin UI) talks to QueryFlux only through the Admin API.
+  queryflux-studio:
+    image: ghcr.io/lakeops-org/queryflux-studio:latest
+    ports:
+      - "3000:3000"
+    environment:
+      ADMIN_API_URL: http://queryflux:9000
+    depends_on:
+      queryflux:
+        condition: service_healthy
+    restart: unless-stopped
 
 volumes:
   queryflux-pg:

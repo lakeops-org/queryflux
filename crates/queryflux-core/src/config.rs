@@ -218,8 +218,17 @@ impl ProxyConfig {
                             .to_string(),
                     );
                 }
+                if q.capacity != CapacityConfig::default() {
+                    issues.push(
+                        "queryflux.capacity comes from the control plane on a worker; remove it"
+                            .to_string(),
+                    );
+                }
             }
             Role::Standalone | Role::ControlPlane => {
+                if let Err(e) = q.capacity.validate() {
+                    issues.push(e);
+                }
                 let worker_only = [
                     ("controlPlane", q.control_plane.is_some()),
                     ("workerName", q.worker_name.is_some()),
@@ -884,6 +893,90 @@ pub struct QueryFluxConfig {
     /// Standalone or control plane: accept workers on the admin listener.
     #[serde(default)]
     pub worker_api: Option<WorkerApiConfig>,
+    /// Standalone or control plane: how fleet-wide `maxRunningQueries` is enforced.
+    /// Workers follow their control plane.
+    #[serde(default)]
+    pub capacity: CapacityConfig,
+}
+
+/// How a cluster's `maxRunningQueries` is shared between the processes that admit
+/// queries (`queryflux.capacity`). Applies with distributed coordination.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CapacityConfig {
+    #[serde(default)]
+    pub mode: CapacityMode,
+    /// Share of each cluster's limit never handed out as quota, left for per-query leases
+    /// (bursts above a process's quota, and older workers). Default 0.15.
+    #[serde(default = "default_reserve_fraction")]
+    pub reserve_fraction: f64,
+    /// How long a process may admit on its quota without reaching the allocator.
+    /// Default 15.
+    #[serde(default = "default_quota_lease_secs")]
+    pub quota_lease_secs: u64,
+    /// How often each process reports its demand. Default 1000; at most 250 ms apart
+    /// while it has queries waiting.
+    #[serde(default = "default_report_interval_ms")]
+    pub report_interval_ms: u64,
+}
+
+impl Default for CapacityConfig {
+    fn default() -> Self {
+        Self {
+            mode: CapacityMode::default(),
+            reserve_fraction: default_reserve_fraction(),
+            quota_lease_secs: default_quota_lease_secs(),
+            report_interval_ms: default_report_interval_ms(),
+        }
+    }
+}
+
+fn default_reserve_fraction() -> f64 {
+    0.15
+}
+fn default_quota_lease_secs() -> u64 {
+    15
+}
+fn default_report_interval_ms() -> u64 {
+    1000
+}
+
+impl CapacityConfig {
+    pub fn validate(&self) -> std::result::Result<(), String> {
+        if !(0.0..=0.9).contains(&self.reserve_fraction) {
+            return Err(format!(
+                "capacity.reserveFraction must be between 0 and 0.9 (got {})",
+                self.reserve_fraction
+            ));
+        }
+        if !(2..=300).contains(&self.quota_lease_secs) {
+            return Err(format!(
+                "capacity.quotaLeaseSecs must be between 2 and 300 (got {})",
+                self.quota_lease_secs
+            ));
+        }
+        if !(100..=60_000).contains(&self.report_interval_ms)
+            || self.report_interval_ms >= self.quota_lease_secs * 1000 / 2
+        {
+            return Err(format!(
+                "capacity.reportIntervalMs must be between 100 and 60000 and under half of \
+                 quotaLeaseSecs (got {} ms with a {} s lease)",
+                self.report_interval_ms, self.quota_lease_secs
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum CapacityMode {
+    /// Every admission takes a per-query lease from Postgres (or the control plane).
+    #[default]
+    Leases,
+    /// Each process gets a share of every cluster's limit and admits within it without a
+    /// round trip; per-query leases cover the rest.
+    Quotas,
 }
 
 /// What a QueryFlux process does.
@@ -1178,13 +1271,16 @@ pub struct PostgresPersistenceConfig {
     /// dedicated `PgListener` connection. When the per-workload pool sizes below
     /// are omitted, one slot is reserved for LISTEN and the remainder is split
     /// 60% query / 20% coordination / 20% admin (minimum 1 each). Must be at least
-    /// 4. Ignored when any workload-specific pool size is set.
+    /// 4. Ignored when any workload-specific pool size is set. When neither this nor
+    /// the workload sizes are set, the pools are 7 query, 8 coordination, 2 admin.
     #[serde(default)]
     pub pool_size: Option<u32>,
     /// Hot-path pool for executing/queued query state (`queryPoolSize`).
     #[serde(default)]
     pub query_pool_size: Option<u32>,
     /// Pool for distributed capacity, queue claims, and sweep locks (`coordinationPoolSize`).
+    /// Default 8. Size it to the capacity calls in flight at peak: admissions per second
+    /// times the time one call holds a connection (about 1 ms).
     #[serde(default)]
     pub coordination_pool_size: Option<u32>,
     /// Pool for admin API, metrics, cache metadata, and config reload reads (`adminPoolSize`).
@@ -1285,26 +1381,37 @@ impl PostgresPersistenceConfig {
     pub const LISTENER_CONNECTIONS: u32 = 1;
     /// Minimum legacy `poolSize`: 3 isolated pools (1 each) + 1 LISTEN connection.
     pub const MIN_LEGACY_POOL_SIZE: u32 = 4;
+    /// Coordination pool size when `coordinationPoolSize` and `poolSize` are unset. A
+    /// capacity acquire is one short call (V21), so eight connections carry thousands of
+    /// admissions per second.
+    pub const DEFAULT_COORDINATION_POOL: u32 = 8;
 
     /// Resolve isolated pool sizes for query, coordination, and admin workloads.
     ///
     /// Legacy `poolSize` is inclusive of [`Self::LISTENER_CONNECTIONS`]. Workload-specific
     /// sizes (`queryPoolSize` / …) are pool-only; the listener is extra in that mode.
     pub fn resolve_pool_sizes(&self) -> Result<(u32, u32, u32), String> {
-        const DEFAULT_TOTAL: u32 = 10;
-
         if self.query_pool_size.is_some()
             || self.coordination_pool_size.is_some()
             || self.admin_pool_size.is_some()
         {
             return Ok((
                 self.query_pool_size.unwrap_or(6).max(1),
-                self.coordination_pool_size.unwrap_or(2).max(1),
+                self.coordination_pool_size
+                    .unwrap_or(Self::DEFAULT_COORDINATION_POOL)
+                    .max(1),
                 self.admin_pool_size.unwrap_or(2).max(1),
             ));
         }
 
-        let total = self.pool_size.unwrap_or(DEFAULT_TOTAL);
+        // Nothing set. The legacy split of 10 connections left coordination one
+        // connection, which capped admissions for the whole process at a few hundred per
+        // second (every query takes and releases a lease on it in distributed mode).
+        // Pools open connections on demand, so a larger coordination pool costs nothing
+        // unless it's used.
+        let Some(total) = self.pool_size else {
+            return Ok((7, Self::DEFAULT_COORDINATION_POOL, 2));
+        };
         if total < Self::MIN_LEGACY_POOL_SIZE {
             return Err(format!(
                 "postgres persistence: poolSize must be at least {} \
@@ -2240,10 +2347,47 @@ pub struct TranslationConfig {
     /// falling back to dialect-only translation. Default 1500ms.
     #[serde(default = "default_schema_resolution_timeout_ms")]
     pub schema_resolution_timeout_ms: u64,
+    /// In-process caches for repeated queries (`translation.cache`).
+    #[serde(default)]
+    pub cache: SqlCacheConfig,
 }
 
 fn default_schema_resolution_timeout_ms() -> u64 {
     1500
+}
+
+/// Entry limits for the per-process caches that let a repeated query skip SQL work. Each
+/// is a bounded LRU; 0 disables that cache. Local to each process (a worker reads its own
+/// file), never sent by a control plane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SqlCacheConfig {
+    /// Translated SQL (sqlglot + fixup scripts).
+    #[serde(default = "default_sql_cache_entries")]
+    pub translations: usize,
+    /// Table extraction: access-control resources and the table references that
+    /// schema-aware translation looks up in the catalog.
+    #[serde(default = "default_sql_cache_entries")]
+    pub table_extraction: usize,
+    /// Query-history fingerprints (normalized digest and hashes).
+    #[serde(default = "default_sql_cache_entries")]
+    pub fingerprints: usize,
+}
+
+pub const DEFAULT_SQL_CACHE_ENTRIES: usize = 4096;
+
+fn default_sql_cache_entries() -> usize {
+    DEFAULT_SQL_CACHE_ENTRIES
+}
+
+impl Default for SqlCacheConfig {
+    fn default() -> Self {
+        Self {
+            translations: DEFAULT_SQL_CACHE_ENTRIES,
+            table_extraction: DEFAULT_SQL_CACHE_ENTRIES,
+            fingerprints: DEFAULT_SQL_CACHE_ENTRIES,
+        }
+    }
 }
 
 // --- Catalog provider ---
@@ -2971,12 +3115,35 @@ guardrails:
     }
 
     fn assert_legacy_budget_inclusive_of_listener(cfg: &PostgresPersistenceConfig) {
-        let total = cfg.pool_size.unwrap_or(10);
+        let total = cfg.pool_size.expect("legacy poolSize");
         let (query, coordination, admin) = cfg.resolve_pool_sizes().unwrap();
         assert!(
             query + coordination + admin + PostgresPersistenceConfig::LISTENER_CONNECTIONS <= total,
             "pools ({query}+{coordination}+{admin}) + listener must not exceed poolSize {total}"
         );
+    }
+
+    #[test]
+    fn capacity_config_defaults_and_limits() {
+        use crate::config::{CapacityConfig, CapacityMode};
+        let c = CapacityConfig::default();
+        assert_eq!(c.mode, CapacityMode::Leases);
+        assert!(c.validate().is_ok());
+        let bad = CapacityConfig {
+            reserve_fraction: 0.95,
+            ..Default::default()
+        };
+        assert!(bad.validate().unwrap_err().contains("reserveFraction"));
+        let slow = CapacityConfig {
+            quota_lease_secs: 4,
+            report_interval_ms: 3000,
+            ..Default::default()
+        };
+        assert!(slow.validate().unwrap_err().contains("half"));
+        let parsed: CapacityConfig =
+            serde_yaml::from_str("mode: quotas\nreserveFraction: 0.2\n").unwrap();
+        assert_eq!(parsed.mode, CapacityMode::Quotas);
+        assert_eq!(parsed.quota_lease_secs, 15);
     }
 
     #[test]
@@ -2990,9 +3157,18 @@ guardrails:
     }
 
     #[test]
-    fn postgres_pool_sizes_default_total_includes_listener() {
+    fn postgres_pool_sizes_default_gives_coordination_room() {
         let c = PostgresPersistenceConfig::default();
-        assert_eq!(c.resolve_pool_sizes().unwrap(), (7, 1, 1));
+        assert_eq!(c.resolve_pool_sizes().unwrap(), (7, 8, 2));
+        let only_query = PostgresPersistenceConfig {
+            query_pool_size: Some(4),
+            ..Default::default()
+        };
+        assert_eq!(only_query.resolve_pool_sizes().unwrap(), (4, 8, 2));
+    }
+
+    #[test]
+    fn postgres_pool_sizes_legacy_ten_unchanged() {
         let with_ten = PostgresPersistenceConfig {
             pool_size: Some(10),
             ..Default::default()

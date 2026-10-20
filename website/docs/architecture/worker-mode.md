@@ -176,7 +176,7 @@ sequenceDiagram
     alt granted
         CP-->>W: granted: true
         W->>E: execute
-        W->>CP: POST /worker/capacity/release
+        W-)CP: POST /worker/capacity/release-batch (queued, with other releases)
     else fleet full
         CP-->>W: granted: false
         Note over W: queue, retry with backoff<br/>(queryflux_capacity_lease_denied_total)
@@ -186,8 +186,10 @@ sequenceDiagram
 - **The query path doesn't change.** The worker's `RemoteCoordinationStore` implements the same `CapacityStore` and `SweepCoordinator` traits that dispatch, the slot guard and the engine reconcile loop already use. The control plane exposes its own store at `/worker/capacity/*` and `/worker/sweep-lock/*`.
 - **Mixed fleets share one cap.** A control plane that also serves queries uses the lease table directly, and its workers use it through the API, so one `maxRunningQueries` covers all of them.
 - **Leases of dead workers expire.** Workers renew their leases on a timer, and the control plane's stale-lease sweep reclaims a worker's leases once its renewals stop. Sweep locks held for a worker are dropped after 5 minutes if never released.
+- **Releases are batched.** A worker queues each release and sends them together (`POST /worker/capacity/release-batch`), so a finishing query doesn't wait on the control plane. What a lease costs: [Capacity and throughput](./capacity-and-throughput).
+- **Quotas.** With `capacity.mode: quotas` on the control plane, each worker gets a share of every cluster's limit and admits within it without a round trip; per-query leases cover bursts and older workers. See [Capacity quotas](./capacity-and-throughput#capacity-quotas).
 - **Local work stays local.** A worker's zombie and stale-queue sweeps clean its own memory, so they never take fleet-wide locks.
-- **Cost:** one round trip per query to acquire a lease, and one to release it, each with a 5-second timeout.
+- **Cost:** one round trip per query to acquire a lease, with a 5-second timeout. The release is off the query path: a finishing query doesn't wait for it. Releases that finish together share one request; a query that finishes alone still sends its own.
 
 | | `coordination.mode: controlPlane` (default) | `coordination.mode: local` |
 |---|---|---|
@@ -229,6 +231,9 @@ flowchart LR
 
 - **The query path never waits on the network.** A finished query is redacted and queued. A flusher sends batches every 2 seconds, and a final flush runs after the shutdown drain. When the endpoint stays down, the oldest records are dropped and counted (`historyUplink.dropped`).
 - **Delivery is at least once and ingest is idempotent.** Records are keyed by proxy query id, so a retried batch stores nothing twice.
+- **One write per batch.** On Postgres, a batch becomes one multi-row insert into `query_records` (`ON CONFLICT (proxy_query_id) DO NOTHING`) and one multi-row upsert into `query_digest_stats`, in one transaction. A 200-record batch is two statements, not 400. The control plane's own queries take the same path: its buffered store flushes up to 100 records per call.
+- **Digest stats are folded in memory.** The batch is folded into one delta per fingerprint (call count, sums, first and last seen, digest text). Only records the insert actually stored are folded, so a retried batch is not counted twice.
+- **Backpressure.** The control plane writes at most 2 batches at once. A batch that cannot start within 5 seconds gets `503` with `Retry-After`. The worker keeps it spooled, waits as told (plus some jitter, so the fleet does not come back in one wave), and sends it again. Any other non-2xx answer or network error is retried with backoff up to 60 seconds. Queries never wait on this.
 - **Format.** Records travel as a versioned `QueryRecordBatchV1`.
 - **Attribution.** Each record is stamped with the sending worker (`query_records.worker`). Workers report config names, not database ids, so ingest resolves ids by name.
 - **No double counting.** Ingest writes to the history store only, not to the control plane's Prometheus, because each worker already exports its own metrics.

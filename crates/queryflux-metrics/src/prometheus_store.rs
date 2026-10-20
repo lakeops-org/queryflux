@@ -55,6 +55,15 @@ pub struct PrometheusMetrics {
     /// `queryflux_queue_duration_seconds`, it shows whether some workers wait more than
     /// others for the same group.
     capacity_lease_denied_total: CounterVec,
+    /// queryflux_capacity_quota{cluster_name, kind}: this process's quota for a cluster
+    /// (`kind="quota"`), the queries it runs on it (`"running"`) and the queries waiting
+    /// for capacity (`"waiting"`). Capacity quotas only.
+    capacity_quota: prometheus::GaugeVec,
+    /// queryflux_capacity_quota_committed{cluster_name}: the allocator's committed quota
+    /// for a cluster, summed over holders; per-query leases get what is left.
+    capacity_quota_committed: prometheus::GaugeVec,
+    /// queryflux_capacity_quota_holders{cluster_name}: processes sharing the cluster.
+    capacity_quota_holders: prometheus::GaugeVec,
     /// queryflux_auth_failures_total{protocol}
     auth_failures_total: CounterVec,
     /// queryflux_config_reload_failures_total{stage}
@@ -86,6 +95,7 @@ impl PrometheusMetrics {
     ) -> std::result::Result<Self, prometheus::Error> {
         let registry = Registry::new();
         crate::adbc::register(&registry)?;
+        crate::sql_cache::register(&registry)?;
         let translation_skipped_total = CounterVec::new(
             Opts::new(
                 "queryflux_translation_skipped_total",
@@ -191,6 +201,28 @@ impl PrometheusMetrics {
             &["cluster_group", "cluster_name"],
         )?;
 
+        let capacity_quota = prometheus::GaugeVec::new(
+            Opts::new(
+                "queryflux_capacity_quota",
+                "This process's capacity quota for a cluster, and the queries running on it and waiting (kind = quota | running | waiting)",
+            ),
+            &["cluster_name", "kind"],
+        )?;
+        let capacity_quota_committed = prometheus::GaugeVec::new(
+            Opts::new(
+                "queryflux_capacity_quota_committed",
+                "Capacity committed to quotas for a cluster, summed over every process (allocator)",
+            ),
+            &["cluster_name"],
+        )?;
+        let capacity_quota_holders = prometheus::GaugeVec::new(
+            Opts::new(
+                "queryflux_capacity_quota_holders",
+                "Processes holding a capacity quota for a cluster (allocator)",
+            ),
+            &["cluster_name"],
+        )?;
+
         let auth_failures_total = CounterVec::new(
             Opts::new(
                 "queryflux_auth_failures_total",
@@ -261,6 +293,9 @@ impl PrometheusMetrics {
         registry.register(Box::new(config_reload_failures_total.clone()))?;
         registry.register(Box::new(worker_config_stale.clone()))?;
         registry.register(Box::new(capacity_lease_denied_total.clone()))?;
+        registry.register(Box::new(capacity_quota.clone()))?;
+        registry.register(Box::new(capacity_quota_committed.clone()))?;
+        registry.register(Box::new(capacity_quota_holders.clone()))?;
         registry.register(Box::new(queue_rejections_total.clone()))?;
         registry.register(Box::new(queue_duration_seconds.clone()))?;
         registry.register(Box::new(cache_hits_total.clone()))?;
@@ -283,6 +318,9 @@ impl PrometheusMetrics {
             coordination_failures_total,
             capacity_degraded_total,
             capacity_lease_denied_total,
+            capacity_quota,
+            capacity_quota_committed,
+            capacity_quota_holders,
             auth_failures_total,
             config_reload_failures_total,
             worker_config_stale,
@@ -391,6 +429,23 @@ impl MetricsStore for PrometheusMetrics {
             .inc();
     }
 
+    fn on_capacity_quota(&self, cluster_name: &str, quota: u64, running: u64, waiting: u64) {
+        for (kind, v) in [("quota", quota), ("running", running), ("waiting", waiting)] {
+            self.capacity_quota
+                .with_label_values(&[cluster_name, kind])
+                .set(v as f64);
+        }
+    }
+
+    fn on_capacity_allocation(&self, cluster_name: &str, quota_committed: u64, holders: u64) {
+        self.capacity_quota_committed
+            .with_label_values(&[cluster_name])
+            .set(quota_committed as f64);
+        self.capacity_quota_holders
+            .with_label_values(&[cluster_name])
+            .set(holders as f64);
+    }
+
     fn on_auth_failure(&self, protocol: &str) {
         self.auth_failures_total
             .with_label_values(&[protocol])
@@ -495,6 +550,30 @@ impl MetricsStore for PrometheusMetrics {
 mod tests {
     use super::*;
     use queryflux_persistence::MetricsStore;
+
+    #[test]
+    fn sql_cache_counters_are_exported() {
+        use queryflux_core::bounded_cache::BoundedCache;
+        let cache: BoundedCache<u32, u32> = BoundedCache::new("metrics_test_cache", 1);
+        cache.get(&1);
+        cache.insert(1, 1);
+        cache.get(&1);
+        cache.insert(2, 2);
+        let metrics = PrometheusMetrics::new().expect("prometheus init");
+        let text = metrics.gather_text();
+        for name in ["hits", "misses", "evictions"] {
+            assert!(
+                text.contains(&format!(
+                    "queryflux_sql_cache_{name}_total{{cache=\"metrics_test_cache\"}} 1"
+                )),
+                "{name} missing in:\n{text}"
+            );
+        }
+        // A second scrape does not double-count.
+        cache.get(&2);
+        let text = metrics.gather_text();
+        assert!(text.contains("queryflux_sql_cache_hits_total{cache=\"metrics_test_cache\"} 2"));
+    }
 
     #[test]
     fn worker_fleet_metrics() {

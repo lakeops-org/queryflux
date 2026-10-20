@@ -16,7 +16,7 @@ chrono = { workspace = true }
 utoipa = { workspace = true }
 tracing = { workspace = true }
 
-tokio = { workspace = true, features = ["sync"] }
+tokio = { workspace = true, features = ["sync", "rt", "time"] }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["rt", "macros"] }
+tokio = { workspace = true, features = ["rt", "macros", "test-util"] }

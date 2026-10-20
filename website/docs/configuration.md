@@ -73,6 +73,20 @@ translation; dialect-only fallback remains allowed when it succeeds. The legacy
 changing this policy. See [Query translation](./architecture/query-translation) for
 fallback counters and query history outcomes.
 
+```yaml
+translation:
+  cache:
+    translations: 4096     # translated SQL; 0 disables
+    tableExtraction: 4096  # access-control table extraction and schema table references
+    fingerprints: 4096     # query-history fingerprints
+```
+
+Repeated queries reuse earlier results instead of parsing again. Each cache is a bounded
+LRU keyed on everything that changes its result (SQL text, dialects, fixup scripts,
+schema, strict mode), so it needs no flush on reload. Set a size to 0 to disable that
+cache. These settings are local to each process, including workers. See
+[Query translation](./architecture/query-translation#caching).
+
 ## Authentication, authorization & backend identity
 
 ```yaml
@@ -169,11 +183,26 @@ With **Postgres persistence** and **`distributed: true`** (the default when Post
 | Concern | Mechanism |
 |---|---|
 | Config hot-reload | `configReloadIntervalSecs` + immediate reload on Admin API writes |
-| Fleet-wide `maxRunningQueries` | Capacity leases in `cluster_capacity_leases` (`try_acquire` / `release`) |
+| Fleet-wide `maxRunningQueries` | Capacity leases in `cluster_capacity_leases`, counted in `cluster_capacity_counters.leased`; see [Capacity and throughput](./architecture/capacity-and-throughput) |
 | Engine running counts | Reconcile sweep publishes to `cluster_capacity_counters.running` |
 | Queued query dispatch | Claim columns on `queued_queries` — one replica per query |
 
 Set `distributed: false` to run Postgres-backed persistence without cross-replica coordination (single replica or explicit opt-out).
+
+**Capacity quotas.** By default every admission takes a per-query lease (one call into Postgres or the control plane). With quotas, each process gets a share of every cluster's limit and admits within it locally. Set it on standalone replicas or the control plane; workers follow their control plane.
+
+```yaml
+queryflux:
+  capacity:
+    mode: quotas            # leases (default) | quotas
+    reserveFraction: 0.15   # share of each limit kept for per-query leases
+    quotaLeaseSecs: 15      # how long a process may admit on its quota without reporting
+    reportIntervalMs: 1000  # how often each process reports demand
+```
+
+Turn it on only once every standalone or control-plane replica runs a version with quotas. How it works: [Capacity and throughput](./architecture/capacity-and-throughput#capacity-quotas).
+
+**Connection pools.** Each process opens three pools: query state (`queryPoolSize`, default 7), coordination for capacity leases, queue claims and sweep locks (`coordinationPoolSize`, default 8), and admin (`adminPoolSize`, default 2), plus one `LISTEN` connection. Connections open on demand. Size `coordinationPoolSize` to the admissions per second you expect × about 1 ms. The legacy `poolSize` instead sets one budget split 60/20/20, and is ignored when any of the three is set.
 
 **Query history retention.** `queryHistoryRetentionDays` deletes query records, digest stats and cluster snapshots older than that many days. With Postgres it runs hourly, on every replica (deleting the same rows twice is harmless), in batches of 10,000 rows, each its own short transaction. A large backlog, such as after turning retention on for an existing database, is worked through over successive batches. Each statement stays short, and autovacuum keeps up. Omit it to keep history forever.
 
@@ -182,7 +211,7 @@ queryflux:
   queryHistoryRetentionDays: 30
 ```
 
-Helm / Kubernetes: see **[charts/queryflux/README.md](https://github.com/lakeops-org/queryflux/blob/main/charts/queryflux/README.md#persistence-and-replicas)**. Full behavior: **[Cluster variants, health checks & reconciliation](./architecture/cluster-variants-and-health#distributed-mode-and-capacitystore)**.
+Helm / Kubernetes: see **[Run multiple replicas](./installation/kubernetes.md#run-multiple-replicas)**. Full behavior: **[Cluster variants, health checks & reconciliation](./architecture/cluster-variants-and-health#distributed-mode-and-capacitystore)**.
 
 ## Worker mode
 

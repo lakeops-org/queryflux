@@ -269,20 +269,22 @@ impl Guard for OpaAccessGuard {
         let empty_schema = SchemaContext::default();
         let schema = ctx.schema.unwrap_or(&empty_schema);
 
-        let statement = match queryflux_translation::extract_resources(ctx.sql, ctx.dialect, schema)
-        {
-            Ok(r) => r,
-            // A query that can't be analyzed has no resources to put in a request, so it can't
-            // be judged at all. `onMissingSchema` is about unresolved *columns* of tables that
-            // were found — not about failing to find them — so this denies in both modes;
-            // allowing it would let anything the parser can't read skip access control.
-            Err(e) => {
-                return GuardResult::deny(
-                    format!("access control: could not analyze query: {e}"),
-                    "ACCESS_ANALYSIS_FAILED",
-                )
-            }
-        };
+        // Only the parse is cached (keyed on the exact SQL, dialect and schema); every
+        // decision below is still made for this query.
+        let statement =
+            match queryflux_translation::extract_resources_cached(ctx.sql, ctx.dialect, schema) {
+                Ok(r) => r,
+                // A query that can't be analyzed has no resources to put in a request, so it can't
+                // be judged at all. `onMissingSchema` is about unresolved *columns* of tables that
+                // were found — not about failing to find them — so this denies in both modes;
+                // allowing it would let anything the parser can't read skip access control.
+                Err(e) => {
+                    return GuardResult::deny(
+                        format!("access control: could not analyze query: {e}"),
+                        "ACCESS_ANALYSIS_FAILED",
+                    )
+                }
+            };
 
         if statement.nested_writes {
             return GuardResult::deny(
@@ -1013,6 +1015,121 @@ mod tests {
             schema: None,
             sql_parse: Some(sql_parse),
         }
+    }
+
+    /// The extraction cache holds only the parse. With it warm, the same SQL is still
+    /// decided per query (alice allowed, bob denied), and a different statement is sent
+    /// with its own tables, never a cached statement's.
+    #[tokio::test]
+    async fn extraction_cache_never_skips_the_decision_or_mixes_up_tables() {
+        type Seen = Arc<std::sync::Mutex<Vec<(String, Vec<String>)>>>;
+        async fn handler(
+            axum::extract::State(seen): axum::extract::State<Seen>,
+            Json(body): Json<serde_json::Value>,
+        ) -> Json<serde_json::Value> {
+            let user = body["input"]["identity"]["user"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            let tables: Vec<String> = body["input"]["action"]["resources"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|r| r["table"].as_str().map(String::from))
+                .collect();
+            seen.lock().unwrap().push((user.clone(), tables.clone()));
+            let resources: Vec<serde_json::Value> = tables
+                .iter()
+                .map(|t| serde_json::json!({ "table": t, "allow": user == "alice" }))
+                .collect();
+            Json(serde_json::json!({ "result": { "resources": resources } }))
+        }
+        let seen: Seen = Default::default();
+        let app = Router::new()
+            .route("/v1/data/queryflux/access", post(handler))
+            .with_state(seen.clone());
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind stub");
+        let url = format!("http://{}", listener.local_addr().expect("stub addr"));
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+
+        let cfg = AccessControlConfig {
+            enabled: true,
+            default_connection: Some("default".to_string()),
+            connections: HashMap::from([("default".to_string(), opa_connection(&url))]),
+            groups: HashMap::new(),
+        };
+        let guard = OpaAccessGuard::try_from_config(&cfg).expect("build guard");
+        let dialect = SqlDialect::Postgres;
+        let engine_type = EngineType::Trino;
+        let group = ClusterGroupName("g".to_string());
+        let attributes = BTreeMap::new();
+        let query_tags = QueryTags::new();
+        let session_extra = HashMap::new();
+
+        let check = |sql: &'static str, user: &'static str| {
+            let guard = &guard;
+            let (dialect, engine_type, group) = (&dialect, &engine_type, &group);
+            let (attributes, query_tags, session_extra) =
+                (&attributes, &query_tags, &session_extra);
+            async move {
+                let parse = SqlParseCache::new(sql.to_string(), dialect.clone());
+                let ctx = GuardContext {
+                    sql,
+                    original_sql: None,
+                    dialect,
+                    engine_type,
+                    cluster_group: group,
+                    user: Some(user),
+                    groups: &[],
+                    roles: &[],
+                    attributes,
+                    agent_context: None,
+                    query_tags,
+                    session_extra,
+                    schema: None,
+                    sql_parse: Some(&parse),
+                };
+                guard.check(&ctx).await
+            }
+        };
+
+        let orders = "SELECT id FROM cache_test_orders";
+        let customers = "SELECT id FROM cache_test_customers";
+        for _ in 0..2 {
+            assert!(
+                matches!(check(orders, "alice").await, GuardResult::Allow { .. }),
+                "alice must be allowed"
+            );
+            assert!(
+                matches!(check(orders, "bob").await, GuardResult::Deny { .. }),
+                "bob must be denied even with the parse cached"
+            );
+        }
+        assert!(matches!(
+            check(customers, "alice").await,
+            GuardResult::Allow { .. }
+        ));
+        assert!(matches!(
+            check(customers, "bob").await,
+            GuardResult::Deny { .. }
+        ));
+
+        let seen = seen.lock().unwrap().clone();
+        let expect = |user: &str, table: &str| (user.to_string(), vec![table.to_string()]);
+        assert_eq!(
+            seen,
+            vec![
+                expect("alice", "cache_test_orders"),
+                expect("bob", "cache_test_orders"),
+                expect("alice", "cache_test_orders"),
+                expect("bob", "cache_test_orders"),
+                expect("alice", "cache_test_customers"),
+                expect("bob", "cache_test_customers"),
+            ],
+            "every query must reach the policy engine with its own tables"
+        );
     }
 
     /// Proves a cluster group actually reaches a *different* HTTP endpoint when

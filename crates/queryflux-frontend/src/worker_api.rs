@@ -14,7 +14,10 @@
 //!   worker. Available only when this process has a coordination store (Postgres).
 //!
 //! - `/worker/query-records` stores the query history workers send (a
-//!   [`QueryRecordBatchV1`]) in this process's history store, stamped with the worker.
+//!   [`QueryRecordBatchV1`]) in this process's history store, stamped with the worker,
+//!   as one batch write. At most [`MAX_CONCURRENT_RECORD_BATCHES`] batches are written at
+//!   once; a batch that cannot start within [`RECORD_BATCH_QUEUE_WAIT`] gets
+//!   `503 Service Unavailable` with `Retry-After`, and the worker keeps it spooled.
 //!
 //! Workers authenticate with `Authorization: Bearer <workerApi.sharedSecret>`, separate
 //! from the admin API's Basic auth.
@@ -57,10 +60,21 @@ pub struct WorkerApi {
     /// Where worker query records are stored (history only, not Prometheus: each worker
     /// exports its own metrics). `None` refuses them.
     pub history: Option<Arc<dyn MetricsStore>>,
+    /// Capacity quotas for workers (`capacity.mode: quotas`); `None` answers 404, and
+    /// workers keep using per-query leases.
+    pub quotas: Option<Arc<dyn queryflux_persistence::quota::QuotaStore>>,
 }
 
 /// Largest query-record batch accepted. Workers send at most a few hundred records.
 const MAX_RECORD_BATCH_BYTES: usize = 32 * 1024 * 1024;
+/// Query-record batches written at once. Each holds one connection of the admin pool
+/// (2 by default) for one short transaction; more would only queue on the pool and delay
+/// the admin API sharing it.
+pub const MAX_CONCURRENT_RECORD_BATCHES: usize = 2;
+/// How long a batch may wait for a write slot before it is refused with 503.
+pub const RECORD_BATCH_QUEUE_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+/// `Retry-After` (seconds) on a refused or failed query-record batch.
+const RECORD_BATCH_RETRY_AFTER_SECS: u64 = 2;
 
 /// A long-poll never holds a request longer than this.
 const MAX_WAIT_SECS: u64 = 60;
@@ -68,6 +82,16 @@ const MAX_WAIT_SECS: u64 = 60;
 const LIVE_WINDOW_SECS: i64 = 120;
 
 pub fn router(api: WorkerApi) -> Router {
+    router_with_ingest_limit(api, MAX_CONCURRENT_RECORD_BATCHES, RECORD_BATCH_QUEUE_WAIT)
+}
+
+/// [`router`] with a different history-ingest limit: `max_batches` written at once, each
+/// waiting at most `queue_wait` to start.
+pub fn router_with_ingest_limit(
+    api: WorkerApi,
+    max_batches: usize,
+    queue_wait: std::time::Duration,
+) -> Router {
     Router::new()
         .route("/worker/config", get(get_config))
         .route("/worker/config/wait", get(wait_config))
@@ -75,6 +99,15 @@ pub fn router(api: WorkerApi) -> Router {
         .route("/worker/heartbeat", post(report))
         .route("/worker/capacity/acquire", post(capacity_acquire))
         .route("/worker/capacity/release", post(capacity_release))
+        .route(
+            "/worker/capacity/release-batch",
+            post(capacity_release_batch),
+        )
+        .route("/worker/capacity/quota", post(capacity_quota))
+        .route(
+            "/worker/capacity/quota/release",
+            post(capacity_quota_release),
+        )
         .route("/worker/capacity/heartbeat", post(capacity_heartbeat))
         .route("/worker/capacity/release-all", post(capacity_release_all))
         .route(
@@ -96,6 +129,8 @@ pub fn router(api: WorkerApi) -> Router {
             api,
             last_fleet_warning: std::sync::atomic::AtomicI64::new(0),
             sweep_locks: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+            ingest_slots: tokio::sync::Semaphore::new(max_batches.max(1)),
+            ingest_queue_wait: queue_wait,
         }))
 }
 
@@ -111,6 +146,9 @@ struct WorkerApiState {
     /// Unix seconds of the last shared-capacity warning (rate limit).
     last_fleet_warning: std::sync::atomic::AtomicI64,
     sweep_locks: HeldSweepLocks,
+    /// Bounds concurrent query-record batch writes (backpressure for history ingest).
+    ingest_slots: tokio::sync::Semaphore,
+    ingest_queue_wait: std::time::Duration,
 }
 
 /// Constant-time comparison, so response timing does not leak how much of the
@@ -317,17 +355,51 @@ async fn ingest_records(
         )
             .into_response();
     }
-    let accepted = batch.records.len();
-    for mut record in batch.records {
-        record.worker = Some(batch.worker.clone());
-        // Retried batches repeat records; the store keeps the first per proxy query id.
-        if let Err(e) = store.record_query(record).await {
-            return (StatusCode::SERVICE_UNAVAILABLE, e.to_string()).into_response();
+    // Backpressure: a few batches are written at once and others wait briefly. When
+    // ingest falls behind, refuse with 503; the worker keeps the batch spooled and retries,
+    // so its queries never wait on this.
+    let _slot = match tokio::time::timeout(st.ingest_queue_wait, st.ingest_slots.acquire()).await {
+        Ok(Ok(permit)) => permit,
+        _ => {
+            tracing::warn!(
+                worker = %batch.worker,
+                records = batch.records.len(),
+                "Query history ingest is behind; asking the worker to retry"
+            );
+            return retry_later("query history ingest is busy, retry later".to_string());
         }
+    };
+    let accepted = batch.records.len();
+    let worker = batch.worker;
+    let records: Vec<_> = batch
+        .records
+        .into_iter()
+        .map(|mut record| {
+            record.worker = Some(worker.clone());
+            record
+        })
+        .collect();
+    // One write for the whole batch. Retried batches repeat records; the store keeps the
+    // first per proxy query id and counts each once in digest stats.
+    if let Err(e) = store.record_queries(records).await {
+        return retry_later(e.to_string());
     }
     (
         StatusCode::ACCEPTED,
         Json(serde_json::json!({ "accepted": accepted })),
+    )
+        .into_response()
+}
+
+/// `503` with `Retry-After`: the worker keeps the batch and sends it again.
+fn retry_later(message: String) -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        [(
+            header::RETRY_AFTER,
+            HeaderValue::from(RECORD_BATCH_RETRY_AFTER_SECS),
+        )],
+        message,
     )
         .into_response()
 }
@@ -348,6 +420,12 @@ pub struct AcquireRequest {
 pub struct ReleaseRequest {
     pub cluster: String,
     pub query_id: String,
+}
+
+#[derive(serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReleaseBatchRequest {
+    pub leases: Vec<ReleaseRequest>,
 }
 
 #[derive(serde::Deserialize, serde::Serialize)]
@@ -424,6 +502,86 @@ async fn capacity_release(
         Err(r) => return r,
     };
     match store.release(&req.cluster, &req.query_id).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => store_error(e),
+    }
+}
+
+/// Authorize the worker and return the quota store, or 404 when this control plane has
+/// no quotas (`capacity.mode: leases`): the worker then keeps per-query leases.
+#[allow(clippy::result_large_err)]
+fn quotas(
+    st: &WorkerApiState,
+    headers: &HeaderMap,
+) -> Result<Arc<dyn queryflux_persistence::quota::QuotaStore>, Response> {
+    if !authorized(headers, &st.api.shared_secret) {
+        return Err(unauthorized());
+    }
+    st.api.quotas.clone().ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            "capacity quotas are off on this control plane (capacity.mode: leases)",
+        )
+            .into_response()
+    })
+}
+
+#[derive(serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QuotaReportRequest {
+    pub instance_id: String,
+    #[serde(default)]
+    pub clusters: Vec<queryflux_persistence::quota::DemandReport>,
+}
+
+/// A worker's demand report; the response carries its current quotas (capacity quotas).
+async fn capacity_quota(
+    State(st): State<Arc<WorkerApiState>>,
+    headers: HeaderMap,
+    Json(req): Json<QuotaReportRequest>,
+) -> Response {
+    let store = match quotas(&st, &headers) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    match store.report_demand(&req.instance_id, &req.clusters).await {
+        Ok(Some(resp)) => Json(resp).into_response(),
+        Ok(None) => (StatusCode::NOT_FOUND, "capacity quotas are off").into_response(),
+        Err(e) => store_error(e),
+    }
+}
+
+async fn capacity_quota_release(
+    State(st): State<Arc<WorkerApiState>>,
+    headers: HeaderMap,
+    Json(req): Json<InstanceRequest>,
+) -> Response {
+    let store = match quotas(&st, &headers) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    match store.release_holder(&req.instance_id).await {
+        Ok(n) => Json(serde_json::json!({ "released": n })).into_response(),
+        Err(e) => store_error(e),
+    }
+}
+
+/// Releases from one worker, sent together (`BatchedReleaseStore` on the worker).
+async fn capacity_release_batch(
+    State(st): State<Arc<WorkerApiState>>,
+    headers: HeaderMap,
+    Json(req): Json<ReleaseBatchRequest>,
+) -> Response {
+    let store = match coordination(&st, &headers) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    let leases: Vec<(String, String)> = req
+        .leases
+        .into_iter()
+        .map(|l| (l.cluster, l.query_id))
+        .collect();
+    match store.release_many(&leases).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => store_error(e),
     }
@@ -589,6 +747,7 @@ mod tests {
             changes: None,
             coordination: None,
             history: None,
+            quotas: None,
         })
     }
 
@@ -669,6 +828,7 @@ mod tests {
             changes: Some(changes),
             coordination: None,
             history: None,
+            quotas: None,
         })
     }
 
@@ -765,6 +925,7 @@ mod tests {
             changes: None,
             coordination: Some(store),
             history: None,
+            quotas: None,
         });
         let post = |path: &str, body: serde_json::Value| {
             Request::post(path.to_string())
@@ -827,6 +988,7 @@ mod tests {
             changes: None,
             coordination: None,
             history: Some(store.clone()),
+            quotas: None,
         });
         let record = serde_json::json!({
             "proxyQueryId": "q-1",
@@ -872,5 +1034,102 @@ mod tests {
         let future = serde_json::json!({ "schemaVersion": 2, "worker": "w", "records": [] });
         let resp = app.oneshot(post(future)).await.unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// A history store whose batch writes wait until the test opens the gate.
+    struct GatedHistory {
+        entered: tokio::sync::Notify,
+        gate: tokio::sync::Semaphore,
+        batches: std::sync::Mutex<Vec<usize>>,
+    }
+
+    #[async_trait::async_trait]
+    impl MetricsStore for GatedHistory {
+        async fn record_query(
+            &self,
+            _: queryflux_persistence::QueryRecord,
+        ) -> queryflux_core::error::Result<()> {
+            unreachable!("ingest writes whole batches")
+        }
+        async fn record_queries(
+            &self,
+            records: Vec<queryflux_persistence::QueryRecord>,
+        ) -> queryflux_core::error::Result<()> {
+            self.entered.notify_one();
+            self.gate.acquire().await.unwrap().forget();
+            self.batches.lock().unwrap().push(records.len());
+            Ok(())
+        }
+        async fn record_cluster_snapshot(
+            &self,
+            _: queryflux_persistence::ClusterSnapshot,
+        ) -> queryflux_core::error::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn busy_history_ingest_answers_503_with_retry_after() {
+        let store = Arc::new(GatedHistory {
+            entered: tokio::sync::Notify::new(),
+            gate: tokio::sync::Semaphore::new(0),
+            batches: Default::default(),
+        });
+        let app = router_with_ingest_limit(
+            WorkerApi {
+                shared_secret: "s3cret".into(),
+                snapshot: Arc::new(|| Box::pin(async { Err("unused".to_string()) })),
+                registry: None,
+                changes: None,
+                coordination: None,
+                history: Some(store.clone()),
+                quotas: None,
+            },
+            1,
+            std::time::Duration::from_millis(50),
+        );
+        let record = |id: &str| {
+            serde_json::json!({
+                "proxyQueryId": id, "clusterGroup": "g", "clusterName": "c",
+                "engineType": "duckDb", "frontendProtocol": "trinoHttp",
+                "sourceDialect": "trino", "targetDialect": "duckDb",
+                "wasRewritten": false, "wasTranslated": false, "status": "success",
+                "queueDurationMs": 0, "executionDurationMs": 1,
+                "createdAt": "2026-10-14T00:00:00Z"
+            })
+        };
+        let post = |ids: &[&str]| {
+            let batch = serde_json::json!({
+                "schemaVersion": 1, "worker": "w",
+                "records": ids.iter().map(|id| record(id)).collect::<Vec<_>>()
+            });
+            Request::post("/worker/query-records")
+                .header(header::AUTHORIZATION, "Bearer s3cret")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(batch.to_string()))
+                .unwrap()
+        };
+
+        // The first batch takes the only write slot and holds it.
+        let entered = store.entered.notified();
+        let first = tokio::spawn(app.clone().oneshot(post(&["a", "b", "c"])));
+        entered.await;
+
+        let busy = app.clone().oneshot(post(&["d"])).await.unwrap();
+        assert_eq!(busy.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            busy.headers().get(header::RETRY_AFTER).unwrap(),
+            &RECORD_BATCH_RETRY_AFTER_SECS.to_string()
+        );
+
+        store.gate.add_permits(2);
+        assert_eq!(first.await.unwrap().unwrap().status(), StatusCode::ACCEPTED);
+        let retried = app.oneshot(post(&["d"])).await.unwrap();
+        assert_eq!(retried.status(), StatusCode::ACCEPTED);
+        assert_eq!(
+            *store.batches.lock().unwrap(),
+            vec![3, 1],
+            "each batch is one write"
+        );
     }
 }

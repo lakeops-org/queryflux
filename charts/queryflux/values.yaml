@@ -39,6 +39,50 @@ image:
   tag: ""
 
 imagePullSecrets: []
+
+# QueryFlux Studio (admin UI), run as a sidecar next to the server in each pod. It is a
+# separate image (built in lakeops-org/queryflux-studio) and reaches the server's Admin API
+# over localhost. Exposed on service.ports.studio.
+studio:
+  enabled: true
+  image:
+    repository: ghcr.io/lakeops-org/queryflux-studio
+    pullPolicy: IfNotPresent
+    # Studio publishes :latest on every main push; pin a release tag (or a digest,
+    # e.g. "sha256:…", rendered as repository@sha256:…) for production.
+    tag: latest
+  # Extra env, e.g. ADMIN_API_USERNAME / ADMIN_API_PASSWORD for bootstrap Basic auth.
+  env: []
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
+    limits:
+      memory: 512Mi
+  securityContext:
+    allowPrivilegeEscalation: false
+    capabilities:
+      drop:
+        - ALL
+    readOnlyRootFilesystem: true
+    runAsNonRoot: true
+    # The image's nextjs user.
+    runAsUser: 1001
+    runAsGroup: 1001
+  readinessProbe:
+    tcpSocket:
+      port: studio
+    periodSeconds: 5
+    timeoutSeconds: 2
+    failureThreshold: 6
+  livenessProbe:
+    tcpSocket:
+      port: studio
+    initialDelaySeconds: 10
+    periodSeconds: 10
+    timeoutSeconds: 2
+    failureThreshold: 6
+
 nameOverride: ""
 fullnameOverride: ""
 
@@ -152,6 +196,7 @@ service:
       port: 9000
       targetPort: 9000
       protocol: TCP
+    # Served by the studio sidecar; only exposed when studio.enabled.
     studio:
       enabled: true
       name: studio

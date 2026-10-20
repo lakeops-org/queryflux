@@ -175,7 +175,7 @@ With **Postgres persistence** and **`distributed: true`** (the default when Post
 
 Set `distributed: false` to run Postgres-backed persistence without cross-replica coordination (single replica or explicit opt-out).
 
-Helm / Kubernetes: see **[charts/queryflux/README.md](https://github.com/lakeops-org/queryflux/blob/main/charts/queryflux/README.md#persistence-and-replicas)**. Full behavior: **[Cluster variants, health checks & reconciliation](./architecture/cluster-variants-and-health#distributed-mode-and-capacitystore)**.
+Helm / Kubernetes: see **[Run multiple replicas](./installation/kubernetes.md#run-multiple-replicas)**. Full behavior: **[Cluster variants, health checks & reconciliation](./architecture/cluster-variants-and-health#distributed-mode-and-capacitystore)**.
 
 ## Query Cache
 

@@ -1,3 +1,4 @@
+pub mod batched_release;
 pub mod cache_store;
 pub mod cluster_config;
 pub mod in_memory;
@@ -5,6 +6,8 @@ pub mod metrics_store;
 pub mod migrate;
 pub mod postgres;
 pub mod query_history;
+pub mod quota;
+pub mod quota_admission;
 pub mod routing_json;
 pub mod routing_slices;
 pub mod script_library;
@@ -339,6 +342,16 @@ pub trait CapacityStore: Send + Sync {
 
     /// Release a previously acquired capacity slot.
     async fn release(&self, cluster_name: &str, query_id: &str) -> Result<()>;
+
+    /// Release several slots, as `(cluster_name, query_id)` pairs. Backends that can do
+    /// it in one call (one `DELETE`, one HTTP request) override this; the default
+    /// releases them one by one and stops at the first error.
+    async fn release_many(&self, leases: &[(String, String)]) -> Result<()> {
+        for (cluster, query_id) in leases {
+            self.release(cluster, query_id).await?;
+        }
+        Ok(())
+    }
 
     /// Renew the heartbeat on every lease held by `instance_id` so that
     /// [`Self::expire_stale`] does not reclaim slots of long-running queries
