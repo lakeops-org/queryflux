@@ -1,0 +1,26 @@
+# QueryFlux
+
+> QueryFlux is an open-source SQL proxy written in Rust. It gives tools and AI agents one SQL endpoint (Trino HTTP, PostgreSQL wire, MySQL wire, ClickHouse HTTP, Flight SQL, Snowflake, and MCP) in front of many engines (Trino, Athena, DuckDB, StarRocks, ClickHouse, Postgres, Snowflake, Databricks, and more), with routing, SQL dialect translation, guardrails, access control, and a record of every query.
+
+Agents usually connect through the MCP frontend, a streamable-HTTP MCP server at `http://<host>:<port>/mcp` with bearer-token auth. Its tools: `list_schemas`, `list_tables`, `describe_table` (discovery), `execute_query` (reads only), `explain_query`, `get_query_status`, `cancel_query`, and `execute_statement` (writes, only when an operator sets `frontends.mcp.allowWrites: true`). Add LIMITs and filters; when a guardrail rejects a query, its error says how to fix it.
+
+## Docs
+
+- [Overview](https://queryflux.dev/docs/intro): what QueryFlux is and how the docs are organized
+- [Getting started](https://queryflux.dev/docs/getting-started): run QueryFlux and send a first query
+- [Configuration](https://queryflux.dev/docs/configuration): the YAML config reference (frontends, clusters, groups, routers)
+- [Architecture overview](https://queryflux.dev/docs/architecture/overview): frontends, routing, translation, and dispatch
+
+## Agents and MCP
+
+- [Quickstart: query from an AI agent (MCP)](https://queryflux.dev/docs/quickstart/ai-agent-mcp): run the MCP frontend on embedded DuckDB and connect Claude Code, Cursor, or Claude Desktop
+- [MCP frontend](https://queryflux.dev/docs/architecture/frontends/mcp): tool reference, auth, the `dialect` parameter, connecting clients
+- [Guardrails](https://queryflux.dev/docs/architecture/guardrails): read-only, row limits, required predicates, and custom guards
+- [Agent context](https://queryflux.dev/docs/agentic/agent-context): tagging queries with agent_id and conversation_id
+- [Agentic overview](https://queryflux.dev/docs/agentic/overview): how QueryFlux tracks agents and conversations
+
+## Optional
+
+- [Blog](https://queryflux.dev/blog): guides and announcements
+- [Give agents SQL, not the keys to every engine](https://queryflux.dev/blog/agents-sql-not-keys): routing, guardrails, and impersonation for agents
+- [Source code](https://github.com/lakeops-org/queryflux)

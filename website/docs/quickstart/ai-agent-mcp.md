@@ -58,6 +58,7 @@ queryflux:
     mcp:
       enabled: true
       port: 8811
+      allowWrites: true
   persistence:
     type: inMemory
 
@@ -80,61 +81,47 @@ routingFallback: duckdb-local
 ```
 
 - `frontends.mcp` turns on the MCP frontend. It has no default port, so `port: 8811` is set explicitly. The endpoint is always served at the `/mcp` path.
+- `allowWrites: true` lets this demo create tables. The MCP endpoint is **read-only by default**: `execute_query` rejects anything that isn't a read, and the `execute_statement` write tool isn't advertised at all. Leave `allowWrites` off for agents that only need to read. See [Read-only by default](../architecture/frontends/mcp.md#read-only-by-default).
 - `duckdb-1` is an **embedded** DuckDB engine: it runs inside the QueryFlux process, so there is no endpoint to configure.
 - The `protocolBased` router sends all MCP traffic to the `duckdb-local` group. MCP tool calls go through the same routing, translation, guardrail, and query-history pipeline as every other frontend.
 
-## 3. Connect an MCP client
+## 3. Connect an agent
 
 Point any streamable-HTTP MCP client at `http://localhost:8811/mcp`. QueryFlux offers streamable HTTP only, not stdio.
 
-### MCP Inspector (quick check)
-
-```bash
-npx @modelcontextprotocol/inspector
-# Transport: Streamable HTTP
-# URL: http://localhost:8811/mcp
-```
-
-Connect, open the **Tools** tab, and you should see the six QueryFlux tools listed in [step 4](#4-run-queries-through-the-agent).
-
-### Claude Code
+**Claude Code**
 
 ```bash
 claude mcp add --transport http queryflux http://localhost:8811/mcp
 ```
 
-Add `--scope user` to make it available in every project instead of just the current one. Run `/mcp` inside Claude Code to confirm it shows as connected.
+Add `--scope user` to make it available in every project. Run `/mcp` inside Claude Code to confirm it is connected.
 
-### Cursor
-
-Add to `.cursor/mcp.json` (project-scoped) or Cursor's global MCP settings:
+**Cursor** — `.cursor/mcp.json` (project) or the global MCP settings:
 
 ```json title=".cursor/mcp.json"
-{
-  "mcpServers": {
-    "queryflux": {
-      "url": "http://localhost:8811/mcp"
-    }
-  }
-}
+{ "mcpServers": { "queryflux": { "url": "http://localhost:8811/mcp" } } }
 ```
 
-### Claude Desktop
-
-`claude_desktop_config.json` only accepts stdio server entries, so bridge the local endpoint with [`mcp-remote`](https://www.npmjs.com/package/mcp-remote):
+**Claude Desktop** — `claude_desktop_config.json` only accepts stdio servers, so bridge with [`mcp-remote`](https://www.npmjs.com/package/mcp-remote):
 
 ```json title="claude_desktop_config.json"
-{
-  "mcpServers": {
-    "queryflux": {
-      "command": "npx",
-      "args": ["mcp-remote@latest", "http://localhost:8811/mcp"]
-    }
-  }
-}
+{ "mcpServers": { "queryflux": { "command": "npx", "args": ["mcp-remote@latest", "http://localhost:8811/mcp"] } } }
 ```
 
-**Settings → Connectors → Add custom connector** only works for a QueryFlux endpoint that Claude can reach over the internet, not `localhost`. See the [MCP frontend docs](../architecture/frontends/mcp.md#claude-desktop).
+(**Settings → Connectors → Add custom connector** works only for an endpoint Claude can reach over the internet, not `localhost`. See the [MCP frontend docs](../architecture/frontends/mcp.md#claude-desktop).)
+
+**MCP Inspector** (no agent, just a check):
+
+```bash
+npx @modelcontextprotocol/inspector   # Transport: Streamable HTTP, URL: http://localhost:8811/mcp
+```
+
+Then paste this into your agent:
+
+```text
+Use the queryflux MCP server. Discover data with list_schemas, list_tables and describe_table before querying, run reads with execute_query, always add a LIMIT, and if a guardrail rejects a query, fix it the way the error says and retry.
+```
 
 :::tip With authentication enabled
 When QueryFlux requires auth, every client needs an `Authorization: Bearer <token>` header — for example `--header "Authorization: Bearer $QUERYFLUX_MCP_TOKEN"` on `claude mcp add`, or a `"headers"` object in Cursor's `mcp.json`. Read the token from an environment variable rather than committing it. See [Connecting a client](../architecture/frontends/mcp.md#connecting-a-client) for every client's exact syntax.
@@ -142,31 +129,33 @@ When QueryFlux requires auth, every client needs an `Authorization: Bearer <toke
 
 ## 4. Run queries through the agent
 
-QueryFlux exposes six MCP tools:
+QueryFlux exposes these MCP tools. The annotation column is what MCP clients see; most auto-approve read-only tools and ask before a destructive one.
 
-| Tool | What it does |
-| --- | --- |
-| `execute_query` | Runs SQL and returns rows as JSON keyed by column name. Truncates at `max_rows` (default 1000). |
-| `list_schemas` | Lists schemas by querying `information_schema.schemata`. |
-| `describe_table` | Returns column metadata via `DESCRIBE`, plus sample rows in the same call when `sample_rows > 0`. |
-| `explain_query` | Returns the query plan via `EXPLAIN` without running the query. |
-| `get_query_status` | Reports whether a query is `running`, `queued`, or `not_found_or_completed`. |
-| `cancel_query` | Cancels a running or queued query. Only the caller that submitted it can cancel it. |
+| Tool | Annotation | What it does |
+| --- | --- | --- |
+| `execute_query` | read-only | Runs a read (`SELECT`, `WITH`, `SHOW`, `DESCRIBE`, `EXPLAIN`) and returns rows as JSON keyed by column name. Truncates at `max_rows` (default 1000). Rejects writes. |
+| `execute_statement` | destructive | Runs writes and DDL. Only listed when `allowWrites: true`, and each call needs `confirm: true`. |
+| `list_schemas` | read-only | Lists schemas from `information_schema.schemata`. |
+| `list_tables` | read-only | Lists tables and views from `information_schema.tables`, optionally for one `catalog` and/or `schema`. |
+| `describe_table` | read-only | Returns column metadata via `DESCRIBE`, plus sample rows in the same call when `sample_rows > 0`. |
+| `explain_query` | read-only | Returns the query plan via `EXPLAIN` without running the query. |
+| `get_query_status` | read-only | Reports whether a query is `running`, `queued`, or `not_found_or_completed`. |
+| `cancel_query` | idempotent | Cancels a running or queued query. Only the caller that submitted it can cancel it. |
 
 Ask your agent something like:
 
 > Create a table called `orders` with a few sample rows, describe its columns, then show me everything in it.
 
-That makes the agent call `execute_query` (CREATE + INSERT), then `describe_table`, then `execute_query` again (SELECT).
+The agent calls `execute_statement` (CREATE + INSERT). The first call without `confirm: true` comes back with an error asking it to check with you, so expect it to show you the statement and ask. Then it calls `describe_table`, then `execute_query` (SELECT). Without `allowWrites`, the agent would get an error saying writes are disabled on this endpoint.
 
-To drive the tools by hand from the Inspector instead, call `execute_query` with this `sql`:
+To drive the tools by hand from the Inspector instead, call `execute_statement` with `confirm: true` and this `sql`:
 
 ```sql
 CREATE TABLE orders AS
 SELECT * FROM (VALUES (1, 'widget', 9.99), (2, 'gadget', 19.99)) AS t(id, name, price);
 ```
 
-Then call it again with:
+Then call `execute_query` with:
 
 ```sql
 SELECT * FROM orders;
@@ -190,7 +179,7 @@ Open **http://localhost:3000**. MCP queries appear on the **Queries** page like 
 
 ## 6. (Optional) Add guardrails
 
-Nothing in this example limits what an agent can run: no read-only mode, no row caps. The MCP frontend has no guard policy of its own. You add guardrails the same way as for any other frontend, with a `guardrails:` block in `config.yaml` (for example `read_only` or `row_limit`). See [Guardrails](../architecture/guardrails.md), then restart the `queryflux` container to pick up the change:
+Apart from the read/write split, nothing in this example limits what an agent can run: no row caps, no scan limits. You add guardrails the same way as for any other frontend, with a `guardrails:` block in `config.yaml` (for example `read_only` or `row_limit`). See [Guardrails](../architecture/guardrails.md), then restart the `queryflux` container to pick up the change:
 
 ```bash
 docker compose up -d --force-recreate queryflux

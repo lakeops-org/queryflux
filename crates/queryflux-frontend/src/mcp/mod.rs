@@ -1,7 +1,8 @@
 //! MCP (Model Context Protocol) frontend — streamable HTTP tool calls for AI agents.
 //!
-//! Exposes `execute_query`, `list_schemas`, `describe_table`, `explain_query`,
-//! `get_query_status`, and `cancel_query` as MCP tools. Every tool authenticates via
+//! Exposes `execute_query` (reads only), `list_schemas`, `list_tables`, `describe_table`,
+//! `explain_query`, `get_query_status`, and `cancel_query` as MCP tools, plus
+//! `execute_statement` for writes when `frontends.mcp.allowWrites` is set. Every tool authenticates via
 //! `Authorization: Bearer <token>` (same `AuthProvider` as every other HTTP frontend)
 //! and dispatches through the standard `execute_to_sink` pipeline, so routing,
 //! translation, guardrails, and query-history persistence are identical to every other
@@ -29,14 +30,21 @@ pub struct McpFrontend {
     state: Arc<AppState>,
     port: u16,
     max_connections: Option<usize>,
+    allow_writes: bool,
 }
 
 impl McpFrontend {
-    pub fn new(state: Arc<AppState>, port: u16, max_connections: Option<usize>) -> Self {
+    pub fn new(
+        state: Arc<AppState>,
+        port: u16,
+        max_connections: Option<usize>,
+        allow_writes: bool,
+    ) -> Self {
         Self {
             state,
             port,
             max_connections,
+            allow_writes,
         }
     }
 }
@@ -52,9 +60,10 @@ impl FrontendListenerTrait for McpFrontend {
         let config = StreamableHttpServerConfig::default().with_cancellation_token(ct.clone());
 
         let server_state = self.state.clone();
+        let allow_writes = self.allow_writes;
         let service: StreamableHttpService<QueryFluxMcpServer, LocalSessionManager> =
             StreamableHttpService::new(
-                move || Ok(QueryFluxMcpServer::new(server_state.clone())),
+                move || Ok(QueryFluxMcpServer::new(server_state.clone(), allow_writes)),
                 Arc::new(LocalSessionManager::default()),
                 config,
             );

@@ -800,7 +800,7 @@ fn enabled_frontends(f: &queryflux_core::config::FrontendsConfig) -> Vec<String>
         ("mysqlWire", &f.mysql_wire),
         ("clickhouseHttp", &f.clickhouse_http),
         ("flightSql", &f.flight_sql),
-        ("mcp", &f.mcp),
+        ("mcp", &f.mcp.as_ref().map(|c| c.listener.clone())),
     ] {
         if let Some(c) = cfg.as_ref().filter(|c| c.enabled) {
             out.push(format!("{name}:{}", c.port));

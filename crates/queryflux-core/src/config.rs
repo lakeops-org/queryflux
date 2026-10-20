@@ -1291,7 +1291,20 @@ pub struct FrontendsConfig {
     pub snowflake_http: Option<SnowflakeHttpFrontendConfig>,
     /// MCP (Model Context Protocol) streamable-HTTP frontend for AI agent tool calls.
     #[serde(default)]
-    pub mcp: Option<FrontendConfig>,
+    pub mcp: Option<McpFrontendConfig>,
+}
+
+/// Config for the MCP frontend: the common listener settings plus MCP-only tool policy.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpFrontendConfig {
+    #[serde(flatten)]
+    pub listener: FrontendConfig,
+    /// Expose the `execute_statement` tool for writes and DDL. Off by default: the MCP
+    /// endpoint is read-only (`execute_query` rejects anything that is not a read) and
+    /// `execute_statement` is not advertised at all. Guardrails still apply either way.
+    #[serde(default)]
+    pub allow_writes: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
