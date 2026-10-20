@@ -179,6 +179,43 @@ async fn build_pg_pool(
         .map_err(|e| QueryFluxError::Persistence(format!("Failed to connect to Postgres: {e}")))
 }
 
+/// Rows deleted per statement by the history purge.
+const PURGE_BATCH_ROWS: i64 = 10_000;
+
+impl PostgresStore {
+    /// Delete rows of `table` whose `column` is older than `older_than`,
+    /// [`PURGE_BATCH_ROWS`] at a time, until none are left. Rows are picked through the
+    /// index on `column` and deleted by `ctid`. `table` and `column` are fixed names
+    /// from [`Self::purge_old_query_records`], never user input.
+    async fn purge_in_batches(
+        &self,
+        table: &str,
+        column: &str,
+        older_than: chrono::DateTime<chrono::Utc>,
+    ) -> Result<u64> {
+        let sql = format!(
+            "DELETE FROM {table} WHERE ctid = ANY(ARRAY(\
+                SELECT ctid FROM {table} WHERE {column} < $1 LIMIT $2))"
+        );
+        let mut deleted = 0u64;
+        loop {
+            let n = sqlx::query(&sql)
+                .bind(older_than)
+                .bind(PURGE_BATCH_ROWS)
+                .execute(&self.admin_pool)
+                .await
+                .map_err(|e| QueryFluxError::Persistence(format!("purge {table}: {e}")))?
+                .rows_affected();
+            deleted += n;
+            if n < PURGE_BATCH_ROWS as u64 {
+                return Ok(deleted);
+            }
+            // Leave room for the admin API and ingest that share this pool.
+            tokio::task::yield_now().await;
+        }
+    }
+}
+
 /// The Postgres sweep lock is a session-scoped advisory lock held on a
 /// dedicated direct connection (outside the coordination pool), so sweeps
 /// never pin pool slots and concurrent try-lock attempts can each open a
@@ -499,37 +536,27 @@ impl QueryHistoryStore for PostgresStore {
         .map_err(|e| QueryFluxError::Persistence(format!("get_conversation: {e}")))
     }
 
+    /// Deletes in batches of [`PURGE_BATCH_ROWS`], each its own short transaction.
+    ///
+    /// One `DELETE` of everything expired held an admin connection and row locks for as
+    /// long as it ran, wrote the whole delete as one transaction, and at high ingest
+    /// rates (an hour of history can be tens of millions of rows) ran into
+    /// `statement_timeout`, so nothing was purged at all. Small batches keep each
+    /// statement short, let autovacuum keep up, and make progress even when the backlog
+    /// is large.
     async fn purge_old_query_records(
         &self,
         older_than: chrono::DateTime<chrono::Utc>,
     ) -> Result<u64> {
-        let mut tx = self.admin_pool.begin().await.map_err(|e| {
-            QueryFluxError::Persistence(format!("purge_old_query_records begin: {e}"))
-        })?;
-
-        let records = sqlx::query("DELETE FROM query_records WHERE created_at < $1")
-            .bind(older_than)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| QueryFluxError::Persistence(format!("purge query_records: {e}")))?;
-
-        let digests = sqlx::query("DELETE FROM query_digest_stats WHERE last_seen < $1")
-            .bind(older_than)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| QueryFluxError::Persistence(format!("purge query_digest_stats: {e}")))?;
-
-        let snapshots = sqlx::query("DELETE FROM cluster_snapshots WHERE recorded_at < $1")
-            .bind(older_than)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| QueryFluxError::Persistence(format!("purge cluster_snapshots: {e}")))?;
-
-        tx.commit().await.map_err(|e| {
-            QueryFluxError::Persistence(format!("purge_old_query_records commit: {e}"))
-        })?;
-
-        Ok(records.rows_affected() + digests.rows_affected() + snapshots.rows_affected())
+        let mut total = 0;
+        for (table, column) in [
+            ("query_records", "created_at"),
+            ("query_digest_stats", "last_seen"),
+            ("cluster_snapshots", "recorded_at"),
+        ] {
+            total += self.purge_in_batches(table, column, older_than).await?;
+        }
+        Ok(total)
     }
 }
 
@@ -3213,6 +3240,48 @@ mod tests {
             .await
             .unwrap());
         store.release(&cluster, &q3).await.unwrap();
+    }
+
+    /// More expired rows than one batch: all of them go, newer rows stay.
+    #[tokio::test]
+    #[ignore]
+    async fn pg_purge_deletes_expired_history_in_batches() {
+        use crate::QueryHistoryStore;
+        let store = test_store().await;
+        let tag = unique_id("purge");
+        let insert = |n: i64, age: &str| {
+            format!(
+                "INSERT INTO query_records (proxy_query_id, cluster_group, cluster_name, engine_type, \
+                 frontend_protocol, source_dialect, target_dialect, status, created_at) \
+                 SELECT '{tag}-{age}-' || g, '{tag}', 'c', 'duckDb', 'trinoHttp', 'trino', 'duckdb', \
+                 'success', now() - interval '{age}' FROM generate_series(1, {n}) g"
+            )
+        };
+        let expired = PURGE_BATCH_ROWS * 2 + 7;
+        sqlx::query(&insert(expired, "40 days"))
+            .execute(&store.admin_pool)
+            .await
+            .unwrap();
+        sqlx::query(&insert(5, "1 day"))
+            .execute(&store.admin_pool)
+            .await
+            .unwrap();
+
+        let cutoff = chrono::Utc::now() - chrono::Duration::days(30);
+        let deleted = store.purge_old_query_records(cutoff).await.unwrap();
+        assert!(deleted >= expired as u64, "deleted {deleted}");
+        let left: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM query_records WHERE cluster_group = $1")
+                .bind(&tag)
+                .fetch_one(&store.admin_pool)
+                .await
+                .unwrap();
+        assert_eq!(left, 5);
+        sqlx::query("DELETE FROM query_records WHERE cluster_group = $1")
+            .bind(&tag)
+            .execute(&store.admin_pool)
+            .await
+            .unwrap();
     }
 
     async fn lease_rows(store: &PostgresStore, cluster: &str) -> i64 {
