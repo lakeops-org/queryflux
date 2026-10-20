@@ -602,3 +602,38 @@ async fn execute_query_response_conversation_id_can_be_reused_on_a_new_connectio
 
     let _ = client2.cancel().await;
 }
+
+#[tokio::test]
+async fn explain_route_reports_group_engine_and_guard_verdict() {
+    let guard_chain =
+        Arc::new(GuardChain::new(vec![
+            Box::new(queryflux_guardrails::built_in::NoCrossJoinGuard) as Box<dyn Guard>,
+        ]));
+    let h = ProtocolWireHarness::new_with_guard_chain(Some(guard_chain))
+        .await
+        .expect("harness");
+    let client = connect(h.mcp_port).await;
+
+    let explain = |sql: &'static str| {
+        client.call_tool(call("explain_route", serde_json::json!({ "sql": sql })))
+    };
+    let ok = result_json(&explain("SELECT 1").await.expect("explain_route"));
+    assert!(ok["group"].is_string(), "{ok}");
+    assert_eq!(ok["clusters"][0]["engine"], "duckDb", "{ok}");
+    assert_eq!(ok["guards"]["outcome"], "allow", "{ok}");
+
+    let denied = result_json(
+        &explain("SELECT * FROM (SELECT 1) a CROSS JOIN (SELECT 2) b")
+            .await
+            .expect("explain_route"),
+    );
+    assert_eq!(denied["guards"]["outcome"], "deny", "{denied}");
+    assert!(
+        denied["guards"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("[CROSS_JOIN]")),
+        "{denied}"
+    );
+
+    let _ = client.cancel().await;
+}

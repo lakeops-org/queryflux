@@ -507,11 +507,12 @@ impl Guard for NoCrossJoinGuard {
     }
 }
 
+/// Tables, subqueries and table functions; not UNNEST / LATERAL row expansions.
 fn is_relation(expr: &Expression) -> bool {
     match expr {
         Expression::Alias(a) => is_relation(&a.this),
-        Expression::Table(_) | Expression::Subquery(_) => true,
-        _ => false,
+        Expression::Unnest(_) | Expression::Lateral(_) => false,
+        _ => true,
     }
 }
 

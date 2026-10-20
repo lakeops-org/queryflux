@@ -643,7 +643,15 @@ pub async fn post_statement(
             )
     };
 
-    if !use_cache_path && live.group_supports_async(&group.0) {
+    // Why this engine: returned on the first response so clients and agents can see it.
+    let route_headers = [
+        ("x-queryflux-route-group", group.0.clone()),
+        (
+            "x-queryflux-route-rule",
+            crate::route_explain::route_rule(&routing_trace),
+        ),
+    ];
+    let mut response = if !use_cache_path && live.group_supports_async(&group.0) {
         match dispatch_query(
             &state,
             &live,
@@ -713,7 +721,13 @@ pub async fn post_statement(
             warn!(id = %query_id, "execute_to_sink error: {e}");
         }
         sink.into_response()
+    };
+    for (name, value) in route_headers {
+        if let Ok(value) = axum::http::HeaderValue::from_str(&value) {
+            response.headers_mut().insert(name, value);
+        }
     }
+    response
 }
 
 /// Extract raw credentials from Trino HTTP headers for authentication.

@@ -161,6 +161,14 @@ struct ExplainQueryParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct ExplainRouteParams {
+    /// SQL to route (not executed).
+    sql: String,
+    #[serde(flatten)]
+    agent: AgentContextParams,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct QueryIdParams {
     /// The query id returned in an `execute_query` result or `list_engines`-style lookup.
     query_id: String,
@@ -891,6 +899,39 @@ impl QueryFluxMcpServer {
     }
 
     #[tool(
+        description = "Explain where a query would run without running it: the cluster group and its engines, the routing rule that chose it, and whether guardrails would allow, rewrite (e.g. add a LIMIT) or deny it, with the fix hint on deny. Use it before a costly query or after a guardrail error.",
+        annotations(read_only_hint = true)
+    )]
+    async fn explain_route(
+        &self,
+        Parameters(ExplainRouteParams { sql, agent }): Parameters<ExplainRouteParams>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        let headers = extract_headers(&ctx);
+        let live = match self.state.query_snapshot().await {
+            Ok(live) => live,
+            Err(e) => return Ok(tool_error(&e.to_string())),
+        };
+        let auth = authenticate(live.auth_provider.as_ref(), &headers).await?;
+        let agent_context = resolve_agent_context(&headers, &agent, &auth);
+        let session = session_for(&auth, agent_context);
+        match crate::route_explain::explain_route(
+            &live,
+            &sql,
+            &session,
+            &FrontendProtocol::Mcp,
+            &auth,
+        )
+        .await
+        {
+            Ok(explanation) => Ok(CallToolResult::success(vec![ContentBlock::text(
+                serde_json::to_string_pretty(&explanation).unwrap_or_default(),
+            )])),
+            Err(e) => Ok(tool_error(&e.to_string())),
+        }
+    }
+
+    #[tool(
         description = "Check the status of a query submitted via execute_query. Only reports on queries still running or queued — QueryFlux does not currently retain a lookup-by-id history of completed queries, so a finished query reports as not_found_or_completed.",
         annotations(read_only_hint = true)
     )]
@@ -1031,7 +1072,8 @@ const INSTRUCTIONS: &str = "QueryFlux MCP server: SQL access to the engines behi
      describe_table (with sample_rows for a peek). Run reads with execute_query; it accepts \
      only read statements. Always add a LIMIT and selective filters (WHERE on partition/date \
      columns) — results are truncated at max_rows, and large scans may be refused. Use \
-     explain_query to check an expensive query before running it. Operator guardrails apply \
+     explain_query to check an expensive query before running it, and explain_route to see \
+     which engine it would run on and whether guardrails allow it. Operator guardrails apply \
      to every call; when one rejects a query, its error explains how to fix it — revise the \
      SQL and retry rather than giving up. Responses include conversation_id: pass that exact \
      value as the conversation_id argument on every later call in this conversation.";
@@ -1232,6 +1274,7 @@ mod read_write_split_tests {
                 "describe_table",
                 "execute_query",
                 "explain_query",
+                "explain_route",
                 "get_query_status",
                 "list_schemas",
                 "list_tables",
@@ -1249,6 +1292,7 @@ mod read_write_split_tests {
             "list_tables",
             "describe_table",
             "explain_query",
+            "explain_route",
             "get_query_status",
         ] {
             assert!(annotations(&router, name).0, "{name} should be read-only");

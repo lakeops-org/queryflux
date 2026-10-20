@@ -8,6 +8,7 @@ pub mod mcp;
 pub mod mysql_wire;
 pub mod ops;
 pub mod postgres_wire;
+pub mod route_explain;
 pub mod routing_resolve;
 pub mod snowflake;
 pub mod sql_pipeline;

@@ -732,13 +732,12 @@ async fn hints_cannot_enable_caching_for_writes() {
 async fn guard_injected_limit_is_executed() {
     use queryflux_guardrails::{built_in::RowLimitGuard, GuardChain};
     let f = Fixture::new().await;
-    f.state.live.write().await.guard_chain = Some(Arc::new(GuardChain::new(vec![Box::new(
-        RowLimitGuard {
+    f.state.live.write().await.guard_chain =
+        Some(Arc::new(GuardChain::new(vec![Box::new(RowLimitGuard {
             max_rows: Some(1000),
             inject_limit: true,
             default_limit: Some(3),
-        },
-    )])));
+        })])));
     let sql = "SELECT * FROM range(10)";
     for _ in 0..2 {
         let rows: usize = f.run(sql).await.batches.iter().map(|b| b.num_rows()).sum();
@@ -780,4 +779,10 @@ async fn max_execution_secs_cancels_long_query() {
         .to_string();
     assert!(err.contains("EXECUTION_TIMEOUT"), "{err}");
     assert!(started.elapsed() < std::time::Duration::from_secs(10));
+    // The engine query was killed: the single DuckDB connection serves the next query.
+    let next = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        f.scalar("SELECT CAST(7 AS BIGINT)"),
+    );
+    assert_eq!(next.await.expect("engine query was not cancelled"), 7);
 }
