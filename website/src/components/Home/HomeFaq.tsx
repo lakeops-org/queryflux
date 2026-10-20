@@ -1,5 +1,4 @@
 import type {ReactNode} from 'react';
-import clsx from 'clsx';
 import Link from '@docusaurus/Link';
 import SectionHeader from './SectionHeader';
 import styles from './styles.module.css';
@@ -71,7 +70,7 @@ const FAQS: Faq[] = [
 
 export default function HomeFaq(): ReactNode {
   return (
-    <section className={clsx(styles.section, styles.sectionAlt)} aria-labelledby="home-faq">
+    <section className={styles.section} aria-labelledby="home-faq">
       <div className="container">
         <SectionHeader id="home-faq" eyebrow="FAQ" title="Questions teams ask first" center />
         <div className={styles.faqList}>

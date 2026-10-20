@@ -10,6 +10,7 @@ import HomeUseCases from '@site/src/components/Home/HomeUseCases';
 import HomeCommunity from '@site/src/components/Home/HomeCommunity';
 import HomeAgents from '@site/src/components/Home/HomeAgents';
 import HomeFaq from '@site/src/components/Home/HomeFaq';
+import HomeProduction from '@site/src/components/Home/HomeProduction';
 import PageSeo from '@site/src/components/PageSeo';
 import styles from '@site/src/components/Home/styles.module.css';
 
@@ -41,6 +42,7 @@ export default function Home(): ReactNode {
           <HomeArchitecture />
           <HomePillars />
           <HomeUseCases />
+          <HomeProduction />
           <HomeFaq />
           <HomeCommunity />
         </main>
