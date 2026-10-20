@@ -14,14 +14,14 @@ type Pillar = {
 
 const PILLARS: Pillar[] = [
   {
-    title: 'Cost-aware routing',
-    body: 'Steer CPU-heavy joins to compute-priced clusters and selective cold scans to pay-per-scan engines. Benchmarks show up to 56% lower total workload cost.',
+    title: 'Workload-aware routing',
+    body: 'Route by protocol, user, tags, SQL pattern, or a Python rule: send CPU-heavy joins to compute-priced clusters and selective cold scans to pay-per-scan engines. Encode the cost model once; every client inherits it.',
     basis: 'Router chain · Python routers',
     to: '/docs/architecture/routing-and-clusters',
   },
   {
     title: 'SLA protection',
-    body: 'Cap running queries per cluster group. When a group is full, queries queue at the proxy or spill to a fallback group instead of hammering the backend.',
+    body: 'Cap running queries per cluster group, across every replica and worker. When a group is full, queries wait in line at the proxy, first come first served, instead of hammering the backend.',
     basis: 'Cluster groups · Admission queue',
     to: '/docs/architecture/routing-and-clusters',
   },

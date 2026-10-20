@@ -41,7 +41,7 @@ Modern stacks mix **many query engines** — each with its own wire protocol and
 
 **Typical outcomes:**
 
-- **Cost-aware routing** — steer CPU-heavy work to compute-priced clusters and selective scans to pay-per-scan engines.
+- **Workload-aware routing** — encode which workloads go where (by protocol, user, tags, SQL pattern, or a Python rule), e.g. CPU-heavy work to compute-priced clusters and selective scans to pay-per-scan engines.
 - **SLA protection** — cap concurrent queries per group; queue at the proxy instead of overloading backends.
 - **Transparent migration** — split traffic by weight between engines without client changes.
 

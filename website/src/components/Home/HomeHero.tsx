@@ -185,11 +185,11 @@ export default function HomeHero(): ReactNode {
               <dd>p50 proxy overhead</dd>
             </div>
             <div>
-              <dt>up to 56%</dt>
-              <dd>workload cost cut</dd>
+              <dt>6 protocols</dt>
+              <dd>Trino · Postgres · MySQL · Snowflake · Flight · MCP</dd>
             </div>
             <div>
-              <dt>6 routers</dt>
+              <dt>8 routers</dt>
               <dd>protocol → Python</dd>
             </div>
           </dl>
