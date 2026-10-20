@@ -190,20 +190,43 @@ pub(super) fn dedupe_first(records: Vec<QueryRecord>) -> Vec<QueryRecord> {
 impl PostgresStore {
     /// Write records in chunks of [`MAX_RECORDS_PER_STATEMENT`]: per chunk, one insert
     /// and one digest upsert in one transaction. Returns how many records were new.
+    ///
+    /// If Postgres rejects a chunk's data, the chunk is retried one record at a time and
+    /// only the records it still rejects are dropped, so one bad record cannot block a
+    /// batch forever. Other errors (connection, timeout) are returned for a retry.
     pub(super) async fn insert_query_records(&self, records: Vec<QueryRecord>) -> Result<u64> {
         let records = dedupe_first(records);
         let mut inserted = 0u64;
         for chunk in records.chunks(MAX_RECORDS_PER_STATEMENT) {
-            inserted += self.insert_chunk(chunk).await?;
+            match self.insert_chunk(chunk).await {
+                Ok(n) => inserted += n,
+                Err(e) if is_rejected_data(&e) => {
+                    tracing::warn!(
+                        records = chunk.len(),
+                        "Postgres rejected a query history batch, retrying per record: {e}"
+                    );
+                    for r in chunk {
+                        match self.insert_chunk(std::slice::from_ref(r)).await {
+                            Ok(n) => inserted += n,
+                            Err(e) if is_rejected_data(&e) => tracing::warn!(
+                                proxy_query_id = %r.proxy_query_id,
+                                "Dropping query record Postgres rejected: {e}"
+                            ),
+                            Err(e) => return Err(e.into()),
+                        }
+                    }
+                }
+                Err(e) => return Err(e.into()),
+            }
         }
         Ok(inserted)
     }
 
-    async fn insert_chunk(&self, chunk: &[QueryRecord]) -> Result<u64> {
+    async fn insert_chunk(&self, chunk: &[QueryRecord]) -> std::result::Result<u64, ChunkError> {
         if chunk.is_empty() {
             return Ok(0);
         }
-        let err = |what: &str, e: sqlx::Error| QueryFluxError::Persistence(format!("{what}: {e}"));
+        let err = |what: &'static str, e: sqlx::Error| ChunkError(what, e);
         let mut tx = self
             .admin_pool
             .begin()
@@ -234,6 +257,34 @@ impl PostgresStore {
             .await
             .map_err(|e| err("Insert query_records (commit)", e))?;
         Ok(new_ids.len() as u64)
+    }
+}
+
+/// A failed chunk write: what was being done, and the driver error.
+#[derive(Debug)]
+struct ChunkError(&'static str, sqlx::Error);
+
+impl std::fmt::Display for ChunkError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.0, self.1)
+    }
+}
+
+impl From<ChunkError> for QueryFluxError {
+    fn from(e: ChunkError) -> Self {
+        QueryFluxError::Persistence(e.to_string())
+    }
+}
+
+/// Postgres refused the data itself (SQLSTATE class 22 data exception, e.g. a NUL byte in
+/// text, or class 23 constraint violation). Retrying the same record will not succeed.
+fn is_rejected_data(e: &ChunkError) -> bool {
+    match &e.1 {
+        sqlx::Error::Database(db) => db
+            .code()
+            .is_some_and(|c| c.starts_with("22") || c.starts_with("23")),
+        sqlx::Error::Encode(_) => true,
+        _ => false,
     }
 }
 
@@ -732,6 +783,38 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(stats, vec![(8, 80, 16), (7, 70, 14)]);
+    }
+
+    /// A record Postgres rejects is dropped alone; the rest of its batch is stored.
+    #[tokio::test]
+    #[ignore]
+    async fn pg_rejected_record_does_not_fail_its_batch() {
+        let store = test_store().await;
+        let (run, base) = run_id();
+        let mut records: Vec<QueryRecord> = (0..3)
+            .map(|i| record(&format!("{run}-{i}"), Some(base)))
+            .collect();
+        // Postgres rejects NUL bytes in text columns (SQLSTATE 22021).
+        records[1].sql_preview = "select \0".into();
+        store.record_queries(records).await.unwrap();
+
+        let ids: Vec<String> = sqlx::query_scalar(
+            "SELECT proxy_query_id FROM query_records WHERE proxy_query_id LIKE $1 || '-%'
+             ORDER BY proxy_query_id",
+        )
+        .bind(&run)
+        .fetch_all(&store.admin_pool)
+        .await
+        .unwrap();
+        assert_eq!(ids, [format!("{run}-0"), format!("{run}-2")]);
+        let calls: i64 = sqlx::query_scalar(
+            "SELECT call_count FROM query_digest_stats WHERE query_parameterized_hash = $1",
+        )
+        .bind(base)
+        .fetch_one(&store.admin_pool)
+        .await
+        .unwrap();
+        assert_eq!(calls, 2);
     }
 
     /// A batch larger than one statement is split, and a repeat in a later chunk is
