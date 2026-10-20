@@ -1,9 +1,12 @@
 pub mod access;
 pub mod sqlglot;
 
+use queryflux_core::bounded_cache::{BoundedCache, ContentHasher, MAX_CACHED_SQL_BYTES};
+
 pub use access::{
-    apply_write_filters, extract_resources, render_mask, rewrite_table_scans, ExtractedResource,
-    ExtractedStatement, MaskRenderError, TablePolicy,
+    apply_write_filters, extract_resources, extract_resources_cached, extraction_cache,
+    render_mask, rewrite_table_scans, ExtractedResource, ExtractedStatement, MaskRenderError,
+    TablePolicy,
 };
 
 use std::collections::HashMap;
@@ -14,7 +17,7 @@ use async_trait::async_trait;
 pub use queryflux_core::schema_context::{ColumnMap, SchemaContext};
 use queryflux_core::{
     catalog::CatalogProvider,
-    config::TranslationMode,
+    config::{SqlCacheConfig, TranslationMode},
     error::{QueryFluxError, Result},
     query::{SqlDialect, TranslationOutcome, TranslationReason, TranslationStatus},
 };
@@ -82,6 +85,101 @@ pub struct TranslationService {
     error_on_unsupported: std::sync::atomic::AtomicBool,
     python_scripts: Vec<String>,
     schema_resolution_timeout: Duration,
+    /// sqlglot results for repeated queries. See [`TranslationKey`].
+    translations: TranslationCache,
+    /// Table references `resolve_schema_context` looks up, by (SQL, dialect).
+    table_refs: TableRefsCache,
+}
+
+/// Everything the sqlglot call in `maybe_translate_report` depends on. The SQL is kept
+/// verbatim so two statements can never share an entry; scripts and schema, which can be
+/// large, are content hashes. The policy is part of the key because strict mode changes
+/// what sqlglot itself returns (`unsupported_level=RAISE`).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct TranslationKey {
+    sql: String,
+    /// sqlglot dialect names: exactly what the Python side receives.
+    src: String,
+    tgt: String,
+    /// Global then group fixup scripts, in order.
+    scripts: u128,
+    schema: u128,
+    strict: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct TableRefsKey {
+    sql: String,
+    dialect: String,
+}
+
+/// A cached sqlglot result. Only deterministic failures are stored (see
+/// `SqlglotFailure::cacheable`); the report is rebuilt from it on every hit, so the
+/// best-effort/strict mapping is still applied per query.
+#[derive(Debug)]
+enum CachedTranslation {
+    Ok(String, Option<TranslationReason>),
+    Err {
+        message: String,
+        reason: TranslationReason,
+        reject_passthrough: bool,
+    },
+}
+
+impl CachedTranslation {
+    fn to_result(
+        &self,
+    ) -> std::result::Result<(String, Option<TranslationReason>), sqlglot::SqlglotFailure> {
+        match self {
+            CachedTranslation::Ok(sql, fallback) => Ok((sql.clone(), *fallback)),
+            CachedTranslation::Err {
+                message,
+                reason,
+                reject_passthrough,
+            } => Err(sqlglot::SqlglotFailure {
+                error: QueryFluxError::Translation(message.clone()),
+                reason: *reason,
+                reject_passthrough: *reject_passthrough,
+                cacheable: true,
+            }),
+        }
+    }
+
+    fn from_result(
+        result: &std::result::Result<(String, Option<TranslationReason>), sqlglot::SqlglotFailure>,
+    ) -> Option<Self> {
+        match result {
+            Ok((sql, fallback)) => Some(CachedTranslation::Ok(sql.clone(), *fallback)),
+            Err(failure) if failure.cacheable => match &failure.error {
+                QueryFluxError::Translation(message) => Some(CachedTranslation::Err {
+                    message: message.clone(),
+                    reason: failure.reason,
+                    reject_passthrough: failure.reject_passthrough,
+                }),
+                _ => None,
+            },
+            Err(_) => None,
+        }
+    }
+}
+
+fn scripts_hash(scripts: &[String]) -> u128 {
+    let mut h = ContentHasher::new();
+    h.write_u64(scripts.len() as u64);
+    for script in scripts {
+        h.write_str(script);
+    }
+    h.finish()
+}
+
+type TranslationCache = BoundedCache<TranslationKey, Arc<CachedTranslation>>;
+type TableRefsCache = BoundedCache<TableRefsKey, Arc<Vec<TableRef>>>;
+
+fn new_caches(config: &SqlCacheConfig) -> (TranslationCache, TableRefsCache) {
+    (
+        BoundedCache::new("translation", config.translations),
+        BoundedCache::new("schema_table_refs", config.table_extraction),
+    )
 }
 
 impl TranslationService {
@@ -97,24 +195,48 @@ impl TranslationService {
         for script in &python_scripts {
             sqlglot::validate_fixup_script(script)?;
         }
+        let (translations, table_refs) = new_caches(&SqlCacheConfig::default());
         Ok(Self {
             enabled: true,
             strict_mode: std::sync::atomic::AtomicBool::new(false),
             error_on_unsupported: std::sync::atomic::AtomicBool::new(false),
             python_scripts,
             schema_resolution_timeout: DEFAULT_SCHEMA_RESOLUTION_TIMEOUT,
+            translations,
+            table_refs,
         })
     }
 
     /// Create an unavailable service with the default best-effort policy.
     pub fn disabled() -> Self {
+        let (translations, table_refs) = new_caches(&SqlCacheConfig::default());
         Self {
             enabled: false,
             strict_mode: std::sync::atomic::AtomicBool::new(false),
             error_on_unsupported: std::sync::atomic::AtomicBool::new(false),
             python_scripts: Vec::new(),
             schema_resolution_timeout: DEFAULT_SCHEMA_RESOLUTION_TIMEOUT,
+            translations,
+            table_refs,
         }
+    }
+
+    /// Size this service's caches (`translation.cache`): `translations` for sqlglot results,
+    /// `tableExtraction` for the table references schema resolution looks up. 0 disables.
+    pub fn with_cache_config(self, config: &SqlCacheConfig) -> Self {
+        self.translations.set_capacity(config.translations);
+        self.table_refs.set_capacity(config.table_extraction);
+        self
+    }
+
+    /// Hit/miss/eviction counters of the translation cache.
+    pub fn translation_cache_stats(&self) -> queryflux_core::bounded_cache::CacheStatsSnapshot {
+        self.translations.stats()
+    }
+
+    /// Hit/miss/eviction counters of the schema table-reference cache.
+    pub fn table_refs_cache_stats(&self) -> queryflux_core::bounded_cache::CacheStatsSnapshot {
+        self.table_refs.stats()
     }
 
     /// Keep configured fixups even if sqlglot is unavailable at startup.
@@ -203,14 +325,14 @@ impl TranslationService {
                 .error_on_unsupported
                 .load(std::sync::atomic::Ordering::Relaxed);
         let result = if self.enabled {
-            let translator = SqlglotTranslator::new(src.clone(), tgt.clone(), combined)
-                .with_error_on_unsupported(strict);
-            translator.translate_detailed(sql, schema).await
+            self.translate_cached(sql, src, tgt, schema, combined, strict)
+                .await
         } else {
             Err(sqlglot::SqlglotFailure {
                 error: QueryFluxError::Translation("required translation unavailable: sqlglot is not installed or could not be imported".into()),
                 reason: TranslationReason::SqlglotUnavailable,
                 reject_passthrough: false,
+                cacheable: false,
             })
         };
         match result {
@@ -239,6 +361,74 @@ impl TranslationService {
         }
     }
 
+    /// Run sqlglot, or reuse its result for an identical earlier call.
+    async fn translate_cached(
+        &self,
+        sql: &str,
+        src: &SqlDialect,
+        tgt: &SqlDialect,
+        schema: &SchemaContext,
+        scripts: Vec<String>,
+        strict: bool,
+    ) -> std::result::Result<(String, Option<TranslationReason>), sqlglot::SqlglotFailure> {
+        let key =
+            (self.translations.is_enabled() && sql.len() <= MAX_CACHED_SQL_BYTES).then(|| {
+                TranslationKey {
+                    sql: sql.to_string(),
+                    src: src.sqlglot_write_name(),
+                    tgt: tgt.sqlglot_write_name(),
+                    scripts: scripts_hash(&scripts),
+                    schema: schema.content_hash(),
+                    strict,
+                }
+            });
+        if let Some(cached) = key.as_ref().and_then(|k| self.translations.get(k)) {
+            return cached.to_result();
+        }
+        let result = SqlglotTranslator::new(src.clone(), tgt.clone(), scripts)
+            .with_error_on_unsupported(strict)
+            .translate_detailed(sql, schema)
+            .await;
+        if let (Some(key), Some(entry)) = (key, CachedTranslation::from_result(&result)) {
+            self.translations.insert(key, Arc::new(entry));
+        }
+        result
+    }
+
+    /// Table references in `sql`, cached by (SQL, dialect). Parse failures yield an empty
+    /// list (deterministic, cached); import errors, panics and timeouts are not cached.
+    async fn table_refs(&self, sql: &str, dialect: String) -> Option<Arc<Vec<TableRef>>> {
+        let key = (self.table_refs.is_enabled() && sql.len() <= MAX_CACHED_SQL_BYTES).then(|| {
+            TableRefsKey {
+                sql: sql.to_string(),
+                dialect: dialect.clone(),
+            }
+        });
+        if let Some(refs) = key.as_ref().and_then(|k| self.table_refs.get(k)) {
+            return Some(refs);
+        }
+        let refs = match tokio::time::timeout(
+            self.schema_resolution_timeout,
+            extract_table_refs_async(sql.to_string(), dialect),
+        )
+        .await
+        {
+            Ok(Ok(refs)) => Arc::new(refs),
+            Ok(Err(e)) => {
+                tracing::debug!("resolve_schema_context: table-ref extraction failed: {e}");
+                return None;
+            }
+            Err(_) => {
+                tracing::debug!("resolve_schema_context: table-ref extraction timed out");
+                return None;
+            }
+        };
+        if let Some(key) = key {
+            self.table_refs.insert(key, refs.clone());
+        }
+        Some(refs)
+    }
+
     /// Best-effort schema resolution: extract the tables `sql` references, look them
     /// up via `catalog`, and flatten the result into a `SchemaContext` for
     /// `maybe_translate`. **Never fails** — a parse error, catalog error, or timeout
@@ -263,21 +453,10 @@ impl TranslationService {
         let timeout = self.schema_resolution_timeout;
 
         let dialect = src_dialect.sqlglot_write_name().to_string();
-        let refs =
-            match tokio::time::timeout(timeout, extract_table_refs_async(sql.to_string(), dialect))
-                .await
-            {
-                Ok(Ok(refs)) if !refs.is_empty() => refs,
-                Ok(Ok(_)) => return SchemaContext::default(),
-                Ok(Err(e)) => {
-                    tracing::debug!("resolve_schema_context: table-ref extraction failed: {e}");
-                    return SchemaContext::default();
-                }
-                Err(_) => {
-                    tracing::debug!("resolve_schema_context: table-ref extraction timed out");
-                    return SchemaContext::default();
-                }
-            };
+        let refs = match self.table_refs(sql, dialect).await {
+            Some(refs) if !refs.is_empty() => refs,
+            _ => return SchemaContext::default(),
+        };
 
         let tables: Vec<&str> = refs.iter().map(|r| r.table.as_str()).collect();
         let resolved_catalog = refs

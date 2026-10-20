@@ -19,3 +19,4 @@ bytes = { workspace = true }
 polyglot-sql = { workspace = true }
 tokio = { workspace = true }
 xxhash-rust = { workspace = true }
+lru = "0.14"

@@ -73,6 +73,20 @@ translation; dialect-only fallback remains allowed when it succeeds. The legacy
 changing this policy. See [Query translation](./architecture/query-translation) for
 fallback counters and query history outcomes.
 
+```yaml
+translation:
+  cache:
+    translations: 4096     # translated SQL; 0 disables
+    tableExtraction: 4096  # access-control table extraction and schema table references
+    fingerprints: 4096     # query-history fingerprints
+```
+
+Repeated queries reuse earlier results instead of parsing again. Each cache is a bounded
+LRU keyed on everything that changes its result (SQL text, dialects, fixup scripts,
+schema, strict mode), so it needs no flush on reload. Set a size to 0 to disable that
+cache. These settings are local to each process, including workers. See
+[Query translation](./architecture/query-translation#caching).
+
 ## Authentication, authorization & backend identity
 
 ```yaml
