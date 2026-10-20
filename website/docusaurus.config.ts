@@ -94,7 +94,7 @@ const config: Config = {
     [
       '@cmfcmf/docusaurus-search-local',
       {
-        indexBlog: false,
+        indexBlog: true,
         indexPages: true,
         language: 'en',
       },
@@ -113,7 +113,15 @@ const config: Config = {
           // SEO: only latest is indexable; see seoConfig.ts (reads versions.json each build)
           versions: buildDocsVersionConfig(),
         },
-        blog: false,
+        blog: {
+          showReadingTime: true,
+          blogTitle: 'QueryFlux blog',
+          blogDescription: 'Why QueryFlux exists, how it works, and how teams run SQL for tools and AI agents across many engines.',
+          blogSidebarTitle: 'Recent posts',
+          blogSidebarCount: 'ALL',
+          editUrl: 'https://github.com/lakeops-org/queryflux/tree/main/website/',
+          onUntruncatedBlogPosts: 'throw',
+        },
         sitemap: buildSitemapConfig(),
         theme: {
           customCss: ['./src/css/custom.css', './src/css/docs.css'],
@@ -149,7 +157,7 @@ const config: Config = {
           className: 'navbar-item-docs-mobile',
         },
         {
-          href: 'https://lakeops.dev/blog/category/queryflux',
+          to: '/blog',
           label: 'Blog',
           position: 'left',
         },
