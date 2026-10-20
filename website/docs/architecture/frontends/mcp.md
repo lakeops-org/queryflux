@@ -158,7 +158,7 @@ Most other MCP-capable tools (Windsurf, VS Code's MCP support, etc.) follow the 
 | stdio transport | Not offered — streamable HTTP only. |
 | MCP Resources (e.g. `schema:///{table}` subscriptions) | Not implemented. |
 | Natural-language-to-SQL, semantic routing, query rewriting | Explicitly out of scope for this frontend — QueryFlux routes and executes the SQL it's given. |
-| Result caching | Works as for every frontend: `execute_query` goes through the shared dispatch path, so repeated identical SQL is served from the [result cache](../caching) when the group enables it. |
+| Result caching | Works as for every frontend: `execute_query` goes through the shared dispatch path, so repeated identical, deterministic SQL is served from the [result cache](../caching) when the group enables it. |
 | Async submit/poll execution model | `execute_query` is synchronous — it blocks until the query completes. `get_query_status` / `cancel_query` are best-effort against the existing in-flight query registry (useful from a concurrent tool call), not a full async job API. |
 | Column masks / row filters | Available via [access control](../../access-control/overview) (`opa_access`) — not MCP-specific. |
 | TLS | Not terminated by QueryFlux. Use an external TLS terminator in front of QueryFlux for any deployment where the bearer token crosses an untrusted network. |

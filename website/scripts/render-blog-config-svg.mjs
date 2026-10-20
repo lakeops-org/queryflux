@@ -148,7 +148,16 @@ function renderWindow({filename, title, lines, lineHeight = 20, lang = 'yaml'}) 
 </svg>`;
 }
 
-const agentsConfig = `queryflux:
+const agentsConfig = `auth:
+  provider: oidc
+  required: true
+  oidc:
+    issuer: https://idp.example.com/realms/queryflux
+    jwksUri: https://idp.example.com/realms/queryflux/protocol/openid-connect/certs
+    audience: queryflux
+    groupsClaim: groups
+
+queryflux:
   frontends:
     mcp:
       enabled: true
@@ -165,9 +174,20 @@ clusters:
     queryAuth:             # identity each query runs as
       type: impersonate
 
+authorization:
+  provider: none
+
 clusterGroups:
-  analysts: { maxRunningQueries: 40, members: [trino-1] }
-  agents:   { maxRunningQueries: 8,  members: [trino-1] }
+  analysts:
+    maxRunningQueries: 40
+    members: [trino-1]
+    authorization:
+      allowGroups: [analysts]   # blocks MCP engine_hint bypass
+  agents:
+    maxRunningQueries: 8
+    members: [trino-1]
+    authorization:
+      allowGroups: [agents]
 
 routers:
   - type: protocolBased
@@ -195,12 +215,14 @@ const routingYaml = `routers:
     trinoHttp: trino-default`.split('\n');
 
 const routingPy = `def route(query: str, ctx: dict) -> str | None:
-    # Small, local queries → DuckDB
+    # Small, local queries -> DuckDB
     if "local." in query and "JOIN" not in query.upper():
         return "duckdb-local"
     return None`.split('\n');
 
-const mcpBash = `$ claude mcp add --transport http queryflux http://localhost:8811/mcp`.split('\n');
+const mcpBash = `$ claude mcp add --transport http queryflux \\
+    http://localhost:8811/mcp \\
+    --header "Authorization: Bearer $QUERYFLUX_MCP_TOKEN"`.split('\n');
 
 fs.mkdirSync(outDir, {recursive: true});
 

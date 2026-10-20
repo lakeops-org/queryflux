@@ -30,22 +30,22 @@ This post shows how to set that up with QueryFlux using features that ship today
 
 ## The setup in one file
 
-One QueryFlux config gives agents their own entry point, capacity pool, guardrails, and per-user identity on the engine:
+One QueryFlux config gives agents a verified identity, their own entry point, capacity pool, guardrails, and per-user identity on the engine:
 
 <figure class="blog-figure">
-  <img src="/img/blog/agents-mcp-config.svg" alt="QueryFlux YAML: MCP frontend on port 8811, trino cluster with impersonation, separate analysts and agents cluster groups, protocol router sending MCP to agents group, read_only row_limit and require_predicate guardrails" />
-  <figcaption>Full example — adjust endpoints and limits for your environment. See <a href="/docs/configuration">configuration</a> and <a href="/docs/quickstart/ai-agent-mcp">MCP quickstart</a>.</figcaption>
+  <img src="/img/blog/agents-mcp-config.svg" alt="QueryFlux YAML with OIDC auth required, Trino impersonation, analysts and agents groups with allowGroups, protocol router for MCP, and agent guardrails" />
+  <figcaption>Full example — adjust IdP URLs, endpoints, and limits for your environment. See <a href="/docs/authentication">authentication</a>, <a href="/docs/configuration">configuration</a>, and the <a href="/docs/quickstart/ai-agent-mcp">MCP quickstart</a>.</figcaption>
 </figure>
 
 The sections below map directly to that file.
 
 ## 1. One endpoint, any agent
 
-Agents connect over MCP (streamable HTTP):
+Turn on OIDC (or another verified provider) with `auth.required: true` so MCP callers cannot connect as `anonymous`. Agents send a bearer token on every request:
 
 <figure class="blog-figure">
-  <img src="/img/blog/mcp-connect.svg" alt="Terminal command: claude mcp add with HTTP transport to localhost QueryFlux MCP endpoint" />
-  <figcaption>Cursor and Claude Desktop use the same MCP URL on port 8811.</figcaption>
+  <img src="/img/blog/mcp-connect.svg" alt="Terminal command: claude mcp add with HTTP transport and Authorization Bearer header to QueryFlux MCP" />
+  <figcaption>Cursor and Claude Desktop use the same MCP URL; put the token in an environment variable, not in a committed config. See <a href="/docs/architecture/frontends/mcp#connecting-a-client">Connecting a client</a>.</figcaption>
 </figure>
 
 The agent gets tools to run a query, list schemas, describe a table, read the engine's plan, and check or cancel what it started.
@@ -55,6 +55,8 @@ Agents that prefer a SQL driver can connect over Trino, PostgreSQL, or MySQL ins
 ## 2. Agents get their own lane
 
 The `protocolBased` router sends every MCP query to the `agents` group, which has its own `maxRunningQueries`. A burst of exploratory agent queries queues in its own lane instead of starving dashboards in `analysts`.
+
+MCP's `execute_query` also accepts an optional `engine_hint` that can name a cluster group and skip the router. Without a group allow-list, an authenticated agent could hint `analysts` and pick up that group's capacity without its agent guardrails. The config above sets `authorization.allowGroups` on each group so only IdP group `analysts` can reach `analysts`, and only `agents` can reach `agents`.
 
 With Postgres persistence, the limit holds across every QueryFlux replica and worker, and waiting queries are served first come, first served.
 
@@ -76,7 +78,7 @@ A rule in an MCP wrapper only holds while the agent uses that wrapper. A rule in
 
 ## 4. The engine sees the person, not a shared account
 
-With `queryAuth: impersonate`, QueryFlux authenticates to Trino with its own service account but runs each query as the user who sent it. When an agent connects with a person's token, the engine applies that person's permissions and writes that person into its audit log. There is no shared password for an agent to leak or overreach with.
+With `queryAuth: impersonate`, QueryFlux authenticates to Trino with its own service account but runs each query as the **verified** user from the bearer token. The engine applies that person's permissions and writes that person into its audit log. There is no shared password for an agent to leak or overreach with — and without `auth.required`, impersonation would only forward `anonymous`.
 
 Trino and ClickHouse support impersonation. For Snowflake and Trino, QueryFlux can instead exchange the caller's OAuth token for one the engine accepts, or pass the caller's credential through.
 
@@ -84,9 +86,12 @@ For finer control, add row filters and column masks from OPA or Cerbos — they 
 
 ## 5. Every query has an owner
 
-Each query QueryFlux runs is stored with the agent, conversation, step, and tool call that produced it. Over MCP these fields are filled automatically from the authenticated user and MCP session. Over Trino HTTP, send `X-Agent-Id` and `X-Conversation-Id` headers.
+QueryFlux stores agent context when it is present:
 
-In Studio, the **Agents** and **Conversations** pages group history by agent and session so you can replay a conversation step by step: every query, where it ran, how long it took, and which guardrail stopped it.
+- **MCP:** `agent_id` defaults from the authenticated user and `conversation_id` from the MCP session. `step_index` and `tool_call_id` are optional — the client must send them (as tool parameters or `X-Step-Index` / `X-Tool-Call-Id` headers) if you want a full step-by-step trail.
+- **Trino HTTP (and other SQL drivers):** both `X-Agent-Id` and `X-Conversation-Id` are required for the request to count as agentic; otherwise it is treated as a normal client query. Optional headers cover step, tool call, and intent.
+
+In Studio, the **Agents** and **Conversations** pages group history by agent and session so you can replay what was recorded: every query, where it ran, how long it took, and which guardrail stopped it.
 
 ## What this adds up to
 
@@ -96,7 +101,7 @@ An agent gets one endpoint and the SQL it needs. You keep control of:
 - how much of the cluster agents can use;
 - what agents may do;
 - whose permissions apply on the engine;
-- a complete record of what happened.
+- a record of agent and conversation — plus step/tool metadata when the client supplies it.
 
 It works the same over MCP and over a SQL driver, on the engines you already run.
 

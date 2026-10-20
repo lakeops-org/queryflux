@@ -106,7 +106,7 @@ When a query joins data that spans two engines — e.g. a Trino-managed Iceberg 
 
 ### Snapshot-aware result cache invalidation
 
-The [result cache](./architecture/caching) is built: repeated identical, deterministic queries are served from object storage, with TTL-based expiry. Still planned: invalidating entries when the underlying Iceberg snapshot changes, instead of waiting for the TTL.
+The [result cache](./architecture/caching) is built: repeated identical, deterministic queries are served from a configured filesystem or S3 backend (OpenDAL), with TTL-based expiry. Still planned: invalidating entries when the underlying Iceberg snapshot changes, instead of waiting for the TTL.
 
 ### ML-driven routing
 

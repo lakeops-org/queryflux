@@ -19,7 +19,7 @@ Agentic context can be set in three ways depending on which frontend protocol th
 
 | Mechanism | Used by |
 |-----------|---------|
-| **HTTP headers** | Trino HTTP, Snowflake HTTP, and [MCP](../architecture/frontends/mcp) frontends. |
+| **HTTP headers** | Trino HTTP and [MCP](../architecture/frontends/mcp) frontends. |
 | **SQL session params** | MySQL wire and PostgreSQL wire frontends, where HTTP headers are not available. |
 | **MCP tool parameters** | The [MCP](../architecture/frontends/mcp) frontend additionally accepts these fields as explicit tool-call arguments, since not every MCP client lets you set custom headers per call. |
 

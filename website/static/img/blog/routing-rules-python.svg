@@ -15,7 +15,7 @@
   <circle cx="56" cy="22" r="5" fill="#a3e635"/>
   <text x="80" y="27" fill="#71717a" font-family="ui-monospace, Menlo, monospace" font-size="12">router.py</text>
   <text x="48" y="62" fill="#67e8f9" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="13">def route(query: str, ctx: dict) -&gt; str | None:</text>
-<text x="48" y="82" fill="#52525b" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="13">    # Small, local queries → DuckDB</text>
+<text x="48" y="82" fill="#52525b" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="13">    # Small, local queries -&gt; DuckDB</text>
 <text x="48" y="102" fill="#d4d4d8" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="13">    if "local." in query and "JOIN" not in query.upper():</text>
 <text x="48" y="122" fill="#f472b6" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="13">        return </text>
 <text x="154.5" y="122" fill="#a3e635" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="13">"duckdb-local"</text>

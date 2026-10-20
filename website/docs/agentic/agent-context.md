@@ -7,7 +7,7 @@ description: How to attach agent identity and conversation state to queries — 
 
 Agentic context can be set in three ways depending on which frontend protocol the agent uses:
 
-- **HTTP headers** — for Trino HTTP, Snowflake HTTP, and [MCP](../architecture/frontends/mcp) frontends.
+- **HTTP headers** — for Trino HTTP and [MCP](../architecture/frontends/mcp) frontends.
 - **SQL session params** — for MySQL wire and PostgreSQL wire frontends, where HTTP headers are not available.
 - **MCP tool parameters** — the [MCP](../architecture/frontends/mcp) frontend additionally accepts these fields as explicit tool-call arguments, since not every MCP client lets you set custom headers per call.
 
