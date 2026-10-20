@@ -1,6 +1,7 @@
 pub mod adbc;
 pub mod buffered_store;
 pub mod prometheus_store;
+mod sql_cache;
 
 use std::sync::Arc;
 
@@ -123,6 +124,15 @@ impl MetricsStore for MultiMetricsStore {
         for s in &self.stores {
             if let Err(e) = s.record_query(record.clone()).await {
                 tracing::warn!("MetricsStore::record_query error: {e}");
+            }
+        }
+        Ok(())
+    }
+
+    async fn record_queries(&self, records: Vec<QueryRecord>) -> Result<()> {
+        for s in &self.stores {
+            if let Err(e) = s.record_queries(records.clone()).await {
+                tracing::warn!("MetricsStore::record_queries error: {e}");
             }
         }
         Ok(())

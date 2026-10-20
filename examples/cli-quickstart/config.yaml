@@ -3,21 +3,22 @@
 
 queryflux:
   frontends:
-    trino_http:
+    trinoHttp:
       enabled: true
-      bind_address: "0.0.0.0:8080"
-  metrics:
-    bind_address: "0.0.0.0:9000"
+      port: 8080
+  adminApi:
+    port: 9000
 
 clusters:
-  local_duckdb:
+  local-duckdb:
     engine: duckDb
-    max_connections: 10
+    enabled: true
 
-cluster_groups:
-  default_group:
-    members:
-      - local_duckdb
+clusterGroups:
+  default-group:
+    enabled: true
+    maxRunningQueries: 10
+    members: [local-duckdb]
 
-routing_fallback: default_group
 routers: []
+routingFallback: default-group

@@ -1,0 +1,53 @@
+queryflux:
+  externalAddress: http://localhost:8080
+  frontends:
+    trinoHttp:
+      enabled: true
+      port: 8080
+    mysqlWire:
+      enabled: true
+      port: 3306
+  persistence:
+    type: postgres
+    url: postgres://queryflux:queryflux@postgres:5432/queryflux
+  adminApi:
+    port: 9000
+
+clusters:
+  trino-1:
+    engine: trino
+    enabled: true
+    endpoint: http://trino:8080
+  starrocks-1:
+    engine: starRocks
+    enabled: true
+
+    endpoint: mysql://starrocks:9030
+    auth:
+      type: basic
+      username: root
+      password: ""
+
+clusterGroups:
+  trino-default:
+    enabled: true
+    maxRunningQueries: 100
+    members: [trino-1]
+    strategy:
+      type: roundRobin
+  starrocks-default:
+    enabled: true
+    maxRunningQueries: 50
+    members: [starrocks-1]
+    strategy:
+      type: roundRobin
+
+routers:
+  - type: protocolBased
+    trinoHttp: trino-default
+    mysqlWire: starrocks-default
+
+routingFallback: trino-default
+
+translation:
+  errorOnUnsupported: false

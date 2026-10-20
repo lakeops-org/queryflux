@@ -6,6 +6,10 @@
 //!
 //! Falls back to `crate::fallback` if polyglot-sql cannot parse the input.
 
+use std::sync::{Arc, LazyLock};
+
+use queryflux_core::bounded_cache::{BoundedCache, CacheStatsSnapshot, MAX_CACHED_SQL_BYTES};
+use queryflux_core::config::DEFAULT_SQL_CACHE_ENTRIES;
 use tracing::warn;
 use xxhash_rust::xxh64::xxh64;
 
@@ -33,17 +37,29 @@ pub struct QueryFingerprint {
 ///
 /// Returns `None` if polyglot-sql fails to parse the SQL — callers should leave
 /// hash/digest fields unpopulated rather than writing unreliable data.
+///
+/// Repeated statements are served from the process-wide [`fingerprint_cache`].
 pub fn rich_fingerprint(
     original_sql: &str,
     translated_sql: Option<&str>,
     src_dialect: &str,
     tgt_dialect: &str,
 ) -> Option<QueryFingerprint> {
+    FINGERPRINT_CACHE.rich_fingerprint(original_sql, translated_sql, src_dialect, tgt_dialect)
+}
+
+fn rich_fingerprint_with(
+    original_sql: &str,
+    translated_sql: Option<&str>,
+    src_dialect: &str,
+    tgt_dialect: &str,
+    one: impl Fn(&str, &str) -> Option<OneFingerprint>,
+) -> Option<QueryFingerprint> {
     let (query_hash, query_parameterized_hash, digest_text, is_deterministic) =
-        fingerprint_one(original_sql, src_dialect)?;
+        one(original_sql, src_dialect)?;
 
     let (translated_query_hash, translated_digest_text) = match translated_sql {
-        Some(tsql) => match fingerprint_one(tsql, tgt_dialect) {
+        Some(tsql) => match one(tsql, tgt_dialect) {
             Some((_, hash, digest, _)) => (Some(hash), Some(digest)),
             None => (None, None),
         },
@@ -60,9 +76,84 @@ pub fn rich_fingerprint(
     })
 }
 
+/// `(query_hash, parameterized_hash, digest_text, is_deterministic)` for one statement.
+type OneFingerprint = (u64, u64, String, bool);
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct FingerprintKey {
+    sql: String,
+    dialect: String,
+}
+
+/// Cache of per-statement fingerprints keyed on the exact SQL text and polyglot dialect,
+/// the only inputs. Only successful parses are kept: a failure may be the parse pool's
+/// thread overflowing rather than the SQL itself.
+pub struct FingerprintCache {
+    cache: BoundedCache<FingerprintKey, Arc<OneFingerprint>>,
+}
+
+impl FingerprintCache {
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            cache: BoundedCache::new("fingerprint", capacity),
+        }
+    }
+
+    pub fn set_capacity(&self, capacity: usize) {
+        self.cache.set_capacity(capacity);
+    }
+
+    pub fn stats(&self) -> CacheStatsSnapshot {
+        self.cache.stats()
+    }
+
+    /// [`rich_fingerprint`] through this cache.
+    pub fn rich_fingerprint(
+        &self,
+        original_sql: &str,
+        translated_sql: Option<&str>,
+        src_dialect: &str,
+        tgt_dialect: &str,
+    ) -> Option<QueryFingerprint> {
+        rich_fingerprint_with(
+            original_sql,
+            translated_sql,
+            src_dialect,
+            tgt_dialect,
+            |s, d| self.fingerprint_one(s, d),
+        )
+    }
+
+    fn fingerprint_one(&self, sql: &str, dialect: &str) -> Option<OneFingerprint> {
+        let key = (self.cache.is_enabled() && sql.len() <= MAX_CACHED_SQL_BYTES).then(|| {
+            FingerprintKey {
+                sql: sql.to_string(),
+                dialect: dialect.to_string(),
+            }
+        });
+        if let Some(hit) = key.as_ref().and_then(|k| self.cache.get(k)) {
+            return Some((*hit).clone());
+        }
+        let fp = fingerprint_one(sql, dialect)?;
+        if let Some(key) = key {
+            self.cache.insert(key, Arc::new(fp.clone()));
+        }
+        Some(fp)
+    }
+}
+
+static FINGERPRINT_CACHE: LazyLock<FingerprintCache> =
+    LazyLock::new(|| FingerprintCache::new(DEFAULT_SQL_CACHE_ENTRIES));
+
+/// The process-wide fingerprint cache [`rich_fingerprint`] uses. Sized at startup from
+/// `translation.cache.fingerprints`.
+pub fn fingerprint_cache() -> &'static FingerprintCache {
+    &FINGERPRINT_CACHE
+}
+
 /// Normalize and fingerprint a single SQL string using polyglot-sql.
 /// Returns `None` if parsing fails or the thread overflows — no fallback.
-fn fingerprint_one(sql: &str, dialect: &str) -> Option<(u64, u64, String, bool)> {
+fn fingerprint_one(sql: &str, dialect: &str) -> Option<OneFingerprint> {
     let sql_owned = sql.to_string();
     let dialect_owned = dialect.to_string();
 
@@ -174,4 +265,88 @@ fn contains_nondeterministic_expr(expr: &polyglot_sql::expressions::Expression) 
         }
         _ => false,
     })
+}
+
+#[cfg(test)]
+mod cache_tests {
+    use super::*;
+
+    fn same(a: &QueryFingerprint, b: &QueryFingerprint) {
+        assert_eq!(a.query_hash, b.query_hash);
+        assert_eq!(a.query_parameterized_hash, b.query_parameterized_hash);
+        assert_eq!(a.digest_text, b.digest_text);
+        assert_eq!(a.translated_query_hash, b.translated_query_hash);
+        assert_eq!(a.translated_digest_text, b.translated_digest_text);
+        assert_eq!(a.is_deterministic, b.is_deterministic);
+    }
+
+    #[test]
+    fn hit_returns_the_same_fingerprint() {
+        let cache = FingerprintCache::new(16);
+        let sql = "SELECT id FROM orders WHERE id = 42";
+        let translated = "SELECT id FROM orders WHERE id = 42 LIMIT 10";
+        let uncached = rich_fingerprint_with(sql, Some(translated), "trino", "postgres", |s, d| {
+            fingerprint_one(s, d)
+        })
+        .unwrap();
+        let first = cache
+            .rich_fingerprint(sql, Some(translated), "trino", "postgres")
+            .unwrap();
+        let second = cache
+            .rich_fingerprint(sql, Some(translated), "trino", "postgres")
+            .unwrap();
+        same(&first, &uncached);
+        same(&second, &uncached);
+        // Original and translated are cached separately: 2 misses, then 2 hits.
+        assert_eq!(cache.stats().misses, 2);
+        assert_eq!(cache.stats().hits, 2);
+    }
+
+    #[test]
+    fn sql_change_misses() {
+        let cache = FingerprintCache::new(16);
+        let a = cache
+            .rich_fingerprint("SELECT 1 FROM t", None, "trino", "trino")
+            .unwrap();
+        let b = cache
+            .rich_fingerprint("SELECT 1 FROM u", None, "trino", "trino")
+            .unwrap();
+        assert_ne!(a.query_hash, b.query_hash);
+        assert_eq!(cache.stats().misses, 2);
+        assert_eq!(cache.stats().hits, 0);
+    }
+
+    #[test]
+    fn dialect_change_misses() {
+        let cache = FingerprintCache::new(16);
+        cache.rich_fingerprint("SELECT 1 FROM t", None, "trino", "trino");
+        cache.rich_fingerprint("SELECT 1 FROM t", None, "postgres", "trino");
+        assert_eq!(cache.stats().misses, 2);
+        assert_eq!(cache.stats().hits, 0);
+    }
+
+    #[test]
+    fn parse_failures_are_not_cached() {
+        let cache = FingerprintCache::new(16);
+        assert!(cache
+            .rich_fingerprint("SELEC FROM (((", None, "trino", "trino")
+            .is_none());
+        assert!(cache
+            .rich_fingerprint("SELEC FROM (((", None, "trino", "trino")
+            .is_none());
+        assert_eq!(cache.stats().hits, 0);
+    }
+
+    #[test]
+    fn disabled_cache_still_fingerprints() {
+        let cache = FingerprintCache::new(0);
+        let a = cache
+            .rich_fingerprint("SELECT 1 FROM t", None, "trino", "trino")
+            .unwrap();
+        let b = cache
+            .rich_fingerprint("SELECT 1 FROM t", None, "trino", "trino")
+            .unwrap();
+        same(&a, &b);
+        assert_eq!(cache.stats(), CacheStatsSnapshot::default());
+    }
 }

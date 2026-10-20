@@ -5,8 +5,12 @@
 //! output is still source-dialect; the normal translation pass then carries the spliced
 //! filter/mask expressions to the target engine.
 
+use std::sync::{Arc, LazyLock};
+
 use pyo3::prelude::*;
 use queryflux_core::access_model::{ColumnMask, Columns, GrantDetail, MaskType, ResourceKind};
+use queryflux_core::bounded_cache::{BoundedCache, CacheStatsSnapshot, MAX_CACHED_SQL_BYTES};
+use queryflux_core::config::DEFAULT_SQL_CACHE_ENTRIES;
 use queryflux_core::error::{QueryFluxError, Result};
 use queryflux_core::query::SqlDialect;
 use queryflux_core::schema_context::SchemaContext;
@@ -161,6 +165,98 @@ pub fn extract_resources(
     let dialect = dialect_kwarg(src_dialect);
     let schema_json = schema_to_json(schema);
     Python::attach(|py| extract_resources_gil(py, sql, &dialect, &schema_json))
+}
+
+/// What [`extract_resources`] depends on: the SQL verbatim (so two statements never share
+/// an entry), the sqlglot dialect name, and a content hash of the schema context.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ExtractionKey {
+    sql: String,
+    dialect: String,
+    schema: u128,
+}
+
+/// Cache of [`extract_resources`] results, keyed by [`ExtractionKey`]. It holds only the
+/// parse (which tables and columns a statement touches); the access decision is still made
+/// for every query by the caller. Only successful extractions are stored, so a query the
+/// parser cannot analyze is re-parsed (and denied) every time.
+pub struct ExtractionCache {
+    cache: BoundedCache<ExtractionKey, Arc<ExtractedStatement>>,
+}
+
+impl ExtractionCache {
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            cache: BoundedCache::new("access_extraction", capacity),
+        }
+    }
+
+    pub fn set_capacity(&self, capacity: usize) {
+        self.cache.set_capacity(capacity);
+    }
+
+    pub fn stats(&self) -> CacheStatsSnapshot {
+        self.cache.stats()
+    }
+
+    pub fn len(&self) -> usize {
+        self.cache.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.cache.is_empty()
+    }
+
+    /// [`extract_resources`], reusing an earlier result for the same key.
+    pub fn extract(
+        &self,
+        sql: &str,
+        src_dialect: &SqlDialect,
+        schema: &SchemaContext,
+    ) -> Result<ExtractedStatement> {
+        self.extract_with(sql, src_dialect, schema, extract_resources)
+    }
+
+    fn extract_with(
+        &self,
+        sql: &str,
+        src_dialect: &SqlDialect,
+        schema: &SchemaContext,
+        extract: impl FnOnce(&str, &SqlDialect, &SchemaContext) -> Result<ExtractedStatement>,
+    ) -> Result<ExtractedStatement> {
+        let key =
+            (self.cache.is_enabled() && sql.len() <= MAX_CACHED_SQL_BYTES).then(|| ExtractionKey {
+                sql: sql.to_string(),
+                dialect: dialect_kwarg(src_dialect),
+                schema: schema.content_hash(),
+            });
+        if let Some(hit) = key.as_ref().and_then(|k| self.cache.get(k)) {
+            return Ok((*hit).clone());
+        }
+        let statement = extract(sql, src_dialect, schema)?;
+        if let Some(key) = key {
+            self.cache.insert(key, Arc::new(statement.clone()));
+        }
+        Ok(statement)
+    }
+}
+
+static EXTRACTION_CACHE: LazyLock<ExtractionCache> =
+    LazyLock::new(|| ExtractionCache::new(DEFAULT_SQL_CACHE_ENTRIES));
+
+/// The process-wide extraction cache the access-control guard uses. Sized at startup from
+/// `translation.cache.tableExtraction`.
+pub fn extraction_cache() -> &'static ExtractionCache {
+    &EXTRACTION_CACHE
+}
+
+/// [`extract_resources`] through the process-wide [`extraction_cache`].
+pub fn extract_resources_cached(
+    sql: &str,
+    src_dialect: &SqlDialect,
+    schema: &SchemaContext,
+) -> Result<ExtractedStatement> {
+    EXTRACTION_CACHE.extract(sql, src_dialect, schema)
 }
 
 /// Apply row filters and (pre-rendered, source-dialect) column-mask expressions at every
@@ -876,12 +972,22 @@ def rewrite_table_scans(sql, dialect, schema_json, policies_json):
     return tree.sql(dialect=dialect or None)
 "#;
 
+/// The compiled access module. Compiling `ACCESS_PY` costs about 3 ms, more than most
+/// extractions, and the module holds only functions and constants, so it is built once
+/// per process and shared. A failed build is not kept: the next call retries.
+static ACCESS_MODULE: pyo3::sync::PyOnceLock<Py<PyModule>> = pyo3::sync::PyOnceLock::new();
+
 fn load_module<'py>(py: Python<'py>) -> Result<Bound<'py, PyModule>> {
-    let code = std::ffi::CString::new(ACCESS_PY).unwrap();
-    let file = std::ffi::CString::new("qflux_access.py").unwrap();
-    let name = std::ffi::CString::new("qflux_access").unwrap();
-    PyModule::from_code(py, code.as_c_str(), file.as_c_str(), name.as_c_str())
-        .map_err(|e| QueryFluxError::Translation(format!("load access module: {e}")))
+    ACCESS_MODULE
+        .get_or_try_init(py, || {
+            let code = std::ffi::CString::new(ACCESS_PY).unwrap();
+            let file = std::ffi::CString::new("qflux_access.py").unwrap();
+            let name = std::ffi::CString::new("qflux_access").unwrap();
+            PyModule::from_code(py, code.as_c_str(), file.as_c_str(), name.as_c_str())
+                .map(Bound::unbind)
+                .map_err(|e| QueryFluxError::Translation(format!("load access module: {e}")))
+        })
+        .map(|module| module.bind(py).clone())
 }
 
 fn extract_resources_gil(
@@ -2318,5 +2424,158 @@ mod tests {
             out.contains("zeta, id, NULL AS ssn, alpha, region, beta"),
             "columns must follow schema order: {out}"
         );
+    }
+}
+
+#[cfg(test)]
+mod extraction_cache_tests {
+    use super::*;
+    use queryflux_core::schema_context::ColumnMap;
+    use std::cell::Cell;
+
+    fn tables(stmt: &ExtractedStatement) -> Vec<String> {
+        let mut t: Vec<String> = stmt.resources.iter().map(|r| r.table.clone()).collect();
+        t.sort();
+        t
+    }
+
+    fn schema(ty: &str) -> SchemaContext {
+        SchemaContext {
+            catalog: None,
+            database: None,
+            tables: [(
+                "orders".to_string(),
+                ColumnMap::from([
+                    ("id".to_string(), ty.to_string()),
+                    ("secret".to_string(), "VARCHAR".to_string()),
+                ]),
+            )]
+            .into_iter()
+            .collect(),
+        }
+    }
+
+    #[test]
+    fn hit_returns_the_same_extraction() {
+        let cache = ExtractionCache::new(16);
+        let sql = "SELECT o.id FROM orders o JOIN customers c ON o.cid = c.id";
+        let first = cache
+            .extract(sql, &SqlDialect::Trino, &SchemaContext::default())
+            .unwrap();
+        let second = cache
+            .extract(sql, &SqlDialect::Trino, &SchemaContext::default())
+            .unwrap();
+        assert_eq!(first, second);
+        assert_eq!(
+            first,
+            extract_resources(sql, &SqlDialect::Trino, &SchemaContext::default()).unwrap()
+        );
+        assert_eq!(cache.stats().hits, 1);
+        assert_eq!(cache.stats().misses, 1);
+    }
+
+    /// Statements that differ only slightly (a table name, a comment, whitespace) must each
+    /// get their own tables back, never another statement's, even interleaved.
+    #[test]
+    fn never_returns_another_statements_tables() {
+        let cache = ExtractionCache::new(16);
+        let cases = [
+            ("SELECT * FROM orders", vec!["orders"]),
+            ("SELECT * FROM orders2", vec!["orders2"]),
+            ("SELECT * FROM  orders", vec!["orders"]),
+            ("SELECT * FROM customers", vec!["customers"]),
+            (
+                "SELECT * FROM orders JOIN customers ON 1 = 1",
+                vec!["customers", "orders"],
+            ),
+            ("SELECT 1", vec![]),
+        ];
+        for _ in 0..3 {
+            for (sql, expected) in &cases {
+                let got = cache
+                    .extract(sql, &SqlDialect::Trino, &SchemaContext::default())
+                    .unwrap();
+                assert_eq!(&tables(&got), expected, "{sql}");
+            }
+        }
+        assert_eq!(cache.stats().misses, cases.len() as u64);
+        assert_eq!(cache.stats().hits, 2 * cases.len() as u64);
+    }
+
+    #[test]
+    fn dialect_change_misses() {
+        let cache = ExtractionCache::new(16);
+        let sql = "SELECT id FROM orders";
+        let empty = SchemaContext::default();
+        cache.extract(sql, &SqlDialect::Trino, &empty).unwrap();
+        cache.extract(sql, &SqlDialect::Postgres, &empty).unwrap();
+        assert_eq!(cache.stats().misses, 2);
+        assert_eq!(cache.stats().hits, 0);
+    }
+
+    #[test]
+    fn schema_change_misses_and_changes_columns() {
+        let cache = ExtractionCache::new(16);
+        let sql = "SELECT * FROM orders";
+        let without = cache
+            .extract(sql, &SqlDialect::Trino, &SchemaContext::default())
+            .unwrap();
+        let with = cache
+            .extract(sql, &SqlDialect::Trino, &schema("BIGINT"))
+            .unwrap();
+        cache
+            .extract(sql, &SqlDialect::Trino, &schema("INT"))
+            .unwrap();
+        assert_eq!(cache.stats().misses, 3);
+        assert_eq!(without.resources[0].columns, Columns::All);
+        assert_ne!(with.resources[0].columns, Columns::All);
+    }
+
+    #[test]
+    fn errors_are_not_cached() {
+        let cache = ExtractionCache::new(16);
+        let calls = Cell::new(0);
+        let flaky = |sql: &str, d: &SqlDialect, s: &SchemaContext| {
+            calls.set(calls.get() + 1);
+            if calls.get() == 1 {
+                Err(QueryFluxError::Translation("transient".into()))
+            } else {
+                extract_resources(sql, d, s)
+            }
+        };
+        let empty = SchemaContext::default();
+        assert!(cache
+            .extract_with("SELECT * FROM t", &SqlDialect::Trino, &empty, flaky)
+            .is_err());
+        let ok = cache
+            .extract_with("SELECT * FROM t", &SqlDialect::Trino, &empty, flaky)
+            .unwrap();
+        assert_eq!(tables(&ok), vec!["t"]);
+        assert_eq!(calls.get(), 2, "the failure must not have been cached");
+        // A genuine parse failure is not cached either.
+        assert!(cache
+            .extract("SELECT FROM (", &SqlDialect::Trino, &empty)
+            .is_err());
+        assert!(cache
+            .extract("SELECT FROM (", &SqlDialect::Trino, &empty)
+            .is_err());
+        assert_eq!(cache.len(), 1);
+    }
+
+    #[test]
+    fn disabled_cache_still_extracts() {
+        let cache = ExtractionCache::new(0);
+        for _ in 0..2 {
+            let got = cache
+                .extract(
+                    "SELECT * FROM orders",
+                    &SqlDialect::Trino,
+                    &SchemaContext::default(),
+                )
+                .unwrap();
+            assert_eq!(tables(&got), vec!["orders"]);
+        }
+        assert_eq!(cache.stats(), CacheStatsSnapshot::default());
+        assert!(cache.is_empty());
     }
 }

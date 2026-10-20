@@ -14,7 +14,10 @@
 //!   worker. Available only when this process has a coordination store (Postgres).
 //!
 //! - `/worker/query-records` stores the query history workers send (a
-//!   [`QueryRecordBatchV1`]) in this process's history store, stamped with the worker.
+//!   [`QueryRecordBatchV1`]) in this process's history store, stamped with the worker,
+//!   as one batch write. At most [`MAX_CONCURRENT_RECORD_BATCHES`] batches are written at
+//!   once; a batch that cannot start within [`RECORD_BATCH_QUEUE_WAIT`] gets
+//!   `503 Service Unavailable` with `Retry-After`, and the worker keeps it spooled.
 //!
 //! Workers authenticate with `Authorization: Bearer <workerApi.sharedSecret>`, separate
 //! from the admin API's Basic auth.
@@ -64,6 +67,14 @@ pub struct WorkerApi {
 
 /// Largest query-record batch accepted. Workers send at most a few hundred records.
 const MAX_RECORD_BATCH_BYTES: usize = 32 * 1024 * 1024;
+/// Query-record batches written at once. Each holds one connection of the admin pool
+/// (2 by default) for one short transaction; more would only queue on the pool and delay
+/// the admin API sharing it.
+pub const MAX_CONCURRENT_RECORD_BATCHES: usize = 2;
+/// How long a batch may wait for a write slot before it is refused with 503.
+pub const RECORD_BATCH_QUEUE_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+/// `Retry-After` (seconds) on a refused or failed query-record batch.
+const RECORD_BATCH_RETRY_AFTER_SECS: u64 = 2;
 
 /// A long-poll never holds a request longer than this.
 const MAX_WAIT_SECS: u64 = 60;
@@ -71,6 +82,16 @@ const MAX_WAIT_SECS: u64 = 60;
 const LIVE_WINDOW_SECS: i64 = 120;
 
 pub fn router(api: WorkerApi) -> Router {
+    router_with_ingest_limit(api, MAX_CONCURRENT_RECORD_BATCHES, RECORD_BATCH_QUEUE_WAIT)
+}
+
+/// [`router`] with a different history-ingest limit: `max_batches` written at once, each
+/// waiting at most `queue_wait` to start.
+pub fn router_with_ingest_limit(
+    api: WorkerApi,
+    max_batches: usize,
+    queue_wait: std::time::Duration,
+) -> Router {
     Router::new()
         .route("/worker/config", get(get_config))
         .route("/worker/config/wait", get(wait_config))
@@ -108,6 +129,8 @@ pub fn router(api: WorkerApi) -> Router {
             api,
             last_fleet_warning: std::sync::atomic::AtomicI64::new(0),
             sweep_locks: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+            ingest_slots: tokio::sync::Semaphore::new(max_batches.max(1)),
+            ingest_queue_wait: queue_wait,
         }))
 }
 
@@ -123,6 +146,9 @@ struct WorkerApiState {
     /// Unix seconds of the last shared-capacity warning (rate limit).
     last_fleet_warning: std::sync::atomic::AtomicI64,
     sweep_locks: HeldSweepLocks,
+    /// Bounds concurrent query-record batch writes (backpressure for history ingest).
+    ingest_slots: tokio::sync::Semaphore,
+    ingest_queue_wait: std::time::Duration,
 }
 
 /// Constant-time comparison, so response timing does not leak how much of the
@@ -329,17 +355,51 @@ async fn ingest_records(
         )
             .into_response();
     }
-    let accepted = batch.records.len();
-    for mut record in batch.records {
-        record.worker = Some(batch.worker.clone());
-        // Retried batches repeat records; the store keeps the first per proxy query id.
-        if let Err(e) = store.record_query(record).await {
-            return (StatusCode::SERVICE_UNAVAILABLE, e.to_string()).into_response();
+    // Backpressure: a few batches are written at once and others wait briefly. When
+    // ingest falls behind, refuse with 503; the worker keeps the batch spooled and retries,
+    // so its queries never wait on this.
+    let _slot = match tokio::time::timeout(st.ingest_queue_wait, st.ingest_slots.acquire()).await {
+        Ok(Ok(permit)) => permit,
+        _ => {
+            tracing::warn!(
+                worker = %batch.worker,
+                records = batch.records.len(),
+                "Query history ingest is behind; asking the worker to retry"
+            );
+            return retry_later("query history ingest is busy, retry later".to_string());
         }
+    };
+    let accepted = batch.records.len();
+    let worker = batch.worker;
+    let records: Vec<_> = batch
+        .records
+        .into_iter()
+        .map(|mut record| {
+            record.worker = Some(worker.clone());
+            record
+        })
+        .collect();
+    // One write for the whole batch. Retried batches repeat records; the store keeps the
+    // first per proxy query id and counts each once in digest stats.
+    if let Err(e) = store.record_queries(records).await {
+        return retry_later(e.to_string());
     }
     (
         StatusCode::ACCEPTED,
         Json(serde_json::json!({ "accepted": accepted })),
+    )
+        .into_response()
+}
+
+/// `503` with `Retry-After`: the worker keeps the batch and sends it again.
+fn retry_later(message: String) -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        [(
+            header::RETRY_AFTER,
+            HeaderValue::from(RECORD_BATCH_RETRY_AFTER_SECS),
+        )],
+        message,
     )
         .into_response()
 }
@@ -974,5 +1034,102 @@ mod tests {
         let future = serde_json::json!({ "schemaVersion": 2, "worker": "w", "records": [] });
         let resp = app.oneshot(post(future)).await.unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// A history store whose batch writes wait until the test opens the gate.
+    struct GatedHistory {
+        entered: tokio::sync::Notify,
+        gate: tokio::sync::Semaphore,
+        batches: std::sync::Mutex<Vec<usize>>,
+    }
+
+    #[async_trait::async_trait]
+    impl MetricsStore for GatedHistory {
+        async fn record_query(
+            &self,
+            _: queryflux_persistence::QueryRecord,
+        ) -> queryflux_core::error::Result<()> {
+            unreachable!("ingest writes whole batches")
+        }
+        async fn record_queries(
+            &self,
+            records: Vec<queryflux_persistence::QueryRecord>,
+        ) -> queryflux_core::error::Result<()> {
+            self.entered.notify_one();
+            self.gate.acquire().await.unwrap().forget();
+            self.batches.lock().unwrap().push(records.len());
+            Ok(())
+        }
+        async fn record_cluster_snapshot(
+            &self,
+            _: queryflux_persistence::ClusterSnapshot,
+        ) -> queryflux_core::error::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn busy_history_ingest_answers_503_with_retry_after() {
+        let store = Arc::new(GatedHistory {
+            entered: tokio::sync::Notify::new(),
+            gate: tokio::sync::Semaphore::new(0),
+            batches: Default::default(),
+        });
+        let app = router_with_ingest_limit(
+            WorkerApi {
+                shared_secret: "s3cret".into(),
+                snapshot: Arc::new(|| Box::pin(async { Err("unused".to_string()) })),
+                registry: None,
+                changes: None,
+                coordination: None,
+                history: Some(store.clone()),
+                quotas: None,
+            },
+            1,
+            std::time::Duration::from_millis(50),
+        );
+        let record = |id: &str| {
+            serde_json::json!({
+                "proxyQueryId": id, "clusterGroup": "g", "clusterName": "c",
+                "engineType": "duckDb", "frontendProtocol": "trinoHttp",
+                "sourceDialect": "trino", "targetDialect": "duckDb",
+                "wasRewritten": false, "wasTranslated": false, "status": "success",
+                "queueDurationMs": 0, "executionDurationMs": 1,
+                "createdAt": "2026-10-14T00:00:00Z"
+            })
+        };
+        let post = |ids: &[&str]| {
+            let batch = serde_json::json!({
+                "schemaVersion": 1, "worker": "w",
+                "records": ids.iter().map(|id| record(id)).collect::<Vec<_>>()
+            });
+            Request::post("/worker/query-records")
+                .header(header::AUTHORIZATION, "Bearer s3cret")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(batch.to_string()))
+                .unwrap()
+        };
+
+        // The first batch takes the only write slot and holds it.
+        let entered = store.entered.notified();
+        let first = tokio::spawn(app.clone().oneshot(post(&["a", "b", "c"])));
+        entered.await;
+
+        let busy = app.clone().oneshot(post(&["d"])).await.unwrap();
+        assert_eq!(busy.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            busy.headers().get(header::RETRY_AFTER).unwrap(),
+            &RECORD_BATCH_RETRY_AFTER_SECS.to_string()
+        );
+
+        store.gate.add_permits(2);
+        assert_eq!(first.await.unwrap().unwrap().status(), StatusCode::ACCEPTED);
+        let retried = app.oneshot(post(&["d"])).await.unwrap();
+        assert_eq!(retried.status(), StatusCode::ACCEPTED);
+        assert_eq!(
+            *store.batches.lock().unwrap(),
+            vec![3, 1],
+            "each batch is one write"
+        );
     }
 }

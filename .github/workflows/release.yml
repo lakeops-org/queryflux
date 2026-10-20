@@ -40,7 +40,6 @@ jobs:
           token: ${{ secrets.RELEASE_PLEASE_TOKEN }}
           config-file: release-please/release-please-config.json
           manifest-file: release-please/.release-please-manifest.json
-
   # Release Please bumps the workspace version in Cargo.toml but not Cargo.lock, which then
   # still lists the workspace crates at the previous version: releases shipped a stale
   # lockfile and `cargo build --locked` failed. After every run that creates or updates the
@@ -142,7 +141,7 @@ jobs:
           git push origin HEAD:main
 
   build-slim:
-    name: Build server-only (${{ matrix.suffix }})
+    name: Build server image (${{ matrix.suffix }})
     needs: [release_please]
     strategy:
       fail-fast: false
@@ -196,7 +195,7 @@ jobs:
           retention-days: 1
 
   manifest-slim:
-    name: Manifest server-only image
+    name: Manifest server image
     needs: [release_please, build-slim, docker_tag_base]
     runs-on: ubuntu-latest
     steps:
@@ -223,102 +222,10 @@ jobs:
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
-            type=raw,value=latest-slim
-            type=raw,value=${{ needs.docker_tag_base.outputs.base }}-slim,enable=${{ needs.release_please.outputs.releases_created == 'true' }}
-
-      - name: Create and push manifest
-        working-directory: /tmp/digests
-        run: |
-          docker buildx imagetools create \
-            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
-            $(printf '${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@sha256:%s ' *)
-
-  build-full:
-    name: Build server + Studio (${{ matrix.suffix }})
-    needs: [release_please]
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - platform: linux/amd64
-            runs-on: ubuntu-latest
-            suffix: amd64
-          - platform: linux/arm64
-            runs-on: ubuntu-24.04-arm
-            suffix: arm64
-    runs-on: ${{ matrix.runs-on }}
-    steps:
-      - uses: actions/checkout@44c2b7a8a4ea60a981eaca3cf939b5f4305c123b # v4.1.5
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v3
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Build and push by digest
-        id: build
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: docker/queryflux/Dockerfile
-          target: runtime-unified
-          platforms: ${{ matrix.platform }}
-          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
-          build-args: |
-            CARGO_BUILD_JOBS=4
-            QUERYFLUX_STUDIO_IMAGE=ghcr.io/lakeops-org/queryflux-studio:latest
-          cache-from: type=gha,scope=queryflux-full-${{ matrix.suffix }}
-          cache-to: type=gha,mode=max,scope=queryflux-full-${{ matrix.suffix }}
-
-      - name: Export digest
-        run: |
-          mkdir -p /tmp/digests
-          digest="${{ steps.build.outputs.digest }}"
-          touch "/tmp/digests/${digest#sha256:}"
-
-      - name: Upload digest
-        uses: actions/upload-artifact@v4
-        with:
-          name: digests-full-${{ matrix.suffix }}
-          path: /tmp/digests/*
-          if-no-files-found: error
-          retention-days: 1
-
-  manifest-full:
-    name: Manifest server + Studio image
-    needs: [release_please, build-full, docker_tag_base]
-    runs-on: ubuntu-latest
-    steps:
-      - name: Download digests
-        uses: actions/download-artifact@v4
-        with:
-          path: /tmp/digests
-          pattern: digests-full-*
-          merge-multiple: true
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v3
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Docker metadata
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          tags: |
             type=raw,value=latest
+            type=raw,value=latest-slim
             type=raw,value=${{ needs.docker_tag_base.outputs.base }},enable=${{ needs.release_please.outputs.releases_created == 'true' }}
+            type=raw,value=${{ needs.docker_tag_base.outputs.base }}-slim,enable=${{ needs.release_please.outputs.releases_created == 'true' }}
 
       - name: Create and push manifest
         working-directory: /tmp/digests
@@ -329,7 +236,7 @@ jobs:
 
   publish:
     name: GitHub Release summary
-    needs: [release_please, manifest-slim, manifest-full, docker_tag_base]
+    needs: [release_please, manifest-slim, docker_tag_base]
     if: ${{ needs.release_please.outputs.releases_created == 'true' }}
     runs-on: ubuntu-latest
     steps:
@@ -339,5 +246,4 @@ jobs:
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "| Variant | Tags |" >> "$GITHUB_STEP_SUMMARY"
           echo "|---------|------|" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Server only | \`:${{ needs.docker_tag_base.outputs.base }}-slim\`, \`:latest-slim\` |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Server + Studio | \`:${{ needs.docker_tag_base.outputs.base }}\`, \`:latest\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Server | \`:${{ needs.docker_tag_base.outputs.base }}\`, \`:latest\` (aliases \`:${{ needs.docker_tag_base.outputs.base }}-slim\`, \`:latest-slim\`) |" >> "$GITHUB_STEP_SUMMARY"
