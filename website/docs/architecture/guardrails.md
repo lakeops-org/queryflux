@@ -12,8 +12,8 @@ Most built-in guards inspect the **translated** SQL (after dialect translation, 
 |---------|--------|
 | `allow` | Query proceeds. |
 | `warn`  | Query proceeds; a warning is recorded in the audit log. |
-| `rewrite` | Query proceeds with modified SQL. Used by [access control](../access-control/overview) (`opa_access`) for row filters and column masks. |
-| `deny`  | Query is blocked. A machine-readable error code is returned so agents can react programmatically. |
+| `rewrite` | Query proceeds with modified SQL. Used by [access control](../access-control/overview) (`opa_access`) for row filters and column masks, and by `row_limit` with `inject_limit` to add or lower a `LIMIT`. |
+| `deny`  | Query is blocked. The client gets the guard name, a machine-readable code and a hint on how to fix the query, so agents can correct it and retry. |
 
 Every verdict is recorded in `guard_actions` on the query record, alongside a `was_guard_blocked` flag. Studio's **Queries** page shows the full trail — built-in guards and `opa_access` rewrites together — plus rewritten SQL separately from dialect-translated SQL.
 
@@ -21,7 +21,17 @@ Every verdict is recorded in `guard_actions` on the query record, alongside a `w
 
 ## How the chain works
 
-Guards are evaluated in order. **The chain stops at the first deny** — subsequent guards are skipped.
+Guards are evaluated in order. **The chain stops at the first deny** — subsequent guards are skipped. When a guard rewrites the query, the guards after it check the rewritten SQL, and the rewritten SQL is what the engine runs.
+
+A blocked query fails with a message of this form:
+
+```text
+blocked by guard partition_predicate_required [PARTITION_PREDICATE_REQUIRED]: query on events must filter on its partition column dt; add a WHERE condition on dt (e.g. dt = <value> or dt >= <start>)
+```
+
+The reasons are written for the caller: they say what to change. An agent that reads the error can fix its SQL and retry instead of giving up.
+
+To check a query without running it, use [route explain](./routing-and-clusters#route-explain): it returns the guard verdict (allow, rewrite with the new SQL, or deny with this message) along with the routing decision.
 
 Two layers of guards compose per query:
 
@@ -52,6 +62,8 @@ When access control is on, the rewriting guard is `opa_access`.
 
 Blocks any statement that is not a `SELECT`, `WITH`, `SHOW`, `DESCRIBE`, or `EXPLAIN`. Guards against agents issuing accidental `INSERT`, `UPDATE`, `DELETE`, or DDL.
 
+The check looks inside reads too: `SELECT … INTO`, a CTE that deletes or updates (`WITH d AS (DELETE … RETURNING *) SELECT …`), `EXPLAIN ANALYZE` of a write (which runs the write on several engines), and procedure calls such as `CALL` are blocked. SQL that can't be parsed is blocked if it contains a write keyword.
+
 ```yaml
 guardrails:
   global:
@@ -78,6 +90,24 @@ guardrails:
       max_rows: 10000
 ```
 
+Set `inject_limit: true` to fix the query instead of warning or denying. This suits agents: they get a bounded result rather than an error.
+
+- **No LIMIT present** → `rewrite`, adding `LIMIT default_limit` (or `LIMIT max_rows` when `default_limit` is not set).
+- **LIMIT above `max_rows`** → `rewrite`, lowering it to `max_rows`.
+
+```yaml
+guardrails:
+  groups:
+    agents:
+      - kind: built_in
+        name: row_limit
+        max_rows: 10000
+        inject_limit: true
+        default_limit: 1000
+```
+
+The rewrite is recorded in `guard_actions` with the injected `limit` in its metadata. A query a guard rewrites is never served from the [result cache](./caching), whose key is the client's SQL. Batches of several statements are not rewritten; they get the warn/deny behavior.
+
 Error code on deny: `ROW_LIMIT_EXCEEDED`
 
 The check is applied to the **outermost** query only — a subquery with `LIMIT 9999` inside a `SELECT … LIMIT 10` outer query correctly passes a `max_rows: 1000` guard.
@@ -103,6 +133,67 @@ guardrails:
 With an empty `applies_to` list (or omitted), the guard applies to **all** tables.
 
 Error code on deny: `MISSING_PREDICATE`
+
+---
+
+### `partition_predicate_required`
+
+Requires queries on chosen tables to filter on the table's partition column, so they read a few partitions instead of the whole table. `tables` maps a table pattern (same glob syntax as `applies_to`) to its partition column:
+
+```yaml
+guardrails:
+  groups:
+    agents:
+      - kind: built_in
+        name: partition_predicate_required
+        tables:
+          "events": dt
+          "fct_*": event_date
+```
+
+Every `SELECT` that reads a matching table (in `FROM` or a `JOIN`, including inside CTEs and subqueries) must reference the column in its `WHERE`. Any condition on the column counts (`=`, `>=`, `BETWEEN`, `IN`).
+
+Error code on deny: `PARTITION_PREDICATE_REQUIRED`
+
+---
+
+### `time_range_limit`
+
+Bounds how far back queries on chosen tables may read. `tables` maps a table pattern to its time column, and `max_lookback` is the limit (`36h`, `90d`, `12w`, `1y`):
+
+```yaml
+guardrails:
+  groups:
+    agents:
+      - kind: built_in
+        name: time_range_limit
+        tables:
+          "events": ts
+        max_lookback: 30d
+```
+
+A query on a matching table must give the column a lower bound (`ts >= …`, `ts > …`, or `ts BETWEEN … AND …`):
+
+- **No lower bound** → `deny` with `TIME_RANGE_REQUIRED`.
+- **A literal date older than now minus `max_lookback`** → `deny` with `TIME_RANGE_EXCEEDED`. The message gives the earliest date allowed.
+- **A computed bound** such as `current_date - INTERVAL '7' DAY` is accepted as is; only literal dates are compared.
+
+A lower bound inside an `OR` counts too, so treat this guard as a guide for agents rather than a hard limit.
+
+---
+
+### `no_cross_join`
+
+Blocks cartesian products: `CROSS JOIN` between tables or subqueries, a `JOIN` with no `ON` or `USING`, and `FROM a, b` with no `WHERE`. Row expansions are allowed (`CROSS JOIN UNNEST(...)`, `LATERAL`).
+
+```yaml
+guardrails:
+  global:
+    - kind: built_in
+      name: no_cross_join
+```
+
+Error code on deny: `CROSS_JOIN`
 
 ---
 

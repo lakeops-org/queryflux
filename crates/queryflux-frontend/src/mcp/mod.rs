@@ -1,7 +1,7 @@
 //! MCP (Model Context Protocol) frontend — streamable HTTP tool calls for AI agents.
 //!
 //! Exposes `execute_query` (reads only), `list_schemas`, `list_tables`, `describe_table`,
-//! `explain_query`, `get_query_status`, and `cancel_query` as MCP tools, plus
+//! `explain_query`, `explain_route`, `get_query_status`, and `cancel_query` as MCP tools, plus
 //! `execute_statement` for writes when `frontends.mcp.allowWrites` is set. Every tool authenticates via
 //! `Authorization: Bearer <token>` (same `AuthProvider` as every other HTTP frontend)
 //! and dispatches through the standard `execute_to_sink` pipeline, so routing,

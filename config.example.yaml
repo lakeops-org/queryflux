@@ -16,10 +16,12 @@ queryflux:
     # Authenticates via `Authorization: Bearer <token>` like other HTTP frontends — see
     # the `auth` section below. Guardrails (read-only, row limits, etc.) are configured
     # the same way as for every other frontend, via the top-level `guardrails` /
-    # per-group guard config — nothing MCP-specific is enforced by default.
+    # per-group guard config. MCP is read-only by default: writes need `allowWrites: true`
+    # and go through the `execute_statement` tool with an explicit confirm.
     # mcp:
     #   enabled: false
     #   port: 8811
+    #   allowWrites: false
   persistence:
     type: inMemory
   # --- Postgres persistence examples (pick one style) ---

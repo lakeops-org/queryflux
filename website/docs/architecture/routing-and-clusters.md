@@ -127,7 +127,43 @@ def route(query: str, ctx: dict) -> str | None:
 
 ## Routing trace
 
-`route_with_trace` records each router’s decision (`matched`, optional `result`) and whether the **fallback** group was used. This supports debugging and future UI/metrics (see `RoutingTrace` in `queryflux_routing::chain`).
+`route_with_trace` records each router’s decision (`matched`, optional `result`) and whether the **fallback** group was used. It is stored with the query in history (see `RoutingTrace` in `queryflux_routing::chain`).
+
+Trino HTTP responses carry the decision in two headers, so a client can see why its query ran where it did:
+
+| Header | Value |
+|---|---|
+| `X-QueryFlux-Route-Group` | The cluster group the query was routed to. |
+| `X-QueryFlux-Route-Rule` | What chose it: the router type that matched (`Tags`, `PythonScript`, `Header`, …) or `fallback`. |
+
+## Route explain
+
+`POST /admin/route/explain` answers "where would this query run, and would it be allowed?" without running it. It routes the query through the live router chain, as the chosen identity, and runs the guard chain for the resulting group:
+
+```bash
+curl -s -u admin:admin -X POST http://localhost:9000/admin/route/explain \
+  -H 'Content-Type: application/json' \
+  -d '{"sql": "SELECT * FROM events", "protocol": "mcp",
+       "identity": {"user": "agent-1", "groups": ["agents"]}}'
+```
+
+```json
+{
+  "group": "agents",
+  "rule": "Tags",
+  "clusters": [{ "cluster": "trino-1", "engine": "trino" }],
+  "trace": { "decisions": [ ... ], "final_group": "agents", "used_fallback": false },
+  "guards": {
+    "outcome": "deny",
+    "message": "blocked by guard partition_predicate_required [PARTITION_PREDICATE_REQUIRED]: query on events must filter on its partition column dt; ...",
+    "actions": [ ... ]
+  }
+}
+```
+
+Request fields: `sql` (required), `protocol` (the frontend the query would arrive on, default `trinoHttp`; it also sets the SQL dialect), `identity` (`user`, `groups`, `roles`, `attributes`), and `session` (values routers read, such as `snowflake.warehouse`). `guards.outcome` is `allow`, `rewrite` (with `rewrittenSql`) or `deny` (with the client-facing `message`). The guards check the SQL as given, before dialect translation.
+
+Agents get the same answer from the MCP tool [`explain_route`](./frontends/mcp).
 
 ## Cluster group configuration (actual shape)
 
@@ -159,6 +195,7 @@ clusterGroups:
 Notes:
 
 - **`maxRunningQueries`** on the group applies to **each** member cluster’s `ClusterState` when those states are built (see `main.rs` pass 2). It is the cap used for **acquire** / capacity checks.
+- **`maxExecutionSecs`** (optional) stops queries that run too long: when a query has run on the engine for longer than this, QueryFlux cancels it on the engine and fails it with `EXECUTION_TIMEOUT` and a hint to narrow the query. Streaming frontends (MySQL, Postgres, Flight SQL, MCP, Snowflake) enforce it exactly; Trino HTTP queries are checked by a background sweep every 30 seconds, so they stop up to 30 seconds late. Set in YAML; omitted or `0` means no limit.
 - **`members`** can list multiple clusters, including **mixed engines** (e.g. Trino and DuckDB in one group). For that, **`engineAffinity`** (or another strategy) helps express preference order across engine types (`queryflux_cluster_manager::strategy`).
 
 ## Selection strategies

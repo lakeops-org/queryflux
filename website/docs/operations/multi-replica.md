@@ -66,6 +66,7 @@ Related group knobs:
 
 - `maxQueuedQueries` — proxy queue depth (enforced from LiveConfig)
 - `capacityWaitTimeoutSecs` — max wait for a slot (default **300**)
+- `maxExecutionSecs` — max run time on the engine before the query is cancelled (no limit by default)
 
 A lease is one call into Postgres, and releases are sent in batches in the background. Capacity calls use the coordination pool, 8 connections by default; size `coordinationPoolSize` to admissions per second × about 1 ms. If you set only `poolSize`, coordination gets 20% of it, so set `coordinationPoolSize` too. How it works: [Capacity and throughput](../architecture/capacity-and-throughput).
 
