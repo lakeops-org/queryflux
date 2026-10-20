@@ -1048,7 +1048,7 @@ impl ProtocolWireHarness {
         .await?;
         let mcp_port = start_wire_frontend(
             "MCP",
-            |port| McpFrontend::new(state.clone(), port, None),
+            |port| McpFrontend::new(state.clone(), port, None, true),
             shutdown_rx,
         )
         .await?;

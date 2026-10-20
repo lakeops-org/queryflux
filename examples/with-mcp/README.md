@@ -51,9 +51,12 @@ Once connected, ask your agent to run something like:
 > Create a table called `orders` with a few sample rows, describe its columns, then
 > show me everything in it.
 
-That exercises `execute_query` (CREATE + INSERT), `describe_table`, and `execute_query`
-again (SELECT) in sequence — a good first look at all six tools working together. Or run
-the same steps directly against `execute_query` yourself via the Inspector:
+That exercises `execute_statement` (CREATE + INSERT, with `confirm: true`), `describe_table`,
+and `execute_query` (SELECT) in sequence. `execute_statement` exists only because this
+demo's `config.yaml` sets `frontends.mcp.allowWrites: true`; by default the MCP endpoint is
+read-only and `execute_query` rejects writes. Or run the same steps yourself via the
+Inspector: the CREATE through `execute_statement` (with `confirm: true`), the SELECT through
+`execute_query`:
 
 ```sql
 CREATE TABLE orders AS

@@ -289,7 +289,7 @@ fn config_requires_translation(config: &ProxyConfig) -> bool {
         }
     }
     if let Some(ref f) = config.queryflux.frontends.mcp {
-        if f.enabled {
+        if f.listener.enabled {
             enabled_frontends.push((FrontendProtocol::Mcp, SqlDialect::Generic));
         }
     }

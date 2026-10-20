@@ -451,7 +451,7 @@ pub fn build_frontends_status(
             "mcp",
             "MCP",
             "Model Context Protocol streamable-HTTP tool calls for AI agents.",
-            frontends.mcp.as_ref(),
+            frontends.mcp.as_ref().map(|c| &c.listener),
         ),
     ];
 

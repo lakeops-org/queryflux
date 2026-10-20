@@ -148,13 +148,18 @@ pub(crate) fn spawn_query_frontends(
         });
     }
     if let Some(cfg) = config.queryflux.frontends.mcp.clone() {
-        frontend_tasks.spawn_if_enabled("MCP", cfg.enabled, || {
+        frontend_tasks.spawn_if_enabled("MCP", cfg.listener.enabled, || {
             let state = app_state.clone();
             let rx = shutdown_rx.clone();
             async move {
-                McpFrontend::new(state, cfg.port, cfg.max_connections)
-                    .listen(rx)
-                    .await
+                McpFrontend::new(
+                    state,
+                    cfg.listener.port,
+                    cfg.listener.max_connections,
+                    cfg.allow_writes,
+                )
+                .listen(rx)
+                .await
             }
         });
     }
