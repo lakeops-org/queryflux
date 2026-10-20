@@ -44,8 +44,15 @@ function Cover({post, index, large}: {post: Post; index: number; large?: boolean
   const src = useBaseUrl(image ? `/${image.replace(/^\//, '')}` : '/');
   if (image) {
     return (
-      <div className={clsx(styles.cover, styles.coverImage, large && styles.coverLarge)} aria-hidden>
-        <img src={src} alt="" loading={large ? 'eager' : 'lazy'} />
+      <div className={clsx(styles.cover, styles.coverImage, large && styles.coverLarge)}>
+        <img
+          src={src}
+          alt=""
+          loading={large ? 'eager' : 'lazy'}
+          width={1200}
+          height={675}
+          // Decorative beside the linked title text; empty alt avoids duplicate announcement.
+        />
       </div>
     );
   }

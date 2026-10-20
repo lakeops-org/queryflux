@@ -204,6 +204,7 @@ docker compose down
 
 ## Next steps
 
+- [Blog: Give agents SQL, not the keys to every engine](/blog/agents-sql-not-keys) — routing, guardrails, and impersonation for agents
 - [MCP frontend](../architecture/frontends/mcp.md) — full tool reference, the `dialect` parameter, OIDC tokens for MCP clients, and known limitations
 - [Agentic AI overview](../agentic/overview.md) — how QueryFlux tracks agent identity and conversations across frontends
 - [Setting agent context](../agentic/agent-context.md) and [Session replay and guardrails](../agentic/session-replay.md)

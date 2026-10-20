@@ -30,14 +30,19 @@ export default function PageSeo({
 
   return (
     <Head>
+      <meta name="description" content={description} />
       <meta property="og:url" content={pageUrl} />
+      <meta property="og:type" content="website" />
       <meta property="og:title" content={fullTitle} />
       <meta property="og:description" content={description} />
       <meta property="og:image" content={imageUrl} />
+      <meta property="og:image:alt" content={fullTitle} />
+      <meta name="twitter:card" content="summary_large_image" />
       <meta name="twitter:url" content={pageUrl} />
       <meta name="twitter:title" content={fullTitle} />
       <meta name="twitter:description" content={description} />
       <meta name="twitter:image" content={imageUrl} />
+      <meta name="twitter:image:alt" content={fullTitle} />
       <link rel="canonical" href={pageUrl} />
     </Head>
   );

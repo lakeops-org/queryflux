@@ -89,15 +89,10 @@ Native adapters cover Trino, DuckDB, StarRocks, ClickHouse, Athena, and MySQL. T
 
 Routing is a two-stage process:
 
-```mermaid
-flowchart LR
-  Q[Incoming query] --> R[Routers chain]
-  R --> G[Cluster group]
-  G --> S[Selection strategy]
-  S --> C[Healthy cluster]
-  C --> T[Dialect translate]
-  T --> E[Engine]
-```
+<figure class="blog-figure">
+  <img src="/img/blog/routing-pipeline.svg" alt="Pipeline: query in, routers chain, cluster group, healthy cluster selection, dialect translate, engine" />
+  <figcaption>Group selection first, then cluster selection, then optional dialect translation.</figcaption>
+</figure>
 
 **Group selection.** A chain of routers inspects each query in order and returns a cluster group — a named pool of backends. The first match wins; if nothing matches, a fallback group takes the query. Routers can match on client protocol, HTTP headers, SQL patterns, client tags, the user's group, or a Python `route(query, ctx)` function.
 

@@ -52,6 +52,60 @@ export function buildDocsVersionConfig(): DocsVersionsConfig {
   return versions;
 }
 
+/** Paths that are thin / utility and should not compete in search. */
+function shouldOmitFromSitemap(pathname: string): boolean {
+  if (pathname.startsWith('/docs/next')) {
+    return true;
+  }
+  // Older doc versions are noIndex; omit if they still appear.
+  if (/^\/docs\/\d+\.\d+(\.\d+)?(\/|$)/.test(pathname)) {
+    return true;
+  }
+  if (
+    pathname === '/blog/archive' ||
+    pathname === '/blog/authors' ||
+    pathname === '/blog/tags' ||
+    pathname.startsWith('/blog/tags/')
+  ) {
+    return true;
+  }
+  return false;
+}
+
+function sitemapPriority(pathname: string): number {
+  if (pathname === '/') {
+    return 1.0;
+  }
+  if (pathname === '/docs/intro' || pathname === '/docs/getting-started') {
+    return 0.9;
+  }
+  if (pathname === '/blog') {
+    return 0.85;
+  }
+  // Individual posts: /blog/<slug> (not /blog itself)
+  if (pathname.startsWith('/blog/') && !pathname.slice('/blog/'.length).includes('/')) {
+    return 0.85;
+  }
+  if (
+    pathname.startsWith('/docs/quickstart/') ||
+    pathname === '/docs/configuration' ||
+    pathname === '/docs/architecture/overview' ||
+    pathname === '/docs/architecture/routing-and-clusters' ||
+    pathname === '/docs/architecture/guardrails' ||
+    pathname === '/docs/agentic/overview' ||
+    pathname === '/docs/quickstart/ai-agent-mcp'
+  ) {
+    return 0.8;
+  }
+  if (pathname === '/community') {
+    return 0.6;
+  }
+  if (pathname.startsWith('/docs/')) {
+    return 0.7;
+  }
+  return 0.5;
+}
+
 /** Sitemap tuned for SEO; lastmod refreshes on every build (schedule deploy daily at midnight UTC). */
 export function buildSitemapConfig(): Partial<SitemapPluginOptions> {
   const lastmod = sitemapLastModDate();
@@ -62,28 +116,23 @@ export function buildSitemapConfig(): Partial<SitemapPluginOptions> {
     priority: 0.5,
     createSitemapItems: async (params) => {
       const items = await params.defaultCreateSitemapItems(params);
-      return items.map((item) => {
-        let pathname: string;
-        try {
-          pathname = new URL(item.url).pathname.replace(/\/$/, '') || '/';
-        } catch {
-          pathname = item.url.replace(/\/$/, '') || '/';
-        }
-        let priority = 0.7;
-        if (pathname === '/') {
-          priority = 1.0;
-        } else if (pathname === '/community') {
-          priority = 0.6;
-        } else if (pathname === '/docs/intro') {
-          priority = 0.9;
-        }
-        return {
+      return items
+        .map((item) => {
+          let pathname: string;
+          try {
+            pathname = new URL(item.url).pathname.replace(/\/$/, '') || '/';
+          } catch {
+            pathname = item.url.replace(/\/$/, '') || '/';
+          }
+          return {item, pathname};
+        })
+        .filter(({pathname}) => !shouldOmitFromSitemap(pathname))
+        .map(({item, pathname}) => ({
           ...item,
           lastmod,
           changefreq: 'weekly' as const,
-          priority,
-        };
-      });
+          priority: sitemapPriority(pathname),
+        }));
     },
   };
 }
@@ -98,7 +147,15 @@ export function robotsTxtPlugin(_context: LoadContext): Plugin {
       const contents = `# Generated at build time — do not edit build/robots.txt by hand.
 # https://docusaurus.io/docs/seo#robots-file
 User-agent: *
-Disallow:
+Allow: /
+# Unreleased "Next" docs (also noIndex)
+Disallow: /docs/next
+Disallow: /docs/next/
+# Thin blog utility pages (also omitted from sitemap)
+Disallow: /blog/tags
+Disallow: /blog/tags/
+Disallow: /blog/archive
+Disallow: /blog/authors
 
 Sitemap: ${sitemapUrl}
 `;

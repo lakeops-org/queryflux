@@ -53,7 +53,7 @@ The N×M client-to-engine wiring is still there. Dialect differences are still t
 
 QueryFlux is the missing layer above the table format: **compute interoperability**. It gives every client one endpoint regardless of what engine sits behind it, routes each query to the right engine based on explicit rules, translates dialect in flight, and manages capacity across the fleet. Iceberg unified the data; QueryFlux unifies the access.
 
-That argument is expanded in **[The Future Isn't One Engine. It's a Control Plane.](https://lakeops.dev/blog/the-future-isnt-one-engine)** — why engines became components, why open formats are not enough on their own, and how QueryFlux plus LakeOps decide where a query runs and how the table stays fast.
+That argument is expanded in **[Why QueryFlux](/blog/why-queryflux)** and **[The Future Isn't One Engine. It's a Control Plane.](https://lakeops.dev/blog/the-future-isnt-one-engine)** — why engines became components, why open formats are not enough on their own, and how QueryFlux plus LakeOps decide where a query runs and how the table stays fast.
 
 ---
 

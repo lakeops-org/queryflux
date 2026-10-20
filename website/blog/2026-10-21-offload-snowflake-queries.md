@@ -1,10 +1,19 @@
 ---
 slug: offload-snowflake-queries
-title: "Offload Snowflake queries to Trino or StarRocks without changing a client"
-description: Not every Snowflake query needs a Snowflake warehouse. Point your Snowflake clients at QueryFlux, keep the heavy work on Snowflake, and send the rest to engines you already run, with no change to dashboards, notebooks or connection code.
+title: "Offload Snowflake queries without changing clients"
+description: Point Snowflake clients at QueryFlux, keep heavy work on Snowflake, and offload the rest to Trino or StarRocks — no dashboard or notebook rewrites.
 authors: [amit]
 tags: [Guides]
-date: 2026-10-21T12:00
+keywords:
+  - Snowflake
+  - QueryFlux
+  - query offload
+  - Trino
+  - StarRocks
+  - Iceberg
+  - SQL proxy
+  - cost optimization
+image: img/blog/offload-snowflake-hero.jpg
 ---
 
 Snowflake bills for warehouse time. A lot of that time goes to queries that don't need it: dashboard refreshes, small lookups, exploratory `SELECT`s from notebooks. If your data already lives in open formats like Iceberg, an engine you already run (Trino, StarRocks, DuckDB) could answer many of those queries.
@@ -17,12 +26,10 @@ QueryFlux removes that step. Snowflake clients connect to it as if it were Snowf
 
 ## How it works
 
-```mermaid
-flowchart LR
-  c["Snowflake clients<br/>(Python connector, JDBC, SnowSQL)"] --> qf["QueryFlux<br/>Snowflake frontend"]
-  qf -->|"BI and exploration"| t["Trino or StarRocks<br/>(reads your Iceberg tables)"]
-  qf -->|"everything else"| sf["Snowflake<br/>(through ADBC)"]
-```
+<figure class="blog-figure">
+  <img src="/img/blog/snowflake-offload.svg" alt="Snowflake clients connect to QueryFlux; BI and exploration go to Trino or StarRocks on Iceberg, everything else stays on Snowflake via ADBC" />
+  <figcaption>Same Snowflake login UX. Session routing picks Trino/StarRocks or Snowflake.</figcaption>
+</figure>
 
 QueryFlux speaks the Snowflake HTTP protocol and the SQL API v2. The Python connector, JDBC drivers and SnowSQL log in to QueryFlux the same way they log in to Snowflake. At login, a router picks a cluster group for the session: by the warehouse, role or user the client asked for. Every query in that session runs on that group, with Snowflake SQL translated to the target engine's dialect by sqlglot.
 

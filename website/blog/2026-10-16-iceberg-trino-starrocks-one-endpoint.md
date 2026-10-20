@@ -1,10 +1,18 @@
 ---
 slug: iceberg-trino-starrocks-one-endpoint
-title: "Query the same Iceberg tables from Trino and StarRocks, through one endpoint"
-description: Iceberg lets Trino and StarRocks read the same tables, but every client still has to pick an engine, a protocol and a dialect. Put one SQL endpoint in front of both and route each workload to the engine that fits it, in a stack you can run locally in minutes.
+title: "One endpoint for Iceberg on Trino and StarRocks"
+description: Run Trino and StarRocks on the same Iceberg tables behind one QueryFlux SQL endpoint — route BI and notebooks without client rewrites.
 authors: [amit]
 tags: [Guides]
-date: 2026-10-21T09:00
+keywords:
+  - Apache Iceberg
+  - Trino
+  - StarRocks
+  - QueryFlux
+  - SQL proxy
+  - lakehouse
+  - query routing
+image: img/blog/iceberg-trino-starrocks-hero.jpg
 ---
 
 Apache Iceberg solved the hard part: one copy of your data that many engines can read. Trino reads it for interactive and federated SQL. StarRocks reads the same tables for fast, high-concurrency dashboards. On paper you have the best of both.
@@ -17,16 +25,10 @@ This guide puts one SQL endpoint in front of both engines, so clients connect on
 
 ## What you'll build
 
-```mermaid
-flowchart LR
-  bi["BI tools<br/>(MySQL wire)"] --> qf["QueryFlux"]
-  nb["Notebooks, CLIs<br/>(Trino HTTP)"] --> qf
-  qf --> trino["Trino"]
-  qf --> sr["StarRocks"]
-  trino --> lk["Iceberg catalog<br/>(Lakekeeper)"]
-  sr --> lk
-  lk --> s3["Object storage<br/>(RustFS)"]
-```
+<figure class="blog-figure">
+  <img src="/img/blog/iceberg-stack.svg" alt="Architecture: BI over MySQL and notebooks over Trino HTTP into QueryFlux, routing to Trino and StarRocks on a shared Iceberg catalog and object storage" />
+  <figcaption>BI and notebooks share one front door; both engines read the same Iceberg tables.</figcaption>
+</figure>
 
 - An Iceberg REST catalog (Lakekeeper) on S3-compatible storage (RustFS), loaded with TPC-H.
 - Trino and StarRocks, both reading the same Iceberg tables.

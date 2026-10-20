@@ -9,13 +9,17 @@ type Props = WrapperProps<typeof HeaderType>;
 
 /** The post's `image` front matter, shown as a hero under the byline on the post page. */
 export default function HeaderWrapper(props: Props): ReactNode {
-  const {frontMatter, assets, isBlogPostPage} = useBlogPost();
+  const {metadata, frontMatter, assets, isBlogPostPage} = useBlogPost();
   const image = (assets.image ?? frontMatter.image) as string | undefined;
-  const src = useBaseUrl(image && !/^https?:/.test(image) ? `/${image.replace(/^\//, '')}` : image ?? '/');
+  const src = useBaseUrl(
+    image && !/^https?:/.test(image) ? `/${image.replace(/^\//, '')}` : (image ?? '/'),
+  );
   return (
     <>
       <Header {...props} />
-      {isBlogPostPage && image && <img className="blog-post-hero" src={src} alt="" />}
+      {isBlogPostPage && image && (
+        <img className="blog-post-hero" src={src} alt={metadata.title} width={1200} height={675} />
+      )}
     </>
   );
 }
