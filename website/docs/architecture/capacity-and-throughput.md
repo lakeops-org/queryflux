@@ -8,7 +8,7 @@ image: img/queryflux-hero-banner.png
 
 `maxRunningQueries` caps how many queries run on a cluster at once. With several QueryFlux processes (replicas, or a control plane and its workers), the cap holds across all of them. This page explains how that's enforced, what it costs per query, and how the design keeps the shared limit cheap at high query rates.
 
-For running replicas see [Multi-replica deployment](../operations/multi-replica); for workers see the [Worker mode design](./worker-mode#shared-capacity).
+For running replicas see [Multi-replica deployment](../operations/multi-replica); for workers see the [Worker mode design](./worker-mode#shared-capacity). To size a fleet, see [Sizing for high query rates](../operations/sizing).
 
 ## Admission in two steps
 
