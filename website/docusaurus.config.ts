@@ -116,7 +116,7 @@ const config: Config = {
         blog: false,
         sitemap: buildSitemapConfig(),
         theme: {
-          customCss: './src/css/custom.css',
+          customCss: ['./src/css/custom.css', './src/css/docs.css'],
         },
       } satisfies Preset.Options,
     ],
@@ -184,6 +184,7 @@ const config: Config = {
           items: [
             {label: 'Overview', to: '/docs/intro'},
             {label: 'Getting started', to: '/docs/getting-started'},
+            {label: 'Installation', to: '/docs/installation/overview'},
             {label: 'Studio', to: '/docs/studio'},
             {label: 'Configuration', to: '/docs/configuration'},
             {label: 'Architecture', to: '/docs/architecture/overview'},

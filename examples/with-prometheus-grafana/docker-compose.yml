@@ -44,7 +44,6 @@ services:
     ports:
       - "8080:8080"
       - "9000:9000"
-      - "8085:3000"  # Studio UI
     volumes:
       - ./config.yaml:/etc/queryflux/config.yaml:ro
     environment:
@@ -67,6 +66,18 @@ services:
       timeout: 5s
       retries: 15
       start_period: 90s
+
+  # Studio (admin UI) talks to QueryFlux only through the Admin API.
+  queryflux-studio:
+    image: ghcr.io/lakeops-org/queryflux-studio:latest
+    ports:
+      - "8085:3000"
+    environment:
+      ADMIN_API_URL: http://queryflux:9000
+    depends_on:
+      queryflux:
+        condition: service_healthy
+    restart: unless-stopped
 
   prometheus:
     image: quay.io/prometheus/prometheus:v2.53.0

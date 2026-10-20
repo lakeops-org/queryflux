@@ -73,6 +73,20 @@ translation; dialect-only fallback remains allowed when it succeeds. The legacy
 changing this policy. See [Query translation](./architecture/query-translation) for
 fallback counters and query history outcomes.
 
+```yaml
+translation:
+  cache:
+    translations: 4096     # translated SQL; 0 disables
+    tableExtraction: 4096  # access-control table extraction and schema table references
+    fingerprints: 4096     # query-history fingerprints
+```
+
+Repeated queries reuse earlier results instead of parsing again. Each cache is a bounded
+LRU keyed on everything that changes its result (SQL text, dialects, fixup scripts,
+schema, strict mode), so it needs no flush on reload. Set a size to 0 to disable that
+cache. These settings are local to each process, including workers. See
+[Query translation](./architecture/query-translation#caching).
+
 ## Authentication, authorization & backend identity
 
 ```yaml
@@ -190,7 +204,14 @@ Turn it on only once every standalone or control-plane replica runs a version wi
 
 **Connection pools.** Each process opens three pools: query state (`queryPoolSize`, default 7), coordination for capacity leases, queue claims and sweep locks (`coordinationPoolSize`, default 8), and admin (`adminPoolSize`, default 2), plus one `LISTEN` connection. Connections open on demand. Size `coordinationPoolSize` to the admissions per second you expect × about 1 ms. The legacy `poolSize` instead sets one budget split 60/20/20, and is ignored when any of the three is set.
 
-Helm / Kubernetes: see **[charts/queryflux/README.md](https://github.com/lakeops-org/queryflux/blob/main/charts/queryflux/README.md#persistence-and-replicas)**. Full behavior: **[Cluster variants, health checks & reconciliation](./architecture/cluster-variants-and-health#distributed-mode-and-capacitystore)**.
+**Query history retention.** `queryHistoryRetentionDays` deletes query records, digest stats and cluster snapshots older than that many days. With Postgres it runs hourly, on every replica (deleting the same rows twice is harmless), in batches of 10,000 rows, each its own short transaction. A large backlog, such as after turning retention on for an existing database, is worked through over successive batches. Each statement stays short, and autovacuum keeps up. Omit it to keep history forever.
+
+```yaml
+queryflux:
+  queryHistoryRetentionDays: 30
+```
+
+Helm / Kubernetes: see **[Run multiple replicas](./installation/kubernetes.md#run-multiple-replicas)**. Full behavior: **[Cluster variants, health checks & reconciliation](./architecture/cluster-variants-and-health#distributed-mode-and-capacitystore)**.
 
 ## Worker mode
 

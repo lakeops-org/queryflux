@@ -43,14 +43,10 @@ services:
     ports:
       - "8080:8080"
       - "9000:9000"
-      - "3000:3000"
     volumes:
       - ./config.yaml:/etc/queryflux/config.yaml:ro
     environment:
       RUST_LOG: ${RUST_LOG:-queryflux=info,queryflux_frontend=info}
-      ADMIN_API_URL: http://queryflux:9000
-      ADMIN_API_USERNAME: admin
-      ADMIN_API_PASSWORD: admin
     depends_on:
       postgres:
         condition: service_healthy
@@ -72,6 +68,19 @@ services:
       retries: 15
       start_period: 90s
 
+  # Studio (admin UI) talks to QueryFlux only through the Admin API.
+  queryflux-studio:
+    image: ghcr.io/lakeops-org/queryflux-studio:latest
+    ports:
+      - "3000:3000"
+    environment:
+      ADMIN_API_URL: http://queryflux:9000
+      ADMIN_API_USERNAME: admin
+      ADMIN_API_PASSWORD: admin
+    depends_on:
+      queryflux:
+        condition: service_healthy
+    restart: unless-stopped
 
 volumes:
   queryflux-pg:

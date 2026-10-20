@@ -2,8 +2,10 @@ apiVersion: v2
 name: queryflux
 description: Universal SQL multi-engine query router and proxy.
 type: application
-version: 0.2.0
-appVersion: "0.2.0"
+version: 0.3.0
+# Default server image tag (image.tag overrides it). Must be a server-only image: Studio runs
+# as a separate sidecar on port 3000, and tags up to v0.4.0 without -slim also start Studio.
+appVersion: "v0.4.0-slim"
 home: https://queryflux.dev/
 sources:
   - https://github.com/lakeops-org/queryflux

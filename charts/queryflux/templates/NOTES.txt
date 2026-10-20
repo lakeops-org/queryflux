@@ -43,8 +43,10 @@ Admin API:
 Trino HTTP frontend:
   kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "queryflux.fullname" . }} {{ .Values.service.ports.trinoHttp.port }}:{{ .Values.service.ports.trinoHttp.port }}
 
+{{- if and .Values.studio.enabled .Values.service.ports.studio.enabled }}
 Studio:
   kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "queryflux.fullname" . }} {{ .Values.service.ports.studio.port }}:{{ .Values.service.ports.studio.port }}
+{{- end }}
 
 Admin credentials are stored in:
   Secret: {{ include "queryflux.secretName" . }}

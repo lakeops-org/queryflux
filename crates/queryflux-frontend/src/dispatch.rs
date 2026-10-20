@@ -341,11 +341,18 @@ pub async fn dispatch_query(
                 query_id.0.clone(),
             );
             match acquire_global_capacity(state, &cluster_manager, &group, &c, &query_id.0).await {
-                CapacityGrant::Denied => {
-                    // Global capacity full — release the local slot and queue. The query
-                    // holds no lease, and its place in the fleet-wide line (kept by the
-                    // backend under its id) carries over to its next poll.
-                    slot.release_local().await;
+                grant @ (CapacityGrant::Denied | CapacityGrant::Unavailable) => {
+                    if grant == CapacityGrant::Denied {
+                        // Global capacity full — the query holds no lease, so give back
+                        // only the local slot. Its place in the fleet-wide line (kept by
+                        // the backend under its id) carries over to its next poll.
+                        slot.release_local().await;
+                    } else {
+                        // The acquire may have committed before it failed: release the
+                        // lease too. The release is queued; the next poll's acquire under
+                        // the same id sends it first, so it can't remove the new lease.
+                        slot.release().await;
+                    }
                     let uri = persist_queued_query(
                         state,
                         query_id,
@@ -1084,9 +1091,15 @@ async fn should_yield_to_older_queued(
 enum CapacityGrant {
     /// Capacity confirmed available by the coordination backend.
     Granted,
-    /// Global capacity is full or coordination backend unreachable (fail-closed) —
-    /// caller must queue or back off.
+    /// Global capacity is full: the backend answered and took no lease. The caller
+    /// must queue or back off, and has no lease to release.
     Denied,
+    /// The acquire failed (timeout, lost connection), so whether the backend took the
+    /// lease is unknown: it may have committed before the error. The caller must queue
+    /// or back off (fail-closed) and release the lease, so it is neither leaked nor
+    /// kept alive by this replica's heartbeat, and so a retry under the same query id
+    /// is not refused because the id already holds one.
+    Unavailable,
 }
 
 /// In distributed mode, take a global capacity lease for a cluster slot that
@@ -1123,7 +1136,7 @@ async fn acquire_global_capacity(
             tracing::warn!(
                 "CapacityStore try_acquire failed, rejecting to queue (fail-closed): {e}"
             );
-            CapacityGrant::Denied
+            CapacityGrant::Unavailable
         }
     }
 }
@@ -1704,12 +1717,12 @@ async fn setup_sync_query(
                     .await
                 {
                     CapacityGrant::Denied => {
-                        // Global capacity full or coordination unavailable (fail-closed) —
-                        // release the local slot, then wait in line (under the query's
-                        // id) until the backend hands this query a slot. Each wait renews
-                        // its place cheaply; a full retry only comes when it was handed a
-                        // slot, or every RENEW_WAITS_FOR as a fallback (an older control
-                        // plane that can't hand over, a missed notification).
+                        // Global capacity full — release the local slot (the query holds
+                        // no lease), then wait in line (under the query's id) until the
+                        // backend hands this query a slot. Each wait renews its place
+                        // cheaply; a full retry only comes when it was handed a slot, or
+                        // every RENEW_WAITS_FOR as a fallback (an older control plane that
+                        // can't hand over, a missed notification).
                         slot.release_local().await;
                         waited_on = Some(name.clone());
                         match &state.capacity_store {
@@ -1736,6 +1749,15 @@ async fn setup_sync_query(
                             }
                             None => queued_backoff_delay(seq).await,
                         }
+                        seq += 1;
+                        continue;
+                    }
+                    CapacityGrant::Unavailable => {
+                        // Coordination unavailable (fail-closed). The lease may have been
+                        // taken before the error, so release it as well as the local slot;
+                        // the retry's acquire sends the queued release first.
+                        slot.release().await;
+                        queued_backoff_delay(seq).await;
                         seq += 1;
                         continue;
                     }

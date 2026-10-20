@@ -8,6 +8,9 @@
 //! Run (after `cargo build --bin queryflux`):
 //!   cargo run --bin queryflux-bench
 //!
+//! `queryflux-bench capacity --help` runs the capacity-admission benchmark instead (lease
+//! acquire/release against Postgres, with a cap-violation checker); see `src/capacity`.
+//!
 //! Configuration (environment):
 //!   `QUERYFLUX_BENCH_WARMUP` — warmup rounds per path (default `50`).
 //!   `QUERYFLUX_BENCH_ITERATIONS` — timed iterations (default `500`).
@@ -34,6 +37,8 @@ use serde_json::{json, Value};
 use tokio::io::BufWriter;
 use tokio::net::TcpListener;
 use tokio::time::sleep;
+
+mod capacity;
 
 static QUERY_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -77,6 +82,12 @@ fn env_truthy(key: &str) -> bool {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some("capacity") {
+        let code = capacity::main(args[1..].to_vec()).await?;
+        std::process::exit(code);
+    }
+
     let cfg = BenchConfig::from_env()?;
     eprintln!(
         "[queryflux-bench] warmup={} iterations={} trino_poll={}",

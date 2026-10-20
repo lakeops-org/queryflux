@@ -18,7 +18,8 @@ enum MetricsEvent {
 /// Metrics store that buffers writes and flushes them to an inner store in the background.
 ///
 /// `record_query` and `record_cluster_snapshot` return immediately — records are sent
-/// to a bounded channel and written to the inner store by a background task in batches.
+/// to a bounded channel and written to the inner store by a background task in batches,
+/// one [`MetricsStore::record_queries`] call per batch.
 /// If the channel is full, records are silently dropped to avoid blocking query execution.
 ///
 /// Construct via `BufferedMetricsStore::new`; the background flush task is spawned
@@ -99,9 +100,12 @@ async fn flush(
     queries: &mut Vec<QueryRecord>,
     snapshots: &mut Vec<ClusterSnapshot>,
 ) {
-    for record in queries.drain(..) {
-        if let Err(e) = inner.record_query(record).await {
-            warn!("Failed to flush query record to metrics store: {e}");
+    if !queries.is_empty() {
+        // One call per flush: Postgres writes the whole batch in one statement.
+        let batch = std::mem::replace(queries, Vec::with_capacity(queries.capacity()));
+        let n = batch.len();
+        if let Err(e) = inner.record_queries(batch).await {
+            warn!("Failed to flush {n} query records to metrics store: {e}");
         }
     }
     for snap in snapshots.drain(..) {

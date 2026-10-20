@@ -1,6 +1,5 @@
 # Verify server-only image (host platform only, no push).
-# Unified (server+studio) image is built on release — see release.yml / docker-publish-tag.yml.
-#   One Dockerfile: docker/queryflux/Dockerfile — targets runtime-server | runtime-unified
+# Studio is a separate image (ghcr.io/lakeops-org/queryflux-studio), built in its own repo.
 #
 # PR automation is disabled to save Actions minutes. Re-enable pull_request in `on:` when
 # you want per-PR Docker builds again. Run manually: Actions → "Docker — QueryFlux (verify)".
@@ -25,7 +24,7 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Build server-only (no push)
+      - name: Build server image (no push)
         uses: docker/build-push-action@v6
         with:
           context: .

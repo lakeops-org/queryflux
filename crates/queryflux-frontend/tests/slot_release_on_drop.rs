@@ -1,5 +1,9 @@
 //! Regression for #292: a dispatch future dropped while waiting on the global
 //! capacity lease must still release the local cluster slot.
+//!
+//! Also: when the lease acquire fails outright (timeout, lost connection), the
+//! backend may still have committed the lease, so dispatch must release it; a plain
+//! "capacity full" denial took no lease and must not send a release.
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use queryflux_auth::{
@@ -9,7 +13,7 @@ use queryflux_auth::{
 use queryflux_cache::noop::NoopResultCache;
 use queryflux_cluster_manager::{cluster_state::ClusterState, simple::SimpleClusterGroupManager};
 use queryflux_core::{
-    error::Result,
+    error::{QueryFluxError, Result},
     query::{
         ClusterGroupName, ClusterName, EngineType, FrontendProtocol, ProxyQueryId, QueryStats,
     },
@@ -20,7 +24,7 @@ use queryflux_engine_adapters::{
     AdapterKind,
 };
 use queryflux_frontend::{
-    dispatch::{dispatch_query, execute_to_sink, ResultSink},
+    dispatch::{dispatch_query, execute_to_sink, DispatchOutcome, ResultSink},
     state::{AppState, LiveConfig},
 };
 use queryflux_metrics::{ClusterSnapshot, MetricsStore, QueryRecord};
@@ -30,8 +34,8 @@ use queryflux_translation::TranslationService;
 use std::{
     collections::HashMap,
     sync::{
-        atomic::{AtomicUsize, Ordering},
-        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Arc, Mutex,
     },
     time::Duration,
 };
@@ -106,8 +110,77 @@ impl ResultSink for NullSink {
     }
 }
 
-/// Wire one DuckDB cluster behind a capacity store that never grants a lease.
-fn test_state(capacity: Arc<HangingCapacity>) -> (Arc<AppState>, Arc<ClusterState>) {
+/// Capacity store that fails the next `fail_acquires` acquires with an error (the
+/// lease may or may not have been taken), or denies every acquire when `deny` is set,
+/// and records each acquire and release in order.
+#[derive(Default)]
+struct FlakyCapacity {
+    fail_acquires: AtomicUsize,
+    deny: AtomicBool,
+    events: Mutex<Vec<&'static str>>,
+}
+impl FlakyCapacity {
+    fn failing(n: usize) -> Arc<Self> {
+        let c = Self::default();
+        c.fail_acquires.store(n, Ordering::SeqCst);
+        Arc::new(c)
+    }
+    fn denying() -> Arc<Self> {
+        let c = Self::default();
+        c.deny.store(true, Ordering::SeqCst);
+        Arc::new(c)
+    }
+    fn events(&self) -> Vec<&'static str> {
+        self.events.lock().unwrap().clone()
+    }
+}
+#[async_trait]
+impl CapacityStore for FlakyCapacity {
+    /// Fail, deny, or grant per the configured behaviour, recording the outcome.
+    async fn try_acquire(&self, _: &str, _: u64, _: &str, _: &str) -> Result<bool> {
+        let failing = self
+            .fail_acquires
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+            .is_ok();
+        let mut events = self.events.lock().unwrap();
+        if failing {
+            events.push("acquire:error");
+            return Err(QueryFluxError::Persistence("connection reset".into()));
+        }
+        if self.deny.load(Ordering::SeqCst) {
+            events.push("acquire:denied");
+            return Ok(false);
+        }
+        events.push("acquire:granted");
+        Ok(true)
+    }
+    /// Record the release.
+    async fn release(&self, _: &str, _: &str) -> Result<()> {
+        self.events.lock().unwrap().push("release");
+        Ok(())
+    }
+    async fn heartbeat(&self, _: &str) -> Result<u64> {
+        Ok(0)
+    }
+    async fn expire_stale(&self, _: DateTime<Utc>) -> Result<u64> {
+        Ok(0)
+    }
+    async fn active_count(&self, _: &str) -> Result<u64> {
+        Ok(0)
+    }
+    async fn publish_running_count(&self, _: &str, _: u64) -> Result<()> {
+        Ok(())
+    }
+    async fn active_lease_count(&self, _: &str) -> Result<u64> {
+        Ok(0)
+    }
+    async fn release_all_for_instance(&self, _: &str) -> Result<u64> {
+        Ok(0)
+    }
+}
+
+/// Wire one DuckDB cluster behind the given capacity store.
+fn test_state(capacity: Arc<dyn CapacityStore>) -> (Arc<AppState>, Arc<ClusterState>) {
     let group_name = ClusterGroupName("duckdb".into());
     let cluster_name = ClusterName("duckdb-1".into());
     let adapter = AdapterKind::Sync(Arc::new(
@@ -253,4 +326,82 @@ async fn async_dispatch_dropped_during_global_acquire_releases_slot() {
         .await;
     });
     assert_released_after_abort(task, &capacity, &cluster).await;
+}
+
+/// Run one async (Trino HTTP) dispatch against `capacity` and return its outcome.
+async fn dispatch_once(capacity: Arc<FlakyCapacity>) -> (DispatchOutcome, Arc<ClusterState>) {
+    let (state, cluster) = test_state(capacity);
+    let live = state.snapshot().await;
+    let outcome = dispatch_query(
+        &state,
+        &live,
+        ProxyQueryId::new(),
+        "SELECT 1".into(),
+        vec![],
+        SessionContext::default(),
+        FrontendProtocol::TrinoHttp,
+        ClusterGroupName("duckdb".into()),
+        false,
+        None,
+        0,
+        &AuthContext::default(),
+    )
+    .await
+    .expect("dispatch");
+    (outcome, cluster)
+}
+
+#[tokio::test]
+async fn async_dispatch_releases_lease_when_acquire_fails() {
+    let capacity = FlakyCapacity::failing(1);
+    let (outcome, cluster) = dispatch_once(capacity.clone()).await;
+    assert!(
+        matches!(outcome, DispatchOutcome::Queued { .. }),
+        "fails closed to the queue"
+    );
+    assert_eq!(cluster.running_queries(), 0, "local slot released");
+    assert_eq!(
+        capacity.events(),
+        ["acquire:error", "release"],
+        "a lease the failed acquire may have committed is released"
+    );
+}
+
+#[tokio::test]
+async fn async_dispatch_sends_no_release_when_capacity_is_full() {
+    let capacity = FlakyCapacity::denying();
+    let (outcome, cluster) = dispatch_once(capacity.clone()).await;
+    assert!(matches!(outcome, DispatchOutcome::Queued { .. }));
+    assert_eq!(cluster.running_queries(), 0, "local slot released");
+    assert_eq!(
+        capacity.events(),
+        ["acquire:denied"],
+        "a denied acquire took no lease, so nothing is released"
+    );
+}
+
+#[tokio::test]
+async fn sync_dispatch_releases_lease_before_retrying_a_failed_acquire() {
+    let capacity = FlakyCapacity::failing(1);
+    let (state, cluster) = test_state(capacity.clone());
+    let live = state.snapshot().await;
+    execute_to_sink(
+        &state,
+        &live,
+        "SELECT 1".into(),
+        vec![],
+        SessionContext::default(),
+        FrontendProtocol::Mcp,
+        ClusterGroupName("duckdb".into()),
+        &mut NullSink,
+        &AuthContext::default(),
+    )
+    .await
+    .expect("query runs once the retry is granted");
+    assert_eq!(cluster.running_queries(), 0);
+    assert_eq!(
+        capacity.events(),
+        ["acquire:error", "release", "acquire:granted", "release"],
+        "the possibly committed lease is released before the retry acquires again"
+    );
 }

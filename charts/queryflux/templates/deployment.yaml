@@ -119,8 +119,8 @@ spec:
             {{- toYaml . | nindent 12 }}
           {{- end }}
           ports:
-            {{- range $port := .Values.service.ports }}
-            {{- if $port.enabled }}
+            {{- range $key, $port := .Values.service.ports }}
+            {{- if and $port.enabled (ne $key "studio") }}
             - name: {{ $port.name }}
               containerPort: {{ $port.targetPort }}
               protocol: {{ $port.protocol }}
@@ -163,6 +163,43 @@ spec:
           lifecycle:
             {{- toYaml . | nindent 12 }}
           {{- end }}
+        {{- if .Values.studio.enabled }}
+        - name: studio
+          securityContext:
+            {{- toYaml .Values.studio.securityContext | nindent 12 }}
+          {{- $studioTag := toString .Values.studio.image.tag }}
+          image: "{{ .Values.studio.image.repository }}{{ if hasPrefix "sha256:" $studioTag }}@{{ else }}:{{ end }}{{ $studioTag }}"
+          imagePullPolicy: {{ .Values.studio.image.pullPolicy }}
+          env:
+            - name: ADMIN_API_URL
+              value: "http://127.0.0.1:{{ .Values.service.ports.admin.targetPort }}"
+            - name: PORT
+              value: {{ .Values.service.ports.studio.targetPort | quote }}
+            - name: HOSTNAME
+              value: 0.0.0.0
+            {{- with .Values.studio.env }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          ports:
+            - name: {{ .Values.service.ports.studio.name }}
+              containerPort: {{ .Values.service.ports.studio.targetPort }}
+              protocol: TCP
+          {{- with .Values.studio.readinessProbe }}
+          readinessProbe:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.studio.livenessProbe }}
+          livenessProbe:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          resources:
+            {{- toYaml .Values.studio.resources | nindent 12 }}
+          volumeMounts:
+            - name: studio-cache
+              mountPath: /app/.next/cache
+            - name: tmp
+              mountPath: /tmp
+        {{- end }}
         {{- with .Values.extraContainers }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
@@ -183,6 +220,10 @@ spec:
           {{- end }}
         - name: tmp
           emptyDir: {}
+        {{- if .Values.studio.enabled }}
+        - name: studio-cache
+          emptyDir: {}
+        {{- end }}
         {{- if $adbcDrivers }}
         - name: adbc-drivers
           {{- toYaml .Values.adbcDrivers.volume | nindent 10 }}
