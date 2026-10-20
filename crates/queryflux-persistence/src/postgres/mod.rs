@@ -27,9 +27,10 @@ use chrono::{DateTime, Utc};
 use queryflux_core::{
     error::{QueryFluxError, Result},
     query::{BackendQueryId, ExecutingQuery, ProxyQueryId, QueuedQuery},
-    tags::tags_to_json,
 };
 use sqlx::PgPool;
+
+mod history_batch;
 
 /// Select group rows with `members` as cluster **names** (joined from `cluster_configs` by id).
 const CLUSTER_GROUP_CONFIG_SELECT: &str = r#"
@@ -1890,149 +1891,13 @@ impl Persistence for PostgresStore {
 #[async_trait]
 impl MetricsStore for PostgresStore {
     async fn record_query(&self, r: QueryRecord) -> Result<()> {
-        let (
-            engine_elapsed_ms,
-            cpu_ms,
-            proc_rows,
-            proc_bytes,
-            phys_bytes,
-            peak_mem,
-            spilled,
-            splits,
-        ) = match &r.engine_stats {
-            Some(s) => (
-                s.engine_elapsed_time_ms.map(|v| v as i64),
-                s.cpu_time_ms.map(|v| v as i64),
-                s.processed_rows.map(|v| v as i64),
-                s.processed_bytes.map(|v| v as i64),
-                s.physical_input_bytes.map(|v| v as i64),
-                s.peak_memory_bytes.map(|v| v as i64),
-                s.spilled_bytes.map(|v| v as i64),
-                s.total_splits.map(|v| v as i32),
-            ),
-            None => (None, None, None, None, None, None, None, None),
-        };
+        self.insert_query_records(vec![r]).await.map(|_| ())
+    }
 
-        let query_tags_json = tags_to_json(&r.query_tags);
-        let guard_actions_json =
-            serde_json::to_value(&r.guard_actions).unwrap_or(serde_json::Value::Array(vec![]));
-        let insert_result = sqlx::query(
-            r#"INSERT INTO query_records
-                (proxy_query_id, backend_query_id, cluster_group, cluster_name, engine_type,
-                 frontend_protocol, source_dialect, target_dialect, was_rewritten, was_translated,
-                 username, catalog, db_name, sql_preview, rewritten_sql, translated_sql, status,
-                 routing_trace, queue_duration_ms, execution_duration_ms, rows_returned,
-                 error_message, created_at, engine_elapsed_time_ms, cpu_time_ms, processed_rows,
-                 processed_bytes, physical_input_bytes, peak_memory_bytes, spilled_bytes,
-                 total_splits, cluster_group_id, cluster_id, query_tags,
-                 query_hash, query_parameterized_hash, translated_query_hash,
-                 agent_id, conversation_id, step_index, tool_call_id, query_intent,
-                 guard_actions, was_guard_blocked, cache_hit, translation, worker)
-               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,
-                       $21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,
-                       -- Records from workers (#255) carry names, not this database's
-                       -- ids, and may arrive after a cluster was deleted: resolve by name
-                       -- for those, and store a missing row as NULL rather than failing
-                       -- the foreign key.
-                       COALESCE((SELECT id FROM cluster_group_configs WHERE id = $32),
-                                (SELECT id FROM cluster_group_configs
-                                  WHERE $47::text IS NOT NULL AND name = $3)),
-                       COALESCE((SELECT id FROM cluster_configs WHERE id = $33),
-                                (SELECT id FROM cluster_configs
-                                  WHERE $47::text IS NOT NULL AND name = $4)),
-                       $34,$35,$36,$37,$38,$39,$40,$41,$42,$43,$44,$45,$46,$47)
-               ON CONFLICT (proxy_query_id) DO NOTHING"#,
-        )
-        .bind(&r.proxy_query_id)
-        .bind(&r.backend_query_id)
-        .bind(&r.cluster_group.0)
-        .bind(&r.cluster_name.0)
-        .bind(format!("{:?}", r.engine_type))
-        .bind(format!("{:?}", r.frontend_protocol))
-        .bind(format!("{:?}", r.source_dialect))
-        .bind(format!("{:?}", r.target_dialect))
-        .bind(r.was_rewritten)
-        .bind(r.was_translated)
-        .bind(&r.user)
-        .bind(&r.catalog)
-        .bind(&r.database)
-        .bind(&r.sql_preview)
-        .bind(&r.rewritten_sql)
-        .bind(&r.translated_sql)
-        .bind(format!("{:?}", r.status))
-        .bind(&r.routing_trace)
-        .bind(r.queue_duration_ms as i64)
-        .bind(r.execution_duration_ms as i64)
-        .bind(r.rows_returned.map(|v| v as i64))
-        .bind(&r.error_message)
-        .bind(r.created_at)
-        .bind(engine_elapsed_ms)
-        .bind(cpu_ms)
-        .bind(proc_rows)
-        .bind(proc_bytes)
-        .bind(phys_bytes)
-        .bind(peak_mem)
-        .bind(spilled)
-        .bind(splits)
-        .bind(r.cluster_group_config_id)
-        .bind(r.cluster_config_id)
-        .bind(query_tags_json)
-        .bind(r.query_hash)
-        .bind(r.query_parameterized_hash)
-        .bind(r.translated_query_hash)
-        .bind(&r.agent_id)
-        .bind(&r.conversation_id)
-        .bind(r.step_index)
-        .bind(&r.tool_call_id)
-        .bind(&r.query_intent)
-        .bind(guard_actions_json)
-        .bind(r.was_guard_blocked)
-        .bind(r.cache_hit)
-        .bind(r.translation.map(|outcome| {
-            serde_json::to_value(outcome).expect("serializable translation outcome")
-        }))
-        .bind(&r.worker)
-        .execute(&self.admin_pool)
-        .await
-        .map_err(|e| QueryFluxError::Persistence(format!("Insert query_records: {e}")))?;
-        if insert_result.rows_affected() == 0 {
-            return Ok(());
-        }
-
-        // Upsert into query_digest_stats.
-        if let Some(phash) = r.query_parameterized_hash {
-            let rows = r.rows_returned.map(|v| v as i64).unwrap_or(0);
-            let exec_ms = r.execution_duration_ms as i64;
-            sqlx::query(
-                r#"INSERT INTO query_digest_stats
-                    (query_parameterized_hash, digest_text,
-                     translated_query_hash, translated_digest_text,
-                     first_seen, last_seen, call_count, sum_execution_ms, sum_rows_returned,
-                     cluster_group)
-                   VALUES ($1,$2,$3,$4,$5,$5,1,$6,$7,$8)
-                   ON CONFLICT (query_parameterized_hash) DO UPDATE SET
-                     last_seen = EXCLUDED.last_seen,
-                     call_count = query_digest_stats.call_count + 1,
-                     sum_execution_ms = query_digest_stats.sum_execution_ms + EXCLUDED.sum_execution_ms,
-                     sum_rows_returned = query_digest_stats.sum_rows_returned + EXCLUDED.sum_rows_returned,
-                     cluster_group = EXCLUDED.cluster_group,
-                     digest_text = CASE WHEN query_digest_stats.digest_text = '' THEN EXCLUDED.digest_text ELSE query_digest_stats.digest_text END,
-                     translated_digest_text = COALESCE(query_digest_stats.translated_digest_text, EXCLUDED.translated_digest_text)"#,
-            )
-            .bind(phash)
-            .bind(r.digest_text.as_deref().unwrap_or(""))
-            .bind(r.translated_query_hash)
-            .bind(r.translated_digest_text.as_deref())
-            .bind(r.created_at)
-            .bind(exec_ms)
-            .bind(rows)
-            .bind(&r.cluster_group.0)
-            .execute(&self.admin_pool)
-            .await
-            .map_err(|e| QueryFluxError::Persistence(format!("Upsert query_digest_stats: {e}")))?;
-        }
-
-        Ok(())
+    /// One insert and one digest upsert per chunk of up to
+    /// [`history_batch::MAX_RECORDS_PER_STATEMENT`] records, in one transaction.
+    async fn record_queries(&self, records: Vec<QueryRecord>) -> Result<()> {
+        self.insert_query_records(records).await.map(|_| ())
     }
 
     async fn record_cluster_snapshot(&self, s: ClusterSnapshot) -> Result<()> {
@@ -3573,10 +3438,16 @@ mod tests {
 
         let store = test_store().await;
         let proxy_id = unique_id("dedup");
+        // Unique group: other tests write history concurrently to the same database.
+        let group = unique_id("dedup-g");
+        let digest_hash = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as i64;
         let mut first = QueryRecord {
             proxy_query_id: proxy_id.clone(),
             backend_query_id: None,
-            cluster_group: ClusterGroupName("g".into()),
+            cluster_group: ClusterGroupName(group.clone()),
             cluster_name: ClusterName("c".into()),
             cluster_group_config_id: None,
             cluster_config_id: None,
@@ -3606,7 +3477,7 @@ mod tests {
             engine_stats: None,
             query_tags: Default::default(),
             query_hash: None,
-            query_parameterized_hash: Some(42),
+            query_parameterized_hash: Some(digest_hash),
             translated_query_hash: None,
             digest_text: Some("select 1".into()),
             translated_digest_text: None,
@@ -3629,6 +3500,7 @@ mod tests {
 
         let rows = store
             .list_queries(&QueryFilters {
+                cluster_group: Some(group.clone()),
                 limit: 50,
                 ..Default::default()
             })
@@ -3652,7 +3524,7 @@ mod tests {
         let digest_count: (i64,) = sqlx::query_as(
             "SELECT call_count FROM query_digest_stats WHERE query_parameterized_hash = $1",
         )
-        .bind(42_i64)
+        .bind(digest_hash)
         .fetch_one(&store.admin_pool)
         .await
         .unwrap();

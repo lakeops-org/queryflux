@@ -116,6 +116,15 @@ impl MetricsStore for MultiMetricsStore {
         Ok(())
     }
 
+    async fn record_queries(&self, records: Vec<QueryRecord>) -> Result<()> {
+        for s in &self.stores {
+            if let Err(e) = s.record_queries(records.clone()).await {
+                tracing::warn!("MetricsStore::record_queries error: {e}");
+            }
+        }
+        Ok(())
+    }
+
     async fn record_cluster_snapshot(&self, snapshot: ClusterSnapshot) -> Result<()> {
         for s in &self.stores {
             if let Err(e) = s.record_cluster_snapshot(snapshot.clone()).await {

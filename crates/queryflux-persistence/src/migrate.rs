@@ -86,7 +86,27 @@ async fn reject_legacy_sqlx_migration_ledger(database_url: &str) -> Result<()> {
 }
 
 /// Run Refinery migrations against a Postgres connection URL.
+///
+/// Holds a session-level advisory lock for the duration so concurrent migrators
+/// (replicas starting together, parallel tests) don't race on Refinery's ledger.
 pub(crate) async fn run_postgres_refinery_migrations(database_url: &str) -> Result<()> {
+    use sqlx::Connection;
+    let mut lock_conn = sqlx::PgConnection::connect(database_url)
+        .await
+        .map_err(|e| {
+            QueryFluxError::Persistence(format!("Failed to connect for migrations: {e}"))
+        })?;
+    sqlx::query("SELECT pg_advisory_lock(hashtext('queryflux:migrate')::bigint)")
+        .execute(&mut lock_conn)
+        .await
+        .map_err(|e| QueryFluxError::Persistence(format!("Failed to take migration lock: {e}")))?;
+    let result = run_migrations_locked(database_url).await;
+    // Closing the session releases the advisory lock.
+    let _ = lock_conn.close().await;
+    result
+}
+
+async fn run_migrations_locked(database_url: &str) -> Result<()> {
     reject_legacy_sqlx_migration_ledger(database_url).await?;
 
     let mut config = Config::from_str(database_url).map_err(|e| {
