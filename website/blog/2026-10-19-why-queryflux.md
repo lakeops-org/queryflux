@@ -1,9 +1,18 @@
 ---
 slug: why-queryflux
-title: "Why we built QueryFlux: the missing interoperability layer for query engines"
-description: Open table formats made data interoperable. Query engines are still islands. Why QueryFlux exists, and what a neutral layer above the engines makes possible.
+title: "Why QueryFlux: the missing layer above query engines"
+description: Open table formats made data interoperable. Query engines are still islands. Why QueryFlux exists as a neutral SQL layer above the engines.
 authors: [amit]
 tags: [Vision]
+keywords:
+  - QueryFlux
+  - SQL proxy
+  - query router
+  - lakehouse
+  - Iceberg
+  - multi-engine
+  - DuckDB
+  - Trino
 image: img/blog/why-queryflux-hero.jpg
 ---
 

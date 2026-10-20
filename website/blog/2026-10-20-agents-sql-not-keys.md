@@ -1,9 +1,17 @@
 ---
 slug: agents-sql-not-keys
 title: "Give agents SQL, not the keys to every engine"
-description: AI agents need live data, but a warehouse password and an open SQL prompt is the wrong interface. How to put agents behind QueryFlux, with routing, guardrails, identity and a record of every query, in one config file.
+description: Put AI agents behind QueryFlux — one MCP or SQL endpoint with routing, guardrails, impersonation, and a record of every query.
 authors: [amit]
 tags: [Guides]
+keywords:
+  - AI agents
+  - MCP
+  - QueryFlux
+  - SQL guardrails
+  - impersonation
+  - agentic AI
+  - Trino
 image: img/blog/agents-sql-hero.jpg
 ---
 
