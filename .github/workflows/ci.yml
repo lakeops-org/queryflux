@@ -240,6 +240,11 @@ jobs:
           cache-on-failure: true
           cache-all-crates: true
           save-if: ${{ github.ref == 'refs/heads/main' }}
+          # The default env hash includes every rustc on the runner, and runner images
+          # ship different preinstalled stables (1.99.0 vs 1.99.1), so the key flipped
+          # between machines. Key on the pinned toolchain we actually build with instead.
+          prefix-key: v0-rust-${{ env.RUST_TOOLCHAIN_VERSION }}
+          add-rust-environment-hash-key: false
 
       - uses: actions/setup-python@v5
         with:
