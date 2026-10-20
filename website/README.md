@@ -11,6 +11,32 @@ npm run build # static output in build/
 npm run serve # preview production build (search works here)
 ```
 
+## Analytics
+
+The site already runs **[OpenPanel](https://openpanel.dev)** (see `src/components/OpenPanelInit.tsx`). Disable with `OPENPANEL_DISABLED=true`.
+
+**Google Analytics 4** uses [`@docusaurus/plugin-google-gtag`](https://docusaurus.io/docs/api/plugins/@docusaurus/plugin-google-gtag) via the classic preset’s `gtag` option (no extra npm install — it ships with `@docusaurus/preset-classic`). The plugin is **inactive in development** and only runs in production builds.
+
+```js
+// website/docusaurus.config.ts (preset-classic)
+gtag: {
+  trackingID: 'G-XXXXXXXXXX', // from env GA_MEASUREMENT_ID
+  anonymizeIP: true,
+},
+```
+
+Enable by setting a measurement ID at **build/deploy** time:
+
+```bash
+# GA4 → Admin → Data streams → Web → Measurement ID
+export GA_MEASUREMENT_ID=G-XXXXXXXXXX
+npm run build   # then npm run serve to verify (production mode)
+```
+
+In GitHub Actions, set repository/org **variable** `GA_MEASUREMENT_ID` (same place as `OPENPANEL_CLIENT_ID`). `deploy-website.yml` passes it into the build. Verify with [Google Tag Assistant](https://tagassistant.google.com/).
+
+OpenPanel and GA4 can run together; they are independent.
+
 ## Search
 
 Local search uses [`@cmfcmf/docusaurus-search-local`](https://github.com/cmfcmf/docusaurus-search-local) ([Docusaurus: local search](https://docusaurus.io/docs/search#using-local-search)): the index is built at compile time and shipped with the site—no Algolia or other hosted service.

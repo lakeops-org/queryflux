@@ -43,6 +43,8 @@ jobs:
         env:
           # Optional override; defaults in website/analytics/openpanel.ts
           OPENPANEL_CLIENT_ID: ${{ vars.OPENPANEL_CLIENT_ID }}
+          # Optional GA4 (G-XXXXXXXX). Set repo/org variable GA_MEASUREMENT_ID to enable.
+          GA_MEASUREMENT_ID: ${{ vars.GA_MEASUREMENT_ID }}
         run: npm run build
 
       - name: Upload Build Artifact

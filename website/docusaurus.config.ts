@@ -12,6 +12,9 @@ const siteCanonicalUrl = siteUrl;
 const siteDescription =
   'Open-source SQL proxy and router in Rust. One endpoint for tools and AI agents across Trino, DuckDB, StarRocks, and more — with routing, dialect translation, guardrails, and observability.';
 
+/** GA4 measurement ID (G-…). Optional — omit locally; set in deploy via vars.GA_MEASUREMENT_ID. */
+const gaMeasurementId = process.env.GA_MEASUREMENT_ID;
+
 const config: Config = {
   title: 'QueryFlux',
   tagline: 'Universal SQL query proxy and router in Rust',
@@ -148,6 +151,14 @@ const config: Config = {
           editUrl: 'https://github.com/lakeops-org/queryflux/tree/main/website/',
           onUntruncatedBlogPosts: 'throw',
         },
+        // https://docusaurus.io/docs/api/plugins/@docusaurus/plugin-google-gtag
+        // Bundled with preset-classic; inactive in development, active in production builds.
+        gtag: gaMeasurementId
+          ? {
+              trackingID: gaMeasurementId,
+              anonymizeIP: true,
+            }
+          : undefined,
         sitemap: buildSitemapConfig(),
         theme: {
           customCss: ['./src/css/custom.css', './src/css/docs.css', './src/css/blog.css'],
