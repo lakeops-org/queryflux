@@ -22,54 +22,74 @@ impl GuardChain {
     /// Run all guards for the given layer in order.
     ///
     /// Returns `(actions, outcome)`. Stops at the first `Deny` (recording it first). A
-    /// chain has no mechanism to carry a `Rewrite` result back to its caller — the only
-    /// guard that ever returns one (the access-control guard) runs outside any chain, on
-    /// pre-translation SQL, via its own dedicated call site — so a guard placed *in* a
-    /// chain that returns `Rewrite` is treated as a configuration/implementation error
-    /// (blocked, not silently dropped) rather than adding unused generality to carry a
-    /// rewrite that nothing here can actually produce today.
+    /// `Rewrite` replaces the working SQL: later guards check the rewritten SQL, and the
+    /// outcome is `Rewritten` so the caller submits it.
     pub async fn run(
         &self,
         ctx: &GuardContext<'_>,
         layer: GuardLayer,
     ) -> (Vec<GuardAction>, GuardChainOutcome) {
-        let mut actions: Vec<GuardAction> = Vec::new();
+        run_chains([self], ctx, layer).await
+    }
+}
 
-        for guard in &self.guards {
-            if guard.layer() != layer {
-                continue;
-            }
+/// Run several chains in order (e.g. global then per-group) as one chain, so a rewrite
+/// by an earlier chain is what later chains check.
+pub async fn run_chains<'c>(
+    chains: impl IntoIterator<Item = &'c GuardChain>,
+    ctx: &GuardContext<'_>,
+    layer: GuardLayer,
+) -> (Vec<GuardAction>, GuardChainOutcome) {
+    let mut actions: Vec<GuardAction> = Vec::new();
+    let mut rewritten: Option<String> = None;
 
-            let result = guard.check(ctx).await;
-            actions.push(result_to_action(guard.name(), &result));
-
-            match &result {
-                GuardResult::Deny { reason, code } => {
-                    return (
-                        actions,
-                        GuardChainOutcome::Blocked {
-                            reason: reason.clone(),
-                            code: code.clone(),
-                        },
-                    );
-                }
-                GuardResult::Rewrite { .. } => {
-                    return (
-                        actions,
-                        GuardChainOutcome::Blocked {
-                            reason: format!(
-                                "guard {:?} returned Rewrite, which chained guards do not support",
-                                guard.name()
-                            ),
-                            code: Some("GUARD_REWRITE_UNSUPPORTED".to_string()),
-                        },
-                    );
-                }
-                GuardResult::Allow { .. } | GuardResult::Warn { .. } => {}
-            }
+    for guard in chains.into_iter().flat_map(|c| c.guards.iter()) {
+        if guard.layer() != layer {
+            continue;
         }
 
-        (actions, GuardChainOutcome::Proceed)
+        let result = match &rewritten {
+            // The shared parse cache describes the input SQL, not the rewrite.
+            Some(sql) => {
+                let ctx = GuardContext {
+                    sql,
+                    sql_parse: None,
+                    ..*ctx
+                };
+                guard.check(&ctx).await
+            }
+            None => guard.check(ctx).await,
+        };
+        actions.push(result_to_action(guard.name(), &result));
+
+        match result {
+            GuardResult::Deny { reason, code } => {
+                return (actions, GuardChainOutcome::Blocked { reason, code });
+            }
+            GuardResult::Rewrite { sql, .. } => rewritten = Some(sql),
+            GuardResult::Allow { .. } | GuardResult::Warn { .. } => {}
+        }
+    }
+
+    let outcome = match rewritten {
+        Some(sql) => GuardChainOutcome::Rewritten { sql },
+        None => GuardChainOutcome::Proceed,
+    };
+    (actions, outcome)
+}
+
+/// Client-facing message for a blocked query: guard, code and the guard's reason (which
+/// says how to fix the query), so agents can correct and retry.
+pub fn deny_message(actions: &[GuardAction]) -> String {
+    match actions.iter().find(|a| a.action == "deny") {
+        Some(a) => {
+            let reason = a.reason.as_deref().unwrap_or("query blocked by guardrail");
+            match &a.code {
+                Some(code) => format!("blocked by guard {} [{code}]: {reason}", a.guard),
+                None => format!("blocked by guard {}: {reason}", a.guard),
+            }
+        }
+        None => "query blocked by guardrail".to_string(),
     }
 }
 
@@ -230,27 +250,50 @@ mod tests {
         assert!(is_blocked(&outcome));
     }
 
-    /// Regression: a `GuardChain` has no mechanism to carry a `Rewrite` result back to
-    /// its caller, so a guard placed *in* a chain that returns one must be blocked with a
-    /// clear, machine-readable code — not silently dropped (which would let a supposed
-    /// rewrite never actually reach the query) and not given unused generality to carry a
-    /// rewrite that no chain-placed guard produces today.
     #[tokio::test]
-    async fn run_blocks_a_chained_guard_that_returns_rewrite() {
-        let chain = GuardChain::new(vec![Box::new(TestGuard {
+    async fn run_applies_rewrite_and_later_guards_see_it() {
+        struct SeesSql;
+        #[async_trait]
+        impl Guard for SeesSql {
+            fn name(&self) -> &'static str {
+                "sees"
+            }
+            fn layer(&self) -> GuardLayer {
+                GuardLayer::Plan
+            }
+            async fn check(&self, ctx: &GuardContext<'_>) -> GuardResult {
+                if ctx.sql == "SELECT 1 LIMIT 5" && ctx.sql_parse.is_none() {
+                    GuardResult::allow()
+                } else {
+                    GuardResult::deny(format!("saw {}", ctx.sql), "X")
+                }
+            }
+        }
+        let first = GuardChain::new(vec![Box::new(TestGuard {
             name: "rewriter",
             layer: GuardLayer::Plan,
-            result: GuardResult::rewrite("SELECT 1"),
+            result: GuardResult::rewrite("SELECT 1 LIMIT 5"),
         })]);
+        let second = GuardChain::new(vec![Box::new(SeesSql)]);
         let tc = TestCtx::plan_select_fixture();
-        let (actions, outcome) = chain.run(&tc.ctx(), GuardLayer::Plan).await;
-        assert_eq!(actions.len(), 1);
-        assert_eq!(actions[0].guard, "rewriter");
+        let (actions, outcome) = run_chains([&first, &second], &tc.ctx(), GuardLayer::Plan).await;
+        assert_eq!(actions[0].action, "rewrite");
+        assert_eq!(actions[1].action, "allow");
         match outcome {
-            GuardChainOutcome::Blocked { code, .. } => {
-                assert_eq!(code, Some("GUARD_REWRITE_UNSUPPORTED".to_string()));
-            }
-            other => panic!("expected Blocked, got {other:?}"),
+            GuardChainOutcome::Rewritten { sql } => assert_eq!(sql, "SELECT 1 LIMIT 5"),
+            other => panic!("expected Rewritten, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn deny_message_names_guard_and_code() {
+        let a = crate::result_to_action(
+            "row_limit",
+            &GuardResult::deny("too big", "ROW_LIMIT_EXCEEDED"),
+        );
+        assert_eq!(
+            deny_message(&[a]),
+            "blocked by guard row_limit [ROW_LIMIT_EXCEEDED]: too big"
+        );
     }
 }

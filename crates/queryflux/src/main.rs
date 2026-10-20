@@ -1636,8 +1636,11 @@ mod tests {
                 retry_count: None,
                 fail_behavior: None,
                 headers: None,
-                max_rows: None,
-                applies_to: None,
+                params: queryflux_core::config::BuiltInGuardParams {
+                    max_rows: None,
+                    applies_to: None,
+                    ..Default::default()
+                },
             }];
             let chain = build_chain_from_yaml_specs(&specs, &HashMap::new())
                 .expect("chain should be built");
@@ -1664,8 +1667,11 @@ mod tests {
                 retry_count: None,
                 fail_behavior: None,
                 headers: None,
-                max_rows: None,
-                applies_to: None,
+                params: queryflux_core::config::BuiltInGuardParams {
+                    max_rows: None,
+                    applies_to: None,
+                    ..Default::default()
+                },
             }];
             let err = GuardrailsConfig {
                 global: specs.clone(),
@@ -1717,8 +1723,11 @@ mod tests {
                 retry_count: None,
                 fail_behavior: None,
                 headers: None,
-                max_rows: None,
-                applies_to: None,
+                params: queryflux_core::config::BuiltInGuardParams {
+                    max_rows: None,
+                    applies_to: None,
+                    ..Default::default()
+                },
             }];
             let chain = build_chain_from_yaml_specs(&specs, &HashMap::new())
                 .expect("chain should be built");
@@ -1744,8 +1753,11 @@ mod tests {
                 retry_count: None,
                 fail_behavior: Some(GuardFailBehaviorConfig::Allow),
                 headers: None,
-                max_rows: None,
-                applies_to: None,
+                params: queryflux_core::config::BuiltInGuardParams {
+                    max_rows: None,
+                    applies_to: None,
+                    ..Default::default()
+                },
             }];
             let chain = build_chain_from_yaml_specs(&specs, &HashMap::new())
                 .expect("chain should be built");
@@ -1780,8 +1792,11 @@ mod tests {
                 retry_count: Some(0),
                 fail_behavior: Some(GuardFailBehaviorConfig::Allow),
                 headers: None,
-                max_rows: None,
-                applies_to: None,
+                params: queryflux_core::config::BuiltInGuardParams {
+                    max_rows: None,
+                    applies_to: None,
+                    ..Default::default()
+                },
             }];
             let chain = build_chain_from_yaml_specs(&specs, &HashMap::new())
                 .expect("chain should be built");

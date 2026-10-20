@@ -2759,10 +2759,8 @@ enum WebhookFailBehavior {
 enum GuardSpecDto {
     BuiltIn {
         name: Option<String>,
-        #[serde(default)]
-        max_rows: Option<u64>,
-        #[serde(default)]
-        applies_to: Option<Vec<String>>,
+        #[serde(flatten)]
+        params: queryflux_core::config::BuiltInGuardParams,
     },
     PythonScript {
         script_id: Option<i64>,
@@ -2787,11 +2785,9 @@ enum GuardSpecDto {
 impl GuardSpecDto {
     fn validate(&self) -> std::result::Result<(), String> {
         match self {
-            GuardSpecDto::BuiltIn { name, .. } => match name.as_deref() {
-                Some("read_only" | "row_limit" | "require_predicate") => Ok(()),
-                Some(other) => Err(format!("unsupported built_in guard name \"{other}\"")),
-                None => Err("built_in guard is missing required field \"name\"".to_string()),
-            },
+            GuardSpecDto::BuiltIn { name, params } => {
+                queryflux_core::config::validate_built_in_guard(name.as_deref(), params)
+            }
             GuardSpecDto::PythonScript {
                 script_id, script, ..
             } => {

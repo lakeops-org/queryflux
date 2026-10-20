@@ -8,6 +8,7 @@ license.workspace = true
 queryflux-core = { workspace = true }
 queryflux-persistence = { workspace = true }
 async-trait = { workspace = true }
+chrono = { workspace = true }
 polyglot-sql = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

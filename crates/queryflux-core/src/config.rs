@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use serde::{Deserialize, Serialize};
 
@@ -342,12 +342,126 @@ pub struct GuardSpecConfig {
     /// `http_webhook`: extra request headers sent with every call.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub headers: Option<HashMap<String, String>>,
-    /// `row_limit`: maximum rows allowed (default: none).
+    /// Parameters of `built_in` guards (`max_rows`, `applies_to`, `tables`, …).
+    #[serde(flatten)]
+    pub params: BuiltInGuardParams,
+}
+
+/// Names of the `built_in` guards.
+pub const BUILT_IN_GUARD_NAMES: &[&str] = &[
+    "read_only",
+    "row_limit",
+    "require_predicate",
+    "partition_predicate_required",
+    "time_range_limit",
+    "no_cross_join",
+];
+
+/// Parameters of `built_in` guards. Each guard reads the fields it needs; the rest are
+/// ignored. The same keys are used in YAML, in Studio's stored config and by the admin API.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct BuiltInGuardParams {
+    /// `row_limit`: largest `LIMIT` allowed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_rows: Option<u64>,
-    /// `require_predicate`: table patterns this guard applies to.
+    /// `row_limit`: instead of warning about a missing `LIMIT` or denying one that is too
+    /// large, rewrite the query to add `LIMIT default_limit` (or `max_rows`) or to lower it
+    /// to `max_rows`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inject_limit: Option<bool>,
+    /// `row_limit` with `inject_limit`: `LIMIT` added to queries that have none
+    /// (default: `max_rows`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_limit: Option<u64>,
+    /// `require_predicate`: table patterns this guard applies to (glob, `*`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub applies_to: Option<Vec<String>>,
+    /// `partition_predicate_required` / `time_range_limit`: table pattern → the column a
+    /// query must filter on (the partition column, or the time column).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tables: Option<BTreeMap<String, String>>,
+    /// `time_range_limit`: furthest back a query may read, e.g. `90d`, `12w`, `1y`, `36h`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_lookback: Option<String>,
+}
+
+/// Parse a lookback such as `90d`, `12w`, `1y` or `36h`.
+pub fn parse_lookback(s: &str) -> std::result::Result<chrono::Duration, String> {
+    let s = s.trim();
+    let (num, unit) = s.split_at(s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len()));
+    let n: i64 = num
+        .parse()
+        .map_err(|_| format!("invalid lookback \"{s}\": expected e.g. 90d, 12w, 1y, 36h"))?;
+    if n <= 0 {
+        return Err(format!("invalid lookback \"{s}\": must be positive"));
+    }
+    let days = match unit {
+        "h" => return Ok(chrono::Duration::hours(n)),
+        "d" => n,
+        "w" => n * 7,
+        "y" => n * 365,
+        _ => {
+            return Err(format!(
+                "invalid lookback \"{s}\": unit must be h, d, w or y"
+            ))
+        }
+    };
+    Ok(chrono::Duration::days(days))
+}
+
+/// Check a `built_in` guard's name and the parameters it needs.
+pub fn validate_built_in_guard(
+    name: Option<&str>,
+    params: &BuiltInGuardParams,
+) -> std::result::Result<(), String> {
+    let Some(name) = name else {
+        return Err("built_in guard is missing required field \"name\"".to_string());
+    };
+    if !BUILT_IN_GUARD_NAMES.contains(&name) {
+        return Err(format!(
+            "unsupported built_in guard name \"{name}\" (expected one of {})",
+            BUILT_IN_GUARD_NAMES.join(", ")
+        ));
+    }
+    let tables_set = params.tables.as_ref().is_some_and(|t| !t.is_empty());
+    match name {
+        "row_limit" if params.inject_limit == Some(true) => {
+            if params.max_rows.is_none() && params.default_limit.is_none() {
+                return Err(
+                    "row_limit with inject_limit needs max_rows or default_limit".to_string(),
+                );
+            }
+            if let (Some(d), Some(m)) = (params.default_limit, params.max_rows) {
+                if d > m {
+                    return Err(format!(
+                        "row_limit: default_limit ({d}) is larger than max_rows ({m})"
+                    ));
+                }
+            }
+        }
+        "partition_predicate_required" if !tables_set => {
+            return Err(
+                "partition_predicate_required needs \"tables\": table pattern → partition column"
+                    .to_string(),
+            );
+        }
+        "time_range_limit" => {
+            if !tables_set {
+                return Err(
+                    "time_range_limit needs \"tables\": table pattern → time column".to_string(),
+                );
+            }
+            match params.max_lookback.as_deref() {
+                None => return Err("time_range_limit needs \"max_lookback\", e.g. 90d".to_string()),
+                Some(l) => {
+                    parse_lookback(l).map_err(|e| format!("time_range_limit: {e}"))?;
+                }
+            }
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 impl<'de> Deserialize<'de> for GuardSpecConfig {
@@ -377,10 +491,8 @@ impl<'de> Deserialize<'de> for GuardSpecConfig {
             fail_behavior: Option<GuardFailBehaviorConfig>,
             #[serde(default)]
             headers: Option<HashMap<String, String>>,
-            #[serde(default)]
-            max_rows: Option<u64>,
-            #[serde(default)]
-            applies_to: Option<Vec<String>>,
+            #[serde(flatten)]
+            params: BuiltInGuardParams,
         }
 
         let raw = Raw::deserialize(deserializer)?;
@@ -429,8 +541,7 @@ impl<'de> Deserialize<'de> for GuardSpecConfig {
             retry_count: raw.retry_count,
             fail_behavior: raw.fail_behavior,
             headers: raw.headers,
-            max_rows: raw.max_rows,
-            applies_to: raw.applies_to,
+            params: raw.params,
         })
     }
 }
@@ -438,11 +549,7 @@ impl<'de> Deserialize<'de> for GuardSpecConfig {
 impl GuardSpecConfig {
     pub fn validate(&self) -> std::result::Result<(), String> {
         match &self.kind {
-            GuardKindConfig::BuiltIn => match self.name.as_deref() {
-                Some("read_only" | "row_limit" | "require_predicate") => Ok(()),
-                Some(other) => Err(format!("unsupported built_in guard name \"{other}\"")),
-                None => Err("built_in guard is missing required field \"name\"".to_string()),
-            },
+            GuardKindConfig::BuiltIn => validate_built_in_guard(self.name.as_deref(), &self.params),
             GuardKindConfig::PythonScript => {
                 let has_script = self.script.as_ref().is_some_and(|s| !s.trim().is_empty());
                 let has_id = self.script_id.is_some();
@@ -2600,10 +2707,10 @@ fn default_cache_ttl() -> u64 {
 mod tests {
     use super::{
         query_auth_supported, AuthConfig, AuthProviderConfig, AuthorizationConfig,
-        AuthorizationProviderConfig, CircuitBreakerConfig, ClusterAuth, EngineConfig,
-        GuardKindConfig, GuardSpecConfig, LdapConfig, OidcConfig, OpenFgaConfig, PersistenceConfig,
-        PostgresPersistenceConfig, ProxyConfig, QueryAuthConfig, RouterConfig, StrategyConfig,
-        TokenExchangeConfig,
+        AuthorizationProviderConfig, BuiltInGuardParams, CircuitBreakerConfig, ClusterAuth,
+        EngineConfig, GuardKindConfig, GuardSpecConfig, LdapConfig, OidcConfig, OpenFgaConfig,
+        PersistenceConfig, PostgresPersistenceConfig, ProxyConfig, QueryAuthConfig, RouterConfig,
+        StrategyConfig, TokenExchangeConfig,
     };
 
     #[test]
@@ -2968,8 +3075,11 @@ queryflux: {}
             retry_count: None,
             fail_behavior: None,
             headers: None,
-            max_rows: None,
-            applies_to: None,
+            params: BuiltInGuardParams {
+                max_rows: None,
+                applies_to: None,
+                ..Default::default()
+            },
         };
         python.validate().expect("python_script should validate");
 
@@ -2983,8 +3093,11 @@ queryflux: {}
             retry_count: Some(1),
             fail_behavior: Some(super::GuardFailBehaviorConfig::Deny),
             headers: None,
-            max_rows: None,
-            applies_to: None,
+            params: BuiltInGuardParams {
+                max_rows: None,
+                applies_to: None,
+                ..Default::default()
+            },
         };
         webhook.validate().expect("http_webhook should validate");
     }
@@ -3018,8 +3131,11 @@ guardrails:
             retry_count: None,
             fail_behavior: None,
             headers: None,
-            max_rows: None,
-            applies_to: None,
+            params: BuiltInGuardParams {
+                max_rows: None,
+                applies_to: None,
+                ..Default::default()
+            },
         };
         assert!(blank.validate().unwrap_err().contains("script"));
     }
@@ -3036,8 +3152,11 @@ guardrails:
             retry_count: None,
             fail_behavior: None,
             headers: None,
-            max_rows: None,
-            applies_to: None,
+            params: BuiltInGuardParams {
+                max_rows: None,
+                applies_to: None,
+                ..Default::default()
+            },
         };
         assert!(both.validate().unwrap_err().contains("not both"));
     }
@@ -3076,8 +3195,11 @@ guardrails:
             retry_count: None,
             fail_behavior: None,
             headers: None,
-            max_rows: None,
-            applies_to: None,
+            params: BuiltInGuardParams {
+                max_rows: None,
+                applies_to: None,
+                ..Default::default()
+            },
         };
         let err = webhook.validate().unwrap_err();
         assert!(err.contains("http or https"), "{err}");

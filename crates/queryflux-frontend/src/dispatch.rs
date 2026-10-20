@@ -25,7 +25,9 @@ use queryflux_engine_adapters::{
     wire_auth::{enrich_session_for_passthrough, resolve_stored_wire_auth},
     AdapterKind, AsyncAdapter, BackendQueryIdSlot, ConnectionFormat, SyncAdapter,
 };
-use queryflux_guardrails::{GuardChain, GuardChainOutcome, GuardContext, GuardLayer};
+use queryflux_guardrails::{
+    deny_message, run_chains, GuardChain, GuardChainOutcome, GuardContext, GuardLayer,
+};
 use queryflux_metrics::MetricsStore;
 
 use tracing::{debug, info, warn};
@@ -722,11 +724,8 @@ pub async fn dispatch_query(
 
     macro_rules! guard_deny {
         ($actions:expr) => {{
-            let deny_reason = $actions
-                .iter()
-                .find(|a| a.action == "deny")
-                .and_then(|a| a.reason.clone())
-                .unwrap_or_else(|| "query blocked by guardrail".to_string());
+            let actions = $actions;
+            let deny_reason = deny_message(&actions);
             let ctx = QueryContext {
                 query_id: query_id.clone(),
                 sql: original_sql.clone(),
@@ -758,7 +757,7 @@ pub async fn dispatch_query(
                     error: Some(deny_reason.clone()),
                     routing_trace: None,
                     engine_stats: None,
-                    guard_actions: $actions,
+                    guard_actions: actions,
                     was_guard_blocked: true,
                     queue_duration_ms: 0,
                     cache_hit: false,
@@ -769,16 +768,19 @@ pub async fn dispatch_query(
         }};
     }
 
-    for chain in [guard_chain.as_ref(), group_guard_chain.as_ref()]
+    let chains = [guard_chain.as_deref(), group_guard_chain.as_deref()]
         .into_iter()
-        .flatten()
-    {
-        let (actions, outcome) = chain.run(&guard_ctx, GuardLayer::Plan).await;
-        all_guard_actions.extend(actions);
-        if matches!(outcome, GuardChainOutcome::Blocked { .. }) {
-            guard_deny!(std::mem::take(&mut all_guard_actions));
+        .flatten();
+    let (actions, outcome) = run_chains(chains, &guard_ctx, GuardLayer::Plan).await;
+    all_guard_actions.extend(actions);
+    let engine_sql = match outcome {
+        GuardChainOutcome::Blocked { .. } => guard_deny!(std::mem::take(&mut all_guard_actions)),
+        GuardChainOutcome::Rewritten { sql } => {
+            info!(id = %query_id, "SQL rewritten by guard");
+            sql
         }
-    }
+        GuardChainOutcome::Proceed => engine_sql,
+    };
 
     // Serialize guard actions for storage in ExecutingQuery (retrieved at poll time).
     // Treat serialization failure as fatal — silently omitting guard actions from the
@@ -2435,7 +2437,7 @@ async fn run_plan_guards(
     session: &SessionContext,
     auth_ctx: &AuthContext,
     effective_tags: &queryflux_core::tags::QueryTags,
-) -> std::result::Result<Vec<queryflux_persistence::GuardAction>, String> {
+) -> std::result::Result<Option<Vec<queryflux_persistence::GuardAction>>, String> {
     let engine_type = queryflux_core::query::EngineType::Cache;
     let resolved_agent_ctx = session.resolved_agent_context();
     let sql_parse = queryflux_core::sql_classify::SqlParseCache::new(
@@ -2459,22 +2461,16 @@ async fn run_plan_guards(
         sql_parse: Some(&sql_parse),
     };
 
-    let mut all_actions = Vec::new();
-    for chain in [guard_chain.as_ref(), group_guard_chain.as_ref()]
+    let chains = [guard_chain.as_deref(), group_guard_chain.as_deref()]
         .into_iter()
-        .flatten()
-    {
-        let (actions, outcome) = chain.run(&guard_ctx, GuardLayer::Plan).await;
-        all_actions.extend(actions);
-        if matches!(outcome, GuardChainOutcome::Blocked { .. }) {
-            return Err(all_actions
-                .iter()
-                .find(|a| a.action == "deny")
-                .and_then(|a| a.reason.clone())
-                .unwrap_or_else(|| "query blocked by guardrail".to_string()));
-        }
+        .flatten();
+    let (actions, outcome) = run_chains(chains, &guard_ctx, GuardLayer::Plan).await;
+    match outcome {
+        GuardChainOutcome::Blocked { .. } => Err(deny_message(&actions)),
+        // The cache key is the client SQL; a rewritten query must not be served from it.
+        GuardChainOutcome::Rewritten { .. } => Ok(None),
+        GuardChainOutcome::Proceed => Ok(Some(actions)),
     }
-    Ok(all_actions)
 }
 
 /// Execute a query against any backend and stream RecordBatches to `sink`.
@@ -2636,6 +2632,8 @@ pub async fn execute_to_sink(
         let guard_actions = if skip_cache_lookup {
             Vec::new()
         } else {
+            // `None`: a guard rewrites this query, so it skips the cache (the full path
+            // below runs the guards again on the engine SQL).
             match run_plan_guards(
                 &guard_chain,
                 &group_guard_chain,
@@ -2647,7 +2645,11 @@ pub async fn execute_to_sink(
             )
             .await
             {
-                Ok(actions) => actions,
+                Ok(Some(actions)) => actions,
+                Ok(None) => {
+                    skip_cache_lookup = true;
+                    Vec::new()
+                }
                 Err(deny_reason) => return sink.on_error(&deny_reason).await,
             }
         };
@@ -2840,10 +2842,12 @@ async fn execute_to_sink_inner(
 
     // Guard chain: runs after translation (SQL is final) and after routing (group is known),
     // before submitting to the engine. Global guards run first; per-group guards are appended.
+    let mut guard_rewrite: Option<String> = None;
     {
         let ctx = &setup.ctx;
         let guard_ctx = GuardContext {
-            sql: ctx.translated_sql.as_deref().unwrap_or(&setup.translated),
+            // The SQL that is submitted (and that `sql_parse` was built from).
+            sql: &setup.translated,
             original_sql: Some(ctx.sql.as_str()),
             dialect: &ctx.tgt_dialect,
             engine_type: &ctx.engine_type,
@@ -2863,18 +2867,14 @@ async fn execute_to_sink_inner(
         // `setup_sync_query`) so the audit trail carries the whole pipeline.
         let mut all_actions: Vec<queryflux_persistence::GuardAction> = setup.guard_actions.clone();
 
-        for chain in [guard_chain.as_ref(), group_guard_chain.as_ref()]
+        let chains = [guard_chain.as_deref(), group_guard_chain.as_deref()]
             .into_iter()
-            .flatten()
-        {
-            let (actions, outcome) = chain.run(&guard_ctx, GuardLayer::Plan).await;
-            all_actions.extend(actions);
-            if matches!(outcome, GuardChainOutcome::Blocked { .. }) {
-                let deny_reason = all_actions
-                    .iter()
-                    .find(|a| a.action == "deny")
-                    .and_then(|a| a.reason.clone())
-                    .unwrap_or_else(|| "query blocked by guardrail".to_string());
+            .flatten();
+        let (actions, outcome) = run_chains(chains, &guard_ctx, GuardLayer::Plan).await;
+        all_actions.extend(actions);
+        match outcome {
+            GuardChainOutcome::Blocked { .. } => {
+                let deny_reason = deny_message(&all_actions);
                 setup.slot.release().await;
                 state.record_query(
                     ctx,
@@ -2894,11 +2894,17 @@ async fn execute_to_sink_inner(
                 );
                 return sink.on_error(&deny_reason).await;
             }
+            GuardChainOutcome::Rewritten { sql } => guard_rewrite = Some(sql),
+            GuardChainOutcome::Proceed => {}
         }
 
         // Attach the combined (pre- + post-translation) guard actions to the setup
         // context so they flow into record_query at the normal exit point below.
         setup.guard_actions = all_actions;
+    }
+    if let Some(sql) = guard_rewrite {
+        info!(id = %setup.ctx.query_id, "SQL rewritten by guard");
+        setup.translated = sql;
     }
 
     if let Err(e) = sink.on_translated_sql(&setup.translated).await {
