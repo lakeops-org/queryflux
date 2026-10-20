@@ -125,6 +125,8 @@ The allocator writes `sum(commit)` as `quota_committed` under the clusters' advi
 
 During a control-plane or Postgres outage, holders keep admitting within their grants until the lease runs out. Then admissions fall back to per-query leases, which follow `coordination.onUnavailable` on workers and fail closed on replicas.
 
+**Quotas and the line.** When leases hold a cluster, for example because a long line was served from the reserve, the allocator can't grant quotas yet. It records what it wants (`quota_wanted`, at most `max - reserve - quota_committed`). Per-query acquires and hand-overs leave that capacity alone, so as leases end it goes to quotas on the next pass instead of back to the line. The reserve always stays available to leases.
+
 **Small limits.** A cluster whose limit is below twice the number of active holders gets no quotas: every admission takes a per-query lease, which is exact for small limits.
 
 **Turning it on.** Set `capacity.mode: quotas` on the control plane (or standalone replicas).
@@ -144,6 +146,34 @@ During a control-plane or Postgres outage, holders keep admitting within their g
 - On the allocator: `queryflux_capacity_quota_committed{cluster_name}` and `queryflux_capacity_quota_holders{cluster_name}`.
 - Failures count in `queryflux_coordination_failures_total` (`capacity_quota_report`, `capacity_allocate`).
 
+## Waiting for capacity
+
+A query denied capacity used to retry on a timer (100 ms, doubling to 2 s). A freed slot could sit idle until someone's timer fired, and it usually went to a newly arrived query rather than one that had been waiting. The capacity benchmark measured queries denied once waiting 13 to 18 seconds at p99 under contention.
+
+Now waiting is a line, kept in Postgres:
+
+1. **A denied acquire joins the line.** `queryflux_capacity_try_acquire` records the query in `capacity_waiters`, with when it first waited. Each retry refreshes the row; a query that stops retrying stops counting after 6 seconds.
+2. **First come, first served.** A query, new or retrying, gets a free slot only if fewer live waiters joined before it than there are free slots. Newcomers don't jump the line.
+3. **Releases hand slots over.** When leases are released, the delete trigger gives the freed slots to the oldest live *parked* waiters right away, as leases created for them, and notifies only those queries (`queryflux_capacity_granted`). The allocator does the same when a quota shrinks.
+4. **Waiters park and wake on the hand-over.** After a denial, dispatch calls `wait_for_grant` instead of sleeping. That parks the query: only parked queries are handed slots or hold up others.
+   - On a replica, it waits for the notification for its query id.
+   - On a worker, it long-polls `POST /worker/capacity/wait` on the control plane, for up to 3 seconds per request.
+   - With quotas, a quota slot freeing up on the same process wakes it too.
+
+   Each wait lasts up to 2 seconds and renews the query's place in line. A renewal is cheap: no lock while the cluster is full. If the cluster has free capacity nobody was handed (its limit went up), the renewal hands it out. The query retries its acquire when it is handed a slot, which claims it, or every 5 seconds as a fallback.
+
+**Leases nobody claims.** A slot handed to a query that has since given up (timed out, client gone) stays unclaimed. An unclaimed lease older than 10 seconds is deleted by the next acquire on that cluster, and by the expiry sweep. A query that times out waiting leaves the line at once. Releasing a query is two statements (leave the line, then drop the lease), so a release that races a hand-over to the same query also removes the slot just handed to it.
+
+**Locks.** Everything that changes a cluster's leases or line takes the cluster's advisory lock first, in cluster-name order when there are several: acquires, the release trigger, the release function (before it touches waiter rows) and the allocator. A hand-over never races an acquire past the limit, and releases don't deadlock with hand-overs.
+
+**Cost of the line.** An acquire only counts the waiters ahead of it up to the number of free slots, so its cost doesn't grow with the length of the line.
+
+**Compatibility.**
+- An older worker gets 404 from `/worker/capacity/wait` and keeps retrying on its timer. It also releases its query right after every denial. It never parks, so it is never handed a slot it would give straight back, and it doesn't hold up others: it competes for free slots as before.
+- Replicas from before this change don't use the line, and could take a slot ahead of waiters until they are upgraded.
+
+**Not built: grouping acquires.** The plan also proposed sending acquires that arrive together on one worker as one request. With quotas, most admissions don't reach the control plane, and with the line, waiters no longer poll, so the remaining reserve traffic is small. It will be revisited if the capacity benchmark shows the reserve path is the limit.
+
 ## Code map
 
 | Piece | Where |
@@ -158,3 +188,5 @@ During a control-plane or Postgres outage, holders keep admitting within their g
 | Holder (admission on quota, demand reports) | `crates/queryflux-persistence/src/quota_admission.rs` |
 | Holder rows, `quota_committed`, quota-aware acquire | `crates/queryflux-persistence/migrations/postgres/V22__capacity_quotas.sql` |
 | Allocator task | `crates/queryflux/src/startup/tasks.rs` (`spawn_capacity_allocator`) |
+| The line, hand-over on release, `wait_for_grant` | `crates/queryflux-persistence/migrations/postgres/V23__capacity_waiters.sql`, `crates/queryflux-persistence/src/postgres/mod.rs` |
+| Waiting in dispatch | `crates/queryflux-frontend/src/dispatch.rs` (`setup_sync_query`) |

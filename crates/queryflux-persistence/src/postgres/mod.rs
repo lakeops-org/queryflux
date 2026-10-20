@@ -1,5 +1,6 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::{
     cache_store::{CacheEntryMeta, CacheEntryRef, CacheStore},
@@ -75,6 +76,9 @@ pub struct PostgresStore {
     /// their grants.
     quota_lease_secs: std::sync::atomic::AtomicU64,
     quota_report_interval_ms: std::sync::atomic::AtomicU64,
+    /// Queries waiting in `wait_for_grant`, woken by `queryflux_capacity_granted`.
+    grant_waiters: Arc<dashmap::DashMap<String, Arc<tokio::sync::Notify>>>,
+    grant_listener: tokio::sync::OnceCell<()>,
 }
 
 impl PostgresStore {
@@ -143,6 +147,8 @@ impl PostgresStore {
             database_url: database_url.to_string(),
             quota_lease_secs: std::sync::atomic::AtomicU64::new(15),
             quota_report_interval_ms: std::sync::atomic::AtomicU64::new(1000),
+            grant_waiters: Arc::default(),
+            grant_listener: tokio::sync::OnceCell::new(),
         })
     }
 
@@ -2120,6 +2126,49 @@ impl crate::quota::QuotaStore for PostgresStore {
 impl PostgresStore {
     /// What holders are told with every grant: how long they may admit on it
     /// (`capacity.quotaLeaseSecs`) and how often to report (`capacity.reportIntervalMs`).
+    /// Start (once) the listener that wakes `wait_for_grant` callers when a release hands
+    /// their query a slot. One extra connection, opened the first time a query waits.
+    async fn ensure_grant_listener(&self) {
+        let url = self.database_url.clone();
+        let waiters = self.grant_waiters.clone();
+        self.grant_listener
+            .get_or_init(|| async move {
+                tokio::spawn(async move {
+                    const MAX_BACKOFF: std::time::Duration = std::time::Duration::from_secs(30);
+                    let mut backoff = std::time::Duration::from_secs(1);
+                    loop {
+                        let mut listener = match sqlx::postgres::PgListener::connect(&url).await {
+                            Ok(l) => l,
+                            Err(e) => {
+                                tracing::warn!("Capacity grant listener connect failed: {e}");
+                                tokio::time::sleep(backoff).await;
+                                backoff = (backoff * 2).min(MAX_BACKOFF);
+                                continue;
+                            }
+                        };
+                        if let Err(e) = listener.listen("queryflux_capacity_granted").await {
+                            tracing::warn!("Capacity grant LISTEN failed: {e}");
+                            tokio::time::sleep(backoff).await;
+                            backoff = (backoff * 2).min(MAX_BACKOFF);
+                            continue;
+                        }
+                        backoff = std::time::Duration::from_secs(1);
+                        // A notification missed while reconnecting only delays its waiter
+                        // until its timeout, when it retries the acquire and claims the slot.
+                        while let Ok(n) = listener.recv().await {
+                            for id in n.payload().split(' ') {
+                                if let Some(w) = waiters.get(id) {
+                                    w.notify_one();
+                                }
+                            }
+                        }
+                        tracing::warn!("Capacity grant listener lost its connection; reconnecting");
+                    }
+                });
+            })
+            .await;
+    }
+
     pub fn set_quota_timing(&self, lease_secs: u64, report_interval_ms: u64) {
         use std::sync::atomic::Ordering;
         self.quota_lease_secs
@@ -2232,6 +2281,7 @@ impl crate::quota::QuotaAllocator for PostgresStore {
         let mut upd_ceiling = Vec::new();
         let mut committed_cluster = Vec::new();
         let mut committed_value = Vec::new();
+        let mut wanted_value = Vec::new();
         let mut pass = crate::quota::AllocationPass {
             clusters: clusters.len(),
             holders: rows.len(),
@@ -2254,6 +2304,7 @@ impl crate::quota::QuotaAllocator for PostgresStore {
             }
             committed_cluster.push(cluster.clone());
             committed_value.push(a.quota_committed.min(i64::MAX as u64) as i64);
+            wanted_value.push(a.quota_wanted.min(i64::MAX as u64) as i64);
         }
         pass.changed = upd_cluster.len();
 
@@ -2279,16 +2330,27 @@ impl crate::quota::QuotaAllocator for PostgresStore {
         }
         sqlx::query(
             r#"
-            INSERT INTO cluster_capacity_counters (cluster_name, quota_committed)
-            SELECT c, q FROM UNNEST($1::text[], $2::bigint[]) AS u(c, q)
-            ON CONFLICT (cluster_name) DO UPDATE SET quota_committed = EXCLUDED.quota_committed
+            INSERT INTO cluster_capacity_counters (cluster_name, quota_committed, quota_wanted)
+            SELECT c, q, w FROM UNNEST($1::text[], $2::bigint[], $3::bigint[]) AS u(c, q, w)
+            ON CONFLICT (cluster_name) DO UPDATE SET
+                quota_committed = EXCLUDED.quota_committed,
+                quota_wanted = EXCLUDED.quota_wanted
             "#,
         )
         .bind(&committed_cluster)
         .bind(&committed_value)
+        .bind(&wanted_value)
         .execute(&mut *tx)
         .await
         .map_err(|e| err("allocation committed", e))?;
+        // Capacity a shrinking quota gave back goes to waiters right away.
+        sqlx::query(
+            "SELECT queryflux_capacity_grant_waiters(c) FROM UNNEST($1::text[]) AS c ORDER BY c",
+        )
+        .bind(&committed_cluster)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| err("allocation grants to waiters", e))?;
 
         tx.commit().await.map_err(|e| err("allocation commit", e))?;
         Ok(pass)
@@ -2356,7 +2418,9 @@ impl CapacityStore for PostgresStore {
     }
 
     async fn release(&self, _cluster_name: &str, query_id: &str) -> Result<()> {
-        sqlx::query("DELETE FROM cluster_capacity_leases WHERE query_id = $1")
+        // Also drop the query's waiter row, so a query that gives up stops holding its
+        // place in line.
+        sqlx::query("SELECT queryflux_capacity_release(ARRAY[$1])")
             .bind(query_id)
             .execute(&self.coordination_pool)
             .await
@@ -2364,12 +2428,49 @@ impl CapacityStore for PostgresStore {
         Ok(())
     }
 
+    async fn wait_for_grant(
+        &self,
+        cluster_name: &str,
+        query_id: &str,
+        timeout: std::time::Duration,
+    ) -> Result<bool> {
+        /// Removes the registration however the wait ends, including when the caller's
+        /// future is dropped (a cancelled long-poll, or a quota slot winning a select).
+        struct Registered<'a>(
+            &'a dashmap::DashMap<String, Arc<tokio::sync::Notify>>,
+            &'a str,
+        );
+        impl Drop for Registered<'_> {
+            fn drop(&mut self) {
+                self.0.remove(self.1);
+            }
+        }
+
+        self.ensure_grant_listener().await;
+        let notify = Arc::new(tokio::sync::Notify::new());
+        self.grant_waiters
+            .insert(query_id.to_string(), notify.clone());
+        let _registered = Registered(&self.grant_waiters, query_id);
+        let notified = notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        // Park in the line (only parked waiters are handed slots), and check for a slot
+        // handed over before we started listening, which is already a lease.
+        let already: bool = sqlx::query_scalar("SELECT queryflux_capacity_park($1, $2)")
+            .bind(cluster_name)
+            .bind(query_id)
+            .fetch_one(&self.coordination_pool)
+            .await
+            .map_err(|e| QueryFluxError::Persistence(format!("wait_for_grant: {e}")))?;
+        Ok(already || tokio::time::timeout(timeout, notified).await.is_ok())
+    }
+
     async fn release_many(&self, leases: &[(String, String)]) -> Result<()> {
         if leases.is_empty() {
             return Ok(());
         }
         let ids: Vec<&str> = leases.iter().map(|(_, q)| q.as_str()).collect();
-        sqlx::query("DELETE FROM cluster_capacity_leases WHERE query_id = ANY($1)")
+        sqlx::query("SELECT queryflux_capacity_release($1)")
             .bind(&ids)
             .execute(&self.coordination_pool)
             .await
@@ -2394,6 +2495,32 @@ impl CapacityStore for PostgresStore {
             .execute(&self.coordination_pool)
             .await
             .map_err(|e| QueryFluxError::Persistence(format!("expire_stale: {e}")))?;
+        // Leases handed to waiters that never came back for them, and waiters that
+        // stopped retrying long ago.
+        // Through the release function, which takes the clusters' locks first.
+        let unclaimed: i64 = sqlx::query_scalar(
+            r#"
+            SELECT queryflux_capacity_release(ARRAY(
+                SELECT query_id FROM cluster_capacity_leases
+                WHERE NOT claimed AND acquired_at < now() - interval '10 seconds'
+            ))
+            "#,
+        )
+        .fetch_one(&self.coordination_pool)
+        .await
+        .map_err(|e| QueryFluxError::Persistence(format!("expire unclaimed grants: {e}")))?;
+        sqlx::query(
+            "DELETE FROM capacity_waiters WHERE refreshed_at < now() - interval '60 seconds'",
+        )
+        .execute(&self.coordination_pool)
+        .await
+        .map_err(|e| QueryFluxError::Persistence(format!("expire waiters: {e}")))?;
+        if unclaimed > 0 {
+            tracing::info!(
+                leases = unclaimed,
+                "Expired capacity handed to queries that stopped waiting"
+            );
+        }
         // This sweep runs on one replica at a time, every couple of minutes: also put
         // right any lease counter that no longer matches its leases.
         if let Err(e) = self.recount_drifted_counters().await {
@@ -3340,7 +3467,14 @@ mod tests {
             .try_acquire(&a, 3, "inst-1", &format!("{a}-again"))
             .await
             .unwrap());
-        store.release(&a, &format!("{a}-again")).await.unwrap();
+        store
+            .release_many(&[
+                (a.clone(), format!("{a}-again")),
+                (a.clone(), format!("{a}-full")),
+            ])
+            .await
+            .unwrap();
+        assert_eq!(store.active_lease_count(&a).await.unwrap(), 0);
     }
 
     /// A replica still on the previous version writes lease rows directly (advisory
@@ -3606,6 +3740,313 @@ mod tests {
         // It comes back: no stale grant is handed back.
         let (q2, _) = grant(&store, &h, demand(&c, 4, 6, s, 50)).await;
         assert_eq!(q2, 0);
+    }
+
+    /// Wait in line for a hand-over without blocking, as dispatch does after a denial.
+    async fn park(store: &PostgresStore, cluster: &str, query_id: &str) -> bool {
+        store
+            .wait_for_grant(cluster, query_id, std::time::Duration::ZERO)
+            .await
+            .unwrap()
+    }
+
+    async fn waiter_rows(store: &PostgresStore, cluster: &str) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM capacity_waiters WHERE cluster_name = $1")
+            .bind(cluster)
+            .fetch_one(&store.coordination_pool)
+            .await
+            .unwrap()
+    }
+
+    /// A release hands the slot to the oldest waiter, not to whoever asks next.
+    #[tokio::test]
+    #[ignore]
+    async fn pg_capacity_release_hands_the_slot_to_the_oldest_waiter() {
+        let _guard = CAPACITY_TEST_LOCK.lock().await;
+        let store = test_store().await;
+        let c = unique_id("fifo");
+        let (q1, q2, q3) = (format!("{c}-1"), format!("{c}-2"), format!("{c}-3"));
+        assert!(store.try_acquire(&c, 1, "i", &q1).await.unwrap());
+        assert!(!store.try_acquire(&c, 1, "i", &q2).await.unwrap());
+        park(&store, &c, &q2).await;
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        assert!(!store.try_acquire(&c, 1, "i", &q3).await.unwrap());
+        park(&store, &c, &q3).await;
+        assert_eq!(waiter_rows(&store, &c).await, 2);
+
+        store.release(&c, &q1).await.unwrap();
+        assert!(
+            !store.try_acquire(&c, 1, "i", &q3).await.unwrap(),
+            "q3 came after q2"
+        );
+        assert!(
+            store.try_acquire(&c, 1, "i", &q2).await.unwrap(),
+            "q2 claims its slot"
+        );
+        assert_eq!(store.active_lease_count(&c).await.unwrap(), 1);
+        // Claiming twice is still one lease.
+        assert!(store.try_acquire(&c, 1, "i", &q2).await.unwrap());
+        assert_eq!(store.active_lease_count(&c).await.unwrap(), 1);
+
+        store.release(&c, &q2).await.unwrap();
+        assert!(store.try_acquire(&c, 1, "i", &q3).await.unwrap());
+        store.release(&c, &q3).await.unwrap();
+        assert_eq!(waiter_rows(&store, &c).await, 0);
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn pg_capacity_wait_for_grant_wakes_on_release() {
+        let _guard = CAPACITY_TEST_LOCK.lock().await;
+        let store = std::sync::Arc::new(test_store().await);
+        let c = unique_id("wake");
+        let (q1, q2) = (format!("{c}-1"), format!("{c}-2"));
+        assert!(store.try_acquire(&c, 1, "i", &q1).await.unwrap());
+        assert!(!store.try_acquire(&c, 1, "i", &q2).await.unwrap());
+        park(&store, &c, &q2).await;
+
+        let waiter = {
+            let (store, c, q2) = (store.clone(), c.clone(), q2.clone());
+            tokio::spawn(async move {
+                let start = std::time::Instant::now();
+                let granted = store
+                    .wait_for_grant(&c, &q2, std::time::Duration::from_secs(10))
+                    .await
+                    .unwrap();
+                (granted, start.elapsed())
+            })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        store.release(&c, &q1).await.unwrap();
+        let (granted, waited) = waiter.await.unwrap();
+        assert!(granted);
+        assert!(
+            waited < std::time::Duration::from_secs(3),
+            "woke after {waited:?}"
+        );
+        assert!(store.try_acquire(&c, 1, "i", &q2).await.unwrap());
+        store.release(&c, &q2).await.unwrap();
+
+        // Nothing frees: the wait times out.
+        assert!(store.try_acquire(&c, 1, "i", &q1).await.unwrap());
+        assert!(!store.try_acquire(&c, 1, "i", &q2).await.unwrap());
+        park(&store, &c, &q2).await;
+        assert!(!store
+            .wait_for_grant(&c, &q2, std::time::Duration::from_millis(200))
+            .await
+            .unwrap());
+        store
+            .release_many(&[(c.clone(), q1), (c.clone(), q2)])
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn pg_capacity_newcomers_do_not_jump_the_line_but_stale_waiters_stop_counting() {
+        let _guard = CAPACITY_TEST_LOCK.lock().await;
+        let store = test_store().await;
+        let c = unique_id("line");
+        let (q1, q2, q3) = (format!("{c}-1"), format!("{c}-2"), format!("{c}-3"));
+        assert!(store.try_acquire(&c, 1, "i", &q1).await.unwrap());
+        assert!(!store.try_acquire(&c, 1, "i", &q2).await.unwrap());
+        park(&store, &c, &q2).await;
+        // The limit goes up to 2: one slot is free, but q2 waited first.
+        assert!(!store.try_acquire(&c, 2, "i", &q3).await.unwrap());
+        park(&store, &c, &q3).await;
+        assert!(store.try_acquire(&c, 2, "i", &q2).await.unwrap());
+        store.release(&c, &q2).await.unwrap();
+
+        // A waiter that stopped retrying no longer holds anyone up.
+        assert!(!store.try_acquire(&c, 1, "i", &q2).await.unwrap());
+        park(&store, &c, &q2).await;
+        sqlx::query("UPDATE capacity_waiters SET refreshed_at = now() - interval '10 seconds' WHERE query_id = $1")
+            .bind(&q2)
+            .execute(&store.coordination_pool)
+            .await
+            .unwrap();
+        assert!(store.try_acquire(&c, 2, "i", &q3).await.unwrap());
+        store
+            .release_many(&[(c.clone(), q1), (c.clone(), q2), (c.clone(), q3)])
+            .await
+            .unwrap();
+    }
+
+    /// A client that releases its query right after a denial (0.5.0 and earlier) never
+    /// parks, so no slot is handed to it to be given straight back.
+    #[tokio::test]
+    #[ignore]
+    async fn pg_capacity_queries_that_do_not_wait_are_not_handed_slots() {
+        let _guard = CAPACITY_TEST_LOCK.lock().await;
+        let store = test_store().await;
+        let c = unique_id("noPark");
+        let (q1, q2, q3) = (format!("{c}-1"), format!("{c}-2"), format!("{c}-3"));
+        assert!(store.try_acquire(&c, 1, "i", &q1).await.unwrap());
+        assert!(!store.try_acquire(&c, 1, "old", &q2).await.unwrap());
+        store.release(&c, &q1).await.unwrap();
+        assert_eq!(
+            store.active_lease_count(&c).await.unwrap(),
+            0,
+            "nothing handed to q2"
+        );
+        // q2's row doesn't hold up a newcomer either.
+        assert!(store.try_acquire(&c, 1, "i", &q3).await.unwrap());
+        store
+            .release_many(&[(c.clone(), q2), (c.clone(), q3)])
+            .await
+            .unwrap();
+    }
+
+    /// A query leaves the line while another release is handing it a slot: its release
+    /// must remove that slot too, not leave it held by nobody.
+    #[tokio::test]
+    #[ignore]
+    async fn pg_capacity_release_during_a_hand_over_frees_the_slot() {
+        let _guard = CAPACITY_TEST_LOCK.lock().await;
+        let store = std::sync::Arc::new(test_store().await);
+        let c = unique_id("race");
+        let (h, w) = (format!("{c}-h"), format!("{c}-w"));
+        assert!(store.try_acquire(&c, 1, "i", &h).await.unwrap());
+        assert!(!store.try_acquire(&c, 1, "i", &w).await.unwrap());
+        park(&store, &c, &w).await;
+
+        // Release h in a transaction that stays open: its trigger hands the slot to w.
+        let mut tx = store.coordination_pool.begin().await.unwrap();
+        sqlx::query("SELECT queryflux_capacity_release(ARRAY[$1])")
+            .bind(&h)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        // Meanwhile w gives up; its release blocks on the waiter row until tx commits.
+        let leave = {
+            let (store, c, w) = (store.clone(), c.clone(), w.clone());
+            tokio::spawn(async move { store.release(&c, &w).await })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        tx.commit().await.unwrap();
+        leave.await.unwrap().unwrap();
+
+        assert_eq!(store.active_lease_count(&c).await.unwrap(), 0);
+        assert_eq!(
+            lease_rows(&store, &c).await,
+            0,
+            "no unclaimed slot left behind"
+        );
+    }
+
+    /// Many parked waiters leave the line at once while releases hand slots over, across
+    /// two clusters: releases take the clusters' locks before the waiter rows, so none
+    /// deadlocks (Postgres would fail one of them), and nothing is left behind.
+    #[tokio::test]
+    #[ignore]
+    async fn pg_capacity_mass_departure_during_hand_overs_does_not_deadlock() {
+        let _guard = CAPACITY_TEST_LOCK.lock().await;
+        let store = std::sync::Arc::new(test_store().await);
+        for round in 0..5 {
+            let clusters = [
+                unique_id(&format!("md{round}a")),
+                unique_id(&format!("md{round}b")),
+            ];
+            let mut holders = Vec::new();
+            let mut waiters = Vec::new();
+            for c in &clusters {
+                for i in 0..2 {
+                    let q = format!("{c}-h{i}");
+                    assert!(store.try_acquire(c, 2, "i", &q).await.unwrap());
+                    holders.push((c.clone(), q));
+                }
+                for i in 0..20 {
+                    let q = format!("{c}-w{i}");
+                    assert!(!store.try_acquire(c, 2, "i", &q).await.unwrap());
+                    park(&store, c, &q).await;
+                    waiters.push((c.clone(), q));
+                }
+            }
+            let mut tasks = Vec::new();
+            for chunk in holders
+                .into_iter()
+                .chain(waiters)
+                .collect::<Vec<_>>()
+                .chunks(3)
+            {
+                let (store, chunk) = (store.clone(), chunk.to_vec());
+                tasks.push(tokio::spawn(
+                    async move { store.release_many(&chunk).await },
+                ));
+            }
+            for t in tasks {
+                t.await
+                    .unwrap()
+                    .expect("no release fails (a deadlock would)");
+            }
+            for c in &clusters {
+                assert_eq!(lease_rows(&store, c).await, 0);
+                assert_eq!(waiter_rows(&store, c).await, 0);
+                assert_eq!(store.active_lease_count(c).await.unwrap(), 0);
+            }
+        }
+    }
+
+    /// Capacity that frees without a release (here the limit goes up) reaches a parked
+    /// waiter when it renews its wait.
+    #[tokio::test]
+    #[ignore]
+    async fn pg_capacity_renewing_a_wait_picks_up_free_capacity() {
+        let _guard = CAPACITY_TEST_LOCK.lock().await;
+        let store = test_store().await;
+        let c = unique_id("renew");
+        let (q1, q2) = (format!("{c}-1"), format!("{c}-2"));
+        assert!(store.try_acquire(&c, 1, "i", &q1).await.unwrap());
+        assert!(!store.try_acquire(&c, 1, "i", &q2).await.unwrap());
+        assert!(!park(&store, &c, &q2).await);
+        // Another query's acquire records the higher limit; q2 is ahead of it in line.
+        assert!(!store
+            .try_acquire(&c, 2, "i", &format!("{c}-3"))
+            .await
+            .unwrap());
+        assert!(
+            park(&store, &c, &q2).await,
+            "handed the new slot on renewal"
+        );
+        assert!(store.try_acquire(&c, 2, "i", &q2).await.unwrap());
+        store
+            .release_many(&[
+                (c.clone(), q1),
+                (c.clone(), q2),
+                (c.clone(), format!("{c}-3")),
+            ])
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn pg_capacity_unclaimed_grants_are_swept() {
+        let _guard = CAPACITY_TEST_LOCK.lock().await;
+        let store = test_store().await;
+        let c = unique_id("unclaimed");
+        let (q1, q2) = (format!("{c}-1"), format!("{c}-2"));
+        assert!(store.try_acquire(&c, 1, "i", &q1).await.unwrap());
+        assert!(!store.try_acquire(&c, 1, "i", &q2).await.unwrap());
+        park(&store, &c, &q2).await;
+        store.release(&c, &q1).await.unwrap();
+        assert_eq!(
+            store.active_lease_count(&c).await.unwrap(),
+            1,
+            "handed to q2"
+        );
+
+        // q2 never comes back for it.
+        sqlx::query("UPDATE cluster_capacity_leases SET acquired_at = now() - interval '1 minute' WHERE query_id = $1")
+            .bind(&q2)
+            .execute(&store.coordination_pool)
+            .await
+            .unwrap();
+        let past = chrono::Utc::now() - chrono::Duration::hours(1);
+        store.expire_stale(past).await.unwrap();
+        assert_eq!(store.active_lease_count(&c).await.unwrap(), 0);
+        assert!(store.try_acquire(&c, 1, "i", &q1).await.unwrap());
+        store.release(&c, &q1).await.unwrap();
     }
 
     // -- Admission fairness ---------------------------------------------------

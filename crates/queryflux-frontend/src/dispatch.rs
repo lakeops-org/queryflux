@@ -344,7 +344,8 @@ pub async fn dispatch_query(
                 grant @ (CapacityGrant::Denied | CapacityGrant::Unavailable) => {
                     if grant == CapacityGrant::Denied {
                         // Global capacity full — the query holds no lease, so give back
-                        // only the local slot.
+                        // only the local slot. Its place in the fleet-wide line (kept by
+                        // the backend under its id) carries over to its next poll.
                         slot.release_local().await;
                     } else {
                         // The acquire may have committed before it failed: release the
@@ -1201,10 +1202,19 @@ async fn persist_queued_query(
 // execute_to_sink — shared Arrow execution driver for non-Trino-HTTP frontends
 // ---------------------------------------------------------------------------
 
+/// A query waiting in the capacity line retries its acquire at least this often, even
+/// if it isn't handed a slot.
+const RENEW_WAITS_FOR: chrono::Duration = chrono::Duration::seconds(5);
+/// Longest single `wait_for_grant`; each one also renews the query's place in line.
+const MAX_SINGLE_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// How long to wait between queue retries (exponential backoff, capped at 2s).
+fn queued_backoff(seq: u64) -> std::time::Duration {
+    std::time::Duration::from_millis((100u64 * (1 << seq.min(4))).min(2000))
+}
+
 async fn queued_backoff_delay(seq: u64) {
-    let ms = (100u64 * (1 << seq.min(4))).min(2000);
-    tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+    tokio::time::sleep(queued_backoff(seq)).await;
 }
 
 // ---------------------------------------------------------------------------
@@ -1277,9 +1287,9 @@ impl ClusterSlotGuard {
     }
 
     /// Give back only the local slot, after the fleet-wide lease was denied: the query
-    /// holds no lease. Releasing it from the capacity store as well would be a wasted
-    /// round trip, and with releases sent in the background it could arrive after the
-    /// query's retry was granted under the same id and remove that lease.
+    /// holds no lease. Releasing it from the capacity store as well would take it out of
+    /// the line it now waits in there, and with releases sent in the background it could
+    /// arrive after the query's retry was granted under the same id and remove that lease.
     async fn release_local(&mut self) {
         if !self.released {
             self.released = true;
@@ -1672,8 +1682,13 @@ async fn setup_sync_query(
     let wait_start = Utc::now();
     let deadline = wait_start + chrono::Duration::seconds(wait_timeout_secs as i64);
     let mut seq: u64 = 0;
+    // The cluster this query last waited in line for, so a timeout can leave the line.
+    let mut waited_on: Option<ClusterName> = None;
     let (cluster_name, adapter, this_cluster_cfg, mut slot) = loop {
         if Utc::now() >= deadline {
+            if let (Some(cap), Some(c)) = (&state.capacity_store, &waited_on) {
+                let _ = cap.release(&c.0, &query_id.0).await;
+            }
             return Err(QueryFluxError::CapacityWaitTimeout {
                 group: group.0.clone(),
                 timeout_secs: wait_timeout_secs,
@@ -1703,9 +1718,37 @@ async fn setup_sync_query(
                 {
                     CapacityGrant::Denied => {
                         // Global capacity full — release the local slot (the query holds
-                        // no lease) and retry with backoff.
+                        // no lease), then wait in line (under the query's id) until the
+                        // backend hands this query a slot. Each wait renews its place
+                        // cheaply; a full retry only comes when it was handed a slot, or
+                        // every RENEW_WAITS_FOR as a fallback (an older control plane that
+                        // can't hand over, a missed notification).
                         slot.release_local().await;
-                        queued_backoff_delay(seq).await;
+                        waited_on = Some(name.clone());
+                        match &state.capacity_store {
+                            Some(cap) => {
+                                let retry_at = (Utc::now() + RENEW_WAITS_FOR).min(deadline);
+                                loop {
+                                    let left = (retry_at - Utc::now())
+                                        .to_std()
+                                        .unwrap_or_default()
+                                        .min(MAX_SINGLE_WAIT);
+                                    if left.is_zero() {
+                                        break;
+                                    }
+                                    match cap.wait_for_grant(&name.0, &query_id.0, left).await {
+                                        Ok(true) => break,
+                                        Ok(false) => {}
+                                        Err(e) => {
+                                            tracing::debug!("Capacity wait failed, retrying: {e}");
+                                            queued_backoff_delay(seq).await;
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                            None => queued_backoff_delay(seq).await,
+                        }
                         seq += 1;
                         continue;
                     }

@@ -103,6 +103,7 @@ pub fn router_with_ingest_limit(
             "/worker/capacity/release-batch",
             post(capacity_release_batch),
         )
+        .route("/worker/capacity/wait", post(capacity_wait))
         .route("/worker/capacity/quota", post(capacity_quota))
         .route(
             "/worker/capacity/quota/release",
@@ -503,6 +504,36 @@ async fn capacity_release(
     };
     match store.release(&req.cluster, &req.query_id).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => store_error(e),
+    }
+}
+
+#[derive(serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WaitRequest {
+    pub cluster: String,
+    pub query_id: String,
+    #[serde(default)]
+    pub wait_ms: u64,
+}
+
+/// A worker's query was denied capacity: hold the request until a release hands the
+/// query a slot, or `waitMs` (at most 5 s) passes.
+async fn capacity_wait(
+    State(st): State<Arc<WorkerApiState>>,
+    headers: HeaderMap,
+    Json(req): Json<WaitRequest>,
+) -> Response {
+    let store = match coordination(&st, &headers) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    let wait = std::time::Duration::from_millis(req.wait_ms.min(5_000));
+    match store
+        .wait_for_grant(&req.cluster, &req.query_id, wait)
+        .await
+    {
+        Ok(granted) => Json(serde_json::json!({ "granted": granted })).into_response(),
         Err(e) => store_error(e),
     }
 }

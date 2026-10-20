@@ -167,6 +167,11 @@ pub struct ClusterAllocation {
     pub changed: Vec<Allocation>,
     /// Sum of every holder's commit after the change: what per-query acquires must leave.
     pub quota_committed: u64,
+    /// Capacity the allocator would grant as quota but couldn't, because leases hold it.
+    /// Per-query acquires and hand-overs to waiters leave it alone, so as leases end the
+    /// next pass can grant it. Never more than `max - reserve - quota_committed`: the
+    /// reserve always stays available to per-query leases.
+    pub quota_wanted: u64,
 }
 
 /// Compute new quotas for one cluster.
@@ -193,12 +198,15 @@ pub fn allocate(
         .filter(|&i| holders[i].active(policy))
         .collect();
     let capacity = max.saturating_sub(leased);
+    let reserve = ((max as f64) * policy.reserve_fraction).floor() as u64;
 
     // 1. Targets.
     let mut target = vec![0u64; holders.len()];
     if !active.is_empty() && max >= 2 * active.len() as u64 {
-        let reserve = ((max as f64) * policy.reserve_fraction).floor() as u64;
-        let assignable = capacity.saturating_sub(reserve);
+        // Assign from what leases don't hold. Fair share is computed against all of
+        // `max - reserve`, so holders still get a target when leases fill the cluster;
+        // what they can't be granted now becomes `quota_wanted`.
+        let assignable = max.saturating_sub(reserve);
         let demand: Vec<u64> = active
             .iter()
             .map(|&i| holders[i].running.saturating_add(holders[i].waiting))
@@ -277,10 +285,15 @@ pub fn allocate(
             ceiling: ceiling[i],
         })
         .collect();
-    let quota_committed = (0..holders.len()).map(|i| commit_of(i, &ceiling)).sum();
+    let quota_committed: u64 = (0..holders.len()).map(|i| commit_of(i, &ceiling)).sum();
+    let deficit: u64 = (0..holders.len())
+        .map(|i| target[i].saturating_sub(granted[i]))
+        .sum();
+    let quota_wanted = deficit.min(max.saturating_sub(reserve).saturating_sub(quota_committed));
     ClusterAllocation {
         changed,
         quota_committed,
+        quota_wanted,
     }
 }
 
@@ -409,6 +422,25 @@ mod tests {
         let a = allocate(100, 60, &hs, &policy());
         assert_eq!(a.changed[0].granted, 40);
         assert_eq!(a.quota_committed, 40);
+    }
+
+    #[test]
+    fn capacity_held_by_leases_is_wanted_back_for_quotas() {
+        // Leases fill the cluster (a long line was served from the reserve).
+        let hs = vec![holder("a", 0, 50, 0, 0), holder("b", 0, 50, 0, 0)];
+        let p = AllocatorPolicy {
+            reserve_fraction: 0.2,
+            ..Default::default()
+        };
+        let a = allocate(100, 100, &hs, &p);
+        assert!(a.changed.is_empty(), "nothing free to grant yet");
+        assert_eq!(a.quota_wanted, 80, "everything but the reserve");
+
+        // Leases ended and their slots were held back: the next pass grants them.
+        let a = allocate(100, 20, &hs, &p);
+        let granted: u64 = a.changed.iter().map(|c| c.granted).sum();
+        assert_eq!(granted, 80);
+        assert_eq!(a.quota_wanted, 0);
     }
 
     #[test]
