@@ -8,7 +8,7 @@
     {
       "type": "category",
       "label": "Guides",
-      "collapsed": false,
+      "collapsed": true,
       "items": [
         "getting-started",
         "studio",
@@ -18,7 +18,7 @@
     {
       "type": "category",
       "label": "Operations",
-      "collapsed": false,
+      "collapsed": true,
       "items": [
         "operations/multi-replica"
       ]
@@ -26,7 +26,7 @@
     {
       "type": "category",
       "label": "Reference",
-      "collapsed": false,
+      "collapsed": true,
       "items": [
         "configuration"
       ]
@@ -34,7 +34,7 @@
     {
       "type": "category",
       "label": "Agentic AI",
-      "collapsed": false,
+      "collapsed": true,
       "items": [
         "agentic/agent-context"
       ]

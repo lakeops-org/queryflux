@@ -1,16 +1,18 @@
 # syntax=docker/dockerfile:1
 #
-# Canonical QueryFlux Docker build (server + optional Studio). Edit this file only.
+# Canonical QueryFlux Docker build. Edit this file only.
 #
-# Targets (use --target for non-default):
-#   runtime-server   — Rust server + Python venv + DuckDB + dbc CLI (default final stage)
-#   runtime-unified  — server + bundled QueryFlux Studio (Next.js)
+# Builds the QueryFlux server image (runtime-server): Rust server + Python venv + DuckDB + dbc CLI.
+# Published as ghcr.io/lakeops-org/queryflux:<version> / :latest (also :<version>-slim / :latest-slim).
+#
+# Studio is not part of this image: run ghcr.io/lakeops-org/queryflux-studio next to it
+# (a separate compose service, or the Helm chart's `studio` sidecar) with ADMIN_API_URL
+# pointing at the admin port.
 #
 # Examples (repo root as context):
 #   docker build -f docker/queryflux/Dockerfile -t queryflux:local .
-#   docker build -f docker/queryflux/Dockerfile --target runtime-unified -t queryflux:unified .
 #   docker buildx build --platform linux/amd64,linux/arm64 -f docker/queryflux/Dockerfile \
-#     --target runtime-unified -t queryflux:unified --push .
+#     -t queryflux:local --push .
 #
 # PyO3/sqlglot: builder + runtime use python:3.12.13-slim-trixie.
 # Rust: rustup 1.91.1. DuckDB: DUCKDB_DOWNLOAD_LIB links a prebuilt libduckdb.
@@ -19,8 +21,6 @@
 #
 # ADBC drivers are not baked in. Declare them at run time with QUERYFLUX_ADBC_DRIVERS or
 # QUERYFLUX_ADBC_DRIVERS_FILE; docker/adbc-drivers.sh installs them with the pinned dbc CLI.
-
-ARG QUERYFLUX_STUDIO_IMAGE=ghcr.io/lakeops-org/queryflux-studio:latest
 
 # =============================================================================
 # Chef base — Python + Rust (rustup, cargo-chef)
@@ -136,70 +136,14 @@ RUN curl -LsSf https://dbc.columnar.tech/install.sh \
     && dbc --version
 
 # =============================================================================
-# QueryFlux Studio — pre-built standalone image used by runtime-unified
-# =============================================================================
-FROM ${QUERYFLUX_STUDIO_IMAGE} AS studio-image
-
-# =============================================================================
-# Runtime: server + Studio + Node (bundled UI)
-# =============================================================================
-FROM python:3.12.13-slim-trixie AS runtime-unified
-
-ARG NODE_VERSION=20.18.1
-
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates \
-    curl \
-    xz-utils \
-    tini \
-    && DPKG_ARCH=$(dpkg --print-architecture) \
-    && case "$DPKG_ARCH" in \
-         amd64) NODE_ARCH=x64 ;; \
-         arm64) NODE_ARCH=arm64 ;; \
-         armhf) NODE_ARCH=armv7l ;; \
-         i386)  NODE_ARCH=x86 ;; \
-         *) echo "unsupported arch=$DPKG_ARCH"; exit 1 ;; \
-       esac \
-    && curl -fsSL "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-${NODE_ARCH}.tar.xz" \
-         | tar -xJf - -C /usr/local --strip-components=1 \
-    && rm -rf /var/lib/apt/lists/* \
-    && useradd -m -u 1000 queryflux \
-    && mkdir -p /app/studio \
-    && chown -R queryflux:queryflux /app
-
-COPY requirements.txt /tmp/requirements.txt
-RUN python3 -m venv /opt/venv && \
-    /opt/venv/bin/pip install --no-cache-dir -r /tmp/requirements.txt && \
-    rm /tmp/requirements.txt
-
-COPY --from=builder /queryflux-binary /app/queryflux
-COPY --from=builder /queryflux-libduckdb.so /usr/local/lib/libduckdb.so
-COPY --from=dbc /usr/local/bin/dbc /usr/local/bin/dbc
-COPY --from=studio-image --chown=queryflux:queryflux /app/ /app/studio/
-
-COPY docker/queryflux-unified/entrypoint-unified.sh /app/entrypoint-unified.sh
-COPY docker/adbc-drivers.sh /app/adbc-drivers.sh
-RUN chmod +x /app/queryflux /app/entrypoint-unified.sh /app/adbc-drivers.sh \
-    && mkdir -p /var/lib/queryflux/adbc \
-    && chown -R queryflux:queryflux /var/lib/queryflux
-
-ENV LD_LIBRARY_PATH=/usr/local/lib
-ENV PYO3_PYTHON=/opt/venv/bin/python3
-WORKDIR /app
-USER queryflux
-
-EXPOSE 3000 8080 9000
-
-ENTRYPOINT ["/usr/bin/tini", "--", "/app/entrypoint-unified.sh"]
-CMD ["--config", "/etc/queryflux/config.yaml"]
-
-# =============================================================================
-# Runtime: server only (default `docker build` final stage)
+# Runtime: server only
 # =============================================================================
 FROM python:3.12.13-slim-trixie AS runtime-server
 
+# curl: container healthchecks (docker compose examples) hit /health with it.
 RUN apt-get update && apt-get install --no-install-recommends -y \
     ca-certificates \
+    curl \
     && rm -rf /var/lib/apt/lists/* \
     && useradd -m -u 1000 queryflux \
     && mkdir -p /app \

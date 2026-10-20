@@ -31,7 +31,7 @@ else
 TEST_RUNNER = $(CARGO) test --tests --workspace --exclude queryflux-e2e-tests --exclude queryflux-bench
 endif
 
-.PHONY: dev stop logs build lint clippy check helm-check test benchmark benchmark-build benchmark-run test-e2e clean setup
+.PHONY: dev stop logs build lint clippy check helm-check test benchmark benchmark-build benchmark-run bench-capacity test-e2e clean setup
 
 
 
@@ -107,6 +107,19 @@ benchmark-run:
 	PYO3_PYTHON=$(shell pwd)/.venv/bin/python3 \
 	PYTHONPATH=$(PYTHONPATH_VENV) \
 	$(CARGO) run --release -p queryflux-bench
+
+## Capacity admission benchmark: simulated workers acquiring/releasing capacity leases in
+## Postgres, with a cap-violation checker (exits nonzero on any violation).
+## Needs DATABASE_URL (a disposable database; migrations run). Extra flags: BENCH_ARGS, e.g.
+##   make bench-capacity DATABASE_URL=postgres://... BENCH_ARGS="--duration-secs 30 --json out.json"
+## See website/docs/benchmarks.md ("Capacity benchmark").
+bench-capacity:
+	@test -n "$(DATABASE_URL)" || (echo "Set DATABASE_URL=postgres://user@host:port/db" && exit 1)
+	@test -f .venv/bin/python3 || (echo "Run 'make setup' first" && exit 1)
+	PYO3_PYTHON=$(shell pwd)/.venv/bin/python3 \
+	PYTHONPATH=$(PYTHONPATH_VENV) \
+	$(CARGO) run --release -p queryflux-bench -- capacity \
+		--database-url "$(DATABASE_URL)" --scenario all --transport both $(BENCH_ARGS)
 
 ## Run E2E tests. Spins up Trino + StarRocks + Lakekeeper stack via Docker.
 ## CI runs the same compose + `cargo test -p queryflux-e2e-tests` steps explicitly (see `e2e` job).

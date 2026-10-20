@@ -22,8 +22,8 @@ spec:
   {{- end }}
   {{- end }}
   ports:
-    {{- range $port := .Values.service.ports }}
-    {{- if $port.enabled }}
+    {{- range $key, $port := .Values.service.ports }}
+    {{- if and $port.enabled (or (ne $key "studio") $.Values.studio.enabled) }}
     - port: {{ $port.port }}
       targetPort: {{ $port.targetPort }}
       protocol: {{ $port.protocol }}

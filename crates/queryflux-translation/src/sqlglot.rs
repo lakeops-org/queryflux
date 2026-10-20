@@ -135,6 +135,12 @@ pub(crate) struct SqlglotFailure {
     pub reason: TranslationReason,
     /// Invariant violations must reject the request even under best-effort policy.
     pub reject_passthrough: bool,
+    /// The same input always fails the same way (a parse error, an unsupported construct
+    /// in strict mode, the read-to-write fixup check), so the translation cache may keep
+    /// it. False for anything that could succeed on retry: sqlglot import errors, a
+    /// panicked or cancelled blocking task, and errors raised by fixup scripts, which are
+    /// user code.
+    pub cacheable: bool,
 }
 
 impl From<QueryFluxError> for SqlglotFailure {
@@ -143,6 +149,19 @@ impl From<QueryFluxError> for SqlglotFailure {
             error,
             reason: TranslationReason::TranspileError,
             reject_passthrough: false,
+            cacheable: false,
+        }
+    }
+}
+
+impl SqlglotFailure {
+    /// A sqlglot parse or render error. Deterministic for the same input, except when the
+    /// interpreter ran out of memory.
+    fn deterministic(error: QueryFluxError) -> Self {
+        let cacheable = !error.to_string().contains("MemoryError");
+        Self {
+            cacheable,
+            ..Self::from(error)
         }
     }
 }
@@ -254,35 +273,34 @@ fn translate_with_gil(
             error: QueryFluxError::Translation(format!("Failed to import sqlglot: {e}")),
             reason: TranslationReason::SqlglotUnavailable,
             reject_passthrough: false,
+            cacheable: false,
         })?;
 
         // sqlglot can accept unknown syntax as an opaque Command even with
         // unsupported_level=RAISE. Keep the validated executable AST so empty
         // statements and standalone comments cannot change which SQL we emit.
-        let tree = parse_translatable_statement(py, &sqlglot, sql, src)?;
+        let tree = parse_translatable_statement(py, &sqlglot, sql, src)
+            .map_err(SqlglotFailure::deterministic)?;
+        let render = |tree: &Bound<'_, PyAny>| {
+            render_sql(py, tree, tgt, strict).map_err(SqlglotFailure::deterministic)
+        };
 
         // 1. Dialect translation (skipped when src == tgt; fixup scripts may still run).
         let (translated, fallback) = if src == tgt {
             let sql = if python_scripts.is_empty() {
                 sql.to_string()
             } else {
-                render_sql(py, &tree, tgt, strict)?
+                render(&tree)?
             };
             (sql, None)
         } else if schema_context.is_empty() {
             debug!(src, tgt, "sqlglot dialect-only translation");
-            (
-                render_sql(py, &tree, tgt, strict)?,
-                Some(TranslationReason::NoSchema),
-            )
+            (render(&tree)?, Some(TranslationReason::NoSchema))
         } else {
             debug!(src, tgt, "sqlglot schema-aware translation");
             match translate_with_schema(py, &tree, src, tgt, schema_context, strict) {
                 Ok(sql) => (sql, None),
-                Err(_) => (
-                    render_sql(py, &tree, tgt, strict)?,
-                    Some(TranslationReason::OptimizeError),
-                ),
+                Err(_) => (render(&tree)?, Some(TranslationReason::OptimizeError)),
             }
         };
 
@@ -533,6 +551,7 @@ fn run_fixup_scripts(
                 )),
                 reason: TranslationReason::TranspileError,
                 reject_passthrough: true,
+                cacheable: true,
             });
         }
     }

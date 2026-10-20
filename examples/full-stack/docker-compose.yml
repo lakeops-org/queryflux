@@ -17,7 +17,6 @@ services:
     ports:
       - "8080:8080"
       - "9000:9000"
-      - "3000:3000"
       - "3306:3306"
     volumes:
       - ./config.yaml:/etc/queryflux/config.yaml:ro
@@ -30,6 +29,17 @@ services:
         condition: service_healthy
       starrocks:
         condition: service_healthy
+    restart: unless-stopped
+
+  # Studio (admin UI) talks to QueryFlux only through the Admin API.
+  queryflux-studio:
+    image: ghcr.io/lakeops-org/queryflux-studio:latest
+    ports:
+      - "3000:3000"
+    environment:
+      ADMIN_API_URL: http://queryflux:9000
+    depends_on:
+      - queryflux
     restart: unless-stopped
 
   trino:

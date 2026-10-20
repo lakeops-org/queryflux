@@ -8,13 +8,13 @@
     {
       "type": "category",
       "label": "Guides",
-      "collapsed": false,
+      "collapsed": true,
       "items": ["getting-started", "studio"]
     },
     {
       "type": "category",
       "label": "Reference",
-      "collapsed": false,
+      "collapsed": true,
       "items": ["configuration"]
     },
     {

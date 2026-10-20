@@ -9,6 +9,9 @@ keywords:
   - SQL proxy
   - documentation
 ---
+
+import {DocCards, DocCard} from '@site/src/components/DocCards';
+
 # QueryFlux documentation
 
 QueryFlux is a **high-performance, protocol-aware SQL proxy** for analytical and operational engines. Clients connect with the drivers they already use (Trino HTTP, PostgreSQL wire, MySQL wire, Snowflake HTTP wire and SQL API v2, Arrow Flight). QueryFlux routes each query to the right backend, translates SQL dialects when needed, and exposes a single observability surface — so you stop wiring **N clients × M engines** by hand.
@@ -21,13 +24,14 @@ The ideas mirror what proxies like [ProxySQL](https://proxysql.com/documentation
 
 ## Quick guides
 
-| Guide | What you will do |
-| --- | --- |
-| **[Getting started](/docs/getting-started)** | Run QueryFlux with Docker Compose, connect a SQL client, smoke-test Trino HTTP. |
-| **[QueryFlux Studio](/docs/studio)** | Use the web UI for clusters, routing, query history, and admin security. |
-| **[Authentication & identity](./authentication)** | Set up OIDC/LDAP client auth and choose a backend identity mode (passthrough, impersonate, token exchange). |
-| **[Access control](./access-control/overview)** | Connect to OPA (not Rego in Studio); global + per–cluster-group scope; row filters, masks, use cases. |
-| **[Configuration](/docs/configuration)** | Edit `config.yaml` — frontends, cluster groups, routers, persistence, admin API. |
+<DocCards>
+  <DocCard title="Getting started" to="/docs/getting-started">Run QueryFlux with Docker Compose, connect a SQL client, smoke-test Trino HTTP.</DocCard>
+  <DocCard title="Installation" to="/docs/installation/overview">Deploy on Kubernetes with the Helm chart, run the Docker image, or install the binary.</DocCard>
+  <DocCard title="QueryFlux Studio" to="/docs/studio">Use the web UI for clusters, routing, query history, and admin security.</DocCard>
+  <DocCard title="Authentication & identity" to="/docs/authentication">Set up OIDC/LDAP client auth and choose a backend identity mode (passthrough, impersonate, token exchange).</DocCard>
+  <DocCard title="Access control" to="/docs/access-control/overview">Connect to OPA (not Rego in Studio); global + per–cluster-group scope; row filters, masks, use cases.</DocCard>
+  <DocCard title="Configuration" to="/docs/configuration">Edit <code>config.yaml</code> — frontends, cluster groups, routers, persistence, admin API.</DocCard>
+</DocCards>
 
 ---
 
