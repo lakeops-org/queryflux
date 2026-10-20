@@ -66,6 +66,18 @@ impl MetricsStore for MultiMetricsStore {
         }
     }
 
+    fn on_capacity_quota(&self, cluster_name: &str, quota: u64, running: u64, waiting: u64) {
+        for s in &self.stores {
+            s.on_capacity_quota(cluster_name, quota, running, waiting);
+        }
+    }
+
+    fn on_capacity_allocation(&self, cluster_name: &str, quota_committed: u64, holders: u64) {
+        for s in &self.stores {
+            s.on_capacity_allocation(cluster_name, quota_committed, holders);
+        }
+    }
+
     fn on_auth_failure(&self, protocol: &str) {
         for s in &self.stores {
             s.on_auth_failure(protocol);

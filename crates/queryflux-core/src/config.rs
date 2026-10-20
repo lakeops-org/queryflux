@@ -218,8 +218,17 @@ impl ProxyConfig {
                             .to_string(),
                     );
                 }
+                if q.capacity != CapacityConfig::default() {
+                    issues.push(
+                        "queryflux.capacity comes from the control plane on a worker; remove it"
+                            .to_string(),
+                    );
+                }
             }
             Role::Standalone | Role::ControlPlane => {
+                if let Err(e) = q.capacity.validate() {
+                    issues.push(e);
+                }
                 let worker_only = [
                     ("controlPlane", q.control_plane.is_some()),
                     ("workerName", q.worker_name.is_some()),
@@ -883,6 +892,90 @@ pub struct QueryFluxConfig {
     /// Standalone or control plane: accept workers on the admin listener.
     #[serde(default)]
     pub worker_api: Option<WorkerApiConfig>,
+    /// Standalone or control plane: how fleet-wide `maxRunningQueries` is enforced.
+    /// Workers follow their control plane.
+    #[serde(default)]
+    pub capacity: CapacityConfig,
+}
+
+/// How a cluster's `maxRunningQueries` is shared between the processes that admit
+/// queries (`queryflux.capacity`). Applies with distributed coordination.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CapacityConfig {
+    #[serde(default)]
+    pub mode: CapacityMode,
+    /// Share of each cluster's limit never handed out as quota, left for per-query leases
+    /// (bursts above a process's quota, and older workers). Default 0.15.
+    #[serde(default = "default_reserve_fraction")]
+    pub reserve_fraction: f64,
+    /// How long a process may admit on its quota without reaching the allocator.
+    /// Default 15.
+    #[serde(default = "default_quota_lease_secs")]
+    pub quota_lease_secs: u64,
+    /// How often each process reports its demand. Default 1000; at most 250 ms apart
+    /// while it has queries waiting.
+    #[serde(default = "default_report_interval_ms")]
+    pub report_interval_ms: u64,
+}
+
+impl Default for CapacityConfig {
+    fn default() -> Self {
+        Self {
+            mode: CapacityMode::default(),
+            reserve_fraction: default_reserve_fraction(),
+            quota_lease_secs: default_quota_lease_secs(),
+            report_interval_ms: default_report_interval_ms(),
+        }
+    }
+}
+
+fn default_reserve_fraction() -> f64 {
+    0.15
+}
+fn default_quota_lease_secs() -> u64 {
+    15
+}
+fn default_report_interval_ms() -> u64 {
+    1000
+}
+
+impl CapacityConfig {
+    pub fn validate(&self) -> std::result::Result<(), String> {
+        if !(0.0..=0.9).contains(&self.reserve_fraction) {
+            return Err(format!(
+                "capacity.reserveFraction must be between 0 and 0.9 (got {})",
+                self.reserve_fraction
+            ));
+        }
+        if !(2..=300).contains(&self.quota_lease_secs) {
+            return Err(format!(
+                "capacity.quotaLeaseSecs must be between 2 and 300 (got {})",
+                self.quota_lease_secs
+            ));
+        }
+        if !(100..=60_000).contains(&self.report_interval_ms)
+            || self.report_interval_ms >= self.quota_lease_secs * 1000 / 2
+        {
+            return Err(format!(
+                "capacity.reportIntervalMs must be between 100 and 60000 and under half of \
+                 quotaLeaseSecs (got {} ms with a {} s lease)",
+                self.report_interval_ms, self.quota_lease_secs
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum CapacityMode {
+    /// Every admission takes a per-query lease from Postgres (or the control plane).
+    #[default]
+    Leases,
+    /// Each process gets a share of every cluster's limit and admits within it without a
+    /// round trip; per-query leases cover the rest.
+    Quotas,
 }
 
 /// What a QueryFlux process does.
@@ -3027,6 +3120,29 @@ guardrails:
             query + coordination + admin + PostgresPersistenceConfig::LISTENER_CONNECTIONS <= total,
             "pools ({query}+{coordination}+{admin}) + listener must not exceed poolSize {total}"
         );
+    }
+
+    #[test]
+    fn capacity_config_defaults_and_limits() {
+        use crate::config::{CapacityConfig, CapacityMode};
+        let c = CapacityConfig::default();
+        assert_eq!(c.mode, CapacityMode::Leases);
+        assert!(c.validate().is_ok());
+        let bad = CapacityConfig {
+            reserve_fraction: 0.95,
+            ..Default::default()
+        };
+        assert!(bad.validate().unwrap_err().contains("reserveFraction"));
+        let slow = CapacityConfig {
+            quota_lease_secs: 4,
+            report_interval_ms: 3000,
+            ..Default::default()
+        };
+        assert!(slow.validate().unwrap_err().contains("half"));
+        let parsed: CapacityConfig =
+            serde_yaml::from_str("mode: quotas\nreserveFraction: 0.2\n").unwrap();
+        assert_eq!(parsed.mode, CapacityMode::Quotas);
+        assert_eq!(parsed.quota_lease_secs, 15);
     }
 
     #[test]

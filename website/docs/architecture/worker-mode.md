@@ -187,6 +187,7 @@ sequenceDiagram
 - **Mixed fleets share one cap.** A control plane that also serves queries uses the lease table directly, and its workers use it through the API, so one `maxRunningQueries` covers all of them.
 - **Leases of dead workers expire.** Workers renew their leases on a timer, and the control plane's stale-lease sweep reclaims a worker's leases once its renewals stop. Sweep locks held for a worker are dropped after 5 minutes if never released.
 - **Releases are batched.** A worker queues each release and sends them together (`POST /worker/capacity/release-batch`), so a finishing query doesn't wait on the control plane. What a lease costs: [Capacity and throughput](./capacity-and-throughput).
+- **Quotas.** With `capacity.mode: quotas` on the control plane, each worker gets a share of every cluster's limit and admits within it without a round trip; per-query leases cover bursts and older workers. See [Capacity quotas](./capacity-and-throughput#capacity-quotas).
 - **Local work stays local.** A worker's zombie and stale-queue sweeps clean its own memory, so they never take fleet-wide locks.
 - **Cost:** one round trip per query to acquire a lease, with a 5-second timeout. The release is off the query path: a finishing query doesn't wait for it. Releases that finish together share one request; a query that finishes alone still sends its own.
 

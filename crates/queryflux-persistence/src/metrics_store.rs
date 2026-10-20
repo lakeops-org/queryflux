@@ -194,6 +194,13 @@ pub trait MetricsStore: Send + Sync {
     /// a worker's control plane) was full, so it waits in the queue.
     fn on_capacity_lease_denied(&self, _cluster_group: &str, _cluster_name: &str) {}
 
+    /// A holder's current quota for a cluster, the queries it runs on it, and the
+    /// queries waiting for capacity (capacity quotas). Called on every demand report.
+    fn on_capacity_quota(&self, _cluster_name: &str, _quota: u64, _running: u64, _waiting: u64) {}
+
+    /// The allocator's total committed quota for a cluster and how many holders share it.
+    fn on_capacity_allocation(&self, _cluster_name: &str, _quota_committed: u64, _holders: u64) {}
+
     /// Called when a worker starts or stops serving a config its control plane has not
     /// confirmed (one copied from a peer at startup).
     fn on_worker_config_stale(&self, _stale: bool) {}

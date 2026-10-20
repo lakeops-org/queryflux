@@ -19,6 +19,7 @@ use crate::live_config::{
 /// process reloads its config (`changes`), so admin edits reach workers on their next
 /// poll while thousands of waiting workers share one build. Without Postgres the config
 /// cannot change at runtime, so the snapshot is built once, now, from the startup inputs.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn worker_api(
     config: &ProxyConfig,
     store: Option<Arc<dyn ConfigSnapshotStore>>,
@@ -27,6 +28,7 @@ pub(crate) fn worker_api(
     changes: tokio::sync::watch::Receiver<u64>,
     coordination: Option<Arc<dyn queryflux_persistence::CoordinationStore>>,
     history: Arc<dyn queryflux_persistence::MetricsStore>,
+    quotas: Option<Arc<dyn queryflux_persistence::quota::QuotaStore>>,
 ) -> Result<Option<WorkerApi>> {
     let Some(api_cfg) = config.queryflux.worker_api.as_ref().filter(|a| a.enabled) else {
         return Ok(None);
@@ -97,6 +99,7 @@ pub(crate) fn worker_api(
         changes: Some(changes),
         coordination,
         history: Some(history),
+        quotas,
     }))
 }
 

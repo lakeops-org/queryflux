@@ -6,6 +6,8 @@ pub mod metrics_store;
 pub mod migrate;
 pub mod postgres;
 pub mod query_history;
+pub mod quota;
+pub mod quota_admission;
 pub mod routing_json;
 pub mod routing_slices;
 pub mod script_library;

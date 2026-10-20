@@ -152,6 +152,8 @@ async fn main() -> Result<()> {
         snapshot_store,
         worker_registry,
         history_store,
+        quota_store,
+        quota_allocator,
     } = startup::stores::build_stores(&config).await?;
     // Coordination the control plane serves to workers: its own, only when it enforces
     // capacity with it (otherwise dead workers' leases would never expire).
@@ -159,7 +161,9 @@ async fn main() -> Result<()> {
     // A worker's executing and queued queries live in its own memory, so it sweeps them
     // itself (`local_sweeps`), while capacity leases and engine counts are shared through
     // the control plane with `coordination.mode: controlPlane`.
-    let (coordination, local_sweeps) = if is_worker {
+    // Quotas: where this process reports demand. A worker asks its control plane, which
+    // answers 404 when it has no quotas, so the worker keeps per-query leases.
+    let (coordination, local_sweeps, quota_source) = if is_worker {
         let coord_cfg = config.queryflux.coordination.clone().unwrap_or_default();
         let remote = match (&config.queryflux.control_plane, coord_cfg.mode) {
             (Some(cp), queryflux_core::config::CoordinationMode::ControlPlane) => {
@@ -177,9 +181,16 @@ async fn main() -> Result<()> {
                 None
             }
         };
-        (remote, None)
+        let quota_source = remote
+            .clone()
+            .map(|r| r as Arc<dyn queryflux_persistence::quota::QuotaStore>);
+        (
+            remote.map(|r| r as Arc<dyn queryflux_persistence::CoordinationStore>),
+            None,
+            quota_source,
+        )
     } else {
-        (coordination.clone(), coordination)
+        (coordination.clone(), coordination, quota_store.clone())
     };
 
     // Filled when Postgres loads cluster/group rows — used for query_history FKs on ClusterState.
@@ -621,19 +632,40 @@ async fn main() -> Result<()> {
 
     // Releases are queued and sent in batches in the background, so a finishing query
     // never waits on Postgres or the control plane. Shutdown's `release_all_for_instance`
-    // frees anything still queued.
-    let capacity_store: Option<Arc<dyn queryflux_persistence::CapacityStore>> = distributed
-        .then(|| {
-            coordination.clone().map(|b| {
-                Arc::new(
-                    queryflux_persistence::batched_release::BatchedReleaseStore::new(
-                        b as Arc<dyn queryflux_persistence::CapacityStore>,
-                        metrics.clone(),
-                    ),
-                ) as Arc<dyn queryflux_persistence::CapacityStore>
-            })
-        })
-        .flatten();
+    // frees anything still queued. With capacity quotas, most admissions don't reach the
+    // store at all (see `QuotaAdmission`).
+    let capacity_mode = config.queryflux.capacity.mode;
+    let mut capacity_store: Option<Arc<dyn queryflux_persistence::CapacityStore>> = None;
+    if let (true, Some(store)) = (distributed, coordination.clone()) {
+        let batched: Arc<dyn queryflux_persistence::CapacityStore> = Arc::new(
+            queryflux_persistence::batched_release::BatchedReleaseStore::new(
+                store as Arc<dyn queryflux_persistence::CapacityStore>,
+                metrics.clone(),
+            ),
+        );
+        capacity_store = Some(match &quota_source {
+            Some(source) => {
+                let qa = queryflux_persistence::quota_admission::QuotaAdmission::new(
+                    batched,
+                    source.clone(),
+                    instance_id.clone(),
+                    metrics.clone(),
+                );
+                if is_worker {
+                    qa.follow_source();
+                } else {
+                    qa.set_policy(
+                        capacity_mode == queryflux_core::config::CapacityMode::Quotas,
+                        std::time::Duration::from_millis(
+                            config.queryflux.capacity.report_interval_ms,
+                        ),
+                    );
+                }
+                qa
+            }
+            None => batched,
+        });
+    }
     let queue_coordinator: Option<Arc<dyn queryflux_persistence::QueueCoordinator>> = distributed
         .then(|| {
             distributed_backend
@@ -818,6 +850,9 @@ async fn main() -> Result<()> {
         config_changed_rx,
         served_coordination.filter(|_| distributed),
         history_store,
+        quota_store.filter(|_| {
+            distributed && capacity_mode == queryflux_core::config::CapacityMode::Quotas
+        }),
     )?;
     let admin = AdminFrontend::new(
         prometheus.clone(),
@@ -897,6 +932,28 @@ async fn main() -> Result<()> {
     );
 
     startup::tasks::spawn_lease_heartbeat(&app_state, &shutdown_rx);
+
+    if let (
+        true,
+        false,
+        queryflux_core::config::CapacityMode::Quotas,
+        Some(allocator),
+        Some(sweeps),
+    ) = (
+        distributed,
+        is_worker,
+        capacity_mode,
+        quota_allocator,
+        local_sweeps.clone(),
+    ) {
+        startup::tasks::spawn_capacity_allocator(
+            allocator,
+            sweeps,
+            &config.queryflux.capacity,
+            app_state.metrics.clone(),
+            &shutdown_rx,
+        );
+    }
 
     startup::tasks::spawn_zombie_sweep(&app_state, &local_sweeps, &shutdown_rx);
 
