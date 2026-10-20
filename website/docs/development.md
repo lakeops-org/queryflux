@@ -79,7 +79,7 @@ The Cargo workspace lives under `crates/`. Common places to touch code:
 | `queryflux-metrics` | Prometheus instrumentation, buffered metrics |
 | `queryflux-auth` | Auth providers, authorization, identity resolution |
 | `queryflux-fingerprint` | Query fingerprinting (AST-based deduplication) |
-| `queryflux-bench` | Proxy overhead benchmarks (mock backends) |
+| `queryflux-bench` | Proxy overhead benchmarks (mock backends) and the capacity admission benchmark (`queryflux-bench capacity`) |
 | `queryflux-e2e-tests` | Integration tests behind Docker |
 
 Architecture narrative: **[System map](/docs/architecture/system-map)** and the **[architecture documentation overview](/docs/architecture/overview)**.

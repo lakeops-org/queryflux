@@ -17,3 +17,9 @@ anyhow = { workspace = true }
 async-trait = { workspace = true }
 mysql_async = { workspace = true }
 opensrv-mysql = { version = "0.7", default-features = false }
+clap = { version = "4", features = ["derive"] }
+serde = { workspace = true }
+queryflux-core = { workspace = true }
+queryflux-persistence = { workspace = true }
+queryflux-frontend = { workspace = true }
+sqlx = { version = "0.8.6", features = ["runtime-tokio-rustls", "postgres"] }
