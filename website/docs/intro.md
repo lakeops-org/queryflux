@@ -44,6 +44,7 @@ Modern stacks mix **many query engines** — each with its own wire protocol and
 - **Workload-aware routing** — encode which workloads go where (by protocol, user, tags, SQL pattern, or a Python rule), e.g. CPU-heavy work to compute-priced clusters and selective scans to pay-per-scan engines.
 - **SLA protection** — cap concurrent queries per group; queue at the proxy instead of overloading backends.
 - **Transparent migration** — split traffic by weight between engines without client changes.
+- **Agents with guardrails** — AI agents connect over MCP or any SQL driver; every query records its agent and conversation, and goes through the same routing, guardrails and access policies as everyone else. See [Agentic AI](/docs/agentic/overview).
 
 For a deeper product rationale, see **[Motivation and goals](/docs/architecture/motivation-and-goals)** and **[Benchmarks](/docs/benchmarks)**. For the control-plane argument — why engines should stay replaceable — read **[The Future Isn't One Engine. It's a Control Plane.](https://lakeops.dev/blog/the-future-isnt-one-engine)** on the LakeOps blog.
 

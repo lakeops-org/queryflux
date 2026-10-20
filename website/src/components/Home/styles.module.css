@@ -699,7 +699,7 @@
 
 .pillarGrid {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(4, minmax(0, 1fr));
   gap: 1.25rem;
 }
 
@@ -1011,4 +1011,29 @@
   .useCaseGrid {
     grid-template-columns: 1fr;
   }
+}
+
+/* Homepage FAQ: native <details>, no JS. */
+.faqList {
+  max-width: 820px;
+  margin: 0 auto;
+  display: grid;
+  gap: 0.75rem;
+}
+
+.faqItem {
+  border: 1px solid var(--ifm-color-emphasis-200);
+  border-radius: 10px;
+  padding: 0.9rem 1.15rem;
+  background: var(--ifm-background-surface-color);
+}
+
+.faqQuestion {
+  cursor: pointer;
+  font-weight: 600;
+}
+
+.faqAnswer {
+  margin: 0.65rem 0 0;
+  color: var(--ifm-color-emphasis-800);
 }

@@ -14,40 +14,28 @@ type Pillar = {
 
 const PILLARS: Pillar[] = [
   {
-    title: 'Workload-aware routing',
-    body: 'Route by protocol, user, tags, SQL pattern, or a Python rule: send CPU-heavy joins to compute-priced clusters and selective cold scans to pay-per-scan engines. Encode the cost model once; every client inherits it.',
-    basis: 'Router chain · Python routers',
+    title: 'Route',
+    body: 'Send each query to the engine that should run it, by protocol, user, tags, SQL pattern or a Python rule. Translate the dialect on the way, and move traffic between engines by weight with no client changes.',
+    basis: 'Router chain · sqlglot · weighted groups',
     to: '/docs/architecture/routing-and-clusters',
   },
   {
-    title: 'SLA protection',
-    body: 'Cap running queries per cluster group, across every replica and worker. When a group is full, queries wait in line at the proxy, first come first served, instead of hammering the backend.',
-    basis: 'Cluster groups · Admission queue',
-    to: '/docs/architecture/routing-and-clusters',
+    title: 'Contain',
+    body: 'Cap running queries per engine across every replica and worker, and queue the rest. Block writes, cap rows, require a WHERE clause on chosen tables, and apply row filters and column masks from OPA or Cerbos.',
+    basis: 'Capacity limits · guardrails · access control',
+    to: '/docs/architecture/guardrails',
   },
   {
-    title: 'Dialect translation',
-    body: 'Clients write the SQL they know. QueryFlux rewrites it with sqlglot when the target engine speaks a different dialect, in strict or best-effort mode.',
-    basis: 'sqlglot · Translation policy',
-    to: '/docs/architecture/query-translation',
+    title: 'Understand',
+    body: 'See every query with its user or agent, the route it took, its timings and its guardrail decisions. Prometheus metrics, Grafana dashboards, and Studio for history, routing and replay.',
+    basis: 'Query history · Prometheus · Studio',
+    to: '/docs/architecture/observability',
   },
   {
-    title: 'Transparent migration',
-    body: 'Weighted load balancing inside a group lets you ramp a new engine from 10% to 100% of traffic with zero client changes and side-by-side latency in Studio.',
-    basis: 'Weighted strategies · Query history',
-    to: '/docs/architecture/routing-and-clusters',
-  },
-  {
-    title: 'Identity & access control',
-    body: 'Authenticate clients with OIDC or LDAP, choose passthrough or impersonation per backend, and enforce row filters and column masks through OPA.',
-    basis: 'Auth providers · OPA policies',
-    to: '/docs/access-control/overview',
-  },
-  {
-    title: 'Built for operators',
-    body: 'Rust core with ~0.35 ms p50 overhead, Prometheus metrics, Postgres-backed state, an admin API, and a Studio UI for clusters, routing, and history.',
-    basis: 'Tokio · Prometheus · Studio',
-    to: '/docs/studio',
+    title: 'Open',
+    body: 'Any engine, any protocol, in your environment. Apache-2.0, written in Rust, about 0.35 ms of p50 overhead. Your clients keep their drivers; your engines stay replaceable.',
+    basis: 'Apache-2.0 · Rust · self-hosted',
+    to: '/docs/getting-started',
   },
 ];
 
@@ -58,8 +46,8 @@ export default function HomePillars(): ReactNode {
         <SectionHeader
           id="home-pillars"
           eyebrow="Capabilities"
-          title="Six reasons teams put QueryFlux in front"
-          lead="A smart tier between clients and engines — the pattern ProxySQL made standard for OLTP fleets, applied to multi-engine analytics and the lakehouse."
+          title="Route, contain, understand — over engines you already run"
+          lead="One control point between your clients, your agents and your engines: it decides where each query runs, what it may do, and keeps the record."
         />
         <div className={styles.pillarGrid}>
           {PILLARS.map((p, i) => (
