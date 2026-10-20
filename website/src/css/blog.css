@@ -118,3 +118,106 @@ article .markdown .blog-cta {
 article .markdown .blog-cta p {
   margin: 0;
 }
+
+/*
+ * Post page: wide layout with a content column and a carded "On this page" TOC,
+ * large title and byline, hero image, faint dot grid.
+ */
+html.blog-post-page .main-wrapper {
+  background-image: radial-gradient(rgba(255, 255, 255, 0.07) 1px, transparent 1px);
+  background-size: 22px 22px;
+}
+
+html.blog-post-page .container.margin-vert--lg {
+  max-width: 78rem;
+}
+
+@media (min-width: 997px) {
+  html.blog-post-page .row > main.col {
+    flex: 0 0 68%;
+    max-width: 68%;
+    margin-left: 0;
+  }
+
+  html.blog-post-page .row > .col.col--2 {
+    flex: 0 0 28%;
+    max-width: 28%;
+    margin-left: 4%;
+  }
+}
+
+html.blog-post-page article header h1 {
+  font-size: clamp(2.2rem, 4.2vw, 3.2rem);
+  line-height: 1.08;
+  letter-spacing: -0.035em;
+  margin-bottom: 1rem;
+}
+
+html.blog-post-page article header .avatar__photo {
+  width: 3.5rem;
+  height: 3.5rem;
+}
+
+html.blog-post-page article header .avatar__name {
+  font-size: 1.1rem;
+}
+
+.blog-post-hero {
+  display: block;
+  width: 100%;
+  height: auto;
+  margin: 1.75rem 0 2.25rem;
+  border-radius: 14px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+/* Table of contents as a sticky card. */
+html.blog-post-page .col--2 > div {
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 14px;
+  background: rgba(10, 10, 14, 0.85);
+  padding: 1.1rem 0.9rem 1.1rem 1rem;
+}
+
+html.blog-post-page .col--2 > div::before {
+  content: 'On this page';
+  display: block;
+  font-family: var(--qf-font-mono);
+  font-size: 0.72rem;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: rgba(212, 212, 216, 0.7);
+  padding: 0 0.4rem 0.85rem;
+  margin-bottom: 0.6rem;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+html.blog-post-page .col--2 .table-of-contents {
+  border-left: none;
+  font-size: 0.86rem;
+}
+
+html.blog-post-page .col--2 .table-of-contents__link {
+  display: block;
+  padding: 0.35rem 0.5rem;
+  border-left: 2px solid transparent;
+  border-radius: 0 6px 6px 0;
+  color: rgba(212, 212, 216, 0.75);
+}
+
+html.blog-post-page .col--2 .table-of-contents__link:hover {
+  color: #fafafa;
+}
+
+html.blog-post-page .col--2 .table-of-contents__link--active {
+  color: #e9d5ff;
+  border-left-color: #8b5cf6;
+  background: rgba(139, 92, 246, 0.12);
+}
+
+/* Inline code as small chips. */
+html.blog-post-page article .markdown :not(pre) > code {
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 5px;
+  padding: 0.1rem 0.35rem;
+}
