@@ -4424,4 +4424,52 @@ auth: { provider: static, required: true }
         );
         assert!(ok.validate_role().is_ok());
     }
+
+    #[test]
+    fn agent_guard_params_parse_and_validate() {
+        let spec: GuardSpecConfig = serde_yaml::from_str(
+            "kind: built_in\nname: time_range_limit\ntables: { \"events*\": ts }\nmax_lookback: 30d\n",
+        )
+        .unwrap();
+        assert_eq!(spec.params.max_lookback.as_deref(), Some("30d"));
+        assert!(spec.validate().is_ok());
+
+        let check = |name: &str, params: BuiltInGuardParams| {
+            super::validate_built_in_guard(Some(name), &params)
+        };
+        assert!(check("partition_predicate_required", Default::default()).is_err());
+        assert!(check(
+            "time_range_limit",
+            BuiltInGuardParams {
+                tables: Some([("events".to_string(), "ts".to_string())].into()),
+                max_lookback: Some("30 days".into()),
+                ..Default::default()
+            }
+        )
+        .is_err());
+        assert!(check(
+            "row_limit",
+            BuiltInGuardParams {
+                inject_limit: Some(true),
+                ..Default::default()
+            }
+        )
+        .is_err());
+        assert!(check(
+            "row_limit",
+            BuiltInGuardParams {
+                inject_limit: Some(true),
+                max_rows: Some(100),
+                default_limit: Some(500),
+                ..Default::default()
+            }
+        )
+        .is_err());
+        assert!(check("no_cross_join", Default::default()).is_ok());
+        assert_eq!(super::parse_lookback("2w"), Ok(chrono::Duration::days(14)));
+        assert_eq!(
+            super::parse_lookback("36h"),
+            Ok(chrono::Duration::hours(36))
+        );
+    }
 }

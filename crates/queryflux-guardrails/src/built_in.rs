@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use polyglot_sql::expressions::{Expression, Literal};
 use polyglot_sql::traversal::ExpressionWalk;
-use queryflux_core::sql_classify::{is_read_like_fallback, is_read_stmt, to_polyglot_dialect};
+use queryflux_core::sql_classify::{is_read_only_sql, is_read_stmt, to_polyglot_dialect};
 
 use crate::context::{GuardContext, GuardLayer, GuardResult};
 
@@ -52,25 +52,14 @@ impl Guard for ReadOnlyGuard {
         GuardLayer::Plan
     }
     async fn check(&self, ctx: &GuardContext<'_>) -> GuardResult {
-        match guard_statements(ctx).await {
-            Ok(stmts) => {
-                for stmt in stmts.iter() {
-                    if !is_read_stmt(stmt) {
-                        return GuardResult::deny(
-                            "write operations are not permitted",
-                            "READ_ONLY_VIOLATION",
-                        );
-                    }
-                }
-                GuardResult::allow()
-            }
-            Err(_) => {
-                if is_read_like_fallback(ctx.sql) {
-                    GuardResult::allow()
-                } else {
-                    GuardResult::deny("write operations are not permitted", "READ_ONLY_VIOLATION")
-                }
-            }
+        if is_read_only_sql(ctx.sql, ctx.dialect.clone(), ctx.sql_parse).await {
+            GuardResult::allow()
+        } else {
+            GuardResult::deny(
+                "write operations are not permitted; only SELECT, SHOW, DESCRIBE and EXPLAIN \
+                 (without ANALYZE of a write) may run here",
+                "READ_ONLY_VIOLATION",
+            )
         }
     }
 }
@@ -1369,5 +1358,25 @@ SELECT order_id, amount FROM filtered
             .with_engine(EngineType::Trino);
         let r = NoCrossJoinGuard.check(&tc.ctx()).await;
         assert!(!r.is_deny(), "{r:?}");
+    }
+
+    #[tokio::test]
+    async fn read_only_blocks_writes_hidden_in_reads() {
+        for sql in [
+            "EXPLAIN ANALYZE DELETE FROM t",
+            "SELECT * INTO t2 FROM t",
+            "WITH d AS (DELETE FROM t RETURNING *) SELECT * FROM d",
+            "CALL system.drop_stats('t')",
+        ] {
+            let tc = TestCtx::new(sql).with_engine(EngineType::Trino);
+            let r = ReadOnlyGuard.check(&tc.ctx()).await;
+            assert!(r.is_deny(), "{sql}: {r:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn read_only_allows_explain_of_select() {
+        let tc = TestCtx::new("EXPLAIN SELECT * FROM t").with_engine(EngineType::Trino);
+        assert!(!ReadOnlyGuard.check(&tc.ctx()).await.is_deny());
     }
 }

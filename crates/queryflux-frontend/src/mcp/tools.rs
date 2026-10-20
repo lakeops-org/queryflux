@@ -2,14 +2,11 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
-use polyglot_sql::{expressions::Expression, is_ddl, ExpressionWalk};
 use queryflux_auth::{require_query_owner, AuthContext, AuthProvider};
 use queryflux_core::{
     query::{ClusterGroupName, FrontendProtocol, ProxyQueryId, SqlDialect},
     session::{AgentContext, SessionContext},
-    sql_classify::{
-        is_read_like_fallback, is_read_stmt, strip_leading_sql_comments, SqlParseCache,
-    },
+    sql_classify::is_read_only_sql,
 };
 use queryflux_routing::ChainRouteResult;
 use rmcp::{
@@ -437,92 +434,6 @@ fn list_tables_sql(catalog: Option<&str>, schema: Option<&str>) -> String {
     )
 }
 
-/// Keywords that mark a statement as a write (or a SELECT ... INTO). Used where the SQL
-/// can't be fully parsed: an EXPLAIN's target, and the prefix fallback.
-const WRITE_KEYWORDS: &[&str] = &[
-    "INSERT", "UPDATE", "DELETE", "MERGE", "UPSERT", "CREATE", "DROP", "ALTER", "TRUNCATE", "COPY",
-    "CALL", "GRANT", "REVOKE", "VACUUM", "UNLOAD", "INTO",
-];
-const READ_HEADS: &[&str] = &[
-    "SELECT", "WITH", "VALUES", "TABLE", "SHOW", "DESCRIBE", "DESC",
-];
-
-/// Words of `sql` with their byte offsets (identifier characters only, so punctuation,
-/// parentheses, and operators separate words).
-fn words(sql: &str) -> impl Iterator<Item = (usize, &str)> {
-    sql.split(|c: char| !(c.is_alphanumeric() || c == '_'))
-        .filter(|w| !w.is_empty())
-        .map(move |w| (w.as_ptr() as usize - sql.as_ptr() as usize, w))
-}
-
-/// The statement an `EXPLAIN ...` wraps, skipping options like `ANALYZE` or `(FORMAT JSON)`.
-/// `None` when the first statement keyword is a write — `EXPLAIN ANALYZE DELETE` runs the
-/// DELETE on several engines.
-fn explained_statement(sql: &str) -> Option<&str> {
-    words(sql).skip(1).find_map(|(at, w)| {
-        let w = w.to_ascii_uppercase();
-        if READ_HEADS.contains(&w.as_str()) {
-            Some(Some(&sql[at..]))
-        } else if WRITE_KEYWORDS.contains(&w.as_str()) {
-            Some(None)
-        } else {
-            None
-        }
-    })?
-}
-
-/// Stricter than the `read_only` guardrail's `is_read_stmt`: a parser catch-all `Command`
-/// counts only when it is a SHOW/DESCRIBE (`CALL`, `VACUUM`, `UNLOAD` land there too), and
-/// no node anywhere in the tree may write — that catches `SELECT ... INTO` and
-/// data-modifying CTEs (`WITH d AS (DELETE ... RETURNING *) SELECT ...`).
-fn is_mcp_read_stmt(stmt: &Expression) -> bool {
-    let top_level_read = match stmt {
-        Expression::Command(c) => words(&c.this).next().is_some_and(|(_, w)| {
-            ["SHOW", "DESCRIBE", "DESC"].contains(&w.to_ascii_uppercase().as_str())
-        }),
-        other => is_read_stmt(other),
-    };
-    top_level_read && !stmt.contains(is_write_node)
-}
-
-fn is_write_node(e: &Expression) -> bool {
-    match e {
-        Expression::Insert(_)
-        | Expression::Update(_)
-        | Expression::Delete(_)
-        | Expression::Merge(_)
-        | Expression::Copy(_)
-        | Expression::Truncate(_) => true,
-        Expression::Select(s) => s.into.is_some(),
-        other => is_ddl(other),
-    }
-}
-
-/// Whether `sql` is safe for the read-only `execute_query` tool: every statement is a read.
-async fn is_read_only_sql(sql: &str, dialect: SqlDialect) -> bool {
-    let mut sql = strip_leading_sql_comments(sql);
-    if words(sql)
-        .next()
-        .is_some_and(|(_, w)| w.eq_ignore_ascii_case("EXPLAIN"))
-    {
-        match explained_statement(sql) {
-            Some(inner) => sql = inner,
-            None => return false,
-        }
-    }
-    let cache = SqlParseCache::new(sql, dialect);
-    match cache.statements_async().await {
-        Some(stmts) => !stmts.is_empty() && stmts.iter().all(is_mcp_read_stmt),
-        // ponytail: keyword scan over-rejects reads that mention e.g. a column named
-        // "update" — only on SQL the parser can't handle, and refusing is the safe side.
-        None => {
-            is_read_like_fallback(sql)
-                && !words(sql)
-                    .any(|(_, w)| WRITE_KEYWORDS.contains(&w.to_ascii_uppercase().as_str()))
-        }
-    }
-}
-
 /// The dialect `sql` is parsed with for classification: the caller's `dialect` override,
 /// else the MCP frontend default.
 fn classify_dialect(dialect: Option<&str>) -> SqlDialect {
@@ -643,7 +554,7 @@ impl QueryFluxMcpServer {
     ) -> Result<CallToolResult, McpError> {
         let classify_as = classify_dialect(dialect.as_deref());
         let dialect = resolve_dialect_override(dialect.as_deref())?;
-        if !is_read_only_sql(&sql, classify_as).await {
+        if !is_read_only_sql(&sql, classify_as, None).await {
             return Ok(tool_error(if self.allow_writes {
                 USE_EXECUTE_STATEMENT
             } else {
@@ -1160,7 +1071,10 @@ mod read_write_split_tests {
             "SHOW CREATE TABLE t",
             "DESC t",
         ] {
-            assert!(is_read_only_sql(sql, SqlDialect::Generic).await, "{sql}");
+            assert!(
+                is_read_only_sql(sql, SqlDialect::Generic, None).await,
+                "{sql}"
+            );
         }
     }
 
@@ -1193,7 +1107,10 @@ mod read_write_split_tests {
             "USE db",
             "",
         ] {
-            assert!(!is_read_only_sql(sql, SqlDialect::Generic).await, "{sql}");
+            assert!(
+                !is_read_only_sql(sql, SqlDialect::Generic, None).await,
+                "{sql}"
+            );
         }
     }
 
@@ -1201,7 +1118,9 @@ mod read_write_split_tests {
     async fn dialect_override_is_used_for_classification() {
         assert_eq!(classify_dialect(Some("trino")), SqlDialect::Trino);
         assert_eq!(classify_dialect(None), SqlDialect::Generic);
-        assert!(is_read_only_sql("SELECT `a` FROM `t`", classify_dialect(Some("mysql"))).await);
+        assert!(
+            is_read_only_sql("SELECT `a` FROM `t`", classify_dialect(Some("mysql")), None).await
+        );
     }
 
     #[test]
