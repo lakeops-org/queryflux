@@ -73,6 +73,8 @@ pub struct LiveConfig {
     pub group_max_queued_queries: HashMap<String, Option<u64>>,
     /// group_name → resolved capacity wait timeout in seconds (default 300).
     pub group_capacity_wait_timeout_secs: HashMap<String, u64>,
+    /// group_name → `maxExecutionSecs` for groups that set one (no entry = no limit).
+    pub group_max_execution_secs: HashMap<String, u64>,
     /// group_name → cache settings for groups that have caching enabled.
     pub group_cache_settings: HashMap<String, queryflux_core::config::GroupCacheConfig>,
     /// Verifies client identity — hot-reloaded when security config changes via admin API.
@@ -810,6 +812,7 @@ pub mod test_fixtures {
             group_default_tags: HashMap::new(),
             group_max_queued_queries: HashMap::new(),
             group_capacity_wait_timeout_secs: HashMap::new(),
+            group_max_execution_secs: HashMap::new(),
             group_cache_settings: HashMap::new(),
             auth_provider: Arc::new(NoneAuthProvider::new(auth_required)) as Arc<dyn AuthProvider>,
             authorization: Arc::new(AllowAllAuthorization::default())

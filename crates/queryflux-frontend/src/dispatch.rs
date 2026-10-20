@@ -2805,6 +2805,14 @@ impl<S: ResultSink + ?Sized> queryflux_cache::CacheSink for SinkCacheAdapter<'_,
     }
 }
 
+/// Error for a query stopped by its group's `maxExecutionSecs`.
+pub fn execution_timeout_message(limit_secs: u64) -> String {
+    format!(
+        "query exceeded the {limit_secs}s execution limit (maxExecutionSecs) and was cancelled \
+         [EXECUTION_TIMEOUT]; narrow the query (filters, LIMIT, fewer columns) and retry"
+    )
+}
+
 /// Inner function that does the actual sync query execution (slot acquisition,
 /// guard chain, engine submission). Extracted so `execute_to_sink` can wrap it
 /// with `TeeResultSink` on cache-miss without duplicating logic.
@@ -2923,14 +2931,40 @@ async fn execute_to_sink_inner(
         setup.ctx.clone(),
         setup.start,
     );
-    let (mut outcome, sink_result) = if setup
-        .adapter
-        .connection_format()
-        .matches_frontend(&protocol)
-    {
-        execute_native_to_sink(&setup, &protocol, sink, &id_slot).await
-    } else {
-        execute_stream(&setup, sink, &id_slot).await
+    let max_execution = live
+        .group_max_execution_secs
+        .get(&setup.ctx.group.0)
+        .map(|&secs| std::time::Duration::from_secs(secs));
+    let execution = async {
+        if setup
+            .adapter
+            .connection_format()
+            .matches_frontend(&protocol)
+        {
+            execute_native_to_sink(&setup, &protocol, sink, &id_slot).await
+        } else {
+            execute_stream(&setup, sink, &id_slot).await
+        }
+    };
+    let (mut outcome, sink_result) = match max_execution {
+        None => execution.await,
+        Some(limit) => match tokio::time::timeout(limit, execution).await {
+            Ok(r) => r,
+            Err(_) => {
+                // Kill the engine query; the client gets an error instead of a hang.
+                cancel.fire();
+                let msg = execution_timeout_message(limit.as_secs());
+                warn!(id = %setup.ctx.query_id, cluster = %setup.ctx.cluster, "{msg}");
+                let outcome = SyncOutcome {
+                    status: QueryStatus::Failed,
+                    rows: None,
+                    error: Some(msg.clone()),
+                    elapsed_ms: setup.start.elapsed().as_millis() as u64,
+                    engine_stats: None,
+                };
+                (outcome, sink.on_error(&msg).await)
+            }
+        },
     };
     if sink_result.is_err() {
         // Client gone mid-stream (or during schema send): stop the engine query.

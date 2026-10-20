@@ -283,6 +283,7 @@ async fn test_state(cache: Arc<dyn QueryResultCache>, metrics: Arc<Metrics>) -> 
         group_default_tags: HashMap::new(),
         group_max_queued_queries: HashMap::new(),
         group_capacity_wait_timeout_secs: HashMap::new(),
+        group_max_execution_secs: HashMap::new(),
         group_cache_settings: HashMap::from([(
             "duckdb".into(),
             GroupCacheConfig {
@@ -723,4 +724,60 @@ async fn hints_cannot_enable_caching_for_writes() {
         f.run(&read).await;
         assert_eq!(f.hits(), 1, "{hint}");
     }
+}
+
+/// A `row_limit` guard with `inject_limit` rewrites the query, and the rewrite is what runs
+/// (also on a repeat, so a cached unlimited result is never replayed).
+#[tokio::test]
+async fn guard_injected_limit_is_executed() {
+    use queryflux_guardrails::{built_in::RowLimitGuard, GuardChain};
+    let f = Fixture::new().await;
+    f.state.live.write().await.guard_chain = Some(Arc::new(GuardChain::new(vec![Box::new(
+        RowLimitGuard {
+            max_rows: Some(1000),
+            inject_limit: true,
+            default_limit: Some(3),
+        },
+    )])));
+    let sql = "SELECT * FROM range(10)";
+    for _ in 0..2 {
+        let rows: usize = f.run(sql).await.batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(rows, 3);
+    }
+    assert_eq!(f.hits(), 0);
+}
+
+/// Blocked queries tell the client which guard blocked them, with its code and fix hint.
+#[tokio::test]
+async fn guard_denial_names_guard_and_code() {
+    use queryflux_guardrails::{built_in::NoCrossJoinGuard, GuardChain};
+    let f = Fixture::new().await;
+    f.state.live.write().await.guard_chain =
+        Some(Arc::new(GuardChain::new(vec![Box::new(NoCrossJoinGuard)])));
+    let err = f
+        .try_run("SELECT * FROM range(3) a CROSS JOIN range(3) b")
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("no_cross_join [CROSS_JOIN]"), "{err}");
+}
+
+/// `maxExecutionSecs` cancels a long query and fails it with a clear error.
+#[tokio::test]
+async fn max_execution_secs_cancels_long_query() {
+    let f = Fixture::new().await;
+    f.state
+        .live
+        .write()
+        .await
+        .group_max_execution_secs
+        .insert("duckdb".into(), 1);
+    let started = std::time::Instant::now();
+    let err = f
+        .try_run("SELECT sum(a.range * b.range) FROM range(1000000) a, range(1000000) b")
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("EXECUTION_TIMEOUT"), "{err}");
+    assert!(started.elapsed() < std::time::Duration::from_secs(10));
 }

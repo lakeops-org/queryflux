@@ -139,6 +139,7 @@ mod tests {
             group_default_tags: HashMap::new(),
             group_max_queued_queries: HashMap::new(),
             group_capacity_wait_timeout_secs: HashMap::new(),
+            group_max_execution_secs: HashMap::new(),
             group_cache_settings: HashMap::new(),
             auth_provider: Arc::new(queryflux_auth::NoneAuthProvider::new(false)),
             authorization: Arc::new(SimpleAuthorizationPolicy::new(policies))

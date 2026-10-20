@@ -371,6 +371,7 @@ impl ClusterGroupConfigRecord {
             max_queued_queries: self.max_queued_queries.map(|v| v as u64),
             // Not persisted in Postgres yet; YAML LiveConfig path supplies the value.
             capacity_wait_timeout_secs: None,
+            max_execution_secs: None,
             authorization: queryflux_core::config::ClusterGroupAuthorizationConfig {
                 allow_groups: self.allow_groups.clone(),
                 allow_users: self.allow_users.clone(),
@@ -429,6 +430,7 @@ mod tests {
             max_running_queries: 10,
             max_queued_queries: None,
             capacity_wait_timeout_secs: None,
+            max_execution_secs: None,
             authorization: queryflux_core::config::ClusterGroupAuthorizationConfig {
                 allow_groups: vec![],
                 allow_users: vec![],

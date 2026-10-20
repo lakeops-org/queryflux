@@ -1627,6 +1627,11 @@ pub struct ClusterGroupConfig {
     /// Defaults to [`DEFAULT_CAPACITY_WAIT_TIMEOUT_SECS`] when omitted.
     #[serde(default)]
     pub capacity_wait_timeout_secs: Option<u64>,
+    /// Max seconds a query may run on the engine before QueryFlux cancels it and fails it
+    /// with an error. Omitted / zero = no limit. Streaming frontends enforce it exactly;
+    /// Trino-HTTP (async) queries are checked by the background sweep (every 30s).
+    #[serde(default)]
+    pub max_execution_secs: Option<u64>,
     /// Simple authorization policy (used when `authorization.provider: none`).
     /// If both lists are empty/absent, all authenticated users are allowed.
     #[serde(default)]
