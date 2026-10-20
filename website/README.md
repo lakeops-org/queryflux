@@ -19,7 +19,7 @@ The search bar appears in the navbar after a **production build**. It does **not
 
 ## SEO
 
-Global metadata, JSON-LD, and `static/robots.txt` follow [Docusaurus SEO](https://docusaurus.io/docs/seo). **`seoConfig.ts`** sets `noIndex` on the **Next** draft and all **older** doc versions (everything in `versions.json` except the first entry). Only the **latest release** at `/docs/` is indexable; the sitemap plugin omits `noIndex` pages automatically. At build time, **`robotsTxtPlugin`** writes `build/robots.txt` with `Sitemap:` derived from `url` + `baseUrl` in `docusaurus.config.ts` (update those if the domain changes). Per-page titles, descriptions, and OG images live in **`seo/docSeo.json`** — run **`npm run seo:apply-doc-meta`** after adding docs.
+Global metadata, JSON-LD, and `static/robots.txt` follow [Docusaurus SEO](https://docusaurus.io/docs/seo). **`seoConfig.ts`** sets `noIndex` on the **Next** draft and all **older** doc versions (everything in `versions.json` except the first entry). Only the **latest release** at `/docs/` is indexable; the sitemap plugin omits `noIndex` pages and thin blog utility URLs (`/blog/tags`, `/blog/archive`, `/blog/authors`). Priorities favor home, getting started, and blog posts. At build time, **`robotsTxtPlugin`** writes `build/robots.txt` with matching `Disallow` rules and a `Sitemap:` line from `url` + `baseUrl`. Per-doc titles, descriptions, and OG images live in **`seo/docSeo.json`** — run **`npm run seo:apply-doc-meta`** after adding docs. Blog posts should set `title` (~50–60 chars before `| QueryFlux`), `description` (~150–160 chars), `keywords`, and `image`. After building, run **`npm run seo:check-blog`** to verify every post has those fields and appears in `sitemap.xml`.
 
 ## Versioning
 

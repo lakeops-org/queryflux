@@ -1,6 +1,12 @@
 # Dev/fallback copy — production build overwrites build/robots.txt via seoConfig.ts
 # https://docusaurus.io/docs/seo#robots-file
 User-agent: *
-Disallow:
+Allow: /
+Disallow: /docs/next
+Disallow: /docs/next/
+Disallow: /blog/tags
+Disallow: /blog/tags/
+Disallow: /blog/archive
+Disallow: /blog/authors
 
 Sitemap: https://queryflux.dev/sitemap.xml

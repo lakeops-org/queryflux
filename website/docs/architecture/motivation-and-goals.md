@@ -53,7 +53,7 @@ The N×M client-to-engine wiring is still there. Dialect differences are still t
 
 QueryFlux is the missing layer above the table format: **compute interoperability**. It gives every client one endpoint regardless of what engine sits behind it, routes each query to the right engine based on explicit rules, translates dialect in flight, and manages capacity across the fleet. Iceberg unified the data; QueryFlux unifies the access.
 
-That argument is expanded in **[The Future Isn't One Engine. It's a Control Plane.](https://lakeops.dev/blog/the-future-isnt-one-engine)** — why engines became components, why open formats are not enough on their own, and how QueryFlux plus LakeOps decide where a query runs and how the table stays fast.
+That argument is expanded in **[Why QueryFlux](/blog/why-queryflux)** and **[The Future Isn't One Engine. It's a Control Plane.](https://lakeops.dev/blog/the-future-isnt-one-engine)** — why engines became components, why open formats are not enough on their own, and how QueryFlux plus LakeOps decide where a query runs and how the table stays fast.
 
 ---
 
@@ -144,7 +144,7 @@ Cloud analytical systems charge in fundamentally different ways:
 
 Query shapes are not uniform. **CPU-bound queries** (heavy joins, window functions, aggregations over pre-loaded hot data) run cheapest on compute-priced backends where you pay for capacity, not scan volume. **IO-bound queries** (selective filters over large cold datasets in object storage, exploration queries) often run cheapest on scan-priced backends where idle compute costs nothing.
 
-Without a routing layer, the default is to send every query to the same engine regardless of its shape or the billing model it maps to. In our own benchmarking and cost modeling while building QueryFlux — running the same analytical SQL across engines with different pricing models — we repeatedly saw a **poor match** between query shape and billing model inflate cost by large factors (on the order of **2–5×** versus a better-matched engine in those runs). When we prototyped **workload-aware routing**, steering CPU-skewed work toward compute-priced backends and scan-heavy work toward byte-priced backends, **total workload cost** in one representative suite fell by up to about **56%**, and **individual queries** sometimes dropped by up to about **90%** compared with always using a single default. That gap is not a rounding error — it is a structural inefficiency in any stack that treats every query the same.
+Without a routing layer, the default is to send every query to the same engine regardless of its shape or the billing model it maps to. In our own benchmarking and cost modeling while building QueryFlux — running the same analytical SQL across engines with different pricing models — we repeatedly saw a **poor match** between query shape and billing model inflate cost by large factors (on the order of **2–5×** versus a better-matched engine in those runs). When we prototyped **workload-aware routing**, steering CPU-skewed work toward compute-priced backends and scan-heavy work toward byte-priced backends, **total workload cost** in one representative suite fell by up to about **56%**, and **individual queries** sometimes dropped by up to about **90%** compared with always using a single default. Those are prototype measurements, not a built-in router: today you encode that routing yourself with routing rules or a Python router, and built-in cost-aware routing is on the [roadmap](../roadmap). That gap is not a rounding error — it is a structural inefficiency in any stack that treats every query the same.
 
 ---
 
@@ -196,13 +196,11 @@ Every query engine has an internal concurrency limit. When that limit is hit, th
 
 2. **QueryFlux-side queuing**: when a group is at capacity, queries wait in QueryFlux's own queue rather than hammering the backend. The Trino HTTP async path suspends the client poll loop transparently; sync paths (DuckDB, StarRocks) retry with backoff. In both cases, the client sees standard protocol behavior — not an error.
 
-3. **Spillover routing**: when one group is at capacity, compound or fallback rules can redirect overflow to a secondary group — e.g., spill ad-hoc queries from a saturated Trino cluster to a less-loaded DuckDB pool or a scan-priced Athena group.
+3. **Centralized queue visibility**: `queryflux_queued_queries` (Gauge, per group) and `queryflux_running_queries` (Gauge, per cluster) are Prometheus metrics. You get a single pane of glass across all cluster groups instead of piecing together engine-specific UIs.
 
-4. **Centralized queue visibility**: `queryflux_queued_queries` (Gauge, per group) and `queryflux_running_queries` (Gauge, per cluster) are Prometheus metrics. You get a single pane of glass across all cluster groups instead of piecing together engine-specific UIs.
+4. **Health-aware cluster selection**: unhealthy or disabled clusters are excluded from selection. Within a group, the `leastLoaded` strategy picks the member with the fewest in-flight queries; `failover` respects priority order. Capacity is never sent to a degraded backend.
 
-5. **Health-aware cluster selection**: unhealthy or disabled clusters are excluded from selection. Within a group, the `leastLoaded` strategy picks the member with the fewest in-flight queries; `failover` respects priority order. Capacity is never sent to a degraded backend.
-
-The practical effect is that **QueryFlux absorbs burst pressure** at a controlled point, makes it observable, and can spill intelligently rather than letting it cascade to the engines.
+The practical effect is that **QueryFlux absorbs burst pressure** at a controlled point, and makes it observable, rather than letting it cascade to the engines. (Redirecting overflow from a full group to another group is not built yet.)
 
 ---
 
@@ -217,7 +215,7 @@ The practical effect is that **QueryFlux absorbs burst pressure** at a controlle
 - **Observability** — Prometheus metrics, Grafana dashboards, and an admin REST API give a unified view across all engines and groups.
 - **Dynamic config** — routing rules and cluster groups can be updated at runtime via API (with Postgres persistence) without restarting the proxy.
 
-That same layer is where **performance- and cost-aware routing** lives: matching queries to engines by their workload shape, their SLA requirements, their billing model fit, and the current load across the fleet — in one place, without touching client code.
+That same layer is where **performance- and cost-aware routing** belongs: matching queries to engines by their workload shape, their SLA requirements, their billing model fit, and the current load across the fleet — in one place, without touching client code. Today you express it as routing rules or a Python router; automatic cost-aware routing is on the [roadmap](../roadmap).
 
 The result is a **uniform client experience** — one URL, shared tooling, consistent behavior — without forcing consolidation onto a single engine, or leaving performance and money on the table by ignoring how differently queries and engines behave.
 
@@ -242,7 +240,7 @@ Some gateways optimize for **load-balanced Trino** behind one client protocol. Q
 - **Multiple engine types** in one deployment (Trino, DuckDB, StarRocks, Athena, …).
 - **Protocol choices at the edge** — not only Trino HTTP.
 - **SQL dialect translation** when the routed engine's SQL differs from what the client naturally speaks.
-- **Cross-engine capacity management** — overflow, spillover, and queue visibility across engine types, not just within one cluster.
+- **Cross-engine capacity management** — concurrency limits, queueing, and queue visibility across engine types, not just within one cluster.
 
 ---
 

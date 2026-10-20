@@ -1,0 +1,78 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="420" viewBox="0 0 960 420" role="img" aria-label="BI and notebooks through QueryFlux to Trino and StarRocks on shared Iceberg">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#0b0614"/>
+      <stop offset="100%" stop-color="#050508"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="50%" cy="55%" r="45%">
+      <stop offset="0%" stop-color="#7c3aed" stop-opacity="0.3"/>
+      <stop offset="100%" stop-color="#7c3aed" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="qf" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#8b5cf6"/>
+      <stop offset="100%" stop-color="#ff7619"/>
+    </linearGradient>
+    <marker id="arr" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto">
+      <path d="M0,0 L7,3 L0,6 Z" fill="#a78bfa"/>
+    </marker>
+    <marker id="arrG" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto">
+      <path d="M0,0 L7,3 L0,6 Z" fill="#86efac"/>
+    </marker>
+    <pattern id="dots" width="22" height="22" patternUnits="userSpaceOnUse">
+      <circle cx="1" cy="1" r="0.8" fill="rgba(255,255,255,0.05)"/>
+    </pattern>
+  </defs>
+
+  <rect width="960" height="420" rx="20" fill="url(#bg)"/>
+  <rect width="960" height="420" rx="20" fill="url(#glow)"/>
+  <rect width="960" height="420" rx="20" fill="url(#dots)"/>
+  <rect x="1" y="1" width="958" height="418" rx="19" fill="none" stroke="rgba(255,255,255,0.08)"/>
+
+  <text x="40" y="40" fill="#fafafa" font-family="ui-sans-serif, system-ui, sans-serif" font-size="18" font-weight="650">What you will build</text>
+  <text x="40" y="64" fill="#a1a1aa" font-family="ui-sans-serif, system-ui, sans-serif" font-size="12">One QueryFlux endpoint in front of Trino and StarRocks on the same Iceberg tables.</text>
+
+  <g font-family="ui-sans-serif, system-ui, sans-serif">
+    <rect x="40" y="100" width="170" height="88" rx="14" fill="rgba(255,118,25,0.1)" stroke="#ff7619"/>
+    <text x="125" y="136" text-anchor="middle" fill="#ffedd5" font-size="14" font-weight="650">BI tools</text>
+    <text x="125" y="160" text-anchor="middle" fill="#fdba74" font-size="11">MySQL wire :3306</text>
+
+    <rect x="40" y="208" width="170" height="88" rx="14" fill="rgba(255,118,25,0.08)" stroke="rgba(255,118,25,0.55)"/>
+    <text x="125" y="244" text-anchor="middle" fill="#ffedd5" font-size="14" font-weight="650">Notebooks / CLIs</text>
+    <text x="125" y="268" text-anchor="middle" fill="#fdba74" font-size="11">Trino HTTP :8080</text>
+
+    <path d="M210 144 H248" stroke="#a78bfa" stroke-width="2" marker-end="url(#arr)"/>
+    <path d="M210 252 H248" stroke="#a78bfa" stroke-width="2" marker-end="url(#arr)"/>
+
+    <rect x="250" y="120" width="200" height="156" rx="16" fill="rgba(139,92,246,0.14)" stroke="url(#qf)" stroke-width="1.75"/>
+    <text x="350" y="168" text-anchor="middle" fill="#ede9fe" font-size="16" font-weight="650">QueryFlux</text>
+    <text x="350" y="196" text-anchor="middle" fill="#c4b5fd" font-size="12">protocol-based route</text>
+    <text x="350" y="220" text-anchor="middle" fill="#a78bfa" font-size="11">MySQL to StarRocks</text>
+    <text x="350" y="242" text-anchor="middle" fill="#a78bfa" font-size="11">Trino HTTP to Trino</text>
+    <text x="350" y="264" text-anchor="middle" fill="#71717a" font-size="10" font-family="ui-monospace, Menlo, monospace">Studio :3000</text>
+
+    <path d="M450 168 H498" stroke="#a78bfa" stroke-width="2" marker-end="url(#arr)"/>
+    <path d="M450 228 H498" stroke="#a78bfa" stroke-width="2" marker-end="url(#arr)"/>
+
+    <rect x="500" y="100" width="170" height="88" rx="14" fill="rgba(255,255,255,0.04)" stroke="rgba(255,255,255,0.16)"/>
+    <text x="585" y="140" text-anchor="middle" fill="#f4f4f5" font-size="15" font-weight="650">Trino</text>
+    <text x="585" y="164" text-anchor="middle" fill="#a1a1aa" font-size="11">interactive / federation</text>
+
+    <rect x="500" y="208" width="170" height="88" rx="14" fill="rgba(255,255,255,0.04)" stroke="rgba(255,255,255,0.16)"/>
+    <text x="585" y="248" text-anchor="middle" fill="#f4f4f5" font-size="15" font-weight="650">StarRocks</text>
+    <text x="585" y="272" text-anchor="middle" fill="#a1a1aa" font-size="11">serving / dashboards</text>
+
+    <path d="M670 144 H718" stroke="#86efac" stroke-width="2" marker-end="url(#arrG)"/>
+    <path d="M670 252 H718" stroke="#86efac" stroke-width="2" marker-end="url(#arrG)"/>
+
+    <rect x="720" y="120" width="200" height="156" rx="16" fill="rgba(163,230,53,0.08)" stroke="rgba(163,230,53,0.45)"/>
+    <text x="820" y="168" text-anchor="middle" fill="#ecfccb" font-size="14" font-weight="650">Iceberg catalog</text>
+    <text x="820" y="192" text-anchor="middle" fill="#bef264" font-size="12">Lakekeeper (REST)</text>
+    <line x1="752" y1="212" x2="888" y2="212" stroke="rgba(163,230,53,0.25)"/>
+    <text x="820" y="244" text-anchor="middle" fill="#86efac" font-size="13" font-weight="600">Object storage</text>
+    <text x="820" y="266" text-anchor="middle" fill="#4d7c0f" font-size="11" font-family="ui-monospace, Menlo, monospace">RustFS / TPC-H</text>
+  </g>
+
+  <text x="480" y="348" text-anchor="middle" fill="#a1a1aa" font-family="ui-sans-serif, system-ui, sans-serif" font-size="12">Same tables under lakekeeper.tpch - clients never pick an engine.</text>
+  <text x="480" y="388" text-anchor="middle" fill="#71717a" font-family="ui-sans-serif, system-ui, sans-serif" font-size="11">Run the full stack locally with Docker Compose in a few minutes.</text>
+</svg>

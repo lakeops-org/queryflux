@@ -10,7 +10,7 @@ import {
 const siteUrl = 'https://queryflux.dev';
 const siteCanonicalUrl = siteUrl;
 const siteDescription =
-  'Universal SQL query proxy and router in Rust. One endpoint for Trino, PostgreSQL, MySQL, Snowflake HTTP, Flight, and more — with routing, queueing, and observability.';
+  'Open-source SQL proxy and router in Rust. One endpoint for tools and AI agents across Trino, DuckDB, StarRocks, and more — with routing, dialect translation, guardrails, and observability.';
 
 const config: Config = {
   title: 'QueryFlux',
@@ -60,7 +60,7 @@ const config: Config = {
         '@type': 'SoftwareSourceCode',
         name: 'QueryFlux',
         description:
-          'Universal SQL query proxy and router in Rust. Front protocols include Trino HTTP, PostgreSQL wire, MySQL wire, Snowflake HTTP wire + SQL API v2, and Arrow Flight; backends include Trino, DuckDB, StarRocks, and more with routing and sqlglot dialect translation.',
+          'Open-source SQL query proxy and router in Rust. Front protocols include Trino HTTP, PostgreSQL wire, MySQL wire, Snowflake HTTP, Arrow Flight, and MCP; backends include Trino, DuckDB, StarRocks, and more with routing, guardrails, and sqlglot dialect translation.',
         url: siteCanonicalUrl,
         codeRepository: 'https://github.com/lakeops-org/queryflux',
         license: 'https://www.apache.org/licenses/LICENSE-2.0',
@@ -78,7 +78,33 @@ const config: Config = {
         name: 'QueryFlux',
         url: siteCanonicalUrl,
         description:
-          'Documentation and resources for QueryFlux, a universal SQL query proxy and router.',
+          'Docs, blog, and community for QueryFlux — one SQL endpoint for tools and AI agents across many engines.',
+        publisher: {
+          '@type': 'Organization',
+          name: 'LakeOps',
+          url: 'https://lakeops.dev',
+          sameAs: [
+            'https://github.com/lakeops-org/queryflux',
+            'https://twitter.com/lakeops',
+          ],
+        },
+      }),
+    },
+    {
+      tagName: 'script',
+      attributes: {
+        type: 'application/ld+json',
+      },
+      innerHTML: JSON.stringify({
+        '@context': 'https://schema.org',
+        '@type': 'Organization',
+        name: 'QueryFlux',
+        url: siteCanonicalUrl,
+        logo: `${siteCanonicalUrl}/img/queryflux-hero-banner.png`,
+        sameAs: [
+          'https://github.com/lakeops-org/queryflux',
+          'https://twitter.com/lakeops',
+        ],
       }),
     },
   ],
@@ -94,7 +120,7 @@ const config: Config = {
     [
       '@cmfcmf/docusaurus-search-local',
       {
-        indexBlog: false,
+        indexBlog: true,
         indexPages: true,
         language: 'en',
       },
@@ -113,10 +139,18 @@ const config: Config = {
           // SEO: only latest is indexable; see seoConfig.ts (reads versions.json each build)
           versions: buildDocsVersionConfig(),
         },
-        blog: false,
+        blog: {
+          showReadingTime: true,
+          blogTitle: 'QueryFlux blog',
+          blogDescription: 'Why QueryFlux exists, how it works, and how teams run SQL for tools and AI agents across many engines.',
+          blogSidebarCount: 0,
+          postsPerPage: 'ALL',
+          editUrl: 'https://github.com/lakeops-org/queryflux/tree/main/website/',
+          onUntruncatedBlogPosts: 'throw',
+        },
         sitemap: buildSitemapConfig(),
         theme: {
-          customCss: ['./src/css/custom.css', './src/css/docs.css'],
+          customCss: ['./src/css/custom.css', './src/css/docs.css', './src/css/blog.css'],
         },
       } satisfies Preset.Options,
     ],
@@ -149,7 +183,7 @@ const config: Config = {
           className: 'navbar-item-docs-mobile',
         },
         {
-          href: 'https://lakeops.dev/blog/category/queryflux',
+          to: '/blog',
           label: 'Blog',
           position: 'left',
         },
@@ -193,6 +227,7 @@ const config: Config = {
         {
           title: 'Project',
           items: [
+            {label: 'Blog', to: '/blog'},
             {label: 'Community', to: '/community'},
             {label: 'Development', to: '/docs/development'},
             {label: 'Contribute', to: '/docs/contribute'},
@@ -234,7 +269,7 @@ const config: Config = {
       {
         name: 'keywords',
         content:
-          'LakeOps, QueryFlux, SQL proxy, query router, Trino, PostgreSQL, MySQL, Arrow Flight, DuckDB, StarRocks, Rust, sqlglot, data lake',
+          'QueryFlux, SQL proxy, query router, AI agents, MCP, Trino, DuckDB, StarRocks, PostgreSQL, MySQL, Arrow Flight, sqlglot, lakehouse, LakeOps, Rust',
       },
       {
         name: 'description',

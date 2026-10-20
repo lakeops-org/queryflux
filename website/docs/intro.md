@@ -41,11 +41,12 @@ Modern stacks mix **many query engines** — each with its own wire protocol and
 
 **Typical outcomes:**
 
-- **Cost-aware routing** — steer CPU-heavy work to compute-priced clusters and selective scans to pay-per-scan engines.
+- **Workload-aware routing** — encode which workloads go where (by protocol, user, tags, SQL pattern, or a Python rule), e.g. CPU-heavy work to compute-priced clusters and selective scans to pay-per-scan engines.
 - **SLA protection** — cap concurrent queries per group; queue at the proxy instead of overloading backends.
 - **Transparent migration** — split traffic by weight between engines without client changes.
+- **Agents with guardrails** — AI agents connect over MCP or any SQL driver; when a request supplies both `agent_id` and `conversation_id` (MCP fills these in by default), QueryFlux records that context, and every query still goes through the same routing, guardrails and access policies as everyone else. See [Agentic AI](/docs/agentic/overview).
 
-For a deeper product rationale, see **[Motivation and goals](/docs/architecture/motivation-and-goals)** and **[Benchmarks](/docs/benchmarks)**. For the control-plane argument — why engines should stay replaceable — read **[The Future Isn't One Engine. It's a Control Plane.](https://lakeops.dev/blog/the-future-isnt-one-engine)** on the LakeOps blog.
+For a deeper product rationale, see **[Motivation and goals](/docs/architecture/motivation-and-goals)** and **[Benchmarks](/docs/benchmarks)**. On the QueryFlux blog: **[Why QueryFlux](/blog/why-queryflux)**, **[Iceberg on Trino and StarRocks](/blog/iceberg-trino-starrocks-one-endpoint)**, and **[Offload Snowflake queries](/blog/offload-snowflake-queries)**. For the broader control-plane argument, see **[The Future Isn't One Engine](https://lakeops.dev/blog/the-future-isnt-one-engine)** on the LakeOps blog.
 
 ---
 
@@ -119,4 +120,5 @@ Use these when you already know what you are looking for:
 | **[Contribute](/docs/contribute)** | PRs, issues, community |
 | **[Project structure](/docs/project-structure)** | Repository layout |
 | **[Roadmap](/docs/roadmap)** | Shipped vs planned features |
+| **[QueryFlux blog](/blog)** | Why QueryFlux, agents, Iceberg routing, Snowflake offload |
 | **[The Future Isn't One Engine](https://lakeops.dev/blog/the-future-isnt-one-engine)** | Why routing belongs in a control plane, not inside a warehouse |

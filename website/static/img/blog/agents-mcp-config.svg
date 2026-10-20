@@ -1,0 +1,107 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="760" height="1208" viewBox="0 0 760 1208" role="img" aria-label="QueryFlux agent MCP configuration">
+  <defs>
+    <linearGradient id="glow" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#7c3aed" stop-opacity="0.35"/>
+      <stop offset="100%" stop-color="#ff7619" stop-opacity="0.12"/>
+    </linearGradient>
+  </defs>
+  <rect width="100%" height="100%" rx="14" fill="#0c0a12"/>
+  <rect x="1" y="1" width="758" height="1206" rx="13" fill="none" stroke="url(#glow)" stroke-width="1"/>
+  <rect x="0" y="0" width="760" height="44" rx="14" fill="#12101c"/>
+  <rect x="0" y="36" width="760" height="8" fill="#12101c"/>
+  <circle cx="20" cy="22" r="5" fill="#fb7185"/>
+  <circle cx="38" cy="22" r="5" fill="#fbbf24"/>
+  <circle cx="56" cy="22" r="5" fill="#a3e635"/>
+  <text x="80" y="27" fill="#71717a" font-family="ui-monospace, Menlo, monospace" font-size="12">config.yaml</text>
+  <text x="48" y="62" fill="#c4b5fd" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="13">auth:</text>
+<text x="62" y="82" fill="#c4b5fd" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="13">  provider:</text>
+<text x="140.1" y="82" fill="#d4d4d8" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="13"> oidc</text>
+<text x="62" y="102" fill="#c4b5fd" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="13">  required:</text>
+<text x="140.1" y="102" fill="#f472b6" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="13"> true</text>
+<text x="62" y="122" fill="#c4b5fd" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="13">  oidc:</text>
+<text x="76" y="142" fill="#c4b5fd" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="13">    issuer:</text>
+<text x="154.1" y="142" fill="#d4d4d8" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="13"> https://idp.example.com/realms/queryflux</text>
+<text x="76" y="162" fill="#c4b5fd" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="13">    jwksUri:</text>
+<text x="161.2" y="162" fill="#d4d4d8" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="13"> https://idp.example.com/realms/queryflux/protocol/openid-connect/certs</text>
+<text x="76" y="182" fill="#c4b5fd" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="13">    audience:</text>
+<text x="168.3" y="182" fill="#d4d4d8" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="13"> queryflux</text>
+<text x="76" y="202" fill="#c4b5fd" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="13">    groupsClaim:</text>
+<text x="189.6" y="202" fill="#d4d4d8" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="13"> groups</text>
+<text x="48" y="222" fill="#d4d4d8" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="13"></text>
+<text x="48" y="242" fill="#c4b5fd" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="13">queryflux:</text>
+<text x="62" y="262" fill="#c4b5fd" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="13">  frontends:</text>
+<text x="76" y="282" fill="#c4b5fd" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="13">    mcp:</text>
+<text x="90" y="302" fill="#c4b5fd" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="13">      enabled:</text>
+<text x="189.39999999999998" y="302" fill="#f472b6" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="13"> true</text>
+<text x="90" y="322" fill="#c4b5fd" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="13">      port:</text>
+<text x="168.1" y="322" fill="#f472b6" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="13"> 8811</text>
+<text x="48" y="342" fill="#d4d4d8" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="13"></text>
+<text x="48" y="362" fill="#c4b5fd" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="13">clusters:</text>
+<text x="62" y="382" fill="#c4b5fd" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="13">  trino-1:</text>
+<text x="76" y="402" fill="#c4b5fd" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="13">    engine:</text>
+<text x="154.1" y="402" fill="#d4d4d8" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="13"> trino</text>
+<text x="76" y="422" fill="#c4b5fd" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="13">    endpoint:</text>
+<text x="168.3" y="422" fill="#d4d4d8" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="13"> https://trino.internal:8443</text>
+<text x="76" y="442" fill="#c4b5fd" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="13">    auth:</text>
+<text x="139.9" y="442" fill="#d4d4d8" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="13">                 </text>
+<text x="267.7" y="442" fill="#52525b" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="13"> # QueryFlux service credential</text>
+<text x="90" y="462" fill="#c4b5fd" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="13">      type:</text>
+<text x="168.1" y="462" fill="#d4d4d8" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="13"> basic</text>
+<text x="90" y="482" fill="#c4b5fd" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="13">      username:</text>
+<text x="196.5" y="482" fill="#d4d4d8" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="13"> qf_svc</text>
+<text x="90" y="502" fill="#c4b5fd" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="13">      password:</text>
+<text x="196.5" y="502" fill="#a3e635" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="13"> "..."</text>
+<text x="76" y="522" fill="#c4b5fd" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="13">    queryAuth:</text>
+<text x="175.39999999999998" y="522" fill="#d4d4d8" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="13">            </text>
+<text x="303.2" y="522" fill="#52525b" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="13"> # identity each query runs as</text>
+<text x="90" y="542" fill="#c4b5fd" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="13">      type:</text>
+<text x="168.1" y="542" fill="#d4d4d8" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="13"> impersonate</text>
+<text x="48" y="562" fill="#d4d4d8" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="13"></text>
+<text x="48" y="582" fill="#c4b5fd" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="13">authorization:</text>
+<text x="62" y="602" fill="#c4b5fd" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="13">  provider:</text>
+<text x="140.1" y="602" fill="#d4d4d8" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="13"> none</text>
+<text x="48" y="622" fill="#d4d4d8" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="13"></text>
+<text x="48" y="642" fill="#c4b5fd" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="13">clusterGroups:</text>
+<text x="62" y="662" fill="#c4b5fd" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="13">  analysts:</text>
+<text x="76" y="682" fill="#c4b5fd" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="13">    maxRunningQueries:</text>
+<text x="232.2" y="682" fill="#f472b6" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="13"> 40</text>
+<text x="76" y="702" fill="#c4b5fd" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="13">    members:</text>
+<text x="161.2" y="702" fill="#d4d4d8" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="13"> [trino-1]</text>
+<text x="76" y="722" fill="#c4b5fd" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="13">    authorization:</text>
+<text x="90" y="742" fill="#c4b5fd" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="13">      allowGroups:</text>
+<text x="217.8" y="742" fill="#d4d4d8" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="13"> [analysts]  </text>
+<text x="352.70000000000005" y="742" fill="#52525b" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="13"> # blocks MCP engine_hint bypass</text>
+<text x="62" y="762" fill="#c4b5fd" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="13">  agents:</text>
+<text x="76" y="782" fill="#c4b5fd" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="13">    maxRunningQueries:</text>
+<text x="232.2" y="782" fill="#f472b6" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="13"> 8</text>
+<text x="76" y="802" fill="#c4b5fd" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="13">    members:</text>
+<text x="161.2" y="802" fill="#d4d4d8" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="13"> [trino-1]</text>
+<text x="76" y="822" fill="#c4b5fd" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="13">    authorization:</text>
+<text x="90" y="842" fill="#c4b5fd" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="13">      allowGroups:</text>
+<text x="217.8" y="842" fill="#d4d4d8" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="13"> [agents]</text>
+<text x="48" y="862" fill="#d4d4d8" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="13"></text>
+<text x="48" y="882" fill="#c4b5fd" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="13">routers:</text>
+<text x="62" y="902" fill="#d4d4d8" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="13">  - type: protocolBased</text>
+<text x="76" y="922" fill="#c4b5fd" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="13">    mcp:</text>
+<text x="132.8" y="922" fill="#d4d4d8" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="13"> agents</text>
+<text x="48" y="942" fill="#c4b5fd" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="13">routingFallback:</text>
+<text x="161.6" y="942" fill="#d4d4d8" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="13"> analysts</text>
+<text x="48" y="962" fill="#d4d4d8" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="13"></text>
+<text x="48" y="982" fill="#c4b5fd" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="13">guardrails:</text>
+<text x="62" y="1002" fill="#c4b5fd" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="13">  groups:</text>
+<text x="76" y="1022" fill="#c4b5fd" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="13">    agents:</text>
+<text x="90" y="1042" fill="#d4d4d8" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="13">      - kind: built_in</text>
+<text x="104" y="1062" fill="#c4b5fd" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="13">        name:</text>
+<text x="196.3" y="1062" fill="#d4d4d8" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="13"> read_only</text>
+<text x="90" y="1082" fill="#d4d4d8" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="13">      - kind: built_in</text>
+<text x="104" y="1102" fill="#c4b5fd" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="13">        name:</text>
+<text x="196.3" y="1102" fill="#d4d4d8" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="13"> row_limit</text>
+<text x="104" y="1122" fill="#c4b5fd" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="13">        max_rows:</text>
+<text x="224.7" y="1122" fill="#f472b6" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="13"> 5000</text>
+<text x="90" y="1142" fill="#d4d4d8" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="13">      - kind: built_in</text>
+<text x="104" y="1162" fill="#c4b5fd" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="13">        name:</text>
+<text x="196.3" y="1162" fill="#d4d4d8" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="13"> require_predicate</text>
+<text x="104" y="1182" fill="#c4b5fd" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="13">        applies_to:</text>
+<text x="238.9" y="1182" fill="#d4d4d8" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="13"> ["fct_*", "events.*"]</text>
+</svg>

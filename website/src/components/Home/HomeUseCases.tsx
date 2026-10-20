@@ -34,12 +34,12 @@ const USE_CASES: UseCase[] = [
   },
   {
     title: 'Dashboard SLA protection',
-    tag: 'maxRunningQueries · fallback',
+    tag: 'maxRunningQueries · queueing',
     body: (
       <>
         Cap the StarRocks group with <code>maxRunningQueries</code> so dashboards always have
-        headroom. When it is full, ad-hoc queries queue at the proxy or spill to a Trino
-        fallback — and Grafana shows queue depth live.
+        headroom. When it is full, ad-hoc queries wait in line at the proxy instead of reaching
+        StarRocks — and Grafana shows queue depth live.
       </>
     ),
   },

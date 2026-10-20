@@ -251,6 +251,7 @@ docker compose down -v
 
 ## Next steps
 
+- [Blog: One endpoint for Iceberg on Trino and StarRocks](/blog/iceberg-trino-starrocks-one-endpoint) — the same pattern with more context.
 - [Monitor with Prometheus & Grafana](./observability.md): add metrics and dashboards to a QueryFlux stack.
 - [Routing & cluster groups](../architecture/routing-and-clusters.md): the other router types (`header`, `queryRegex`, `tags`, `pythonScript`, `compound`) and load-balancing strategies.
 - [Configuration](../configuration.md): every config key.

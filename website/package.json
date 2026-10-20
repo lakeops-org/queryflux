@@ -15,7 +15,8 @@
     "write-translations": "docusaurus write-translations",
     "write-heading-ids": "docusaurus write-heading-ids",
     "docs:version": "docusaurus docs:version",
-    "seo:apply-doc-meta": "node scripts/apply-doc-seo.mjs"
+    "seo:apply-doc-meta": "node scripts/apply-doc-seo.mjs",
+    "seo:check-blog": "node scripts/check-blog-seo.mjs"
   },
   "dependencies": {
     "@cmfcmf/docusaurus-search-local": "^2.0.1",

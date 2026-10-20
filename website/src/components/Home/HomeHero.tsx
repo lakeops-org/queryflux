@@ -56,6 +56,20 @@ const TABS: Tab[] = [
     ],
   },
   {
+    id: 'agent',
+    label: 'agents',
+    lines: [
+      <>{c('# Connect an agent over MCP')}</>,
+      <>{p('$')} claude mcp add --transport http queryflux \</>,
+      <>{'    '}http://localhost:8811/mcp</>,
+      <> </>,
+      <>{c('# Every query it runs is recorded with its agent,')}</>,
+      <>{c('# conversation and tool call, and goes through the')}</>,
+      <>{c('# same routing, guardrails and access policies as')}</>,
+      <>{c('# every other client.')}</>,
+    ],
+  },
+  {
     id: 'run',
     label: 'quickstart',
     lines: [
@@ -155,13 +169,13 @@ export default function HomeHero(): ReactNode {
             Open source · Apache 2.0 · Written in Rust
           </span>
           <Heading as="h1" className={styles.heroTitle}>
-            One SQL endpoint.<br /><span className={styles.accent}>Every engine.</span>
+            One SQL endpoint.<br />Every engine.<br /><span className={styles.accent}>Every agent.</span>
           </Heading>
           <p className={styles.heroSubtitle}>
-            QueryFlux is a protocol-aware SQL proxy. Clients connect over Trino HTTP,
-            PostgreSQL, MySQL, Snowflake, or Arrow Flight — QueryFlux routes each query
-            to the right engine, translates the dialect, and queues work before your
-            clusters fall over.
+            Put QueryFlux in front of the engines you already run. Your tools and AI agents
+            connect once, over Trino, PostgreSQL, MySQL, Snowflake, Arrow Flight or MCP.
+            QueryFlux sends each query to the right engine, translates the dialect, enforces
+            your guardrails and access policies, and records who ran what.
           </p>
           <div className={styles.heroCtas}>
             <Link className={clsx('button button--lg', styles.ctaPrimary)} to="/docs/getting-started">
@@ -185,11 +199,11 @@ export default function HomeHero(): ReactNode {
               <dd>p50 proxy overhead</dd>
             </div>
             <div>
-              <dt>up to 56%</dt>
-              <dd>workload cost cut</dd>
+              <dt>6 protocols</dt>
+              <dd>client protocols, incl. MCP</dd>
             </div>
             <div>
-              <dt>6 routers</dt>
+              <dt>8 routers</dt>
               <dd>protocol → Python</dd>
             </div>
           </dl>

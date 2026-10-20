@@ -8,18 +8,21 @@ import HomeArchitecture from '@site/src/components/Home/HomeArchitecture';
 import HomePillars from '@site/src/components/Home/HomePillars';
 import HomeUseCases from '@site/src/components/Home/HomeUseCases';
 import HomeCommunity from '@site/src/components/Home/HomeCommunity';
+import HomeAgents from '@site/src/components/Home/HomeAgents';
+import HomeFaq from '@site/src/components/Home/HomeFaq';
+import HomeProduction from '@site/src/components/Home/HomeProduction';
 import PageSeo from '@site/src/components/PageSeo';
 import styles from '@site/src/components/Home/styles.module.css';
 
 /** Homepage meta description; keep concise for search-result snippets (~155 chars / ~1000px). */
 const HOME_DESCRIPTION =
-  'Multi-engine query routing proxy for SQL clients: route Trino, PostgreSQL, MySQL, and Flight queries to the best backend engine with translation, queueing, and observability.';
+  'Open-source SQL control plane for tools and AI agents: one endpoint over the engines you run, with routing, dialect translation, guardrails, and a record of every query.';
 
 /**
  * Page title before Docusaurus appends ` | QueryFlux` (~12 chars). Keep the *final*
  * string ≤ ~60 chars for Twitter / strict OG validators.
  */
-const HOME_PAGE_TITLE = 'Multi-engine SQL query routing proxy';
+const HOME_PAGE_TITLE = 'One SQL endpoint for every engine and agent';
 
 export default function Home(): ReactNode {
   return (
@@ -35,9 +38,12 @@ export default function Home(): ReactNode {
         <main>
           <EngineStrip />
           <HomeComparison />
+          <HomeAgents />
           <HomeArchitecture />
           <HomePillars />
           <HomeUseCases />
+          <HomeProduction />
+          <HomeFaq />
           <HomeCommunity />
         </main>
       </div>

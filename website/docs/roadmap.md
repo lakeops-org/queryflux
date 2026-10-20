@@ -104,9 +104,9 @@ The current persistence options are in-memory (single instance) and PostgreSQL (
 
 When a query joins data that spans two engines — e.g. a Trino-managed Iceberg table and a StarRocks pre-aggregated mart — QueryFlux today routes the whole query to one engine. A federated planner would decompose the query, dispatch sub-queries to each appropriate engine in parallel, and merge results. This is a significant undertaking (Trino already does this for heterogeneous catalogs; QueryFlux would do it across engine types).
 
-### Query result caching
+### Snapshot-aware result cache invalidation
 
-A cache layer in the proxy that intercepts repeated identical queries (same SQL, same session parameters) and serves results from a short-lived store (Redis or in-process). Particularly useful for dashboard refresh patterns where dozens of users hit the same aggregation query within the same time window. Cache invalidation would be TTL-based initially, with Iceberg snapshot-aware invalidation on the roadmap.
+The [result cache](./architecture/caching) is built: repeated identical, deterministic queries are served from a configured filesystem or S3 backend (OpenDAL), with TTL-based expiry. Still planned: invalidating entries when the underlying Iceberg snapshot changes, instead of waiting for the TTL.
 
 ### ML-driven routing
 

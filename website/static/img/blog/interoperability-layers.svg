@@ -1,0 +1,77 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="520" viewBox="0 0 960 520" role="img" aria-label="Open table formats vs query engine silos, with QueryFlux as the front door">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#0b0614"/>
+      <stop offset="100%" stop-color="#050508"/>
+    </linearGradient>
+    <radialGradient id="glowV" cx="70%" cy="20%" r="50%">
+      <stop offset="0%" stop-color="#7c3aed" stop-opacity="0.35"/>
+      <stop offset="100%" stop-color="#7c3aed" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="glowO" cx="15%" cy="90%" r="45%">
+      <stop offset="0%" stop-color="#ff7619" stop-opacity="0.18"/>
+      <stop offset="100%" stop-color="#ff7619" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="qfStroke" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#8b5cf6"/>
+      <stop offset="55%" stop-color="#c4b5fd"/>
+      <stop offset="100%" stop-color="#ff7619"/>
+    </linearGradient>
+    <linearGradient id="storeFill" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="rgba(163,230,53,0.16)"/>
+      <stop offset="100%" stop-color="rgba(163,230,53,0.04)"/>
+    </linearGradient>
+    <pattern id="dots" width="22" height="22" patternUnits="userSpaceOnUse">
+      <circle cx="1" cy="1" r="0.8" fill="rgba(255,255,255,0.06)"/>
+    </pattern>
+  </defs>
+
+  <rect width="960" height="520" rx="20" fill="url(#bg)"/>
+  <rect width="960" height="520" rx="20" fill="url(#glowV)"/>
+  <rect width="960" height="520" rx="20" fill="url(#glowO)"/>
+  <rect width="960" height="520" rx="20" fill="url(#dots)"/>
+  <rect x="1" y="1" width="958" height="518" rx="19" fill="none" stroke="rgba(255,255,255,0.08)"/>
+
+  <text x="48" y="48" fill="#fafafa" font-family="ui-sans-serif, system-ui, sans-serif" font-size="20" font-weight="650" letter-spacing="-0.02em">Data is open. Engines still aren&apos;t.</text>
+  <text x="48" y="74" fill="#a1a1aa" font-family="ui-sans-serif, system-ui, sans-serif" font-size="13">Open formats fixed storage. Clients still face N engines x M protocols.</text>
+
+  <rect x="48" y="108" width="864" height="78" rx="16" fill="url(#storeFill)" stroke="rgba(163,230,53,0.4)" stroke-width="1.25"/>
+  <circle cx="88" cy="147" r="16" fill="rgba(163,230,53,0.2)" stroke="#a3e635" stroke-width="1.25"/>
+  <path d="M80 147h16M88 139v16" stroke="#a3e635" stroke-width="1.5" stroke-linecap="round"/>
+  <text x="118" y="142" fill="#ecfccb" font-family="ui-sans-serif, system-ui, sans-serif" font-size="14" font-weight="650">Open table formats</text>
+  <text x="118" y="164" fill="#86efac" font-family="ui-sans-serif, system-ui, sans-serif" font-size="12">Iceberg - one copy of data - many readers</text>
+  <text x="860" y="152" text-anchor="end" fill="#a3e635" font-family="ui-monospace, Menlo, monospace" font-size="11">STORAGE</text>
+
+  <line x1="480" y1="198" x2="480" y2="218" stroke="#52525b" stroke-width="1.5" stroke-dasharray="3 4"/>
+  <text x="480" y="238" text-anchor="middle" fill="#71717a" font-family="ui-sans-serif, system-ui, sans-serif" font-size="11">protocols / dialects / credentials multiply</text>
+
+  <g font-family="ui-sans-serif, system-ui, sans-serif">
+    <rect x="48" y="258" width="198" height="100" rx="14" fill="rgba(255,255,255,0.035)" stroke="rgba(255,255,255,0.12)"/>
+    <text x="68" y="290" fill="#f4f4f5" font-size="15" font-weight="650">Trino</text>
+    <text x="68" y="314" fill="#a1a1aa" font-size="12">HTTP + SQL dialect A</text>
+    <text x="68" y="336" fill="#71717a" font-size="11" font-family="ui-monospace, Menlo, monospace">federation</text>
+
+    <rect x="266" y="258" width="198" height="100" rx="14" fill="rgba(255,255,255,0.035)" stroke="rgba(255,255,255,0.12)"/>
+    <text x="286" y="290" fill="#f4f4f5" font-size="15" font-weight="650">DuckDB</text>
+    <text x="286" y="314" fill="#a1a1aa" font-size="12">in-process</text>
+    <text x="286" y="336" fill="#71717a" font-size="11" font-family="ui-monospace, Menlo, monospace">low latency</text>
+
+    <rect x="484" y="258" width="198" height="100" rx="14" fill="rgba(255,255,255,0.035)" stroke="rgba(255,255,255,0.12)"/>
+    <text x="504" y="290" fill="#f4f4f5" font-size="15" font-weight="650">StarRocks</text>
+    <text x="504" y="314" fill="#a1a1aa" font-size="12">MySQL wire</text>
+    <text x="504" y="336" fill="#71717a" font-size="11" font-family="ui-monospace, Menlo, monospace">serving</text>
+
+    <rect x="702" y="258" width="210" height="100" rx="14" fill="rgba(255,255,255,0.035)" stroke="rgba(255,255,255,0.12)"/>
+    <text x="722" y="290" fill="#f4f4f5" font-size="15" font-weight="650">Snowflake ...</text>
+    <text x="722" y="314" fill="#a1a1aa" font-size="12">vendor APIs</text>
+    <text x="722" y="336" fill="#71717a" font-size="11" font-family="ui-monospace, Menlo, monospace">SaaS warehouses</text>
+  </g>
+
+  <rect x="48" y="392" width="864" height="92" rx="16" fill="rgba(139,92,246,0.14)" stroke="url(#qfStroke)" stroke-width="1.75"/>
+  <circle cx="88" cy="438" r="16" fill="rgba(139,92,246,0.35)" stroke="#c4b5fd" stroke-width="1.25"/>
+  <path d="M80 438h16M88 430v16" stroke="#e9d5ff" stroke-width="1.5" stroke-linecap="round"/>
+  <text x="118" y="428" fill="#ede9fe" font-family="ui-sans-serif, system-ui, sans-serif" font-size="15" font-weight="650">QueryFlux - one SQL front door</text>
+  <text x="118" y="452" fill="#c4b5fd" font-family="ui-sans-serif, system-ui, sans-serif" font-size="12">route / translate / queue / observe / guard</text>
+  <text x="860" y="438" text-anchor="end" fill="#ff7619" font-family="ui-monospace, Menlo, monospace" font-size="11">CLIENTS: BI / notebooks / agents / apps</text>
+</svg>

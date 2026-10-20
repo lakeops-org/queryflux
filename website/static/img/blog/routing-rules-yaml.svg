@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="760" height="208" viewBox="0 0 760 208" role="img" aria-label="QueryFlux routing rules YAML">
+  <defs>
+    <linearGradient id="glow" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#7c3aed" stop-opacity="0.35"/>
+      <stop offset="100%" stop-color="#ff7619" stop-opacity="0.12"/>
+    </linearGradient>
+  </defs>
+  <rect width="100%" height="100%" rx="14" fill="#0c0a12"/>
+  <rect x="1" y="1" width="758" height="206" rx="13" fill="none" stroke="url(#glow)" stroke-width="1"/>
+  <rect x="0" y="0" width="760" height="44" rx="14" fill="#12101c"/>
+  <rect x="0" y="36" width="760" height="8" fill="#12101c"/>
+  <circle cx="20" cy="22" r="5" fill="#fb7185"/>
+  <circle cx="38" cy="22" r="5" fill="#fbbf24"/>
+  <circle cx="56" cy="22" r="5" fill="#a3e635"/>
+  <text x="80" y="27" fill="#71717a" font-family="ui-monospace, Menlo, monospace" font-size="12">routing.yaml</text>
+  <text x="48" y="62" fill="#c4b5fd" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="13">routers:</text>
+<text x="62" y="82" fill="#d4d4d8" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="13">  - type: queryRegex</text>
+<text x="76" y="102" fill="#c4b5fd" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="13">    rules:</text>
+<text x="90" y="122" fill="#d4d4d8" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="13">      - regex: "FROM local\\..*"</text>
+<text x="104" y="142" fill="#c4b5fd" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="13">        targetGroup:</text>
+<text x="246" y="142" fill="#d4d4d8" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="13"> duckdb-local</text>
+<text x="62" y="162" fill="#d4d4d8" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="13">  - type: protocolBased</text>
+<text x="76" y="182" fill="#c4b5fd" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="13">    trinoHttp:</text>
+<text x="175.39999999999998" y="182" fill="#d4d4d8" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="13"> trino-default</text>
+</svg>
