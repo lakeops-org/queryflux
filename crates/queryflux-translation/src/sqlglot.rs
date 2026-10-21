@@ -414,19 +414,23 @@ fn translate_with_schema(
     schema_context: &SchemaContext,
     strict: bool,
 ) -> Result<String> {
-    let schema_dict = PyDict::new(py);
-    for (table, cols) in &schema_context.tables {
-        let col_dict = PyDict::new(py);
-        for (col, ty) in cols {
-            col_dict.set_item(col, ty).ok();
-        }
-        schema_dict.set_item(table, col_dict).ok();
-    }
+    let access = crate::access::load_module(py)?;
+    let (schema_dict, catalog, db): (Bound<'_, PyAny>, Option<String>, Option<String>) = access
+        .call_method1("_schema_parts", (schema_context.to_sqlglot_json(),))
+        .and_then(|parts| parts.extract())
+        .map_err(|e| QueryFluxError::Translation(format!("reading schema context failed: {e}")))?;
 
     // Preserve the parsed AST for dialect-only fallback if optimization fails.
     let tree = tree
         .call_method0("copy")
         .map_err(|e| QueryFluxError::Translation(format!("copying SQL AST failed: {e}")))?;
+    // Resolve unqualified tables under the session defaults the schema was looked up with;
+    // `_strip_defaults` below puts the table names back as written.
+    let tree = access
+        .call_method1("_apply_defaults", (&tree, catalog, db))
+        .map_err(|e| {
+            QueryFluxError::Translation(format!("applying session defaults failed: {e}"))
+        })?;
 
     let optimizer = PyModule::import(py, "sqlglot.optimizer").map_err(|e| {
         QueryFluxError::Translation(format!("Failed to import sqlglot.optimizer: {e}"))
@@ -449,6 +453,11 @@ fn translate_with_schema(
     let optimized = optimizer
         .call_method("optimize", (&tree,), Some(&opt_kwargs))
         .map_err(|e| QueryFluxError::Translation(format!("sqlglot.optimize failed: {e}")))?;
+    let optimized = access
+        .call_method1("_strip_defaults", (&optimized,))
+        .map_err(|e| {
+            QueryFluxError::Translation(format!("stripping session defaults failed: {e}"))
+        })?;
 
     render_sql(py, &optimized, tgt, strict)
 }

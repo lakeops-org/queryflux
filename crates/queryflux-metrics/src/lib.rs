@@ -14,7 +14,9 @@ use queryflux_core::error::Result;
 // to depend on one crate.  Re-export them here so all existing call sites
 // (`use queryflux_metrics::{MetricsStore, QueryRecord, ...}`) continue to
 // compile without any changes.
-pub use queryflux_persistence::{ClusterSnapshot, GuardAction, MetricsStore, QueryRecord};
+pub use queryflux_persistence::{
+    ClusterSnapshot, GuardAction, MetricsStore, QueryDataset, QueryRecord,
+};
 
 /// Fans out to multiple stores. Useful for combining Prometheus (real-time)
 /// with Postgres (historical) without changing callers.
@@ -34,6 +36,10 @@ impl MetricsStore for MultiMetricsStore {
         for store in &self.stores {
             store.on_translation(outcome);
         }
+    }
+
+    fn wants_datasets(&self) -> bool {
+        self.stores.iter().any(|s| s.wants_datasets())
     }
 
     fn on_query_started(&self, group: &str, cluster: &str) {

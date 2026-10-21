@@ -79,6 +79,11 @@ pub struct HistoryPolicy {
     pub endpoint: Option<String>,
     #[serde(default)]
     pub redaction: HistoryRedaction,
+    /// Fill each record's `datasets` (the tables it read and wrote): the control plane
+    /// emits OpenLineage events from them. Set by the control plane when
+    /// `queryflux.openLineage` is configured.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub datasets: bool,
 }
 
 /// How much SQL a query record keeps when it leaves the worker.

@@ -228,6 +228,10 @@ queryflux:
 
 The control plane enables `queryflux.workerApi` (`enabled`, `sharedSecret`, `history.endpoint`, `history.redaction`). Every key, and how config, capacity and history flow: **[Worker mode](./operations/worker-mode)**.
 
+## OpenLineage
+
+`queryflux.openLineage` sends an OpenLineage event for every query that reads or writes a table, with column lineage for writes; `lineageCatalogs` on a cluster maps its catalog names to shared dataset namespaces. Keys, event contents and delivery: **[OpenLineage](./architecture/openlineage)**.
+
 ## Query Cache
 
 QueryFlux can cache deterministic query results to avoid repeated backend roundtrips. See the dedicated **[Caching](./architecture/caching)** page for full documentation.

@@ -47,6 +47,10 @@ impl MetricsStore for BufferedMetricsStore {
         self.inner.on_translation(outcome);
     }
 
+    fn wants_datasets(&self) -> bool {
+        self.inner.wants_datasets()
+    }
+
     async fn record_query(&self, record: QueryRecord) -> Result<()> {
         let _ = self.tx.try_send(MetricsEvent::Query(record));
         Ok(())

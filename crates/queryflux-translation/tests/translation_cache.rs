@@ -26,7 +26,7 @@ fn schema(ty: &str) -> SchemaContext {
         catalog: None,
         database: None,
         tables: [(
-            "orders".to_string(),
+            "orders".into(),
             ColumnMap::from([
                 ("id".to_string(), ty.to_string()),
                 ("name".to_string(), "VARCHAR".to_string()),

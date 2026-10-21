@@ -447,6 +447,8 @@ mod tests {
             was_guard_blocked: false,
             cache_hit: false,
             worker: None,
+            datasets: vec![],
+            sql: None,
         }
     }
 

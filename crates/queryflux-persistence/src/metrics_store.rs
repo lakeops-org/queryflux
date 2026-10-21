@@ -25,6 +25,26 @@ pub struct GuardAction {
     pub metadata: Option<std::collections::HashMap<String, String>>,
 }
 
+/// A table a query read or wrote, for lineage. Named as the SQL wrote it: a missing
+/// `catalog`/`database` means the session's ([`QueryRecord::catalog`]/[`QueryRecord::database`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QueryDataset {
+    pub catalog: Option<String>,
+    pub database: Option<String>,
+    pub table: String,
+    /// The columns the query read from (or wrote to) this table, when the catalog schema let
+    /// them be attributed. Empty when unknown, or for `SELECT *`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub columns: Vec<String>,
+    /// The table the statement writes (`INSERT INTO`, `CREATE TABLE … AS`, `UPDATE`, …).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub is_write: bool,
+    /// For the written table: which input columns each written column comes from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub column_lineage: Option<queryflux_core::lineage::ColumnLineage>,
+}
+
 /// A record of one completed (or failed/cancelled) query execution.
 /// Written to the metrics store at the end of every query, regardless of outcome.
 ///
@@ -104,6 +124,14 @@ pub struct QueryRecord {
     /// The worker that ran the query (#255); `None` when this process ran it.
     #[serde(default)]
     pub worker: Option<String>,
+    /// Tables the query read and wrote. Filled only when a store in the chain
+    /// [wants them](MetricsStore::wants_datasets); empty when the SQL couldn't be parsed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub datasets: Vec<QueryDataset>,
+    /// The whole original SQL (`sql_preview` is cut at 500 characters). Set alongside
+    /// `datasets`, for the lineage `sql` facet; not stored in history.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sql: Option<String>,
 }
 
 /// `schemaVersion` of [`QueryRecordBatchV1`].
@@ -143,6 +171,12 @@ pub trait MetricsStore: Send + Sync {
     fn on_translation(&self, _outcome: queryflux_core::query::TranslationOutcome) {}
 
     async fn record_query(&self, record: QueryRecord) -> Result<()>;
+
+    /// Whether this store reads [`QueryRecord::datasets`]. Filling them parses each query's
+    /// SQL and looks up its tables, so it only happens when some store asks.
+    fn wants_datasets(&self) -> bool {
+        false
+    }
 
     /// Record many queries at once, with the same semantics as calling
     /// [`Self::record_query`] for each in order: the first record per `proxy_query_id`

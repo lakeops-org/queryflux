@@ -48,6 +48,17 @@ queryflux:
   # config still reloads immediately after routing/cluster/group writes via the admin API.
   # configReloadIntervalSecs: 60
   # queryHistoryRetentionDays: 90
+  # OpenLineage: one event per query that reads or writes a table (tables, columns, and
+  # column lineage for writes), sent to any OpenLineage consumer. On a control plane this
+  # also covers its workers' queries. Map catalogs to shared namespaces per cluster with
+  # `lineageCatalogs` so engines reading the same catalog name its tables alike.
+  # openLineage:
+  #   url: https://marquez.example.com      # events go to {url}{endpoint}
+  #   endpoint: /api/v1/lineage
+  #   # apiKey: ...                          # Bearer token; default: $OPENLINEAGE_API_KEY
+  #   namespace: queryflux                   # job namespace
+  #   sql: maskLiterals                      # full | maskLiterals | metadata (no SQL)
+  #   spoolMaxEvents: 10000                  # held while the consumer is down
 
 clusterGroups:
   # trino-default:

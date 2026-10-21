@@ -21,8 +21,10 @@ mod config_source;
 mod guards;
 mod history_uplink;
 mod live_config;
+mod openlineage;
 mod registered_engines;
 mod remote_coordination;
+mod spool;
 mod startup;
 mod worker_labels;
 
@@ -592,6 +594,30 @@ async fn main() -> Result<()> {
         ])),
         None => metrics,
     };
+    // OpenLineage: this process's queries and, on a control plane, its workers' (they
+    // send datasets upstream instead of emitting).
+    let lineage = config
+        .queryflux
+        .open_lineage
+        .as_ref()
+        .filter(|_| !is_worker)
+        .map(|c| openlineage::OpenLineageStore::new(c, live.clone()));
+    let (metrics, history_store): (
+        Arc<dyn queryflux_metrics::MetricsStore>,
+        Arc<dyn queryflux_metrics::MetricsStore>,
+    ) = match &lineage {
+        Some(lineage) => (
+            Arc::new(queryflux_metrics::MultiMetricsStore::new(vec![
+                metrics,
+                lineage.clone() as Arc<dyn queryflux_metrics::MetricsStore>,
+            ])),
+            Arc::new(queryflux_metrics::MultiMetricsStore::new(vec![
+                history_store,
+                lineage.clone() as Arc<dyn queryflux_metrics::MetricsStore>,
+            ])),
+        ),
+        None => (metrics, history_store),
+    };
 
     // Replica identity for capacity leases and queue claims. Must be unique per
     // *process incarnation*: PIDs collide across containers (the main process is
@@ -1009,11 +1035,14 @@ async fn main() -> Result<()> {
         if is_worker {
             startup::tasks::spawn_worker_heartbeat(&config, &worker_sync_state, &shutdown_rx);
             if let Some(uplink) = &history_uplink {
-                uplink.spawn_flusher(shutdown_rx.clone());
+                spool::spawn_flusher(uplink.clone(), shutdown_rx.clone());
             }
         }
     }
 
+    if let Some(lineage) = &lineage {
+        spool::spawn_flusher(lineage.clone(), shutdown_rx.clone());
+    }
     startup::tasks::spawn_health_checks(&app_state, &shutdown_rx);
 
     startup::tasks::spawn_engine_reconcile(&app_state, &coordination, &shutdown_rx);
@@ -1084,7 +1113,10 @@ async fn main() -> Result<()> {
     )
     .await;
     if let Some(uplink) = &history_uplink {
-        uplink.final_flush(std::time::Duration::from_secs(10)).await;
+        spool::final_flush(uplink.as_ref(), std::time::Duration::from_secs(10)).await;
+    }
+    if let Some(lineage) = &lineage {
+        spool::final_flush(lineage.as_ref(), std::time::Duration::from_secs(10)).await;
     }
 
     tracing::info!("QueryFlux shutdown complete");
@@ -1872,6 +1904,8 @@ mod tests {
                 was_guard_blocked: false,
                 cache_hit: false,
                 worker: None,
+                datasets: vec![],
+                sql: None,
             }
         }
 

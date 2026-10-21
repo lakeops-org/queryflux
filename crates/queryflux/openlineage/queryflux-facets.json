@@ -1,0 +1,46 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/lakeops-org/queryflux/main/crates/queryflux/openlineage/queryflux-facets.json",
+  "$defs": {
+    "QueryFluxRunFacet": {
+      "description": "How QueryFlux routed and ran the query.",
+      "allOf": [
+        { "$ref": "https://openlineage.io/spec/2-0-2/OpenLineage.json#/$defs/RunFacet" },
+        {
+          "type": "object",
+          "properties": {
+            "clusterGroup": { "type": "string", "description": "The cluster group the query was routed to." },
+            "cluster": { "type": "string", "description": "The cluster that ran it." },
+            "engine": { "type": "string", "description": "The engine type, e.g. trino, snowflake, duckDb." },
+            "sourceDialect": { "type": "string", "description": "The SQL dialect the client sent." },
+            "targetDialect": { "type": "string", "description": "The SQL dialect the engine received." },
+            "translated": { "type": "boolean", "description": "Whether the SQL was translated between dialects." },
+            "rewritten": { "type": "boolean", "description": "Whether access control rewrote the SQL (row filters, column masks)." },
+            "cacheHit": { "type": "boolean", "description": "Whether the result came from the QueryFlux result cache." },
+            "user": { "type": ["string", "null"] },
+            "agentId": { "type": ["string", "null"] },
+            "backendQueryId": { "type": ["string", "null"], "description": "The engine's own query ID." },
+            "queueMs": { "type": "integer" },
+            "executionMs": { "type": "integer" },
+            "rowsReturned": { "type": ["integer", "null"] }
+          }
+        }
+      ],
+      "type": "object"
+    },
+    "ColumnsReadDatasetFacet": {
+      "description": "The columns a query read from an input dataset, when the catalog schema let QueryFlux attribute them.",
+      "allOf": [
+        { "$ref": "https://openlineage.io/spec/2-0-2/OpenLineage.json#/$defs/DatasetFacet" },
+        {
+          "type": "object",
+          "properties": {
+            "fields": { "type": "array", "items": { "type": "string" } }
+          },
+          "required": ["fields"]
+        }
+      ],
+      "type": "object"
+    }
+  }
+}

@@ -4,6 +4,7 @@ use std::sync::Arc;
 use chrono::Utc;
 use queryflux_auth::{AuthProvider, AuthorizationChecker, BackendIdentityResolver};
 use queryflux_cluster_manager::{cluster_state::ClusterState, ClusterGroupManager};
+use queryflux_core::access_model::{Columns, ResourceKind};
 use queryflux_core::{
     catalog::CatalogProvider,
     config::ClusterConfig,
@@ -18,10 +19,10 @@ use queryflux_core::{
 use queryflux_engine_adapters::AdapterKind;
 use queryflux_fingerprint::{polyglot_dialect, rich_fingerprint};
 use queryflux_guardrails::GuardChain;
-use queryflux_metrics::{GuardAction, MetricsStore, QueryRecord};
+use queryflux_metrics::{GuardAction, MetricsStore, QueryDataset, QueryRecord};
 use queryflux_persistence::{CapacityStore, Persistence, QueueCoordinator};
 use queryflux_routing::chain::{RouterChain, RoutingTrace};
-use queryflux_translation::TranslationService;
+use queryflux_translation::{ExtractedStatement, TranslationService};
 
 /// Everything that can be hot-reloaded from the DB without restarting the proxy.
 ///
@@ -396,8 +397,17 @@ impl AppState {
             was_guard_blocked: outcome.was_guard_blocked,
             cache_hit: outcome.cache_hit,
             worker: None,
+            datasets: vec![],
+            sql: None,
         };
         let metrics = self.metrics.clone();
+        let lineage = metrics.wants_datasets().then(|| LineageInput {
+            translation: self.translation.clone(),
+            live: self.live.clone(),
+            dialect: ctx.src_dialect.clone(),
+            catalog: ctx.session.catalog().map(String::from),
+            database: ctx.session.database().map(String::from),
+        });
         tokio::spawn(async move {
             if let Some(fp) = rich_fingerprint(
                 &original_sql,
@@ -410,6 +420,10 @@ impl AppState {
                 record.translated_query_hash = fp.translated_query_hash.map(|h| h as i64);
                 record.digest_text = Some(fp.digest_text);
                 record.translated_digest_text = fp.translated_digest_text;
+            }
+            if let Some(lineage) = lineage {
+                record.datasets = lineage.datasets(original_sql.clone()).await;
+                record.sql = Some(original_sql);
             }
             let _ = metrics.record_query(record).await;
         });
@@ -581,6 +595,157 @@ impl AppState {
                 cache_hit: false,
             },
         );
+    }
+}
+
+/// What [`AppState::record_query`] needs to work out a query's datasets.
+struct LineageInput {
+    translation: Arc<TranslationService>,
+    live: Arc<tokio::sync::RwLock<LiveConfig>>,
+    dialect: SqlDialect,
+    catalog: Option<String>,
+    database: Option<String>,
+}
+
+impl LineageInput {
+    /// The tables `sql` read and wrote. Empty when it can't be parsed.
+    // ponytail: resolves the schema a second time (dispatch already did, for translation)
+    // rather than carrying it through every `QueryContext` and the async-poll path. A
+    // `catalogProvider.cache` makes the second lookup a cache hit; carry dispatch's
+    // `SchemaContext` along if uncached lookups show up in catalog load.
+    async fn datasets(self, sql: String) -> Vec<QueryDataset> {
+        let provider = self.live.read().await.catalog.clone();
+        let schema = self
+            .translation
+            .resolve_schema_context(
+                &sql,
+                &self.dialect,
+                &provider,
+                self.catalog.as_deref(),
+                self.database.as_deref(),
+            )
+            .await;
+        let dialect = self.dialect;
+        let extracted = tokio::task::spawn_blocking(move || {
+            let statement =
+                queryflux_translation::extract_resources_cached(&sql, &dialect, &schema)?;
+            let mut datasets = datasets_from(&statement);
+            if let Some(target) = datasets.iter_mut().find(|d| d.is_write) {
+                target.column_lineage = queryflux_translation::column_lineage(
+                    &sql, &dialect, &schema,
+                )
+                .unwrap_or_else(|e| {
+                    tracing::debug!("lineage: no column lineage: {e}");
+                    None
+                });
+            }
+            Ok::<_, queryflux_core::error::QueryFluxError>(datasets)
+        })
+        .await;
+        match extracted {
+            Ok(Ok(datasets)) => datasets,
+            Ok(Err(e)) => {
+                tracing::debug!("lineage: could not parse the query: {e}");
+                vec![]
+            }
+            Err(e) => {
+                tracing::debug!("lineage: extraction task failed: {e}");
+                vec![]
+            }
+        }
+    }
+}
+
+/// Tables and views a statement reads and writes. Statements that only name a table
+/// (`DROP`, `ALTER`, `DESCRIBE`, `GRANT`, …) move no data, so they have none.
+fn datasets_from(statement: &ExtractedStatement) -> Vec<QueryDataset> {
+    if !statement.embeds_reads {
+        return vec![];
+    }
+    statement
+        .resources
+        .iter()
+        .filter(|r| matches!(r.kind, ResourceKind::Table | ResourceKind::View))
+        .map(|r| QueryDataset {
+            catalog: r.catalog.clone(),
+            database: r.schema.clone(),
+            table: r.table.clone(),
+            columns: match &r.columns {
+                Columns::Named(columns) => columns.clone(),
+                Columns::All => vec![],
+            },
+            is_write: r.is_write_target,
+            column_lineage: None,
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod datasets_tests {
+    use queryflux_core::query::SqlDialect;
+    use queryflux_core::schema_context::SchemaContext;
+    use queryflux_metrics::QueryDataset;
+
+    use super::datasets_from;
+
+    fn datasets(sql: &str) -> Vec<QueryDataset> {
+        let statement = queryflux_translation::extract_resources(
+            sql,
+            &SqlDialect::Trino,
+            &SchemaContext::default(),
+        )
+        .unwrap();
+        let mut out = datasets_from(&statement);
+        out.sort_by(|a, b| (&a.database, &a.table).cmp(&(&b.database, &b.table)));
+        out
+    }
+
+    fn table(database: Option<&str>, table: &str, is_write: bool) -> QueryDataset {
+        QueryDataset {
+            catalog: None,
+            database: database.map(String::from),
+            table: table.into(),
+            columns: vec![],
+            is_write,
+            column_lineage: None,
+        }
+    }
+
+    #[test]
+    fn insert_select_reads_its_sources_and_writes_its_target() {
+        assert_eq!(
+            datasets("INSERT INTO mart.daily SELECT o.day, c.region FROM sales.orders o JOIN crm.customers c ON o.cid = c.id"),
+            [
+                table(Some("crm"), "customers", false),
+                table(Some("mart"), "daily", true),
+                table(Some("sales"), "orders", false),
+            ]
+        );
+    }
+
+    #[test]
+    fn ctas_writes_the_new_table() {
+        assert_eq!(
+            datasets("CREATE TABLE mart.t AS SELECT * FROM sales.orders"),
+            [
+                table(Some("mart"), "t", true),
+                table(Some("sales"), "orders", false)
+            ]
+        );
+    }
+
+    #[test]
+    fn a_cte_is_not_a_dataset() {
+        assert_eq!(
+            datasets("WITH orders AS (SELECT * FROM sales.raw) SELECT * FROM orders"),
+            [table(Some("sales"), "raw", false)]
+        );
+    }
+
+    #[test]
+    fn statements_that_move_no_data_have_no_datasets() {
+        assert_eq!(datasets("DROP TABLE sales.orders"), []);
+        assert_eq!(datasets("SELECT 1"), []);
     }
 }
 

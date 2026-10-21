@@ -5335,6 +5335,7 @@ dependencies = [
  "async-trait",
  "axum",
  "chrono",
+ "futures",
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",
@@ -5717,6 +5718,7 @@ name = "queryflux-translation"
 version = "0.4.0"
 dependencies = [
  "async-trait",
+ "futures",
  "pyo3",
  "queryflux-core",
  "queryflux-fingerprint",
@@ -6877,6 +6879,12 @@ dependencies = [
  "cpufeatures 0.2.17",
  "digest 0.10.7",
 ]
+
+[[package]]
+name = "sha1_smol"
+version = "1.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bbfa15b3dddfee50a0fff136974b3e1bde555604ba463834a7eb7deb6417705d"
 
 [[package]]
 name = "sha2"
@@ -8152,6 +8160,7 @@ dependencies = [
  "getrandom 0.4.2",
  "js-sys",
  "serde_core",
+ "sha1_smol",
  "wasm-bindgen",
 ]
 

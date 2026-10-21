@@ -236,6 +236,12 @@ impl UpsertClusterConfig {
         if let Some(qa) = &cfg.query_auth {
             config.insert("queryAuth".into(), serde_json::to_value(qa)?);
         }
+        if !cfg.lineage_catalogs.is_empty() {
+            config.insert(
+                "lineageCatalogs".into(),
+                serde_json::to_value(&cfg.lineage_catalogs)?,
+            );
+        }
 
         if let Some(v) = &cfg.health_check_query {
             config.insert("healthCheckQuery".into(), v.clone().into());

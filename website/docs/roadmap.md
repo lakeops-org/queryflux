@@ -51,6 +51,7 @@ Everything below is implemented and available on the `main` branch.
 | | Grafana dashboard (auto-provisioned) |
 | | QueryFlux Studio — Next.js UI: clusters, query history, engine registry |
 | | Buffered + multi-store metrics pipeline |
+| | OpenLineage events per query: tables read and written, columns read, column lineage for writes, routing facet; shared catalog namespaces across engines — see **[OpenLineage](./architecture/openlineage)** |
 | **Ops** | Dynamic config reload from Postgres (configurable interval + immediate on write) |
 | | Per-example Docker Compose stacks (`minimal-trino`, `minimal-inmemory`, `quickstart`, `with-prometheus-grafana`, `full-stack`) |
 | | Proxy overhead benchmarks (`queryflux-bench`): ~0.35 ms p50 added latency |
@@ -70,6 +71,16 @@ Implemented catalog providers: `glue` (direct AWS Glue Data Catalog access), `hi
 ### ClickHouse HTTP frontend
 
 The ClickHouse **backend** adapter (HTTP protocol, sync Arrow path, `queryAuth: impersonate` via `EXECUTE AS`) is done. Still planned: a ClickHouse HTTP **frontend** so native ClickHouse clients can connect to QueryFlux directly, without any driver change — the same pattern the Snowflake frontend already uses for Snowflake-native clients.
+
+### Built-in lineage store and Studio lineage graph
+
+QueryFlux already sends OpenLineage events to an external consumer such as Marquez. Next, it stores them itself: an OpenLineage ingest endpoint (`POST /api/v1/lineage`) so Spark, Airflow, dbt and any other producer can send their events too, and Studio pages to explore the result:
+
+- a graph of jobs and datasets, with upstream and downstream navigation from any node;
+- a column view, showing where each column of a table comes from and how (renamed, transformed, aggregated, masked);
+- an events explorer with filters by job, dataset, run, status and time.
+
+Export to an external consumer stays available alongside.
 
 ### Routing telemetry in Studio
 

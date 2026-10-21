@@ -152,6 +152,10 @@ pub fn cluster_config_from_persisted_json(
         variants: Vec::new(),
         health_check_query: json_str(config, "healthCheckQuery"),
         reconcile_query: json_str(config, "reconcileQuery"),
+        lineage_catalogs: config
+            .get("lineageCatalogs")
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .unwrap_or_default(),
     }
 }
 

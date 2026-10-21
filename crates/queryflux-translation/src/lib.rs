@@ -4,17 +4,17 @@ pub mod sqlglot;
 use queryflux_core::bounded_cache::{BoundedCache, ContentHasher, MAX_CACHED_SQL_BYTES};
 
 pub use access::{
-    apply_write_filters, extract_resources, extract_resources_cached, extraction_cache,
-    render_mask, rewrite_table_scans, ExtractedResource, ExtractedStatement, MaskRenderError,
-    TablePolicy,
+    apply_write_filters, column_lineage, extract_resources, extract_resources_cached,
+    extraction_cache, render_mask, rewrite_table_scans, ExtractedResource, ExtractedStatement,
+    MaskRenderError, TablePolicy,
 };
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-pub use queryflux_core::schema_context::{ColumnMap, SchemaContext};
+pub use queryflux_core::schema_context::{ColumnMap, SchemaContext, TableKey};
 use queryflux_core::{
     catalog::CatalogProvider,
     config::{SqlCacheConfig, TranslationMode},
@@ -451,6 +451,7 @@ impl TranslationService {
             return SchemaContext::default();
         }
         let timeout = self.schema_resolution_timeout;
+        let catalog_provider = catalog;
 
         let dialect = src_dialect.sqlglot_write_name().to_string();
         let refs = match self.table_refs(sql, dialect).await {
@@ -458,47 +459,78 @@ impl TranslationService {
             _ => return SchemaContext::default(),
         };
 
-        let tables: Vec<&str> = refs.iter().map(|r| r.table.as_str()).collect();
-        let resolved_catalog = refs
-            .first()
-            .and_then(|r| r.catalog.as_deref())
-            .or(default_catalog);
-        let resolved_database = refs
-            .first()
-            .and_then(|r| r.database.as_deref())
-            .or(default_database);
-
-        let schemas = match tokio::time::timeout(
-            timeout,
-            catalog.get_schemas_for_query(resolved_catalog, resolved_database, &tables),
-        )
-        .await
-        {
-            Ok(Ok(schemas)) => schemas,
-            Ok(Err(e)) => {
-                tracing::debug!("resolve_schema_context: catalog lookup failed: {e}");
-                return SchemaContext::default();
-            }
-            Err(_) => {
-                tracing::debug!("resolve_schema_context: catalog lookup timed out");
-                return SchemaContext::default();
-            }
-        };
-
-        let mut tables_map = HashMap::new();
-        for schema in schemas {
-            let cols: ColumnMap = schema
-                .columns
-                .iter()
-                .map(|c| (c.name.clone(), c.data_type.clone()))
-                .collect();
-            tables_map.insert(schema.table.clone(), cols);
+        // Each reference is looked up in its own catalog and database, with the session's
+        // defaults filling in what it leaves out: one lookup per (catalog, database),
+        // concurrently, each under the timeout. A failed group leaves only its own tables
+        // without a schema.
+        let mut groups: BTreeMap<(&str, &str), Vec<&str>> = BTreeMap::new();
+        for r in refs.iter() {
+            let catalog = r.catalog.as_deref().or(default_catalog).unwrap_or_default();
+            let database = r
+                .database
+                .as_deref()
+                .or(default_database)
+                .unwrap_or_default();
+            groups
+                .entry((catalog, database))
+                .or_default()
+                .push(r.table.as_str());
         }
+        let lookups = groups
+            .iter()
+            .map(|(&(catalog, database), tables)| async move {
+                let schemas = match tokio::time::timeout(
+                    timeout,
+                    catalog_provider.get_schemas_for_query(
+                        (!catalog.is_empty()).then_some(catalog),
+                        (!database.is_empty()).then_some(database),
+                        tables,
+                    ),
+                )
+                .await
+                {
+                    Ok(Ok(schemas)) => schemas,
+                    Ok(Err(e)) => {
+                        tracing::debug!(
+                            catalog,
+                            database,
+                            "resolve_schema_context: catalog lookup failed: {e}"
+                        );
+                        vec![]
+                    }
+                    Err(_) => {
+                        tracing::debug!(
+                            catalog,
+                            database,
+                            "resolve_schema_context: catalog lookup timed out"
+                        );
+                        vec![]
+                    }
+                };
+                schemas.into_iter().map(move |schema| {
+                    let key = TableKey {
+                        catalog: catalog.to_string(),
+                        database: database.to_string(),
+                        table: schema.table,
+                    };
+                    let cols: ColumnMap = schema
+                        .columns
+                        .into_iter()
+                        .map(|c| (c.name, c.data_type))
+                        .collect();
+                    (key, cols)
+                })
+            });
+        let tables = futures::future::join_all(lookups)
+            .await
+            .into_iter()
+            .flatten()
+            .collect();
 
         SchemaContext {
-            catalog: resolved_catalog.map(String::from),
-            database: resolved_database.map(String::from),
-            tables: tables_map,
+            catalog: default_catalog.map(String::from),
+            database: default_database.map(String::from),
+            tables,
         }
     }
 }

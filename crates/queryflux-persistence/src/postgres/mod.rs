@@ -4411,6 +4411,8 @@ mod tests {
             was_guard_blocked: false,
             cache_hit: false,
             worker: None,
+            datasets: vec![],
+            sql: None,
         };
         first.was_rewritten = true;
         first.rewritten_sql = Some("SELECT 1 WHERE tenant_id = 42".into());
