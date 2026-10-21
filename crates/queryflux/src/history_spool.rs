@@ -111,8 +111,23 @@ impl HistorySpool {
         policy: PolicyFn,
     ) -> anyhow::Result<Arc<Self>> {
         use anyhow::Context;
+        let created: Vec<PathBuf> = dir
+            .ancestors()
+            .take_while(|d| !d.as_os_str().is_empty() && !d.exists())
+            .map(PathBuf::from)
+            .collect();
         std::fs::create_dir_all(&dir)
             .with_context(|| format!("create history spool directory {}", dir.display()))?;
+        // A new directory's name lives in its parent: sync that too, so files acknowledged
+        // into the spool don't vanish with it on a power loss.
+        #[cfg(unix)]
+        for d in &created {
+            if let Some(parent) = d.parent().filter(|p| !p.as_os_str().is_empty()) {
+                std::fs::File::open(parent)
+                    .and_then(|f| f.sync_all())
+                    .with_context(|| format!("sync directory {}", parent.display()))?;
+            }
+        }
         let mut files = BTreeMap::new();
         for entry in std::fs::read_dir(&dir)? {
             let entry = entry?;
