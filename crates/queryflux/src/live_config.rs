@@ -447,6 +447,7 @@ pub(crate) fn snapshot_from_inputs(
             .collect(),
         history: None,
         translation: None,
+        extra: Default::default(),
         settings: SnapshotSettings {
             guardrails: inputs.settings.guardrails.clone(),
             security: inputs.settings.security.clone(),
