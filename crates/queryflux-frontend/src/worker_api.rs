@@ -1071,6 +1071,7 @@ mod tests {
             settings: SnapshotSettings::default(),
             history: None,
             translation: None,
+            extra: Default::default(),
         }
         .seal()
     }

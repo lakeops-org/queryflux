@@ -782,6 +782,7 @@ mod tests {
                 redaction: HistoryRedaction::MaskLiterals,
             }),
             translation: None,
+            extra: Default::default(),
         }
         .seal()
     }
