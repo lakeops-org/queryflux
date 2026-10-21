@@ -63,7 +63,7 @@ queryflux:
       redaction: full         # full | maskLiterals | metadata
 ```
 
-The worker API lives on the admin port, under `/worker/*`. It uses its own bearer secret and does not accept the admin API's credentials.
+The worker API lives on the admin port, under `/worker/*`. It uses its own bearer secret and does not accept the admin API's credentials. Site agents can instead present a token of their own site (`workerApi.sites`, see [Site tokens](./site-agent#site-tokens)); with `sites` set and no `sharedSecret`, only site agents are accepted.
 
 ### Worker
 
