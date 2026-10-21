@@ -348,6 +348,7 @@ async fn run_fleet(
                 stale: st.stale,
                 confirmed_at: st.confirmed_at,
                 consecutive_failures: st.consecutive_failures,
+                served_revision: st.served_revision.clone(),
                 heartbeat_interval_secs: Some(upstream.heartbeat_interval_secs),
                 history: Some(queryflux_persistence::WorkerHistoryStatus {
                     redaction: relay.served().and_then(|s| {

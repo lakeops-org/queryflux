@@ -878,6 +878,7 @@ pub(crate) fn spawn_worker_heartbeat(
                         last_error: st.history_uplink.last_error.clone(),
                     }),
                     frontends: frontends.clone(),
+                    served_revision: None,
                 },
                 kind: "worker".to_string(),
                 parent: None,

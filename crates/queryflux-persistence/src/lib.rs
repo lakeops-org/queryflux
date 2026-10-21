@@ -632,6 +632,9 @@ pub struct WorkerStatus {
     pub history: Option<WorkerHistoryStatus>,
     /// Enabled query frontends, e.g. `trinoHttp:8080`.
     pub frontends: Vec<String>,
+    /// Site agent only: the revision it serves its workers. Differs from `activeRevision`
+    /// (upstream's) when the agent re-sealed the snapshot without a history endpoint.
+    pub served_revision: Option<String>,
 }
 
 #[derive(
