@@ -27,7 +27,7 @@ Read [Worker mode](./worker-mode) first: the agent relays that protocol and chan
 
 | | At the site | Upstream |
 |---|---|---|
-| **Config** | Workers long-poll the agent. Their waits wake as soon as a new revision reaches it. | The agent long-polls `/worker/config/wait` and serves the snapshot it gets unchanged, with the same revision. The last one is cached on disk. |
+| **Config** | Workers long-poll the agent. Their waits wake as soon as a new revision reaches it. | The agent long-polls `/worker/config/wait` and serves the snapshot it gets, with upstream's revision. The one exception: when upstream names `workerApi.history.endpoint`, the agent removes it and re-seals the snapshot, so workers get a new revision ([Query history](#query-history)); `/agent/status` shows both revisions. The last snapshot is cached on disk. |
 | **Fleet** | Workers register and heartbeat with the agent. | Every heartbeat interval the agent posts its live workers to `/worker/fleet`, where they appear as `<siteName>/<workerName>` with `parent: <siteName>`. It also registers itself, with `kind: siteAgent`. |
 | **Query history** | Each batch a worker sends is redacted and written to disk before the worker gets its `202`. | A flusher posts the oldest batch upstream and deletes it once accepted. Each record keeps its worker's name, as `<siteName>/<workerName>`. |
 | **Capacity** | Workers' acquires, releases, waits, quota reports and sweep locks go to the agent. | The agent forwards each one, so one `maxRunningQueries` holds across every site and the control plane. Each worker's lease and quota holder is sent as `<siteName>/<instanceId>`, so two sites with a `worker-0` hold separate leases and quotas. |
