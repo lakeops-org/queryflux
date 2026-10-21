@@ -485,7 +485,42 @@ async fn is_trino_ready(url: &str) -> bool {
     };
     let host = parsed.host_str().unwrap_or("localhost");
     let port = parsed.port().unwrap_or(8080);
-    port_is_open(host, port).await
+    // Fast path when nothing is listening (local runs without the e2e stack).
+    if !port_is_open(host, port).await {
+        return false;
+    }
+    // Port-up is not enough: Trino accepts TCP / HTTP while `starting` is still
+    // true and rejects statements with "Trino server is still initializing".
+    // Compose `--wait` can race the same window if the healthcheck is too loose.
+    wait_for_trino_not_starting(url, Duration::from_secs(180)).await
+}
+
+/// Poll `/v1/info` until Trino reports `"starting": false`, or `timeout` elapses.
+async fn wait_for_trino_not_starting(url: &str, timeout: Duration) -> bool {
+    let info_url = format!("{}/v1/info", url.trim_end_matches('/'));
+    let client = reqwest::Client::new();
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if let Ok(resp) = client
+            .get(&info_url)
+            .header("X-Trino-User", "queryflux-e2e")
+            .timeout(Duration::from_secs(2))
+            .send()
+            .await
+        {
+            if resp.status().is_success() {
+                if let Ok(body) = resp.json::<serde_json::Value>().await {
+                    if body.get("starting") == Some(&serde_json::Value::Bool(false)) {
+                        return true;
+                    }
+                }
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
 }
 
 async fn is_starrocks_ready(url: &str) -> bool {

@@ -26,8 +26,14 @@ services:
       - CATALOG_MANAGEMENT=dynamic
     # GHA runners are slow when StarRocks + Trino start together; avoid the old
     # 10s start + 2 retries window that marks Trino unhealthy before JVM is ready.
+    # `/v1/status` (and `/v1/info` alone) can succeed while Trino still rejects
+    # statements with "Trino server is still initializing". Require starting:false.
     healthcheck:
-      test: ["CMD", "curl", "-sf", "http://127.0.0.1:8080/v1/status"]
+      test:
+        [
+          "CMD-SHELL",
+          "curl -sf http://127.0.0.1:8080/v1/info | grep -q '\"starting\":false'",
+        ]
       interval: 10s
       timeout: 25s
       retries: 30
