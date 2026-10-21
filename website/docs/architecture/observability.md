@@ -130,8 +130,11 @@ The admin API is served on port 9000 alongside `/metrics`. An OpenAPI spec is av
 | `GET` | `/admin/engine-registry` | Full engine descriptor catalog |
 | `GET/PUT/DELETE` | `/admin/config/clusters/{name}` | Cluster config CRUD (Postgres required). Request/response include `variants`, and optional `config.healthCheckQuery` / `config.reconcileQuery`. |
 | `GET` | `/admin/config/clusters` | List all persisted cluster configs |
-| `GET/PUT/DELETE` | `/admin/config/groups/{name}` | Cluster group config CRUD (Postgres required) |
+| `GET/PUT/DELETE` | `/admin/config/groups/{name}` | Cluster group config CRUD (Postgres required). Accepts the group settings, including `maxExecutionSecs` and `capacityWaitTimeoutSecs`. |
 | `GET` | `/admin/config/groups` | List all persisted group configs |
+| `GET/PUT` | `/admin/config/guardrails` | Guard chain config (global and per-group guards) |
+| `POST` | `/admin/route/explain` | Where a query would run and whether guards allow it, without running it; see [Route explain](./routing-and-clusters#route-explain) |
+| `POST` | `/admin/access-control/dry-run` | Access-control decision for a query, without running it |
 | `DELETE` | `/admin/cache` | Invalidate all cached query results |
 | `DELETE` | `/admin/cache/{group}` | Invalidate cached results for a group |
 | `GET` | `/openapi.json` | OpenAPI spec |

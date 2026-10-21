@@ -301,16 +301,9 @@ fn select_lacks_where(expr: &Expression, patterns: &[String]) -> bool {
 /// Check whether a FROM-clause expression references a table matching any pattern.
 fn from_expr_matches(expr: &Expression, patterns: &[String]) -> bool {
     match expr {
-        Expression::Table(t) => {
-            let full_name = match &t.schema {
-                Some(s) => format!("{}.{}", s.name, t.name.name),
-                None => t.name.name.clone(),
-            };
-            patterns
-                .iter()
-                .any(|p| simple_glob_match(&full_name.to_uppercase(), &p.to_uppercase()))
+        Expression::Table(_) | Expression::Alias(_) => {
+            table_name(expr).is_some_and(|name| patterns.iter().any(|p| table_matches(&name, p)))
         }
-        Expression::Alias(a) => from_expr_matches(&a.this, patterns),
         _ => false,
     }
 }
@@ -534,9 +527,8 @@ fn guarded_scans<'a>(
             let Some(name) = table_name(source) else {
                 continue;
             };
-            let upper = name.to_uppercase();
             for (pattern, column) in tables {
-                if simple_glob_match(&upper, &pattern.to_uppercase()) {
+                if table_matches(&name, pattern) {
                     out.push((select, name.clone(), column.as_str()));
                 }
             }
@@ -560,36 +552,47 @@ fn table_name(expr: &Expression) -> Option<String> {
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// Heuristic for SQL that doesn't parse: does the text mention a matching table?
 fn table_name_matches_any_str(upper_sql: &str, patterns: &[String]) -> bool {
-    patterns
-        .iter()
-        .any(|p| simple_glob_match(upper_sql, &p.to_uppercase()))
+    patterns.iter().any(|p| {
+        p.split('*')
+            .filter(|part| !part.is_empty())
+            .all(|part| upper_sql.contains(&part.to_uppercase()))
+    })
 }
 
-/// Simple glob: `*` matches any sequence of characters.
-fn simple_glob_match(haystack: &str, pattern: &str) -> bool {
-    if !pattern.contains('*') {
-        return haystack.contains(pattern);
-    }
-    let parts: Vec<&str> = pattern.split('*').collect();
-    let mut pos = 0usize;
-    for (i, part) in parts.iter().enumerate() {
-        if part.is_empty() {
-            continue;
+/// Whether table `name` (`table` or `schema.table`) matches a configured pattern. The
+/// match is exact and ignores case; `*` matches any run of characters. A pattern without a
+/// `.` is matched against the table name alone, so `events` matches `events` and
+/// `analytics.events` but not `events_archive`; a pattern with a `.` (`dw.fct_*`) is
+/// matched against `schema.table`.
+fn table_matches(name: &str, pattern: &str) -> bool {
+    let target = if pattern.contains('.') {
+        name
+    } else {
+        name.rsplit('.').next().unwrap_or(name)
+    };
+    glob_match(&target.to_uppercase(), &pattern.to_uppercase())
+}
+
+/// Anchored glob: the whole of `text` must match `pattern`, `*` matching any run.
+fn glob_match(text: &str, pattern: &str) -> bool {
+    let mut parts = pattern.split('*');
+    let first = parts.next().unwrap_or("");
+    let Some(mut rest) = text.strip_prefix(first) else {
+        return false;
+    };
+    let mut parts: Vec<&str> = parts.collect();
+    let Some(last) = parts.pop() else {
+        return rest.is_empty(); // no `*`: exact match
+    };
+    for part in parts {
+        match rest.find(part) {
+            Some(i) => rest = &rest[i + part.len()..],
+            None => return false,
         }
-        if i == 0 {
-            if !haystack.starts_with(*part) {
-                return false;
-            }
-            pos = part.len();
-        } else {
-            match haystack[pos..].find(*part) {
-                Some(found) => pos += found + part.len(),
-                None => return false,
-            }
-        }
     }
-    true
+    rest.len() >= last.len() && rest.ends_with(last)
 }
 
 #[cfg(test)]
@@ -1407,5 +1410,27 @@ SELECT order_id, amount FROM filtered
         let sql = format!("SELECT * FROM events WHERE ts >= DATE '{recent}' OR user_id = 7");
         let tc = TestCtx::new(&sql);
         assert!(!time_range().check(&tc.ctx()).await.is_deny());
+    }
+
+    #[test]
+    fn table_patterns_match_exactly() {
+        for (name, pattern, expected) in [
+            ("events", "events", true),
+            ("analytics.events", "events", true),
+            ("events_archive", "events", false),
+            ("user_events", "events", false),
+            ("EVENTS", "events", true),
+            ("fct_sales", "fct_*", true),
+            ("dw.fct_sales", "fct_*", true),
+            ("dw.fct_sales", "dw.fct_*", true),
+            ("stage.fct_sales", "dw.fct_*", false),
+            ("fct_sales", "*_sales", true),
+            ("fct_sales_v2", "*_sales", false),
+            ("a_x_b", "a*b", true),
+            ("ab", "a*b", true),
+            ("anything", "*", true),
+        ] {
+            assert_eq!(table_matches(name, pattern), expected, "{name} ~ {pattern}");
+        }
     }
 }

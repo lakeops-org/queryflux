@@ -50,7 +50,7 @@ SELECT
     ) AS members,
     g.max_running_queries,
     g.max_queued_queries,
-    g.max_execution_secs,
+    g.settings,
     g.strategy,
     g.circuit_breaker,
     g.allow_groups,
@@ -1143,7 +1143,7 @@ impl ClusterConfigStore for PostgresStore {
 
         sqlx::query(
             r#"INSERT INTO cluster_group_configs
-                   (name, enabled, members, max_running_queries, max_queued_queries, strategy, circuit_breaker, allow_groups, allow_users, translation_script_ids, default_tags, cache, max_execution_secs)
+                   (name, enabled, members, max_running_queries, max_queued_queries, strategy, circuit_breaker, allow_groups, allow_users, translation_script_ids, default_tags, cache, settings)
                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
                ON CONFLICT (name) DO UPDATE SET
                    enabled                = EXCLUDED.enabled,
@@ -1157,7 +1157,7 @@ impl ClusterConfigStore for PostgresStore {
                    translation_script_ids = EXCLUDED.translation_script_ids,
                    default_tags           = EXCLUDED.default_tags,
                    cache                  = EXCLUDED.cache,
-                   max_execution_secs     = EXCLUDED.max_execution_secs,
+                   settings               = EXCLUDED.settings,
                    updated_at             = now()"#,
         )
         .bind(name)
@@ -1172,7 +1172,7 @@ impl ClusterConfigStore for PostgresStore {
         .bind(&cfg.translation_script_ids)
         .bind(&cfg.default_tags)
         .bind(&cfg.cache)
-        .bind(cfg.max_execution_secs)
+        .bind(sqlx::types::Json(&cfg.settings))
         .execute(&mut *tx)
         .await
         .map_err(|e| QueryFluxError::Persistence(format!("upsert_group_config: {e}")))?;
@@ -1263,7 +1263,7 @@ impl ClusterConfigStore for PostgresStore {
 
         let inserted: Option<(i64,)> = sqlx::query_as(
             r#"INSERT INTO cluster_group_configs
-                   (name, enabled, members, max_running_queries, max_queued_queries, strategy, circuit_breaker, allow_groups, allow_users, translation_script_ids, default_tags, cache, max_execution_secs)
+                   (name, enabled, members, max_running_queries, max_queued_queries, strategy, circuit_breaker, allow_groups, allow_users, translation_script_ids, default_tags, cache, settings)
                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
                ON CONFLICT (name) DO NOTHING
                RETURNING id"#,
@@ -1280,7 +1280,7 @@ impl ClusterConfigStore for PostgresStore {
         .bind(&cfg.translation_script_ids)
         .bind(&cfg.default_tags)
         .bind(&cfg.cache)
-        .bind(cfg.max_execution_secs)
+        .bind(sqlx::types::Json(&cfg.settings))
         .fetch_optional(&mut *tx)
         .await
         .map_err(|e| {
@@ -2878,7 +2878,7 @@ mod tests {
 
     #[tokio::test]
     #[ignore]
-    async fn pg_group_max_execution_secs_is_stored() {
+    async fn pg_group_settings_are_stored() {
         let store = test_store().await;
         let cluster = unique_id("maxexec-c");
         let group = unique_id("maxexec-g");
@@ -2887,15 +2887,18 @@ mod tests {
             serde_json::from_value(serde_json::json!({
                 "members": [cluster],
                 "maxRunningQueries": 1,
-                "maxExecutionSecs": 90
+                "maxExecutionSecs": 90,
+                "capacityWaitTimeoutSecs": 20
             }))
             .unwrap();
         let record = store.upsert_group_config(&group, &g).await.unwrap();
-        assert_eq!(record.max_execution_secs, Some(90));
+        assert_eq!(record.settings.max_execution_secs, Some(90));
         use crate::ConfigSnapshotStore;
         let rows = store.load_config_snapshot_rows().await.unwrap();
         let row = rows.groups.iter().find(|r| r.name == group).unwrap();
-        assert_eq!(row.to_core().unwrap().max_execution_secs, Some(90));
+        let core = row.to_core().unwrap();
+        assert_eq!(core.max_execution_secs, Some(90));
+        assert_eq!(core.capacity_wait_timeout_secs, Some(20));
 
         store.delete_group_config(&group).await.unwrap();
         store.delete_cluster_config(&cluster).await.unwrap();

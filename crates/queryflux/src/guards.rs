@@ -194,14 +194,19 @@ pub(crate) fn resolve_built_in_guard(
             applies_to: params.applies_to.unwrap_or_default(),
         }),
         Some("partition_predicate_required") => Box::new(PartitionPredicateGuard { tables }),
-        Some("time_range_limit") => Box::new(TimeRangeLimitGuard {
-            tables,
-            max_lookback: params
+        Some("time_range_limit") => {
+            match params
                 .max_lookback
                 .as_deref()
-                .and_then(|l| queryflux_core::config::parse_lookback(l).ok())
-                .unwrap_or_else(|| chrono::Duration::days(90)),
-        }),
+                .map(queryflux_core::config::parse_lookback)
+            {
+                Some(Ok(max_lookback)) => Box::new(TimeRangeLimitGuard {
+                    tables,
+                    max_lookback,
+                }),
+                _ => unreachable!("validate_built_in_guard requires a valid max_lookback"),
+            }
+        }
         Some("no_cross_join") => Box::new(NoCrossJoinGuard),
         Some(other) => Box::new(MisconfiguredGuard {
             guard_name: "built_in",

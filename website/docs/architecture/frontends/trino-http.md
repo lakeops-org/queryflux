@@ -74,6 +74,21 @@ Tags can be set via:
 
 Tags are used by the `tags` router for routing decisions. See [Query tags](/docs/architecture/query-tags).
 
+## Routing headers
+
+The first response to `POST /v1/statement` carries the routing decision:
+
+| Header | Value |
+|---|---|
+| `X-QueryFlux-Route-Group` | The cluster group the query was routed to. |
+| `X-QueryFlux-Route-Rule` | The router type that matched (`Tags`, `PythonScript`, `Header`, …) or `fallback`. |
+
+To see the decision without running the query, use [route explain](../routing-and-clusters#route-explain).
+
+## Execution limit
+
+If the group sets `maxExecutionSecs`, a query that runs longer is cancelled on the engine. Trino HTTP queries are checked every 30 seconds, so they can stop up to 30 seconds after the limit. The next poll for a stopped query no longer finds it, and the reason (`EXECUTION_TIMEOUT`) is in query history.
+
 ## nextUri rewriting
 
 When proxying Trino async queries, QueryFlux rewrites `nextUri` URLs in response JSON so the client always polls through the proxy rather than going directly to the Trino coordinator. The rewrite replaces the host/port with `externalAddress` while preserving the Trino path from `/v1/` onward. This is done via fast byte-level patching when possible, avoiding full JSON deserialization.

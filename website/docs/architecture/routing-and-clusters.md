@@ -190,12 +190,16 @@ clusterGroups:
     enabled: true
     maxRunningQueries: 4
     members: [duckdb-1]
+    capacityWaitTimeoutSecs: 60   # optional: max wait for a slot (default 300)
+    maxExecutionSecs: 600         # optional: cancel queries running longer (default: no limit)
 ```
 
 Notes:
 
 - **`maxRunningQueries`** on the group applies to **each** member cluster’s `ClusterState` when those states are built (see `main.rs` pass 2). It is the cap used for **acquire** / capacity checks.
-- **`maxExecutionSecs`** (optional) stops queries that run too long: when a query has run on the engine for longer than this, QueryFlux cancels it on the engine and fails it with `EXECUTION_TIMEOUT` and a hint to narrow the query. Streaming frontends (MySQL, Postgres, Flight SQL, MCP, Snowflake) enforce it exactly; Trino HTTP queries are checked by a background sweep every 30 seconds, so they stop up to 30 seconds late. Set it in YAML (`clusterGroups.<name>.maxExecutionSecs`) or through the admin API (`maxExecutionSecs` in `PUT /admin/config/groups/{name}`); omitted, `null` or `0` means no limit.
+- **`maxExecutionSecs`** (optional) stops queries that run too long: when a query has run on the engine for longer than this, QueryFlux cancels it on the engine and fails it with `EXECUTION_TIMEOUT` and a hint to narrow the query. Streaming frontends (MySQL, Postgres, Flight SQL, MCP, Snowflake) enforce it exactly; Trino HTTP queries are checked by a background sweep every 30 seconds, so they stop up to 30 seconds late. Omitted, `null` or `0` means no limit.
+- **`capacityWaitTimeoutSecs`** (optional) is how long a query may wait for a free slot before it fails. Omitted or `0` means the default, 300 seconds.
+- Every group setting can be set in YAML or through the admin API (`PUT /admin/config/groups/{name}`, same camelCase keys). With Postgres persistence, `maxExecutionSecs` and `capacityWaitTimeoutSecs` are stored in the group's `settings` JSON column, so they survive restarts and reach every replica and worker.
 - **`members`** can list multiple clusters, including **mixed engines** (e.g. Trino and DuckDB in one group). For that, **`engineAffinity`** (or another strategy) helps express preference order across engine types (`queryflux_cluster_manager::strategy`).
 
 ## Selection strategies
