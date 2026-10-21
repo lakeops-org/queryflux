@@ -232,6 +232,21 @@ The migrations are forward-only: once they've run, an older QueryFlux won't star
 
 See the [Helm chart README](https://github.com/lakeops-org/queryflux/blob/main/charts/queryflux/README.md#worker-mode).
 
+## Version skew
+
+The control plane, site agents and workers don't need to run the same release. They work together as long as they share the snapshot schema version (`schemaVersion`, 1 today) and the query-history batch version (1 today). Upgrade them in any order: a hosted control plane, for example, is upgraded first, and each site upgrades its agent and workers on its own schedule.
+
+- A newer control plane can add top-level snapshot fields. Older site agents, snapshot caches and peers pass them on unchanged. Older workers ignore them and still verify the revision.
+- A newer worker or agent reads a snapshot from an older control plane: fields it knows but doesn't receive keep their defaults.
+- Query-history batches and worker reports work the same way: unknown fields are ignored, missing ones default.
+- A schema version bump is a breaking change and is called out in the release notes. A worker that receives a version it doesn't support reports `unsupported_snapshot_version` and keeps its active config.
+
+For contributors, two tests in `crates/queryflux-core/src/worker_snapshot.rs` enforce this:
+- **Older control plane:** a v1 snapshot from an older control plane (a fixed fixture) must still verify. A new field therefore needs `#[serde(default, skip_serializing_if = ...)]`.
+- **Newer control plane:** a snapshot with a field this version doesn't know must verify and pass through unchanged.
+
+Only top-level fields pass through. Data added inside a group, router or other typed value needs a version bump.
+
 ## Security notes
 
 - Snapshots embed cluster credentials. Serve the control plane's admin port over TLS. `allowInsecureHttp` exists for local demos.

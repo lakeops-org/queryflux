@@ -1,0 +1,79 @@
+{
+  "schemaVersion": 1,
+  "revision": "c25b7d4b2af483a2",
+  "credentials": "embedded",
+  "clusters": [
+    {
+      "name": "adbc-a",
+      "enabled": true,
+      "engineKey": "adbc",
+      "maxRunningQueries": 4,
+      "config": {
+        "dbKwargs": {
+          "privateKeyPassphrase": "pp",
+          "warehouse": "WH"
+        },
+        "driver": "snowflake",
+        "queryAuth": {
+          "type": "tokenExchange"
+        }
+      },
+      "variants": []
+    },
+    {
+      "name": "trino-b",
+      "enabled": true,
+      "engineKey": "trino",
+      "maxRunningQueries": null,
+      "config": {
+        "authPassword": "s3cret",
+        "authType": "basic",
+        "authUsername": "svc",
+        "endpoint": "https://trino-b:8443"
+      },
+      "variants": []
+    }
+  ],
+  "groups": {
+    "analytics": {
+      "enabled": true,
+      "members": [
+        "trino-b",
+        "adbc-a"
+      ],
+      "strategy": {
+        "type": "weighted",
+        "weights": {
+          "trino-b": 3,
+          "adbc-a": 1
+        }
+      },
+      "circuitBreaker": null,
+      "maxRunningQueries": 10,
+      "maxQueuedQueries": null,
+      "capacityWaitTimeoutSecs": null,
+      "authorization": {
+        "allowGroups": [],
+        "allowUsers": []
+      },
+      "defaultTags": {},
+      "cache": null
+    }
+  },
+  "routers": [],
+  "routingFallback": "analytics",
+  "groupTranslationScripts": {},
+  "settings": {
+    "guardrails": null,
+    "security": {
+      "oidc": {
+        "clientSecret": "cs",
+        "issuer": "https://idp"
+      },
+      "provider": "oidc"
+    },
+    "catalog": null,
+    "accessControl": null,
+    "guardScriptBodies": {}
+  }
+}
