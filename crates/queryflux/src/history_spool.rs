@@ -195,7 +195,12 @@ impl HistorySpool {
         let path = self.path(seq, file);
         let tmp = path.with_extension("json.tmp");
         let io = |e: std::io::Error| QueryFluxError::Persistence(format!("history spool: {e}"));
-        let mut f = tokio::fs::File::create(&tmp).await.map_err(io)?;
+        // Readable only by this user: with `redaction: full` the batch holds raw SQL.
+        let mut opts = tokio::fs::OpenOptions::new();
+        opts.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        opts.mode(0o600);
+        let mut f = opts.open(&tmp).await.map_err(io)?;
         f.write_all(&body).await.map_err(io)?;
         f.sync_all().await.map_err(io)?;
         drop(f);
@@ -249,7 +254,9 @@ impl HistorySpool {
             let path = self.path(seq, file);
             let records: Vec<QueryRecord> = match tokio::fs::read(&path).await {
                 Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_else(|e| {
-                    tracing::warn!(file = %path.display(), "Unreadable history spool file, skipping it: {e}");
+                    tracing::warn!(file = %path.display(), "Unreadable history spool file, dropping it: {e}");
+                    queryflux_metrics::site_agent::HISTORY_DROPPED.inc_by(file.records);
+                    self.status.lock().unwrap_or_else(|e| e.into_inner()).dropped += file.records;
                     Vec::new()
                 }),
                 // Dropped by eviction meanwhile.

@@ -494,9 +494,13 @@ fn start(
     let registry = Arc::new(InMemoryPersistence::new());
     // Capacity is forwarded; when upstream is unreachable the agent answers 503 and each
     // worker's `coordination.onUnavailable` decides.
-    let remote = crate::remote_coordination::remote_coordination(
-        &agent.upstream,
-        OnCoordinationUnavailable::FailClosed,
+    // Holders are qualified by site, like fleet and history names.
+    let remote = Arc::new(
+        crate::remote_coordination::RemoteCoordinationStore::new(
+            &agent.upstream,
+            OnCoordinationUnavailable::FailClosed,
+        )
+        .with_holder_prefix(format!("{}/", agent.site_name)),
     );
     let api = WorkerApi {
         shared_secret: worker_secret,

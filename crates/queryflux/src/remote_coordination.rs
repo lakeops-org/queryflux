@@ -30,6 +30,9 @@ pub(crate) struct RemoteCoordinationStore {
     /// Cleared when the control plane answers 404 to `/worker/capacity/wait` (a version
     /// before it); waits then fall back to sleeping.
     wait_endpoint: std::sync::atomic::AtomicBool,
+    /// Put before every holder (`instanceId`) sent upstream. A site agent sets
+    /// `<site>/`, so `worker-0` at two sites holds separate leases and quotas.
+    holder_prefix: String,
 }
 
 impl RemoteCoordinationStore {
@@ -47,7 +50,17 @@ impl RemoteCoordinationStore {
             on_unavailable,
             batch_release: std::sync::atomic::AtomicBool::new(true),
             wait_endpoint: std::sync::atomic::AtomicBool::new(true),
+            holder_prefix: String::new(),
         }
+    }
+
+    pub(crate) fn with_holder_prefix(mut self, prefix: String) -> Self {
+        self.holder_prefix = prefix;
+        self
+    }
+
+    fn holder(&self, instance_id: &str) -> String {
+        format!("{}{instance_id}", self.holder_prefix)
     }
 
     async fn send(&self, req: reqwest::RequestBuilder) -> Result<reqwest::Response> {
@@ -140,7 +153,7 @@ impl CapacityStore for RemoteCoordinationStore {
                 json!({
                     "cluster": cluster_name,
                     "maxRunningQueries": max_running_queries,
-                    "instanceId": instance_id,
+                    "instanceId": self.holder(instance_id),
                     "queryId": query_id,
                 }),
             )
@@ -260,7 +273,7 @@ impl CapacityStore for RemoteCoordinationStore {
         let r: Renewed = self
             .post(
                 "/worker/capacity/heartbeat",
-                json!({ "instanceId": instance_id }),
+                json!({ "instanceId": self.holder(instance_id) }),
             )
             .await?;
         Ok(r.renewed)
@@ -293,7 +306,7 @@ impl CapacityStore for RemoteCoordinationStore {
         let r: Released = self
             .post(
                 "/worker/capacity/release-all",
-                json!({ "instanceId": instance_id }),
+                json!({ "instanceId": self.holder(instance_id) }),
             )
             .await?;
         Ok(r.released)
@@ -313,7 +326,7 @@ impl queryflux_persistence::quota::QuotaStore for RemoteCoordinationStore {
         let resp = self
             .client
             .post(format!("{}/worker/capacity/quota", self.base))
-            .json(&json!({ "instanceId": instance_id, "clusters": reports }))
+            .json(&json!({ "instanceId": self.holder(instance_id), "clusters": reports }))
             .bearer_auth(&self.bearer)
             .send()
             .await
@@ -338,7 +351,7 @@ impl queryflux_persistence::quota::QuotaStore for RemoteCoordinationStore {
         let r: Released = self
             .post(
                 "/worker/capacity/quota/release",
-                json!({ "instanceId": instance_id }),
+                json!({ "instanceId": self.holder(instance_id) }),
             )
             .await?;
         Ok(r.released)
@@ -521,6 +534,21 @@ mod tests {
         a.release("c", "q1").await.unwrap();
         assert!(b.try_acquire("c", 1, "wb", "q2").await.unwrap());
         assert_eq!(b.release_all_for_instance("wb").await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn same_worker_name_at_two_sites_holds_separate_leases() {
+        let url = control_plane(leases()).await;
+        let a =
+            client(&url, OnCoordinationUnavailable::FailClosed).with_holder_prefix("dc1/".into());
+        let b =
+            client(&url, OnCoordinationUnavailable::FailClosed).with_holder_prefix("dc2/".into());
+
+        assert!(a.try_acquire("c", 2, "worker-0", "q1").await.unwrap());
+        assert!(b.try_acquire("c", 2, "worker-0", "q2").await.unwrap());
+        // dc1's worker-0 shutting down frees only its own lease.
+        assert_eq!(a.release_all_for_instance("worker-0").await.unwrap(), 1);
+        assert_eq!(b.active_lease_count("c").await.unwrap(), 1);
     }
 
     #[tokio::test]
