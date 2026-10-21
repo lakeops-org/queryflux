@@ -41,7 +41,7 @@ use queryflux_persistence::{in_memory::InMemoryPersistence, WorkerRecord, Worker
 use tokio::sync::watch;
 
 use crate::config_source::{fetch_snapshot, FetchMode, Fetched, PeerConfig};
-use crate::history_spool::{HistorySpool, SpoolStatus};
+use crate::history_spool::{write_private, HistorySpool, SpoolStatus};
 
 /// Workers that reported within this window are relayed upstream as live.
 const LIVE_WINDOW_SECS: i64 = 60;
@@ -146,7 +146,13 @@ impl Relay {
                 snapshot: snapshot.clone(),
                 confirmed_at: now,
             };
-            if let Err(e) = write_private(path, &cached).await {
+            let written = match serde_json::to_vec(&cached) {
+                Ok(body) => write_private(path, &body)
+                    .await
+                    .map_err(anyhow::Error::from),
+                Err(e) => Err(e.into()),
+            };
+            if let Err(e) = written {
                 tracing::warn!(file = %path.display(), "Could not cache the snapshot on disk: {e:#}");
             }
         }
@@ -218,23 +224,6 @@ impl Relay {
         let jitter_ms = (uuid::Uuid::new_v4().as_u128() % 1000) as u64;
         Duration::from_secs(base) + Duration::from_millis(jitter_ms)
     }
-}
-
-/// Write JSON readable only by this user: temp file, fsync, rename.
-async fn write_private<T: serde::Serialize>(path: &std::path::Path, value: &T) -> Result<()> {
-    use tokio::io::AsyncWriteExt;
-    let body = serde_json::to_vec(value)?;
-    let tmp = path.with_extension("json.tmp");
-    let mut opts = tokio::fs::OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    opts.mode(0o600);
-    let mut f = opts.open(&tmp).await?;
-    f.write_all(&body).await?;
-    f.sync_all().await?;
-    drop(f);
-    tokio::fs::rename(&tmp, path).await?;
-    Ok(())
 }
 
 /// Keep the agent's copy of upstream's config current until shutdown.

@@ -70,6 +70,26 @@ pub(crate) struct HistorySpool {
     policy: PolicyFn,
 }
 
+/// Write `body` to `path` durably and readable only by this user: temp file, fsync,
+/// rename, then fsync the directory so the new name survives a power loss too.
+pub(crate) async fn write_private(path: &std::path::Path, body: &[u8]) -> std::io::Result<()> {
+    let tmp = path.with_extension("json.tmp");
+    let mut opts = tokio::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    opts.mode(0o600);
+    let mut f = opts.open(&tmp).await?;
+    f.write_all(body).await?;
+    f.sync_all().await?;
+    drop(f);
+    tokio::fs::rename(&tmp, path).await?;
+    #[cfg(unix)]
+    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+        tokio::fs::File::open(dir).await?.sync_all().await?;
+    }
+    Ok(())
+}
+
 fn file_name(seq: u64, records: u64) -> String {
     format!("{seq:020}-{records}.json")
 }
@@ -192,19 +212,10 @@ impl HistorySpool {
             bytes: body.len() as u64,
             records: records.len() as u64,
         };
-        let path = self.path(seq, file);
-        let tmp = path.with_extension("json.tmp");
-        let io = |e: std::io::Error| QueryFluxError::Persistence(format!("history spool: {e}"));
         // Readable only by this user: with `redaction: full` the batch holds raw SQL.
-        let mut opts = tokio::fs::OpenOptions::new();
-        opts.write(true).create(true).truncate(true);
-        #[cfg(unix)]
-        opts.mode(0o600);
-        let mut f = opts.open(&tmp).await.map_err(io)?;
-        f.write_all(&body).await.map_err(io)?;
-        f.sync_all().await.map_err(io)?;
-        drop(f);
-        tokio::fs::rename(&tmp, &path).await.map_err(io)?;
+        write_private(&self.path(seq, file), &body)
+            .await
+            .map_err(|e| QueryFluxError::Persistence(format!("history spool: {e}")))?;
 
         let evicted: Vec<(u64, SpoolFile)> = {
             let mut files = self.files.lock().unwrap_or_else(|e| e.into_inner());
