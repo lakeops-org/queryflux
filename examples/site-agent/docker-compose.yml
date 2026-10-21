@@ -1,0 +1,121 @@
+# Site agent: a control plane (with Postgres) standing in for a remote one, one site
+# agent, and two workers that reach the control plane only through the agent.
+#
+# From this directory:
+#   docker compose up -d --wait
+#
+# SQL via worker-a: http://localhost:8090 · worker-b: :8091
+# Agent status: http://localhost:9100/agent/status
+# Studio (control plane): http://localhost:3000 · Admin API: http://localhost:9000
+#
+# The site agent needs a QueryFlux image built from a release that includes it. To use a
+# local build: QUERYFLUX_IMAGE=queryflux:dev docker compose up -d --wait
+
+name: queryflux-example-site-agent
+
+x-readyz: &readyz
+  test:
+    - CMD
+    - python3
+    - -c
+    - "import urllib.request; urllib.request.urlopen('http://localhost:9000/readyz')"
+  interval: 3s
+  timeout: 3s
+  retries: 40
+
+networks:
+  # The control plane's network ("upstream") and the site's network. Only the agent is on
+  # both: the workers have no route to the control plane.
+  upstream: {}
+  site: {}
+
+volumes:
+  # The agent's snapshot cache and history spool. Keep it on an encrypted volume in a real
+  # deployment: the cached snapshot can carry engine credentials.
+  agent-state: {}
+
+services:
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: queryflux
+      POSTGRES_PASSWORD: queryflux
+      POSTGRES_DB: queryflux
+    networks: [upstream]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U queryflux"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  control-plane:
+    image: ${QUERYFLUX_IMAGE:-ghcr.io/lakeops-org/queryflux:latest}
+    networks: [upstream]
+    ports:
+      - "9000:9000"
+    volumes:
+      - ./control-plane.yaml:/etc/queryflux/config.yaml:ro
+    environment:
+      RUST_LOG: ${RUST_LOG:-queryflux=info}
+    healthcheck: *readyz
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  site-agent:
+    image: ${QUERYFLUX_IMAGE:-ghcr.io/lakeops-org/queryflux:latest}
+    networks: [upstream, site]
+    ports:
+      - "9100:9000"
+    volumes:
+      - ./site-agent.yaml:/etc/queryflux/config.yaml:ro
+      - agent-state:/var/lib/queryflux/site-agent
+    environment:
+      RUST_LOG: ${RUST_LOG:-queryflux=info}
+    # Ready once it has a config to serve, from upstream or its cache.
+    healthcheck: *readyz
+    depends_on:
+      - control-plane
+    restart: unless-stopped
+
+  worker-a:
+    image: ${QUERYFLUX_IMAGE:-ghcr.io/lakeops-org/queryflux:latest}
+    networks: [site]
+    ports:
+      - "8090:8080"
+      - "9090:9000"
+    volumes:
+      - ./worker-a.yaml:/etc/queryflux/config.yaml:ro
+    environment:
+      RUST_LOG: ${RUST_LOG:-queryflux=info}
+    healthcheck: *readyz
+    depends_on:
+      - site-agent
+    restart: unless-stopped
+
+  worker-b:
+    image: ${QUERYFLUX_IMAGE:-ghcr.io/lakeops-org/queryflux:latest}
+    networks: [site]
+    ports:
+      - "8091:8080"
+      - "9091:9000"
+    volumes:
+      - ./worker-b.yaml:/etc/queryflux/config.yaml:ro
+    environment:
+      RUST_LOG: ${RUST_LOG:-queryflux=info}
+    healthcheck: *readyz
+    depends_on:
+      - site-agent
+    restart: unless-stopped
+
+  queryflux-studio:
+    image: ghcr.io/lakeops-org/queryflux-studio:latest
+    networks: [upstream]
+    ports:
+      - "3000:3000"
+    environment:
+      ADMIN_API_URL: http://control-plane:9000
+    depends_on:
+      - control-plane
+    restart: unless-stopped

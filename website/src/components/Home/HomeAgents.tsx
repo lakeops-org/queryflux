@@ -1,6 +1,8 @@
 import type {ReactNode} from 'react';
+import clsx from 'clsx';
 import Link from '@docusaurus/Link';
 import Heading from '@theme/Heading';
+import HomeAgentFlow from './HomeAgentFlow';
 import SectionHeader from './SectionHeader';
 import styles from './styles.module.css';
 
@@ -59,22 +61,23 @@ const CARDS: Card[] = [
 
 export default function HomeAgents(): ReactNode {
   return (
-    <section className={styles.section} aria-labelledby="home-agents">
+    <section className={styles.sectionAlt} aria-labelledby="home-agents">
       <div className="container">
         <SectionHeader
           id="home-agents"
           eyebrow="Built for agents"
-          title="Give agents SQL, not the keys to every engine"
+          title="Follow a query through QueryFlux"
           lead={
             <>
-              Agents don’t choose engines and don’t get unchecked SQL access. QueryFlux decides
-              where each query runs and what it may do, and records all of it.{' '}
+              From an agent question to a Studio trail: guardrails, dialect translate, routing,
+              cache, then the engine that should run it.{' '}
               <Link to="/docs/quickstart/ai-agent-mcp">Connect an agent →</Link>
             </>
           }
           center
         />
-        <div className={styles.useCaseGrid}>
+        <HomeAgentFlow />
+        <div className={clsx(styles.useCaseGrid, styles.flowFollowup)}>
           {CARDS.map((card, i) => (
             <article key={card.title} className={styles.useCaseCard}>
               <div className={styles.useCaseTop}>

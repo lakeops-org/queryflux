@@ -17,23 +17,10 @@ Every query takes a slot in two places before it runs:
 1. **A local slot** in the process's own counters (`ClusterState`). No I/O. A lone process stops here.
 2. **A fleet-wide lease** when coordination is on (Postgres persistence, or a worker with `coordination.mode: controlPlane`). The lease is a row in `cluster_capacity_leases`, tied to the query id.
 
-```mermaid
-sequenceDiagram
-    participant Q as Query
-    participant P as QueryFlux process
-    participant DB as Postgres (or the control plane)
-    Q->>P: submit
-    P->>P: local slot (atomic counter)
-    P->>DB: queryflux_capacity_try_acquire(cluster, max)
-    alt granted
-        DB-->>P: true
-        P->>P: run the query
-        P-)DB: release (queued, sent in a batch)
-    else cluster full
-        DB-->>P: false
-        P->>P: queue, retry
-    end
-```
+<img
+  src="/img/docs/capacity-lease-admission.svg"
+  alt="Admission sequence: local atomic slot then queryflux_capacity_try_acquire; granted runs the query and queues release, cluster full queues and retries"
+/>
 
 If the coordination store can't be reached, admission fails closed: the query waits rather than running past the limit. Workers can choose `localLimits` instead (see [Worker mode](./worker-mode#shared-capacity)).
 
@@ -88,24 +75,10 @@ Per-query leases still cost one round trip per admission. Capacity quotas remove
 
 With `capacity.mode: quotas`, each process that admits queries (a *holder*: a worker, or a replica serving queries itself) gets a share of every cluster's limit and admits within it with an atomic counter, with no round trip. Control-plane load then depends on the number of holders, not on the query rate. The design follows Google's [Doorman](https://github.com/youtube/doorman).
 
-```mermaid
-sequenceDiagram
-    participant H as Holder (worker or replica)
-    participant CP as Control plane
-    participant DB as Postgres
-    participant A as Allocator (one replica)
-    loop every second (every 250 ms while queries wait)
-        H->>CP: POST /worker/capacity/quota (running, waiting per cluster)
-        CP->>DB: upsert capacity_holders
-        DB-->>H: current grant and its sequence
-    end
-    loop every 200 ms
-        A->>DB: lock clusters, read demand and leases
-        A->>A: fair share, headroom, shrink rule
-        A->>DB: write grants, quota_committed
-    end
-    Note over H: admit while running < grant (no I/O)<br/>beyond the grant: one per-query lease (the reserve)
-```
+<img
+  src="/img/docs/capacity-quota-allocator.svg"
+  alt="Capacity quotas: holders report demand to the control plane; allocator writes grants; admit locally while running is below grant, otherwise use per-query lease reserve"
+/>
 
 **Demand and grants.** Every holder reports, per cluster, the queries it runs on quota and the queries waiting for capacity. The allocator, run by whichever replica holds the `capacity-allocator` lock, gives each holder a max-min fair share of `maxRunningQueries - leases - reserve` by demand, plus up to a quarter of its demand as headroom from what is left. The grant comes back on the holder's next report.
 

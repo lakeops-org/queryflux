@@ -11,12 +11,10 @@ In this quickstart you build QueryFlux from source and run it as a plain process
 
 ## What you'll build
 
-```mermaid
-flowchart LR
-  client["curl or Trino CLI"] -->|"Trino HTTP<br/>:8080"| qf["queryflux binary"]
-  qf -->|"Trino SQL → DuckDB SQL<br/>(sqlglot)"| duck["Embedded DuckDB<br/>(in-process, in-memory)"]
-  ops["curl"] -->|"Admin API + /metrics<br/>:9000"| qf
-```
+<img
+  src="/img/docs/quickstart-local-duckdb.svg"
+  alt="cli-quickstart: curl or Trino CLI to queryflux binary on port 8080 with embedded in-memory DuckDB via sqlglot translation; Admin API and metrics on port 9000"
+/>
 
 | Endpoint | URL |
 | --- | --- |

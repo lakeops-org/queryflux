@@ -1,0 +1,73 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="480" viewBox="0 0 960 480" role="img" aria-label="full-stack quickstart: Trino and StarRocks via QueryFlux over shared Iceberg catalog on RustFS">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#0b0614"/>
+      <stop offset="100%" stop-color="#050508"/>
+    </linearGradient>
+    <marker id="arr" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto">
+      <path d="M0,0 L7,3 L0,6 Z" fill="#a78bfa"/>
+    </marker>
+    <marker id="arrG" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto">
+      <path d="M0,0 L7,3 L0,6 Z" fill="#86efac"/>
+    </marker>
+    <pattern id="dots" width="22" height="22" patternUnits="userSpaceOnUse">
+      <circle cx="1" cy="1" r="0.8" fill="rgba(255,255,255,0.05)"/>
+    </pattern>
+  </defs>
+
+  <rect width="960" height="480" rx="20" fill="url(#bg)"/>
+  <rect width="960" height="480" rx="20" fill="url(#dots)"/>
+  <rect x="1" y="1" width="958" height="478" rx="19" fill="none" stroke="rgba(255,255,255,0.08)"/>
+
+  <text x="40" y="40" fill="#fafafa" font-family="ui-sans-serif, system-ui, sans-serif" font-size="18" font-weight="650">Multi-engine lakehouse</text>
+  <text x="40" y="64" fill="#a1a1aa" font-family="ui-sans-serif, system-ui, sans-serif" font-size="12">Trino HTTP and MySQL wire route to different engines over one Iceberg catalog.</text>
+
+  <g font-family="ui-sans-serif, system-ui, sans-serif" font-size="11">
+    <rect x="40" y="100" width="120" height="48" rx="12" fill="rgba(255,118,25,0.12)" stroke="#ff7619"/>
+    <text x="100" y="120" text-anchor="middle" fill="#ffedd5" font-weight="650">Trino CLI / HTTP</text>
+    <text x="100" y="136" text-anchor="middle" fill="#fdba74">:8080</text>
+
+    <rect x="40" y="160" width="120" height="48" rx="12" fill="rgba(255,118,25,0.12)" stroke="#ff7619"/>
+    <text x="100" y="180" text-anchor="middle" fill="#ffedd5" font-weight="650">mysql client</text>
+    <text x="100" y="196" text-anchor="middle" fill="#fdba74">MySQL :3306</text>
+
+    <rect x="220" y="120" width="120" height="72" rx="14" fill="rgba(139,92,246,0.18)" stroke="#8b5cf6"/>
+    <text x="280" y="152" text-anchor="middle" fill="#ede9fe" font-size="14" font-weight="650">QueryFlux</text>
+
+    <rect x="400" y="100" width="100" height="44" rx="12" fill="rgba(139,92,246,0.12)" stroke="#8b5cf6"/>
+    <text x="450" y="120" text-anchor="middle" fill="#c4b5fd" font-weight="650">Trino</text>
+    <text x="450" y="136" text-anchor="middle" fill="#71717a">trino-default</text>
+
+    <rect x="400" y="168" width="100" height="44" rx="12" fill="rgba(139,92,246,0.12)" stroke="#8b5cf6"/>
+    <text x="450" y="188" text-anchor="middle" fill="#c4b5fd" font-weight="650">StarRocks</text>
+    <text x="450" y="204" text-anchor="middle" fill="#71717a">starrocks-default</text>
+
+    <rect x="560" y="120" width="120" height="56" rx="12" fill="rgba(163,230,53,0.1)" stroke="rgba(163,230,53,0.45)"/>
+    <text x="620" y="144" text-anchor="middle" fill="#ecfccb" font-weight="650">Lakekeeper</text>
+    <text x="620" y="162" text-anchor="middle" fill="#86efac">Iceberg REST</text>
+
+    <rect x="720" y="120" width="120" height="56" rx="12" fill="rgba(255,118,25,0.1)" stroke="#ff7619"/>
+    <text x="780" y="144" text-anchor="middle" fill="#ffedd5" font-weight="650">RustFS</text>
+    <text x="780" y="162" text-anchor="middle" fill="#fdba74">S3 warehouse</text>
+
+    <ellipse cx="280" cy="320" rx="80" ry="32" fill="rgba(255,118,25,0.1)" stroke="#ff7619"/>
+    <text x="280" y="316" text-anchor="middle" fill="#ffedd5" font-weight="650">Postgres</text>
+    <text x="280" y="332" text-anchor="middle" fill="#fdba74">history, config</text>
+
+    <rect x="40" y="300" width="88" height="44" rx="12" fill="rgba(163,230,53,0.1)" stroke="rgba(163,230,53,0.45)"/>
+    <text x="84" y="320" text-anchor="middle" fill="#ecfccb" font-weight="650">Studio</text>
+    <text x="84" y="336" text-anchor="middle" fill="#86efac">:3000</text>
+
+    <line x1="160" y1="124" x2="218" y2="140" stroke="#fdba74" stroke-width="1.5" marker-end="url(#arr)"/>
+    <line x1="160" y1="184" x2="218" y2="168" stroke="#fdba74" stroke-width="1.5" marker-end="url(#arr)"/>
+    <line x1="340" y1="136" x2="398" y2="122" stroke="#a78bfa" stroke-width="1.5" marker-end="url(#arr)"/>
+    <line x1="340" y1="168" x2="398" y2="190" stroke="#a78bfa" stroke-width="1.5" marker-end="url(#arr)"/>
+    <line x1="500" y1="122" x2="558" y2="140" stroke="#86efac" stroke-width="1.5" marker-end="url(#arr)"/>
+    <line x1="500" y1="190" x2="558" y2="160" stroke="#86efac" stroke-width="1.5" marker-end="url(#arr)"/>
+    <line x1="680" y1="148" x2="718" y2="148" stroke="#fdba74" stroke-width="1.5" marker-end="url(#arr)"/>
+    <line x1="280" y1="192" x2="280" y2="286" stroke="#fdba74" stroke-width="1.5" marker-end="url(#arr)"/>
+    <line x1="128" y1="322" x2="200" y2="180" stroke="#86efac" stroke-width="1.5" marker-end="url(#arrG)"/>
+    <text x="128" y="268" fill="#71717a" font-size="10">Admin API :9000</text>
+  </g>
+</svg>

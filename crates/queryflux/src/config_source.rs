@@ -583,11 +583,80 @@ impl ConfigSource for RemoteConfigSource {
     }
 }
 
+/// What a control plane answered to one config request.
+pub(crate) enum Fetched {
+    /// The revision asked about is still current.
+    Unchanged,
+    /// A new snapshot, already checked for schema version and integrity.
+    New(Box<queryflux_core::worker_snapshot::WorkerSnapshotV1>),
+}
+
+/// How to ask for config.
+pub(crate) enum FetchMode<'a> {
+    /// No config yet: fetch now.
+    Now,
+    /// Conditional GET: answers at once, `Unchanged` while `rev` is current.
+    Check(&'a str),
+    /// Long-poll: held until the revision differs from `rev`, or `wait_secs` pass.
+    Wait(&'a str, u64),
+}
+
+/// One config request to `url` (a control plane's or site agent's `/worker/config`).
+/// A received snapshot is verified: schema version and sealed revision. `Err` is a
+/// message for logs and status.
+pub(crate) async fn fetch_snapshot(
+    client: &reqwest::Client,
+    url: &str,
+    bearer: &str,
+    mode: FetchMode<'_>,
+) -> Result<Fetched, String> {
+    use queryflux_core::worker_snapshot::{WorkerSnapshotV1, WORKER_SNAPSHOT_SCHEMA_VERSION};
+    let req = match mode {
+        FetchMode::Now => client.get(url),
+        FetchMode::Check(rev) => client
+            .get(url)
+            .header(reqwest::header::IF_NONE_MATCH, format!("\"{rev}\"")),
+        FetchMode::Wait(rev, wait_secs) => client
+            .get(format!("{url}/wait"))
+            .query(&[("since", rev), ("timeoutSecs", &wait_secs.to_string())])
+            .header(reqwest::header::IF_NONE_MATCH, format!("\"{rev}\"")),
+    };
+    let resp = req
+        .bearer_auth(bearer)
+        .send()
+        .await
+        .map_err(|e| format!("control plane unreachable: {e}"))?;
+    match resp.status() {
+        reqwest::StatusCode::NOT_MODIFIED => return Ok(Fetched::Unchanged),
+        reqwest::StatusCode::OK => {}
+        status => {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(format!("control plane answered {status}: {body}"));
+        }
+    }
+    let snapshot: WorkerSnapshotV1 = resp
+        .json()
+        .await
+        .map_err(|e| format!("snapshot does not parse: {e}"))?;
+    if snapshot.schema_version != WORKER_SNAPSHOT_SCHEMA_VERSION {
+        return Err(format!(
+            "unsupported_snapshot_version: {} (this version supports {})",
+            snapshot.schema_version, WORKER_SNAPSHOT_SCHEMA_VERSION
+        ));
+    }
+    if !snapshot.is_sealed() {
+        return Err(format!(
+            "snapshot {} failed its integrity check",
+            snapshot.revision
+        ));
+    }
+    Ok(Fetched::New(Box::new(snapshot)))
+}
+
 impl RemoteConfigSource {
     /// One exchange with the control plane. Returns `true` if it answered with a usable
     /// response (a new snapshot, or "unchanged").
     async fn sync(&self, handles: &LiveHandles) -> bool {
-        use queryflux_core::worker_snapshot::{WorkerSnapshotV1, WORKER_SNAPSHOT_SCHEMA_VERSION};
         // The active revision, not the last downloaded one: a snapshot that failed to
         // activate must be fetched and tried again rather than answered with a 304.
         let (active, stale) = self
@@ -598,28 +667,13 @@ impl RemoteConfigSource {
         // With an active revision, long-poll for the next one; otherwise fetch now. A config
         // copied from a peer is checked with a plain conditional GET instead, so the control
         // plane confirms it at once rather than at the end of a long-poll.
-        let mut req = match &active {
-            Some(rev) if stale => self
-                .client
-                .get(&self.url)
-                .header(reqwest::header::IF_NONE_MATCH, format!("\"{rev}\"")),
-            Some(rev) => self
-                .client
-                .get(format!("{}/wait", self.url))
-                .query(&[
-                    ("since", rev.as_str()),
-                    ("timeoutSecs", &self.wait_secs.to_string()),
-                ])
-                .header(reqwest::header::IF_NONE_MATCH, format!("\"{rev}\"")),
-            None => self.client.get(&self.url),
+        let mode = match active.as_deref() {
+            Some(rev) if stale => FetchMode::Check(rev),
+            Some(rev) => FetchMode::Wait(rev, self.wait_secs),
+            None => FetchMode::Now,
         };
-        req = req.bearer_auth(&self.bearer);
-        let resp = match req.send().await {
-            Ok(r) => r,
-            Err(e) => return self.record_failure(format!("control plane unreachable: {e}")),
-        };
-        match resp.status() {
-            reqwest::StatusCode::NOT_MODIFIED => {
+        let snapshot = match fetch_snapshot(&self.client, &self.url, &self.bearer, mode).await {
+            Ok(Fetched::Unchanged) => {
                 {
                     let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
                     st.last_successful_sync = Some(chrono::Utc::now());
@@ -628,28 +682,9 @@ impl RemoteConfigSource {
                 self.confirmed(handles);
                 return true;
             }
-            reqwest::StatusCode::OK => {}
-            status => {
-                let body = resp.text().await.unwrap_or_default();
-                return self.record_failure(format!("control plane answered {status}: {body}"));
-            }
-        }
-        let snapshot: WorkerSnapshotV1 = match resp.json().await {
-            Ok(s) => s,
-            Err(e) => return self.record_failure(format!("snapshot does not parse: {e}")),
+            Ok(Fetched::New(snapshot)) => *snapshot,
+            Err(message) => return self.record_failure(message),
         };
-        if snapshot.schema_version != WORKER_SNAPSHOT_SCHEMA_VERSION {
-            return self.record_failure(format!(
-                "unsupported_snapshot_version: {} (this worker supports {})",
-                snapshot.schema_version, WORKER_SNAPSHOT_SCHEMA_VERSION
-            ));
-        }
-        if !snapshot.is_sealed() {
-            return self.record_failure(format!(
-                "snapshot {} failed its integrity check",
-                snapshot.revision
-            ));
-        }
         {
             let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
             st.downloaded_revision = Some(snapshot.revision.clone());

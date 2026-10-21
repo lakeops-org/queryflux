@@ -1,0 +1,64 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="400" viewBox="0 0 960 400" role="img" aria-label="Operations path: Studio and Prometheus use Admin API; query proxy and Admin API share the persistence backend">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#0b0614"/>
+      <stop offset="100%" stop-color="#050508"/>
+    </linearGradient>
+    <marker id="arr" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto">
+      <path d="M0,0 L7,3 L0,6 Z" fill="#a78bfa"/>
+    </marker>
+    <marker id="arrG" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto">
+      <path d="M0,0 L7,3 L0,6 Z" fill="#86efac"/>
+    </marker>
+    <pattern id="dots" width="22" height="22" patternUnits="userSpaceOnUse">
+      <circle cx="1" cy="1" r="0.8" fill="rgba(255,255,255,0.05)"/>
+    </pattern>
+  </defs>
+
+  <rect width="960" height="400" rx="20" fill="url(#bg)"/>
+  <rect width="960" height="400" rx="20" fill="url(#dots)"/>
+  <rect x="1" y="1" width="958" height="398" rx="19" fill="none" stroke="rgba(255,255,255,0.08)"/>
+
+  <text x="40" y="40" fill="#fafafa" font-family="ui-sans-serif, system-ui, sans-serif" font-size="18" font-weight="650">Operations and persistence</text>
+  <text x="40" y="64" fill="#a1a1aa" font-family="ui-sans-serif, system-ui, sans-serif" font-size="12">Query traffic and operational state share one process; Studio reaches Admin API on port 9000.</text>
+
+  <g font-family="ui-sans-serif, system-ui, sans-serif">
+    <rect x="40" y="100" width="88" height="44" rx="12" fill="rgba(163,230,53,0.1)" stroke="rgba(163,230,53,0.45)"/>
+    <text x="84" y="127" text-anchor="middle" fill="#ecfccb" font-size="13" font-weight="650">Studio</text>
+
+    <rect x="40" y="160" width="100" height="44" rx="12" fill="rgba(255,118,25,0.1)" stroke="#ff7619"/>
+    <text x="90" y="187" text-anchor="middle" fill="#ffedd5" font-size="12" font-weight="650">Prometheus</text>
+
+    <rect x="200" y="120" width="120" height="52" rx="12" fill="rgba(139,92,246,0.18)" stroke="#8b5cf6"/>
+    <text x="260" y="145" text-anchor="middle" fill="#ede9fe" font-size="13" font-weight="650">Admin API</text>
+    <text x="260" y="162" text-anchor="middle" fill="#a78bfa" font-size="10">:9000</text>
+
+    <line x1="128" y1="122" x2="198" y2="140" stroke="#86efac" stroke-width="1.5" marker-end="url(#arrG)"/>
+    <line x1="140" y1="182" x2="198" y2="152" stroke="#fdba74" stroke-width="1.5" marker-end="url(#arr)"/>
+
+    <rect x="160" y="240" width="280" height="120" rx="16" fill="rgba(139,92,246,0.08)" stroke="#8b5cf6" stroke-width="1.5"/>
+    <text x="300" y="264" text-anchor="middle" fill="#ede9fe" font-size="14" font-weight="650">QueryFlux replica</text>
+    <rect x="180" y="278" width="110" height="44" rx="10" fill="rgba(0,0,0,0.28)" stroke="rgba(255,255,255,0.12)"/>
+    <text x="235" y="305" text-anchor="middle" fill="#f4f4f5" font-size="12" font-weight="600">Admin API</text>
+    <rect x="310" y="278" width="110" height="44" rx="10" fill="rgba(0,0,0,0.28)" stroke="rgba(255,255,255,0.12)"/>
+    <text x="365" y="305" text-anchor="middle" fill="#f4f4f5" font-size="12" font-weight="600">Query proxy</text>
+
+    <line x1="260" y1="172" x2="235" y2="276" stroke="#a78bfa" stroke-width="1.5" marker-end="url(#arr)"/>
+
+    <rect x="560" y="200" width="360" height="160" rx="16" fill="rgba(255,118,25,0.06)" stroke="#ff7619" stroke-width="1.5"/>
+    <text x="740" y="228" text-anchor="middle" fill="#ffedd5" font-size="14" font-weight="650">Persistence backend</text>
+
+    <rect x="580" y="248" width="72" height="40" rx="10" fill="rgba(0,0,0,0.28)" stroke="rgba(255,255,255,0.12)"/>
+    <text x="616" y="273" text-anchor="middle" fill="#f4f4f5" font-size="11" font-weight="600">Config</text>
+    <rect x="662" y="248" width="88" height="40" rx="10" fill="rgba(0,0,0,0.28)" stroke="rgba(255,255,255,0.12)"/>
+    <text x="706" y="273" text-anchor="middle" fill="#f4f4f5" font-size="11" font-weight="600">In-flight state</text>
+    <rect x="760" y="248" width="72" height="40" rx="10" fill="rgba(0,0,0,0.28)" stroke="rgba(255,255,255,0.12)"/>
+    <text x="796" y="273" text-anchor="middle" fill="#f4f4f5" font-size="11" font-weight="600">History</text>
+    <rect x="842" y="248" width="68" height="40" rx="10" fill="rgba(0,0,0,0.28)" stroke="rgba(255,255,255,0.12)"/>
+    <text x="876" y="273" text-anchor="middle" fill="#f4f4f5" font-size="10" font-weight="600">Coordination</text>
+
+    <line x1="235" y1="322" x2="558" y2="280" stroke="#a78bfa" stroke-width="1.5" marker-end="url(#arr)"/>
+    <line x1="365" y1="322" x2="558" y2="300" stroke="#a78bfa" stroke-width="1.5" marker-end="url(#arr)"/>
+  </g>
+</svg>

@@ -1,0 +1,89 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="440" viewBox="0 0 960 440" role="img" aria-label="Worker mode topology: applications talk to workers; workers pull config, capacity, and history from the control plane and send SQL to query engines; workers never connect to Postgres">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#0b0614"/>
+      <stop offset="100%" stop-color="#050508"/>
+    </linearGradient>
+    <marker id="arr" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto">
+      <path d="M0,0 L7,3 L0,6 Z" fill="#a78bfa"/>
+    </marker>
+    <marker id="arrO" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto">
+      <path d="M0,0 L7,3 L0,6 Z" fill="#fdba74"/>
+    </marker>
+    <marker id="arrG" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto">
+      <path d="M0,0 L7,3 L0,6 Z" fill="#86efac"/>
+    </marker>
+    <pattern id="dots" width="22" height="22" patternUnits="userSpaceOnUse">
+      <circle cx="1" cy="1" r="0.8" fill="rgba(255,255,255,0.05)"/>
+    </pattern>
+  </defs>
+
+  <rect width="960" height="440" rx="20" fill="url(#bg)"/>
+  <rect width="960" height="440" rx="20" fill="url(#dots)"/>
+  <rect x="1" y="1" width="958" height="438" rx="19" fill="none" stroke="rgba(255,255,255,0.08)"/>
+
+  <text x="40" y="40" fill="#fafafa" font-family="ui-sans-serif, system-ui, sans-serif" font-size="18" font-weight="650">Worker mode topology</text>
+  <text x="40" y="62" fill="#a1a1aa" font-family="ui-sans-serif, system-ui, sans-serif" font-size="12">Workers never connect to Postgres. Config, capacity, and history go through the control plane.</text>
+
+  <!-- Control plane -->
+  <rect x="200" y="88" width="560" height="110" rx="16" fill="rgba(139,92,246,0.12)" stroke="#8b5cf6" stroke-width="1.5"/>
+  <text x="480" y="112" text-anchor="middle" fill="#ede9fe" font-family="ui-sans-serif, system-ui, sans-serif" font-size="14" font-weight="650">Control plane</text>
+
+  <rect x="220" y="128" width="120" height="48" rx="10" fill="rgba(0,0,0,0.28)" stroke="rgba(255,255,255,0.12)"/>
+  <text x="280" y="148" text-anchor="middle" fill="#f4f4f5" font-family="ui-sans-serif, system-ui, sans-serif" font-size="12" font-weight="600">Admin API</text>
+  <text x="280" y="166" text-anchor="middle" fill="#a78bfa" font-family="ui-sans-serif, system-ui, sans-serif" font-size="10">+ Studio</text>
+
+  <rect x="356" y="128" width="120" height="48" rx="10" fill="rgba(0,0,0,0.28)" stroke="rgba(255,255,255,0.12)"/>
+  <text x="416" y="148" text-anchor="middle" fill="#f4f4f5" font-family="ui-sans-serif, system-ui, sans-serif" font-size="12" font-weight="600">/worker/config</text>
+  <text x="416" y="166" text-anchor="middle" fill="#a78bfa" font-family="ui-monospace, Menlo, monospace" font-size="10">long-poll</text>
+
+  <rect x="492" y="128" width="120" height="48" rx="10" fill="rgba(0,0,0,0.28)" stroke="rgba(255,255,255,0.12)"/>
+  <text x="552" y="148" text-anchor="middle" fill="#f4f4f5" font-family="ui-sans-serif, system-ui, sans-serif" font-size="12" font-weight="600">/worker/capacity</text>
+  <text x="552" y="166" text-anchor="middle" fill="#a78bfa" font-family="ui-sans-serif, system-ui, sans-serif" font-size="10">leases</text>
+
+  <rect x="628" y="128" width="112" height="48" rx="10" fill="rgba(0,0,0,0.28)" stroke="rgba(255,255,255,0.12)"/>
+  <text x="684" y="148" text-anchor="middle" fill="#f4f4f5" font-family="ui-sans-serif, system-ui, sans-serif" font-size="12" font-weight="600">query-records</text>
+  <text x="684" y="166" text-anchor="middle" fill="#a78bfa" font-family="ui-sans-serif, system-ui, sans-serif" font-size="10">history</text>
+
+  <!-- Studio -->
+  <rect x="40" y="118" width="100" height="50" rx="12" fill="rgba(163,230,53,0.1)" stroke="rgba(163,230,53,0.45)"/>
+  <text x="90" y="147" text-anchor="middle" fill="#ecfccb" font-family="ui-sans-serif, system-ui, sans-serif" font-size="13" font-weight="650">Studio</text>
+  <line x1="140" y1="143" x2="198" y2="143" stroke="#86efac" stroke-width="1.5" marker-end="url(#arrG)"/>
+
+  <!-- Postgres -->
+  <ellipse cx="860" cy="143" rx="70" ry="36" fill="rgba(255,118,25,0.1)" stroke="#ff7619" stroke-width="1.5"/>
+  <text x="860" y="140" text-anchor="middle" fill="#ffedd5" font-family="ui-sans-serif, system-ui, sans-serif" font-size="13" font-weight="650">Postgres</text>
+  <text x="860" y="158" text-anchor="middle" fill="#fdba74" font-family="ui-sans-serif, system-ui, sans-serif" font-size="10">config · leases · history</text>
+  <line x1="760" y1="143" x2="788" y2="143" stroke="#fdba74" stroke-width="1.5" marker-end="url(#arrO)"/>
+
+  <!-- Application -->
+  <rect x="40" y="280" width="130" height="80" rx="14" fill="rgba(255,118,25,0.12)" stroke="#ff7619" stroke-width="1.5"/>
+  <text x="105" y="314" text-anchor="middle" fill="#ffedd5" font-family="ui-sans-serif, system-ui, sans-serif" font-size="14" font-weight="650">Application</text>
+  <text x="105" y="336" text-anchor="middle" fill="#fdba74" font-family="ui-sans-serif, system-ui, sans-serif" font-size="10">Trino · Postgres</text>
+  <text x="105" y="350" text-anchor="middle" fill="#a16207" font-family="ui-sans-serif, system-ui, sans-serif" font-size="10">MySQL · Flight SQL</text>
+
+  <line x1="170" y1="320" x2="218" y2="320" stroke="#fdba74" stroke-width="1.75" marker-end="url(#arrO)"/>
+
+  <!-- Worker -->
+  <rect x="230" y="260" width="320" height="120" rx="16" fill="rgba(255,255,255,0.03)" stroke="rgba(255,255,255,0.18)" stroke-width="1.5"/>
+  <text x="390" y="300" text-anchor="middle" fill="#f4f4f5" font-family="ui-sans-serif, system-ui, sans-serif" font-size="14" font-weight="650">Worker</text>
+  <text x="390" y="322" text-anchor="middle" fill="#a1a1aa" font-family="ui-sans-serif, system-ui, sans-serif" font-size="11">sidecar or shared service</text>
+  <text x="390" y="348" text-anchor="middle" fill="#c4b5fd" font-family="ui-sans-serif, system-ui, sans-serif" font-size="11">config · heartbeat · capacity · history</text>
+
+  <!-- Arrows from worker to control plane -->
+  <line x1="300" y1="260" x2="300" y2="202" stroke="#a78bfa" stroke-width="1.5" marker-end="url(#arr)"/>
+  <line x1="416" y1="260" x2="416" y2="202" stroke="#a78bfa" stroke-width="1.5" marker-end="url(#arr)"/>
+  <line x1="520" y1="260" x2="552" y2="202" stroke="#a78bfa" stroke-width="1.5" marker-end="url(#arr)"/>
+
+  <!-- Worker → Engines -->
+  <line x1="550" y1="320" x2="648" y2="320" stroke="#86efac" stroke-width="1.75" marker-end="url(#arrG)"/>
+  <text x="600" y="308" text-anchor="middle" fill="#86efac" font-family="ui-sans-serif, system-ui, sans-serif" font-size="11" font-weight="600">SQL</text>
+
+  <!-- Query engines (separate from the worker) -->
+  <rect x="660" y="270" width="260" height="100" rx="16" fill="rgba(163,230,53,0.08)" stroke="rgba(163,230,53,0.5)" stroke-width="1.5"/>
+  <text x="790" y="308" text-anchor="middle" fill="#ecfccb" font-family="ui-sans-serif, system-ui, sans-serif" font-size="14" font-weight="650">Query engines</text>
+  <text x="790" y="332" text-anchor="middle" fill="#86efac" font-family="ui-sans-serif, system-ui, sans-serif" font-size="11">Trino · DuckDB · StarRocks · …</text>
+
+  <text x="480" y="420" text-anchor="middle" fill="#71717a" font-family="ui-sans-serif, system-ui, sans-serif" font-size="11">Apps talk to the worker; the worker talks to the engines. Only the control plane talks to Postgres.</text>
+</svg>

@@ -11,14 +11,10 @@ In this quickstart you put QueryFlux behind [Keycloak](https://www.keycloak.org/
 
 ## What you'll build
 
-```mermaid
-flowchart LR
-  client["curl / SQL client"] -->|"1. password grant"| kc["Keycloak<br/>realm: queryflux<br/>:8180"]
-  client -->|"2. Bearer JWT<br/>:8080"| qf["QueryFlux<br/>Trino HTTP frontend"]
-  qf -->|"verify signature<br/>(JWKS)"| kc
-  qf -->|"queryAuth: passthrough"| trino["Trino<br/>:8081 direct"]
-  qf --> pg[("Postgres<br/>query history")]
-```
+<img
+  src="/img/docs/quickstart-oidc.svg"
+  alt="with-keycloak-oidc quickstart: password grant to Keycloak, Bearer JWT on QueryFlux Trino HTTP frontend with JWKS verification, passthrough to Trino, Postgres query history"
+/>
 
 | Service | URL | Credentials |
 | --- | --- | --- |

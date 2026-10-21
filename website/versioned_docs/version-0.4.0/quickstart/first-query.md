@@ -11,13 +11,10 @@ In this quickstart you run QueryFlux in front of a single Trino cluster, send SQ
 
 ## What you'll build
 
-```mermaid
-flowchart LR
-  cli["Trino CLI<br/>or curl"] -->|"Trino HTTP<br/>:8080"| qf["QueryFlux"]
-  qf --> trino["Trino<br/>(direct: :8081)"]
-  qf -->|"query history,<br/>cluster config"| pg[("Postgres<br/>:5433")]
-  studio["Studio<br/>:3000"] -->|"Admin API :9000"| qf
-```
+<img
+  src="/img/docs/quickstart-first-query.svg"
+  alt="minimal-trino quickstart: Trino CLI or curl through QueryFlux on port 8080 to Trino, Postgres for history and config, Studio on Admin API port 9000"
+/>
 
 | Service | URL / connection |
 | --- | --- |

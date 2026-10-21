@@ -1,7 +1,11 @@
 {{- $adbcDrivers := include "queryflux.adbcDrivers.enabled" . }}
 {{- $daemonSet := eq .Values.workload.kind "DaemonSet" }}
+{{- $statefulSet := eq .Values.workload.kind "StatefulSet" }}
 {{- if and $daemonSet .Values.autoscaling.enabled }}
 {{- fail "workload.kind: DaemonSet runs one pod per node; disable autoscaling" }}
+{{- end }}
+{{- if and $statefulSet (not .Values.service.headless.enabled) }}
+{{- fail "workload.kind: StatefulSet needs service.headless.enabled: true (its governing Service)" }}
 {{- end }}
 apiVersion: apps/v1
 kind: {{ .Values.workload.kind }}
@@ -10,6 +14,10 @@ metadata:
   labels:
     {{- include "queryflux.labels" . | nindent 4 }}
 spec:
+  {{- if $statefulSet }}
+  serviceName: {{ include "queryflux.fullname" . | trunc 54 | trimSuffix "-" }}-headless
+  podManagementPolicy: Parallel
+  {{- end }}
   {{- if $daemonSet }}
   {{- with .Values.workload.daemonSetUpdateStrategy }}
   updateStrategy:
@@ -252,3 +260,9 @@ spec:
       topologySpreadConstraints:
         {{- toYaml . | nindent 8 }}
       {{- end }}
+  {{- if $statefulSet }}
+  {{- with .Values.workload.volumeClaimTemplates }}
+  volumeClaimTemplates:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- end }}

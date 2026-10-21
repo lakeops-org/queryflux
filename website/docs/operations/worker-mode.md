@@ -16,19 +16,10 @@ In worker mode, one QueryFlux deployment owns the config and the others run quer
   - shares capacity limits through the control plane;
   - sends its query history to the control plane.
 
-```text
-             ┌──────────────────────────── control plane ────────────────────────────┐
-  Studio ───►│ admin API   /worker/config   /worker/capacity/*   /worker/query-records │──► Postgres
-             └──────▲───────────────▲──────────────────▲─────────────────────▲─────────┘
-                    │ config        │ register,        │ capacity leases     │ query history
-                    │ (long-poll)   │ heartbeat        │                     │
-             ┌──────┴───────────────┴──────────────────┴─────────────────────┴───┐
-             │ worker (sidecar or shared service)  ── SQL ──►  Trino, DuckDB, …   │
-             └───────────────────────────────────────────────────────────────────┘
-                    ▲
-                    │ Trino HTTP, Postgres wire, MySQL wire, Flight SQL, …
-               application
-```
+<img
+  src="/img/docs/worker-mode-topology.svg"
+  alt="Worker mode topology: applications talk to workers; workers talk to query engines and to the control plane for config, capacity, and history; only the control plane connects to Postgres"
+/>
 
 Running QueryFlux without workers works exactly as before. Worker mode is opt-in, through `queryflux.role`.
 
@@ -39,6 +30,7 @@ Running QueryFlux without workers works exactly as before. Worker mode is opt-in
 | One QueryFlux deployment, every client reaches it | `role: standalone` (the default). See [Multi-replica operations](./multi-replica) for HA. |
 | QueryFlux next to each application, or in networks that cannot reach the database | `role: controlPlane` plus workers |
 | Many small QueryFlux deployments that should share one config, one set of limits and one query history | `role: controlPlane` plus workers |
+| Workers in a remote network (another data center, a customer site) that may only connect outbound | Workers behind one [site agent](./site-agent) per site |
 
 ## Roles
 
@@ -47,6 +39,7 @@ Running QueryFlux without workers works exactly as before. Worker mode is opt-in
 | `standalone` (default) | Yes (YAML or Postgres) | Optional | Yes | With `workerApi.enabled` |
 | `controlPlane` | Yes | Yes, for shared capacity | Yes | Yes |
 | `worker` | No, pulled from the control plane | **Never** | No: ops listener only | No |
+| `siteAgent` | No, relayed from the control plane | **Never** | No: worker API and ops endpoints only | Yes, the workers at its site. See [Site agent](./site-agent). |
 
 A standalone process with `workerApi.enabled: true` can serve workers too. Without Postgres it serves the config it started with, and workers coordinate with `coordination.mode: local`.
 
@@ -180,10 +173,10 @@ If two or more workers share clusters with `coordination.mode: local`, the contr
 
 Workers keep no durable history. Each finished query's record goes upstream:
 
-```text
-worker ──► control plane        (POST /worker/query-records, the default)
-worker ──► history endpoint     (workerApi.history.endpoint, or the worker's history.endpoint)
-```
+<img
+  src="/img/docs/worker-mode-history-uplink.svg"
+  alt="Query history uplink: worker posts records to the control plane by default, or to an optional named history endpoint"
+/>
 
 - **Delivery.** Records are batched (up to 200 per request), queued in a bounded spool (`spoolMaxRecords`) and retried with backoff. When the spool is full, the oldest records are dropped and counted. The query path never waits on the network. A final flush runs after the shutdown drain.
 - **Idempotent ingest.** A retried batch is safe: the control plane keeps the first record per proxy query id, and counts it once in digest stats.
@@ -251,4 +244,4 @@ See the [Helm chart README](https://github.com/lakeops-org/queryflux/blob/main/c
   - For a shared-service worker with more than one replica, set `service.sessionAffinity: ClientIP` in the Helm values (`worker-values.yaml` does), and use sticky sessions on any external load balancer.
   - Sidecar workers are not affected.
   - Forwarding a request to the worker that owns the query, so that any load balancer works, is planned.
-- Per-worker credentials, secret references in snapshots, and a site agent that forwards for many workers are planned.
+- Per-worker credentials and secret references in snapshots are planned. For workers in a remote network, see [Site agent](./site-agent).

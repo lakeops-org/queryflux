@@ -10,28 +10,14 @@ import {DocCards, DocCard} from '@site/src/components/DocCards';
 
 # Installation & Deployment
 
-This page lists the building blocks of a QueryFlux deployment, what each one does, and the ways to deploy them. To try QueryFlux in a few minutes instead, start with a **[Quickstart](../getting-started.md)**.
+One QueryFlux server sits between your clients and your engines. Everything around it — Studio, Postgres, identity, policy, metrics — is optional until you need it. To try QueryFlux in a few minutes, start with a **[Quickstart](../getting-started.md)**.
 
 ## Reference architecture
 
-```mermaid
-flowchart LR
-  C["Clients<br/>BI · JDBC · psql · mysql · AI agents"]
-  QF["QueryFlux server<br/>frontends → router → queue → translate"]
-  E["Engines<br/>Trino · StarRocks · DuckDB · Athena · ADBC"]
-  PG[("Postgres<br/>persistence")]
-  ST["Studio :3000"]
-  PR["Prometheus"]
-  ID["OIDC / LDAP"]
-  AC["OPA / Cerbos"]
-
-  C --> QF --> E
-  QF --- PG
-  ST -- admin API :9000 --> QF
-  PR -. scrapes /metrics .-> QF
-  QF -. authenticates .-> ID
-  QF -. policies .-> AC
-```
+<img
+  src="/img/docs/install-overview.svg"
+  alt="Reference architecture: clients send SQL to QueryFlux; QueryFlux routes, queues, and translates, then dispatches to query engines; Postgres holds config, history, and capacity; optional Studio, Prometheus, OIDC or LDAP, and OPA or Cerbos plug in around the server"
+/>
 
 ## Components
 

@@ -22,6 +22,11 @@ Every sidecar is a worker of its own. It keeps its own long-poll and heartbeat w
 
 ## How it works
 
+<img
+  src="/img/docs/worker-sidecar-topology.svg"
+  alt="Sidecar worker: application pod with app and QueryFlux worker; app talks to localhost; worker talks to query engines and the control plane"
+/>
+
 The worker runs as a **native sidecar**: an init container with `restartPolicy: Always`. This needs Kubernetes 1.29 or later.
 
 - **Start:** Kubernetes starts the worker first and waits for its startup probe (`/readyz`). `/readyz` turns `200` once the worker has a config from the control plane, so the application never starts against a worker that can't run queries yet.

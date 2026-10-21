@@ -78,18 +78,10 @@ Details: **[Routing and clusters](./architecture/routing-and-clusters)**. For mu
 
 QueryFlux picks a healthy cluster (round-robin, least-loaded, failover, weighted), optionally **rewrites SQL** for the target dialect, and runs the query. If the group is at capacity, queries **queue** at the proxy.
 
-```
-Client (psql / Trino CLI / mysql / Snowflake / BI)
-        │  native protocol
-        ▼
-┌──────────────────────────┐
-│        QueryFlux         │
-│  Frontend → Router → SQL │
-│  translation → Group     │
-└────────────┬─────────────┘
-             ▼
-      Trino / DuckDB / …
-```
+<img
+  src="/img/docs/intro-dispatch-path.svg"
+  alt="Dispatch path: client native protocol into QueryFlux frontends, router, SQL translation, and cluster group, then SQL to Trino, DuckDB, and other engines"
+/>
 
 ---
 

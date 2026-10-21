@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="780" height="240" viewBox="0 0 780 240" role="img" aria-label="cli-quickstart: curl or Trino CLI to queryflux binary with embedded DuckDB and Admin API on 9000">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#0b0614"/>
+      <stop offset="100%" stop-color="#050508"/>
+    </linearGradient>
+    <marker id="arr" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto">
+      <path d="M0,0 L7,3 L0,6 Z" fill="#a78bfa"/>
+    </marker>
+    <marker id="arrO" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto">
+      <path d="M0,0 L7,3 L0,6 Z" fill="#fdba74"/>
+    </marker>
+    <pattern id="dots" width="22" height="22" patternUnits="userSpaceOnUse">
+      <circle cx="1" cy="1" r="0.8" fill="rgba(255,255,255,0.05)"/>
+    </pattern>
+  </defs>
+
+  <rect width="780" height="240" rx="20" fill="url(#bg)"/>
+  <rect width="780" height="240" rx="20" fill="url(#dots)"/>
+  <rect x="1" y="1" width="778" height="238" rx="19" fill="none" stroke="rgba(255,255,255,0.08)"/>
+
+  <text x="40" y="40" fill="#fafafa" font-family="ui-sans-serif, system-ui, sans-serif" font-size="18" font-weight="650">Run locally without Docker</text>
+  <text x="40" y="64" fill="#a1a1aa" font-family="ui-sans-serif, system-ui, sans-serif" font-size="12">Embedded DuckDB in-process; no containers or external databases.</text>
+
+  <g font-family="ui-sans-serif, system-ui, sans-serif">
+    <rect x="40" y="110" width="130" height="56" rx="12" fill="rgba(255,118,25,0.12)" stroke="#ff7619"/>
+    <text x="105" y="134" text-anchor="middle" fill="#ffedd5" font-size="12" font-weight="650">curl or</text>
+    <text x="105" y="152" text-anchor="middle" fill="#fdba74" font-size="12" font-weight="650">Trino CLI</text>
+
+    <rect x="240" y="100" width="140" height="76" rx="14" fill="rgba(139,92,246,0.18)" stroke="#8b5cf6"/>
+    <text x="310" y="128" text-anchor="middle" fill="#ede9fe" font-size="13" font-weight="650">queryflux binary</text>
+    <text x="310" y="148" text-anchor="middle" fill="#a78bfa" font-size="10">Trino HTTP :8080</text>
+
+    <rect x="450" y="100" width="200" height="76" rx="14" fill="rgba(163,230,53,0.1)" stroke="rgba(163,230,53,0.45)"/>
+    <text x="550" y="128" text-anchor="middle" fill="#ecfccb" font-size="13" font-weight="650">Embedded DuckDB</text>
+    <text x="550" y="148" text-anchor="middle" fill="#86efac" font-size="10">in-process, in-memory</text>
+    <text x="550" y="164" text-anchor="middle" fill="#71717a" font-size="9" font-style="italic">Trino SQL · DuckDB (sqlglot)</text>
+
+    <rect x="40" y="190" width="80" height="36" rx="10" fill="rgba(255,255,255,0.04)" stroke="rgba(255,255,255,0.14)"/>
+    <text x="80" y="212" text-anchor="middle" fill="#a1a1aa" font-size="11">curl</text>
+
+    <line x1="170" y1="138" x2="238" y2="138" stroke="#fdba74" stroke-width="1.5" marker-end="url(#arrO)"/>
+    <line x1="380" y1="138" x2="448" y2="138" stroke="#86efac" stroke-width="1.5" marker-end="url(#arr)"/>
+    <line x1="120" y1="208" x2="260" y2="176" stroke="#71717a" stroke-width="1.25" stroke-dasharray="4 3" marker-end="url(#arr)"/>
+    <text x="168" y="198" fill="#71717a" font-size="10">Admin API + /metrics :9000</text>
+  </g>
+</svg>

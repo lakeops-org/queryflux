@@ -11,14 +11,10 @@ In this quickstart you run QueryFlux in front of Trino with **Prometheus** scrap
 
 ## What you'll build
 
-```mermaid
-flowchart LR
-  client["Trino CLI / HTTP client"] -->|"Trino HTTP :8080"| qf["QueryFlux"]
-  qf --> trino["Trino"]
-  qf --> pg["Postgres"]
-  prom["Prometheus :9090"] -->|"scrape queryflux:9000/metrics<br/>every 15s"| qf
-  graf["Grafana :3000"] -->|"PromQL"| prom
-```
+<img
+  src="/img/docs/quickstart-observability.svg"
+  alt="with-prometheus-grafana quickstart: client through QueryFlux to Trino and Postgres; Prometheus scrapes metrics every 15 seconds; Grafana queries Prometheus with PromQL"
+/>
 
 | Service | URL |
 | --- | --- |

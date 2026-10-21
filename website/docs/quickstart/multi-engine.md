@@ -11,18 +11,10 @@ In this quickstart you run **Trino** and **StarRocks** behind one QueryFlux inst
 
 ## What you'll build
 
-```mermaid
-flowchart LR
-  tc["Trino CLI / HTTP client"] -->|"Trino HTTP :8080"| qf["QueryFlux"]
-  mc["mysql client"] -->|"MySQL wire :3306"| qf
-  qf -->|"trino-default"| trino["Trino"]
-  qf -->|"starrocks-default"| sr["StarRocks"]
-  trino --> lk["Lakekeeper<br/>(Iceberg REST)"]
-  sr --> lk
-  lk --> s3["RustFS<br/>(S3 bucket: warehouse)"]
-  qf --> pg["Postgres<br/>(query history, config)"]
-  studio["Studio :3000"] -->|"Admin API :9000"| qf
-```
+<img
+  src="/img/docs/quickstart-multi-engine.svg"
+  alt="full-stack quickstart: Trino HTTP and MySQL wire clients through QueryFlux to Trino and StarRocks over shared Lakekeeper Iceberg catalog on RustFS, with Postgres and Studio"
+/>
 
 | Service | URL / connection |
 | --- | --- |

@@ -1430,6 +1430,38 @@ pub struct WorkerView {
     pub seconds_since_seen: i64,
 }
 
+/// Whether each worker runs the control plane's current revision; `None` when either is
+/// unknown. A worker behind a site agent runs what the agent serves, a re-sealed copy of
+/// that revision when the agent removed a history endpoint: it is in sync when an in-sync
+/// agent of its site serves what it runs.
+fn in_sync_flags(
+    workers: &[queryflux_persistence::WorkerRecord],
+    control_plane: Option<&str>,
+) -> Vec<Option<bool>> {
+    let served_at_site: std::collections::HashSet<(&str, &str)> = workers
+        .iter()
+        .filter(|a| a.kind == "siteAgent" && a.active_revision.as_deref() == control_plane)
+        .filter_map(|a| {
+            Some((
+                a.labels.get("site")?.as_str(),
+                a.status.served_revision.as_deref()?,
+            ))
+        })
+        .collect();
+    workers
+        .iter()
+        .map(|w| {
+            let (cp, active) = (control_plane?, w.active_revision.as_deref()?);
+            Some(
+                cp == active
+                    || w.parent
+                        .as_deref()
+                        .is_some_and(|site| served_at_site.contains(&(site, active))),
+            )
+        })
+        .collect()
+}
+
 /// How long a worker stays listed after its last report.
 const WORKER_LIST_WINDOW_DAYS: i64 = 7;
 
@@ -1468,17 +1500,15 @@ async fn list_workers_handler(State(state): State<Arc<AdminState>>) -> impl Into
         }
         None => vec![],
     };
+    let in_sync = in_sync_flags(&workers, control_plane_revision.as_deref());
     let now = chrono::Utc::now();
     let workers = workers
         .into_iter()
-        .map(|worker| {
+        .zip(in_sync)
+        .map(|(worker, in_sync)| {
             let seconds_since_seen = (now - worker.last_seen).num_seconds().max(0);
             let interval = worker.status.heartbeat_interval_secs.unwrap_or(10) as i64;
             let online = seconds_since_seen <= (interval * 3).max(30);
-            let in_sync = match (&control_plane_revision, &worker.active_revision) {
-                (Some(cp), Some(active)) => Some(cp == active),
-                _ => None,
-            };
             WorkerView {
                 worker,
                 state: if online { "online" } else { "offline" }.into(),
@@ -3959,5 +3989,43 @@ mod tests {
             "keep-me"
         );
         assert_eq!(incoming["connections"]["eu"]["opa"]["bearerToken"], "");
+    }
+
+    #[test]
+    fn workers_behind_a_site_agent_are_in_sync_with_what_it_serves() {
+        let record = |v: serde_json::Value| -> queryflux_persistence::WorkerRecord {
+            serde_json::from_value(v).unwrap()
+        };
+        let workers = vec![
+            // Upstream named a history endpoint: the agent serves a re-sealed "cp-local".
+            record(serde_json::json!({
+                "name": "dc1/agent", "kind": "siteAgent", "labels": { "site": "dc1" },
+                "activeRevision": "cp", "status": { "servedRevision": "cp-local" }
+            })),
+            record(serde_json::json!({
+                "name": "dc1/w", "parent": "dc1", "activeRevision": "cp-local"
+            })),
+            record(serde_json::json!({
+                "name": "dc1/old", "parent": "dc1", "activeRevision": "older"
+            })),
+            // Another site's agent doesn't vouch for this worker.
+            record(serde_json::json!({
+                "name": "dc2/w", "parent": "dc2", "activeRevision": "cp-local"
+            })),
+            record(serde_json::json!({ "name": "direct", "activeRevision": "cp" })),
+            record(serde_json::json!({ "name": "new" })),
+        ];
+        assert_eq!(
+            super::in_sync_flags(&workers, Some("cp")),
+            vec![
+                Some(true),
+                Some(true),
+                Some(false),
+                Some(false),
+                Some(true),
+                None
+            ]
+        );
+        assert_eq!(super::in_sync_flags(&workers, None), vec![None; 6]);
     }
 }

@@ -1,0 +1,76 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="720" height="520" viewBox="0 0 720 520" role="img" aria-label="Reconcile loop: distributed followers read capacity store; leaders query backends and publish running counts">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#0b0614"/>
+      <stop offset="100%" stop-color="#050508"/>
+    </linearGradient>
+    <marker id="arr" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto">
+      <path d="M0,0 L7,3 L0,6 Z" fill="#a78bfa"/>
+    </marker>
+    <pattern id="dots" width="22" height="22" patternUnits="userSpaceOnUse">
+      <circle cx="1" cy="1" r="0.8" fill="rgba(255,255,255,0.05)"/>
+    </pattern>
+  </defs>
+
+  <rect width="720" height="520" rx="20" fill="url(#bg)"/>
+  <rect width="720" height="520" rx="20" fill="url(#dots)"/>
+  <rect x="1" y="1" width="718" height="518" rx="19" fill="none" stroke="rgba(255,255,255,0.08)"/>
+
+  <text x="40" y="40" fill="#fafafa" font-family="ui-sans-serif, system-ui, sans-serif" font-size="18" font-weight="650">Reconcile loop (every 30s)</text>
+  <text x="40" y="64" fill="#a1a1aa" font-family="ui-sans-serif, system-ui, sans-serif" font-size="12">Syncs running_queries with backend ground truth; distributed followers read Postgres counters.</text>
+
+  <g font-family="ui-sans-serif, system-ui, sans-serif" font-size="11">
+    <rect x="280" y="88" width="160" height="40" rx="12" fill="rgba(139,92,246,0.18)" stroke="#8b5cf6"/>
+    <text x="360" y="114" text-anchor="middle" fill="#ede9fe" font-size="13" font-weight="650">Reconcile loop</text>
+
+    <line x1="360" y1="128" x2="360" y2="152" stroke="#a78bfa" stroke-width="1.5" marker-end="url(#arr)"/>
+
+    <polygon points="360,152 430,192 360,232 290,192" fill="rgba(255,118,25,0.12)" stroke="#ff7619"/>
+    <text x="360" y="188" text-anchor="middle" fill="#ffedd5" font-weight="650">Distributed</text>
+    <text x="360" y="202" text-anchor="middle" fill="#fdba74">follower?</text>
+
+    <line x1="290" y1="192" x2="140" y2="192" stroke="#86efac" stroke-width="1.5" marker-end="url(#arr)"/>
+    <text x="220" y="184" text-anchor="middle" fill="#86efac">yes</text>
+    <rect x="20" y="168" width="120" height="48" rx="10" fill="rgba(163,230,53,0.08)" stroke="rgba(163,230,53,0.4)"/>
+    <text x="80" y="188" text-anchor="middle" fill="#c4b5fd" font-family="ui-monospace, Menlo, monospace">CapacityStore</text>
+    <text x="80" y="204" text-anchor="middle" fill="#c4b5fd" font-family="ui-monospace, Menlo, monospace">.active_count</text>
+
+    <line x1="430" y1="192" x2="560" y2="192" stroke="#a78bfa" stroke-width="1.5" marker-end="url(#arr)"/>
+    <text x="488" y="184" fill="#71717a">no</text>
+    <rect x="560" y="168" width="120" height="48" rx="10" fill="rgba(139,92,246,0.12)" stroke="#8b5cf6"/>
+    <text x="620" y="196" text-anchor="middle" fill="#ede9fe" font-weight="650">Query backend</text>
+
+    <polygon points="620,248 690,288 620,328 550,288" fill="rgba(255,118,25,0.12)" stroke="#ff7619"/>
+    <text x="620" y="284" text-anchor="middle" fill="#fdba74" font-size="10">Custom</text>
+    <text x="620" y="298" text-anchor="middle" fill="#fdba74" font-size="10">reconcileQuery?</text>
+
+    <rect x="440" y="264" width="100" height="48" rx="10" fill="rgba(139,92,246,0.12)" stroke="#8b5cf6"/>
+    <text x="490" y="284" text-anchor="middle" fill="#c4b5fd" font-size="9" font-family="ui-monospace, Menlo, monospace">execute_custom</text>
+    <text x="490" y="298" text-anchor="middle" fill="#c4b5fd" font-size="9" font-family="ui-monospace, Menlo, monospace">_reconcile_query</text>
+    <text x="418" y="292" fill="#86efac">yes</text>
+    <line x1="550" y1="288" x2="538" y2="288" stroke="#a78bfa" stroke-width="1.5" marker-end="url(#arr)"/>
+
+    <rect x="680" y="264" width="30" height="48" rx="10" fill="rgba(139,92,246,0.12)" stroke="#8b5cf6"/>
+    <text x="695" y="284" text-anchor="middle" fill="#c4b5fd" font-size="8" font-family="ui-monospace, Menlo, monospace">fetch</text>
+    <text x="695" y="296" text-anchor="middle" fill="#c4b5fd" font-size="8" font-family="ui-monospace, Menlo, monospace">_running</text>
+    <text x="652" y="292" fill="#71717a">no</text>
+    <line x1="690" y1="288" x2="712" y2="288" stroke="#a78bfa" stroke-width="1.5" marker-end="url(#arr)"/>
+
+    <rect x="560" y="340" width="120" height="40" rx="10" fill="rgba(255,118,25,0.1)" stroke="#ff7619"/>
+    <text x="620" y="365" text-anchor="middle" fill="#fdba74" font-family="ui-monospace, Menlo, monospace">publish_running_count</text>
+    <line x1="620" y1="328" x2="620" y2="338" stroke="#fdba74" stroke-width="1.5" marker-end="url(#arr)"/>
+
+    <rect x="260" y="440" width="200" height="44" rx="12" fill="rgba(163,230,53,0.1)" stroke="rgba(163,230,53,0.45)"/>
+    <text x="360" y="468" text-anchor="middle" fill="#86efac" font-size="13" font-weight="650">Update running_queries</text>
+
+    <line x1="80" y1="216" x2="80" y2="420" stroke="#a78bfa" stroke-width="1.5"/>
+    <line x1="80" y1="420" x2="258" y2="462" stroke="#a78bfa" stroke-width="1.5" marker-end="url(#arr)"/>
+    <line x1="490" y1="312" x2="490" y2="420" stroke="#a78bfa" stroke-width="1.5"/>
+    <line x1="490" y1="420" x2="360" y2="440" stroke="#a78bfa" stroke-width="1.5" marker-end="url(#arr)"/>
+    <line x1="695" y1="312" x2="695" y2="420" stroke="#a78bfa" stroke-width="1.5"/>
+    <line x1="695" y1="420" x2="460" y2="462" stroke="#a78bfa" stroke-width="1.5" marker-end="url(#arr)"/>
+    <line x1="620" y1="380" x2="620" y2="420" stroke="#fdba74" stroke-width="1.5"/>
+    <line x1="620" y1="420" x2="420" y2="462" stroke="#a78bfa" stroke-width="1.5" marker-end="url(#arr)"/>
+  </g>
+</svg>

@@ -215,7 +215,7 @@ Helm / Kubernetes: see **[Run multiple replicas](./installation/kubernetes.md#ru
 
 ## Worker mode
 
-`queryflux.role` selects how a process gets its config: `standalone` (the default), `controlPlane`, or `worker`. A worker pulls its config, capacity leases and history endpoint from a control plane, and never connects to Postgres:
+`queryflux.role` selects how a process gets its config: `standalone` (the default), `controlPlane`, `worker`, or `siteAgent` (relays a remote control plane to the workers at one site; see [Site agent](./operations/site-agent)). A worker pulls its config, capacity leases and history endpoint from a control plane, and never connects to Postgres:
 
 ```yaml
 queryflux:

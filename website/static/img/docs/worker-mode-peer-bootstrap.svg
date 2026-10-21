@@ -1,0 +1,67 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="420" viewBox="0 0 960 420" role="img" aria-label="Peer bootstrap sequence: new worker copies config from a running peer when the control plane is unreachable, then confirms when it returns">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#0b0614"/>
+      <stop offset="100%" stop-color="#050508"/>
+    </linearGradient>
+    <marker id="arr" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto">
+      <path d="M0,0 L7,3 L0,6 Z" fill="#a78bfa"/>
+    </marker>
+    <marker id="arrX" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto">
+      <path d="M0,0 L7,3 L0,6 Z" fill="#fb7185"/>
+    </marker>
+    <pattern id="dots" width="22" height="22" patternUnits="userSpaceOnUse">
+      <circle cx="1" cy="1" r="0.8" fill="rgba(255,255,255,0.05)"/>
+    </pattern>
+  </defs>
+
+  <rect width="960" height="420" rx="20" fill="url(#bg)"/>
+  <rect width="960" height="420" rx="20" fill="url(#dots)"/>
+  <rect x="1" y="1" width="958" height="418" rx="19" fill="none" stroke="rgba(255,255,255,0.08)"/>
+
+  <text x="40" y="40" fill="#fafafa" font-family="ui-sans-serif, system-ui, sans-serif" font-size="18" font-weight="650">Peer bootstrap</text>
+  <text x="40" y="62" fill="#a1a1aa" font-family="ui-sans-serif, system-ui, sans-serif" font-size="12">When the control plane is down, a new worker can copy a fresh-enough config from a peer.</text>
+
+  <g font-family="ui-sans-serif, system-ui, sans-serif">
+    <rect x="60" y="88" width="160" height="36" rx="10" fill="rgba(139,92,246,0.18)" stroke="#8b5cf6"/>
+    <text x="140" y="111" text-anchor="middle" fill="#ede9fe" font-size="13" font-weight="650">New worker</text>
+    <rect x="380" y="88" width="160" height="36" rx="10" fill="rgba(139,92,246,0.12)" stroke="#8b5cf6"/>
+    <text x="460" y="111" text-anchor="middle" fill="#ede9fe" font-size="13" font-weight="650">Control plane</text>
+    <rect x="700" y="88" width="160" height="36" rx="10" fill="rgba(163,230,53,0.1)" stroke="rgba(163,230,53,0.45)"/>
+    <text x="780" y="111" text-anchor="middle" fill="#ecfccb" font-size="13" font-weight="650">Running worker</text>
+  </g>
+
+  <line x1="140" y1="124" x2="140" y2="390" stroke="rgba(167,139,250,0.35)" stroke-width="1.5" stroke-dasharray="4 4"/>
+  <line x1="460" y1="124" x2="460" y2="390" stroke="rgba(167,139,250,0.35)" stroke-width="1.5" stroke-dasharray="4 4"/>
+  <line x1="780" y1="124" x2="780" y2="390" stroke="rgba(134,239,172,0.35)" stroke-width="1.5" stroke-dasharray="4 4"/>
+
+  <g font-family="ui-sans-serif, system-ui, sans-serif" font-size="12">
+    <!-- unreachable -->
+    <line x1="140" y1="160" x2="452" y2="160" stroke="#fb7185" stroke-width="1.5" stroke-dasharray="5 3" marker-end="url(#arrX)"/>
+    <text x="300" y="152" text-anchor="middle" fill="#fb7185">GET /worker/config (unreachable)</text>
+
+    <rect x="50" y="180" width="180" height="28" rx="8" fill="rgba(251,113,133,0.1)" stroke="rgba(251,113,133,0.35)"/>
+    <text x="140" y="198" text-anchor="middle" fill="#fda4af" font-size="11">still no config after afterSecs</text>
+
+    <!-- peer config -->
+    <line x1="140" y1="240" x2="772" y2="240" stroke="#a78bfa" stroke-width="1.5" marker-end="url(#arr)"/>
+    <text x="450" y="232" text-anchor="middle" fill="#d4d4d8">GET /worker/peer-config (shared secret)</text>
+
+    <line x1="780" y1="280" x2="148" y2="280" stroke="#86efac" stroke-width="1.5" marker-end="url(#arr)"/>
+    <text x="450" y="272" text-anchor="middle" fill="#86efac">snapshot + confirmedAt</text>
+
+    <rect x="50" y="300" width="180" height="48" rx="8" fill="rgba(139,92,246,0.12)" stroke="rgba(167,139,250,0.35)"/>
+    <text x="140" y="318" text-anchor="middle" fill="#c4b5fd" font-size="11">verify hash · age &lt;= maxAgeSecs</text>
+    <text x="140" y="336" text-anchor="middle" fill="#a78bfa" font-size="11">activate · stale = true</text>
+
+    <!-- confirm -->
+    <line x1="140" y1="370" x2="452" y2="370" stroke="#a78bfa" stroke-width="1.5" marker-end="url(#arr)"/>
+    <text x="300" y="362" text-anchor="middle" fill="#d4d4d8">conditional GET (If-None-Match)</text>
+
+    <line x1="460" y1="400" x2="148" y2="400" stroke="#a78bfa" stroke-width="1.5" marker-end="url(#arr)"/>
+    <text x="300" y="392" text-anchor="middle" fill="#c4b5fd">304 or a newer snapshot</text>
+  </g>
+
+  <text x="140" y="415" text-anchor="middle" fill="#71717a" font-family="ui-sans-serif, system-ui, sans-serif" font-size="11">confirmed · stale = false</text>
+</svg>

@@ -30,6 +30,8 @@ required_files=(
   "examples/worker-autoscaling-values.yaml"
   "examples/worker-daemonset-values.yaml"
   "examples/worker-sidecar-manifest.yaml"
+  "examples/site-agent-values.yaml"
+  "examples/site-agent-config.yaml"
   "values.yaml"
   "values.schema.json"
   "templates/_helpers.tpl"

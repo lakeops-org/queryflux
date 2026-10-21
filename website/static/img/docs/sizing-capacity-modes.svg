@@ -1,0 +1,72 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="400" viewBox="0 0 960 400" role="img" aria-label="Capacity modes for sizing: leases cost one Postgres round trip per admission; quotas admit locally within a share">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#0b0614"/>
+      <stop offset="100%" stop-color="#050508"/>
+    </linearGradient>
+    <marker id="arr" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto">
+      <path d="M0,0 L7,3 L0,6 Z" fill="#a78bfa"/>
+    </marker>
+    <marker id="arrO" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto">
+      <path d="M0,0 L7,3 L0,6 Z" fill="#fdba74"/>
+    </marker>
+    <marker id="arrG" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto">
+      <path d="M0,0 L7,3 L0,6 Z" fill="#86efac"/>
+    </marker>
+    <pattern id="dots" width="22" height="22" patternUnits="userSpaceOnUse">
+      <circle cx="1" cy="1" r="0.8" fill="rgba(255,255,255,0.05)"/>
+    </pattern>
+  </defs>
+  <rect width="960" height="400" rx="20" fill="url(#bg)"/>
+  <rect width="960" height="400" rx="20" fill="url(#dots)"/>
+  <rect x="1" y="1" width="958" height="398" rx="19" fill="none" stroke="rgba(255,255,255,0.08)"/>
+
+  <text x="40" y="40" fill="#fafafa" font-family="ui-sans-serif, system-ui, sans-serif" font-size="18" font-weight="650">What costs what at the control plane</text>
+  <text x="40" y="62" fill="#a1a1aa" font-family="ui-sans-serif, system-ui, sans-serif" font-size="12">Workers scale on their own. Shared state is capacity admission and query history.</text>
+
+  <rect x="40" y="90" width="420" height="250" rx="16" fill="rgba(139,92,246,0.08)" stroke="#8b5cf6" stroke-width="1.5"/>
+  <text x="250" y="120" text-anchor="middle" fill="#ede9fe" font-family="ui-sans-serif, system-ui, sans-serif" font-size="15" font-weight="650">Leases (default)</text>
+  <text x="250" y="142" text-anchor="middle" fill="#a78bfa" font-family="ui-sans-serif, system-ui, sans-serif" font-size="11">exact · one Postgres RTT per admission</text>
+
+  <rect x="70" y="168" width="100" height="48" rx="10" fill="rgba(255,255,255,0.04)" stroke="rgba(255,255,255,0.14)"/>
+  <text x="120" y="197" text-anchor="middle" fill="#f4f4f5" font-family="ui-sans-serif, system-ui, sans-serif" font-size="12" font-weight="600">Worker</text>
+  <line x1="170" y1="192" x2="218" y2="192" stroke="#a78bfa" stroke-width="1.5" marker-end="url(#arr)"/>
+  <text x="194" y="180" text-anchor="middle" fill="#c4b5fd" font-family="ui-sans-serif, system-ui, sans-serif" font-size="9">acquire</text>
+  <rect x="230" y="168" width="100" height="48" rx="10" fill="rgba(139,92,246,0.2)" stroke="#8b5cf6"/>
+  <text x="280" y="188" text-anchor="middle" fill="#ede9fe" font-family="ui-sans-serif, system-ui, sans-serif" font-size="11" font-weight="600">Control</text>
+  <text x="280" y="204" text-anchor="middle" fill="#ede9fe" font-family="ui-sans-serif, system-ui, sans-serif" font-size="11" font-weight="600">plane</text>
+  <line x1="330" y1="192" x2="378" y2="192" stroke="#fdba74" stroke-width="1.5" marker-end="url(#arrO)"/>
+  <ellipse cx="420" cy="192" rx="28" ry="22" fill="rgba(255,118,25,0.12)" stroke="#ff7619"/>
+  <text x="420" y="196" text-anchor="middle" fill="#ffedd5" font-family="ui-sans-serif, system-ui, sans-serif" font-size="10" font-weight="650">PG</text>
+
+  <text x="250" y="250" text-anchor="middle" fill="#d4d4d8" font-family="ui-sans-serif, system-ui, sans-serif" font-size="12">~1 capacity txn per query</text>
+  <text x="250" y="274" text-anchor="middle" fill="#a1a1aa" font-family="ui-sans-serif, system-ui, sans-serif" font-size="11">~3-5k adm/s per cluster lock</text>
+  <text x="250" y="298" text-anchor="middle" fill="#a1a1aa" font-family="ui-sans-serif, system-ui, sans-serif" font-size="11">Best when exact and simple is enough</text>
+  <text x="250" y="322" text-anchor="middle" fill="#71717a" font-family="ui-sans-serif, system-ui, sans-serif" font-size="11">Release is batched off the query path</text>
+
+  <rect x="500" y="90" width="420" height="250" rx="16" fill="rgba(163,230,53,0.06)" stroke="rgba(163,230,53,0.45)" stroke-width="1.5"/>
+  <text x="710" y="120" text-anchor="middle" fill="#ecfccb" font-family="ui-sans-serif, system-ui, sans-serif" font-size="15" font-weight="650">Quotas</text>
+  <text x="710" y="142" text-anchor="middle" fill="#86efac" font-family="ui-sans-serif, system-ui, sans-serif" font-size="11">admit in memory within a share</text>
+
+  <rect x="530" y="168" width="100" height="48" rx="10" fill="rgba(255,255,255,0.04)" stroke="rgba(255,255,255,0.14)"/>
+  <text x="580" y="197" text-anchor="middle" fill="#f4f4f5" font-family="ui-sans-serif, system-ui, sans-serif" font-size="12" font-weight="600">Worker</text>
+  <line x1="630" y1="180" x2="678" y2="180" stroke="#86efac" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#arrG)"/>
+  <text x="654" y="168" text-anchor="middle" fill="#86efac" font-family="ui-sans-serif, system-ui, sans-serif" font-size="9">report ~1/s</text>
+  <line x1="580" y1="216" x2="580" y2="248" stroke="#a78bfa" stroke-width="1.5" marker-end="url(#arr)"/>
+  <text x="600" y="240" fill="#c4b5fd" font-family="ui-sans-serif, system-ui, sans-serif" font-size="9">atomic</text>
+  <rect x="530" y="252" width="100" height="36" rx="8" fill="rgba(139,92,246,0.15)" stroke="#8b5cf6"/>
+  <text x="580" y="274" text-anchor="middle" fill="#ede9fe" font-family="ui-sans-serif, system-ui, sans-serif" font-size="11">local admit</text>
+  <rect x="690" y="168" width="100" height="48" rx="10" fill="rgba(139,92,246,0.2)" stroke="#8b5cf6"/>
+  <text x="740" y="188" text-anchor="middle" fill="#ede9fe" font-family="ui-sans-serif, system-ui, sans-serif" font-size="11" font-weight="600">Control</text>
+  <text x="740" y="204" text-anchor="middle" fill="#ede9fe" font-family="ui-sans-serif, system-ui, sans-serif" font-size="11" font-weight="600">plane</text>
+  <line x1="790" y1="192" x2="838" y2="192" stroke="#fdba74" stroke-width="1.5" marker-end="url(#arrO)"/>
+  <ellipse cx="880" cy="192" rx="28" ry="22" fill="rgba(255,118,25,0.12)" stroke="#ff7619"/>
+  <text x="880" y="196" text-anchor="middle" fill="#ffedd5" font-family="ui-sans-serif, system-ui, sans-serif" font-size="10" font-weight="650">PG</text>
+
+  <text x="710" y="298" text-anchor="middle" fill="#d4d4d8" font-family="ui-sans-serif, system-ui, sans-serif" font-size="12">Load scales with holders, not QPS</text>
+  <text x="710" y="322" text-anchor="middle" fill="#a1a1aa" font-family="ui-sans-serif, system-ui, sans-serif" font-size="11">Use above ~10k QPS or high RTT</text>
+
+  <text x="480" y="380" text-anchor="middle" fill="#71717a" font-family="ui-sans-serif, system-ui, sans-serif" font-size="11">History is the same either way: batches of 200, two statements per batch. Engines are never on this path.</text>
+
+</svg>

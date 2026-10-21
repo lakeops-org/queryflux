@@ -7,6 +7,8 @@
 //!   re-checks whenever this process reloads its config.
 //! - `POST /worker/register` and `POST /worker/heartbeat` record what each worker reports
 //!   (name, version, labels, coordination mode, revisions, last error).
+//! - `POST /worker/fleet` records the workers a site agent relays for, as
+//!   `<site>/<name>` (a [`FleetReportV1`]).
 //!
 //! - `/worker/capacity/*` and `/worker/sweep-lock/*` give workers with
 //!   `coordination.mode: controlPlane` the same capacity leases, sweep locks and published
@@ -35,7 +37,7 @@ use axum::{
 };
 use queryflux_core::worker_snapshot::{WorkerSnapshotV1, WORKER_SNAPSHOT_MEDIA_TYPE};
 use queryflux_persistence::{
-    CoordinationStore, MetricsStore, QueryRecordBatchV1, SweepGuard, WorkerRecord,
+    CoordinationStore, FleetReportV1, MetricsStore, QueryRecordBatchV1, SweepGuard, WorkerRecord,
     WorkerRegistryStore, QUERY_RECORDS_SCHEMA_VERSION,
 };
 
@@ -97,6 +99,7 @@ pub fn router_with_ingest_limit(
         .route("/worker/config/wait", get(wait_config))
         .route("/worker/register", post(report))
         .route("/worker/heartbeat", post(report))
+        .route("/worker/fleet", post(fleet_report))
         .route("/worker/capacity/acquire", post(capacity_acquire))
         .route("/worker/capacity/release", post(capacity_release))
         .route(
@@ -296,6 +299,42 @@ async fn report(
     StatusCode::NO_CONTENT.into_response()
 }
 
+/// A site agent's workers. Each is stored as `<site>/<name>` with `parent` set to the
+/// site, so `worker-0` at two sites doesn't collide.
+async fn fleet_report(
+    State(st): State<Arc<WorkerApiState>>,
+    headers: HeaderMap,
+    Json(fleet): Json<FleetReportV1>,
+) -> Response {
+    if !authorized(&headers, &st.api.shared_secret) {
+        return unauthorized();
+    }
+    let site = fleet.site.trim();
+    if site.is_empty() || site.contains('/') {
+        return (
+            StatusCode::BAD_REQUEST,
+            "site is required and must not contain '/'",
+        )
+            .into_response();
+    }
+    let Some(registry) = &st.api.registry else {
+        return StatusCode::NO_CONTENT.into_response();
+    };
+    for mut worker in fleet.workers {
+        if worker.name.trim().is_empty() {
+            continue;
+        }
+        worker.name = format!("{site}/{}", worker.name);
+        worker.kind = "worker".to_string();
+        worker.parent = Some(site.to_string());
+        if let Err(e) = registry.upsert_worker(&worker).await {
+            tracing::warn!(worker = %worker.name, "Failed to record relayed worker: {e}");
+            return (StatusCode::SERVICE_UNAVAILABLE, e.to_string()).into_response();
+        }
+    }
+    StatusCode::NO_CONTENT.into_response()
+}
+
 /// Several live workers with any of them on local-only limits means their caps are not
 /// shared: each worker admits up to the full limit on its own.
 async fn warn_on_unshared_capacity(st: &WorkerApiState, registry: &dyn WorkerRegistryStore) {
@@ -372,11 +411,19 @@ async fn ingest_records(
     };
     let accepted = batch.records.len();
     let worker = batch.worker;
+    let site = batch.site.filter(|s| !s.trim().is_empty());
     let records: Vec<_> = batch
         .records
         .into_iter()
         .map(|mut record| {
-            record.worker = Some(worker.clone());
+            record.worker = Some(match &site {
+                // Relayed by a site agent: each record names the worker that ran it.
+                Some(site) => format!(
+                    "{site}/{}",
+                    record.worker.as_deref().unwrap_or(worker.as_str())
+                ),
+                None => worker.clone(),
+            });
             record
         })
         .collect();

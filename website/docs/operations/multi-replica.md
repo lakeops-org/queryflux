@@ -10,6 +10,11 @@ QueryFlux can run as a single process or as a fleet of replicas that share state
 
 For chart knobs and install notes, see also the [Helm chart README](https://github.com/lakeops-org/queryflux/blob/main/charts/queryflux/README.md).
 
+<img
+  src="/img/docs/multi-replica-topology.svg"
+  alt="Coordinated multi-replica: clients through a load balancer to QueryFlux replicas that share Postgres for capacity, queue, config, and history, and send SQL to query engines"
+/>
+
 ## Modes at a glance
 
 | Mode | Persistence | Replicas | Capacity / queue | Safe? |

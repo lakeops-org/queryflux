@@ -10,8 +10,6 @@ type Tab = {
   lines: ReactNode[];
 };
 
-// Hand-highlighted so the hero renders identically with or without JS, and so
-// we can keep colors on-brand without pulling Prism into the landing page.
 const k = (s: string) => <span className={styles.tokKey}>{s}</span>;
 const v = (s: string) => <span className={styles.tokVal}>{s}</span>;
 const c = (s: string) => <span className={styles.tokComment}>{s}</span>;
@@ -90,7 +88,6 @@ function CodeWindow(): ReactNode {
   const activeIndex = Math.max(0, TABS.findIndex((t) => t.id === active));
   const tab = TABS[activeIndex];
 
-  // WAI-ARIA tabs pattern: arrows move between tabs, Home/End jump to the ends.
   const onKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
     const last = TABS.length - 1;
     const next = {

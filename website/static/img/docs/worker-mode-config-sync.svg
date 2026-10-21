@@ -1,0 +1,82 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="480" viewBox="0 0 960 480" role="img" aria-label="Config sync sequence: worker fetches snapshot, long-polls for changes, and receives last-good config when Postgres is down">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#0b0614"/>
+      <stop offset="100%" stop-color="#050508"/>
+    </linearGradient>
+    <marker id="arr" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto">
+      <path d="M0,0 L7,3 L0,6 Z" fill="#a78bfa"/>
+    </marker>
+    <pattern id="dots" width="22" height="22" patternUnits="userSpaceOnUse">
+      <circle cx="1" cy="1" r="0.8" fill="rgba(255,255,255,0.05)"/>
+    </pattern>
+  </defs>
+
+  <rect width="960" height="480" rx="20" fill="url(#bg)"/>
+  <rect width="960" height="480" rx="20" fill="url(#dots)"/>
+  <rect x="1" y="1" width="958" height="478" rx="19" fill="none" stroke="rgba(255,255,255,0.08)"/>
+
+  <text x="40" y="40" fill="#fafafa" font-family="ui-sans-serif, system-ui, sans-serif" font-size="18" font-weight="650">Config sync and activation</text>
+  <text x="40" y="62" fill="#a1a1aa" font-family="ui-sans-serif, system-ui, sans-serif" font-size="12">Long-poll for changes; last-good snapshot when Postgres cannot build a new one.</text>
+
+  <!-- Participants -->
+  <g font-family="ui-sans-serif, system-ui, sans-serif">
+    <rect x="80" y="88" width="140" height="36" rx="10" fill="rgba(139,92,246,0.18)" stroke="#8b5cf6"/>
+    <text x="150" y="111" text-anchor="middle" fill="#ede9fe" font-size="13" font-weight="650">Worker</text>
+    <rect x="380" y="88" width="160" height="36" rx="10" fill="rgba(139,92,246,0.12)" stroke="#8b5cf6"/>
+    <text x="460" y="111" text-anchor="middle" fill="#ede9fe" font-size="13" font-weight="650">Control plane</text>
+    <rect x="700" y="88" width="140" height="36" rx="10" fill="rgba(255,118,25,0.12)" stroke="#ff7619"/>
+    <text x="770" y="111" text-anchor="middle" fill="#ffedd5" font-size="13" font-weight="650">Postgres</text>
+  </g>
+
+  <!-- Lifelines -->
+  <line x1="150" y1="124" x2="150" y2="450" stroke="rgba(167,139,250,0.35)" stroke-width="1.5" stroke-dasharray="4 4"/>
+  <line x1="460" y1="124" x2="460" y2="450" stroke="rgba(167,139,250,0.35)" stroke-width="1.5" stroke-dasharray="4 4"/>
+  <line x1="770" y1="124" x2="770" y2="450" stroke="rgba(253,186,116,0.35)" stroke-width="1.5" stroke-dasharray="4 4"/>
+
+  <g font-family="ui-sans-serif, system-ui, sans-serif" font-size="12">
+    <!-- 1 GET config -->
+    <line x1="150" y1="160" x2="452" y2="160" stroke="#a78bfa" stroke-width="1.5" marker-end="url(#arr)"/>
+    <text x="300" y="152" text-anchor="middle" fill="#d4d4d8">GET /worker/config</text>
+
+    <!-- CP -> DB -->
+    <line x1="460" y1="190" x2="762" y2="190" stroke="#fdba74" stroke-width="1.5" marker-end="url(#arr)"/>
+    <text x="610" y="182" text-anchor="middle" fill="#fdba74">consistent read (REPEATABLE READ)</text>
+
+    <!-- 200 snapshot -->
+    <line x1="460" y1="220" x2="158" y2="220" stroke="#a78bfa" stroke-width="1.5" marker-end="url(#arr)"/>
+    <text x="300" y="212" text-anchor="middle" fill="#c4b5fd">200 snapshot, ETag "rev1"</text>
+
+    <!-- Note activate -->
+    <rect x="60" y="240" width="180" height="44" rx="8" fill="rgba(139,92,246,0.12)" stroke="rgba(167,139,250,0.35)"/>
+    <text x="150" y="258" text-anchor="middle" fill="#c4b5fd" font-size="11">verify version + hash</text>
+    <text x="150" y="274" text-anchor="middle" fill="#a78bfa" font-size="11">compile · swap atomically</text>
+
+    <!-- wait -->
+    <line x1="150" y1="310" x2="452" y2="310" stroke="#a78bfa" stroke-width="1.5" marker-end="url(#arr)"/>
+    <text x="300" y="302" text-anchor="middle" fill="#d4d4d8">GET /worker/config/wait?since=rev1</text>
+
+    <!-- Note hold -->
+    <rect x="380" y="322" width="160" height="28" rx="8" fill="rgba(0,0,0,0.3)" stroke="rgba(255,255,255,0.1)"/>
+    <text x="460" y="340" text-anchor="middle" fill="#71717a" font-size="11">holds up to pollTimeoutSecs</text>
+
+    <!-- admin edit note -->
+    <rect x="700" y="322" width="140" height="28" rx="8" fill="rgba(255,118,25,0.1)" stroke="rgba(255,118,25,0.35)"/>
+    <text x="770" y="340" text-anchor="middle" fill="#fdba74" font-size="11">admin edits a cluster</text>
+
+    <!-- rev2 -->
+    <line x1="460" y1="370" x2="158" y2="370" stroke="#a78bfa" stroke-width="1.5" marker-end="url(#arr)"/>
+    <text x="300" y="362" text-anchor="middle" fill="#c4b5fd">200 snapshot "rev2" (~1s)</text>
+
+    <!-- wait again -->
+    <line x1="150" y1="400" x2="452" y2="400" stroke="#a78bfa" stroke-width="1.5" marker-end="url(#arr)"/>
+    <text x="300" y="392" text-anchor="middle" fill="#d4d4d8">GET /worker/config/wait?since=rev2</text>
+
+    <!-- Postgres down + last good -->
+    <rect x="700" y="412" width="140" height="28" rx="8" fill="rgba(255,118,25,0.1)" stroke="rgba(255,118,25,0.35)"/>
+    <text x="770" y="430" text-anchor="middle" fill="#fb7185" font-size="11">Postgres down</text>
+    <line x1="460" y1="450" x2="158" y2="450" stroke="#86efac" stroke-width="1.5" marker-end="url(#arr)"/>
+    <text x="300" y="442" text-anchor="middle" fill="#86efac">last good snapshot (build failed or &gt;10s)</text>
+  </g>
+</svg>

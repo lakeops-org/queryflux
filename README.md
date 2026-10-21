@@ -1,65 +1,73 @@
-# <p align="center"><big>QueryFlux</big></p>
+<div align="center">
+
+# QueryFlux
+
+**One query. Any engine.**
+
+Open-source SQL proxy and router in Rust — one endpoint for tools and AI agents across Trino, DuckDB, StarRocks, Athena, ClickHouse, and ADBC warehouses.
+
+<br/>
+
+<a href="https://queryflux.dev/" title="QueryFlux documentation">
+  <img
+    src="website/static/img/queryflux-hero-banner.svg"
+    alt="QueryFlux — One query, any engine. Rust mascot with fiber cables connecting Trino, DuckDB, Snowflake, DataFusion, Databricks, Presto, Spark, and ClickHouse"
+    width="820"
+  />
+</a>
+
+<br/>
+
+<a href="https://github.com/lakeops-org/queryflux/actions/workflows/ci.yml?query=branch%3Amain"><img src="https://img.shields.io/github/actions/workflow/status/lakeops-org/queryflux/ci.yml?branch=main&amp;label=build&amp;style=for-the-badge&amp;logo=github&amp;logoColor=white" alt="CI status on main" /></a>
+<a href="https://github.com/lakeops-org/queryflux/pkgs/container/queryflux"><img src="https://ghcr-badge.elias.eu.org/shield/lakeops-org/queryflux/queryflux" alt="GHCR downloads" /></a>
+<a href="https://github.com/lakeops-org/queryflux/releases/latest"><img src="https://img.shields.io/github/v/release/lakeops-org/queryflux?sort=semver&amp;style=for-the-badge&amp;logo=github&amp;logoColor=white&amp;label=release" alt="Latest release" /></a>
+<a href="https://github.com/lakeops-org/queryflux/commits/main/"><img src="https://img.shields.io/github/last-commit/lakeops-org/queryflux?style=for-the-badge&amp;logo=git&amp;logoColor=white&amp;label=last%20commit" alt="Last commit" /></a>
+<br/>
+<a href="https://github.com/lakeops-org/queryflux/blob/main/LICENSE"><img src="https://img.shields.io/github/license/lakeops-org/queryflux?style=for-the-badge&amp;logo=apache&amp;logoColor=white" alt="License" /></a>
+<a href="https://github.com/lakeops-org/queryflux/issues"><img src="https://img.shields.io/github/issues/lakeops-org/queryflux?style=for-the-badge&amp;logo=github&amp;logoColor=white&amp;label=issues" alt="Open issues" /></a>
+<a href="https://github.com/lakeops-org/queryflux/stargazers"><img src="https://img.shields.io/github/stars/lakeops-org/queryflux?style=for-the-badge&amp;logo=github&amp;logoColor=white&amp;label=stars" alt="GitHub stars" /></a>
+
+<br/>
+
+[Documentation](https://queryflux.dev/) · [Slack](https://join.slack.com/t/queryfluxworkspace/shared_invite/zt-3v7qedxj9-o8ElCLGK0UXT8xBU0_bD8w) · [Why a control plane](https://lakeops.dev/blog/the-future-isnt-one-engine) · [Quickstart](https://queryflux.dev/docs/quickstart/first-query)
+
+</div>
+
+---
+
+## Why QueryFlux
+
+Modern stacks mix **many engines** — each with its own wire protocol and SQL dialect. QueryFlux sits between clients and those engines:
+
+- **Speak what clients already speak** — Trino HTTP, PostgreSQL wire, MySQL wire, Snowflake HTTP + SQL API v2, Arrow Flight SQL, MCP
+- **Route with intent** — protocol, headers, SQL regex, Trino tags, compound rules, or Python
+- **Translate when dialects differ** — [sqlglot](https://github.com/tobymao/sqlglot) (31+ dialects)
+- **Protect capacity** — per-group `maxRunningQueries`, queue at the proxy, fail-closed coordination
+- **Operate one surface** — Studio, Prometheus metrics, query history, guardrails, OPA/Cerbos
+
+The future of data platforms is not one engine — it is a **control plane** over specialized engines on shared data. Read [The Future Isn't One Engine](https://lakeops.dev/blog/the-future-isnt-one-engine).
 
 <p align="center">
-  <a href="https://queryflux.dev/" title="QueryFlux documentation">
-    <img
-      src="website/static/img/queryflux-hero-banner.svg"
-      alt="QueryFlux — One query, any engine. Rust mascot with fiber cables connecting Trino, DuckDB, Snowflake, DataFusion, Databricks, Presto, Spark, and ClickHouse"
-      width="800"
-    />
-  </a>
+  <img
+    src="website/static/img/docs/readme-architecture.svg"
+    alt="Clients connect with native protocols to QueryFlux; QueryFlux routes, queues, and translates SQL; specialized engines execute"
+    width="900"
+  />
 </p>
-<p align="center"><strong>One query. Any engine.</strong></p>
-
-<p align="center">
-  <a href="https://github.com/lakeops-org/queryflux/actions/workflows/ci.yml?query=branch%3Amain"><img src="https://img.shields.io/github/actions/workflow/status/lakeops-org/queryflux/ci.yml?branch=main&amp;label=build&amp;style=for-the-badge&amp;logo=github&amp;logoColor=white" alt="CI status on main" /></a>
-  <a href="https://github.com/lakeops-org/queryflux/pkgs/container/queryflux"><img src="https://ghcr-badge.elias.eu.org/shield/lakeops-org/queryflux/queryflux" alt="GHCR downloads" /></a>
-  <a href="https://github.com/lakeops-org/queryflux/releases/latest"><img src="https://img.shields.io/github/v/release/lakeops-org/queryflux?sort=semver&amp;style=for-the-badge&amp;logo=github&amp;logoColor=white&amp;label=release" alt="Latest release" /></a>
-  <a href="https://github.com/lakeops-org/queryflux/commits/main/"><img src="https://img.shields.io/github/last-commit/lakeops-org/queryflux?style=for-the-badge&amp;logo=git&amp;logoColor=white&amp;label=last%20commit" alt="Last commit" /></a>
-</p>
-<p align="center">
-  <a href="https://github.com/lakeops-org/queryflux/blob/main/LICENSE"><img src="https://img.shields.io/github/license/lakeops-org/queryflux?style=for-the-badge&amp;logo=apache&amp;logoColor=white" alt="License" /></a>
-  <a href="https://github.com/lakeops-org/queryflux/issues"><img src="https://img.shields.io/github/issues/lakeops-org/queryflux?style=for-the-badge&amp;logo=github&amp;logoColor=white&amp;label=issues" alt="Open issues" /></a>
-  <a href="https://github.com/lakeops-org/queryflux/stargazers"><img src="https://img.shields.io/github/stars/lakeops-org/queryflux?style=for-the-badge&amp;logo=github&amp;logoColor=white&amp;label=stars" alt="GitHub stars" /></a>
-</p>
-<p align="center">
-  <a href="https://join.slack.com/t/queryfluxworkspace/shared_invite/zt-3v7qedxj9-o8ElCLGK0UXT8xBU0_bD8w">Slack community</a>
-  &nbsp;·&nbsp;
-  <a href="https://queryflux.dev/">Documentation</a>
-  &nbsp;·&nbsp;
-  <a href="https://lakeops.dev/blog/the-future-isnt-one-engine">Why a control plane</a>
-</p>
-
-# <p align="center"><big>Universal SQL multi-engine query router and proxy in Rust</big></p>
-
-QueryFlux sits between SQL clients and multiple backend query engines, providing protocol translation, intelligent routing, load balancing, and automatic SQL dialect conversion.
-
-## Overview
-
-QueryFlux lets you connect any SQL client using standard protocols (Trino HTTP, PostgreSQL wire, MySQL wire, Snowflake HTTP wire + SQL API v2, and Arrow Flight SQL) and route queries to the right backend engine — Trino, DuckDB, StarRocks, Athena, or ClickHouse — based on flexible routing rules. SQL dialects are translated automatically when needed via [sqlglot](https://github.com/tobymao/sqlglot).
-
-The future of data platforms is not one engine — it is a control plane over specialized engines on shared data. [The Future Isn't One Engine. It's a Control Plane.](https://lakeops.dev/blog/the-future-isnt-one-engine) explains why QueryFlux sits above the engines, and how it pairs with LakeOps for table maintenance.
-
-```
-Client (Trino CLI / psql / mysql / Snowflake connectors)
-    ↓ native protocol
-QueryFlux
-    ↓ routing + dialect translation
-Trino / DuckDB / StarRocks / ClickHouse
-```
 
 ## Features
 
-**Frontend Protocols**
-- Trino HTTP (port 8080)
-- PostgreSQL wire (port 5432)
-- MySQL wire (port 3306)
-- Snowflake HTTP wire + SQL REST API v2 on one listener (`snowflakeHttp` in YAML; pick a port, e.g. 8443)
-- Arrow Flight SQL (query execution)
+| | |
+| --- | --- |
+| **Frontends** | Trino HTTP `:8080` · PostgreSQL wire `:5432` · MySQL wire `:3306` · Snowflake HTTP + SQL API v2 · Arrow Flight SQL · MCP |
+| **Engines** | Trino · DuckDB (embedded) · StarRocks · Athena · ClickHouse · ADBC (Snowflake, Databricks, BigQuery, Redshift, …) |
+| **Routing** | Protocol · header · regex · client tags · Python · compound AND/OR · fallback group |
+| **Control** | Capacity leases & quotas · sqlglot translation · guardrails · OIDC/LDAP · OPA/Cerbos |
+| **Ops** | Postgres or in-memory persistence · Studio UI · Prometheus + Grafana · Admin API (OpenAPI) · Helm chart · worker mode |
 
 ### Snowflake HTTP (wire + SQL API v2)
 
-The Snowflake **HTTP wire** (JDBC/ODBC/Python connector, SnowSQL) and **SQL API v2** share the **`snowflakeHttp`** listener; routing distinguishes `snowflakeHttp` vs `snowflakeSqlApi` for `protocolBased` routers. See [`config.example.yaml`](config.example.yaml) for a commented block (`sessionAffinityAcknowledged`, optional session TTL fields). Full reference: [Snowflake frontend](website/docs/architecture/frontends/snowflake.md).
+The Snowflake **HTTP wire** (JDBC/ODBC/Python, SnowSQL) and **SQL API v2** share the **`snowflakeHttp`** listener; routing distinguishes `snowflakeHttp` vs `snowflakeSqlApi`. See [`config.example.yaml`](config.example.yaml) and the [Snowflake frontend](website/docs/architecture/frontends/snowflake.md).
 
 ```yaml
 queryflux:
@@ -73,30 +81,6 @@ routers:
     snowflakeHttp: duckdb-local
     snowflakeSqlApi: duckdb-local
 ```
-
-**Backend Engines**
-- Trino — async HTTP polling
-- DuckDB — embedded, in-process execution
-- StarRocks — MySQL wire protocol
-- Athena — AWS SDK, async polling
-- ClickHouse — HTTP interface, Arrow results
-
-**Routing**
-- Protocol-based (route by client connection type)
-- Header-based (HTTP header values)
-- Query regex matching
-- Client tags (Trino `X-Trino-Client-Tags`)
-- Python script (custom routing logic)
-- Compound (multiple conditions with AND/OR)
-- Fallback group
-
-**Other**
-- SQL dialect translation via sqlglot (31+ dialects)
-- Query queuing with per-cluster capacity limits
-- In-memory (single-instance) or PostgreSQL-backed state
-- Prometheus metrics + Grafana dashboards
-- Admin REST API with OpenAPI spec + Basic auth
-- QueryFlux Studio — web management UI (cluster monitoring, query history, config management)
 
 ## QueryFlux Studio
 
@@ -138,22 +122,19 @@ End-to-end overhead is measured by [`queryflux-bench`](crates/queryflux-bench) (
 | Via QueryFlux | 0.70 ms | 1.21 ms | 4.20 ms |
 | **Overhead** | **0.34 ms** | **0.67 ms** | **3.01 ms** |
 
-## Getting Started
+## Getting started
 
 ### Prerequisites
 
 - Rust (stable)
-- Python 3.10+ (for sqlglot SQL translation)
-- Docker + Docker Compose (for local development stack)
+- Python 3.10+ (sqlglot)
+- Docker + Docker Compose (for `make dev`)
 
-### Setup
+### Fastest path: Docker Compose
 
 ```bash
-# Install Python dependencies (sqlglot)
-make setup
-
-# Start services (Trino, Postgres, Prometheus, Grafana) and run QueryFlux
-make dev
+make setup   # Python deps (sqlglot)
+make dev     # Trino, Postgres, Prometheus, Grafana + QueryFlux
 ```
 
 This starts:
@@ -309,11 +290,11 @@ make clean    # Remove build artifacts and Docker volumes
 
 See [development.md](development.md) for environment variables, workspace layout, and how to run the binary locally. See [contribute.md](contribute.md) for pull request expectations.
 
-## Architecture
+## Architecture & docs
 
-See [docs/README.md](docs/README.md) for the full architecture doc set (motivation, query translation, routing and clusters). The high-level overview lives in [docs/architecture.md](docs/architecture.md).
-
-**Docs website:** a Docusaurus mirror of this README and `docs/` lives under [`website/`](website/README.md); run `npm install` and `npm start` there for a local browseable site.
+- **[queryflux.dev](https://queryflux.dev/)** — full documentation site
+- **[Motivation and goals](website/docs/architecture/motivation-and-goals.md)** · **[System map](website/docs/architecture/system-map.md)** · **[Worker mode](website/docs/operations/worker-mode.md)**
+- Local docs: [`website/`](website/README.md) → `npm install && npm start`
 
 ## License
 

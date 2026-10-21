@@ -1,0 +1,73 @@
+# Site agent: one per customer site, between the site's workers and a remote control
+# plane. Run the following from the repository root.
+#
+#   1. Fill in ./charts/queryflux/examples/site-agent-config.yaml and create its Secret:
+#        kubectl -n queryflux create secret generic queryflux-site-agent-config \
+#          --from-file=config.yaml=./charts/queryflux/examples/site-agent-config.yaml
+#   2. helm install queryflux-site-agent ./charts/queryflux -n queryflux \
+#        -f ./charts/queryflux/examples/site-agent-values.yaml
+#   3. Point the workers' controlPlane.url at
+#        http://queryflux-site-agent.queryflux.svc:9000
+#
+# Each replica keeps its own history spool and snapshot cache on its own volume, so a
+# deleted pod loses neither. Replicas need no coordination with each other.
+
+# The config is in a Secret the chart cannot read; this tells the install notes.
+role: siteAgent
+
+replicaCount: 2
+
+workload:
+  kind: StatefulSet
+  volumeClaimTemplates:
+    - metadata:
+        name: state
+      spec:
+        accessModes: [ReadWriteOnce]
+        # The cached snapshot can carry engine credentials: use an encrypted storage class.
+        # storageClassName: encrypted-ssd
+        resources:
+          requests:
+            storage: 2Gi
+
+extraVolumeMounts:
+  - name: state
+    mountPath: /var/lib/queryflux/site-agent
+
+config:
+  existingSecret: queryflux-site-agent-config
+
+# The agent serves no Studio and no queries: only the worker API and /readyz, /metrics,
+# /agent/status, on the admin port.
+studio:
+  enabled: false
+
+service:
+  # The StatefulSet's governing Service.
+  headless:
+    enabled: true
+  ports:
+    trinoHttp:
+      enabled: false
+    studio:
+      enabled: false
+
+# /readyz turns 200 once the agent has a config to serve (from upstream or its cache).
+startupProbe:
+  httpGet:
+    path: /readyz
+    port: admin
+  periodSeconds: 2
+  timeoutSeconds: 2
+  failureThreshold: 150
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    memory: 512Mi
+
+pdb:
+  enabled: true
+  maxUnavailable: 1

@@ -14,24 +14,10 @@ This page lists the building blocks of a QueryFlux deployment, what each one doe
 
 ## Reference architecture
 
-```mermaid
-flowchart LR
-  C["Clients<br/>BI · JDBC · psql · mysql · AI agents"]
-  QF["QueryFlux server<br/>frontends → router → queue → translate"]
-  E["Engines<br/>Trino · StarRocks · DuckDB · Athena · ADBC"]
-  PG[("Postgres<br/>persistence")]
-  ST["Studio :3000"]
-  PR["Prometheus"]
-  ID["OIDC / LDAP"]
-  AC["OPA / Cerbos"]
-
-  C --> QF --> E
-  QF --- PG
-  ST -- admin API :9000 --> QF
-  PR -. scrapes /metrics .-> QF
-  QF -. authenticates .-> ID
-  QF -. policies .-> AC
-```
+<img
+  src="/img/docs/install-overview.svg"
+  alt="Reference architecture: clients to QueryFlux server to engines, Postgres persistence, Studio admin API, Prometheus metrics scrape, OIDC or LDAP authentication, and OPA or Cerbos policies"
+/>
 
 ## Components
 

@@ -37,6 +37,19 @@ pub(crate) struct UploadError {
     retry_after: Option<Duration>,
 }
 
+impl UploadError {
+    pub(crate) fn new(message: String, retry_after: Option<Duration>) -> Self {
+        Self {
+            message,
+            retry_after,
+        }
+    }
+
+    pub(crate) fn retry_after(&self) -> Option<Duration> {
+        self.retry_after
+    }
+}
+
 impl std::fmt::Display for UploadError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.message)
@@ -44,7 +57,7 @@ impl std::fmt::Display for UploadError {
 }
 
 /// `Retry-After` in seconds (the HTTP-date form is not used by QueryFlux), capped.
-fn retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+pub(crate) fn retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
     let secs: u64 = headers
         .get(reqwest::header::RETRY_AFTER)?
         .to_str()
@@ -57,7 +70,7 @@ fn retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
 
 /// The delay before the next attempt: the endpoint's `Retry-After` plus up to half again
 /// (so a fleet told to wait does not come back in one wave), else exponential backoff.
-fn next_backoff(previous: Duration, retry_after: Option<Duration>) -> Duration {
+pub(crate) fn next_backoff(previous: Duration, retry_after: Option<Duration>) -> Duration {
     match retry_after {
         Some(after) => {
             let nanos = std::time::SystemTime::now()
@@ -187,6 +200,7 @@ impl RemoteMetricsStore {
             schema_version: QUERY_RECORDS_SCHEMA_VERSION,
             worker: self.worker.clone(),
             records,
+            site: None,
         };
         let mut req = self.client.post(endpoint).json(&batch);
         if same_origin(endpoint, &self.control_plane) {

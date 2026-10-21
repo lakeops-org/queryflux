@@ -1,0 +1,61 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="380" viewBox="0 0 960 380" role="img" aria-label="MCP quickstart: AI agent connects to QueryFlux MCP frontend; QueryFlux runs SQL on embedded DuckDB; Studio uses the admin API">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#0b0614"/>
+      <stop offset="100%" stop-color="#050508"/>
+    </linearGradient>
+    <marker id="arr" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto">
+      <path d="M0,0 L7,3 L0,6 Z" fill="#a78bfa"/>
+    </marker>
+    <marker id="arrO" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto">
+      <path d="M0,0 L7,3 L0,6 Z" fill="#fdba74"/>
+    </marker>
+    <marker id="arrG" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto">
+      <path d="M0,0 L7,3 L0,6 Z" fill="#86efac"/>
+    </marker>
+    <pattern id="dots" width="22" height="22" patternUnits="userSpaceOnUse">
+      <circle cx="1" cy="1" r="0.8" fill="rgba(255,255,255,0.05)"/>
+    </pattern>
+  </defs>
+  <rect width="960" height="380" rx="20" fill="url(#bg)"/>
+  <rect width="960" height="380" rx="20" fill="url(#dots)"/>
+  <rect x="1" y="1" width="958" height="378" rx="19" fill="none" stroke="rgba(255,255,255,0.08)"/>
+
+  <text x="40" y="40" fill="#fafafa" font-family="ui-sans-serif, system-ui, sans-serif" font-size="18" font-weight="650">Query from an AI agent (MCP)</text>
+  <text x="40" y="62" fill="#a1a1aa" font-family="ui-sans-serif, system-ui, sans-serif" font-size="12">examples/with-mcp — streamable HTTP on port 8811.</text>
+
+  <!-- Main query path -->
+  <rect x="40" y="110" width="170" height="88" rx="14" fill="rgba(255,118,25,0.12)" stroke="#ff7619" stroke-width="1.5"/>
+  <text x="125" y="144" text-anchor="middle" fill="#ffedd5" font-family="ui-sans-serif, system-ui, sans-serif" font-size="14" font-weight="650">MCP client</text>
+  <text x="125" y="166" text-anchor="middle" fill="#fdba74" font-family="ui-sans-serif, system-ui, sans-serif" font-size="11">Claude · Cursor · Inspector</text>
+
+  <line x1="210" y1="154" x2="278" y2="154" stroke="#fdba74" stroke-width="1.75" marker-end="url(#arrO)"/>
+  <text x="244" y="142" text-anchor="middle" fill="#fdba74" font-family="ui-sans-serif, system-ui, sans-serif" font-size="10">:8811/mcp</text>
+
+  <rect x="290" y="100" width="210" height="108" rx="14" fill="rgba(139,92,246,0.16)" stroke="#8b5cf6" stroke-width="1.5"/>
+  <text x="395" y="140" text-anchor="middle" fill="#ede9fe" font-family="ui-sans-serif, system-ui, sans-serif" font-size="15" font-weight="650">QueryFlux</text>
+  <text x="395" y="162" text-anchor="middle" fill="#c4b5fd" font-family="ui-sans-serif, system-ui, sans-serif" font-size="12">MCP frontend</text>
+  <text x="395" y="184" text-anchor="middle" fill="#a78bfa" font-family="ui-monospace, Menlo, monospace" font-size="11">streamable HTTP</text>
+
+  <line x1="500" y1="154" x2="568" y2="154" stroke="#86efac" stroke-width="1.75" marker-end="url(#arrG)"/>
+  <text x="534" y="142" text-anchor="middle" fill="#86efac" font-family="ui-sans-serif, system-ui, sans-serif" font-size="11" font-weight="600">SQL</text>
+
+  <rect x="580" y="110" width="340" height="88" rx="14" fill="rgba(163,230,53,0.1)" stroke="rgba(163,230,53,0.5)" stroke-width="1.5"/>
+  <text x="750" y="148" text-anchor="middle" fill="#ecfccb" font-family="ui-sans-serif, system-ui, sans-serif" font-size="14" font-weight="650">Embedded DuckDB</text>
+  <text x="750" y="172" text-anchor="middle" fill="#86efac" font-family="ui-sans-serif, system-ui, sans-serif" font-size="11">in-process query engine</text>
+
+  <!-- Operator path, separate row -->
+  <rect x="40" y="260" width="170" height="56" rx="12" fill="rgba(163,230,53,0.1)" stroke="rgba(163,230,53,0.45)"/>
+  <text x="125" y="284" text-anchor="middle" fill="#ecfccb" font-family="ui-sans-serif, system-ui, sans-serif" font-size="13" font-weight="650">Studio</text>
+  <text x="125" y="304" text-anchor="middle" fill="#86efac" font-family="ui-sans-serif, system-ui, sans-serif" font-size="10">:3000</text>
+
+  <line x1="210" y1="288" x2="348" y2="288" stroke="#a78bfa" stroke-width="1.5" marker-end="url(#arr)"/>
+  <text x="280" y="276" text-anchor="middle" fill="#a78bfa" font-family="ui-sans-serif, system-ui, sans-serif" font-size="11">Admin API :9000</text>
+
+  <rect x="360" y="260" width="200" height="56" rx="12" fill="rgba(139,92,246,0.12)" stroke="#8b5cf6"/>
+  <text x="460" y="284" text-anchor="middle" fill="#ede9fe" font-family="ui-sans-serif, system-ui, sans-serif" font-size="13" font-weight="650">QueryFlux ops</text>
+  <text x="460" y="304" text-anchor="middle" fill="#a78bfa" font-family="ui-sans-serif, system-ui, sans-serif" font-size="10">same process · :9000</text>
+
+  <text x="480" y="356" text-anchor="middle" fill="#71717a" font-family="ui-sans-serif, system-ui, sans-serif" font-size="11">Agents talk MCP on :8811. Operators use Studio on the admin API. DuckDB stays inside QueryFlux.</text>
+</svg>

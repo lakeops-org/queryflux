@@ -11,12 +11,10 @@ In this quickstart you run QueryFlux with the **MCP (Model Context Protocol) fro
 
 ## What you'll build
 
-```mermaid
-flowchart LR
-  agent["MCP client<br/>(Claude Code, Cursor,<br/>MCP Inspector)"] -->|"streamable HTTP<br/>:8811/mcp"| qf["QueryFlux<br/>MCP frontend"]
-  qf --> duck["Embedded DuckDB<br/>(in-process)"]
-  studio["Studio<br/>:3000"] -->|"Admin API :9000"| qf
-```
+<img
+  src="/img/docs/quickstart-ai-agent-mcp.svg"
+  alt="with-mcp quickstart: MCP client over streamable HTTP on port 8811 to QueryFlux MCP frontend and embedded DuckDB; Studio on Admin API port 9000"
+/>
 
 | Service | URL |
 | --- | --- |

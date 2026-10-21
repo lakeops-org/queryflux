@@ -1,0 +1,64 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="420" viewBox="0 0 960 420" role="img" aria-label="Sidecar worker: application pod with app and QueryFlux worker; app talks to localhost; worker talks to engines and control plane">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#0b0614"/>
+      <stop offset="100%" stop-color="#050508"/>
+    </linearGradient>
+    <marker id="arr" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto">
+      <path d="M0,0 L7,3 L0,6 Z" fill="#a78bfa"/>
+    </marker>
+    <marker id="arrO" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto">
+      <path d="M0,0 L7,3 L0,6 Z" fill="#fdba74"/>
+    </marker>
+    <marker id="arrG" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto">
+      <path d="M0,0 L7,3 L0,6 Z" fill="#86efac"/>
+    </marker>
+    <pattern id="dots" width="22" height="22" patternUnits="userSpaceOnUse">
+      <circle cx="1" cy="1" r="0.8" fill="rgba(255,255,255,0.05)"/>
+    </pattern>
+  </defs>
+  <rect width="960" height="420" rx="20" fill="url(#bg)"/>
+  <rect width="960" height="420" rx="20" fill="url(#dots)"/>
+  <rect x="1" y="1" width="958" height="418" rx="19" fill="none" stroke="rgba(255,255,255,0.08)"/>
+
+  <text x="40" y="40" fill="#fafafa" font-family="ui-sans-serif, system-ui, sans-serif" font-size="18" font-weight="650">Sidecar worker</text>
+  <text x="40" y="62" fill="#a1a1aa" font-family="ui-sans-serif, system-ui, sans-serif" font-size="12">One worker per application pod. The app connects to localhost; the worker holds engine credentials.</text>
+
+  <rect x="40" y="100" width="420" height="240" rx="16" fill="rgba(255,118,25,0.06)" stroke="rgba(255,118,25,0.4)" stroke-width="1.5"/>
+  <text x="56" y="128" fill="#fdba74" font-family="ui-sans-serif, system-ui, sans-serif" font-size="13" font-weight="650">Application pod</text>
+  <text x="56" y="148" fill="#71717a" font-family="ui-sans-serif, system-ui, sans-serif" font-size="11">native sidecar · restartPolicy: Always · K8s 1.29+</text>
+
+  <rect x="64" y="180" width="160" height="120" rx="14" fill="rgba(255,118,25,0.12)" stroke="#ff7619"/>
+  <text x="144" y="230" text-anchor="middle" fill="#ffedd5" font-family="ui-sans-serif, system-ui, sans-serif" font-size="15" font-weight="650">App</text>
+  <text x="144" y="254" text-anchor="middle" fill="#fdba74" font-family="ui-sans-serif, system-ui, sans-serif" font-size="11">no engine creds</text>
+
+  <line x1="224" y1="240" x2="268" y2="240" stroke="#fdba74" stroke-width="1.75" marker-end="url(#arrO)"/>
+  <text x="246" y="228" text-anchor="middle" fill="#fdba74" font-family="ui-sans-serif, system-ui, sans-serif" font-size="10">localhost</text>
+
+  <rect x="280" y="180" width="160" height="120" rx="14" fill="rgba(139,92,246,0.18)" stroke="#8b5cf6" stroke-width="1.5"/>
+  <text x="360" y="222" text-anchor="middle" fill="#ede9fe" font-family="ui-sans-serif, system-ui, sans-serif" font-size="15" font-weight="650">Worker</text>
+  <text x="360" y="246" text-anchor="middle" fill="#c4b5fd" font-family="ui-sans-serif, system-ui, sans-serif" font-size="11">sidecar</text>
+  <text x="360" y="270" text-anchor="middle" fill="#a78bfa" font-family="ui-monospace, Menlo, monospace" font-size="10">:18080 · :15432</text>
+
+  <text x="250" y="360" text-anchor="middle" fill="#71717a" font-family="ui-sans-serif, system-ui, sans-serif" font-size="11">Startup probe waits on /readyz until a config snapshot is active.</text>
+
+  <rect x="560" y="100" width="360" height="100" rx="14" fill="rgba(139,92,246,0.12)" stroke="#8b5cf6" stroke-width="1.5"/>
+  <text x="740" y="140" text-anchor="middle" fill="#ede9fe" font-family="ui-sans-serif, system-ui, sans-serif" font-size="14" font-weight="650">Control plane</text>
+  <text x="740" y="164" text-anchor="middle" fill="#c4b5fd" font-family="ui-sans-serif, system-ui, sans-serif" font-size="11">config · capacity leases · query history</text>
+  <text x="740" y="184" text-anchor="middle" fill="#a78bfa" font-family="ui-sans-serif, system-ui, sans-serif" font-size="10">never reached by the application</text>
+
+  <path d="M440 200 C500 160, 520 150, 558 148" fill="none" stroke="#a78bfa" stroke-width="1.5" marker-end="url(#arr)"/>
+  <text x="500" y="130" fill="#c4b5fd" font-family="ui-sans-serif, system-ui, sans-serif" font-size="10">long-poll · heartbeat</text>
+
+  <rect x="560" y="240" width="360" height="100" rx="14" fill="rgba(163,230,53,0.08)" stroke="rgba(163,230,53,0.5)" stroke-width="1.5"/>
+  <text x="740" y="280" text-anchor="middle" fill="#ecfccb" font-family="ui-sans-serif, system-ui, sans-serif" font-size="14" font-weight="650">Query engines</text>
+  <text x="740" y="304" text-anchor="middle" fill="#86efac" font-family="ui-sans-serif, system-ui, sans-serif" font-size="11">Trino · DuckDB · StarRocks · …</text>
+  <text x="740" y="324" text-anchor="middle" fill="#4d7c0f" font-family="ui-sans-serif, system-ui, sans-serif" font-size="10">credentials stay in the worker</text>
+
+  <path d="M440 280 C500 300, 520 290, 558 290" fill="none" stroke="#86efac" stroke-width="1.75" marker-end="url(#arrG)"/>
+  <text x="500" y="310" fill="#86efac" font-family="ui-sans-serif, system-ui, sans-serif" font-size="11" font-weight="600">SQL</text>
+
+  <text x="480" y="400" text-anchor="middle" fill="#71717a" font-family="ui-sans-serif, system-ui, sans-serif" font-size="11">Stop order: application first, worker last — in-flight queries finish during shutdown.</text>
+
+</svg>
