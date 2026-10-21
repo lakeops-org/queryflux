@@ -9,6 +9,7 @@ name = "queryflux"
 path = "src/main.rs"
 
 [dependencies]
+futures = { workspace = true }
 queryflux-core = { workspace = true }
 queryflux-catalog = { workspace = true }
 queryflux-auth = { workspace = true }
@@ -34,7 +35,7 @@ chrono = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-uuid = { version = "1", features = ["v4"] }
+uuid = { version = "1", features = ["v4", "v5"] }
 opentelemetry = { workspace = true, optional = true }
 opentelemetry_sdk = { workspace = true, optional = true }
 opentelemetry-otlp = { workspace = true, optional = true }

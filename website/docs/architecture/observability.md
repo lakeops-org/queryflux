@@ -7,6 +7,8 @@ image: img/queryflux-hero-banner.png
 
 QueryFlux exposes three observability surfaces: **Prometheus metrics** (real-time operational), a **Grafana dashboard** (visual ops view), and **QueryFlux Studio** (admin UI with query history, cluster management, and config).
 
+For data lineage, QueryFlux also sends an **OpenLineage** event for every query that reads or writes a table: the tables and columns it touched, column lineage for writes, and how it was routed. Because every engine sits behind QueryFlux, the events join into one graph across engines. See **[OpenLineage](./openlineage)**.
+
 ---
 
 ## Prometheus metrics

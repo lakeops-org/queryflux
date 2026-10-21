@@ -103,6 +103,7 @@ const sidebars: SidebarsConfig = {
         'architecture/query-params',
         'architecture/guardrails',
         'architecture/observability',
+        'architecture/openlineage',
         'architecture/adding-engine-support',
         'architecture/auth-authz-design',
       ],

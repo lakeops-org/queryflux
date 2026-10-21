@@ -12,6 +12,7 @@ use queryflux_core::access_model::{ColumnMask, Columns, GrantDetail, MaskType, R
 use queryflux_core::bounded_cache::{BoundedCache, CacheStatsSnapshot, MAX_CACHED_SQL_BYTES};
 use queryflux_core::config::DEFAULT_SQL_CACHE_ENTRIES;
 use queryflux_core::error::{QueryFluxError, Result};
+use queryflux_core::lineage::ColumnLineage;
 use queryflux_core::query::SqlDialect;
 use queryflux_core::schema_context::SchemaContext;
 
@@ -163,7 +164,7 @@ pub fn extract_resources(
     schema: &SchemaContext,
 ) -> Result<ExtractedStatement> {
     let dialect = dialect_kwarg(src_dialect);
-    let schema_json = schema_to_json(schema);
+    let schema_json = schema.to_sqlglot_json();
     Python::attach(|py| extract_resources_gil(py, sql, &dialect, &schema_json))
 }
 
@@ -271,7 +272,7 @@ pub fn rewrite_table_scans(
         return Ok(sql.to_string());
     }
     let dialect = dialect_kwarg(src_dialect);
-    let schema_json = schema_to_json(schema);
+    let schema_json = schema.to_sqlglot_json();
     let policies_json = policies_to_json(policies);
     Python::attach(|py| rewrite_table_scans_gil(py, sql, &dialect, &schema_json, &policies_json))
 }
@@ -305,17 +306,6 @@ pub fn apply_write_filters(
             .and_then(|v| v.extract::<String>())
             .map_err(|e| QueryFluxError::Translation(format!("apply_write_filters: {e}")))
     })
-}
-
-fn schema_to_json(schema: &SchemaContext) -> String {
-    // { "table_name": { "col1": "type1", ... } } — sqlglot's `qualify(schema=...)`
-    // requires this nesting (a dict of column -> type per table); handing it a
-    // flat list of column names raises `SchemaError: ... must match the schema's
-    // nesting level` internally, which `extract_resources` silently swallows and
-    // treats as "no schema", so column attribution never actually runs.
-    // `rewrite_table_scans`'s own `list(cols)` still works unchanged against this
-    // shape — `list()` on a dict yields its keys, the column names it wants.
-    serde_json::to_string(&schema.tables).unwrap_or_else(|_| "{}".to_string())
 }
 
 fn policies_to_json(policies: &[TablePolicy]) -> String {
@@ -364,6 +354,58 @@ def _table_key(t):
 def _qualified(t):
     db = t.db
     return (db + "." + t.name) if db else t.name
+
+
+def _schema_parts(schema_json):
+    """`(tables, catalog, db)` from `SchemaContext::to_sqlglot_json`: the tables nested as
+    `{catalog: {db: {table: {col: type}}}}`, and the session's default catalog and database."""
+    s = json.loads(schema_json) if schema_json else {}
+    return s.get("tables") or {}, s.get("catalog"), s.get("db")
+
+
+def _apply_defaults(tree, catalog, db):
+    """Qualify table references with the session defaults the schema was looked up under, so
+    qualify() resolves each to its own table, not a same-named one in another schema. Tagged
+    so _strip_defaults can put the names back as written: the output goes to the engine,
+    and catalog names are engine-local."""
+    ctes = _cte_names(tree)
+    for t in tree.find_all(exp.Table):
+        if not t.name or t.name.startswith("@"):
+            continue
+        if not t.catalog and not t.db and t.name.lower() in ctes:
+            continue
+        added = []
+        if db and not t.db:
+            t.set("db", exp.to_identifier(db))
+            added.append("db")
+        if catalog and t.db and not t.catalog:
+            t.set("catalog", exp.to_identifier(catalog))
+            added.append("catalog")
+        if added:
+            t.meta["qf_defaulted"] = added
+    return tree
+
+
+def _strip_defaults(tree):
+    for t in tree.find_all(exp.Table):
+        for part in t.meta.pop("qf_defaulted", ()):
+            t.set(part, None)
+    return tree
+
+
+def _schema_columns(tables, catalog, db, t):
+    """The columns of scan `t` (an ordered dict), resolved like `resolve_schema_context` looked
+    it up: the reference's own parts, else the session defaults. None when not in the schema."""
+    node = tables
+    for part in (t.catalog or catalog or "", t.db or db or "", t.name):
+        if node is None:
+            return None
+        hit = node.get(part)
+        if hit is None:
+            lower = part.lower()
+            hit = next((v for k, v in node.items() if k.lower() == lower), None)
+        node = hit
+    return node
 
 
 _KINDS = {
@@ -655,7 +697,7 @@ def _admin_statement(tree, sql, dialect):
 
 
 def extract_resources(sql, dialect, schema_json):
-    schema = json.loads(schema_json) if schema_json else {}
+    tables, catalog, db = _schema_parts(schema_json)
     # A parse failure must surface as an error, never as "no tables": the backend engine may
     # accept SQL that sqlglot rejects, so an empty result here would let it through unchecked.
     try:
@@ -678,9 +720,11 @@ def extract_resources(sql, dialect, schema_json):
 
     # Best-effort column attribution: qualify when we have a schema.
     qualified = None
-    if schema:
+    if tables:
         try:
-            qualified = qualify(tree.copy(), schema=schema, dialect=dialect or None)
+            qualified = _strip_defaults(qualify(
+                _apply_defaults(tree.copy(), catalog, db), schema=tables, dialect=dialect or None
+            ))
         except Exception:
             qualified = None
 
@@ -805,7 +849,7 @@ def apply_write_filters(sql, dialect, filters_json):
 
 
 def rewrite_table_scans(sql, dialect, schema_json, policies_json):
-    schema = json.loads(schema_json) if schema_json else {}
+    tables, default_catalog, default_db = _schema_parts(schema_json)
     policies = json.loads(policies_json)
     tree = sqlglot.parse_one(sql, dialect=dialect or None)
     ctes = _cte_names(tree)
@@ -883,9 +927,9 @@ def rewrite_table_scans(sql, dialect, schema_json, policies_json):
         # `IN (SELECT id FROM t)` still projects `id` on the inner scan.
         # SELECT * still needs schema — we cannot invent the rest of the table.
         cand = [policy_table.lower(), policy_table.rsplit(".", 1)[-1].lower()]
-        for tname, cols in schema.items():
-            if tname.lower() in cand or tname.rsplit(".", 1)[-1].lower() in cand:
-                return list(cols)
+        cols = _schema_columns(tables, default_catalog, default_db, node)
+        if cols is not None:
+            return list(cols)
         if _star_selects_this_scan(node):
             return None
         alias = (node.alias or node.name or "").lower()
@@ -970,6 +1014,160 @@ def rewrite_table_scans(sql, dialect, schema_json, policies_json):
         replaced += 1
 
     return tree.sql(dialect=dialect or None)
+
+
+# Clauses whose columns decide which rows are written, or how they group and order, without
+# being written themselves: OpenLineage's INDIRECT transformations.
+_INDIRECT = (
+    ("where", "FILTER"),
+    ("having", "FILTER"),
+    ("joins", "JOIN"),
+    ("group", "GROUP_BY"),
+    ("order", "SORT"),
+)
+
+
+def _written_query(tree, tables, catalog, db):
+    """`(query, written column names or None)` for a statement that writes a table from a
+    query; `(None, None)` otherwise. None for the names means: the query's own output names."""
+    if isinstance(tree, exp.Insert) and isinstance(tree.expression, exp.Query):
+        query = tree.expression
+        if isinstance(tree.this, exp.Schema):
+            return query, [c.name for c in tree.this.expressions]
+        target = _unwrap(tree.this)
+        cols = _schema_columns(tables, catalog, db, target) if target is not None else None
+        return query, (list(cols) if cols else None)
+    if isinstance(tree, exp.Create) and isinstance(tree.expression, exp.Query):
+        return tree.expression, None
+    if isinstance(tree, exp.Update) and tree.expressions:
+        # `UPDATE t SET c = expr FROM s WHERE w` writes c from `SELECT expr AS c FROM t, s WHERE w`.
+        query = exp.select(
+            *[exp.alias_(eq.expression.copy(), eq.this.name) for eq in tree.expressions]
+        ).from_(tree.this.copy())
+        source = tree.args.get("from")
+        if source is not None:
+            query = query.join(source.this.copy())
+        where = tree.args.get("where")
+        if where is not None:
+            query.set("where", where.copy())
+        return query, None
+    return None, None
+
+
+def _input(table, column, subtype):
+    return {
+        "catalog": table.catalog or None,
+        "schema": table.db or None,
+        "table": table.name,
+        "column": column,
+        "subtype": subtype,
+    }
+
+
+def _direct_inputs(node, agg=False, identity=True):
+    """Leaf (base table) columns under a lineage node, each with how it reaches the output:
+    IDENTITY when only renamed, AGGREGATION when an aggregate is on the way, else
+    TRANSFORMATION."""
+    e = node.expression
+    if isinstance(e, exp.Table):
+        subtype = "AGGREGATION" if agg else ("IDENTITY" if identity else "TRANSFORMATION")
+        yield _input(e, node.name.split(".")[-1], subtype)
+        return
+    inner = e.this if isinstance(e, exp.Alias) else e
+    agg = agg or inner.find(exp.AggFunc) is not None
+    identity = identity and isinstance(inner, exp.Column)
+    for d in node.downstream:
+        yield from _direct_inputs(d, agg, identity)
+
+
+def _indirect_inputs(qualified):
+    """Base-table columns in the clauses of _INDIRECT, window `PARTITION BY`/`ORDER BY`, and
+    `CASE` conditions, in every scope of the (qualified) query."""
+    from sqlglot.optimizer.scope import traverse_scope
+
+    for scope in traverse_scope(qualified):
+        select = scope.expression
+
+        def base_columns(node):
+            for col in node.find_all(exp.Column):
+                source = scope.sources.get(col.table)
+                # ponytail: only columns read straight from a table in this scope; a column
+                # of a CTE or subquery used in a filter is not traced back to its table.
+                if isinstance(source, exp.Table):
+                    yield source, col.name
+
+        for arg, subtype in _INDIRECT:
+            value = select.args.get(arg)
+            for part in (value if isinstance(value, list) else [value]):
+                if part is None:
+                    continue
+                if arg == "joins":
+                    part = part.args.get("on")
+                    if part is None:
+                        continue
+                for table, column in base_columns(part):
+                    yield _input(table, column, subtype)
+        for window in select.find_all(exp.Window):
+            for part in (window.args.get("partition_by") or []) + [window.args.get("order")]:
+                if part is not None:
+                    for table, column in base_columns(part):
+                        yield _input(table, column, "WINDOW")
+        for case in select.find_all(exp.Case):
+            for when in case.args.get("ifs") or []:
+                for table, column in base_columns(when.this):
+                    yield _input(table, column, "CONDITIONAL")
+
+
+def column_lineage(sql, dialect, schema_json, max_columns):
+    """Column lineage of a statement that writes a table from a query, as JSON:
+    `{"fields": {written column: [input, ...]}, "indirect": [input, ...]}`, each input
+    `{catalog, schema, table, column, subtype}`. `null` when the statement writes no table
+    from a query, or writes more than `max_columns` columns. Columns that can't be traced
+    (no schema for a `SELECT *` or an unqualified column in a join) are left out, never
+    guessed."""
+    from sqlglot.lineage import lineage
+    from sqlglot.optimizer.scope import build_scope
+
+    tables, catalog, db = _schema_parts(schema_json)
+    tree = sqlglot.parse_one(sql, dialect=dialect or None)
+    query, written = _written_query(tree, tables, catalog, db)
+    if query is None:
+        return "null"
+    query = query.copy()
+    if tree.args.get("with") is not None and query.args.get("with") is None:
+        query.set("with", tree.args["with"].copy())
+    query = _apply_defaults(query, catalog, db)
+    qualified = qualify(
+        query, schema=tables, dialect=dialect or None,
+        validate_qualify_columns=False, identify=False,
+    )
+    # trim_selects copies the whole query once per output column (quadratic on wide writes);
+    # `qualified` is already a private copy.
+    nodes = lineage(
+        None, qualified, schema=tables, dialect=dialect or None,
+        scope=build_scope(qualified), trim_selects=False, copy=False,
+    )
+    outputs = list(nodes.items())
+    if len(outputs) > max_columns:
+        return "null"
+    names = written if written and len(written) == len(outputs) else [name for name, _ in outputs]
+
+    def dedupe(items):
+        seen, out = set(), []
+        for i in items:
+            key = tuple(sorted(i.items()))
+            if key not in seen:
+                seen.add(key)
+                out.append(i)
+        return out
+
+    fields = {}
+    for name, (_, node) in zip(names, outputs):
+        inputs = dedupe(_direct_inputs(node))
+        if inputs:
+            fields[name] = inputs
+    indirect = dedupe(_indirect_inputs(qualified))
+    return json.dumps({"fields": fields, "indirect": indirect})
 "#;
 
 /// The compiled access module. Compiling `ACCESS_PY` costs about 3 ms, more than most
@@ -977,7 +1175,7 @@ def rewrite_table_scans(sql, dialect, schema_json, policies_json):
 /// per process and shared. A failed build is not kept: the next call retries.
 static ACCESS_MODULE: pyo3::sync::PyOnceLock<Py<PyModule>> = pyo3::sync::PyOnceLock::new();
 
-fn load_module<'py>(py: Python<'py>) -> Result<Bound<'py, PyModule>> {
+pub(crate) fn load_module<'py>(py: Python<'py>) -> Result<Bound<'py, PyModule>> {
     ACCESS_MODULE
         .get_or_try_init(py, || {
             let code = std::ffi::CString::new(ACCESS_PY).unwrap();
@@ -988,6 +1186,50 @@ fn load_module<'py>(py: Python<'py>) -> Result<Bound<'py, PyModule>> {
                 .map_err(|e| QueryFluxError::Translation(format!("load access module: {e}")))
         })
         .map(|module| module.bind(py).clone())
+}
+
+/// Statements with more written columns than this get no column lineage.
+pub const MAX_LINEAGE_COLUMNS: usize = 500;
+/// SQL longer than this gets no column lineage.
+const MAX_LINEAGE_SQL_BYTES: usize = 256 * 1024;
+
+static LINEAGE_CACHE: LazyLock<BoundedCache<ExtractionKey, Arc<Option<ColumnLineage>>>> =
+    LazyLock::new(|| BoundedCache::new("column_lineage", DEFAULT_SQL_CACHE_ENTRIES));
+
+/// Column lineage of a statement that writes a table from a query (`INSERT … SELECT`, CTAS,
+/// `UPDATE`); `None` for any other statement, SQL over 256 KiB, or more than
+/// [`MAX_LINEAGE_COLUMNS`] written columns. Columns the schema can't resolve are left out.
+/// Cached by (SQL, dialect, schema): scheduled writes repeat.
+// ponytail: size caps, not a time budget: a sqlglot call can't be interrupted once it
+// holds the GIL. Add a per-statement deadline only if a cap-sized statement proves slow.
+pub fn column_lineage(
+    sql: &str,
+    src_dialect: &SqlDialect,
+    schema: &SchemaContext,
+) -> Result<Option<ColumnLineage>> {
+    if sql.len() > MAX_LINEAGE_SQL_BYTES {
+        return Ok(None);
+    }
+    let key = ExtractionKey {
+        sql: sql.to_string(),
+        dialect: dialect_kwarg(src_dialect),
+        schema: schema.content_hash(),
+    };
+    if let Some(hit) = LINEAGE_CACHE.get(&key) {
+        return Ok((*hit).clone());
+    }
+    let schema_json = schema.to_sqlglot_json();
+    let json: String = Python::attach(|py| {
+        load_module(py)?
+            .getattr("column_lineage")
+            .and_then(|f| f.call1((sql, &key.dialect, schema_json, MAX_LINEAGE_COLUMNS)))
+            .and_then(|v| v.extract())
+            .map_err(|e| QueryFluxError::Translation(format!("column_lineage: {e}")))
+    })?;
+    let lineage: Option<ColumnLineage> = serde_json::from_str(&json)
+        .map_err(|e| QueryFluxError::Translation(format!("column_lineage decode: {e}")))?;
+    LINEAGE_CACHE.insert(key, Arc::new(lineage.clone()));
+    Ok(lineage)
 }
 
 fn extract_resources_gil(
@@ -1116,7 +1358,7 @@ mod tests {
     fn schema_with(table: &str, cols: &[&str]) -> SchemaContext {
         let mut tables = HashMap::new();
         tables.insert(
-            table.to_string(),
+            table.into(),
             cols.iter()
                 .map(|c| (c.to_string(), "varchar".to_string()))
                 .collect::<ColumnMap>(),
@@ -2408,7 +2650,7 @@ mod tests {
     #[test]
     fn rewrite_masked_projection_keeps_schema_column_order() {
         let cols = ["zeta", "id", "ssn", "alpha", "region", "beta"];
-        let schema = schema_with("transactions", &cols);
+        let schema = schema_with("finance.transactions", &cols);
         let out = rewrite_table_scans(
             "SELECT * FROM finance.transactions",
             &SqlDialect::Trino,
@@ -2444,7 +2686,7 @@ mod extraction_cache_tests {
             catalog: None,
             database: None,
             tables: [(
-                "orders".to_string(),
+                "orders".into(),
                 ColumnMap::from([
                     ("id".to_string(), ty.to_string()),
                     ("secret".to_string(), "VARCHAR".to_string()),

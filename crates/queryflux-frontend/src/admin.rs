@@ -3144,8 +3144,9 @@ struct AccessControlDryRunRequest {
     #[serde(default)]
     engine: Option<String>,
     identity: DryRunIdentity,
-    /// Optional table → { column → type } map used to apply column masks. Columns are taken
-    /// in name order. When omitted, resolved from the live catalog (same as a real query).
+    /// Optional table → { column → type } map used to apply column masks. Name each table as
+    /// the SQL does (`orders`, `sales.orders`, `hive.sales.orders`). Columns are taken in name
+    /// order. When omitted, resolved from the live catalog (same as a real query).
     #[serde(default)]
     schema: Option<HashMap<String, HashMap<String, String>>>,
 }
@@ -3254,7 +3255,7 @@ async fn access_control_dry_run_handler(
                 .map(|(table, cols)| {
                     let mut cols: Vec<_> = cols.into_iter().collect();
                     cols.sort();
-                    (table, cols.into_iter().collect())
+                    (table.into(), cols.into_iter().collect())
                 })
                 .collect(),
         }

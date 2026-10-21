@@ -8,7 +8,6 @@
 //! keeps the batch spooled; a `503` with `Retry-After` (the control plane's ingest is busy)
 //! sets the next attempt's delay instead of the exponential backoff.
 
-use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -19,57 +18,12 @@ use queryflux_core::worker_snapshot::HistoryRedaction;
 use queryflux_persistence::{
     ClusterSnapshot, MetricsStore, QueryRecord, QueryRecordBatchV1, QUERY_RECORDS_SCHEMA_VERSION,
 };
-use tokio::sync::Notify;
 
 use crate::config_source::WorkerSyncState;
+use crate::spool::{retry_after, Spool, UploadError, Uploader};
 
 /// Records per request.
 const BATCH_SIZE: usize = 200;
-/// How long a record may wait for a batch to fill.
-const FLUSH_INTERVAL: Duration = Duration::from_secs(2);
-const MAX_BACKOFF: Duration = Duration::from_secs(60);
-
-/// A failed upload. The batch is back in the spool.
-#[derive(Debug)]
-pub(crate) struct UploadError {
-    message: String,
-    /// The endpoint's `Retry-After`, when it sent one.
-    retry_after: Option<Duration>,
-}
-
-impl std::fmt::Display for UploadError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.message)
-    }
-}
-
-/// `Retry-After` in seconds (the HTTP-date form is not used by QueryFlux), capped.
-fn retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
-    let secs: u64 = headers
-        .get(reqwest::header::RETRY_AFTER)?
-        .to_str()
-        .ok()?
-        .trim()
-        .parse()
-        .ok()?;
-    Some(Duration::from_secs(secs).min(MAX_BACKOFF))
-}
-
-/// The delay before the next attempt: the endpoint's `Retry-After` plus up to half again
-/// (so a fleet told to wait does not come back in one wave), else exponential backoff.
-fn next_backoff(previous: Duration, retry_after: Option<Duration>) -> Duration {
-    match retry_after {
-        Some(after) => {
-            let nanos = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.subsec_nanos())
-                .unwrap_or(0);
-            let jitter = after.mul_f64(f64::from(nanos % 1000) / 2000.0);
-            (after + jitter).clamp(Duration::from_millis(100), MAX_BACKOFF)
-        }
-        None => (previous * 2).clamp(Duration::from_secs(1), MAX_BACKOFF),
-    }
-}
 
 /// Delivery counters, shown in `/worker/status`.
 #[derive(Debug, Default, Clone, serde::Serialize)]
@@ -85,9 +39,7 @@ pub(crate) struct HistoryUplinkStatus {
 }
 
 pub(crate) struct RemoteMetricsStore {
-    spool: Mutex<VecDeque<QueryRecord>>,
-    max_records: usize,
-    wake: Notify,
+    spool: Spool<QueryRecord>,
     client: reqwest::Client,
     worker: String,
     /// `controlPlane.url`, without a trailing slash.
@@ -108,9 +60,7 @@ impl RemoteMetricsStore {
         state: Arc<Mutex<WorkerSyncState>>,
     ) -> Arc<Self> {
         Arc::new(Self {
-            spool: Mutex::new(VecDeque::new()),
-            max_records: max_records.max(1),
-            wake: Notify::new(),
+            spool: Spool::new(max_records),
             client: reqwest::Client::builder()
                 .timeout(Duration::from_secs(30))
                 .build()
@@ -143,23 +93,7 @@ impl RemoteMetricsStore {
 
     /// Queue records, dropping the oldest beyond the spool size.
     fn enqueue(&self, records: impl IntoIterator<Item = QueryRecord>, front: bool) {
-        let mut spool = self.spool.lock().unwrap_or_else(|e| e.into_inner());
-        let mut items: Vec<QueryRecord> = records.into_iter().collect();
-        if front {
-            // A failed batch goes back ahead of newer records, in order.
-            for r in items.drain(..).rev() {
-                spool.push_front(r);
-            }
-        } else {
-            spool.extend(items);
-        }
-        let mut dropped = 0u64;
-        while spool.len() > self.max_records {
-            spool.pop_front();
-            dropped += 1;
-        }
-        let queued = spool.len();
-        drop(spool);
+        let (queued, dropped) = self.spool.push(records, front);
         let mut st = self.lock_state();
         st.history_uplink.queued = queued;
         if dropped > 0 {
@@ -169,12 +103,6 @@ impl RemoteMetricsStore {
                 "Query history spool full, dropped the oldest records"
             );
         }
-    }
-
-    fn take_batch(&self) -> Vec<QueryRecord> {
-        let mut spool = self.spool.lock().unwrap_or_else(|e| e.into_inner());
-        let n = spool.len().min(BATCH_SIZE);
-        spool.drain(..n).collect()
     }
 
     /// Post one batch. The control plane's secret is sent only to the control plane.
@@ -210,11 +138,19 @@ impl RemoteMetricsStore {
         };
         result.map_err(|e| (e, batch.records))
     }
+}
 
-    /// Send everything queued. Stops at the first failure, re-queuing that batch.
+impl Uploader for RemoteMetricsStore {
+    type Item = QueryRecord;
+    const WHAT: &'static str = "Query history";
+
+    fn spool(&self) -> &Spool<QueryRecord> {
+        &self.spool
+    }
+
     async fn flush(&self) -> std::result::Result<(), UploadError> {
         loop {
-            let batch = self.take_batch();
+            let batch = self.spool.take(BATCH_SIZE);
             if batch.is_empty() {
                 return Ok(());
             }
@@ -222,7 +158,7 @@ impl RemoteMetricsStore {
             let n = batch.len() as u64;
             match self.send(&endpoint, batch).await {
                 Ok(()) => {
-                    let queued = self.spool.lock().unwrap_or_else(|e| e.into_inner()).len();
+                    let queued = self.spool.len();
                     let mut st = self.lock_state();
                     st.history_uplink.endpoint = Some(endpoint);
                     st.history_uplink.sent += n;
@@ -239,51 +175,6 @@ impl RemoteMetricsStore {
             }
         }
     }
-
-    /// Deliver until shutdown, then return. Call [`Self::final_flush`] after the
-    /// frontends drain, so queries that finish while draining are sent too.
-    pub(crate) fn spawn_flusher(
-        self: &Arc<Self>,
-        mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
-    ) {
-        let this = self.clone();
-        tokio::spawn(async move {
-            let mut backoff = Duration::ZERO;
-            loop {
-                tokio::select! {
-                    _ = this.wake.notified() => {}
-                    _ = tokio::time::sleep(FLUSH_INTERVAL) => {}
-                    _ = shutdown_rx.changed() => return,
-                }
-                if !backoff.is_zero() {
-                    tokio::select! {
-                        _ = tokio::time::sleep(backoff) => {}
-                        _ = shutdown_rx.changed() => return,
-                    }
-                }
-                match this.flush().await {
-                    Ok(()) => backoff = Duration::ZERO,
-                    Err(e) => {
-                        backoff = next_backoff(backoff, e.retry_after);
-                        tracing::warn!(retry_in = ?backoff, "Query history upload failed: {e}");
-                    }
-                }
-            }
-        });
-    }
-
-    /// One last delivery attempt at shutdown, bounded by `timeout`.
-    pub(crate) async fn final_flush(&self, timeout: Duration) {
-        match tokio::time::timeout(timeout, self.flush()).await {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => tracing::warn!("Query history not delivered at shutdown: {e}"),
-            Err(_) => tracing::warn!("Query history delivery timed out at shutdown"),
-        }
-        let left = self.spool.lock().unwrap_or_else(|e| e.into_inner()).len();
-        if left > 0 {
-            tracing::warn!(records = left, "Query history records lost at shutdown");
-        }
-    }
 }
 
 #[async_trait]
@@ -296,14 +187,19 @@ impl MetricsStore for RemoteMetricsStore {
             .map(|h| h.redaction)
             .unwrap_or_default();
         redact(&mut record, redaction);
-        let full = {
-            self.enqueue([record], false);
-            self.spool.lock().unwrap_or_else(|e| e.into_inner()).len() >= BATCH_SIZE
-        };
-        if full {
-            self.wake.notify_one();
+        self.enqueue([record], false);
+        if self.spool.len() >= BATCH_SIZE {
+            self.spool.wake();
         }
         Ok(())
+    }
+
+    /// The control plane asks for datasets when it emits OpenLineage events.
+    fn wants_datasets(&self) -> bool {
+        self.lock_state()
+            .history
+            .as_ref()
+            .is_some_and(|h| h.datasets)
     }
 
     /// The control plane records cluster snapshots itself; with shared capacity its
@@ -322,6 +218,12 @@ pub(crate) fn redact(record: &mut QueryRecord, redaction: HistoryRedaction) {
                 .digest_text
                 .clone()
                 .unwrap_or_else(|| mask_literals(&record.sql_preview));
+            record.sql = record.sql.as_deref().map(|sql| {
+                record
+                    .digest_text
+                    .clone()
+                    .unwrap_or_else(|| mask_literals(sql))
+            });
             record.rewritten_sql = record.rewritten_sql.as_deref().map(mask_literals);
             record.translated_sql = record
                 .translated_digest_text
@@ -341,6 +243,7 @@ pub(crate) fn redact(record: &mut QueryRecord, redaction: HistoryRedaction) {
         }
         HistoryRedaction::Metadata => {
             record.sql_preview = String::new();
+            record.sql = None;
             record.rewritten_sql = None;
             record.translated_sql = None;
             record.digest_text = None;
@@ -421,6 +324,7 @@ pub(crate) fn mask_literals(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::spool::next_backoff;
     use queryflux_core::query::{
         ClusterGroupName, ClusterName, EngineType, FrontendProtocol, QueryStatus, SqlDialect,
     };
@@ -476,6 +380,8 @@ mod tests {
             was_guard_blocked: false,
             cache_hit: false,
             worker: None,
+            datasets: vec![],
+            sql: None,
         }
     }
 
@@ -592,6 +498,7 @@ mod tests {
             history: Some(HistoryPolicy {
                 endpoint: None,
                 redaction: HistoryRedaction::Metadata,
+                ..Default::default()
             }),
             ..Default::default()
         }));
@@ -621,8 +528,7 @@ mod tests {
         assert!(st.last_error.is_some());
         let ids: Vec<String> = up
             .spool
-            .lock()
-            .unwrap()
+            .items()
             .iter()
             .map(|r| r.proxy_query_id.clone())
             .collect();
@@ -672,8 +578,7 @@ mod tests {
         assert!(wait >= Duration::from_secs(3) && wait <= Duration::from_millis(4500));
         let ids: Vec<String> = up
             .spool
-            .lock()
-            .unwrap()
+            .items()
             .iter()
             .map(|r| r.proxy_query_id.clone())
             .collect();
@@ -687,15 +592,5 @@ mod tests {
         let st = state.lock().unwrap().history_uplink.clone();
         assert_eq!((st.sent, st.queued), (2, 0));
         assert!(st.last_error.is_none());
-    }
-
-    #[test]
-    fn backoff_without_retry_after_doubles_up_to_the_cap() {
-        assert_eq!(next_backoff(Duration::ZERO, None), Duration::from_secs(1));
-        assert_eq!(
-            next_backoff(Duration::from_secs(4), None),
-            Duration::from_secs(8)
-        );
-        assert_eq!(next_backoff(Duration::from_secs(50), None), MAX_BACKOFF);
     }
 }

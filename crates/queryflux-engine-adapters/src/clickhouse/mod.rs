@@ -1111,6 +1111,7 @@ mod tests {
             variants: vec![],
             health_check_query: None,
             reconcile_query: None,
+            lineage_catalogs: Default::default(),
         };
         assert!(ClickHouseConfig::from_cluster_config(&cfg, "ch-1").is_err());
 

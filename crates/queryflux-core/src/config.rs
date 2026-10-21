@@ -897,6 +897,67 @@ pub struct QueryFluxConfig {
     /// Workers follow their control plane.
     #[serde(default)]
     pub capacity: CapacityConfig,
+    /// Standalone or control plane: send an OpenLineage event for every query, including
+    /// the queries its workers run.
+    #[serde(default)]
+    pub open_lineage: Option<OpenLineageConfig>,
+}
+
+/// Where OpenLineage events go (`queryflux.openLineage`). Any consumer of the OpenLineage
+/// HTTP transport works: Marquez, DataHub, OpenMetadata.
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OpenLineageConfig {
+    /// The consumer's base URL.
+    pub url: String,
+    /// Path events are posted to. Default `/api/v1/lineage`.
+    #[serde(default = "default_openlineage_endpoint")]
+    pub endpoint: String,
+    /// Sent as `Authorization: Bearer`. Default: the `OPENLINEAGE_API_KEY` environment
+    /// variable, so the key can stay out of the config file.
+    #[serde(default)]
+    pub api_key: Option<String>,
+    /// The namespace of the jobs QueryFlux reports. Default `queryflux`.
+    #[serde(default = "default_openlineage_namespace")]
+    pub namespace: String,
+    /// How much SQL the job's `sql` facet carries: `full`, `maskLiterals` (default), or
+    /// `metadata` (no SQL).
+    #[serde(default = "default_openlineage_sql")]
+    pub sql: crate::worker_snapshot::HistoryRedaction,
+    /// Events held while the consumer is unreachable; the oldest are dropped beyond it.
+    /// Default 10000.
+    #[serde(default = "default_openlineage_spool")]
+    pub spool_max_events: usize,
+}
+
+/// Keeps `apiKey` out of logs.
+impl std::fmt::Debug for OpenLineageConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OpenLineageConfig")
+            .field("url", &self.url)
+            .field("endpoint", &self.endpoint)
+            .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
+            .field("namespace", &self.namespace)
+            .field("sql", &self.sql)
+            .field("spool_max_events", &self.spool_max_events)
+            .finish()
+    }
+}
+
+fn default_openlineage_endpoint() -> String {
+    "/api/v1/lineage".to_string()
+}
+
+fn default_openlineage_namespace() -> String {
+    "queryflux".to_string()
+}
+
+fn default_openlineage_sql() -> crate::worker_snapshot::HistoryRedaction {
+    crate::worker_snapshot::HistoryRedaction::MaskLiterals
+}
+
+fn default_openlineage_spool() -> usize {
+    10_000
 }
 
 /// How a cluster's `maxRunningQueries` is shared between the processes that admit
@@ -1644,6 +1705,12 @@ pub struct ClusterConfig {
     /// Supports `{{sub_resource}}` placeholder for variant clusters.
     #[serde(default)]
     pub reconcile_query: Option<String>,
+    /// OpenLineage: the catalog names this cluster's SQL uses, mapped to the namespace of
+    /// the catalog behind them (`iceberg: iceberg+rest://polaris.example.com/api/catalog`).
+    /// Engines that share a catalog then name its tables alike, so lineage joins across
+    /// them. Unmapped catalogs get a namespace from the engine and endpoint.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub lineage_catalogs: HashMap<String, String>,
 }
 
 /// A variant that overrides specific fields of a base cluster config,
@@ -3736,6 +3803,7 @@ queryflux:
             variants: vec![],
             health_check_query: Some("CUSTOM HC".into()),
             reconcile_query: None,
+            lineage_catalogs: Default::default(),
         };
         let json = serde_json::json!({
             "driver": "redshift"

@@ -71,7 +71,7 @@ async fn schema_aware_translation_qualifies_columns_dialect_only_does_not() {
 
     let mut tables = HashMap::new();
     tables.insert(
-        "t".to_string(),
+        "t".into(),
         ColumnMap::from([("x".to_string(), "INT".to_string())]),
     );
     let schema = SchemaContext {
@@ -109,7 +109,10 @@ async fn resolve_schema_context_feeds_maybe_translate_end_to_end() {
         .await;
     assert!(!schema_context.is_empty());
     assert_eq!(
-        schema_context.tables.get("t").and_then(|c| c.get("x")),
+        schema_context
+            .tables
+            .get(&"t".into())
+            .and_then(|c| c.get("x")),
         Some(&"INT".to_string())
     );
 

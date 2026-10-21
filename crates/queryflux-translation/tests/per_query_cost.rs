@@ -17,7 +17,9 @@ use queryflux_core::query::SqlDialect;
 use queryflux_core::sql_classify::SqlParseCache;
 use queryflux_translation::access::ExtractionCache;
 use queryflux_translation::sqlglot::extract_table_refs;
-use queryflux_translation::{extract_resources, ColumnMap, SchemaContext, TranslationService};
+use queryflux_translation::{
+    column_lineage, extract_resources, ColumnMap, SchemaContext, TranslationService,
+};
 
 const ITERS: usize = 200;
 
@@ -64,12 +66,9 @@ fn schema() -> SchemaContext {
     SchemaContext {
         catalog: None,
         database: None,
-        tables: [
-            ("orders".to_string(), orders),
-            ("customers".to_string(), customers),
-        ]
-        .into_iter()
-        .collect(),
+        tables: [("orders".into(), orders), ("customers".into(), customers)]
+            .into_iter()
+            .collect(),
     }
 }
 
@@ -241,4 +240,34 @@ async fn per_query_cost() {
         report("polyglot classify parse (ref)", name, s);
         println!();
     }
+
+    // Column lineage runs only for writes (OpenLineage). A wide one: 200 columns.
+    let cols: Vec<String> = (0..200).map(|i| format!("c{i}")).collect();
+    let wide = ColumnMap::from_iter(cols.iter().map(|c| (c.clone(), "BIGINT".to_string())));
+    let wide_schema = SchemaContext {
+        tables: [("src".into(), wide.clone()), ("dst".into(), wide)]
+            .into_iter()
+            .collect(),
+        ..Default::default()
+    };
+    let select = cols
+        .iter()
+        .map(|c| format!("{c} + 1"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut n = 0u64;
+    let s = time_sync(|| {
+        // A different literal each call: the lineage cache is process-wide.
+        n += 1;
+        let sql = format!("INSERT INTO dst SELECT {select} FROM src WHERE c0 > {n}");
+        column_lineage(&sql, &SqlDialect::Trino, &wide_schema)
+            .unwrap()
+            .expect("lineage");
+    });
+    report("column_lineage +schema (miss)", "insert_select_200_cols", s);
+    let sql = format!("INSERT INTO dst SELECT {select} FROM src");
+    let s = time_sync(|| {
+        column_lineage(&sql, &SqlDialect::Trino, &wide_schema).unwrap();
+    });
+    report("column_lineage (cache hit)", "insert_select_200_cols", s);
 }

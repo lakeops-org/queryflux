@@ -42,7 +42,7 @@ const LAYERS: Layer[] = [
   {
     title: 'Observe',
     caption: 'One pane of glass',
-    items: ['Prometheus', 'Query history', 'Studio', 'Admin API'],
+    items: ['Prometheus', 'Query history', 'OpenLineage', 'Studio', 'Admin API'],
   },
 ];
 

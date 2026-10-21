@@ -1736,6 +1736,8 @@ mod tests {
             was_guard_blocked: false,
             cache_hit: false,
             worker: None,
+            datasets: vec![],
+            sql: None,
         };
         store.record_query(first.clone()).await.unwrap();
         first.status = QueryStatus::Cancelled;

@@ -665,10 +665,17 @@ pub(crate) fn translation_policy(
 pub(crate) fn history_policy(
     yaml: &queryflux_core::config::ProxyConfig,
 ) -> Option<queryflux_core::worker_snapshot::HistoryPolicy> {
-    yaml.queryflux
+    let mut policy = yaml
+        .queryflux
         .worker_api
         .as_ref()
-        .and_then(|w| w.history.clone())
+        .and_then(|w| w.history.clone());
+    // This process emits OpenLineage for its workers' queries, from the datasets on their
+    // records.
+    if yaml.queryflux.open_lineage.is_some() {
+        policy.get_or_insert_with(Default::default).datasets = true;
+    }
+    policy
 }
 
 /// The config a worker holds before its first snapshot: no groups, no adapters. Queries
