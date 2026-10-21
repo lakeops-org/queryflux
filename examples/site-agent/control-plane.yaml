@@ -1,0 +1,37 @@
+# Control plane, standing in for a remote (for example hosted) one. It owns the config,
+# serves it to the site agent, shares capacity and stores query history.
+queryflux:
+  role: controlPlane
+  persistence:
+    type: postgres
+    url: postgres://queryflux:queryflux@postgres:5432/queryflux
+  configReloadIntervalSecs: 5
+  adminApi:
+    port: 9000
+  # Each worker gets a share of every cluster's limit and admits within it locally, so
+  # queries at the site do not wait on a round trip to the control plane.
+  capacity:
+    mode: quotas
+  workerApi:
+    enabled: true
+    # The site agent presents this as siteAgent.upstream.auth.sharedSecret.
+    sharedSecret: change-me-site-secret
+    history:
+      # full | maskLiterals | metadata. Applied by the workers and again by the agent.
+      redaction: maskLiterals
+  frontends:
+    trinoHttp:
+      enabled: false
+      port: 8080
+
+# Seeded into Postgres on first start; afterwards edit in Studio or the admin API.
+clusters:
+  duckdb-1:
+    engine: duckDb
+    # One limit for every worker at every site together.
+    maxRunningQueries: 4
+clusterGroups:
+  analytics:
+    members: [duckdb-1]
+    maxRunningQueries: 4
+routingFallback: analytics

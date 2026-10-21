@@ -39,6 +39,7 @@ Running QueryFlux without workers works exactly as before. Worker mode is opt-in
 | One QueryFlux deployment, every client reaches it | `role: standalone` (the default). See [Multi-replica operations](./multi-replica) for HA. |
 | QueryFlux next to each application, or in networks that cannot reach the database | `role: controlPlane` plus workers |
 | Many small QueryFlux deployments that should share one config, one set of limits and one query history | `role: controlPlane` plus workers |
+| Workers in a remote network (another data center, a customer site) that may only connect outbound | Workers behind one [site agent](./site-agent) per site |
 
 ## Roles
 
@@ -47,6 +48,7 @@ Running QueryFlux without workers works exactly as before. Worker mode is opt-in
 | `standalone` (default) | Yes (YAML or Postgres) | Optional | Yes | With `workerApi.enabled` |
 | `controlPlane` | Yes | Yes, for shared capacity | Yes | Yes |
 | `worker` | No, pulled from the control plane | **Never** | No: ops listener only | No |
+| `siteAgent` | No, relayed from the control plane | **Never** | No: worker API and ops endpoints only | Yes, the workers at its site. See [Site agent](./site-agent). |
 
 A standalone process with `workerApi.enabled: true` can serve workers too. Without Postgres it serves the config it started with, and workers coordinate with `coordination.mode: local`.
 
@@ -251,4 +253,4 @@ See the [Helm chart README](https://github.com/lakeops-org/queryflux/blob/main/c
   - For a shared-service worker with more than one replica, set `service.sessionAffinity: ClientIP` in the Helm values (`worker-values.yaml` does), and use sticky sessions on any external load balancer.
   - Sidecar workers are not affected.
   - Forwarding a request to the worker that owns the query, so that any load balancer works, is planned.
-- Per-worker credentials, secret references in snapshots, and a site agent that forwards for many workers are planned.
+- Per-worker credentials and secret references in snapshots are planned. For workers in a remote network, see [Site agent](./site-agent).

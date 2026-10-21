@@ -879,6 +879,8 @@ pub(crate) fn spawn_worker_heartbeat(
                     }),
                     frontends: frontends.clone(),
                 },
+                kind: "worker".to_string(),
+                parent: None,
             };
             let path = if registered { "heartbeat" } else { "register" };
             match client

@@ -19,10 +19,12 @@ use tracing::info;
 
 mod config_source;
 mod guards;
+mod history_spool;
 mod history_uplink;
 mod live_config;
 mod registered_engines;
 mod remote_coordination;
+mod site_agent;
 mod startup;
 mod worker_labels;
 
@@ -126,6 +128,10 @@ async fn main() -> Result<()> {
         anyhow::bail!("Config has {} role error(s) — aborting", issues.len());
     }
     info!(role = ?config.queryflux.role, "Process role");
+    // A site agent runs no query path at all: only the worker API it relays to upstream.
+    if config.queryflux.role == queryflux_core::config::Role::SiteAgent {
+        return site_agent::run(config).await;
+    }
     // A worker owns no config: it starts empty and pulls its config from the control
     // plane (`RemoteConfigSource`), serves an ops-only listener instead of the admin API,
     // and skips the config-loading and security checks below, which describe config it

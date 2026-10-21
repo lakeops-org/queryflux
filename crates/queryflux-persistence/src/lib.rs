@@ -587,6 +587,25 @@ pub struct WorkerRecord {
     /// Everything else the worker reports about its state.
     #[serde(default)]
     pub status: WorkerStatus,
+    /// `worker` or `siteAgent`.
+    #[serde(default = "default_worker_kind")]
+    pub kind: String,
+    /// The site agent this worker reports through (`None`: it reports directly).
+    #[serde(default)]
+    pub parent: Option<String>,
+}
+
+fn default_worker_kind() -> String {
+    "worker".to_string()
+}
+
+/// A site agent's report of the workers behind it (`POST /worker/fleet`). Upstream
+/// records each one as `<site>/<name>` with `parent` set to the site.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FleetReportV1 {
+    pub site: String,
+    pub workers: Vec<WorkerRecord>,
 }
 
 /// A worker's reported state beyond its revisions. Every field is optional on the wire,

@@ -134,6 +134,7 @@ See [ADBC drivers](https://queryflux.dev/docs/operations/adbc-drivers) for the f
 - `examples/control-plane-values.yaml` + `examples/control-plane-config.yaml`: a worker-mode control plane (Postgres, `workerApi`).
 - `examples/worker-values.yaml` + `examples/worker-config.yaml`: shared-service workers that pull config from the control plane.
 - `examples/worker-sidecar-manifest.yaml`: a worker as a native sidecar (Kubernetes 1.29+) next to an application container. This is a plain manifest, not Helm values.
+- `examples/site-agent-values.yaml` + `examples/site-agent-config.yaml`: a site agent (StatefulSet, a volume per replica) that relays a remote control plane to the workers at one site.
 
 ## Worker mode
 
@@ -157,6 +158,7 @@ helm install queryflux-workers ./charts/queryflux \
 - **Per-pod labels:** `workerLabelsFile` reads labels from a downward API file of `metadata.labels`, so sidecar workers sharing one config each report their own pod's labels (`examples/worker-sidecar-manifest.yaml`). Guide: [Add a worker as a sidecar](https://github.com/lakeops-org/queryflux/blob/main/website/docs/operations/worker-sidecar.md).
 - **Peer bootstrap:** `service.headless.enabled: true` adds `<release>-headless`, which resolves to every ready worker. Point `controlPlane.peerBootstrap.address` at it, so a worker starting while the control plane is down copies its config from a running peer.
 - **Secrets:** QueryFlux does not expand environment variables in its config file, so put the worker config, which holds the shared secret, in a Secret (`config.existingSecret`).
+- **Site agent:** `role: siteAgent` with `workload.kind: StatefulSet` and `workload.volumeClaimTemplates`, so each replica keeps its history spool and snapshot cache on its own volume (`examples/site-agent-values.yaml`). Workers at the site point `controlPlane.url` at the agent's Service. Guide: [Site agent](https://github.com/lakeops-org/queryflux/blob/main/website/docs/operations/site-agent.md).
 
 ## Validation
 

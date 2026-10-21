@@ -159,52 +159,64 @@ impl ProxyConfig {
         fn is_set<T: Serialize + Default>(v: &T) -> bool {
             serde_json::to_value(v).ok() != serde_json::to_value(T::default()).ok()
         }
+        /// `https://` (or `http://` when allowed) and a non-empty secret.
+        fn check_upstream(key: &str, cp: &ControlPlaneClientConfig, issues: &mut Vec<String>) {
+            let url = cp.url.trim();
+            if !(url.starts_with("https://")
+                || (cp.allow_insecure_http && url.starts_with("http://")))
+            {
+                issues.push(format!(
+                    "queryflux.{key}.url must be https:// (got '{url}'); set allowInsecureHttp: true for development only"
+                ));
+            }
+            if cp.auth.bearer().trim().is_empty() {
+                issues.push(format!("queryflux.{key}.auth.sharedSecret is empty"));
+            }
+        }
         let q = &self.queryflux;
         let mut issues = Vec::new();
+        // Config a worker or site agent gets from upstream and must not set itself.
+        let owned_by_control_plane = [
+            ("clusters", !self.clusters.is_empty()),
+            ("clusterGroups", !self.cluster_groups.is_empty()),
+            ("routers", !self.routers.is_empty()),
+            ("routingFallback", !self.routing_fallback.is_empty()),
+            ("auth", is_set(&self.auth)),
+            ("authorization", is_set(&self.authorization)),
+            ("catalogProvider", is_set(&self.catalog_provider)),
+            ("guardrails", self.guardrails.is_some()),
+            ("accessControl", self.access_control.is_some()),
+            (
+                "translation.mode",
+                self.translation.mode != TranslationMode::default(),
+            ),
+            (
+                "translation.errorOnUnsupported",
+                self.translation.error_on_unsupported,
+            ),
+        ];
+        let worker_only = [
+            ("controlPlane", q.control_plane.is_some()),
+            ("workerName", q.worker_name.is_some()),
+            ("workerLabels", !q.worker_labels.is_empty()),
+            ("workerLabelsFile", q.worker_labels_file.is_some()),
+            ("history", q.history.is_some()),
+            ("coordination", q.coordination.is_some()),
+        ];
+        if q.role != Role::SiteAgent && q.site_agent.is_some() {
+            issues.push("queryflux.siteAgent only applies to role: siteAgent".to_string());
+        }
         match q.role {
             Role::Worker => {
                 match &q.control_plane {
                     None => issues.push("role: worker requires queryflux.controlPlane".to_string()),
-                    Some(cp) => {
-                        let url = cp.url.trim();
-                        if !(url.starts_with("https://")
-                            || (cp.allow_insecure_http && url.starts_with("http://")))
-                        {
-                            issues.push(format!(
-                                "queryflux.controlPlane.url must be https:// (got '{url}'); set allowInsecureHttp: true for development only"
-                            ));
-                        }
-                        if cp.auth.bearer().trim().is_empty() {
-                            issues.push(
-                                "queryflux.controlPlane.auth.sharedSecret is empty".to_string(),
-                            );
-                        }
-                    }
+                    Some(cp) => check_upstream("controlPlane", cp, &mut issues),
                 }
                 if !matches!(q.persistence, PersistenceConfig::InMemory) {
                     issues.push(
                         "a worker owns no database: remove queryflux.persistence".to_string(),
                     );
                 }
-                let owned_by_control_plane = [
-                    ("clusters", !self.clusters.is_empty()),
-                    ("clusterGroups", !self.cluster_groups.is_empty()),
-                    ("routers", !self.routers.is_empty()),
-                    ("routingFallback", !self.routing_fallback.is_empty()),
-                    ("auth", is_set(&self.auth)),
-                    ("authorization", is_set(&self.authorization)),
-                    ("catalogProvider", is_set(&self.catalog_provider)),
-                    ("guardrails", self.guardrails.is_some()),
-                    ("accessControl", self.access_control.is_some()),
-                    (
-                        "translation.mode",
-                        self.translation.mode != TranslationMode::default(),
-                    ),
-                    (
-                        "translation.errorOnUnsupported",
-                        self.translation.error_on_unsupported,
-                    ),
-                ];
                 for (key, set) in owned_by_control_plane {
                     if set {
                         issues.push(format!(
@@ -225,18 +237,73 @@ impl ProxyConfig {
                     );
                 }
             }
+            Role::SiteAgent => {
+                match &q.site_agent {
+                    None => issues.push("role: siteAgent requires queryflux.siteAgent".to_string()),
+                    Some(agent) => {
+                        let site = agent.site_name.trim();
+                        if site.is_empty() || site.contains('/') {
+                            issues.push(format!(
+                                "queryflux.siteAgent.siteName must be set and must not contain '/' (got '{site}')"
+                            ));
+                        }
+                        check_upstream("siteAgent.upstream", &agent.upstream, &mut issues);
+                        if agent.state_dir.trim().is_empty() {
+                            issues.push("queryflux.siteAgent.stateDir is empty".to_string());
+                        }
+                    }
+                }
+                match &q.worker_api {
+                    Some(api)
+                        if api.enabled
+                            && api
+                                .shared_secret
+                                .as_deref()
+                                .is_some_and(|s| !s.trim().is_empty()) =>
+                    {
+                        if api.history.is_some() {
+                            issues.push(
+                                "queryflux.workerApi.history comes from upstream on a site agent; remove it"
+                                    .to_string(),
+                            );
+                        }
+                    }
+                    _ => issues.push(
+                        "role: siteAgent requires queryflux.workerApi.enabled with a sharedSecret \
+                         (what this site's workers present)"
+                            .to_string(),
+                    ),
+                }
+                if !matches!(q.persistence, PersistenceConfig::InMemory) {
+                    issues.push(
+                        "a site agent owns no database: remove queryflux.persistence".to_string(),
+                    );
+                }
+                for (key, set) in owned_by_control_plane {
+                    if set {
+                        issues.push(format!(
+                            "'{key}' comes from upstream on a site agent; remove it from this file"
+                        ));
+                    }
+                }
+                for (key, set) in worker_only {
+                    if set {
+                        issues.push(format!(
+                            "queryflux.{key} only applies to role: worker (use siteAgent.upstream)"
+                        ));
+                    }
+                }
+                if q.capacity != CapacityConfig::default() {
+                    issues.push(
+                        "queryflux.capacity comes from upstream on a site agent; remove it"
+                            .to_string(),
+                    );
+                }
+            }
             Role::Standalone | Role::ControlPlane => {
                 if let Err(e) = q.capacity.validate() {
                     issues.push(e);
                 }
-                let worker_only = [
-                    ("controlPlane", q.control_plane.is_some()),
-                    ("workerName", q.worker_name.is_some()),
-                    ("workerLabels", !q.worker_labels.is_empty()),
-                    ("workerLabelsFile", q.worker_labels_file.is_some()),
-                    ("history", q.history.is_some()),
-                    ("coordination", q.coordination.is_some()),
-                ];
                 for (key, set) in worker_only {
                     if set {
                         issues.push(format!("queryflux.{key} only applies to role: worker"));
@@ -897,6 +964,57 @@ pub struct QueryFluxConfig {
     /// Workers follow their control plane.
     #[serde(default)]
     pub capacity: CapacityConfig,
+    /// Site agent only: the upstream control plane and local state.
+    #[serde(default)]
+    pub site_agent: Option<SiteAgentConfig>,
+}
+
+/// A site agent: one per customer site. The site's workers connect to it (it serves the
+/// worker API); it is the only process that connects to the upstream control plane.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SiteAgentConfig {
+    /// Unique per upstream. Workers behind this agent appear upstream as
+    /// `<siteName>/<workerName>`.
+    pub site_name: String,
+    /// The control plane this agent pulls config from and reports to. The secret is this
+    /// site's credential, not the workers' `workerApi.sharedSecret`.
+    pub upstream: ControlPlaneClientConfig,
+    /// Where the snapshot cache and the history spool live. Put it on a persistent,
+    /// encrypted volume: the cached snapshot can carry engine credentials.
+    #[serde(default = "default_site_agent_state_dir")]
+    pub state_dir: String,
+    /// Keep the last snapshot on disk, so the agent can serve its workers after a restart
+    /// while upstream is unreachable.
+    #[serde(default = "default_true")]
+    pub snapshot_cache: bool,
+    #[serde(default)]
+    pub history_spool: HistorySpoolConfig,
+}
+
+fn default_site_agent_state_dir() -> String {
+    "/var/lib/queryflux/site-agent".to_string()
+}
+
+/// The site agent's on-disk history spool.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HistorySpoolConfig {
+    /// When the spool is larger than this, the oldest batches are dropped. Default 1 GiB.
+    #[serde(default = "default_history_spool_max_bytes")]
+    pub max_bytes: u64,
+}
+
+impl Default for HistorySpoolConfig {
+    fn default() -> Self {
+        Self {
+            max_bytes: default_history_spool_max_bytes(),
+        }
+    }
+}
+
+fn default_history_spool_max_bytes() -> u64 {
+    1 << 30
 }
 
 /// How a cluster's `maxRunningQueries` is shared between the processes that admit
@@ -990,6 +1108,9 @@ pub enum Role {
     ControlPlane,
     /// Serves queries with config pulled from a control plane; owns no database.
     Worker,
+    /// Relays between one site's workers and a remote control plane: serves them the
+    /// worker API, and is the only process at the site that connects upstream.
+    SiteAgent,
 }
 
 /// How a worker reaches its control plane.
@@ -4283,5 +4404,82 @@ auth: { provider: static, required: true }
             "queryflux:\n  role: controlPlane\n  workerApi: { enabled: true, sharedSecret: s }\n",
         );
         assert!(ok.validate_role().is_ok());
+    }
+
+    const SITE_AGENT: &str = r#"
+queryflux:
+  role: siteAgent
+  siteAgent:
+    siteName: us-east-dc1
+    upstream:
+      url: https://cp.example.com
+      auth: { mode: sharedSecret, sharedSecret: site-secret }
+  workerApi: { enabled: true, sharedSecret: worker-secret }
+"#;
+
+    #[test]
+    fn a_minimal_site_agent_config_is_valid() {
+        let c = parse(SITE_AGENT);
+        assert_eq!(c.queryflux.role, Role::SiteAgent);
+        let agent = c.queryflux.site_agent.as_ref().unwrap();
+        assert_eq!(agent.state_dir, "/var/lib/queryflux/site-agent");
+        assert!(agent.snapshot_cache);
+        assert_eq!(agent.history_spool.max_bytes, 1 << 30);
+        assert_eq!(c.validate_role(), Ok(()));
+    }
+
+    #[test]
+    fn a_site_agent_needs_an_upstream_a_site_name_and_a_worker_api() {
+        let issues = parse("queryflux:\n  role: siteAgent\n")
+            .validate_role()
+            .unwrap_err();
+        assert!(issues
+            .iter()
+            .any(|i| i.contains("requires queryflux.siteAgent")));
+        assert!(issues
+            .iter()
+            .any(|i| i.contains("requires queryflux.workerApi")));
+
+        let c = parse(
+            &SITE_AGENT
+                .replace("us-east-dc1", "us/east")
+                .replace("https://", "http://"),
+        );
+        let issues = c.validate_role().unwrap_err();
+        assert!(issues.iter().any(|i| i.contains("siteName")), "{issues:?}");
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.contains("siteAgent.upstream.url must be https://")),
+            "{issues:?}"
+        );
+    }
+
+    #[test]
+    fn a_site_agent_rejects_config_that_comes_from_upstream() {
+        let c = parse(&format!(
+            "{}{}",
+            SITE_AGENT.replace(
+                "  workerApi:",
+                "  controlPlane: { url: https://x, auth: { mode: sharedSecret, sharedSecret: s } }\n  workerApi:"
+            ),
+            "clusters:\n  duck: { engine: duckDb }\nroutingFallback: g\n"
+        ));
+        let issues = c.validate_role().unwrap_err();
+        for needle in ["'clusters'", "'routingFallback'", "queryflux.controlPlane"] {
+            assert!(
+                issues.iter().any(|i| i.contains(needle)),
+                "{needle}: {issues:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_site_agent_block_is_rejected_on_other_roles() {
+        let c = parse(&SITE_AGENT.replace("role: siteAgent", "role: controlPlane"));
+        let issues = c.validate_role().unwrap_err();
+        assert!(issues
+            .iter()
+            .any(|i| i.contains("only applies to role: siteAgent")));
     }
 }

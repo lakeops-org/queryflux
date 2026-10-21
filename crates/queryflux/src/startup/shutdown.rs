@@ -7,30 +7,30 @@ use tokio::sync::watch;
 
 use super::frontends::FrontendTasks;
 
+/// Wait for SIGINT or SIGTERM.
+pub(crate) async fn shutdown_signal() {
+    let ctrl_c = tokio::signal::ctrl_c();
+    #[cfg(unix)]
+    {
+        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("register SIGTERM handler");
+        tokio::select! {
+            _ = ctrl_c => tracing::info!("Received SIGINT — initiating graceful shutdown"),
+            _ = sigterm.recv() => tracing::info!("Received SIGTERM — initiating graceful shutdown"),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        ctrl_c.await.ok();
+        tracing::info!("Received Ctrl-C — initiating graceful shutdown");
+    }
+}
+
 /// Wait for SIGINT/SIGTERM, or for a frontend to exit unexpectedly.
 pub(crate) async fn wait_for_shutdown(frontend_tasks: &mut FrontendTasks) {
     // Wait for either a shutdown signal or an unexpected frontend exit.
-    let shutdown_signal = async {
-        let ctrl_c = tokio::signal::ctrl_c();
-        #[cfg(unix)]
-        {
-            let mut sigterm =
-                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                    .expect("register SIGTERM handler");
-            tokio::select! {
-                _ = ctrl_c => tracing::info!("Received SIGINT — initiating graceful shutdown"),
-                _ = sigterm.recv() => tracing::info!("Received SIGTERM — initiating graceful shutdown"),
-            }
-        }
-        #[cfg(not(unix))]
-        {
-            ctrl_c.await.ok();
-            tracing::info!("Received Ctrl-C — initiating graceful shutdown");
-        }
-    };
-
     tokio::select! {
-        _ = shutdown_signal => {},
+        _ = shutdown_signal() => {},
         exit = frontend_tasks.join_next() => {
             if let Some(exit) = exit {
                 match exit.result {

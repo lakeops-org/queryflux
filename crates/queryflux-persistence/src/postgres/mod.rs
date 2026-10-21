@@ -576,8 +576,8 @@ impl crate::WorkerRegistryStore for PostgresStore {
         sqlx::query(
             r#"INSERT INTO worker_registry
                    (name, version, labels, coordination_mode, downloaded_revision,
-                    active_revision, last_error, status, last_seen)
-               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, now())
+                    active_revision, last_error, status, kind, parent, last_seen)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, now())
                ON CONFLICT (name) DO UPDATE SET
                    version             = EXCLUDED.version,
                    labels              = EXCLUDED.labels,
@@ -586,6 +586,8 @@ impl crate::WorkerRegistryStore for PostgresStore {
                    active_revision     = EXCLUDED.active_revision,
                    last_error          = EXCLUDED.last_error,
                    status              = EXCLUDED.status,
+                   kind                = EXCLUDED.kind,
+                   parent              = EXCLUDED.parent,
                    last_seen           = now()"#,
         )
         .bind(&w.name)
@@ -596,6 +598,8 @@ impl crate::WorkerRegistryStore for PostgresStore {
         .bind(&w.active_revision)
         .bind(&w.last_error)
         .bind(sqlx::types::Json(&w.status))
+        .bind(&w.kind)
+        .bind(&w.parent)
         .execute(&self.admin_pool)
         .await
         .map_err(|e| QueryFluxError::Persistence(format!("upsert_worker: {e}")))?;
@@ -617,10 +621,13 @@ impl crate::WorkerRegistryStore for PostgresStore {
             chrono::DateTime<chrono::Utc>,
             chrono::DateTime<chrono::Utc>,
             sqlx::types::Json<serde_json::Value>,
+            String,
+            Option<String>,
         );
         let rows: Vec<Row> = sqlx::query_as(
             r#"SELECT name, version, labels, coordination_mode, downloaded_revision,
-                      active_revision, last_error, last_seen, registered_at, status
+                      active_revision, last_error, last_seen, registered_at, status,
+                      kind, parent
                  FROM worker_registry
                 WHERE last_seen >= $1
                 ORDER BY name"#,
@@ -643,6 +650,8 @@ impl crate::WorkerRegistryStore for PostgresStore {
                 registered_at: Some(r.8),
                 // A row written by a different version may not match; show what we can.
                 status: serde_json::from_value(r.9 .0).unwrap_or_default(),
+                kind: r.10,
+                parent: r.11,
             })
             .collect())
     }
@@ -2966,6 +2975,8 @@ mod tests {
                 }),
                 ..Default::default()
             },
+            kind: "worker".into(),
+            parent: Some("dc1".into()),
         };
         store.upsert_worker(&w).await.unwrap();
         w.active_revision = Some("b".into());
@@ -2982,6 +2993,7 @@ mod tests {
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].active_revision.as_deref(), Some("b"));
         assert_eq!(found[0].status, w.status);
+        assert_eq!(found[0].parent.as_deref(), Some("dc1"));
         assert!(found[0].registered_at.is_some());
         assert_eq!(
             found[0].labels.get("app").map(String::as_str),

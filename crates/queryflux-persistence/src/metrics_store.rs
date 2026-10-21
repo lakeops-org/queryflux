@@ -118,6 +118,10 @@ pub struct QueryRecordBatchV1 {
     /// The sending worker's name; stamped on every record on ingest.
     pub worker: String,
     pub records: Vec<QueryRecord>,
+    /// Set by a site agent relaying its workers' records: each record keeps its own
+    /// `worker`, stored as `<site>/<worker>`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub site: Option<String>,
 }
 
 /// A periodic snapshot of one cluster's live utilization.

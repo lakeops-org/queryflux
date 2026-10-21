@@ -160,7 +160,7 @@ COPY --from=dbc /usr/local/bin/dbc /usr/local/bin/dbc
 COPY docker/queryflux/entrypoint.sh /app/entrypoint.sh
 COPY docker/adbc-drivers.sh /app/adbc-drivers.sh
 RUN chmod +x /app/queryflux /app/entrypoint.sh /app/adbc-drivers.sh \
-    && mkdir -p /var/lib/queryflux/adbc \
+    && mkdir -p /var/lib/queryflux/adbc /var/lib/queryflux/site-agent \
     && chown -R queryflux:queryflux /var/lib/queryflux
 
 ENV LD_LIBRARY_PATH=/usr/local/lib

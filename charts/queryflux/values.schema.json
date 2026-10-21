@@ -9,17 +9,20 @@
     },
     "role": {
       "type": "string",
-      "enum": ["", "standalone", "controlPlane", "worker"]
+      "enum": ["", "standalone", "controlPlane", "worker", "siteAgent"]
     },
     "workload": {
       "type": "object",
       "properties": {
         "kind": {
           "type": "string",
-          "enum": ["Deployment", "DaemonSet"]
+          "enum": ["Deployment", "DaemonSet", "StatefulSet"]
         },
         "daemonSetUpdateStrategy": {
           "type": "object"
+        },
+        "volumeClaimTemplates": {
+          "type": "array"
         }
       }
     },
