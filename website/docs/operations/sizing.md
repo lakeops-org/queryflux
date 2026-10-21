@@ -10,6 +10,11 @@ This page helps you size a QueryFlux fleet for a target query rate: control-plan
 
 All numbers here come from the capacity benchmark (`queryflux-bench capacity`, see [Benchmarks](../benchmarks)) on a laptop against a local, durable Postgres 17. Treat them as orders of magnitude. Run the benchmark against your own Postgres before you commit to a size.
 
+<img
+  src="/img/docs/sizing-capacity-modes.svg"
+  alt="Capacity modes for sizing: leases cost one Postgres round trip per admission; quotas admit locally within a share and report demand in the background"
+/>
+
 ## What costs what
 
 Only shared state costs anything at the control plane: capacity admission and query history. Workers scale out on their own. Everything else a query does (routing, translation, the engine call) happens on the process that runs it.

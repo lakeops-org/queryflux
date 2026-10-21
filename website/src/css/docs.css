@@ -354,6 +354,18 @@ html[data-theme='dark'] .theme-doc-markdown.markdown table th {
   font-size: 0.9em;
 }
 
+/* ——— Static diagram images (replacing Mermaid) ——— */
+
+.theme-doc-markdown.markdown img[src*='/img/docs/'] {
+  display: block;
+  width: 100%;
+  height: auto;
+  margin: 1.75rem 0;
+  border-radius: 16px;
+  border: 1px solid var(--qf-docs-line-strong);
+  box-shadow: 0 18px 48px rgba(0, 0, 0, 0.35);
+}
+
 /* ——— Doc cards (category index pages, DocCardList) ——— */
 
 .theme-doc-markdown a.card,

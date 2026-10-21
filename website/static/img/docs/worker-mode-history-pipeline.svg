@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="260" viewBox="0 0 960 260" role="img" aria-label="Query history pipeline from finished query through redaction, spool, ingest, and Studio">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#0b0614"/>
+      <stop offset="100%" stop-color="#050508"/>
+    </linearGradient>
+    <linearGradient id="pipe" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#8b5cf6"/>
+      <stop offset="100%" stop-color="#ff7619"/>
+    </linearGradient>
+    <marker id="arr" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto">
+      <path d="M0,0 L7,3 L0,6 Z" fill="#a78bfa"/>
+    </marker>
+    <pattern id="dots" width="22" height="22" patternUnits="userSpaceOnUse">
+      <circle cx="1" cy="1" r="0.8" fill="rgba(255,255,255,0.05)"/>
+    </pattern>
+  </defs>
+
+  <rect width="960" height="260" rx="20" fill="url(#bg)"/>
+  <rect width="960" height="260" rx="20" fill="url(#dots)"/>
+  <rect x="1" y="1" width="958" height="258" rx="19" fill="none" stroke="rgba(255,255,255,0.08)"/>
+
+  <text x="40" y="40" fill="#fafafa" font-family="ui-sans-serif, system-ui, sans-serif" font-size="18" font-weight="650">Query history pipeline</text>
+  <text x="40" y="62" fill="#a1a1aa" font-family="ui-sans-serif, system-ui, sans-serif" font-size="12">Redact on the worker, spool locally, ingest idempotently on the control plane.</text>
+
+  <line x1="80" y1="150" x2="880" y2="150" stroke="url(#pipe)" stroke-width="2" opacity="0.45" marker-end="url(#arr)"/>
+
+  <g font-family="ui-sans-serif, system-ui, sans-serif">
+    <rect x="32" y="100" width="130" height="100" rx="14" fill="rgba(255,255,255,0.04)" stroke="rgba(255,255,255,0.14)"/>
+    <text x="97" y="140" text-anchor="middle" fill="#f4f4f5" font-size="13" font-weight="650">Finished</text>
+    <text x="97" y="160" text-anchor="middle" fill="#f4f4f5" font-size="13" font-weight="650">query</text>
+    <text x="97" y="182" text-anchor="middle" fill="#71717a" font-size="10">on the worker</text>
+
+    <rect x="188" y="100" width="150" height="100" rx="14" fill="rgba(139,92,246,0.12)" stroke="#8b5cf6"/>
+    <text x="263" y="140" text-anchor="middle" fill="#ede9fe" font-size="13" font-weight="650">Redact</text>
+    <text x="263" y="162" text-anchor="middle" fill="#c4b5fd" font-size="11">full · maskLiterals</text>
+    <text x="263" y="180" text-anchor="middle" fill="#a78bfa" font-size="11">metadata</text>
+
+    <rect x="364" y="100" width="150" height="100" rx="14" fill="rgba(139,92,246,0.08)" stroke="rgba(196,181,253,0.45)"/>
+    <text x="439" y="140" text-anchor="middle" fill="#f4f4f5" font-size="13" font-weight="650">Bounded spool</text>
+    <text x="439" y="162" text-anchor="middle" fill="#a1a1aa" font-size="11">spoolMaxRecords</text>
+    <text x="439" y="180" text-anchor="middle" fill="#71717a" font-size="10">drop oldest</text>
+
+    <rect x="540" y="100" width="180" height="100" rx="14" fill="rgba(255,118,25,0.1)" stroke="#ff7619"/>
+    <text x="630" y="136" text-anchor="middle" fill="#ffedd5" font-size="12" font-weight="650">POST query-records</text>
+    <text x="630" y="158" text-anchor="middle" fill="#fdba74" font-size="11">batches of 200</text>
+    <text x="630" y="178" text-anchor="middle" fill="#a16207" font-size="10">backoff to 60s</text>
+
+    <rect x="748" y="100" width="180" height="100" rx="14" fill="rgba(163,230,53,0.1)" stroke="rgba(163,230,53,0.45)"/>
+    <text x="838" y="136" text-anchor="middle" fill="#ecfccb" font-size="13" font-weight="650">History store</text>
+    <text x="838" y="158" text-anchor="middle" fill="#86efac" font-size="11">one row per</text>
+    <text x="838" y="176" text-anchor="middle" fill="#86efac" font-size="11">proxy query id</text>
+  </g>
+
+  <text x="480" y="236" text-anchor="middle" fill="#71717a" font-family="ui-sans-serif, system-ui, sans-serif" font-size="11">Studio · digest stats · routing inputs read from the history store</text>
+</svg>

@@ -26,37 +26,10 @@ This page explains how worker mode works and why it is built this way. To run it
 | `worker` | no, pulled from the control plane | **never** | queries, and an ops listener |
 | `siteAgent` | no, relayed from the control plane | **never** | the worker API for one site's workers, and ops endpoints |
 
-```mermaid
-%%{init: {'theme': 'base', 'themeVariables': {
-  'primaryColor': '#f5f3ff',
-  'primaryTextColor': '#3b0764',
-  'primaryBorderColor': '#7c3aed',
-  'lineColor': '#8b5cf6',
-  'fontFamily': 'Manrope Variable, Manrope, system-ui, sans-serif'
-}}}%%
-flowchart TB
-    subgraph CP["Control plane"]
-        direction LR
-        Admin["Admin API + Studio"]
-        WAPI["Worker API<br/><i>/worker/*</i>"]
-    end
-    PG[("Postgres<br/><i>config · leases · history · registry</i>")]
-    CP --- PG
-    subgraph Fleet["Workers — never connect to Postgres"]
-        direction LR
-        subgraph AppPod["Application pod"]
-            App1["App"] -->|"localhost"| W1["Worker<br/><i>sidecar</i>"]
-        end
-        subgraph Pool["Shared worker pool"]
-            W2["Worker"] -.->|"peer bootstrap"| W3["Worker"]
-        end
-    end
-    App2["Apps"] -->|"Service · ClientIP affinity"| Pool
-    Fleet -->|"config long-poll · heartbeat<br/>capacity leases · query history"| WAPI
-    Fleet -->|"SQL"| Engines[("Trino · DuckDB · StarRocks · …")]
-
-    classDef stage fill:#faf5ff,stroke:#7c3aed,stroke-width:1.5px,color:#3b0764
-```
+<img
+  src="/img/docs/worker-mode-roles-topology.svg"
+  alt="Roles and topology: control plane with Admin API, Studio, and Worker API backed by Postgres; sidecar and pooled workers serve apps and engines and never connect to Postgres"
+/>
 
 A worker is the in-memory proxy plus three changes:
 - its config comes from the control plane;
@@ -84,30 +57,10 @@ A control plane serves its whole config as one document, `WorkerSnapshotV1` (med
 
 ### Sync, activation and the last good config
 
-```mermaid
-%%{init: {'theme': 'base', 'themeVariables': {
-  'primaryColor': '#f5f3ff',
-  'primaryTextColor': '#3b0764',
-  'primaryBorderColor': '#7c3aed',
-  'lineColor': '#8b5cf6',
-  'fontFamily': 'Manrope Variable, Manrope, system-ui, sans-serif'
-}}}%%
-sequenceDiagram
-    participant W as Worker
-    participant CP as Control plane
-    participant DB as Postgres
-    W->>CP: GET /worker/config
-    CP->>DB: consistent read (REPEATABLE READ)
-    CP-->>W: 200 snapshot, ETag "rev1"
-    Note over W: verify version + hash,<br/>compile strictly, swap atomically
-    W->>CP: GET /worker/config/wait?since=rev1
-    Note over CP: holds up to pollTimeoutSecs
-    Note over DB: admin edits a cluster
-    CP-->>W: 200 snapshot "rev2" (within ~1s)
-    W->>CP: GET /worker/config/wait?since=rev2
-    Note over DB: Postgres down
-    CP-->>W: last good snapshot (build failed or >10s)
-```
+<img
+  src="/img/docs/worker-mode-config-sync.svg"
+  alt="Config sync sequence: worker fetches a snapshot, long-polls for changes, activates atomically, and receives the last-good snapshot when Postgres is down"
+/>
 
 - **Strict compile.** A received snapshot is compiled strictly: one invalid adapter, script or setting rejects the whole snapshot, and the previous config stays active. The worker remembers the rejected revision and doesn't refetch it until the control plane publishes a new one. It reports the error in its heartbeat and in `/worker/status`.
 - **Long-poll.** `/worker/config/wait` answers as soon as the control plane reloads its config. Otherwise it answers `304` after `pollTimeoutSecs`. A worker without a revision yet uses a plain `GET`.
@@ -127,27 +80,10 @@ sequenceDiagram
 
 Any config a worker starts with while the control plane is down may be missing recent edits. The design keeps it as recent as possible and makes that visible:
 
-```mermaid
-%%{init: {'theme': 'base', 'themeVariables': {
-  'primaryColor': '#f5f3ff',
-  'primaryTextColor': '#3b0764',
-  'primaryBorderColor': '#7c3aed',
-  'lineColor': '#8b5cf6',
-  'fontFamily': 'Manrope Variable, Manrope, system-ui, sans-serif'
-}}}%%
-sequenceDiagram
-    participant N as New worker
-    participant CP as Control plane
-    participant P as Running worker
-    N-xCP: GET /worker/config (unreachable)
-    Note over N: still no config after afterSecs
-    N->>P: GET /worker/peer-config (shared secret)
-    P-->>N: snapshot + confirmedAt
-    Note over N: verify hash, refuse if older than maxAgeSecs,<br/>activate · stale = true
-    N->>CP: conditional GET (If-None-Match)
-    CP-->>N: 304 or a newer snapshot
-    Note over N: confirmed · stale = false
-```
+<img
+  src="/img/docs/worker-mode-peer-bootstrap.svg"
+  alt="Peer bootstrap sequence: new worker copies config from a running peer when the control plane is unreachable, then confirms when the control plane returns"
+/>
 
 - **Where peers come from:** `controlPlane.peerBootstrap.address` is usually a headless Service. Each address is tried in turn, and only ready workers, which all have a config, are listed.
 - **Age limit:** `confirmedAt` is when the control plane last confirmed that config. It is carried along when one peer copies from another, so `maxAgeSecs` bounds the true age.
@@ -158,31 +94,10 @@ sequenceDiagram
 
 `maxRunningQueries` caps how many queries run on a cluster at once. Distributed standalone replicas already enforce it through capacity leases in Postgres. Workers use the same lease table, through the control plane:
 
-```mermaid
-%%{init: {'theme': 'base', 'themeVariables': {
-  'primaryColor': '#f5f3ff',
-  'primaryTextColor': '#3b0764',
-  'primaryBorderColor': '#7c3aed',
-  'lineColor': '#8b5cf6',
-  'fontFamily': 'Manrope Variable, Manrope, system-ui, sans-serif'
-}}}%%
-sequenceDiagram
-    participant C as Client
-    participant W as Worker
-    participant CP as Control plane
-    participant E as Engine
-    C->>W: query
-    Note over W: local slot free
-    W->>CP: POST /worker/capacity/acquire
-    alt granted
-        CP-->>W: granted: true
-        W->>E: execute
-        W-)CP: POST /worker/capacity/release-batch (queued, with other releases)
-    else fleet full
-        CP-->>W: granted: false
-        Note over W: queue, retry with backoff<br/>(queryflux_capacity_lease_denied_total)
-    end
-```
+<img
+  src="/img/docs/worker-mode-capacity-lease.svg"
+  alt="Capacity lease sequence: client query acquires a lease via the control plane before executing on the engine; fleet-full denials queue and retry"
+/>
 
 - **The query path doesn't change.** The worker's `RemoteCoordinationStore` implements the same `CapacityStore` and `SweepCoordinator` traits that dispatch, the slot guard and the engine reconcile loop already use. The control plane exposes its own store at `/worker/capacity/*` and `/worker/sweep-lock/*`.
 - **Mixed fleets share one cap.** A control plane that also serves queries uses the lease table directly, and its workers use it through the API, so one `maxRunningQueries` covers all of them.
@@ -212,23 +127,10 @@ To compare workers, watch, per worker:
 
 Workers keep no durable history. The control plane is the system of record:
 
-```mermaid
-%%{init: {'theme': 'base', 'themeVariables': {
-  'primaryColor': '#f5f3ff',
-  'primaryTextColor': '#3b0764',
-  'primaryBorderColor': '#7c3aed',
-  'lineColor': '#8b5cf6',
-  'fontFamily': 'Manrope Variable, Manrope, system-ui, sans-serif'
-}}}%%
-flowchart LR
-    Q["Finished query"] --> R["Redact<br/><i>full · maskLiterals · metadata</i>"]
-    R --> S["Bounded spool<br/><i>spoolMaxRecords, drop oldest</i>"]
-    S -->|"batches of 200,<br/>backoff to 60s"| I["POST /worker/query-records<br/><i>or the named endpoint</i>"]
-    I --> H[("History store<br/><i>one row per proxy query id</i>")]
-    H --> St["Studio · stats · routing inputs"]
-
-    classDef stage fill:#faf5ff,stroke:#7c3aed,stroke-width:1.5px,color:#3b0764
-```
+<img
+  src="/img/docs/worker-mode-history-pipeline.svg"
+  alt="Query history pipeline: finished query, redact, bounded spool, POST query-records, history store used by Studio"
+/>
 
 - **The query path never waits on the network.** A finished query is redacted and queued. A flusher sends batches every 2 seconds, and a final flush runs after the shutdown drain. When the endpoint stays down, the oldest records are dropped and counted (`historyUplink.dropped`).
 - **Delivery is at least once and ingest is idempotent.** Records are keyed by proxy query id, so a retried batch stores nothing twice.

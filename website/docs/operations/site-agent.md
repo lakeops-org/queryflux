@@ -8,17 +8,10 @@ image: img/queryflux-hero-banner.png
 
 A **site agent** sits between the workers at one site (a data center, a VPC, a customer network) and a control plane that runs somewhere else, for example a hosted one. Workers connect to the agent exactly as they would to a control plane. The agent is the only process at the site that connects upstream, and it only ever opens connections; nothing connects into the site.
 
-```text
-                     site (LAN)                                   |   upstream (WAN)
-                                                                  |
- worker ─┐  GET /worker/config/wait (same worker API)             |
- worker ─┼──► site agent ── long-poll /worker/config/wait ───────────► control plane
- worker ─┘  register, heartbeat, capacity, query records          |
-              │ ├─ snapshot cache (disk)                          |
-              │ ├─ fleet registry (memory) ── POST /worker/fleet ────►
-              │ ├─ history spool (disk) ── POST /worker/query-records ──►
-              │ └─ capacity: forwarded ── /worker/capacity/* ─────────►
-```
+<img
+  src="/img/docs/site-agent-topology.svg"
+  alt="Site agent topology: workers at a site talk to a site agent and to query engines; the agent opens outbound connections to the control plane for config, fleet, history, and capacity"
+/>
 
 Read [Worker mode](./worker-mode) first: the agent relays that protocol and changes nothing about how workers behave.
 
@@ -171,5 +164,3 @@ Alert on `queryflux_agent_upstream_up == 0` lasting longer than you expect, and 
 - Upstream sends every site the whole config; it doesn't filter the snapshot per site.
 - Capacity is forwarded, not held at the site. A site-wide quota held by the agent, which would keep admitting after per-worker quotas expire during a long outage, is planned.
 - Studio actions that must reach engines from inside the site (test a connection, browse a catalog) do not run through the agent yet.
-- Secret references resolved at the site, so upstream never holds engine credentials, are planned.
-- A control plane from before site agents ignores `/worker/fleet` (workers behind the agent then don't appear upstream), and stores relayed history under the agent's name instead of each worker's.

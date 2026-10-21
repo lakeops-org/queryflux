@@ -16,19 +16,10 @@ In worker mode, one QueryFlux deployment owns the config and the others run quer
   - shares capacity limits through the control plane;
   - sends its query history to the control plane.
 
-```text
-             ┌──────────────────────────── control plane ────────────────────────────┐
-  Studio ───►│ admin API   /worker/config   /worker/capacity/*   /worker/query-records │──► Postgres
-             └──────▲───────────────▲──────────────────▲─────────────────────▲─────────┘
-                    │ config        │ register,        │ capacity leases     │ query history
-                    │ (long-poll)   │ heartbeat        │                     │
-             ┌──────┴───────────────┴──────────────────┴─────────────────────┴───┐
-             │ worker (sidecar or shared service)  ── SQL ──►  Trino, DuckDB, …   │
-             └───────────────────────────────────────────────────────────────────┘
-                    ▲
-                    │ Trino HTTP, Postgres wire, MySQL wire, Flight SQL, …
-               application
-```
+<img
+  src="/img/docs/worker-mode-topology.svg"
+  alt="Worker mode topology: applications talk to workers; workers talk to query engines and to the control plane for config, capacity, and history; only the control plane connects to Postgres"
+/>
 
 Running QueryFlux without workers works exactly as before. Worker mode is opt-in, through `queryflux.role`.
 
@@ -182,10 +173,10 @@ If two or more workers share clusters with `coordination.mode: local`, the contr
 
 Workers keep no durable history. Each finished query's record goes upstream:
 
-```text
-worker ──► control plane        (POST /worker/query-records, the default)
-worker ──► history endpoint     (workerApi.history.endpoint, or the worker's history.endpoint)
-```
+<img
+  src="/img/docs/worker-mode-history-uplink.svg"
+  alt="Query history uplink: worker posts records to the control plane by default, or to an optional named history endpoint"
+/>
 
 - **Delivery.** Records are batched (up to 200 per request), queued in a bounded spool (`spoolMaxRecords`) and retried with backoff. When the spool is full, the oldest records are dropped and counted. The query path never waits on the network. A final flush runs after the shutdown drain.
 - **Idempotent ingest.** A retried batch is safe: the control plane keeps the first record per proxy query id, and counts it once in digest stats.

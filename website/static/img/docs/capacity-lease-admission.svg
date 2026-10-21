@@ -1,0 +1,62 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="420" viewBox="0 0 960 420" role="img" aria-label="Admission sequence: local slot then Postgres try_acquire; grant runs query or queue on cluster full">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#0b0614"/>
+      <stop offset="100%" stop-color="#050508"/>
+    </linearGradient>
+    <marker id="arr" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto">
+      <path d="M0,0 L7,3 L0,6 Z" fill="#a78bfa"/>
+    </marker>
+    <pattern id="dots" width="22" height="22" patternUnits="userSpaceOnUse">
+      <circle cx="1" cy="1" r="0.8" fill="rgba(255,255,255,0.05)"/>
+    </pattern>
+  </defs>
+
+  <rect width="960" height="420" rx="20" fill="url(#bg)"/>
+  <rect width="960" height="420" rx="20" fill="url(#dots)"/>
+  <rect x="1" y="1" width="958" height="418" rx="19" fill="none" stroke="rgba(255,255,255,0.08)"/>
+
+  <text x="40" y="40" fill="#fafafa" font-family="ui-sans-serif, system-ui, sans-serif" font-size="18" font-weight="650">Admission in two steps</text>
+  <text x="40" y="62" fill="#a1a1aa" font-family="ui-sans-serif, system-ui, sans-serif" font-size="12">Local atomic counter, then fleet-wide lease via queryflux_capacity_try_acquire.</text>
+
+  <g font-family="ui-sans-serif, system-ui, sans-serif">
+    <rect x="80" y="88" width="100" height="36" rx="10" fill="rgba(255,118,25,0.12)" stroke="#ff7619"/>
+    <text x="130" y="111" text-anchor="middle" fill="#ffedd5" font-size="13" font-weight="650">Query</text>
+    <rect x="380" y="88" width="160" height="36" rx="10" fill="rgba(139,92,246,0.18)" stroke="#8b5cf6"/>
+    <text x="460" y="111" text-anchor="middle" fill="#ede9fe" font-size="13" font-weight="650">QueryFlux process</text>
+    <rect x="720" y="88" width="200" height="36" rx="10" fill="rgba(255,118,25,0.1)" stroke="#ff7619"/>
+    <text x="820" y="105" text-anchor="middle" fill="#ffedd5" font-size="12" font-weight="650">Postgres</text>
+    <text x="820" y="118" text-anchor="middle" fill="#fdba74" font-size="10">(or control plane)</text>
+  </g>
+
+  <line x1="130" y1="124" x2="130" y2="390" stroke="rgba(253,186,116,0.35)" stroke-width="1.5" stroke-dasharray="4 4"/>
+  <line x1="460" y1="124" x2="460" y2="390" stroke="rgba(167,139,250,0.35)" stroke-width="1.5" stroke-dasharray="4 4"/>
+  <line x1="820" y1="124" x2="820" y2="390" stroke="rgba(253,186,116,0.35)" stroke-width="1.5" stroke-dasharray="4 4"/>
+
+  <g font-family="ui-sans-serif, system-ui, sans-serif" font-size="12">
+    <line x1="130" y1="150" x2="452" y2="150" stroke="#fdba74" stroke-width="1.5" marker-end="url(#arr)"/>
+    <text x="290" y="142" text-anchor="middle" fill="#fdba74">submit</text>
+
+    <rect x="390" y="162" width="140" height="28" rx="6" fill="rgba(0,0,0,0.3)" stroke="rgba(255,255,255,0.1)"/>
+    <text x="460" y="181" text-anchor="middle" fill="#c4b5fd" font-size="11">local slot (atomic counter)</text>
+
+    <line x1="460" y1="208" x2="812" y2="208" stroke="#a78bfa" stroke-width="1.5" marker-end="url(#arr)"/>
+    <text x="630" y="200" text-anchor="middle" fill="#d4d4d8" font-size="11">queryflux_capacity_try_acquire(cluster, max)</text>
+
+    <rect x="280" y="228" width="560" height="88" rx="10" fill="rgba(163,230,53,0.05)" stroke="rgba(163,230,53,0.25)"/>
+    <text x="300" y="246" fill="#86efac" font-size="11" font-weight="650">granted</text>
+    <line x1="820" y1="258" x2="468" y2="258" stroke="#86efac" stroke-width="1.5" marker-end="url(#arr)"/>
+    <text x="640" y="250" text-anchor="middle" fill="#86efac">true</text>
+    <rect x="390" y="268" width="120" height="24" rx="6" fill="rgba(0,0,0,0.25)" stroke="rgba(255,255,255,0.08)"/>
+    <text x="450" y="284" text-anchor="middle" fill="#d4d4d8" font-size="11">run the query</text>
+    <line x1="460" y1="300" x2="812" y2="300" stroke="#a78bfa" stroke-width="1.25" stroke-dasharray="4 3" marker-end="url(#arr)"/>
+    <text x="630" y="294" text-anchor="middle" fill="#71717a" font-size="10">release (queued, batched)</text>
+
+    <rect x="280" y="336" width="400" height="56" rx="10" fill="rgba(251,113,133,0.06)" stroke="rgba(251,113,133,0.25)"/>
+    <text x="300" y="354" fill="#fb7185" font-size="11" font-weight="650">cluster full</text>
+    <line x1="820" y1="366" x2="468" y2="366" stroke="#fb7185" stroke-width="1.5" marker-end="url(#arr)"/>
+    <text x="640" y="358" text-anchor="middle" fill="#fda4af">false</text>
+    <text x="480" y="382" text-anchor="middle" fill="#71717a" font-size="11">queue, retry</text>
+  </g>
+</svg>

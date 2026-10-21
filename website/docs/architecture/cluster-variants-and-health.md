@@ -259,44 +259,28 @@ Schema: `crates/queryflux-persistence/src/postgres/migrations/20260611000001_dis
 
 On startup and on each config reload, persisted cluster rows expand into runtime adapters and live routing state:
 
-```mermaid
-flowchart LR
-    PG[(Postgres cluster_configs)] --> EXP[expand_cluster_variants]
-    EXP --> ADP[Build AdbcAdapter]
-    EXP --> LIVE[LiveConfig maps]
-```
+<img
+  src="/img/docs/cluster-variants-expand.svg"
+  alt="Config load: Postgres cluster_configs expand into AdbcAdapter instances and LiveConfig maps"
+/>
 
 ### Health loop (every 30s)
 
 Each runtime cluster is probed independently. Failed probes mark the cluster unhealthy and exclude it from routing until the next success.
 
-```mermaid
-flowchart TD
-    HC[Health loop] --> Q{Custom healthCheckQuery?}
-    Q -->|yes| SQL[execute_custom_health_check]
-    Q -->|no| INT[adapter.health_check]
-    SQL --> OK[Update is_healthy]
-    INT --> OK
-```
+<img
+  src="/img/docs/cluster-variants-health-loop.svg"
+  alt="Health loop every 30 seconds: custom healthCheckQuery or adapter health_check, then update is_healthy"
+/>
 
 ### Reconcile loop (every 30s)
 
 Reconcile syncs `ClusterState.running_queries` with backend ground truth. In distributed mode, only the sweep-lock holder queries backends; followers read `cluster_capacity_counters.running` from Postgres.
 
-```mermaid
-flowchart TD
-    RC[Reconcile loop] --> D{Distributed follower?}
-    D -->|yes| READ[CapacityStore.active_count]
-    D -->|no| BACK[Query backend]
-    BACK --> Q{Custom reconcileQuery?}
-    Q -->|yes| SQL[execute_custom_reconcile_query]
-    Q -->|no| INT[fetch_running_query_count]
-    BACK --> PUB[publish_running_count]
-    READ --> STATE[Update running_queries]
-    SQL --> STATE
-    INT --> STATE
-    PUB --> STATE
-```
+<img
+  src="/img/docs/cluster-variants-reconcile-loop.svg"
+  alt="Reconcile loop every 30 seconds: distributed followers read CapacityStore active_count; leaders query backends, optionally custom reconcile SQL, publish running counts, and update running_queries"
+/>
 
 Admission (`try_acquire` / capacity leases) is **not** part of this loop — see [Distributed mode and CapacityStore](#distributed-mode-and-capacitystore).
 
