@@ -37,8 +37,8 @@ export default function Home(): ReactNode {
         <HomeHero />
         <main>
           <EngineStrip />
-          <HomeComparison />
           <HomeAgents />
+          <HomeComparison />
           <HomeArchitecture />
           <HomePillars />
           <HomeUseCases />
