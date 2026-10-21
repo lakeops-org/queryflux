@@ -59,7 +59,9 @@ impl GuardSpec {
     pub fn validate(&self) -> Result<(), String> {
         match &self.kind {
             GuardKind::BuiltIn => match self.name.as_deref() {
-                Some("read_only" | "row_limit" | "require_predicate") => Ok(()),
+                Some(name) if queryflux_core::config::BUILT_IN_GUARD_NAMES.contains(&name) => {
+                    Ok(())
+                }
                 Some(other) => Err(format!("unsupported built_in guard name \"{other}\"")),
                 None => Err("built_in guard is missing required field \"name\"".to_string()),
             },

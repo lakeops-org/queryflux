@@ -12,8 +12,8 @@ Most built-in guards inspect the **translated** SQL (after dialect translation, 
 |---------|--------|
 | `allow` | Query proceeds. |
 | `warn`  | Query proceeds; a warning is recorded in the audit log. |
-| `rewrite` | Query proceeds with modified SQL. Used by [access control](../access-control/overview) (`opa_access`) for row filters and column masks. |
-| `deny`  | Query is blocked. A machine-readable error code is returned so agents can react programmatically. |
+| `rewrite` | Query proceeds with modified SQL. Used by [access control](../access-control/overview) (`opa_access`) for row filters and column masks, and by `row_limit` with `inject_limit` to add or lower a `LIMIT`. |
+| `deny`  | Query is blocked. The client gets the guard name, a machine-readable code and a hint on how to fix the query, so agents can correct it and retry. |
 
 Every verdict is recorded in `guard_actions` on the query record, alongside a `was_guard_blocked` flag. Studio's **Queries** page shows the full trail — built-in guards and `opa_access` rewrites together — plus rewritten SQL separately from dialect-translated SQL.
 
@@ -21,7 +21,17 @@ Every verdict is recorded in `guard_actions` on the query record, alongside a `w
 
 ## How the chain works
 
-Guards are evaluated in order. **The chain stops at the first deny** — subsequent guards are skipped.
+Guards are evaluated in order. **The chain stops at the first deny** — subsequent guards are skipped. When a guard rewrites the query, the guards after it check the rewritten SQL, and the rewritten SQL is what the engine runs.
+
+A blocked query fails with a message of this form:
+
+```text
+blocked by guard partition_predicate_required [PARTITION_PREDICATE_REQUIRED]: query on events must filter on its partition column dt; add a WHERE condition on dt (e.g. dt = <value> or dt >= <start>)
+```
+
+The reasons are written for the caller: they say what to change. An agent that reads the error can fix its SQL and retry instead of giving up.
+
+To check a query without running it, use [route explain](./routing-and-clusters#route-explain): it returns the guard verdict (allow, rewrite with the new SQL, or deny with this message) along with the routing decision.
 
 Two layers of guards compose per query:
 
@@ -31,6 +41,25 @@ Two layers of guards compose per query:
 This lets you apply baseline safety globally (e.g. read-only for all agents) while tightening or relaxing rules for specific groups (e.g. a stricter row limit for an analytics group).
 
 ---
+
+## Table patterns
+
+`require_predicate` (`applies_to`), `partition_predicate_required` and `time_range_limit` (`tables`) pick tables with patterns. A pattern matches a table name exactly, ignoring case, and `*` matches any run of characters:
+
+| Pattern | Matches | Does not match |
+|---|---|---|
+| `events` | `events`, `analytics.events` | `events_archive`, `user_events` |
+| `fct_*` | `fct_sales`, `dw.fct_sales` | `stage_fct_sales` |
+| `dw.fct_*` | `dw.fct_sales` | `fct_sales`, `stage.fct_sales` |
+| `*_events` | `page_events`, `raw.page_events` | `events_raw` |
+
+A pattern without a `.` is compared with the table name alone, whatever the schema. A pattern with a `.` is compared with `schema.table`. The catalog part of a three-part name is ignored.
+
+:::note Changed in 0.5.0
+Before 0.5.0, a `require_predicate` pattern without `*` matched any table whose name *contained* it (`events` also matched `user_events`). Patterns now match exactly; add `*` where you relied on the old behavior (`*events*`).
+:::
+
+Guards run on the SQL sent to the engine, after dialect translation, so patterns see table names as the engine sees them.
 
 ## Built-in guards
 
@@ -51,6 +80,8 @@ When access control is on, the rewriting guard is `opa_access`.
 ### `read_only`
 
 Blocks any statement that is not a `SELECT`, `WITH`, `SHOW`, `DESCRIBE`, or `EXPLAIN`. Guards against agents issuing accidental `INSERT`, `UPDATE`, `DELETE`, or DDL.
+
+The check looks inside reads too: `SELECT … INTO`, a CTE that deletes or updates (`WITH d AS (DELETE … RETURNING *) SELECT …`), `EXPLAIN ANALYZE` of a write (which runs the write on several engines), and procedure calls such as `CALL` are blocked. SQL that can't be parsed is blocked if it contains a write keyword.
 
 ```yaml
 guardrails:
@@ -77,6 +108,24 @@ guardrails:
       name: row_limit
       max_rows: 10000
 ```
+
+Set `inject_limit: true` to fix the query instead of warning or denying. This suits agents: they get a bounded result rather than an error.
+
+- **No LIMIT present** → `rewrite`, adding `LIMIT default_limit` (or `LIMIT max_rows` when `default_limit` is not set).
+- **LIMIT above `max_rows`** → `rewrite`, lowering it to `max_rows`.
+
+```yaml
+guardrails:
+  groups:
+    agents:
+      - kind: built_in
+        name: row_limit
+        max_rows: 10000
+        inject_limit: true
+        default_limit: 1000
+```
+
+The rewrite is recorded in `guard_actions` with the injected `limit` in its metadata. A query a guard rewrites is never served from the [result cache](./caching), whose key is the client's SQL. Batches of several statements are not rewritten; they get the warn/deny behavior.
 
 Error code on deny: `ROW_LIMIT_EXCEEDED`
 
@@ -105,6 +154,110 @@ With an empty `applies_to` list (or omitted), the guard applies to **all** table
 Error code on deny: `MISSING_PREDICATE`
 
 ---
+
+### `partition_predicate_required`
+
+Requires queries on chosen tables to filter on the table's partition column, so they read a few partitions instead of the whole table. `tables` maps a table pattern (same glob syntax as `applies_to`) to its partition column:
+
+```yaml
+guardrails:
+  groups:
+    agents:
+      - kind: built_in
+        name: partition_predicate_required
+        tables:
+          "events": dt
+          "fct_*": event_date
+```
+
+Every `SELECT` that reads a matching table (in `FROM` or a `JOIN`, including inside CTEs and subqueries) must reference the column in its `WHERE`. Any condition on the column counts (`=`, `>=`, `BETWEEN`, `IN`).
+
+The filter has to be on the `SELECT` that reads the table. A filter in an outer query does not count for a CTE or subquery that reads the table:
+
+```sql
+-- denied: the CTE reads events without a filter on dt
+WITH e AS (SELECT * FROM events) SELECT * FROM e WHERE dt = '2026-10-01';
+-- allowed
+WITH e AS (SELECT * FROM events WHERE dt = '2026-10-01') SELECT * FROM e;
+```
+
+The engine might push the outer filter down, but the guard does not assume it. The deny message names the table and column, so an agent can move the filter.
+
+Error code on deny: `PARTITION_PREDICATE_REQUIRED`
+
+---
+
+### `time_range_limit`
+
+Bounds how far back queries on chosen tables may read. `tables` maps a table pattern to its time column, and `max_lookback` is the limit (`36h`, `90d`, `12w`, `1y`):
+
+```yaml
+guardrails:
+  groups:
+    agents:
+      - kind: built_in
+        name: time_range_limit
+        tables:
+          "events": ts
+        max_lookback: 30d
+```
+
+A query on a matching table must give the column a lower bound (`ts >= …`, `ts > …`, or `ts BETWEEN … AND …`):
+
+- **No lower bound** → `deny` with `TIME_RANGE_REQUIRED`.
+- **A literal date older than now minus `max_lookback`** → `deny` with `TIME_RANGE_EXCEEDED`. The message gives the earliest date allowed.
+
+#### Limits
+
+This guard reads the shape of the `WHERE` clause; it does not evaluate it. Use it to steer agents toward bounded queries, not as a hard cost control. What it does not catch:
+
+| Query | Result | Why |
+|---|---|---|
+| `WHERE ts >= current_date - INTERVAL '400' DAY` | allowed | Only literal dates are compared with `max_lookback`. A computed bound (functions, intervals, parameters, subqueries) counts as a lower bound whatever its value. |
+| `WHERE ts >= DATE '2026-10-01' OR user_id = 7` | allowed | A lower bound anywhere in the `WHERE` counts, even inside an `OR` that makes it optional. |
+| `WHERE ts >= 1262304000000` (epoch milliseconds for 2010) | allowed | Only date and timestamp literals (`'YYYY-MM-DD…'`, `DATE '…'`, `TIMESTAMP '…'`) are compared; numbers are not. |
+| `WHERE CAST(ts AS DATE) >= DATE '2001-01-01'` | denied with `TIME_RANGE_REQUIRED` | The column must appear bare on one side of the comparison; wrapped in a function it is not recognized. |
+| `WHERE e.ts >= …` where `ts` belongs to another joined table | checked as if it were the guarded table's column | Columns are matched by name; the table qualifier is not checked. |
+| `WITH x AS (SELECT * FROM events) SELECT * FROM x WHERE ts >= …` | denied with `TIME_RANGE_REQUIRED` | The bound has to be on the `SELECT` that reads the table, as for `partition_predicate_required`. |
+| SQL the parser can't read | allowed | See [SQL that can't be parsed](#sql-that-cant-be-parsed). |
+
+Dates are compared in UTC, at day granularity: the earliest allowed literal is the UTC date of now minus `max_lookback`. With `max_lookback: 36h` at 10:00 UTC on October 21, that is October 19.
+
+To bound the bytes a query reads for real, combine this guard with `partition_predicate_required` on the partition column and with `maxExecutionSecs` on the cluster group.
+
+---
+
+### `no_cross_join`
+
+Blocks cartesian products: `CROSS JOIN` between tables or subqueries, a `JOIN` with no `ON` or `USING`, and `FROM a, b` with no `WHERE`. Row expansions are allowed (`CROSS JOIN UNNEST(...)`, `LATERAL`).
+
+```yaml
+guardrails:
+  global:
+    - kind: built_in
+      name: no_cross_join
+```
+
+Error code on deny: `CROSS_JOIN`
+
+---
+
+## SQL that can't be parsed
+
+Guards parse the SQL with the target engine's dialect. When parsing fails (an engine-specific construct the parser doesn't know), each guard falls back as follows:
+
+| Guard | SQL that can't be parsed |
+|---|---|
+| `read_only` | Allowed only if it starts like a read (`SELECT`, `WITH`, `SHOW`, …) and contains no write keyword. |
+| `row_limit` | Text check: warns without ` LIMIT `, denies a LIMIT above `max_rows`. No rewrite. |
+| `require_predicate` | Text check: denied when it mentions a matching table and has no ` WHERE `. |
+| `partition_predicate_required`, `time_range_limit`, `no_cross_join` | **Allowed.** |
+
+The last three narrow how much a query reads; they are not access control, so they don't block what they can't read. If you need a hard stop, combine them with `read_only`, [access control](../access-control/overview) and the cluster group's `maxExecutionSecs` (see [Routing and clusters](./routing-and-clusters#cluster-group-configuration-actual-shape)).
+
+## Configuring the new guard parameters
+
+Every built-in guard parameter (`max_rows`, `inject_limit`, `default_limit`, `applies_to`, `tables`, `max_lookback`) can be set in YAML or through the admin API (`PUT /admin/config/guardrails`, same keys). Invalid parameters are rejected when the config is saved — for example `time_range_limit` without `max_lookback`, or `row_limit` with `default_limit` larger than `max_rows`. A guard stored with invalid parameters (an older row in Postgres) denies every query with a configuration error instead of being skipped.
 
 ## Per-group overrides
 

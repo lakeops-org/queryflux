@@ -10,7 +10,10 @@ use queryflux_auth::{
 };
 use queryflux_frontend::access_control_guard::OpaAccessGuard;
 use queryflux_guardrails::{
-    built_in::{Guard, ReadOnlyGuard, RequirePredicateGuard, RowLimitGuard},
+    built_in::{
+        Guard, NoCrossJoinGuard, PartitionPredicateGuard, ReadOnlyGuard, RequirePredicateGuard,
+        RowLimitGuard, TimeRangeLimitGuard,
+    },
     config::FailBehavior,
     external::{HttpWebhookGuard, MisconfiguredGuard, PythonScriptGuard},
     GuardChain,
@@ -166,15 +169,45 @@ pub(crate) async fn load_guard_script_bodies_from_admin(
 
 pub(crate) fn resolve_built_in_guard(
     name: Option<&str>,
-    max_rows: Option<u64>,
-    applies_to: Option<Vec<String>>,
+    params: queryflux_core::config::BuiltInGuardParams,
 ) -> Box<dyn Guard> {
+    if let Err(reason) = queryflux_core::config::validate_built_in_guard(name, &params) {
+        return Box::new(MisconfiguredGuard {
+            guard_name: "built_in",
+            reason,
+        });
+    }
+    let tables: Vec<(String, String)> = params
+        .tables
+        .clone()
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
     match name {
         Some("read_only") => Box::new(ReadOnlyGuard),
-        Some("row_limit") => Box::new(RowLimitGuard { max_rows }),
-        Some("require_predicate") => Box::new(RequirePredicateGuard {
-            applies_to: applies_to.unwrap_or_default(),
+        Some("row_limit") => Box::new(RowLimitGuard {
+            max_rows: params.max_rows,
+            inject_limit: params.inject_limit.unwrap_or(false),
+            default_limit: params.default_limit,
         }),
+        Some("require_predicate") => Box::new(RequirePredicateGuard {
+            applies_to: params.applies_to.unwrap_or_default(),
+        }),
+        Some("partition_predicate_required") => Box::new(PartitionPredicateGuard { tables }),
+        Some("time_range_limit") => {
+            match params
+                .max_lookback
+                .as_deref()
+                .map(queryflux_core::config::parse_lookback)
+            {
+                Some(Ok(max_lookback)) => Box::new(TimeRangeLimitGuard {
+                    tables,
+                    max_lookback,
+                }),
+                _ => unreachable!("validate_built_in_guard requires a valid max_lookback"),
+            }
+        }
+        Some("no_cross_join") => Box::new(NoCrossJoinGuard),
         Some(other) => Box::new(MisconfiguredGuard {
             guard_name: "built_in",
             reason: format!("unsupported built_in guard name \"{other}\""),
@@ -323,8 +356,7 @@ pub(crate) fn build_chain_from_yaml_specs(
             GuardKindConfig::BuiltIn => {
                 guards.push(resolve_built_in_guard(
                     spec.name.as_deref(),
-                    spec.max_rows,
-                    spec.applies_to.clone(),
+                    spec.params.clone(),
                 ));
             }
             GuardKindConfig::PythonScript => {
@@ -385,8 +417,7 @@ pub(crate) fn build_chain_from_db_specs(
     struct DbGuardSpec {
         kind: String,
         name: Option<String>,
-        max_rows: Option<u64>,
-        applies_to: Option<Vec<String>>,
+        params: queryflux_core::config::BuiltInGuardParams,
         script_id: Option<i64>,
         script: Option<String>,
         url: Option<String>,
@@ -403,12 +434,8 @@ pub(crate) fn build_chain_from_db_specs(
                 .get("name")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string()),
-            max_rows: o.get("max_rows").and_then(|v| v.as_u64()),
-            applies_to: o.get("applies_to").and_then(|v| v.as_array()).map(|arr| {
-                arr.iter()
-                    .filter_map(|s| s.as_str().map(|s| s.to_string()))
-                    .collect()
-            }),
+            // Same keys as YAML. Malformed params fall back to defaults, which then fail validation for guards that need them.
+            params: serde_json::from_value(item.clone()).unwrap_or_default(),
             script_id: o.get("script_id").and_then(|v| v.as_i64()),
             script: o.get("script").and_then(|v| v.as_str()).map(str::to_string),
             url: o.get("url").and_then(|v| v.as_str()).map(str::to_string),
@@ -440,11 +467,7 @@ pub(crate) fn build_chain_from_db_specs(
         };
         match spec.kind.as_str() {
             "built_in" => {
-                guards.push(resolve_built_in_guard(
-                    spec.name.as_deref(),
-                    spec.max_rows,
-                    spec.applies_to,
-                ));
+                guards.push(resolve_built_in_guard(spec.name.as_deref(), spec.params));
             }
             "http_webhook" => {
                 guards.push(make_http_webhook_guard(

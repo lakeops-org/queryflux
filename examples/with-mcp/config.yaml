@@ -14,6 +14,10 @@ queryflux:
     mcp:
       enabled: true
       port: 8811
+      # The MCP endpoint is read-only by default. This demo turns on the
+      # execute_statement tool so an agent can CREATE/INSERT into the in-memory
+      # DuckDB; it still asks for confirm: true on every write.
+      allowWrites: true
   persistence:
     type: inMemory
   adminApi:

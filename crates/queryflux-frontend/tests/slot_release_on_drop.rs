@@ -231,6 +231,7 @@ fn test_state(capacity: Arc<dyn CapacityStore>) -> (Arc<AppState>, Arc<ClusterSt
         group_default_tags: HashMap::new(),
         group_max_queued_queries: HashMap::new(),
         group_capacity_wait_timeout_secs: HashMap::new(),
+        group_max_execution_secs: HashMap::new(),
         group_cache_settings: HashMap::new(),
         auth_provider: Arc::new(NoneAuthProvider::new(false)) as Arc<dyn AuthProvider>,
         authorization: Arc::new(AllowAllAuthorization::default()) as Arc<dyn AuthorizationChecker>,

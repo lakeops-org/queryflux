@@ -215,7 +215,8 @@ pub(crate) fn spawn_zombie_sweep(
     shutdown_rx: &watch::Receiver<bool>,
 ) {
     // Background task: release capacity for zombie executing queries (client disconnected
-    // before polling to completion). Runs every 120s; evicts entries not polled for > 5 min.
+    // before polling to completion), and stop queries past their group's maxExecutionSecs.
+    // Runs every 30s; evicts entries not polled for > 5 min.
     //
     // Uses `last_accessed` from persistence — updated by any proxy instance that handles
     // a poll, throttled to at most one write per 120s. Safe across multiple instances.
@@ -226,7 +227,8 @@ pub(crate) fn spawn_zombie_sweep(
         let mut shutdown_rx = shutdown_rx.clone();
         async move {
             const CLIENT_TIMEOUT_SECS: i64 = 300; // matches Trino's query.client.timeout default
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(120));
+                                                  // 30s also bounds how late a `maxExecutionSecs` limit fires for async queries.
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
             loop {
                 if !tick_or_shutdown(&mut interval, &mut shutdown_rx).await {
                     break;
@@ -267,58 +269,68 @@ pub(crate) fn spawn_zombie_sweep(
                 let Ok(all) = state.persistence.list_all().await else {
                     continue;
                 };
+                let max_execution = state.live.read().await.group_max_execution_secs.clone();
+                let now = chrono::Utc::now();
                 for q in all {
-                    if q.last_accessed < cutoff {
-                        tracing::warn!(
-                            id = %q.backend_query_id,
-                            cluster = %q.cluster_name,
-                            group = %q.cluster_group,
-                            last_accessed = %q.last_accessed,
-                            "Evicting zombie executing query — not polled for >5 min"
-                        );
-
-                        // Best-effort cancel on the backend with cluster credentials
-                        // (same path as client/admin cancel). The previous unauthenticated
-                        // DELETE on `/v1/statement/executing/...` did not stop secured Trino.
-                        let backend_id = q.backend_query_id.clone();
-                        let wire_auth = q.wire_auth.clone();
-                        let cluster = q.cluster_name.0.clone();
-                        let (engine_type, tgt_dialect) =
-                            if let Some(adapter) = state.adapter(&cluster).await {
-                                (adapter.engine_type(), adapter.translation_target_dialect())
-                            } else {
-                                state.engine_type_for_cluster(&cluster).await
-                            };
-                        state.record_executing_cancelled(
-                            &q,
-                            queryflux_core::query::FrontendProtocol::TrinoHttp,
-                            engine_type,
-                            tgt_dialect,
-                            "zombie_evicted: not polled for >5 min",
-                        );
-                        if let Some(adapter) = state.adapter(&cluster).await {
-                            tokio::spawn(async move {
-                                if let Err(e) =
-                                    adapter.cancel_query(&backend_id, wire_auth.as_ref()).await
-                                {
-                                    tracing::debug!(
-                                        "Zombie cancel request failed (best-effort): {e}"
-                                    );
-                                }
-                            });
-                        } else {
-                            tracing::debug!(
-                                cluster = %cluster,
-                                id = %q.backend_query_id,
-                                "No adapter available for zombie cancel"
-                            );
+                    let timed_out = max_execution.get(&q.cluster_group.0).filter(|&&secs| {
+                        q.creation_time + chrono::Duration::seconds(secs as i64) < now
+                    });
+                    let reason = match timed_out {
+                        Some(&secs) => {
+                            queryflux_frontend::dispatch::execution_timeout_message(secs)
                         }
+                        None if q.last_accessed < cutoff => {
+                            "zombie_evicted: not polled for >5 min".to_string()
+                        }
+                        None => continue,
+                    };
+                    tracing::warn!(
+                        id = %q.backend_query_id,
+                        cluster = %q.cluster_name,
+                        group = %q.cluster_group,
+                        last_accessed = %q.last_accessed,
+                        "Stopping executing query: {reason}"
+                    );
 
-                        state
-                            .release_query_slot(&q.cluster_group, &q.cluster_name, &q.id.0)
-                            .await;
-                        let _ = state.persistence.delete(&q.backend_query_id).await;
+                    // Best-effort cancel on the backend with cluster credentials
+                    // (same path as client/admin cancel). The previous unauthenticated
+                    // DELETE on `/v1/statement/executing/...` did not stop secured Trino.
+                    let backend_id = q.backend_query_id.clone();
+                    let wire_auth = q.wire_auth.clone();
+                    let cluster = q.cluster_name.0.clone();
+                    let (engine_type, tgt_dialect) =
+                        if let Some(adapter) = state.adapter(&cluster).await {
+                            (adapter.engine_type(), adapter.translation_target_dialect())
+                        } else {
+                            state.engine_type_for_cluster(&cluster).await
+                        };
+                    state.record_executing_cancelled(
+                        &q,
+                        queryflux_core::query::FrontendProtocol::TrinoHttp,
+                        engine_type,
+                        tgt_dialect,
+                        &reason,
+                    );
+                    if let Some(adapter) = state.adapter(&cluster).await {
+                        tokio::spawn(async move {
+                            if let Err(e) =
+                                adapter.cancel_query(&backend_id, wire_auth.as_ref()).await
+                            {
+                                tracing::debug!("Zombie cancel request failed (best-effort): {e}");
+                            }
+                        });
+                    } else {
+                        tracing::debug!(
+                            cluster = %cluster,
+                            id = %q.backend_query_id,
+                            "No adapter available for zombie cancel"
+                        );
                     }
+
+                    state
+                        .release_query_slot(&q.cluster_group, &q.cluster_name, &q.id.0)
+                        .await;
+                    let _ = state.persistence.delete(&q.backend_query_id).await;
                 }
 
                 if let Some(lock) = sweep_lock {
@@ -788,7 +800,7 @@ fn enabled_frontends(f: &queryflux_core::config::FrontendsConfig) -> Vec<String>
         ("mysqlWire", &f.mysql_wire),
         ("clickhouseHttp", &f.clickhouse_http),
         ("flightSql", &f.flight_sql),
-        ("mcp", &f.mcp),
+        ("mcp", &f.mcp.as_ref().map(|c| c.listener.clone())),
     ] {
         if let Some(c) = cfg.as_ref().filter(|c| c.enabled) {
             out.push(format!("{name}:{}", c.port));

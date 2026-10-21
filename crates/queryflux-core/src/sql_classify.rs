@@ -5,7 +5,7 @@
 use std::sync::OnceLock;
 
 use polyglot_sql::expressions::Expression;
-use polyglot_sql::DialectType;
+use polyglot_sql::{is_ddl, DialectType, ExpressionWalk};
 
 use crate::query::SqlDialect;
 
@@ -180,6 +180,107 @@ pub fn is_read_stmt(expr: &Expression) -> bool {
     )
 }
 
+/// Keywords that mark a statement as a write (or a SELECT ... INTO). Used where the SQL
+/// can't be fully parsed: an EXPLAIN's target, and the prefix fallback.
+const WRITE_KEYWORDS: &[&str] = &[
+    "INSERT", "UPDATE", "DELETE", "MERGE", "UPSERT", "CREATE", "DROP", "ALTER", "TRUNCATE", "COPY",
+    "CALL", "GRANT", "REVOKE", "VACUUM", "UNLOAD", "INTO",
+];
+const READ_HEADS: &[&str] = &[
+    "SELECT", "WITH", "VALUES", "TABLE", "SHOW", "DESCRIBE", "DESC",
+];
+
+/// Words of `sql` with their byte offsets (identifier characters only, so punctuation,
+/// parentheses, and operators separate words).
+fn words(sql: &str) -> impl Iterator<Item = (usize, &str)> {
+    sql.split(|c: char| !(c.is_alphanumeric() || c == '_'))
+        .filter(|w| !w.is_empty())
+        .map(move |w| (w.as_ptr() as usize - sql.as_ptr() as usize, w))
+}
+
+/// The statement an `EXPLAIN ...` wraps, skipping options like `ANALYZE` or `(FORMAT JSON)`.
+/// `None` when the first statement keyword is a write — `EXPLAIN ANALYZE DELETE` runs the
+/// DELETE on several engines.
+fn explained_statement(sql: &str) -> Option<&str> {
+    words(sql).skip(1).find_map(|(at, w)| {
+        let w = w.to_ascii_uppercase();
+        if READ_HEADS.contains(&w.as_str()) {
+            Some(Some(&sql[at..]))
+        } else if WRITE_KEYWORDS.contains(&w.as_str()) {
+            Some(None)
+        } else {
+            None
+        }
+    })?
+}
+
+/// Stricter than [`is_read_stmt`]: a parser catch-all `Command`
+/// counts only when it is a SHOW/DESCRIBE (`CALL`, `VACUUM`, `UNLOAD` land there too), and
+/// no node anywhere in the tree may write — that catches `SELECT ... INTO` and
+/// data-modifying CTEs (`WITH d AS (DELETE ... RETURNING *) SELECT ...`).
+pub fn is_strict_read_stmt(stmt: &Expression) -> bool {
+    let top_level_read = match stmt {
+        Expression::Command(c) => words(&c.this).next().is_some_and(|(_, w)| {
+            ["SHOW", "DESCRIBE", "DESC"].contains(&w.to_ascii_uppercase().as_str())
+        }),
+        other => is_read_stmt(other),
+    };
+    top_level_read && !stmt.contains(is_write_node)
+}
+
+fn is_write_node(e: &Expression) -> bool {
+    match e {
+        Expression::Insert(_)
+        | Expression::Update(_)
+        | Expression::Delete(_)
+        | Expression::Merge(_)
+        | Expression::Copy(_)
+        | Expression::Truncate(_) => true,
+        Expression::Select(s) => s.into.is_some(),
+        other => is_ddl(other),
+    }
+}
+
+/// Whether every statement in `sql` is a read, strictly ([`is_strict_read_stmt`]). Used by
+/// the `read_only` guard and MCP's read-only `execute_query`. `cache`, when given, must be
+/// a parse of `sql` in `dialect`; it is reused unless `sql` is an `EXPLAIN`, whose target is
+/// classified on its own.
+pub async fn is_read_only_sql(
+    sql: &str,
+    dialect: SqlDialect,
+    cache: Option<&SqlParseCache>,
+) -> bool {
+    let mut sql = strip_leading_sql_comments(sql);
+    let mut cache = cache;
+    if words(sql)
+        .next()
+        .is_some_and(|(_, w)| w.eq_ignore_ascii_case("EXPLAIN"))
+    {
+        match explained_statement(sql) {
+            Some(inner) => sql = inner,
+            None => return false,
+        }
+        cache = None;
+    }
+    let owned;
+    let cache = match cache {
+        Some(c) => c,
+        None => {
+            owned = SqlParseCache::new(sql, dialect);
+            &owned
+        }
+    };
+    match cache.statements_async().await {
+        Some(stmts) => !stmts.is_empty() && stmts.iter().all(is_strict_read_stmt),
+        // ponytail: keyword scan over-rejects reads that mention e.g. a column named
+        // "update" — only on SQL the parser can't handle, and refusing is the safe side.
+        None => {
+            is_read_like_fallback(sql)
+                && !words(sql)
+                    .any(|(_, w)| WRITE_KEYWORDS.contains(&w.to_ascii_uppercase().as_str()))
+        }
+    }
+}
 /// Classify SQL without retaining a parse cache. Prefer [`SqlParseCache`] on hot paths.
 pub fn is_read_like_sql(sql: &str, dialect: &SqlDialect) -> bool {
     SqlParseCache::new(sql, dialect.clone()).is_read_like()

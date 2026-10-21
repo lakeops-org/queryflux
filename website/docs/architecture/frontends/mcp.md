@@ -1,11 +1,11 @@
 ---
 title: MCP Frontend
-description: Model Context Protocol tool-call frontend — streamable HTTP, six tools for AI agents, and how it reuses QueryFlux's existing routing, auth, guardrails, and agent-context features.
+description: Model Context Protocol tool-call frontend — streamable HTTP, read-only by default, discovery and query tools for AI agents, and how it reuses QueryFlux's existing routing, auth, guardrails, and agent-context features.
 image: img/queryflux-hero-banner.png
 ---
 # MCP Frontend
 
-The MCP frontend lets any [Model Context Protocol](https://modelcontextprotocol.io/) client — Claude, GPT-based agents, LangChain, or a custom framework — query QueryFlux without writing custom integration code. It is implemented as a submodule of `queryflux-frontend`, the same crate every other frontend (Trino HTTP, PostgreSQL wire, MySQL wire, Flight SQL, Snowflake) lives in, and it dispatches every tool call through the exact same `execute_to_sink` pipeline: routing, SQL translation, guardrails, and query-history persistence are identical to every other frontend. There is no separate MCP-specific execution path and no MCP-specific safety policy layered on top — what you already have configured applies here too.
+The MCP frontend lets any [Model Context Protocol](https://modelcontextprotocol.io/) client — Claude, GPT-based agents, LangChain, or a custom framework — query QueryFlux without writing custom integration code. It is implemented as a submodule of `queryflux-frontend`, the same crate every other frontend (Trino HTTP, PostgreSQL wire, MySQL wire, Flight SQL, Snowflake) lives in, and it dispatches every tool call through the exact same `execute_to_sink` pipeline: routing, SQL translation, guardrails, and query-history persistence are identical to every other frontend. There is no separate MCP-specific execution path — what you already have configured applies here too. The one MCP-specific policy is the [read/write split](#read-only-by-default): `execute_query` only runs reads, and writes need a separate tool the operator has to turn on.
 
 ## Configuration
 
@@ -15,7 +15,15 @@ queryflux:
     mcp:
       enabled: true
       port: 8811
+      allowWrites: false   # default; true advertises execute_statement
 ```
+
+| Key | Default | Meaning |
+|-----|---------|---------|
+| `enabled` | `true` | Start the MCP listener. |
+| `port` | — | Required. The endpoint is served at `/mcp` on this port. |
+| `maxConnections` | unlimited | Concurrent in-flight requests. |
+| `allowWrites` | `false` | Advertise the `execute_statement` tool for writes and DDL. See [Read-only by default](#read-only-by-default). |
 
 Config key: `mcp`. Protocol identifier: `FrontendProtocol::Mcp`. Default dialect: `SqlDialect::Generic`. There is no default port — set one explicitly, same as every other optional frontend.
 
@@ -47,24 +55,45 @@ TOKEN=$(curl -s https://keycloak.internal/realms/my-realm/protocol/openid-connec
 
 ## Tools
 
-| Tool | Description |
-|------|-------------|
-| `execute_query(sql, engine_hint?, max_rows?, dialect?, ...agent context)` | Execute SQL and return rows as JSON, keyed by column name. Truncates at `max_rows` (default 1000) — a result-size bound, not a safety mechanism. |
-| `list_schemas(engine_hint?, ...agent context)` | List schemas by querying `information_schema.schemata` — the SQL-standard view every supported engine implements. |
-| `describe_table(schema?, table, sample_rows?, engine_hint?, ...agent context)` | Column metadata via `DESCRIBE`, plus a bounded sample (`SELECT * ... LIMIT sample_rows`) in the same call when `sample_rows > 0` — reduces agent round-trips. |
-| `explain_query(sql, engine_hint?, dialect?, ...agent context)` | Query plan via `EXPLAIN`, without executing the query. |
-| `get_query_status(query_id)` | Status of a query submitted via `execute_query` — `running`, `queued`, or `not_found_or_completed`. QueryFlux does not currently retain a lookup-by-id history of completed queries, so this only covers in-flight queries. |
-| `cancel_query(query_id)` | Cancel a running or queued query. Only the agent/user that submitted it may cancel it (ownership-checked, same as every other owner-scoped operation in QueryFlux). |
+| Tool | Annotations | Description |
+|------|-------------|-------------|
+| `execute_query(sql, engine_hint?, max_rows?, dialect?, ...agent context)` | `readOnlyHint` | Run a **read** statement (`SELECT`, `WITH`, `SHOW`, `DESCRIBE`, `EXPLAIN`) and return rows as JSON, keyed by column name. Anything else is rejected before dispatch. Truncates at `max_rows` (default 1000) — a result-size bound, not a safety mechanism. |
+| `execute_statement(sql, confirm, engine_hint?, dialect?, ...agent context)` | `destructiveHint` | Writes and DDL. Only exists when `allowWrites: true`. `confirm` must be `true`, or the tool returns an error telling the agent to get the user's approval first. |
+| `list_schemas(engine_hint?, ...agent context)` | `readOnlyHint` | List schemas by querying `information_schema.schemata` — the SQL-standard view every supported engine implements. |
+| `list_tables(catalog?, schema?, engine_hint?, ...agent context)` | `readOnlyHint` | List tables and views (`table_schema`, `table_name`, `table_type`) from `information_schema.tables`, capped at 1000 rows. `catalog` qualifies the view (`"<catalog>".information_schema.tables`, the Trino/Snowflake/DuckDB form); `schema` filters on `table_schema`. |
+| `describe_table(schema?, table, sample_rows?, engine_hint?, ...agent context)` | `readOnlyHint` | Column metadata via `DESCRIBE`, plus a bounded sample (`SELECT * ... LIMIT sample_rows`) in the same call when `sample_rows > 0` — reduces agent round-trips. |
+| `explain_query(sql, engine_hint?, dialect?, ...agent context)` | `readOnlyHint` | Query plan via `EXPLAIN`, without executing the query. |
+| `explain_route(sql, ...agent context)` | `readOnlyHint` | Where the query would run (cluster group, engines, the routing rule that chose it) and whether guardrails would allow, rewrite or deny it — without running it. See [route explain](../routing-and-clusters#route-explain). |
+| `get_query_status(query_id)` | `readOnlyHint` | Status of a query submitted via `execute_query` — `running`, `queued`, or `not_found_or_completed`. QueryFlux does not currently retain a lookup-by-id history of completed queries, so this only covers in-flight queries. |
+| `cancel_query(query_id)` | `idempotentHint` (not read-only, not destructive) | Cancel a running or queued query. Only the agent/user that submitted it may cancel it (ownership-checked, same as every other owner-scoped operation in QueryFlux). |
+
+The annotations are standard MCP [tool annotations](https://modelcontextprotocol.io/specification/2025-06-18/server/tools#tool-annotations). Clients use them to decide what to auto-approve: many run `readOnlyHint` tools without asking and prompt the user before a `destructiveHint` one. They are hints for the client, not enforcement; enforcement is the read-only check below and your guardrails.
+
+The server's `instructions` (sent on connect) tell the agent to discover data with `list_schemas` → `list_tables` → `describe_table`, run reads with `execute_query`, add `LIMIT`s and selective filters, and fix and retry when a guardrail rejects a query, since the error says what to change.
 
 Every tool that accepts `engine_hint` uses it as an exact cluster-group name when it matches a configured group; otherwise the query is routed normally through the configured `RouterChain` — the same routing behavior as every other frontend, just with an optional override.
 
 Every tool except `get_query_status` / `cancel_query` also accepts the optional agent-context fields — `agent_id`, `conversation_id`, `step_index`, `tool_call_id`, `query_intent` — directly as tool parameters, in addition to the `X-Agent-Id` / `X-Conversation-Id` / etc. headers every other HTTP frontend already supports. Both are optional: when neither is supplied, `agent_id`/`conversation_id` default rather than being left unset (see [Agent context defaults on MCP](../../agentic/agent-context#agent-context-defaults-on-mcp)). See [Agentic context](../../agentic/agent-context#setting-context-via-mcp-tool-parameters) for why MCP gets both paths and which one wins when both are supplied.
 
+### Read-only by default
+
+`execute_query` classifies the SQL before dispatching it, with the same parser QueryFlux uses for guardrails (the `dialect` argument if given, otherwise generic SQL), and rejects anything that isn't a read:
+
+```text
+execute_query only runs read statements (SELECT, WITH, SHOW, DESCRIBE, EXPLAIN). Writes are disabled on this endpoint; ask an operator to set frontends.mcp.allowWrites: true and use execute_statement.
+```
+
+The check is stricter than the `read_only` guard. It also rejects `SELECT ... INTO`, statements the parser only knows as a generic command (`CALL`, `VACUUM`, `UNLOAD`, …), data-modifying CTEs (`WITH d AS (DELETE … RETURNING *) SELECT …`), and an `EXPLAIN` of a write (`EXPLAIN ANALYZE DELETE` runs the delete on several engines). Every statement in a multi-statement string must be a read. SQL the parser can't handle falls back to a prefix check and is rejected if it mentions a write keyword anywhere.
+
+With `allowWrites: false` (the default) `execute_statement` is not registered at all, so `tools/list` doesn't advertise it and agents never see a write tool. With `allowWrites: true` it is listed with `destructiveHint: true` and still requires `confirm: true` on each call. `execute_query` stays read-only either way.
+
+This split is about what the agent *asks* for. It doesn't replace guardrails: both tools go through the normal dispatch path, so `read_only`, `row_limit`, scan limits, and access control still apply. To keep a group read-only for every client, use the `read_only` guard.
+
 ### The `dialect` parameter
 
 Every other frontend implies a SQL dialect from its wire protocol — a PostgreSQL wire client is assumed to write Postgres-flavored SQL, for example. MCP has no such signal: an LLM agent can write SQL in any dialect, or (more commonly) in whatever dialect the target engine itself uses. Guessing wrong is worse than not translating at all — a wrong dialect assumption can cause sqlglot to parse the SQL under the wrong syntax rules and silently rewrite it incorrectly.
 
-So `execute_query` and `explain_query` don't guess at all: with no `dialect` given, translation is skipped entirely — sqlglot is never invoked, and the SQL is sent to the target engine exactly as written (this also means any configured translation fixup scripts don't run for that call, since those need a real dialect to parse under too). This is a deliberate no-op, not an assumption — QueryFlux doesn't claim to know what dialect the SQL is in unless you tell it. Set `dialect` when the SQL was written for a *different* engine and should actually be translated before being routed. Accepted values (case-insensitive):
+So `execute_query`, `execute_statement`, and `explain_query` don't guess at all: with no `dialect` given, translation is skipped entirely — sqlglot is never invoked, and the SQL is sent to the target engine exactly as written (this also means any configured translation fixup scripts don't run for that call, since those need a real dialect to parse under too). This is a deliberate no-op, not an assumption — QueryFlux doesn't claim to know what dialect the SQL is in unless you tell it. Set `dialect` when the SQL was written for a *different* engine and should actually be translated before being routed. Accepted values (case-insensitive):
 
 `trino`, `athena`, `duckdb`, `starrocks`, `clickhouse`, `mysql`, `postgres` (or `postgresql`), `sqlite`, `snowflake`, `bigquery`, `databricks`, `tsql` (or `mssql`), `redshift`, `exasol`, `generic`.
 
@@ -72,7 +101,7 @@ An unrecognized value is rejected with an `invalid_params` error listing the acc
 
 ## Guardrails and access control
 
-MCP queries flow through the same `GuardChain` as every other frontend — built-in guards (`read_only`, `row_limit`, `require_predicate`, …), `python_script` / `http_webhook` guards, and [access control](../../access-control/overview) (`opa_access`) all apply automatically to any group that serves MCP traffic, with no MCP-specific guard code involved. There is no default guard policy baked into the MCP frontend itself; configure restrictions the same way as for any other frontend — see [Guardrails](../guardrails).
+MCP queries flow through the same `GuardChain` as every other frontend — built-in guards (`read_only`, `row_limit`, `require_predicate`, …), `python_script` / `http_webhook` guards, and [access control](../../access-control/overview) (`opa_access`) all apply automatically to any group that serves MCP traffic, with no MCP-specific guard code involved. Apart from the [read/write split](#read-only-by-default), there is no default guard policy baked into the MCP frontend itself; configure restrictions the same way as for any other frontend — see [Guardrails](../guardrails).
 
 Row filters and column masks are available via OPA access control (same pipeline as Trino HTTP and other frontends).
 

@@ -169,6 +169,106 @@ async fn list_schemas_returns_schema_names() {
 }
 
 #[tokio::test]
+async fn list_tables_filters_by_schema() {
+    // Single-connection pool: DuckDB's :memory: is per-connection, and the CREATE below
+    // must be visible to list_tables.
+    let h = ProtocolWireHarness::new_with_access_control(None)
+        .await
+        .expect("harness");
+    let client = connect(h.mcp_port).await;
+
+    let created = client
+        .call_tool(call(
+            "execute_statement",
+            serde_json::json!({ "sql": "CREATE TABLE mcp_list_t (id INT)", "confirm": true }),
+        ))
+        .await
+        .expect("call_tool execute_statement");
+    assert!(!is_error(&created), "unexpected tool error: {created:?}");
+
+    let result = client
+        .call_tool(call("list_tables", serde_json::json!({ "schema": "main" })))
+        .await
+        .expect("call_tool list_tables");
+    assert!(!is_error(&result), "unexpected tool error: {result:?}");
+    let rows = result_json(&result)["rows"].as_array().cloned().unwrap();
+    assert!(
+        rows.iter().any(|r| r["table_name"] == "mcp_list_t"),
+        "{rows:?}"
+    );
+    assert!(rows.iter().all(|r| r["table_schema"] == "main"));
+
+    let _ = client.cancel().await;
+}
+
+// ---------------------------------------------------------------------------
+// Read/write split — execute_query is read-only; writes need execute_statement
+// (advertised only with allowWrites, which the harness turns on) plus confirm.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn execute_query_rejects_writes_before_dispatch() {
+    let h = ProtocolWireHarness::new().await.expect("harness");
+    let client = connect(h.mcp_port).await;
+
+    let result = client
+        .call_tool(call(
+            "execute_query",
+            serde_json::json!({ "sql": "CREATE TABLE mcp_should_not_exist (id INT)" }),
+        ))
+        .await
+        .expect("call_tool execute_query");
+    assert!(is_error(&result));
+    assert!(result_text(&result).contains("execute_statement"));
+
+    let _ = client.cancel().await;
+}
+
+#[tokio::test]
+async fn execute_statement_requires_confirm() {
+    let h = ProtocolWireHarness::new().await.expect("harness");
+    let client = connect(h.mcp_port).await;
+
+    let refused = client
+        .call_tool(call(
+            "execute_statement",
+            serde_json::json!({ "sql": "CREATE TABLE mcp_confirm_t (id INT)" }),
+        ))
+        .await
+        .expect("call_tool execute_statement");
+    assert!(is_error(&refused));
+    assert!(result_text(&refused).contains("confirm: true"));
+
+    let ok = client
+        .call_tool(call(
+            "execute_statement",
+            serde_json::json!({ "sql": "CREATE TABLE mcp_confirm_t (id INT)", "confirm": true }),
+        ))
+        .await
+        .expect("call_tool execute_statement");
+    assert!(!is_error(&ok), "unexpected tool error: {ok:?}");
+
+    let _ = client.cancel().await;
+}
+
+#[tokio::test]
+async fn tools_list_carries_annotations() {
+    let h = ProtocolWireHarness::new().await.expect("harness");
+    let client = connect(h.mcp_port).await;
+
+    let tools = client.list_all_tools().await.expect("list tools");
+    let hints = |name: &str| {
+        let t = tools.iter().find(|t| t.name == name).expect(name);
+        t.annotations.clone().expect("annotations")
+    };
+    assert_eq!(hints("execute_query").read_only_hint, Some(true));
+    assert_eq!(hints("list_tables").read_only_hint, Some(true));
+    assert_eq!(hints("execute_statement").destructive_hint, Some(true));
+
+    let _ = client.cancel().await;
+}
+
+#[tokio::test]
 async fn describe_table_with_sample_rows() {
     let h = ProtocolWireHarness::new().await.expect("harness");
     let client = connect(h.mcp_port).await;
@@ -269,13 +369,14 @@ async fn execute_query_denied_by_read_only_guard() {
         .expect("harness");
     let client = connect(h.mcp_port).await;
 
+    // execute_statement skips the MCP read-only check, so the guard is what denies this.
     let result = client
         .call_tool(call(
-            "execute_query",
-            serde_json::json!({ "sql": "DELETE FROM information_schema.tables" }),
+            "execute_statement",
+            serde_json::json!({ "sql": "DELETE FROM information_schema.tables", "confirm": true }),
         ))
         .await
-        .expect("call_tool execute_query");
+        .expect("call_tool execute_statement");
     assert!(is_error(&result), "expected read_only guard to deny DELETE");
     assert!(
         result_text(&result)
@@ -500,4 +601,39 @@ async fn execute_query_response_conversation_id_can_be_reused_on_a_new_connectio
     );
 
     let _ = client2.cancel().await;
+}
+
+#[tokio::test]
+async fn explain_route_reports_group_engine_and_guard_verdict() {
+    let guard_chain =
+        Arc::new(GuardChain::new(vec![
+            Box::new(queryflux_guardrails::built_in::NoCrossJoinGuard) as Box<dyn Guard>,
+        ]));
+    let h = ProtocolWireHarness::new_with_guard_chain(Some(guard_chain))
+        .await
+        .expect("harness");
+    let client = connect(h.mcp_port).await;
+
+    let explain = |sql: &'static str| {
+        client.call_tool(call("explain_route", serde_json::json!({ "sql": sql })))
+    };
+    let ok = result_json(&explain("SELECT 1").await.expect("explain_route"));
+    assert!(ok["group"].is_string(), "{ok}");
+    assert_eq!(ok["clusters"][0]["engine"], "duckDb", "{ok}");
+    assert_eq!(ok["guards"]["outcome"], "allow", "{ok}");
+
+    let denied = result_json(
+        &explain("SELECT * FROM (SELECT 1) a CROSS JOIN (SELECT 2) b")
+            .await
+            .expect("explain_route"),
+    );
+    assert_eq!(denied["guards"]["outcome"], "deny", "{denied}");
+    assert!(
+        denied["guards"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("[CROSS_JOIN]")),
+        "{denied}"
+    );
+
+    let _ = client.cancel().await;
 }

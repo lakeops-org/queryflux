@@ -357,6 +357,7 @@ impl TestHarness {
             group_default_tags: HashMap::new(),
             group_max_queued_queries: HashMap::new(),
             group_capacity_wait_timeout_secs: HashMap::new(),
+            group_max_execution_secs: HashMap::new(),
             group_cache_settings: HashMap::new(),
             auth_provider: Arc::new(NoneAuthProvider::new(false)) as Arc<dyn AuthProvider>,
             authorization: Arc::new(AllowAllAuthorization::default())
@@ -610,6 +611,7 @@ impl WireTestHarness {
             group_default_tags: HashMap::new(),
             group_max_queued_queries: HashMap::new(),
             group_capacity_wait_timeout_secs: HashMap::new(),
+            group_max_execution_secs: HashMap::new(),
             group_cache_settings: HashMap::new(),
             auth_provider: Arc::new(NoneAuthProvider::new(false)) as Arc<dyn AuthProvider>,
             authorization: Arc::new(AllowAllAuthorization::default())
@@ -757,6 +759,7 @@ impl WireTestHarness {
             group_default_tags: HashMap::new(),
             group_max_queued_queries: HashMap::new(),
             group_capacity_wait_timeout_secs: HashMap::new(),
+            group_max_execution_secs: HashMap::new(),
             group_cache_settings: HashMap::new(),
             auth_provider: Arc::new(NoneAuthProvider::new(false)) as Arc<dyn AuthProvider>,
             authorization: Arc::new(AllowAllAuthorization::default())
@@ -999,6 +1002,7 @@ impl ProtocolWireHarness {
             group_default_tags: HashMap::new(),
             group_max_queued_queries: HashMap::new(),
             group_capacity_wait_timeout_secs: HashMap::new(),
+            group_max_execution_secs: HashMap::new(),
             group_cache_settings: HashMap::new(),
             auth_provider: Arc::new(NoneAuthProvider::new(false)) as Arc<dyn AuthProvider>,
             authorization: Arc::new(AllowAllAuthorization::default())
@@ -1048,7 +1052,7 @@ impl ProtocolWireHarness {
         .await?;
         let mcp_port = start_wire_frontend(
             "MCP",
-            |port| McpFrontend::new(state.clone(), port, None),
+            |port| McpFrontend::new(state.clone(), port, None, true),
             shutdown_rx,
         )
         .await?;

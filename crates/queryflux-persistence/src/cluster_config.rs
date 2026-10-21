@@ -83,6 +83,10 @@ pub struct ClusterGroupConfigRecord {
     pub members: Vec<String>,
     pub max_running_queries: i64,
     pub max_queued_queries: Option<i64>,
+    /// Settings stored in the `settings` JSON column, flattened into the API shape.
+    #[serde(flatten)]
+    #[sqlx(json)]
+    pub settings: GroupSettings,
     /// Serialised `StrategyConfig`. `null` means RoundRobin (the default).
     #[schema(value_type = Option<Object>)]
     pub strategy: Option<serde_json::Value>,
@@ -108,6 +112,21 @@ pub struct ClusterGroupConfigRecord {
     pub updated_at: DateTime<Utc>,
 }
 
+/// Group settings kept in the `settings` JSONB column. Add new group settings here: they
+/// are stored, returned by the admin API and loaded into live config without a migration.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct GroupSettings {
+    /// Seconds a query may run on the engine before it is cancelled. Omit, `null` or `0` =
+    /// no limit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_execution_secs: Option<u64>,
+    /// Seconds a query may wait for capacity before it fails. Omit, `null` or `0` = the
+    /// default (300).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capacity_wait_timeout_secs: Option<u64>,
+}
+
 /// Request body for creating or fully replacing a cluster group config.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
@@ -117,6 +136,8 @@ pub struct UpsertClusterGroupConfig {
     pub members: Vec<String>,
     pub max_running_queries: i64,
     pub max_queued_queries: Option<i64>,
+    #[serde(flatten)]
+    pub settings: GroupSettings,
     /// `null` = RoundRobin. Set to `{"type":"leastLoaded"}` etc. for other strategies.
     pub strategy: Option<serde_json::Value>,
     /// Omit or set to null to leave circuit breaking disabled.
@@ -296,6 +317,10 @@ impl UpsertClusterGroupConfig {
             members: cfg.members.clone(),
             max_running_queries: cfg.max_running_queries as i64,
             max_queued_queries: cfg.max_queued_queries.map(|v| v as i64),
+            settings: GroupSettings {
+                max_execution_secs: cfg.max_execution_secs,
+                capacity_wait_timeout_secs: cfg.capacity_wait_timeout_secs,
+            },
             strategy,
             circuit_breaker,
             allow_groups: cfg.authorization.allow_groups.clone(),
@@ -369,8 +394,8 @@ impl ClusterGroupConfigRecord {
             circuit_breaker,
             max_running_queries: self.max_running_queries as u64,
             max_queued_queries: self.max_queued_queries.map(|v| v as u64),
-            // Not persisted in Postgres yet; YAML LiveConfig path supplies the value.
-            capacity_wait_timeout_secs: None,
+            capacity_wait_timeout_secs: self.settings.capacity_wait_timeout_secs,
+            max_execution_secs: self.settings.max_execution_secs.filter(|&v| v > 0),
             authorization: queryflux_core::config::ClusterGroupAuthorizationConfig {
                 allow_groups: self.allow_groups.clone(),
                 allow_users: self.allow_users.clone(),
@@ -408,6 +433,7 @@ mod tests {
             members: vec!["c1".to_string()],
             max_running_queries: 10,
             max_queued_queries: None,
+            settings: Default::default(),
             strategy: None,
             circuit_breaker: None,
             allow_groups: vec![],
@@ -429,6 +455,7 @@ mod tests {
             max_running_queries: 10,
             max_queued_queries: None,
             capacity_wait_timeout_secs: None,
+            max_execution_secs: None,
             authorization: queryflux_core::config::ClusterGroupAuthorizationConfig {
                 allow_groups: vec![],
                 allow_users: vec![],
@@ -472,6 +499,35 @@ mod tests {
     }
 
     // --- to_core: JSONB → QueryTags ---
+
+    #[test]
+    fn group_settings_round_trip_and_stay_flat_in_the_api() {
+        let mut core = make_core_group(QueryTags::new());
+        core.max_execution_secs = Some(120);
+        core.capacity_wait_timeout_secs = Some(30);
+        let upsert = UpsertClusterGroupConfig::from_core(&core);
+
+        let mut record = make_record(serde_json::json!({}));
+        record.settings = upsert.settings.clone();
+        let back = record.to_core().unwrap();
+        assert_eq!(back.max_execution_secs, Some(120));
+        assert_eq!(back.capacity_wait_timeout_secs, Some(30));
+        record.settings.max_execution_secs = Some(0);
+        assert_eq!(record.to_core().unwrap().max_execution_secs, None);
+
+        // The admin API shape stays flat: settings sit next to the other fields.
+        let body: UpsertClusterGroupConfig = serde_json::from_value(serde_json::json!({
+            "members": ["c1"], "maxRunningQueries": 5, "maxQueuedQueries": null,
+            "strategy": null, "maxExecutionSecs": 600, "capacityWaitTimeoutSecs": 45
+        }))
+        .unwrap();
+        assert_eq!(body.settings.max_execution_secs, Some(600));
+        assert_eq!(body.settings.capacity_wait_timeout_secs, Some(45));
+        assert_eq!(
+            serde_json::to_value(&body).unwrap()["maxExecutionSecs"],
+            600
+        );
+    }
 
     #[test]
     fn to_core_key_value_tags() {

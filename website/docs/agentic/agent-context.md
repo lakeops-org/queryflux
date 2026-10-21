@@ -83,7 +83,7 @@ Parameters are extracted once at connection time.
 
 The MCP frontend accepts `X-Agent-Id` / `X-Conversation-Id` / etc. as HTTP headers on the streamable-HTTP request, exactly like the other HTTP frontends. But many MCP clients (Claude Desktop and similar consumer hosts) only let you configure headers once for the whole server connection, not per tool call — which makes headers alone a poor fit for per-query agent identity.
 
-To cover that case, every MCP tool (`execute_query`, `list_schemas`, `describe_table`, `explain_query`) also accepts the same fields as explicit, optional arguments:
+To cover that case, every MCP query tool (`execute_query`, `execute_statement`, `list_schemas`, `list_tables`, `describe_table`, `explain_query`) also accepts the same fields as explicit, optional arguments:
 
 ```json
 {

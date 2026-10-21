@@ -205,6 +205,7 @@ mod circuit_breaker_dto_tests {
         get_guardrails_config_handler,
         put_guardrails_config_handler,
         access_control_dry_run_handler,
+        route_explain_handler,
         get_access_control_config_handler,
         put_access_control_config_handler,
         get_catalog_config_handler,
@@ -451,7 +452,7 @@ pub fn build_frontends_status(
             "mcp",
             "MCP",
             "Model Context Protocol streamable-HTTP tool calls for AI agents.",
-            frontends.mcp.as_ref(),
+            frontends.mcp.as_ref().map(|c| &c.listener),
         ),
     ];
 
@@ -848,6 +849,7 @@ impl AdminFrontend {
                 "/admin/access-control/dry-run",
                 post(access_control_dry_run_handler),
             )
+            .route("/admin/route/explain", post(route_explain_handler))
             .route(
                 "/admin/config/catalog",
                 get(get_catalog_config_handler).put(put_catalog_config_handler),
@@ -2759,10 +2761,8 @@ enum WebhookFailBehavior {
 enum GuardSpecDto {
     BuiltIn {
         name: Option<String>,
-        #[serde(default)]
-        max_rows: Option<u64>,
-        #[serde(default)]
-        applies_to: Option<Vec<String>>,
+        #[serde(flatten)]
+        params: queryflux_core::config::BuiltInGuardParams,
     },
     PythonScript {
         script_id: Option<i64>,
@@ -2787,11 +2787,9 @@ enum GuardSpecDto {
 impl GuardSpecDto {
     fn validate(&self) -> std::result::Result<(), String> {
         match self {
-            GuardSpecDto::BuiltIn { name, .. } => match name.as_deref() {
-                Some("read_only" | "row_limit" | "require_predicate") => Ok(()),
-                Some(other) => Err(format!("unsupported built_in guard name \"{other}\"")),
-                None => Err("built_in guard is missing required field \"name\"".to_string()),
-            },
+            GuardSpecDto::BuiltIn { name, params } => {
+                queryflux_core::config::validate_built_in_guard(name.as_deref(), params)
+            }
             GuardSpecDto::PythonScript {
                 script_id, script, ..
             } => {
@@ -3305,6 +3303,66 @@ async fn access_control_dry_run_handler(
         obj.insert("connection".to_string(), serde_json::json!(connection));
     }
     Json(response).into_response()
+}
+
+// ---------------------------------------------------------------------------
+// Route explain: which group and engine a query would use, and the guard verdict
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+struct RouteExplainRequest {
+    sql: String,
+    /// Frontend the query would arrive on (`trinoHttp`, `postgresWire`, `mcp`, …).
+    /// Defaults to `trinoHttp`. Routers and guards see it, and it sets the SQL dialect.
+    #[serde(default)]
+    #[schema(value_type = Option<String>)]
+    protocol: Option<queryflux_core::query::FrontendProtocol>,
+    #[serde(default)]
+    identity: DryRunIdentity,
+    /// Session values routers read (e.g. `snowflake.warehouse`, client headers).
+    #[serde(default)]
+    session: HashMap<String, String>,
+}
+
+/// Explain where a query would run without running it: the cluster group, the rule that
+/// chose it (router type or fallback), each router's decision, the group's clusters and
+/// engines, and whether the guards would allow, rewrite or deny it.
+#[utoipa::path(
+    post,
+    path = "/admin/route/explain",
+    tag = "config",
+    responses(
+        (status = 200, description = "Routing explanation", body = serde_json::Value),
+        (status = 400, description = "Routing failed", body = str),
+    )
+)]
+async fn route_explain_handler(
+    State(state): State<Arc<AdminState>>,
+    Json(body): Json<RouteExplainRequest>,
+) -> impl IntoResponse {
+    let live = state.app.snapshot().await;
+    let protocol = body
+        .protocol
+        .unwrap_or(queryflux_core::query::FrontendProtocol::TrinoHttp);
+    let auth_ctx = queryflux_auth::AuthContext {
+        user: body.identity.user.clone(),
+        groups: body.identity.groups,
+        roles: body.identity.roles,
+        attributes: body.identity.attributes,
+        ..Default::default()
+    };
+    let session = queryflux_core::session::SessionContext {
+        user: (!body.identity.user.is_empty()).then_some(body.identity.user),
+        extra: body.session,
+        ..Default::default()
+    };
+    match crate::route_explain::explain_route(&live, &body.sql, &session, &protocol, &auth_ctx)
+        .await
+    {
+        Ok(explanation) => Json(explanation).into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+    }
 }
 
 // ---------------------------------------------------------------------------

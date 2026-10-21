@@ -693,6 +693,7 @@ pub(crate) fn empty_live_config() -> LiveConfig {
         group_default_tags: HashMap::new(),
         group_max_queued_queries: HashMap::new(),
         group_capacity_wait_timeout_secs: HashMap::new(),
+        group_max_execution_secs: HashMap::new(),
         group_cache_settings: HashMap::new(),
         auth_provider: Arc::new(NoneAuthProvider::new(true)),
         authorization: Arc::new(AllowAllAuthorization::default()),
@@ -1180,6 +1181,12 @@ pub(crate) async fn compile_live_config(
         .map(|(name, g)| (name.clone(), g.capacity_wait_timeout_secs_or_default()))
         .collect();
 
+    let group_max_execution_secs: HashMap<String, u64> = inputs
+        .groups
+        .iter()
+        .filter_map(|(name, g)| Some((name.clone(), g.max_execution_secs.filter(|&n| n > 0)?)))
+        .collect();
+
     let group_cache_settings: HashMap<String, queryflux_core::config::GroupCacheConfig> = inputs
         .groups
         .iter()
@@ -1243,6 +1250,7 @@ pub(crate) async fn compile_live_config(
         group_default_tags,
         group_max_queued_queries,
         group_capacity_wait_timeout_secs,
+        group_max_execution_secs,
         group_cache_settings,
         auth_provider: Arc::new(NoneAuthProvider::new(false)),
         authorization: Arc::new(AllowAllAuthorization::default()),

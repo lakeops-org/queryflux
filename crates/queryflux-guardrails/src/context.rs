@@ -35,6 +35,7 @@ pub enum GuardLayer {
 /// *is* the original (no separate translated form exists yet at that call site).
 /// `engine_type` is the eventual target engine (for guards that care which backend a
 /// query lands on).
+#[derive(Clone, Copy)]
 pub struct GuardContext<'a> {
     pub sql: &'a str,
     /// The pre-translation client SQL, when `sql` is a post-translation rendering of it.
@@ -77,11 +78,9 @@ pub enum GuardResult {
         code: Option<String>,
     },
     /// Query is permitted but the guard rewrote it. `sql` replaces the working SQL for the
-    /// rest of the pipeline. It is still source-dialect (row filters + rendered column
-    /// masks already spliced at the scan site); `maybe_translate` runs next. Only
-    /// meaningful for a guard invoked directly (the access-control guard, via
-    /// `run_access_control_stage`) — a `GuardChain` cannot carry this back to its caller
-    /// and treats it as an error (see `GuardChain::run`).
+    /// rest of the pipeline, in the dialect the guard was given (`GuardContext::dialect`):
+    /// source dialect for the access-control guard, engine dialect for a `Plan`-layer chain
+    /// (e.g. `row_limit` injecting a LIMIT). Later guards in the chain see the rewritten SQL.
     Rewrite {
         sql: String,
         metadata: Option<HashMap<String, String>>,
@@ -126,13 +125,10 @@ pub enum GuardChainOutcome {
         reason: String,
         code: Option<String>,
     },
-    /// The query may proceed unchanged. A `GuardChain` has no mechanism to carry a
-    /// `GuardResult::Rewrite` back to the caller — the one guard that ever returns
-    /// `Rewrite` (the access-control guard) runs outside any chain, on pre-translation
-    /// SQL, via its own dedicated call site (`access_control_guard::run_access_control_stage`).
-    /// A guard placed *in* a chain that returns `Rewrite` is treated as a
-    /// configuration/implementation error (see `GuardChain::run`), not silently ignored.
+    /// The query may proceed unchanged.
     Proceed,
+    /// The query may proceed, with this SQL (a guard rewrote it) instead of the input SQL.
+    Rewritten { sql: String },
 }
 
 #[cfg(test)]

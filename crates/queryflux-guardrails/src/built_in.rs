@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use polyglot_sql::expressions::{Expression, Literal};
-use queryflux_core::sql_classify::{is_read_like_fallback, is_read_stmt, to_polyglot_dialect};
+use polyglot_sql::traversal::ExpressionWalk;
+use queryflux_core::sql_classify::{is_read_only_sql, is_read_stmt, to_polyglot_dialect};
 
 use crate::context::{GuardContext, GuardLayer, GuardResult};
 
@@ -51,25 +52,14 @@ impl Guard for ReadOnlyGuard {
         GuardLayer::Plan
     }
     async fn check(&self, ctx: &GuardContext<'_>) -> GuardResult {
-        match guard_statements(ctx).await {
-            Ok(stmts) => {
-                for stmt in stmts.iter() {
-                    if !is_read_stmt(stmt) {
-                        return GuardResult::deny(
-                            "write operations are not permitted",
-                            "READ_ONLY_VIOLATION",
-                        );
-                    }
-                }
-                GuardResult::allow()
-            }
-            Err(_) => {
-                if is_read_like_fallback(ctx.sql) {
-                    GuardResult::allow()
-                } else {
-                    GuardResult::deny("write operations are not permitted", "READ_ONLY_VIOLATION")
-                }
-            }
+        if is_read_only_sql(ctx.sql, ctx.dialect.clone(), ctx.sql_parse).await {
+            GuardResult::allow()
+        } else {
+            GuardResult::deny(
+                "write operations are not permitted; only SELECT, SHOW, DESCRIBE and EXPLAIN \
+                 (without ANALYZE of a write) may run here",
+                "READ_ONLY_VIOLATION",
+            )
         }
     }
 }
@@ -80,6 +70,10 @@ impl Guard for ReadOnlyGuard {
 
 pub struct RowLimitGuard {
     pub max_rows: Option<u64>,
+    /// Rewrite instead of warn/deny: add `LIMIT default_limit` (or `max_rows`) when the
+    /// query has none, and lower a LIMIT above `max_rows` to `max_rows`.
+    pub inject_limit: bool,
+    pub default_limit: Option<u64>,
 }
 
 #[async_trait]
@@ -93,6 +87,12 @@ impl Guard for RowLimitGuard {
     async fn check(&self, ctx: &GuardContext<'_>) -> GuardResult {
         match guard_statements(ctx).await {
             Ok(stmts) => {
+                // ponytail: rewrite only single-statement batches; multi-statement batches warn/deny.
+                if self.inject_limit && stmts.len() == 1 && is_read_stmt(&stmts[0]) {
+                    if let Some(r) = self.rewrite_limit(ctx, &stmts[0]) {
+                        return r;
+                    }
+                }
                 for stmt in stmts.iter() {
                     if !is_read_stmt(stmt) {
                         continue;
@@ -106,10 +106,7 @@ impl Guard for RowLimitGuard {
                         Some(limit_val) => {
                             if let Some(max) = self.max_rows {
                                 if limit_val > max {
-                                    return GuardResult::deny(
-                                        format!("LIMIT {limit_val} exceeds maximum allowed {max}"),
-                                        "ROW_LIMIT_EXCEEDED",
-                                    );
+                                    return limit_exceeded(limit_val, max);
                                 }
                             }
                         }
@@ -126,16 +123,68 @@ impl Guard for RowLimitGuard {
                 if let Some(max) = self.max_rows {
                     if let Some(limit_val) = extract_limit_value_str(&upper) {
                         if limit_val > max {
-                            return GuardResult::deny(
-                                format!("LIMIT {limit_val} exceeds maximum allowed {max}"),
-                                "ROW_LIMIT_EXCEEDED",
-                            );
+                            return limit_exceeded(limit_val, max);
                         }
                     }
                 }
                 GuardResult::allow()
             }
         }
+    }
+}
+
+impl RowLimitGuard {
+    /// `Some(Rewrite)` when the statement needs a new or lower LIMIT, `None` when it is fine
+    /// as is or can't be rewritten (non-literal LIMIT, unsupported statement shape).
+    fn rewrite_limit(&self, ctx: &GuardContext<'_>, stmt: &Expression) -> Option<GuardResult> {
+        let target = match (
+            top_level_limit(stmt),
+            has_top_level_limit(stmt),
+            self.max_rows,
+        ) {
+            (Some(v), _, Some(max)) if v > max => max,
+            (None, false, _) => self.default_limit.or(self.max_rows)?,
+            _ => return None,
+        };
+        let mut stmt = stmt.clone();
+        let n = Expression::number(i64::try_from(target).ok()?);
+        match &mut stmt {
+            Expression::Select(s) => {
+                s.limit = Some(polyglot_sql::expressions::Limit {
+                    this: n,
+                    percent: false,
+                    comments: Vec::new(),
+                })
+            }
+            Expression::Union(u) => u.limit = Some(Box::new(n)),
+            Expression::Intersect(i) => i.limit = Some(Box::new(n)),
+            Expression::Except(e) => e.limit = Some(Box::new(n)),
+            _ => return None,
+        }
+        let sql = polyglot_sql::generate(&stmt, to_polyglot_dialect(ctx.dialect)).ok()?;
+        let mut metadata = std::collections::HashMap::new();
+        metadata.insert("limit".to_string(), target.to_string());
+        Some(GuardResult::Rewrite {
+            sql,
+            metadata: Some(metadata),
+        })
+    }
+}
+
+fn limit_exceeded(limit_val: u64, max: u64) -> GuardResult {
+    GuardResult::deny(
+        format!("LIMIT {limit_val} exceeds maximum allowed {max}; use LIMIT {max} or less"),
+        "ROW_LIMIT_EXCEEDED",
+    )
+}
+
+fn has_top_level_limit(expr: &Expression) -> bool {
+    match expr {
+        Expression::Select(s) => s.limit.is_some() || s.fetch.is_some(),
+        Expression::Union(u) => u.limit.is_some(),
+        Expression::Intersect(i) => i.limit.is_some(),
+        Expression::Except(e) => e.limit.is_some(),
+        _ => true,
     }
 }
 
@@ -252,17 +301,250 @@ fn select_lacks_where(expr: &Expression, patterns: &[String]) -> bool {
 /// Check whether a FROM-clause expression references a table matching any pattern.
 fn from_expr_matches(expr: &Expression, patterns: &[String]) -> bool {
     match expr {
-        Expression::Table(t) => {
-            let full_name = match &t.schema {
-                Some(s) => format!("{}.{}", s.name, t.name.name),
-                None => t.name.name.clone(),
-            };
-            patterns
-                .iter()
-                .any(|p| simple_glob_match(&full_name.to_uppercase(), &p.to_uppercase()))
+        Expression::Table(_) | Expression::Alias(_) => {
+            table_name(expr).is_some_and(|name| patterns.iter().any(|p| table_matches(&name, p)))
         }
-        Expression::Alias(a) => from_expr_matches(&a.this, patterns),
         _ => false,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// partition_predicate_required — chosen tables must be filtered on their partition column
+// ---------------------------------------------------------------------------
+
+pub struct PartitionPredicateGuard {
+    /// (table glob pattern, partition column).
+    pub tables: Vec<(String, String)>,
+}
+
+#[async_trait]
+impl Guard for PartitionPredicateGuard {
+    fn name(&self) -> &'static str {
+        "partition_predicate_required"
+    }
+    fn layer(&self) -> GuardLayer {
+        GuardLayer::Plan
+    }
+    async fn check(&self, ctx: &GuardContext<'_>) -> GuardResult {
+        // Unparseable SQL is allowed: this guard narrows scans, it is not an access control.
+        let Ok(stmts) = guard_statements(ctx).await else {
+            return GuardResult::allow();
+        };
+        for (select, table, column) in guarded_scans(&stmts, &self.tables) {
+            let filtered = select
+                .where_clause
+                .as_ref()
+                .is_some_and(|w| w.this.contains(|e| is_column(e, column)));
+            if !filtered {
+                return GuardResult::deny(
+                    format!(
+                        "query on {table} must filter on its partition column {column}; \
+                         add a WHERE condition on {column} (e.g. {column} = <value> or \
+                         {column} >= <start>)"
+                    ),
+                    "PARTITION_PREDICATE_REQUIRED",
+                );
+            }
+        }
+        GuardResult::allow()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// time_range_limit — chosen tables need a lower bound on a time column within a lookback
+// ---------------------------------------------------------------------------
+
+pub struct TimeRangeLimitGuard {
+    /// (table glob pattern, time column).
+    pub tables: Vec<(String, String)>,
+    pub max_lookback: chrono::Duration,
+}
+
+#[async_trait]
+impl Guard for TimeRangeLimitGuard {
+    fn name(&self) -> &'static str {
+        "time_range_limit"
+    }
+    fn layer(&self) -> GuardLayer {
+        GuardLayer::Plan
+    }
+    async fn check(&self, ctx: &GuardContext<'_>) -> GuardResult {
+        let Ok(stmts) = guard_statements(ctx).await else {
+            return GuardResult::allow();
+        };
+        let earliest = (chrono::Utc::now() - self.max_lookback).date_naive();
+        for (select, table, column) in guarded_scans(&stmts, &self.tables) {
+            let bounds: Vec<&Expression> = select
+                .where_clause
+                .iter()
+                .flat_map(|w| lower_bounds(&w.this, column))
+                .collect();
+            let hint = format!("add e.g. WHERE {column} >= DATE '{earliest}'");
+            if bounds.is_empty() {
+                return GuardResult::deny(
+                    format!("query on {table} must bound {column} from below; {hint}"),
+                    "TIME_RANGE_REQUIRED",
+                );
+            }
+            // ponytail: only literal dates are checked; expressions like
+            // `current_date - INTERVAL '7' DAY` are trusted. Evaluate them if agents abuse it.
+            if bounds
+                .iter()
+                .filter_map(|b| literal_date(b))
+                .any(|d| d < earliest)
+            {
+                return GuardResult::deny(
+                    format!(
+                        "query on {table} reaches further back on {column} than allowed \
+                         (earliest {earliest}); {hint}"
+                    ),
+                    "TIME_RANGE_EXCEEDED",
+                );
+            }
+        }
+        GuardResult::allow()
+    }
+}
+
+/// Right-hand sides of `col >= x`, `col > x`, `x <= col`, `x < col`, `col BETWEEN x AND y`.
+// ponytail: an OR anywhere in the WHERE can widen the range; not detected.
+fn lower_bounds<'e>(pred: &'e Expression, column: &str) -> Vec<&'e Expression> {
+    pred.dfs()
+        .filter_map(|e| match e {
+            Expression::Gte(op) | Expression::Gt(op) if is_column(&op.left, column) => {
+                Some(&op.right)
+            }
+            Expression::Lte(op) | Expression::Lt(op) if is_column(&op.right, column) => {
+                Some(&op.left)
+            }
+            Expression::Between(b) if !b.not && is_column(&b.this, column) => Some(&b.low),
+            _ => None,
+        })
+        .collect()
+}
+
+fn literal_date(expr: &Expression) -> Option<chrono::NaiveDate> {
+    match expr {
+        Expression::Cast(c) => literal_date(&c.this),
+        Expression::Literal(lit) => match lit.as_ref() {
+            Literal::String(s)
+            | Literal::Date(s)
+            | Literal::Timestamp(s)
+            | Literal::Datetime(s) => {
+                chrono::NaiveDate::parse_from_str(s.get(..10)?, "%Y-%m-%d").ok()
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// no_cross_join — reject cartesian products
+// ---------------------------------------------------------------------------
+
+pub struct NoCrossJoinGuard;
+
+#[async_trait]
+impl Guard for NoCrossJoinGuard {
+    fn name(&self) -> &'static str {
+        "no_cross_join"
+    }
+    fn layer(&self) -> GuardLayer {
+        GuardLayer::Plan
+    }
+    async fn check(&self, ctx: &GuardContext<'_>) -> GuardResult {
+        use polyglot_sql::expressions::JoinKind;
+        let Ok(stmts) = guard_statements(ctx).await else {
+            return GuardResult::allow();
+        };
+        for select in stmts.iter().flat_map(selects) {
+            let comma_join = select
+                .from
+                .as_ref()
+                .is_some_and(|f| f.expressions.len() > 1)
+                && select.where_clause.is_none();
+            // CROSS JOIN UNNEST(...) / LATERAL are row expansions, not cartesian products.
+            let cross = select.joins.iter().any(|j| {
+                is_relation(&j.this)
+                    && match j.kind {
+                        JoinKind::Cross => true,
+                        JoinKind::Inner
+                        | JoinKind::Left
+                        | JoinKind::Right
+                        | JoinKind::Full
+                        | JoinKind::Outer => j.on.is_none() && j.using.is_empty(),
+                        _ => false,
+                    }
+            });
+            if comma_join || cross {
+                return GuardResult::deny(
+                    "query contains a cross join (cartesian product); join with an ON \
+                     condition, or filter the joined tables in WHERE",
+                    "CROSS_JOIN",
+                );
+            }
+        }
+        GuardResult::allow()
+    }
+}
+
+/// Tables, subqueries and table functions; not UNNEST / LATERAL row expansions.
+fn is_relation(expr: &Expression) -> bool {
+    match expr {
+        Expression::Alias(a) => is_relation(&a.this),
+        Expression::Unnest(_) | Expression::Lateral(_) => false,
+        _ => true,
+    }
+}
+
+fn is_column(expr: &Expression, column: &str) -> bool {
+    matches!(expr, Expression::Column(c) if c.name.name.eq_ignore_ascii_case(column))
+}
+
+/// Every SELECT in a statement: the outer one, CTEs, subqueries and set-operation arms.
+fn selects(stmt: &Expression) -> impl Iterator<Item = &polyglot_sql::expressions::Select> {
+    stmt.dfs().filter_map(|e| match e {
+        Expression::Select(s) => Some(s.as_ref()),
+        _ => None,
+    })
+}
+
+/// (select, table name, column) for each table that matches a configured pattern and is
+/// read directly by that SELECT (FROM or JOIN).
+fn guarded_scans<'a>(
+    stmts: &'a [Expression],
+    tables: &'a [(String, String)],
+) -> Vec<(&'a polyglot_sql::expressions::Select, String, &'a str)> {
+    let mut out = Vec::new();
+    for select in stmts.iter().flat_map(selects) {
+        let sources = select
+            .from
+            .iter()
+            .flat_map(|f| f.expressions.iter())
+            .chain(select.joins.iter().map(|j| &j.this));
+        for source in sources {
+            let Some(name) = table_name(source) else {
+                continue;
+            };
+            for (pattern, column) in tables {
+                if table_matches(&name, pattern) {
+                    out.push((select, name.clone(), column.as_str()));
+                }
+            }
+        }
+    }
+    out
+}
+
+fn table_name(expr: &Expression) -> Option<String> {
+    match expr {
+        Expression::Alias(a) => table_name(&a.this),
+        Expression::Table(t) => Some(match &t.schema {
+            Some(s) => format!("{}.{}", s.name, t.name.name),
+            None => t.name.name.clone(),
+        }),
+        _ => None,
     }
 }
 
@@ -270,36 +552,47 @@ fn from_expr_matches(expr: &Expression, patterns: &[String]) -> bool {
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// Heuristic for SQL that doesn't parse: does the text mention a matching table?
 fn table_name_matches_any_str(upper_sql: &str, patterns: &[String]) -> bool {
-    patterns
-        .iter()
-        .any(|p| simple_glob_match(upper_sql, &p.to_uppercase()))
+    patterns.iter().any(|p| {
+        p.split('*')
+            .filter(|part| !part.is_empty())
+            .all(|part| upper_sql.contains(&part.to_uppercase()))
+    })
 }
 
-/// Simple glob: `*` matches any sequence of characters.
-fn simple_glob_match(haystack: &str, pattern: &str) -> bool {
-    if !pattern.contains('*') {
-        return haystack.contains(pattern);
-    }
-    let parts: Vec<&str> = pattern.split('*').collect();
-    let mut pos = 0usize;
-    for (i, part) in parts.iter().enumerate() {
-        if part.is_empty() {
-            continue;
+/// Whether table `name` (`table` or `schema.table`) matches a configured pattern. The
+/// match is exact and ignores case; `*` matches any run of characters. A pattern without a
+/// `.` is matched against the table name alone, so `events` matches `events` and
+/// `analytics.events` but not `events_archive`; a pattern with a `.` (`dw.fct_*`) is
+/// matched against `schema.table`.
+fn table_matches(name: &str, pattern: &str) -> bool {
+    let target = if pattern.contains('.') {
+        name
+    } else {
+        name.rsplit('.').next().unwrap_or(name)
+    };
+    glob_match(&target.to_uppercase(), &pattern.to_uppercase())
+}
+
+/// Anchored glob: the whole of `text` must match `pattern`, `*` matching any run.
+fn glob_match(text: &str, pattern: &str) -> bool {
+    let mut parts = pattern.split('*');
+    let first = parts.next().unwrap_or("");
+    let Some(mut rest) = text.strip_prefix(first) else {
+        return false;
+    };
+    let mut parts: Vec<&str> = parts.collect();
+    let Some(last) = parts.pop() else {
+        return rest.is_empty(); // no `*`: exact match
+    };
+    for part in parts {
+        match rest.find(part) {
+            Some(i) => rest = &rest[i + part.len()..],
+            None => return false,
         }
-        if i == 0 {
-            if !haystack.starts_with(*part) {
-                return false;
-            }
-            pos = part.len();
-        } else {
-            match haystack[pos..].find(*part) {
-                Some(found) => pos += found + part.len(),
-                None => return false,
-            }
-        }
     }
-    true
+    rest.len() >= last.len() && rest.ends_with(last)
 }
 
 #[cfg(test)]
@@ -535,6 +828,8 @@ SELECT 3 AS n
         let tc = TestCtx::new("SELECT * FROM t");
         let g = RowLimitGuard {
             max_rows: Some(1000),
+            inject_limit: false,
+            default_limit: None,
         };
         let r = g.check(&tc.ctx()).await;
         assert!(matches!(r, GuardResult::Warn { .. }));
@@ -546,6 +841,8 @@ SELECT 3 AS n
         let tc = TestCtx::new(sql);
         let g = RowLimitGuard {
             max_rows: Some(1000),
+            inject_limit: false,
+            default_limit: None,
         };
         let r = g.check(&tc.ctx()).await;
         assert!(!r.is_deny());
@@ -557,6 +854,8 @@ SELECT 3 AS n
         let tc = TestCtx::new(sql);
         let g = RowLimitGuard {
             max_rows: Some(1000),
+            inject_limit: false,
+            default_limit: None,
         };
         let r = g.check(&tc.ctx()).await;
         assert!(r.is_deny());
@@ -569,6 +868,8 @@ SELECT 3 AS n
         let tc = TestCtx::new(sql);
         let g = RowLimitGuard {
             max_rows: Some(1000),
+            inject_limit: false,
+            default_limit: None,
         };
         let r = g.check(&tc.ctx()).await;
         assert!(!r.is_deny());
@@ -577,7 +878,11 @@ SELECT 3 AS n
     #[tokio::test]
     async fn row_limit_warns_when_max_rows_disabled_and_no_limit() {
         let tc = TestCtx::new("SELECT * FROM t");
-        let g = RowLimitGuard { max_rows: None };
+        let g = RowLimitGuard {
+            max_rows: None,
+            inject_limit: false,
+            default_limit: None,
+        };
         let r = g.check(&tc.ctx()).await;
         assert!(matches!(r, GuardResult::Warn { .. }));
     }
@@ -588,6 +893,8 @@ SELECT 3 AS n
         let tc = TestCtx::new(sql);
         let g = RowLimitGuard {
             max_rows: Some(1000),
+            inject_limit: false,
+            default_limit: None,
         };
         let r = g.check(&tc.ctx()).await;
         assert!(!r.is_deny());
@@ -599,6 +906,8 @@ SELECT 3 AS n
         let tc = TestCtx::new(sql);
         let g = RowLimitGuard {
             max_rows: Some(500),
+            inject_limit: false,
+            default_limit: None,
         };
         let r = g.check(&tc.ctx()).await;
         assert!(!r.is_deny());
@@ -611,6 +920,8 @@ SELECT 3 AS n
         let tc = TestCtx::new(sql);
         let g = RowLimitGuard {
             max_rows: Some(100),
+            inject_limit: false,
+            default_limit: None,
         };
         let r = g.check(&tc.ctx()).await;
         assert!(!r.is_deny());
@@ -623,6 +934,8 @@ SELECT 3 AS n
         let tc = TestCtx::new(sql);
         let g = RowLimitGuard {
             max_rows: Some(1000),
+            inject_limit: false,
+            default_limit: None,
         };
         let r = g.check(&tc.ctx()).await;
         assert!(matches!(r, GuardResult::Warn { .. }));
@@ -634,6 +947,8 @@ SELECT 3 AS n
         let tc = TestCtx::new(sql);
         let g = RowLimitGuard {
             max_rows: Some(100),
+            inject_limit: false,
+            default_limit: None,
         };
         let r = g.check(&tc.ctx()).await;
         assert!(!r.is_deny());
@@ -646,6 +961,8 @@ SELECT 3 AS n
         let tc = TestCtx::new(sql);
         let g = RowLimitGuard {
             max_rows: Some(1000),
+            inject_limit: false,
+            default_limit: None,
         };
         let r = g.check(&tc.ctx()).await;
         assert!(matches!(r, GuardResult::Warn { .. }));
@@ -666,6 +983,8 @@ LIMIT 50
         let tc = TestCtx::new(sql);
         let g = RowLimitGuard {
             max_rows: Some(100),
+            inject_limit: false,
+            default_limit: None,
         };
         let r = g.check(&tc.ctx()).await;
         assert!(!r.is_deny());
@@ -682,6 +1001,8 @@ SELECT * FROM x CROSS JOIN y
         let tc = TestCtx::new(sql);
         let g = RowLimitGuard {
             max_rows: Some(10000),
+            inject_limit: false,
+            default_limit: None,
         };
         let r = g.check(&tc.ctx()).await;
         assert!(matches!(r, GuardResult::Warn { .. }));
@@ -693,6 +1014,8 @@ SELECT * FROM x CROSS JOIN y
         let tc = TestCtx::new(sql).with_engine(EngineType::Adbc);
         let g = RowLimitGuard {
             max_rows: Some(100),
+            inject_limit: false,
+            default_limit: None,
         };
         let r = g.check(&tc.ctx()).await;
         assert!(!r.is_deny());
@@ -704,6 +1027,8 @@ SELECT * FROM x CROSS JOIN y
         let tc = TestCtx::new(sql).with_engine(EngineType::Adbc);
         let g = RowLimitGuard {
             max_rows: Some(100),
+            inject_limit: false,
+            default_limit: None,
         };
         let r = g.check(&tc.ctx()).await;
         assert!(r.is_deny());
@@ -868,5 +1193,244 @@ SELECT order_id, amount FROM filtered
         let g = RequirePredicateGuard { applies_to: vec![] };
         let r = g.check(&tc.ctx()).await;
         assert!(!r.is_deny());
+    }
+
+    fn rewritten(r: GuardResult) -> String {
+        match r {
+            GuardResult::Rewrite { sql, .. } => sql,
+            other => panic!("expected Rewrite, got {other:?}"),
+        }
+    }
+
+    fn inject(max_rows: Option<u64>, default_limit: Option<u64>) -> RowLimitGuard {
+        RowLimitGuard {
+            max_rows,
+            inject_limit: true,
+            default_limit,
+        }
+    }
+
+    #[tokio::test]
+    async fn row_limit_injects_default_limit() {
+        let tc = TestCtx::new("SELECT a FROM t WHERE b = 1");
+        let sql = rewritten(inject(Some(1000), Some(100)).check(&tc.ctx()).await);
+        assert!(sql.to_uppercase().ends_with("LIMIT 100"), "{sql}");
+    }
+
+    #[tokio::test]
+    async fn row_limit_injects_max_rows_without_default() {
+        let tc = TestCtx::new("SELECT a FROM t UNION ALL SELECT a FROM u");
+        let sql = rewritten(inject(Some(1000), None).check(&tc.ctx()).await);
+        assert!(sql.to_uppercase().ends_with("LIMIT 1000"), "{sql}");
+    }
+
+    #[tokio::test]
+    async fn row_limit_caps_limit_over_max() {
+        let tc = TestCtx::new("SELECT a FROM t LIMIT 5000");
+        let sql = rewritten(inject(Some(1000), None).check(&tc.ctx()).await);
+        assert!(sql.to_uppercase().ends_with("LIMIT 1000"), "{sql}");
+    }
+
+    #[tokio::test]
+    async fn row_limit_inject_leaves_small_limit_and_writes_alone() {
+        for sql in ["SELECT a FROM t LIMIT 10", "INSERT INTO t VALUES (1)"] {
+            let tc = TestCtx::new(sql);
+            let r = inject(Some(1000), None).check(&tc.ctx()).await;
+            assert!(matches!(r, GuardResult::Allow { .. }), "{sql}: {r:?}");
+        }
+    }
+
+    fn partition() -> PartitionPredicateGuard {
+        PartitionPredicateGuard {
+            tables: vec![("events".into(), "dt".into())],
+        }
+    }
+
+    #[tokio::test]
+    async fn partition_predicate_denies_missing_filter() {
+        for sql in [
+            "SELECT * FROM events",
+            "SELECT * FROM events WHERE user_id = 1",
+            "SELECT * FROM users u JOIN events e ON u.id = e.user_id WHERE u.id = 1",
+            "WITH x AS (SELECT * FROM events) SELECT * FROM x WHERE dt = '2026-01-01'",
+        ] {
+            let tc = TestCtx::new(sql);
+            let r = partition().check(&tc.ctx()).await;
+            match r {
+                GuardResult::Deny { reason, code } => {
+                    assert_eq!(code.as_deref(), Some("PARTITION_PREDICATE_REQUIRED"));
+                    assert!(reason.contains("dt"), "{reason}");
+                }
+                other => panic!("{sql}: expected deny, got {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn partition_predicate_allows_filter_and_other_tables() {
+        for sql in [
+            "SELECT * FROM events WHERE dt = '2026-01-01'",
+            "SELECT * FROM analytics.events e WHERE e.dt >= DATE '2026-01-01' AND e.x = 1",
+            "SELECT * FROM users",
+        ] {
+            let tc = TestCtx::new(sql);
+            assert!(!partition().check(&tc.ctx()).await.is_deny(), "{sql}");
+        }
+    }
+
+    fn time_range() -> TimeRangeLimitGuard {
+        TimeRangeLimitGuard {
+            tables: vec![("events".into(), "ts".into())],
+            max_lookback: chrono::Duration::days(30),
+        }
+    }
+
+    #[tokio::test]
+    async fn time_range_requires_lower_bound() {
+        for sql in [
+            "SELECT * FROM events",
+            "SELECT * FROM events WHERE ts <= DATE '2026-01-01'",
+        ] {
+            let tc = TestCtx::new(sql);
+            let r = time_range().check(&tc.ctx()).await;
+            assert!(
+                matches!(&r, GuardResult::Deny { code: Some(c), .. } if c == "TIME_RANGE_REQUIRED"),
+                "{sql}: {r:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn time_range_denies_too_old_literal() {
+        let tc = TestCtx::new("SELECT * FROM events WHERE ts >= DATE '2001-01-01'");
+        let r = time_range().check(&tc.ctx()).await;
+        assert!(
+            matches!(&r, GuardResult::Deny { code: Some(c), .. } if c == "TIME_RANGE_EXCEEDED"),
+            "{r:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn time_range_allows_recent_or_computed_bound() {
+        let recent = (chrono::Utc::now() - chrono::Duration::days(3)).date_naive();
+        for sql in [
+            format!("SELECT * FROM events WHERE ts >= DATE '{recent}'"),
+            format!("SELECT * FROM events WHERE ts BETWEEN '{recent}' AND '2999-01-01'"),
+            "SELECT * FROM events WHERE ts > current_date - INTERVAL '7' DAY".to_string(),
+            "SELECT * FROM users".to_string(),
+        ] {
+            let tc = TestCtx::new(&sql);
+            let r = time_range().check(&tc.ctx()).await;
+            assert!(!r.is_deny(), "{sql}: {r:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn no_cross_join_denies_cartesian_products() {
+        for sql in [
+            "SELECT * FROM a CROSS JOIN b",
+            "SELECT * FROM a, b",
+            "SELECT * FROM a JOIN (SELECT * FROM c) s ON a.id = s.id CROSS JOIN b",
+        ] {
+            let tc = TestCtx::new(sql);
+            let r = NoCrossJoinGuard.check(&tc.ctx()).await;
+            assert!(
+                matches!(&r, GuardResult::Deny { code: Some(c), .. } if c == "CROSS_JOIN"),
+                "{sql}: {r:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn no_cross_join_allows_joins_with_conditions() {
+        for sql in [
+            "SELECT * FROM a JOIN b ON a.id = b.id",
+            "SELECT * FROM a LEFT JOIN b USING (id)",
+            "SELECT * FROM a, b WHERE a.id = b.id",
+            "SELECT * FROM a",
+        ] {
+            let tc = TestCtx::new(sql);
+            let r = NoCrossJoinGuard.check(&tc.ctx()).await;
+            assert!(!r.is_deny(), "{sql}: {r:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn no_cross_join_allows_unnest() {
+        let tc = TestCtx::new("SELECT * FROM t CROSS JOIN UNNEST(t.items) AS u(item)")
+            .with_engine(EngineType::Trino);
+        let r = NoCrossJoinGuard.check(&tc.ctx()).await;
+        assert!(!r.is_deny(), "{r:?}");
+    }
+
+    #[tokio::test]
+    async fn read_only_blocks_writes_hidden_in_reads() {
+        for sql in [
+            "EXPLAIN ANALYZE DELETE FROM t",
+            "SELECT * INTO t2 FROM t",
+            "WITH d AS (DELETE FROM t RETURNING *) SELECT * FROM d",
+            "CALL system.drop_stats('t')",
+        ] {
+            let tc = TestCtx::new(sql).with_engine(EngineType::Trino);
+            let r = ReadOnlyGuard.check(&tc.ctx()).await;
+            assert!(r.is_deny(), "{sql}: {r:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn read_only_allows_explain_of_select() {
+        let tc = TestCtx::new("EXPLAIN SELECT * FROM t").with_engine(EngineType::Trino);
+        assert!(!ReadOnlyGuard.check(&tc.ctx()).await.is_deny());
+    }
+
+    /// The documented limits of `time_range_limit` (guardrails.md, "Limits").
+    #[tokio::test]
+    async fn time_range_documented_limits() {
+        for (sql, denied) in [
+            (
+                "SELECT * FROM events WHERE ts >= current_date - INTERVAL '400' DAY",
+                false,
+            ),
+            (
+                "SELECT * FROM events WHERE ts >= DATE '2001-01-01' OR user_id = 7",
+                true,
+            ),
+            ("SELECT * FROM events WHERE ts >= 1262304000000", false),
+            (
+                "SELECT * FROM events WHERE CAST(ts AS DATE) >= DATE '2001-01-01'",
+                true,
+            ),
+        ] {
+            let tc = TestCtx::new(sql);
+            let r = time_range().check(&tc.ctx()).await;
+            assert_eq!(r.is_deny(), denied, "{sql}: {r:?}");
+        }
+        // A recent bound inside an OR is accepted.
+        let recent = (chrono::Utc::now() - chrono::Duration::days(1)).date_naive();
+        let sql = format!("SELECT * FROM events WHERE ts >= DATE '{recent}' OR user_id = 7");
+        let tc = TestCtx::new(&sql);
+        assert!(!time_range().check(&tc.ctx()).await.is_deny());
+    }
+
+    #[test]
+    fn table_patterns_match_exactly() {
+        for (name, pattern, expected) in [
+            ("events", "events", true),
+            ("analytics.events", "events", true),
+            ("events_archive", "events", false),
+            ("user_events", "events", false),
+            ("EVENTS", "events", true),
+            ("fct_sales", "fct_*", true),
+            ("dw.fct_sales", "fct_*", true),
+            ("dw.fct_sales", "dw.fct_*", true),
+            ("stage.fct_sales", "dw.fct_*", false),
+            ("fct_sales", "*_sales", true),
+            ("fct_sales_v2", "*_sales", false),
+            ("a_x_b", "a*b", true),
+            ("ab", "a*b", true),
+            ("anything", "*", true),
+        ] {
+            assert_eq!(table_matches(name, pattern), expected, "{name} ~ {pattern}");
+        }
     }
 }

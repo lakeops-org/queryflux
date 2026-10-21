@@ -43,6 +43,7 @@ clusterGroups:
   duckdb-local:
     maxRunningQueries: 4
     members: [duckdb-1]
+    maxExecutionSecs: 300          # optional: cancel queries running longer than 5 minutes
 
 routers:
   - type: protocolBased
@@ -57,6 +58,23 @@ routers:
 
 routingFallback: trino-default
 ```
+
+### Cluster group settings
+
+| Key | Default | Meaning |
+|---|---|---|
+| `members` | — | Cluster names in the group. |
+| `maxRunningQueries` | — | Concurrent queries per member cluster. |
+| `maxQueuedQueries` | unlimited | Queries that may wait for a slot. |
+| `capacityWaitTimeoutSecs` | 300 | How long a query may wait for a slot before it fails. |
+| `maxExecutionSecs` | no limit | How long a query may run on the engine before QueryFlux cancels it (`EXECUTION_TIMEOUT`). |
+| `strategy`, `circuitBreaker`, `authorization`, `defaultTags`, `cache` | — | See [Routing and clusters](/docs/architecture/routing-and-clusters) and [Query cache](#query-cache). |
+
+The same keys work in `PUT /admin/config/groups/{name}` when groups are managed through the admin API.
+
+:::caution
+`PUT /admin/config/groups/{name}` replaces the whole group. A client that sends a group without `maxExecutionSecs` or `capacityWaitTimeoutSecs` clears them. Read the group with `GET` first and send every field back.
+:::
 
 ## SQL translation
 
