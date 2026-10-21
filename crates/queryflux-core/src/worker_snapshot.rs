@@ -195,6 +195,20 @@ impl WorkerSnapshotV1 {
         format!("{:016x}", xxh64(&bytes, 0))
     }
 
+    /// What one site sees: only `clusters`, so another site's engines, endpoints and
+    /// credentials never reach it. Groups keep only those members; a group left empty
+    /// stays, so routers and the fallback that name it still resolve (its queries find no
+    /// cluster at this site). Re-sealed, so the site's revision differs from the full
+    /// snapshot's.
+    pub fn for_site(&self, clusters: &[String]) -> Self {
+        let mut s = self.clone();
+        s.clusters.retain(|c| clusters.contains(&c.name));
+        for g in s.groups.values_mut() {
+            g.members.retain(|m| clusters.contains(m));
+        }
+        s.seal()
+    }
+
     /// True when `revision` matches the content (the snapshot was not altered after
     /// sealing).
     pub fn is_sealed(&self) -> bool {
@@ -318,6 +332,21 @@ mod tests {
                 ..SnapshotSettings::default()
             },
         }
+    }
+
+    #[test]
+    fn a_site_sees_only_its_own_clusters() {
+        let full = snapshot(CredentialMode::Embedded).seal();
+        let site = full.for_site(&["adbc-a".to_string()]);
+        assert!(site.is_sealed());
+        assert_ne!(site.revision, full.revision);
+        let names: Vec<_> = site.clusters.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, ["adbc-a"]);
+        assert!(!serde_json::to_string(&site).unwrap().contains("s3cret"));
+        assert_eq!(site.groups["analytics"].members, ["adbc-a"]);
+        // A group left with no member stays, so routes to it still resolve.
+        let none = full.for_site(&[]);
+        assert!(none.groups["analytics"].members.is_empty());
     }
 
     #[test]

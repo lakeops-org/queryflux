@@ -77,12 +77,15 @@ queryflux:
       - name: us-east-dc1      # the agent's siteName
         tokens:                # printf %s "$TOKEN" | sha256sum
           - <64 hex characters>
+        clusters: [trino-dc1]  # optional: the only clusters this site gets
 ```
 
 A caller presenting a site's token is that site's agent, and it can act only for that site:
 - Its fleet reports and history must name its own site, or they're refused with `403`. History that names no site is attributed to the token's site.
 - Its own record is stored as `<site>/<name>`, with kind `siteAgent` and label `site` set to its site, whatever it reports.
 - It can hold capacity only as `<site>/<worker>`, the agent's holder prefix.
+
+With `clusters` set, the site's agent gets a snapshot with only those clusters: other sites' endpoints and credentials never reach it. Groups keep only those members. A group left with no member stays, so routes to it still resolve, and its queries fail at this site with no cluster available. The site gets its own revision, and the fleet view compares the site's agent and workers with it.
 
 To rotate a token, list the new hash next to the old one, restart the control plane, move the agent to the new token, then remove the old hash. Agents serve their cached config while the control plane restarts. A token can't be recovered from its hash; a lost token is replaced the same way.
 
@@ -184,6 +187,6 @@ Alert on `queryflux_agent_upstream_up == 0` lasting longer than you expect, and 
 
 ## Limitations
 
-- Upstream sends every site the whole config; it doesn't filter the snapshot per site.
+- A site without `workerApi.sites[].clusters` gets the whole config.
 - Capacity is forwarded, not held at the site. A site-wide quota held by the agent, which would keep admitting after per-worker quotas expire during a long outage, is planned.
 - Studio actions that must reach engines from inside the site (test a connection, browse a catalog) do not run through the agent yet.
