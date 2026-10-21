@@ -229,6 +229,7 @@ The migrations are forward-only: once they've run, an older QueryFlux won't star
 - **Helm, shared-service workers:** `charts/queryflux/examples/control-plane-values.yaml` and `worker-values.yaml`, one release each. Add `worker-autoscaling-values.yaml` to scale workers on load. Adding workers never raises a limit: with shared capacity, `maxRunningQueries` holds across the fleet.
 - **Native sidecar** (Kubernetes 1.29+): one worker inside each application pod. Step by step: [Add a worker as a sidecar](./worker-sidecar). The example manifest is `charts/queryflux/examples/worker-sidecar-manifest.yaml`.
 - **One worker per node:** `charts/queryflux/examples/worker-daemonset-values.yaml` runs workers as a DaemonSet. With `service.internalTrafficPolicy: Local`, apps keep one Service address, and each connection goes to the worker on the app's own node. There's no fallback while a node's worker restarts, so rollouts replace one node's worker at a time.
+- **A control plane that runs no queries** (one per tenant, serving remote sites): `charts/queryflux/examples/hosted-cell-values.yaml` and `hosted-cell-config.yaml`. With no query frontend enabled, it doesn't health-check engines, which may be unreachable from where it runs. Its ingress exposes only `/worker`, and it uses one Postgres database per instance (not one schema: QueryFlux's advisory locks and LISTEN/NOTIFY channels are scoped to the database).
 
 See the [Helm chart README](https://github.com/lakeops-org/queryflux/blob/main/charts/queryflux/README.md#worker-mode).
 

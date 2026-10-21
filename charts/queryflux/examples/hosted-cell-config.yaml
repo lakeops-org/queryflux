@@ -1,0 +1,40 @@
+# Template for a hosted cell's config Secret (examples/hosted-cell-values.yaml).
+#
+#   kubectl -n tenant-acme create secret generic queryflux-cell-config \
+#     --from-file=config.yaml=./hosted-cell-config.yaml
+#
+# The cell owns the tenant's config (in the tenant's own Postgres database) and serves it
+# to the tenant's site agents: /worker/config, capacity leases and query-history ingest.
+
+queryflux:
+  role: controlPlane
+  externalAddress: https://acme.cp.example.com
+  shutdownDrainTimeoutSecs: 30
+  # No query frontend: the cell runs no queries.
+  frontends:
+    trinoHttp:
+      enabled: false
+      port: 8080
+  persistence:
+    type: postgres
+    url: postgres://tenant_acme:<password>@postgres.example.internal:5432/tenant_acme
+    # Many cells share one Postgres cluster: keep each cell's pools small.
+    poolSize: 6
+  adminApi:
+    port: 9000
+  workerApi:
+    enabled: true
+    # The token the tenant's site agents present (siteAgent.upstream.auth.sharedSecret).
+    sharedSecret: <long-random-secret>
+    history:
+      redaction: full
+
+clusters:
+  trino-1:
+    engine: trino
+    endpoint: http://trino.acme.internal:8080
+clusterGroups:
+  analytics:
+    members: [trino-1]
+    maxRunningQueries: 20
+routingFallback: analytics

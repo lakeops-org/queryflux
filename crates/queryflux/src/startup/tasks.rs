@@ -778,7 +778,7 @@ pub(crate) fn worker_name(config: &ProxyConfig) -> String {
 /// Register with the control plane, then report sync state every heartbeat interval.
 /// Best effort: failures are logged and retried on the next tick.
 /// Enabled query frontends as `name:port`, for the worker's heartbeat.
-fn enabled_frontends(f: &queryflux_core::config::FrontendsConfig) -> Vec<String> {
+pub(crate) fn enabled_frontends(f: &queryflux_core::config::FrontendsConfig) -> Vec<String> {
     let mut out = Vec::new();
     if f.trino_http.enabled {
         out.push(format!("trinoHttp:{}", f.trino_http.port));
