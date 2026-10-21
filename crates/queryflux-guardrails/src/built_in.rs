@@ -1379,4 +1379,33 @@ SELECT order_id, amount FROM filtered
         let tc = TestCtx::new("EXPLAIN SELECT * FROM t").with_engine(EngineType::Trino);
         assert!(!ReadOnlyGuard.check(&tc.ctx()).await.is_deny());
     }
+
+    /// The documented limits of `time_range_limit` (guardrails.md, "Limits").
+    #[tokio::test]
+    async fn time_range_documented_limits() {
+        for (sql, denied) in [
+            (
+                "SELECT * FROM events WHERE ts >= current_date - INTERVAL '400' DAY",
+                false,
+            ),
+            (
+                "SELECT * FROM events WHERE ts >= DATE '2001-01-01' OR user_id = 7",
+                true,
+            ),
+            ("SELECT * FROM events WHERE ts >= 1262304000000", false),
+            (
+                "SELECT * FROM events WHERE CAST(ts AS DATE) >= DATE '2001-01-01'",
+                true,
+            ),
+        ] {
+            let tc = TestCtx::new(sql);
+            let r = time_range().check(&tc.ctx()).await;
+            assert_eq!(r.is_deny(), denied, "{sql}: {r:?}");
+        }
+        // A recent bound inside an OR is accepted.
+        let recent = (chrono::Utc::now() - chrono::Duration::days(1)).date_naive();
+        let sql = format!("SELECT * FROM events WHERE ts >= DATE '{recent}' OR user_id = 7");
+        let tc = TestCtx::new(&sql);
+        assert!(!time_range().check(&tc.ctx()).await.is_deny());
+    }
 }

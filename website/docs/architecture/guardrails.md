@@ -176,9 +176,22 @@ A query on a matching table must give the column a lower bound (`ts >= …`, `ts
 
 - **No lower bound** → `deny` with `TIME_RANGE_REQUIRED`.
 - **A literal date older than now minus `max_lookback`** → `deny` with `TIME_RANGE_EXCEEDED`. The message gives the earliest date allowed.
-- **A computed bound** such as `current_date - INTERVAL '7' DAY` is accepted as is; only literal dates are compared.
 
-A lower bound inside an `OR` counts too, so treat this guard as a guide for agents rather than a hard limit.
+#### Limits
+
+This guard reads the shape of the `WHERE` clause; it does not evaluate it. Use it to steer agents toward bounded queries, not as a hard cost control. What it does not catch:
+
+| Query | Result | Why |
+|---|---|---|
+| `WHERE ts >= current_date - INTERVAL '400' DAY` | allowed | Only literal dates are compared with `max_lookback`. A computed bound (functions, intervals, parameters, subqueries) counts as a lower bound whatever its value. |
+| `WHERE ts >= DATE '2026-10-01' OR user_id = 7` | allowed | A lower bound anywhere in the `WHERE` counts, even inside an `OR` that makes it optional. |
+| `WHERE ts >= 1262304000000` (epoch milliseconds for 2010) | allowed | Only date and timestamp literals (`'YYYY-MM-DD…'`, `DATE '…'`, `TIMESTAMP '…'`) are compared; numbers are not. |
+| `WHERE CAST(ts AS DATE) >= DATE '2001-01-01'` | denied with `TIME_RANGE_REQUIRED` | The column must appear bare on one side of the comparison; wrapped in a function it is not recognized. |
+| `WHERE e.ts >= …` where `ts` belongs to another joined table | checked as if it were the guarded table's column | Columns are matched by name; the table qualifier is not checked. |
+
+Dates are compared in UTC, at day granularity: the earliest allowed literal is the UTC date of now minus `max_lookback`. With `max_lookback: 36h` at 10:00 UTC on October 21, that is October 19.
+
+To bound the bytes a query reads for real, combine this guard with `partition_predicate_required` on the partition column and with `maxExecutionSecs` on the cluster group.
 
 ---
 

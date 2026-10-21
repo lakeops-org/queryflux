@@ -83,6 +83,9 @@ pub struct ClusterGroupConfigRecord {
     pub members: Vec<String>,
     pub max_running_queries: i64,
     pub max_queued_queries: Option<i64>,
+    /// `maxExecutionSecs`: queries running longer are cancelled. `null` = no limit.
+    #[serde(default)]
+    pub max_execution_secs: Option<i64>,
     /// Serialised `StrategyConfig`. `null` means RoundRobin (the default).
     #[schema(value_type = Option<Object>)]
     pub strategy: Option<serde_json::Value>,
@@ -117,6 +120,9 @@ pub struct UpsertClusterGroupConfig {
     pub members: Vec<String>,
     pub max_running_queries: i64,
     pub max_queued_queries: Option<i64>,
+    /// Seconds a query may run on the engine before it is cancelled. Omit or `null` = no limit.
+    #[serde(default)]
+    pub max_execution_secs: Option<i64>,
     /// `null` = RoundRobin. Set to `{"type":"leastLoaded"}` etc. for other strategies.
     pub strategy: Option<serde_json::Value>,
     /// Omit or set to null to leave circuit breaking disabled.
@@ -296,6 +302,7 @@ impl UpsertClusterGroupConfig {
             members: cfg.members.clone(),
             max_running_queries: cfg.max_running_queries as i64,
             max_queued_queries: cfg.max_queued_queries.map(|v| v as i64),
+            max_execution_secs: cfg.max_execution_secs.map(|v| v as i64),
             strategy,
             circuit_breaker,
             allow_groups: cfg.authorization.allow_groups.clone(),
@@ -371,7 +378,10 @@ impl ClusterGroupConfigRecord {
             max_queued_queries: self.max_queued_queries.map(|v| v as u64),
             // Not persisted in Postgres yet; YAML LiveConfig path supplies the value.
             capacity_wait_timeout_secs: None,
-            max_execution_secs: None,
+            max_execution_secs: self
+                .max_execution_secs
+                .and_then(|v| u64::try_from(v).ok())
+                .filter(|&v| v > 0),
             authorization: queryflux_core::config::ClusterGroupAuthorizationConfig {
                 allow_groups: self.allow_groups.clone(),
                 allow_users: self.allow_users.clone(),
@@ -409,6 +419,7 @@ mod tests {
             members: vec!["c1".to_string()],
             max_running_queries: 10,
             max_queued_queries: None,
+            max_execution_secs: None,
             strategy: None,
             circuit_breaker: None,
             allow_groups: vec![],
@@ -474,6 +485,27 @@ mod tests {
     }
 
     // --- to_core: JSONB → QueryTags ---
+
+    #[test]
+    fn max_execution_secs_round_trips_and_ignores_zero() {
+        let mut core = make_core_group(QueryTags::new());
+        core.max_execution_secs = Some(120);
+        let upsert = UpsertClusterGroupConfig::from_core(&core);
+        assert_eq!(upsert.max_execution_secs, Some(120));
+
+        let mut record = make_record(serde_json::json!({}));
+        record.max_execution_secs = upsert.max_execution_secs;
+        assert_eq!(record.to_core().unwrap().max_execution_secs, Some(120));
+        record.max_execution_secs = Some(0);
+        assert_eq!(record.to_core().unwrap().max_execution_secs, None);
+
+        let body: UpsertClusterGroupConfig = serde_json::from_value(serde_json::json!({
+            "members": ["c1"], "maxRunningQueries": 5, "maxQueuedQueries": null,
+            "strategy": null, "maxExecutionSecs": 600
+        }))
+        .unwrap();
+        assert_eq!(body.max_execution_secs, Some(600));
+    }
 
     #[test]
     fn to_core_key_value_tags() {

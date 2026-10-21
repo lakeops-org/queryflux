@@ -2127,6 +2127,7 @@ async fn get_group_config_handler(
     request_body = queryflux_persistence::cluster_config::UpsertClusterGroupConfig,
     responses(
         (status = 200, description = "Updated cluster group config record", body = queryflux_persistence::cluster_config::ClusterGroupConfigRecord),
+        (status = 400, description = "Invalid group config", body = str),
         (status = 503, description = "Postgres persistence not configured", body = str),
         (status = 500, description = "Internal error", body = str),
     )
@@ -2136,6 +2137,13 @@ async fn upsert_group_config_handler(
     Path(name): Path<String>,
     Json(body): Json<UpsertClusterGroupConfig>,
 ) -> impl IntoResponse {
+    if body.max_execution_secs.is_some_and(|v| v < 0) {
+        return (
+            StatusCode::BAD_REQUEST,
+            "maxExecutionSecs must be 0 (no limit) or a positive number of seconds",
+        )
+            .into_response();
+    }
     let pg = require_store!(state);
     match pg.upsert_group_config(&name, &body).await {
         Ok(r) => {
