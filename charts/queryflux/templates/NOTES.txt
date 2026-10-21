@@ -76,6 +76,18 @@ Read the generated password with:
 Workers connect to the worker API on the admin port:
   http(s)://{{ include "queryflux.fullname" . }}.{{ .Release.Namespace }}.svc:{{ .Values.service.ports.admin.port }}
 Worker configs carry engine credentials: serve that port over TLS outside a trusted network.
+{{- if .Values.ingress.enabled }}
+{{- range .Values.ingress.hosts }}
+{{- $host := .host }}
+{{- range .paths }}
+{{- if and (eq .servicePortName $.Values.service.ports.admin.name) (not (hasPrefix "/worker" .path)) }}
+
+WARNING: the ingress sends {{ $host }}{{ .path }} to the admin port, which also serves the
+admin API and /metrics. Expose only /worker on it (see examples/hosted-cell-values.yaml).
+{{- end }}
+{{- end }}
+{{- end }}
+{{- end }}
 {{- end }}
 {{- $persistence := dig "data" "queryflux" "persistence" "type" "inMemory" .Values.config }}
 {{- if and (eq $persistence "inMemory") $multi }}
