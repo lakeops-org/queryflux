@@ -52,7 +52,7 @@ const sidebars: SidebarsConfig = {
       type: 'category',
       label: 'Reference',
       collapsed: true,
-      items: ['configuration'],
+      items: ['configuration', 'role-configuration'],
     },
     {
       type: 'category',

@@ -36,6 +36,8 @@ The agent runs no query frontends and no engine adapters. It needs no database.
 
 ## Configuration
 
+Every key, its default and its rules: [Configuration by role](../role-configuration#site-agent).
+
 ### Site agent
 
 ```yaml

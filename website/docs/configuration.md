@@ -227,7 +227,7 @@ queryflux:
     coordination: { mode: controlPlane, onUnavailable: failClosed }
 ```
 
-Each role other than `standalone` has its own section: `queryflux.controlPlane` (`sharedSecret`, `sites`, `history.endpoint`, `history.redaction`), `queryflux.worker` and `queryflux.siteAgent`. Every key, and how config, capacity and history flow: **[Worker mode](./operations/worker-mode)**.
+Each role other than `standalone` has its own section: `queryflux.controlPlane` (`sharedSecret`, `sites`, `history.endpoint`, `history.redaction`), `queryflux.worker` and `queryflux.siteAgent`. Every key for each role: **[Configuration by role](./role-configuration)**. How config, capacity and history flow: **[Worker mode](./operations/worker-mode)**.
 
 ## Query Cache
 

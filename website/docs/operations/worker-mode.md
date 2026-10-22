@@ -41,7 +41,7 @@ Running QueryFlux without workers works exactly as before. Worker mode is opt-in
 | `worker` | No, pulled from the control plane | **Never** | No: ops listener only | No |
 | `siteAgent` | No, relayed from the control plane | **Never** | No: worker API and ops endpoints only | Yes, the workers at its site. See [Site agent](./site-agent). |
 
-Keys under `queryflux` apply to every role, except that each role other than `standalone` has its own section: `queryflux.controlPlane`, `queryflux.worker` or `queryflux.siteAgent`. A section set on another role is rejected.
+Keys under `queryflux` apply to every role, except that each role other than `standalone` has its own section: `queryflux.controlPlane`, `queryflux.worker` or `queryflux.siteAgent`. A section set on another role is rejected. Every key, its default and its rules: [Configuration by role](../role-configuration).
 
 A control plane without Postgres serves the config it started with, and its workers coordinate with `worker.coordination.mode: local`.
 
