@@ -32,6 +32,8 @@ required_files=(
   "examples/worker-sidecar-manifest.yaml"
   "examples/site-agent-values.yaml"
   "examples/site-agent-config.yaml"
+  "examples/hosted-cell-values.yaml"
+  "examples/hosted-cell-config.yaml"
   "values.yaml"
   "values.schema.json"
   "templates/_helpers.tpl"
@@ -101,5 +103,14 @@ fi
 echo "$empty_np_err" | grep -q 'non-empty networkPolicy' \
   || fail "enabled empty NetworkPolicy must fail with a clear message:
 $empty_np_err"
+
+# A control plane whose ingress sends more than /worker to the admin port must warn.
+cell_notes() {
+  helm install cell "$CHART_DIR" --dry-run=client --values "$CHART_DIR/examples/hosted-cell-values.yaml" "$@" 2>&1
+}
+grep -q "to the admin port" <<<"$(cell_notes)" \
+  && fail "hosted-cell-values.yaml must not warn about the ingress"
+grep -q "to the admin port" <<<"$(cell_notes --set "ingress.hosts[0].paths[0].path=/")" \
+  || fail "an ingress sending / to the admin port of a control plane must warn"
 
 echo "helm chart check passed"

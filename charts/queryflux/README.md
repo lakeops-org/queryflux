@@ -133,6 +133,7 @@ See [ADBC drivers](https://queryflux.dev/docs/operations/adbc-drivers) for the f
 - `examples/networkpolicy-values.yaml`: starter NetworkPolicy allowing clients, DNS, Postgres, and engines (tighten selectors before production).
 - `examples/control-plane-values.yaml` + `examples/control-plane-config.yaml`: a worker-mode control plane (Postgres, `workerApi`).
 - `examples/worker-values.yaml` + `examples/worker-config.yaml`: shared-service workers that pull config from the control plane.
+- `examples/hosted-cell-values.yaml` + `examples/hosted-cell-config.yaml`: a control plane that runs no queries, one per tenant: no query frontend or Studio, small requests and Postgres pools, an ingress that exposes only `/worker`.
 - `examples/worker-sidecar-manifest.yaml`: a worker as a native sidecar (Kubernetes 1.29+) next to an application container. This is a plain manifest, not Helm values.
 - `examples/site-agent-values.yaml` + `examples/site-agent-config.yaml`: a site agent (StatefulSet, a volume per replica) that relays a remote control plane to the workers at one site.
 
