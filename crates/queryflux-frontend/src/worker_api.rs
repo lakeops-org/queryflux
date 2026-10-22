@@ -200,7 +200,7 @@ fn caller(api: &WorkerApi, headers: &HeaderMap) -> Option<Caller> {
     let hash = format!("{:x}", sha2::Sha256::digest(token.as_bytes()));
     api.sites
         .iter()
-        .find(|s| s.token_sha256.iter().any(|h| secret_matches(&hash, h)))
+        .find(|s| s.tokens.iter().any(|h| secret_matches(&hash, h)))
         .map(|s| Caller::Site(s.name.clone()))
 }
 
@@ -1232,11 +1232,11 @@ mod tests {
             sites: vec![
                 queryflux_core::config::WorkerApiSite {
                     name: "dc1".into(),
-                    token_sha256: vec![hash("old-dc1"), hash("t-dc1")],
+                    tokens: vec![hash("old-dc1"), hash("t-dc1")],
                 },
                 queryflux_core::config::WorkerApiSite {
                     name: "dc2".into(),
-                    token_sha256: vec![hash("t-dc2")],
+                    tokens: vec![hash("t-dc2")],
                 },
             ],
         });

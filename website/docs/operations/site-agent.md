@@ -75,7 +75,7 @@ queryflux:
     # sharedSecret: omit it to accept site agents only (no worker connects directly)
     sites:
       - name: us-east-dc1      # the agent's siteName
-        tokenSha256:           # printf %s "$TOKEN" | sha256sum
+        tokens:                # printf %s "$TOKEN" | sha256sum
           - <64 hex characters>
 ```
 

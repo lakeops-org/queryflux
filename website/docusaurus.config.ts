@@ -28,9 +28,11 @@ const config: Config = {
   projectName: 'queryflux',
 
   // Baked at build/start time (Node); read in the client via siteConfig.customFields.
+  // Use || so an empty CI env (unset vars.OPENPANEL_CLIENT_ID → "") still falls back —
+  // ?? only treats null/undefined, so production was shipping clientId: "".
   customFields: {
     openPanelClientId:
-      process.env.OPENPANEL_CLIENT_ID ?? 'f88d1483-36bc-4a52-8333-7f5865e78d16',
+      process.env.OPENPANEL_CLIENT_ID || 'f88d1483-36bc-4a52-8333-7f5865e78d16',
     openPanelDisabled: process.env.OPENPANEL_DISABLED === 'true',
   },
 

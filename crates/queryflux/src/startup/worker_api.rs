@@ -105,11 +105,7 @@ pub(crate) fn worker_api(
             .iter()
             .map(|s| queryflux_core::config::WorkerApiSite {
                 name: s.name.trim().to_string(),
-                token_sha256: s
-                    .token_sha256
-                    .iter()
-                    .map(|h| h.to_ascii_lowercase())
-                    .collect(),
+                tokens: s.tokens.iter().map(|h| h.to_ascii_lowercase()).collect(),
             })
             .collect(),
     }))

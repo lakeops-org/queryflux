@@ -657,7 +657,7 @@ mod tests {
                 quotas: None,
                 sites: vec![queryflux_core::config::WorkerApiSite {
                     name: "dc1".into(),
-                    token_sha256: vec![{
+                    tokens: vec![{
                         use sha2::Digest;
                         format!("{:x}", sha2::Sha256::digest(b"site-secret"))
                     }],

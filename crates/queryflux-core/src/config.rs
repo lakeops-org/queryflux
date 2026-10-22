@@ -1255,7 +1255,7 @@ pub struct WorkerApiSite {
     pub name: String,
     /// Hex SHA-256 of each token accepted for this site (`printf %s "$TOKEN" | sha256sum`).
     /// List two while rotating.
-    pub token_sha256: Vec<String>,
+    pub tokens: Vec<String>,
 }
 
 impl WorkerApiConfig {
@@ -1282,19 +1282,19 @@ impl WorkerApiConfig {
                     "queryflux.workerApi.sites: '{name}' is listed twice"
                 ));
             }
-            if site.token_sha256.is_empty() {
+            if site.tokens.is_empty() {
                 issues.push(format!(
-                    "queryflux.workerApi.sites['{name}'].tokenSha256 is empty"
+                    "queryflux.workerApi.sites['{name}'].tokens is empty"
                 ));
             }
-            for hash in &site.token_sha256 {
+            for hash in &site.tokens {
                 if hash.len() != 64 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
                     issues.push(format!(
-                        "queryflux.workerApi.sites['{name}'].tokenSha256: '{hash}' is not a hex SHA-256 (64 characters)"
+                        "queryflux.workerApi.sites['{name}'].tokens: '{hash}' is not a token hash (64 hex characters)"
                     ));
                 } else if !hashes.insert(hash.to_ascii_lowercase()) {
                     issues.push(format!(
-                        "queryflux.workerApi.sites['{name}'].tokenSha256: a token is used by more than one site"
+                        "queryflux.workerApi.sites['{name}'].tokens: a token is used by more than one site"
                     ));
                 }
             }
@@ -4474,33 +4474,24 @@ auth: { provider: static, required: true }
             ))
             .validate_role()
         };
-        assert_eq!(
-            sites(&format!("{{ name: dc1, tokenSha256: [{h}] }}")),
-            Ok(())
-        );
+        assert_eq!(sites(&format!("{{ name: dc1, tokens: [{h}] }}")), Ok(()));
         for (list, expected) in [
+            ("{ name: dc1, tokens: [] }".to_string(), "tokens is empty"),
             (
-                "{ name: dc1, tokenSha256: [] }".to_string(),
-                "tokenSha256 is empty",
+                "{ name: dc1, tokens: [abc] }".to_string(),
+                "not a token hash",
             ),
-            (
-                "{ name: dc1, tokenSha256: [abc] }".to_string(),
-                "not a hex SHA-256",
-            ),
-            (
-                format!("{{ name: a/b, tokenSha256: [{h}] }}"),
-                "contain no '/'",
-            ),
+            (format!("{{ name: a/b, tokens: [{h}] }}"), "contain no '/'"),
             (
                 format!(
-                    "{{ name: dc1, tokenSha256: [{h}] }}, {{ name: dc1, tokenSha256: [{}] }}",
+                    "{{ name: dc1, tokens: [{h}] }}, {{ name: dc1, tokens: [{}] }}",
                     "b".repeat(64)
                 ),
                 "listed twice",
             ),
             (
                 format!(
-                    "{{ name: dc1, tokenSha256: [{h}] }}, {{ name: dc2, tokenSha256: [{}] }}",
+                    "{{ name: dc1, tokens: [{h}] }}, {{ name: dc2, tokens: [{}] }}",
                     h.to_uppercase()
                 ),
                 "more than one site",
