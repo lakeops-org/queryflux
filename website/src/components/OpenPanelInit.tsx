@@ -2,7 +2,6 @@ import {useEffect, useRef} from 'react';
 import useDocusaurusContext from '@docusaurus/useDocusaurusContext';
 import {OpenPanel} from '@openpanel/web';
 import {
-  DEFAULT_OPENPANEL_CLIENT_ID,
   OPENPANEL_DEV_ORIGINS,
   OPENPANEL_TRACKING_OPTIONS,
   type OpenPanelCustomFields,
@@ -15,7 +14,8 @@ export default function OpenPanelInit(): null {
   const started = useRef(false);
 
   useEffect(() => {
-    if (customFields.openPanelDisabled || started.current) {
+    const clientId = customFields.openPanelClientId?.trim();
+    if (customFields.openPanelDisabled || !clientId || started.current) {
       return;
     }
     started.current = true;
@@ -24,8 +24,8 @@ export default function OpenPanelInit(): null {
       window.location.origin as typeof OPENPANEL_DEV_ORIGINS[number],
     );
 
-    const op = new OpenPanel({
-      clientId: customFields.openPanelClientId ?? DEFAULT_OPENPANEL_CLIENT_ID,
+    new OpenPanel({
+      clientId,
       ...OPENPANEL_TRACKING_OPTIONS,
       // Surface failed ingest in the console during local dev (CORS allowlist, ad blockers).
       debug: isLocalDev,
