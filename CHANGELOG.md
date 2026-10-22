@@ -1,5 +1,34 @@
 # Changelog
 
+## [0.5.0](https://github.com/lakeops-org/queryflux/compare/queryflux-v0.4.0...queryflux-v0.5.0) (2026-10-22)
+
+
+### Features
+
+* **admin:** fleet view of workers for Studio (worker mode 9/10) ([#313](https://github.com/lakeops-org/queryflux/issues/313)) ([afb4faa](https://github.com/lakeops-org/queryflux/commit/afb4faa1afc0ace3d964dd4e35e051e6b406e495))
+* **bench:** capacity admission benchmark and cap-violation checker ([#325](https://github.com/lakeops-org/queryflux/issues/325)) ([98bccf4](https://github.com/lakeops-org/queryflux/commit/98bccf4a51f6d79cc74bc55dcd5ccc27c1c8ebc4))
+* **capacity:** capacity quotas, so admissions within a share need no round trip ([#324](https://github.com/lakeops-org/queryflux/issues/324)) ([7645c85](https://github.com/lakeops-org/queryflux/commit/7645c856e1b1857b4fb2c402566fe8d00767f451))
+* **capacity:** first come, first served waiting, with slots handed over on release ([#327](https://github.com/lakeops-org/queryflux/issues/327)) ([b98b154](https://github.com/lakeops-org/queryflux/commit/b98b154e802b991e8ef6baf6519c70500322868f))
+* **capacity:** one-round-trip leases, batched releases and a larger coordination pool ([#321](https://github.com/lakeops-org/queryflux/issues/321)) ([9bc2803](https://github.com/lakeops-org/queryflux/commit/9bc2803a146d83a59a1fd0e60540add206eb4cba))
+* **core:** worker config snapshot and consistent snapshot read (worker mode 2/10) ([#306](https://github.com/lakeops-org/queryflux/issues/306)) ([5a2b00e](https://github.com/lakeops-org/queryflux/commit/5a2b00e85d5795e99b4949c3d023d87b8468ef4d))
+* **frontend:** retryable "not configured yet" error, and startup phases (worker mode 3/10) ([#307](https://github.com/lakeops-org/queryflux/issues/307)) ([80479c3](https://github.com/lakeops-org/queryflux/commit/80479c33575f8ec721b465bc0b7105c060be6782))
+* **helm:** worker pools, DaemonSet and sidecars, with design docs (worker mode 10/10) ([#314](https://github.com/lakeops-org/queryflux/issues/314)) ([dacf914](https://github.com/lakeops-org/queryflux/commit/dacf914f5639b4906723a5e6d41d8e64f88a0b1c))
+* **history:** batch query history writes and aggregate digest stats ([#322](https://github.com/lakeops-org/queryflux/issues/322)) ([e5510e5](https://github.com/lakeops-org/queryflux/commit/e5510e56a6b0a5e4ea17fde69a95a8aed56a0314))
+* **site-agent:** relay a remote control plane to one site's workers ([#340](https://github.com/lakeops-org/queryflux/issues/340)) ([08d8a30](https://github.com/lakeops-org/queryflux/commit/08d8a30bd8ae0c35530a03c30dd55cdaba109b55))
+* **translation:** cache translations, table extraction and fingerprints for repeated queries ([#323](https://github.com/lakeops-org/queryflux/issues/323)) ([f21a9e1](https://github.com/lakeops-org/queryflux/commit/f21a9e12ecf834b12163e4f9153f473a96c42269))
+* **website:** optional GA4 via @docusaurus/plugin-google-gtag ([#338](https://github.com/lakeops-org/queryflux/issues/338)) ([0578cf9](https://github.com/lakeops-org/queryflux/commit/0578cf90ab6793f79ae57aad63a0022f488993d3))
+* **worker:** long-poll, worker registry and shared capacity (worker mode 5/10) ([#309](https://github.com/lakeops-org/queryflux/issues/309)) ([76d300c](https://github.com/lakeops-org/queryflux/commit/76d300c8a1934ee38ffaf02da85ba25ae9c8b3d1))
+* **worker:** process roles and workers that pull config from a control plane (worker mode 4/10) ([#308](https://github.com/lakeops-org/queryflux/issues/308)) ([d120d9a](https://github.com/lakeops-org/queryflux/commit/d120d9ae8ddd3f2049aed1ef6ec137da1810b5a5))
+* **worker:** resilience, translation policy, cache keying and capacity metrics (worker mode 8/10) ([#312](https://github.com/lakeops-org/queryflux/issues/312)) ([8b23537](https://github.com/lakeops-org/queryflux/commit/8b235377590b00d76048be54c9b4f31facdba704))
+* **worker:** send query history to the control plane ([#310](https://github.com/lakeops-org/queryflux/issues/310)) ([8a3adb4](https://github.com/lakeops-org/queryflux/commit/8a3adb4e1279c414759c036a9ee23f589b2a6088))
+
+
+### Bug Fixes
+
+* **history:** purge expired history in batches ([#326](https://github.com/lakeops-org/queryflux/issues/326)) ([b52aaea](https://github.com/lakeops-org/queryflux/commit/b52aaea48ed74eef23f6507f47a10ac9beaae47d))
+* **release:** keep Cargo.lock in sync with the release version ([#320](https://github.com/lakeops-org/queryflux/issues/320)) ([cc649db](https://github.com/lakeops-org/queryflux/commit/cc649dbd11e42d93696a0537c227cd4fdb9eab0f))
+* **website:** inject OpenPanel clientId via CI, stop hardcoding it ([#346](https://github.com/lakeops-org/queryflux/issues/346)) ([c344fa7](https://github.com/lakeops-org/queryflux/commit/c344fa7cc53688d549c42ccee00de70fb3ab8c4c))
+
 ## [0.4.0](https://github.com/lakeops-org/queryflux/compare/queryflux-v0.3.0...queryflux-v0.4.0) (2026-10-15)
 
 
