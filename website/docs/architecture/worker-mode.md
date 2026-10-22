@@ -21,7 +21,7 @@ This page explains how worker mode works and why it is built this way. To run it
 
 | `queryflux.role` | Owns config | Database | Serves |
 |---|---|---|---|
-| `standalone` (default) | yes (YAML or Postgres) | optional | queries, admin API, Studio; also workers with `workerApi.enabled` |
+| `standalone` (default) | yes (YAML or Postgres) | optional | queries, admin API, Studio |
 | `controlPlane` | yes | Postgres | the same, plus workers |
 | `worker` | no, pulled from the control plane | **never** | queries, and an ops listener |
 | `siteAgent` | no, relayed from the control plane | **never** | the worker API for one site's workers, and ops endpoints |
@@ -85,7 +85,7 @@ Any config a worker starts with while the control plane is down may be missing r
   alt="Peer bootstrap sequence: new worker copies config from a running peer when the control plane is unreachable, then confirms when the control plane returns"
 />
 
-- **Where peers come from:** `controlPlane.peerBootstrap.address` is usually a headless Service. Each address is tried in turn, and only ready workers, which all have a config, are listed.
+- **Where peers come from:** `worker.upstream.peerBootstrap.address` is usually a headless Service. Each address is tried in turn, and only ready workers, which all have a config, are listed.
 - **Age limit:** `confirmedAt` is when the control plane last confirmed that config. It is carried along when one peer copies from another, so `maxAgeSecs` bounds the true age.
 - **Visibility:** a copied config is reported as `configSource: peer` and `stale: true`, and `queryflux_worker_config_stale` is `1`. Once the control plane answers, the worker confirms or replaces the config with a conditional `GET`. It doesn't use a long-poll here, because a long-poll would delay confirmation.
 - **Rejected alternative:** a seed config shipped in a Secret. Edits made in Studio after the export would be silently lost.
@@ -107,7 +107,7 @@ Any config a worker starts with while the control plane is down may be missing r
 - **Local work stays local.** A worker's zombie and stale-queue sweeps clean its own memory, so they never take fleet-wide locks.
 - **Cost:** one round trip per query to acquire a lease, with a 5-second timeout. The release is off the query path: a finishing query doesn't wait for it. Releases that finish together share one request; a query that finishes alone still sends its own.
 
-| | `coordination.mode: controlPlane` (default) | `coordination.mode: local` |
+| | `worker.coordination.mode: controlPlane` (default) | `worker.coordination.mode: local` |
 |---|---|---|
 | Limit applies to | the whole fleet | each worker separately |
 | Limit 10, three workers | at most 10 queries | up to 30 queries |
@@ -201,7 +201,7 @@ The cache key includes a fingerprint of the group's member clusters and their co
 
 ## Site agent
 
-A site agent ([operations guide](../operations/site-agent)) lets workers in a remote network reach a control plane through one process that only makes outbound connections. Its design follows from one rule: **workers can't tell.** The agent serves the exact worker API, so a worker needs no change beyond its `controlPlane.url`.
+A site agent ([operations guide](../operations/site-agent)) lets workers in a remote network reach a control plane through one process that only makes outbound connections. Its design follows from one rule: **workers can't tell.** The agent serves the exact worker API, so a worker needs no change beyond its `worker.upstream.url`.
 
 - **Reuse, not a fork.** The agent is the control plane's `WorkerApi` with different backends:
 

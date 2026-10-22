@@ -107,7 +107,7 @@ impl HistorySpool {
         max_bytes: u64,
         agent: String,
         site: String,
-        upstream: &queryflux_core::config::ControlPlaneClientConfig,
+        upstream: &queryflux_core::config::UpstreamConfig,
         policy: PolicyFn,
     ) -> anyhow::Result<Arc<Self>> {
         use anyhow::Context;

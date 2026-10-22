@@ -61,6 +61,6 @@ It shows up in the control plane's query history as `demo-site/worker-a`, with i
 
 | File | Role |
 |------|------|
-| `control-plane.yaml` | `role: controlPlane`: Postgres, `workerApi`, `capacity.mode: quotas` |
-| `site-agent.yaml` | `role: siteAgent`: `siteAgent.upstream`, `stateDir`, `workerApi` for the site's workers |
-| `worker-a.yaml`, `worker-b.yaml` | `role: worker` with `controlPlane.url` pointing at the agent |
+| `control-plane.yaml` | `role: controlPlane`: Postgres, `controlPlane`, `capacity.mode: quotas` |
+| `site-agent.yaml` | `role: siteAgent`: `siteAgent.upstream`, `stateDir`, `sharedSecret` for the site's workers |
+| `worker-a.yaml`, `worker-b.yaml` | `role: worker` with `worker.upstream.url` pointing at the agent |

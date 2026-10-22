@@ -220,13 +220,14 @@ Helm / Kubernetes: see **[Run multiple replicas](./installation/kubernetes.md#ru
 ```yaml
 queryflux:
   role: worker
-  controlPlane:
-    url: https://queryflux-control:9000
-    auth: { mode: sharedSecret, sharedSecret: <secret> }
-  coordination: { mode: controlPlane, onUnavailable: failClosed }
+  worker:
+    upstream:
+      url: https://queryflux-control:9000
+      auth: { mode: sharedSecret, sharedSecret: <secret> }
+    coordination: { mode: controlPlane, onUnavailable: failClosed }
 ```
 
-The control plane enables `queryflux.workerApi` (`enabled`, `sharedSecret`, `sites`, `history.endpoint`, `history.redaction`). Every key, and how config, capacity and history flow: **[Worker mode](./operations/worker-mode)**.
+Each role other than `standalone` has its own section: `queryflux.controlPlane` (`sharedSecret`, `sites`, `history.endpoint`, `history.redaction`), `queryflux.worker` and `queryflux.siteAgent`. Every key, and how config, capacity and history flow: **[Worker mode](./operations/worker-mode)**.
 
 ## Query Cache
 

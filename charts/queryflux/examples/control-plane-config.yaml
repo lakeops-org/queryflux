@@ -20,9 +20,8 @@ queryflux:
     url: postgres://queryflux:<password>@postgres.example.internal:5432/queryflux
   adminApi:
     port: 9000
-  workerApi:
-    enabled: true
-    # The same value goes into every worker's controlPlane.auth.sharedSecret.
+  controlPlane:
+    # The same value goes into every worker's worker.upstream.auth.sharedSecret.
     sharedSecret: <long-random-secret>
     history:
       # full | maskLiterals | metadata. Workers apply it before records leave them.

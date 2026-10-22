@@ -6,7 +6,7 @@
 #          --from-file=config.yaml=./charts/queryflux/examples/site-agent-config.yaml
 #   2. helm install queryflux-site-agent ./charts/queryflux -n queryflux \
 #        -f ./charts/queryflux/examples/site-agent-values.yaml
-#   3. Point the workers' controlPlane.url at
+#   3. Point the workers' worker.upstream.url at
 #        http://queryflux-site-agent.queryflux.svc:9000
 #
 # Each replica keeps its own history spool and snapshot cache on its own volume, so a

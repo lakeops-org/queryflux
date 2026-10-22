@@ -2,17 +2,18 @@
 # site agent, exactly as it would to a control plane.
 queryflux:
   role: worker
-  workerName: worker-b
+  worker:
+    name: worker-b
+    upstream:
+      url: http://site-agent:9000
+      allowInsecureHttp: true
+      auth:
+        mode: sharedSecret
+        sharedSecret: change-me-worker-secret
+    coordination:
+      mode: controlPlane         # share maxRunningQueries with every site, through the agent
+      onUnavailable: localLimits # keep admitting on this worker's own limit if upstream is down
   externalAddress: http://localhost:8091
-  controlPlane:
-    url: http://site-agent:9000
-    allowInsecureHttp: true
-    auth:
-      mode: sharedSecret
-      sharedSecret: change-me-worker-secret
-  coordination:
-    mode: controlPlane         # share maxRunningQueries with every site, through the agent
-    onUnavailable: localLimits # keep admitting on this worker's own limit if upstream is down
   frontends:
     trinoHttp:
       enabled: true

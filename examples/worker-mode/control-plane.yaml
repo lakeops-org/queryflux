@@ -13,9 +13,8 @@ queryflux:
   configReloadIntervalSecs: 5
   adminApi:
     port: 9000
-  workerApi:
-    enabled: true
-    # Workers present this as controlPlane.auth.sharedSecret. Use a long random value.
+  controlPlane:
+    # Workers present this as worker.upstream.auth.sharedSecret. Use a long random value.
     sharedSecret: change-me-worker-secret
     history:
       # full | maskLiterals | metadata. Applied by each worker before records leave it.

@@ -1406,7 +1406,7 @@ pub(crate) async fn cancel_executing_query(
 #[derive(Debug, Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkerFleetDto {
-    /// Whether this process serves workers (`workerApi.enabled`).
+    /// Whether this process serves workers (`role: controlPlane`).
     pub enabled: bool,
     /// The config revision this process serves workers right now.
     pub control_plane_revision: Option<String>,

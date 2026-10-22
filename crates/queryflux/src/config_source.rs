@@ -360,7 +360,7 @@ pub(crate) struct RemoteConfigSource {
 
 impl RemoteConfigSource {
     pub(crate) fn new(
-        control_plane: &queryflux_core::config::ControlPlaneClientConfig,
+        control_plane: &queryflux_core::config::UpstreamConfig,
         state: Arc<std::sync::Mutex<WorkerSyncState>>,
     ) -> Self {
         let wait_secs = control_plane.poll_timeout_secs.clamp(1, 60);
@@ -872,7 +872,7 @@ mod tests {
         url: &str,
         secret: &str,
     ) -> (RemoteConfigSource, Arc<std::sync::Mutex<WorkerSyncState>>) {
-        let cp: queryflux_core::config::ControlPlaneClientConfig =
+        let cp: queryflux_core::config::UpstreamConfig =
             serde_json::from_value(serde_json::json!({
                 "url": url,
                 "allowInsecureHttp": true,
@@ -1004,7 +1004,7 @@ mod tests {
         peer_addr: &str,
         max_age_secs: u64,
     ) -> (RemoteConfigSource, Arc<std::sync::Mutex<WorkerSyncState>>) {
-        let cp: queryflux_core::config::ControlPlaneClientConfig =
+        let cp: queryflux_core::config::UpstreamConfig =
             serde_json::from_value(serde_json::json!({
                 "url": url,
                 "allowInsecureHttp": true,

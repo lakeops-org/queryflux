@@ -27,10 +27,10 @@ Read [Worker mode](./worker-mode) first: the agent relays that protocol and chan
 
 | | At the site | Upstream |
 |---|---|---|
-| **Config** | Workers long-poll the agent. Their waits wake as soon as a new revision reaches it. | The agent long-polls `/worker/config/wait` and serves the snapshot it gets, with upstream's revision. The one exception: when upstream names `workerApi.history.endpoint`, the agent removes it and re-seals the snapshot, so workers get a new revision ([Query history](#query-history)); `/agent/status` shows both revisions. The last snapshot is cached on disk. |
-| **Fleet** | Workers register and heartbeat with the agent. | Every heartbeat interval the agent posts its live workers to `/worker/fleet`, where they appear as `<siteName>/<workerName>` with `parent: <siteName>`. It also registers itself, with `kind: siteAgent`. |
-| **Query history** | Each batch a worker sends is redacted and written to disk before the worker gets its `202`. | A flusher posts the oldest batch upstream and deletes it once accepted. Each record keeps its worker's name, as `<siteName>/<workerName>`. |
-| **Capacity** | Workers' acquires, releases, waits, quota reports and sweep locks go to the agent. | The agent forwards each one, so one `maxRunningQueries` holds across every site and the control plane. Each worker's lease and quota holder is sent as `<siteName>/<instanceId>`, so two sites with a `worker-0` hold separate leases and quotas. |
+| **Config** | Workers long-poll the agent. Their waits wake as soon as a new revision reaches it. | The agent long-polls `/worker/config/wait` and serves the snapshot it gets, with upstream's revision. The one exception: when upstream names `controlPlane.history.endpoint`, the agent removes it and re-seals the snapshot, so workers get a new revision ([Query history](#query-history)); `/agent/status` shows both revisions. The last snapshot is cached on disk. |
+| **Fleet** | Workers register and heartbeat with the agent. | Every heartbeat interval the agent posts its live workers to `/worker/fleet`, where they appear as `<site>/<worker>` with `parent: <site>`. It also registers itself, with `kind: siteAgent`. |
+| **Query history** | Each batch a worker sends is redacted and written to disk before the worker gets its `202`. | A flusher posts the oldest batch upstream and deletes it once accepted. Each record keeps its worker's name, as `<site>/<worker>`. |
+| **Capacity** | Workers' acquires, releases, waits, quota reports and sweep locks go to the agent. | The agent forwards each one, so one `maxRunningQueries` holds across every site and the control plane. Each worker's lease and quota holder is sent as `<site>/<instanceId>`, so two sites with a `worker-0` hold separate leases and quotas. |
 
 The agent runs no query frontends and no engine adapters. It needs no database.
 
@@ -44,24 +44,22 @@ queryflux:
   adminApi:
     port: 9000                       # the worker API and /readyz, /metrics, /agent/status
   siteAgent:
-    siteName: us-east-dc1            # unique per upstream; no '/'
+    name: us-east-dc1                # unique per upstream; no '/'
     stateDir: /var/lib/queryflux/site-agent
     snapshotCache: true              # default
     historySpool:
       maxBytes: 1073741824           # default 1 GiB; the oldest batches are dropped beyond it
-    upstream:                        # the same block as a worker's controlPlane
+    upstream:                        # the same block as a worker's upstream
       url: https://cp.example.com:9000
       auth: { mode: sharedSecret, sharedSecret: <site credential> }
       pollTimeoutSecs: 30
       heartbeatIntervalSecs: 10
-  workerApi:
-    enabled: true
     sharedSecret: <what this site's workers present>
 ```
 
-- `siteAgent.upstream.auth.sharedSecret` is this site's token on the control plane (see [Site tokens](#site-tokens)), or the control plane's `workerApi.sharedSecret`.
-- `workerApi.sharedSecret` is what the site's workers present. Use a different value, so a worker never holds the site's upstream credential. The agent logs a warning when the two are equal.
-- A site agent rejects everything it gets from upstream (`clusters`, `clusterGroups`, `routers`, `auth`, `guardrails`, `capacity`, …), a `persistence` block, and worker-only keys (`controlPlane`, `workerName`, `coordination`, `history`).
+- `siteAgent.upstream.auth.sharedSecret` is this site's token on the control plane (see [Site tokens](#site-tokens)), or the control plane's `controlPlane.sharedSecret`.
+- `siteAgent.sharedSecret` is what the site's workers present. Use a different value, so a worker never holds the site's upstream credential. The agent logs a warning when the two are equal.
+- A site agent rejects everything it gets from upstream (`clusters`, `clusterGroups`, `routers`, `auth`, `guardrails`, `capacity`, …), a `persistence` block, and the `worker` and `controlPlane` sections.
 
 ### Site tokens
 
@@ -70,11 +68,10 @@ Give each site its own token on the control plane, and list only its SHA-256 the
 ```yaml
 # control plane
 queryflux:
-  workerApi:
-    enabled: true
+  controlPlane:
     # sharedSecret: omit it to accept site agents only (no worker connects directly)
     sites:
-      - name: us-east-dc1      # the agent's siteName
+      - name: us-east-dc1      # the agent's siteAgent.name
         tokens:                # printf %s "$TOKEN" | sha256sum
           - <64 hex characters>
         clusters: [trino-dc1]  # optional: the only clusters this site gets
@@ -91,22 +88,23 @@ To rotate a token, list the new hash next to the old one, restart the control pl
 
 ### Workers
 
-A worker behind an agent is an ordinary worker whose `controlPlane.url` points at the agent:
+A worker behind an agent is an ordinary worker whose `worker.upstream.url` points at the agent:
 
 ```yaml
 queryflux:
   role: worker
-  controlPlane:
-    url: http://queryflux-site-agent.queryflux.svc:9000
-    auth: { mode: sharedSecret, sharedSecret: <the agent's workerApi.sharedSecret> }
-  coordination:
-    mode: controlPlane
-    onUnavailable: localLimits   # or failClosed; see "When upstream is unreachable"
+  worker:
+    upstream:
+      url: http://queryflux-site-agent.queryflux.svc:9000
+      auth: { mode: sharedSecret, sharedSecret: <the agent's siteAgent.sharedSecret> }
+    coordination:
+      mode: controlPlane
+      onUnavailable: localLimits   # or failClosed; see "When upstream is unreachable"
 ```
 
 ### Control plane
 
-Nothing changes. Enable `workerApi` as for workers, and set `capacity.mode: quotas` (see [Capacity](#capacity)).
+Nothing changes. Set `controlPlane` as for workers, and set `capacity.mode: quotas` (see [Capacity](#capacity)).
 
 ## Deploying
 
@@ -119,7 +117,7 @@ helm install queryflux-site-agent ./charts/queryflux -n queryflux \
   -f ./charts/queryflux/examples/site-agent-values.yaml
 ```
 
-`examples/site-agent-values.yaml` sets `workload.kind: StatefulSet`, a `volumeClaimTemplates` entry mounted at `stateDir`, two replicas and a PodDisruptionBudget, and turns off Studio and the query ports. Then point the workers' `controlPlane.url` at `http://queryflux-site-agent.<namespace>.svc:9000`.
+`examples/site-agent-values.yaml` sets `workload.kind: StatefulSet`, a `volumeClaimTemplates` entry mounted at `stateDir`, two replicas and a PodDisruptionBudget, and turns off Studio and the query ports. Then point the workers' `worker.upstream.url` at `http://queryflux-site-agent.<namespace>.svc:9000`.
 
 **Docker Compose.** [`examples/site-agent`](https://github.com/lakeops-org/queryflux/tree/main/examples/site-agent) runs a control plane, an agent and two workers on a site network with no route to the control plane.
 
@@ -144,13 +142,13 @@ Only queries above a worker's share take a forwarded per-query lease.
 - **Redaction at the agent.** The agent applies the served snapshot's `history.redaction` to each batch before writing it to disk. Workers already redact with the same policy, and masking is idempotent, so a worker on an older policy or version is still covered. No unredacted SQL is stored at the site or leaves it.
 - **Durability.** A batch is acknowledged to the worker only after it is on disk (temp file, fsync, rename), so it survives an agent restart. Delivery upstream is at least once; the control plane ignores repeats.
 - **A full spool** (`historySpool.maxBytes`) drops the oldest batches. Drops are counted in `queryflux_agent_history_dropped_total` and `/agent/status`. Queries are never blocked.
-- **A history endpoint named upstream** (`workerApi.history.endpoint`): workers behind an agent always send to the agent, and the agent sends to that endpoint. To do this, the agent removes the endpoint from the snapshot it serves and re-seals it. In that one case the revision workers report differs from upstream's; `/agent/status` shows both.
+- **A history endpoint named upstream** (`controlPlane.history.endpoint`): workers behind an agent always send to the agent, and the agent sends to that endpoint. To do this, the agent removes the endpoint from the snapshot it serves and re-seals it. In that one case the revision workers report differs from upstream's; `/agent/status` shows both.
 
 ## When upstream is unreachable
 
 | Failure | What happens |
 |---|---|
-| Upstream down | Workers keep their active config; new workers get the agent's copy. History waits on the agent's disk. Capacity: the agent answers capacity calls with an error, and each worker's `coordination.onUnavailable` decides (`failClosed` waits, `localLimits` admits on the worker's own limit). With quotas, workers keep admitting within their share until it expires. |
+| Upstream down | Workers keep their active config; new workers get the agent's copy. History waits on the agent's disk. Capacity: the agent answers capacity calls with an error, and each worker's `worker.coordination.onUnavailable` decides (`failClosed` waits, `localLimits` admits on the worker's own limit). With quotas, workers keep admitting within their share until it expires. |
 | Agent restarts, upstream fine | It fetches the snapshot again. Workers re-register within one heartbeat. The spool resumes from disk. |
 | Agent restarts, upstream down | It serves the snapshot cached on disk, marked stale (`/agent/status` `stale: true`, `queryflux_agent_snapshot_stale` 1), until upstream confirms it. |
 | All agent replicas down | Workers keep serving their active config, as during a control-plane outage. Their history waits in worker memory. Capacity follows `onUnavailable`. |
@@ -164,7 +162,7 @@ Only queries above a worker's share take a forwarded per-query lease.
   - upstream's revision and the served revision, `stale`, and `confirmedAt`;
   - the number of live workers;
   - the history spool: files, bytes, queued records, sent, dropped, last error.
-- **Upstream view:** the control plane's fleet API (`/admin/workers`) lists the agent (`kind: siteAgent`) and each worker behind it (`parent: <siteName>`).
+- **Upstream view:** the control plane's fleet API (`/admin/workers`) lists the agent (`kind: siteAgent`) and each worker behind it (`parent: <site>`).
 
 | Metric | Meaning |
 |---|---|
@@ -182,11 +180,11 @@ Alert on `queryflux_agent_upstream_up == 0` lasting longer than you expect, and 
 
 - The cached snapshot can carry engine credentials. The file is written `0600`. Put `stateDir` on an encrypted volume, or set `snapshotCache: false`; without the cache, an agent that restarts while upstream is down has no config to serve.
 - Use separate secrets for upstream and for the site's workers.
-- Give each site its own token ([Site tokens](#site-tokens)). With only the control plane's `workerApi.sharedSecret`, upstream trusts the `site` each agent reports, and any agent can act for any site.
+- Give each site its own token ([Site tokens](#site-tokens)). With only the control plane's `controlPlane.sharedSecret`, upstream trusts the `site` each agent reports, and any agent can act for any site.
 - Serve the control plane's worker API over TLS: `siteAgent.upstream.url` must be `https://` unless `allowInsecureHttp: true`.
 
 ## Limitations
 
-- A site without `workerApi.sites[].clusters` gets the whole config.
+- A site without `controlPlane.sites[].clusters` gets the whole config.
 - Capacity is forwarded, not held at the site. A site-wide quota held by the agent, which would keep admitting after per-worker quotas expire during a long outage, is planned.
 - Studio actions that must reach engines from inside the site (test a connection, browse a catalog) do not run through the agent yet.

@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use queryflux_core::config::{ControlPlaneClientConfig, OnCoordinationUnavailable};
+use queryflux_core::config::{OnCoordinationUnavailable, UpstreamConfig};
 use queryflux_core::error::{QueryFluxError, Result};
 use queryflux_persistence::{BackendCapabilities, CapacityStore, SweepCoordinator, SweepGuard};
 use serde::Deserialize;
@@ -37,7 +37,7 @@ pub(crate) struct RemoteCoordinationStore {
 
 impl RemoteCoordinationStore {
     pub(crate) fn new(
-        control_plane: &ControlPlaneClientConfig,
+        control_plane: &UpstreamConfig,
         on_unavailable: OnCoordinationUnavailable,
     ) -> Self {
         Self {
@@ -404,7 +404,7 @@ impl SweepGuard for RemoteSweepGuard {
 
 /// The store as the shared handle `main` passes around.
 pub(crate) fn remote_coordination(
-    control_plane: &ControlPlaneClientConfig,
+    control_plane: &UpstreamConfig,
     on_unavailable: OnCoordinationUnavailable,
 ) -> Arc<RemoteCoordinationStore> {
     Arc::new(RemoteCoordinationStore::new(control_plane, on_unavailable))
@@ -515,7 +515,7 @@ mod tests {
     }
 
     fn client(url: &str, on_unavailable: OnCoordinationUnavailable) -> RemoteCoordinationStore {
-        let cp: ControlPlaneClientConfig = serde_yaml::from_str(&format!(
+        let cp: UpstreamConfig = serde_yaml::from_str(&format!(
             "url: {url}\nauth:\n  mode: sharedSecret\n  sharedSecret: s3cret\n"
         ))
         .unwrap();

@@ -36,12 +36,14 @@ Running QueryFlux without workers works exactly as before. Worker mode is opt-in
 
 | `queryflux.role` | Owns config | Connects to Postgres | Admin API and Studio | Serves workers |
 |------------------|-------------|----------------------|----------------------|----------------|
-| `standalone` (default) | Yes (YAML or Postgres) | Optional | Yes | With `workerApi.enabled` |
+| `standalone` (default) | Yes (YAML or Postgres) | Optional | Yes | No |
 | `controlPlane` | Yes | Yes, for shared capacity | Yes | Yes |
 | `worker` | No, pulled from the control plane | **Never** | No: ops listener only | No |
 | `siteAgent` | No, relayed from the control plane | **Never** | No: worker API and ops endpoints only | Yes, the workers at its site. See [Site agent](./site-agent). |
 
-A standalone process with `workerApi.enabled: true` can serve workers too. Without Postgres it serves the config it started with, and workers coordinate with `coordination.mode: local`.
+Keys under `queryflux` apply to every role, except that each role other than `standalone` has its own section: `queryflux.controlPlane`, `queryflux.worker` or `queryflux.siteAgent`. A section set on another role is rejected.
+
+A control plane without Postgres serves the config it started with, and its workers coordinate with `worker.coordination.mode: local`.
 
 ## Configuration
 
@@ -55,47 +57,47 @@ queryflux:
     url: postgres://queryflux:<password>@postgres:5432/queryflux
   adminApi:
     port: 9000
-  workerApi:
-    enabled: true
+  controlPlane:
     sharedSecret: <long-random-secret>
     history:
       endpoint: null          # optional: workers send history here instead of to the control plane
       redaction: full         # full | maskLiterals | metadata
 ```
 
-The worker API lives on the admin port, under `/worker/*`. It uses its own bearer secret and does not accept the admin API's credentials. Site agents can instead present a token of their own site (`workerApi.sites`, see [Site tokens](./site-agent#site-tokens)); with `sites` set and no `sharedSecret`, only site agents are accepted.
+The worker API lives on the admin port, under `/worker/*`. It uses its own bearer secret and does not accept the admin API's credentials. Site agents can instead present a token of their own site (`controlPlane.sites`, see [Site tokens](./site-agent#site-tokens)); with `sites` set and no `sharedSecret`, only site agents are accepted.
 
 ### Worker
 
 ```yaml
 queryflux:
   role: worker
-  workerName: checkout-7f9c      # optional; defaults to the hostname (the pod name)
-  workerLabels: { team: checkout }
-  workerLabelsFile: /etc/podinfo/labels   # optional: the pod's own labels (downward API), merged over workerLabels
-  controlPlane:
-    url: https://queryflux-control:9000
-    auth: { mode: sharedSecret, sharedSecret: <long-random-secret> }
-    pollTimeoutSecs: 30          # long-poll hold time
-    heartbeatIntervalSecs: 10
-    allowInsecureHttp: false     # local demos only: snapshots carry credentials
-    peerBootstrap:               # optional: start from a running worker's config
-      address: queryflux-workers-headless:9000
-      afterSecs: 10
-      maxAgeSecs: 86400
-  coordination:
-    mode: controlPlane           # controlPlane | local
-    onUnavailable: failClosed    # failClosed | localLimits
-  history:
-    endpoint: null               # optional override of the snapshot's endpoint
-    spoolMaxRecords: 50000
+  worker:
+    name: checkout-7f9c      # optional; defaults to the hostname (the pod name)
+    labels: { team: checkout }
+    labelsFile: /etc/podinfo/labels   # optional: the pod's own labels (downward API), merged over labels
+    upstream:
+      url: https://queryflux-control:9000
+      auth: { mode: sharedSecret, sharedSecret: <long-random-secret> }
+      pollTimeoutSecs: 30          # long-poll hold time
+      heartbeatIntervalSecs: 10
+      allowInsecureHttp: false     # local demos only: snapshots carry credentials
+      peerBootstrap:               # optional: start from a running worker's config
+        address: queryflux-workers-headless:9000
+        afterSecs: 10
+        maxAgeSecs: 86400
+    coordination:
+      mode: controlPlane           # controlPlane | local
+      onUnavailable: failClosed    # failClosed | localLimits
+    history:
+      endpoint: null               # optional override of the snapshot's endpoint
+      spoolMaxRecords: 50000
   frontends:
     trinoHttp: { enabled: true, port: 8080 }
   adminApi:
     port: 9000                   # ops listener: /health, /readyz, /metrics, /worker/status
 ```
 
-Everything the control plane owns is rejected in a worker config: `persistence` (other than `inMemory`), clusters, groups, routers, `routingFallback`, `auth`, `authorization`, `catalogProvider`, `guardrails`, `accessControl`, `translation.mode`, `translation.errorOnUnsupported` and `workerApi`. Other `translation` settings (`pythonScripts`, `schemaResolutionTimeoutMs`) stay local to the worker for now. `queryflux validate` lists any such settings it finds.
+Everything the control plane owns is rejected in a worker config: `persistence` (other than `inMemory`), clusters, groups, routers, `routingFallback`, `auth`, `authorization`, `catalogProvider`, `guardrails`, `accessControl`, `translation.mode`, `translation.errorOnUnsupported` and `capacity`. Other `translation` settings (`pythonScripts`, `schemaResolutionTimeoutMs`) stay local to the worker for now. `queryflux validate` lists any such settings it finds.
 
 QueryFlux does not expand environment variables in its config file. Mount a worker config that holds the shared secret from a Kubernetes Secret.
 
@@ -122,7 +124,7 @@ While the control plane is unreachable, a worker keeps serving the last config i
 Any config a worker starts with while the control plane is down may be missing recent edits. Two mechanisms keep it as recent as possible, and make its age visible:
 
 - **The control plane serves its last good config.** If building the config from Postgres fails or takes longer than 10 seconds, the control plane serves the last config it built. Run 2+ control-plane replicas, and a Postgres outage does not stop workers from starting.
-- **Peer bootstrap** (`controlPlane.peerBootstrap`, off unless set). A worker that has no config, and still cannot sync from the control plane after `afterSecs`, copies the active config from a running worker:
+- **Peer bootstrap** (`worker.upstream.peerBootstrap`, off unless set). A worker that has no config, and still cannot sync from the control plane after `afterSecs`, copies the active config from a running worker:
   - **Where it looks:** `address` is resolved and each address is tried in turn. Use a headless Service (Helm: `service.headless.enabled`), which resolves to every ready worker, so one attempt can try them all. The plain worker Service also works, reaching one ready worker per attempt. Either way only ready workers are listed, and they all have a config.
   - **Authentication:** peers serve `/worker/peer-config` on their ops port, behind the fleet's shared secret.
   - **Age limit:** a copy whose config the control plane last confirmed more than `maxAgeSecs` ago is refused.
@@ -138,7 +140,7 @@ Each worker registers on start and heartbeats every `heartbeatIntervalSecs`. The
 
 ## Shared capacity
 
-With `coordination.mode: controlPlane`, the following go through the control plane's `/worker/capacity/*` and `/worker/sweep-lock/*` endpoints:
+With `worker.coordination.mode: controlPlane`, the following go through the control plane's `/worker/capacity/*` and `/worker/sweep-lock/*` endpoints:
 
 - the worker's capacity leases;
 - engine reconcile locks;
@@ -167,7 +169,7 @@ A consistently higher wait on some workers for the same group means waiters are 
 
 Each worker sweeps its own zombie and stale queued queries. Those live in its memory.
 
-If two or more workers share clusters with `coordination.mode: local`, the control plane logs a warning, because the effective limit is then multiplied by the number of workers.
+If two or more workers share clusters with `worker.coordination.mode: local`, the control plane logs a warning, because the effective limit is then multiplied by the number of workers.
 
 ## Query history
 

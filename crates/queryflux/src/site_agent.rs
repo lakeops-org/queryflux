@@ -4,7 +4,7 @@
 //! Workers connect to the agent exactly as they would to a control plane: it serves the
 //! same worker API (`/worker/config`, `/wait`, `/register`, `/heartbeat`, `/capacity/*`,
 //! `/sweep-lock/*`, `/query-records`), so a worker needs no change beyond its
-//! `controlPlane.url`. The agent is the only process at the site that talks to upstream,
+//! `worker.upstream.url`. The agent is the only process at the site that talks to upstream,
 //! and every connection is one it opens:
 //!
 //! - **Config:** it long-polls upstream's `/worker/config/wait` and serves the snapshot it
@@ -29,7 +29,7 @@ use anyhow::{Context, Result};
 use axum::{extract::State, http::StatusCode, response::IntoResponse, routing::get, Router};
 use chrono::{DateTime, Utc};
 use queryflux_core::config::{
-    ControlPlaneClientConfig, OnCoordinationUnavailable, ProxyConfig, SiteAgentConfig,
+    OnCoordinationUnavailable, ProxyConfig, SiteAgentConfig, UpstreamConfig,
 };
 use queryflux_core::worker_snapshot::{
     HistoryPolicy, WorkerSnapshotV1, WORKER_SNAPSHOT_SCHEMA_VERSION,
@@ -229,7 +229,7 @@ impl Relay {
 /// Keep the agent's copy of upstream's config current until shutdown.
 async fn run_relay(
     relay: Arc<Relay>,
-    upstream: ControlPlaneClientConfig,
+    upstream: UpstreamConfig,
     mut shutdown: watch::Receiver<bool>,
 ) {
     let wait_secs = upstream.poll_timeout_secs.clamp(1, 60);
@@ -285,7 +285,7 @@ async fn run_fleet(
     relay: Arc<Relay>,
     registry: Arc<InMemoryPersistence>,
     spool: Arc<HistorySpool>,
-    upstream: ControlPlaneClientConfig,
+    upstream: UpstreamConfig,
     site: String,
     agent_name: String,
     mut shutdown: watch::Receiver<bool>,
@@ -459,7 +459,7 @@ fn start(
     let relay = Arc::new(Relay {
         served: Mutex::new(None),
         status: Mutex::new(AgentStatus {
-            site: agent.site_name.clone(),
+            site: agent.name.clone(),
             upstream: agent.upstream.url.clone(),
             ..Default::default()
         }),
@@ -469,12 +469,12 @@ fn start(
             .then(|| state_dir.join("snapshot.json")),
     });
     let host = std::env::var("HOSTNAME").unwrap_or_else(|_| "site-agent".to_string());
-    let agent_name = format!("{}/{host}", agent.site_name);
+    let agent_name = format!("{}/{host}", agent.name);
     let spool = HistorySpool::open(
         state_dir.join("spool"),
         agent.history_spool.max_bytes,
         agent_name.clone(),
-        agent.site_name.clone(),
+        agent.name.clone(),
         &agent.upstream,
         {
             let relay = relay.clone();
@@ -490,7 +490,7 @@ fn start(
             &agent.upstream,
             OnCoordinationUnavailable::FailClosed,
         )
-        .with_holder_prefix(format!("{}/", agent.site_name)),
+        .with_holder_prefix(format!("{}/", agent.name)),
     );
     let api = WorkerApi {
         shared_secret: worker_secret,
@@ -523,7 +523,7 @@ fn start(
         registry,
         spool.clone(),
         agent.upstream.clone(),
-        agent.site_name.clone(),
+        agent.name.clone(),
         agent_name,
         shutdown_rx.clone(),
     ));
@@ -548,14 +548,10 @@ pub(crate) async fn run(config: ProxyConfig) -> Result<()> {
         .site_agent
         .as_ref()
         .context("role: siteAgent needs queryflux.siteAgent")?;
-    let worker_secret = q
-        .worker_api
-        .as_ref()
-        .and_then(|a| a.shared_secret.clone())
-        .context("role: siteAgent needs queryflux.workerApi.sharedSecret")?;
+    let worker_secret = agent.shared_secret.clone();
     if worker_secret == agent.upstream.auth.bearer() {
         tracing::warn!(
-            "workerApi.sharedSecret equals siteAgent.upstream's secret: workers at this site \
+            "siteAgent.sharedSecret equals siteAgent.upstream's secret: workers at this site \
              then hold the site's upstream credential. Use a different secret."
         );
     }
@@ -569,7 +565,7 @@ pub(crate) async fn run(config: ProxyConfig) -> Result<()> {
         .await
         .with_context(|| format!("bind {addr}"))?;
     tracing::info!(
-        site = %agent.site_name,
+        site = %agent.name,
         upstream = %agent.upstream.url,
         "Site agent on {addr} — worker API, /readyz, /metrics, /agent/status"
     );
@@ -639,7 +635,7 @@ mod tests {
             Self::start_limited_to(None).await
         }
 
-        /// dc1 limited to `clusters` (`workerApi.sites[].clusters`).
+        /// dc1 limited to `clusters` (`controlPlane.sites[].clusters`).
         async fn start_limited_to(clusters: Option<Vec<String>>) -> Self {
             let current = Arc::new(std::sync::Mutex::new(snapshot(3)));
             let (changes, rx) = watch::channel(0u64);
@@ -660,7 +656,7 @@ mod tests {
                 coordination: Some(store.clone()),
                 history: Some(store.clone()),
                 quotas: None,
-                sites: vec![queryflux_core::config::WorkerApiSite {
+                sites: vec![queryflux_core::config::ControlPlaneSite {
                     name: "dc1".into(),
                     tokens: vec![{
                         use sha2::Digest;
@@ -707,7 +703,8 @@ mod tests {
 
     fn agent_config(upstream: &str, state_dir: &std::path::Path) -> SiteAgentConfig {
         serde_json::from_value(serde_json::json!({
-            "siteName": "dc1",
+            "name": "dc1",
+            "sharedSecret": "worker-secret",
             "stateDir": state_dir.to_string_lossy(),
             "upstream": {
                 "url": upstream,
@@ -960,7 +957,7 @@ mod tests {
     #[tokio::test]
     async fn a_full_spool_drops_the_oldest_batches() {
         let dir = tempfile::tempdir().unwrap();
-        let upstream: ControlPlaneClientConfig = serde_json::from_value(serde_json::json!({
+        let upstream: UpstreamConfig = serde_json::from_value(serde_json::json!({
             "url": "http://127.0.0.1:9", "allowInsecureHttp": true,
             "auth": { "mode": "sharedSecret", "sharedSecret": "s" }
         }))
@@ -1000,7 +997,7 @@ mod tests {
         let (url, _stop) = agent(&up.url, dir.path()).await;
         eventually(|| async { served_revision(&url).await.is_some() }).await;
 
-        let cp: ControlPlaneClientConfig = serde_json::from_value(serde_json::json!({
+        let cp: UpstreamConfig = serde_json::from_value(serde_json::json!({
             "url": url, "allowInsecureHttp": true, "pollTimeoutSecs": 1,
             "auth": { "mode": "sharedSecret", "sharedSecret": "worker-secret" }
         }))
@@ -1102,7 +1099,7 @@ mod tests {
         assert!(!served.contains("dc2-s3cret"), "{served}");
 
         // A worker activates it: dc2's group is there, with no cluster.
-        let cp: ControlPlaneClientConfig = serde_json::from_value(serde_json::json!({
+        let cp: UpstreamConfig = serde_json::from_value(serde_json::json!({
             "url": url, "allowInsecureHttp": true, "pollTimeoutSecs": 1,
             "auth": { "mode": "sharedSecret", "sharedSecret": "worker-secret" }
         }))

@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use queryflux_core::config::ControlPlaneClientConfig;
+use queryflux_core::config::UpstreamConfig;
 use queryflux_core::error::Result;
 use queryflux_core::worker_snapshot::HistoryRedaction;
 use queryflux_persistence::{
@@ -103,7 +103,7 @@ pub(crate) struct RemoteMetricsStore {
     wake: Notify,
     client: reqwest::Client,
     worker: String,
-    /// `controlPlane.url`, without a trailing slash.
+    /// `worker.upstream.url`, without a trailing slash.
     control_plane: String,
     bearer: String,
     /// `history.endpoint` in the bootstrap config; wins over the snapshot's.
@@ -114,7 +114,7 @@ pub(crate) struct RemoteMetricsStore {
 
 impl RemoteMetricsStore {
     pub(crate) fn new(
-        control_plane: &ControlPlaneClientConfig,
+        control_plane: &UpstreamConfig,
         worker: String,
         endpoint_override: Option<String>,
         max_records: usize,
@@ -579,7 +579,7 @@ mod tests {
         max: usize,
         state: Arc<Mutex<WorkerSyncState>>,
     ) -> Arc<RemoteMetricsStore> {
-        let cp: ControlPlaneClientConfig = serde_yaml::from_str(&format!(
+        let cp: UpstreamConfig = serde_yaml::from_str(&format!(
             "url: {url}\nauth:\n  mode: sharedSecret\n  sharedSecret: s3cret\n"
         ))
         .unwrap();

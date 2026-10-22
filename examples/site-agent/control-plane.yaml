@@ -12,8 +12,7 @@ queryflux:
   # queries at the site do not wait on a round trip to the control plane.
   capacity:
     mode: quotas
-  workerApi:
-    enabled: true
+  controlPlane:
     # The site agent presents this as siteAgent.upstream.auth.sharedSecret.
     sharedSecret: change-me-site-secret
     history:

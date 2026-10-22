@@ -21,7 +21,7 @@
 //!   once; a batch that cannot start within [`RECORD_BATCH_QUEUE_WAIT`] gets
 //!   `503 Service Unavailable` with `Retry-After`, and the worker keeps it spooled.
 //!
-//! Workers authenticate with `Authorization: Bearer <workerApi.sharedSecret>`, separate
+//! Workers authenticate with `Authorization: Bearer <controlPlane.sharedSecret>`, separate
 //! from the admin API's Basic auth.
 
 use std::future::Future;
@@ -66,12 +66,12 @@ pub struct WorkerApi {
     /// Capacity quotas for workers (`capacity.mode: quotas`); `None` answers 404, and
     /// workers keep using per-query leases.
     pub quotas: Option<Arc<dyn queryflux_persistence::quota::QuotaStore>>,
-    /// Site agents with their own tokens (`workerApi.sites`), hashes in lowercase hex.
-    pub sites: Vec<queryflux_core::config::WorkerApiSite>,
+    /// Site agents with their own tokens (`controlPlane.sites`), hashes in lowercase hex.
+    pub sites: Vec<queryflux_core::config::ControlPlaneSite>,
 }
 
 impl WorkerApi {
-    /// The clusters `site` is limited to (`workerApi.sites[].clusters`), if any.
+    /// The clusters `site` is limited to (`controlPlane.sites[].clusters`), if any.
     pub fn site_clusters(&self, site: &str) -> Option<&[String]> {
         self.sites
             .iter()
@@ -205,9 +205,9 @@ pub(crate) fn authorized(headers: &HeaderMap, secret: &str) -> bool {
 /// Who presented the bearer token.
 #[derive(Debug, PartialEq)]
 enum Caller {
-    /// `workerApi.sharedSecret`: a worker, or a site agent trusted with any site.
+    /// `controlPlane.sharedSecret`: a worker, or a site agent trusted with any site.
     Fleet,
-    /// A `workerApi.sites` token: that site's agent, acting only for that site.
+    /// A `controlPlane.sites` token: that site's agent, acting only for that site.
     Site(String),
 }
 
@@ -1253,12 +1253,12 @@ mod tests {
             history: Some(store.clone()),
             quotas: None,
             sites: vec![
-                queryflux_core::config::WorkerApiSite {
+                queryflux_core::config::ControlPlaneSite {
                     name: "dc1".into(),
                     tokens: vec![hash("old-dc1"), hash("t-dc1")],
                     clusters: None,
                 },
-                queryflux_core::config::WorkerApiSite {
+                queryflux_core::config::ControlPlaneSite {
                     name: "dc2".into(),
                     tokens: vec![hash("t-dc2")],
                     clusters: None,

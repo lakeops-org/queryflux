@@ -170,8 +170,9 @@ async fn main() -> Result<()> {
     // Quotas: where this process reports demand. A worker asks its control plane, which
     // answers 404 when it has no quotas, so the worker keeps per-query leases.
     let (coordination, local_sweeps, quota_source) = if is_worker {
-        let coord_cfg = config.queryflux.coordination.clone().unwrap_or_default();
-        let remote = match (&config.queryflux.control_plane, coord_cfg.mode) {
+        let worker = config.queryflux.worker.as_ref();
+        let coord_cfg = worker.map(|w| w.coordination.clone()).unwrap_or_default();
+        let remote = match (worker.map(|w| &w.upstream), coord_cfg.mode) {
             (Some(cp), queryflux_core::config::CoordinationMode::ControlPlane) => {
                 info!(
                     on_unavailable = ?coord_cfg.on_unavailable,
@@ -578,11 +579,11 @@ async fn main() -> Result<()> {
     ));
     // A worker keeps no durable history: its records go upstream, to the control plane
     // or the endpoint its snapshot names.
-    let history_uplink = match (&config.queryflux.control_plane, is_worker) {
-        (Some(cp), true) => {
-            let history = config.queryflux.history.clone().unwrap_or_default();
+    let history_uplink = match (config.queryflux.worker.as_ref(), is_worker) {
+        (Some(worker), true) => {
+            let history = worker.history.clone();
             Some(history_uplink::RemoteMetricsStore::new(
-                cp,
+                &worker.upstream,
                 startup::tasks::worker_name(&config),
                 history.endpoint,
                 history.spool_max_records,
@@ -993,7 +994,10 @@ async fn main() -> Result<()> {
             config.queryflux.periodic_config_reload_interval_secs(),
         )
         .await;
-        let source: Box<dyn ConfigSource> = match (&config.queryflux.control_plane, &backend) {
+        let source: Box<dyn ConfigSource> = match (
+            config.queryflux.worker.as_ref().map(|w| &w.upstream),
+            &backend,
+        ) {
             (Some(cp), _) if is_worker => Box::new(crate::config_source::RemoteConfigSource::new(
                 cp,
                 worker_sync_state.clone(),
@@ -1047,8 +1051,9 @@ async fn main() -> Result<()> {
         // control plane is unreachable.
         let ops = match config
             .queryflux
-            .control_plane
+            .worker
             .as_ref()
+            .map(|w| &w.upstream)
             .filter(|cp| cp.peer_bootstrap.is_some())
         {
             Some(cp) => ops.with_peer_config(queryflux_frontend::ops::PeerConfigEndpoint {

@@ -13,7 +13,7 @@ use crate::live_config::{
     translation_policy, validate_snapshot_inputs, LiveConfigInputs, SettingsInputs,
 };
 
-/// The worker API for this process, if `queryflux.workerApi.enabled`.
+/// The worker API for this process, if it is a control plane (`queryflux.controlPlane`).
 ///
 /// With Postgres, the snapshot is built from one consistent read and reused until this
 /// process reloads its config (`changes`), so admin edits reach workers on their next
@@ -30,7 +30,7 @@ pub(crate) fn worker_api(
     history: Arc<dyn queryflux_persistence::MetricsStore>,
     quotas: Option<Arc<dyn queryflux_persistence::quota::QuotaStore>>,
 ) -> Result<Option<WorkerApi>> {
-    let Some(api_cfg) = config.queryflux.worker_api.as_ref().filter(|a| a.enabled) else {
+    let Some(api_cfg) = config.queryflux.control_plane.as_ref() else {
         return Ok(None);
     };
     let shared_secret = api_cfg.shared_secret.clone().unwrap_or_default();
@@ -73,7 +73,7 @@ pub(crate) fn worker_api(
             let issues = validate_snapshot_inputs(&inputs);
             if !issues.is_empty() {
                 anyhow::bail!(
-                    "workerApi: config cannot be published to workers: {}",
+                    "controlPlane: config cannot be published to workers: {}",
                     issues.join("; ")
                 );
             }
@@ -103,7 +103,7 @@ pub(crate) fn worker_api(
         sites: api_cfg
             .sites
             .iter()
-            .map(|s| queryflux_core::config::WorkerApiSite {
+            .map(|s| queryflux_core::config::ControlPlaneSite {
                 name: s.name.trim().to_string(),
                 tokens: s.tokens.iter().map(|h| h.to_ascii_lowercase()).collect(),
                 clusters: s.clusters.clone(),
