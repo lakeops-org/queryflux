@@ -100,6 +100,14 @@ pub(crate) fn worker_api(
         coordination,
         history: Some(history),
         quotas,
+        sites: api_cfg
+            .sites
+            .iter()
+            .map(|s| queryflux_core::config::WorkerApiSite {
+                name: s.name.trim().to_string(),
+                tokens: s.tokens.iter().map(|h| h.to_ascii_lowercase()).collect(),
+            })
+            .collect(),
     }))
 }
 

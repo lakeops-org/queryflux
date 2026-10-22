@@ -510,6 +510,7 @@ fn start(
         coordination: Some(remote.clone() as Arc<dyn queryflux_persistence::CoordinationStore>),
         history: Some(spool.clone() as Arc<dyn queryflux_persistence::MetricsStore>),
         quotas: Some(remote as Arc<dyn queryflux_persistence::quota::QuotaStore>),
+        sites: Vec::new(),
     };
 
     tokio::spawn(run_relay(
@@ -639,8 +640,9 @@ mod tests {
             let (changes, rx) = watch::channel(0u64);
             let up = Arc::new(AtomicBool::new(true));
             let store = Arc::new(InMemoryPersistence::new());
+            // Agents only, as on a hosted control plane: dc1's agent presents its site token.
             let api = WorkerApi {
-                shared_secret: "site-secret".into(),
+                shared_secret: String::new(),
                 snapshot: {
                     let current = current.clone();
                     Arc::new(move || {
@@ -653,6 +655,13 @@ mod tests {
                 coordination: Some(store.clone()),
                 history: Some(store.clone()),
                 quotas: None,
+                sites: vec![queryflux_core::config::WorkerApiSite {
+                    name: "dc1".into(),
+                    tokens: vec![{
+                        use sha2::Digest;
+                        format!("{:x}", sha2::Sha256::digest(b"site-secret"))
+                    }],
+                }],
             };
             let gate = up.clone();
             let app = queryflux_frontend::worker_api::router(api).layer(axum::middleware::from_fn(
