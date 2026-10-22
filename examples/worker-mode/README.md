@@ -35,7 +35,7 @@ cd examples/worker-mode && QUERYFLUX_IMAGE=queryflux:dev docker compose up -d --
 
 ## Things to try
 
-**Run a query on a worker.** It shows up in the control plane's query history, with the worker's name. Its SQL is masked because the control plane sets `workerApi.history.redaction: maskLiterals`.
+**Run a query on a worker.** It shows up in the control plane's query history, with the worker's name. Its SQL is masked because the control plane sets `controlPlane.history.redaction: maskLiterals`.
 
 ```bash
 ./trino --server http://localhost:8090 --user demo --execute "SELECT 42"
@@ -59,5 +59,5 @@ Set `onUnavailable: localLimits` on a worker to admit queries on its own limit i
 
 | File | Role |
 |------|------|
-| `control-plane.yaml` | `role: controlPlane`, Postgres, `workerApi` (shared secret, history redaction), the seed config |
+| `control-plane.yaml` | `role: controlPlane`, Postgres, `controlPlane` (shared secret, history redaction), the seed config |
 | `worker-a.yaml`, `worker-b.yaml` | `role: worker`, `controlPlane` URL and secret, `coordination`, frontends |

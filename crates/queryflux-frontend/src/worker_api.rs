@@ -7,7 +7,7 @@
 //!   re-checks whenever this process reloads its config.
 //! - `POST /worker/register` and `POST /worker/heartbeat` record what each worker reports
 //!   (name, version, labels, coordination mode, revisions, last error).
-//! - `POST /worker/fleet` records the workers a site agent relays for, as
+//! - `POST /worker/fleet` records the workers a hub relays for, as
 //!   `<site>/<name>` (a [`FleetReportV1`]).
 //!
 //! - `/worker/capacity/*` and `/worker/sweep-lock/*` give workers with
@@ -21,7 +21,7 @@
 //!   once; a batch that cannot start within [`RECORD_BATCH_QUEUE_WAIT`] gets
 //!   `503 Service Unavailable` with `Retry-After`, and the worker keeps it spooled.
 //!
-//! Workers authenticate with `Authorization: Bearer <workerApi.sharedSecret>`, separate
+//! Workers authenticate with `Authorization: Bearer <controlPlane.sharedSecret>`, separate
 //! from the admin API's Basic auth.
 
 use std::future::Future;
@@ -51,7 +51,7 @@ pub type WorkerSnapshotFn = Arc<
 
 #[derive(Clone)]
 pub struct WorkerApi {
-    /// Empty when only site agents are accepted.
+    /// Empty when only hubs are accepted.
     pub shared_secret: String,
     pub snapshot: WorkerSnapshotFn,
     /// Where registrations and heartbeats are recorded; `None` accepts and drops them.
@@ -66,12 +66,12 @@ pub struct WorkerApi {
     /// Capacity quotas for workers (`capacity.mode: quotas`); `None` answers 404, and
     /// workers keep using per-query leases.
     pub quotas: Option<Arc<dyn queryflux_persistence::quota::QuotaStore>>,
-    /// Site agents with their own tokens (`workerApi.sites`), hashes in lowercase hex.
-    pub sites: Vec<queryflux_core::config::WorkerApiSite>,
+    /// Hubs with their own tokens (`controlPlane.sites`), hashes in lowercase hex.
+    pub sites: Vec<queryflux_core::config::ControlPlaneSite>,
 }
 
 impl WorkerApi {
-    /// The clusters `site` is limited to (`workerApi.sites[].clusters`), if any.
+    /// The clusters `site` is limited to (`controlPlane.sites[].clusters`), if any.
     pub fn site_clusters(&self, site: &str) -> Option<&[String]> {
         self.sites
             .iter()
@@ -80,7 +80,7 @@ impl WorkerApi {
     }
 
     /// The snapshot as `who` gets it.
-    /// ponytail: re-filtered and re-sealed per request; cache per site if many agents
+    /// ponytail: re-filtered and re-sealed per request; cache per site if many hubs
     /// long-poll one control plane.
     fn view(&self, who: &Caller, snapshot: WorkerSnapshotV1) -> WorkerSnapshotV1 {
         match who {
@@ -205,9 +205,9 @@ pub(crate) fn authorized(headers: &HeaderMap, secret: &str) -> bool {
 /// Who presented the bearer token.
 #[derive(Debug, PartialEq)]
 enum Caller {
-    /// `workerApi.sharedSecret`: a worker, or a site agent trusted with any site.
+    /// `controlPlane.sharedSecret`: a worker, or a hub trusted with any site.
     Fleet,
-    /// A `workerApi.sites` token: that site's agent, acting only for that site.
+    /// A `controlPlane.sites` token: that site's hub, acting only for that site.
     Site(String),
 }
 
@@ -231,8 +231,8 @@ fn forbidden(message: String) -> Response {
     (StatusCode::FORBIDDEN, message).into_response()
 }
 
-/// A site agent may only hold capacity as its own site's workers (`<site>/<worker>`, the
-/// agent's holder prefix). `None` when the call may go ahead.
+/// A hub may only hold capacity as its own site's workers (`<site>/<worker>`, the
+/// hub's holder prefix). `None` when the call may go ahead.
 /// ponytail: releases and waits name a query id only; those ids are random UUIDs, so
 /// they are not checked against the site.
 fn foreign_holder(st: &WorkerApiState, headers: &HeaderMap, instance_id: &str) -> Option<Response> {
@@ -366,13 +366,13 @@ async fn report(
     if worker.name.trim().is_empty() {
         return (StatusCode::BAD_REQUEST, "worker name is required").into_response();
     }
-    // A site token reports its own agent only, named under its site so another site's
-    // agent can't overwrite it.
+    // A site token reports its own hub only, named under its site so another site's
+    // hub can't overwrite it.
     if let Caller::Site(site) = who {
         if !worker.name.starts_with(&format!("{site}/")) {
             worker.name = format!("{site}/{}", worker.name);
         }
-        worker.kind = "siteAgent".to_string();
+        worker.kind = "hub".to_string();
         worker.parent = None;
         worker.labels.insert("site".to_string(), site);
     }
@@ -386,7 +386,7 @@ async fn report(
     StatusCode::NO_CONTENT.into_response()
 }
 
-/// A site agent's workers. Each is stored as `<site>/<name>` with `parent` set to the
+/// A hub's workers. Each is stored as `<site>/<name>` with `parent` set to the
 /// site, so `worker-0` at two sites doesn't collide.
 async fn fleet_report(
     State(st): State<Arc<WorkerApiState>>,
@@ -518,7 +518,7 @@ async fn ingest_records(
         .into_iter()
         .map(|mut record| {
             record.worker = Some(match &site {
-                // Relayed by a site agent: each record names the worker that ran it.
+                // Relayed by a hub: each record names the worker that ran it.
                 Some(site) => format!(
                     "{site}/{}",
                     record.worker.as_deref().unwrap_or(worker.as_str())
@@ -1241,7 +1241,7 @@ mod tests {
         let store = Arc::new(queryflux_persistence::in_memory::InMemoryPersistence::new());
         let s = snapshot();
         let app = router(WorkerApi {
-            // Agents only: no shared secret.
+            // Hubs only: no shared secret.
             shared_secret: String::new(),
             snapshot: Arc::new(move || {
                 let s = s.clone();
@@ -1253,12 +1253,12 @@ mod tests {
             history: Some(store.clone()),
             quotas: None,
             sites: vec![
-                queryflux_core::config::WorkerApiSite {
+                queryflux_core::config::ControlPlaneSite {
                     name: "dc1".into(),
                     tokens: vec![hash("old-dc1"), hash("t-dc1")],
                     clusters: None,
                 },
-                queryflux_core::config::WorkerApiSite {
+                queryflux_core::config::ControlPlaneSite {
                     name: "dc2".into(),
                     tokens: vec![hash("t-dc2")],
                     clusters: None,
@@ -1294,9 +1294,9 @@ mod tests {
             );
         }
 
-        // The agent's own report is pinned to its site, whatever it claims.
+        // The hub's own report is pinned to its site, whatever it claims.
         let report = serde_json::json!({
-            "name": "agent-0", "version": "0.5.0", "labels": { "site": "dc2" },
+            "name": "hub-0", "version": "0.5.0", "labels": { "site": "dc2" },
             "coordinationMode": "controlPlane", "kind": "worker"
         });
         assert_eq!(
@@ -1325,13 +1325,9 @@ mod tests {
             .map(|w| (w.name.as_str(), w.kind.as_str()))
             .collect();
         names.sort();
-        assert_eq!(names, [("dc1/agent-0", "siteAgent"), ("dc1/w", "worker")]);
+        assert_eq!(names, [("dc1/hub-0", "hub"), ("dc1/w", "worker")]);
         assert_eq!(
-            workers
-                .iter()
-                .find(|w| w.kind == "siteAgent")
-                .unwrap()
-                .labels["site"],
+            workers.iter().find(|w| w.kind == "hub").unwrap().labels["site"],
             "dc1"
         );
 
@@ -1365,7 +1361,7 @@ mod tests {
         // History is attributed to the token's site.
         let batch = |site: Option<&str>| {
             serde_json::json!({
-                "schemaVersion": 1, "worker": "agent-0", "site": site, "records": [{
+                "schemaVersion": 1, "worker": "hub-0", "site": site, "records": [{
                     "proxyQueryId": "q-1", "clusterGroup": "g", "clusterName": "c",
                     "engineType": "duckDb", "frontendProtocol": "trinoHttp",
                     "sourceDialect": "trino", "targetDialect": "duckDb",

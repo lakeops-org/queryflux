@@ -9,7 +9,7 @@
     },
     "role": {
       "type": "string",
-      "enum": ["", "standalone", "controlPlane", "worker", "siteAgent"]
+      "enum": ["", "standalone", "controlPlane", "worker", "hub"]
     },
     "workload": {
       "type": "object",

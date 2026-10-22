@@ -96,7 +96,7 @@ impl PrometheusMetrics {
         let registry = Registry::new();
         crate::adbc::register(&registry)?;
         crate::sql_cache::register(&registry)?;
-        crate::site_agent::register(&registry)?;
+        crate::hub::register(&registry)?;
         let translation_skipped_total = CounterVec::new(
             Opts::new(
                 "queryflux_translation_skipped_total",

@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use queryflux_core::config::ControlPlaneClientConfig;
+use queryflux_core::config::UpstreamConfig;
 use queryflux_core::error::Result;
 use queryflux_core::worker_snapshot::HistoryRedaction;
 use queryflux_persistence::{
@@ -103,9 +103,9 @@ pub(crate) struct RemoteMetricsStore {
     wake: Notify,
     client: reqwest::Client,
     worker: String,
-    /// `controlPlane.url`, without a trailing slash.
+    /// `worker.upstream.url`, without a trailing slash.
     control_plane: String,
-    bearer: String,
+    bearer: crate::bearer::Bearer,
     /// `history.endpoint` in the bootstrap config; wins over the snapshot's.
     endpoint_override: Option<String>,
     /// The active snapshot's history policy and the delivery counters.
@@ -114,7 +114,8 @@ pub(crate) struct RemoteMetricsStore {
 
 impl RemoteMetricsStore {
     pub(crate) fn new(
-        control_plane: &ControlPlaneClientConfig,
+        control_plane: &UpstreamConfig,
+        bearer: crate::bearer::Bearer,
         worker: String,
         endpoint_override: Option<String>,
         max_records: usize,
@@ -130,7 +131,7 @@ impl RemoteMetricsStore {
                 .expect("reqwest client"),
             worker,
             control_plane: control_plane.url.trim_end_matches('/').to_string(),
-            bearer: control_plane.auth.bearer().to_string(),
+            bearer,
             endpoint_override,
             state,
         })
@@ -204,7 +205,7 @@ impl RemoteMetricsStore {
         };
         let mut req = self.client.post(endpoint).json(&batch);
         if same_origin(endpoint, &self.control_plane) {
-            req = req.bearer_auth(&self.bearer);
+            req = req.bearer_auth(self.bearer.get());
         }
         let result = match req.send().await {
             Ok(resp) if resp.status().is_success() => Ok(()),
@@ -579,11 +580,15 @@ mod tests {
         max: usize,
         state: Arc<Mutex<WorkerSyncState>>,
     ) -> Arc<RemoteMetricsStore> {
-        let cp: ControlPlaneClientConfig = serde_yaml::from_str(&format!(
-            "url: {url}\nauth:\n  mode: sharedSecret\n  sharedSecret: s3cret\n"
-        ))
-        .unwrap();
-        RemoteMetricsStore::new(&cp, "worker-a".into(), None, max, state)
+        let cp: UpstreamConfig = serde_yaml::from_str(&format!("url: {url}\n")).unwrap();
+        RemoteMetricsStore::new(
+            &cp,
+            crate::bearer::Bearer::secret("s3cret"),
+            "worker-a".into(),
+            None,
+            max,
+            state,
+        )
     }
 
     async fn stored(

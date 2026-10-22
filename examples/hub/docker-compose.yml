@@ -1,17 +1,17 @@
-# Site agent: a control plane (with Postgres) standing in for a remote one, one site
-# agent, and two workers that reach the control plane only through the agent.
+# Hub: a control plane (with Postgres) standing in for a remote one, one site
+# hub, and two workers that reach the control plane only through the hub.
 #
 # From this directory:
 #   docker compose up -d --wait
 #
 # SQL via worker-a: http://localhost:8090 · worker-b: :8091
-# Agent status: http://localhost:9100/agent/status
+# Hub status: http://localhost:9100/hub/status
 # Studio (control plane): http://localhost:3000 · Admin API: http://localhost:9000
 #
-# The site agent needs a QueryFlux image built from a release that includes it. To use a
+# The hub needs a QueryFlux image built from a release that includes it. To use a
 # local build: QUERYFLUX_IMAGE=queryflux:dev docker compose up -d --wait
 
-name: queryflux-example-site-agent
+name: queryflux-example-hub
 
 x-readyz: &readyz
   test:
@@ -24,15 +24,15 @@ x-readyz: &readyz
   retries: 40
 
 networks:
-  # The control plane's network ("upstream") and the site's network. Only the agent is on
+  # The control plane's network ("upstream") and the site's network. Only the hub is on
   # both: the workers have no route to the control plane.
   upstream: {}
   site: {}
 
 volumes:
-  # The agent's snapshot cache and history spool. Keep it on an encrypted volume in a real
+  # The hub's snapshot cache and history spool. Keep it on an encrypted volume in a real
   # deployment: the cached snapshot can carry engine credentials.
-  agent-state: {}
+  hub-state: {}
 
 services:
   postgres:
@@ -63,14 +63,14 @@ services:
         condition: service_healthy
     restart: unless-stopped
 
-  site-agent:
+  hub:
     image: ${QUERYFLUX_IMAGE:-ghcr.io/lakeops-org/queryflux:latest}
     networks: [upstream, site]
     ports:
       - "9100:9000"
     volumes:
-      - ./site-agent.yaml:/etc/queryflux/config.yaml:ro
-      - agent-state:/var/lib/queryflux/site-agent
+      - ./hub.yaml:/etc/queryflux/config.yaml:ro
+      - hub-state:/var/lib/queryflux/hub
     environment:
       RUST_LOG: ${RUST_LOG:-queryflux=info}
     # Ready once it has a config to serve, from upstream or its cache.
@@ -91,7 +91,7 @@ services:
       RUST_LOG: ${RUST_LOG:-queryflux=info}
     healthcheck: *readyz
     depends_on:
-      - site-agent
+      - hub
     restart: unless-stopped
 
   worker-b:
@@ -106,7 +106,7 @@ services:
       RUST_LOG: ${RUST_LOG:-queryflux=info}
     healthcheck: *readyz
     depends_on:
-      - site-agent
+      - hub
     restart: unless-stopped
 
   queryflux-studio:

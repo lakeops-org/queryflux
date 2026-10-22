@@ -765,12 +765,13 @@ pub(crate) fn apply_reconcile_to_cluster_state(
     }
 }
 
-/// A worker's name for the control plane: `workerName`, else the hostname.
+/// A worker's name for the control plane: `worker.name`, else the hostname.
 pub(crate) fn worker_name(config: &ProxyConfig) -> String {
     config
         .queryflux
-        .worker_name
-        .clone()
+        .worker
+        .as_ref()
+        .and_then(|w| w.name.clone())
         .or_else(|| std::env::var("HOSTNAME").ok())
         .unwrap_or_else(|| format!("worker-{}", std::process::id()))
 }
@@ -805,25 +806,22 @@ pub(crate) fn spawn_worker_heartbeat(
     sync_state: &Arc<std::sync::Mutex<crate::config_source::WorkerSyncState>>,
     shutdown_rx: &watch::Receiver<bool>,
 ) {
-    let Some(cp) = config.queryflux.control_plane.clone() else {
+    let Some(worker) = config.queryflux.worker.clone() else {
         return;
     };
+    let cp = worker.upstream;
+    let secret = config.queryflux.worker_secret.clone().unwrap_or_default();
     let base = cp.url.trim_end_matches('/').to_string();
     let name = worker_name(config);
-    let config_labels = config.queryflux.worker_labels.clone();
-    let labels_file = config.queryflux.worker_labels_file.clone();
-    let coordination_mode = match config.queryflux.coordination.as_ref().map(|c| c.mode) {
-        Some(queryflux_core::config::CoordinationMode::Local) => "local",
-        _ => "controlPlane",
+    let config_labels = worker.labels;
+    let labels_file = worker.labels_file;
+    let coordination_mode = match worker.coordination.mode {
+        queryflux_core::config::CoordinationMode::Local => "local",
+        queryflux_core::config::CoordinationMode::ControlPlane => "controlPlane",
     };
-    let on_unavailable = match config
-        .queryflux
-        .coordination
-        .as_ref()
-        .map(|c| c.on_unavailable)
-    {
-        Some(queryflux_core::config::OnCoordinationUnavailable::LocalLimits) => "localLimits",
-        _ => "failClosed",
+    let on_unavailable = match worker.coordination.on_unavailable {
+        queryflux_core::config::OnCoordinationUnavailable::LocalLimits => "localLimits",
+        queryflux_core::config::OnCoordinationUnavailable::FailClosed => "failClosed",
     };
     let frontends = enabled_frontends(&config.queryflux.frontends);
     let sync_state = sync_state.clone();
@@ -886,7 +884,7 @@ pub(crate) fn spawn_worker_heartbeat(
             let path = if registered { "heartbeat" } else { "register" };
             match client
                 .post(format!("{base}/worker/{path}"))
-                .bearer_auth(cp.auth.bearer())
+                .bearer_auth(&secret)
                 .json(&report)
                 .send()
                 .await

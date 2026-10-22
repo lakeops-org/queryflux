@@ -1,5 +1,5 @@
-//! A worker's labels (#255): `workerLabels` from its config, with the labels in
-//! `workerLabelsFile` on top. The file is in the Kubernetes downward API format, one
+//! A worker's labels (#255): `worker.labels` from its config, with the labels in
+//! `worker.labelsFile` on top. The file is in the Kubernetes downward API format, one
 //! `key="value"` per line, so a sidecar or DaemonSet worker reports its own pod's labels
 //! while every pod shares one worker config.
 
@@ -28,7 +28,7 @@ pub(crate) fn current(
     if let Some(path) = file {
         match std::fs::read_to_string(path) {
             Ok(text) => labels.extend(parse(&text)),
-            Err(e) => tracing::debug!(path, "workerLabelsFile not readable: {e}"),
+            Err(e) => tracing::debug!(path, "worker.labelsFile not readable: {e}"),
         }
     }
     labels

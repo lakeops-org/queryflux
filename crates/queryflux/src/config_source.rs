@@ -348,7 +348,7 @@ impl WorkerSyncState {
 pub(crate) struct RemoteConfigSource {
     client: reqwest::Client,
     url: String,
-    bearer: String,
+    bearer: crate::bearer::Bearer,
     poll_interval: std::time::Duration,
     /// How long the control plane may hold a long-poll.
     wait_secs: u64,
@@ -360,7 +360,8 @@ pub(crate) struct RemoteConfigSource {
 
 impl RemoteConfigSource {
     pub(crate) fn new(
-        control_plane: &queryflux_core::config::ControlPlaneClientConfig,
+        control_plane: &queryflux_core::config::UpstreamConfig,
+        bearer: crate::bearer::Bearer,
         state: Arc<std::sync::Mutex<WorkerSyncState>>,
     ) -> Self {
         let wait_secs = control_plane.poll_timeout_secs.clamp(1, 60);
@@ -371,7 +372,7 @@ impl RemoteConfigSource {
                 .build()
                 .unwrap_or_default(),
             url: format!("{}/worker/config", control_plane.url.trim_end_matches('/')),
-            bearer: control_plane.auth.bearer().to_string(),
+            bearer,
             // Only used when the control plane does not support long-poll.
             poll_interval: std::time::Duration::from_secs(5),
             wait_secs,
@@ -432,23 +433,24 @@ impl RemoteConfigSource {
         let max_age = chrono::Duration::seconds(peer.max_age_secs as i64);
         for addr in addrs {
             let url = format!("http://{addr}/worker/peer-config");
-            let config: PeerConfig = match client.get(&url).bearer_auth(&self.bearer).send().await {
-                Ok(r) if r.status().is_success() => match r.json().await {
-                    Ok(c) => c,
-                    Err(e) => {
-                        tracing::debug!(%addr, "Peer config does not parse: {e}");
+            let config: PeerConfig =
+                match client.get(&url).bearer_auth(self.bearer.get()).send().await {
+                    Ok(r) if r.status().is_success() => match r.json().await {
+                        Ok(c) => c,
+                        Err(e) => {
+                            tracing::debug!(%addr, "Peer config does not parse: {e}");
+                            continue;
+                        }
+                    },
+                    Ok(r) => {
+                        tracing::debug!(%addr, status = %r.status(), "Peer has no config to share");
                         continue;
                     }
-                },
-                Ok(r) => {
-                    tracing::debug!(%addr, status = %r.status(), "Peer has no config to share");
-                    continue;
-                }
-                Err(e) => {
-                    tracing::debug!(%addr, "Peer unreachable: {e}");
-                    continue;
-                }
-            };
+                    Err(e) => {
+                        tracing::debug!(%addr, "Peer unreachable: {e}");
+                        continue;
+                    }
+                };
             let snapshot = config.snapshot;
             if snapshot.schema_version != WORKER_SNAPSHOT_SCHEMA_VERSION || !snapshot.is_sealed() {
                 tracing::warn!(%addr, "Peer config failed its version or integrity check");
@@ -601,7 +603,7 @@ pub(crate) enum FetchMode<'a> {
     Wait(&'a str, u64),
 }
 
-/// One config request to `url` (a control plane's or site agent's `/worker/config`).
+/// One config request to `url` (a control plane's or hub's `/worker/config`).
 /// A received snapshot is verified: schema version and sealed revision. `Err` is a
 /// message for logs and status.
 pub(crate) async fn fetch_snapshot(
@@ -672,7 +674,8 @@ impl RemoteConfigSource {
             Some(rev) => FetchMode::Wait(rev, self.wait_secs),
             None => FetchMode::Now,
         };
-        let snapshot = match fetch_snapshot(&self.client, &self.url, &self.bearer, mode).await {
+        let snapshot = match fetch_snapshot(&self.client, &self.url, &self.bearer.get(), mode).await
+        {
             Ok(Fetched::Unchanged) => {
                 {
                     let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -872,16 +875,18 @@ mod tests {
         url: &str,
         secret: &str,
     ) -> (RemoteConfigSource, Arc<std::sync::Mutex<WorkerSyncState>>) {
-        let cp: queryflux_core::config::ControlPlaneClientConfig =
+        let cp: queryflux_core::config::UpstreamConfig =
             serde_json::from_value(serde_json::json!({
                 "url": url,
                 "allowInsecureHttp": true,
-                "pollTimeoutSecs": 1,
-                "auth": { "mode": "sharedSecret", "sharedSecret": secret }
+                "pollTimeoutSecs": 1
             }))
             .unwrap();
         let state = Arc::new(std::sync::Mutex::new(WorkerSyncState::default()));
-        (RemoteConfigSource::new(&cp, state.clone()), state)
+        (
+            RemoteConfigSource::new(&cp, crate::bearer::Bearer::secret(secret), state.clone()),
+            state,
+        )
     }
 
     async fn group_limit(h: &LiveHandles) -> Option<u64> {
@@ -1004,17 +1009,19 @@ mod tests {
         peer_addr: &str,
         max_age_secs: u64,
     ) -> (RemoteConfigSource, Arc<std::sync::Mutex<WorkerSyncState>>) {
-        let cp: queryflux_core::config::ControlPlaneClientConfig =
+        let cp: queryflux_core::config::UpstreamConfig =
             serde_json::from_value(serde_json::json!({
                 "url": url,
                 "allowInsecureHttp": true,
                 "pollTimeoutSecs": 1,
-                "auth": { "mode": "sharedSecret", "sharedSecret": "s3cret" },
                 "peerBootstrap": { "address": peer_addr, "afterSecs": 0, "maxAgeSecs": max_age_secs }
             }))
             .unwrap();
         let state = Arc::new(std::sync::Mutex::new(WorkerSyncState::default()));
-        (RemoteConfigSource::new(&cp, state.clone()), state)
+        (
+            RemoteConfigSource::new(&cp, crate::bearer::Bearer::secret("s3cret"), state.clone()),
+            state,
+        )
     }
 
     #[tokio::test]

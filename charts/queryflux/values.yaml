@@ -18,8 +18,8 @@ replicaCount: 1
 
 # Deployment (default), DaemonSet for one worker per node (apps on a node reach their
 # node's worker through the Service with service.internalTrafficPolicy: Local), or
-# StatefulSet for site agents, which keep a history spool and snapshot cache on a volume
-# per pod (see examples/site-agent-values.yaml). StatefulSet needs service.headless.enabled.
+# StatefulSet for hubs, which keep a history spool and snapshot cache on a volume
+# per pod (see examples/hub-values.yaml). StatefulSet needs service.headless.enabled.
 workload:
   kind: Deployment
   # DaemonSet only. One node's worker restarts at a time; its apps cannot connect meanwhile.
@@ -31,7 +31,7 @@ workload:
   # with extraVolumeMounts.
   volumeClaimTemplates: []
 
-# The process role: standalone (default), controlPlane, worker or siteAgent (worker mode, #255).
+# The process role: standalone (default), controlPlane, worker or hub (worker mode, #255).
 # Only needed when the config comes from config.existingSecret or an existing ConfigMap,
 # which the chart cannot read; otherwise it is taken from config.data.queryflux.role.
 # Used for the install notes and role-specific warnings, not passed to QueryFlux.
