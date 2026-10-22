@@ -25,8 +25,7 @@ export default function OpenPanelInit(): null {
     );
 
     const op = new OpenPanel({
-      // || not ?? — empty string from a bad build must not win over the default.
-      clientId: customFields.openPanelClientId || DEFAULT_OPENPANEL_CLIENT_ID,
+      clientId: customFields.openPanelClientId ?? DEFAULT_OPENPANEL_CLIENT_ID,
       ...OPENPANEL_TRACKING_OPTIONS,
       // Surface failed ingest in the console during local dev (CORS allowlist, ad blockers).
       debug: isLocalDev,
