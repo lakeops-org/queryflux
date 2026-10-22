@@ -21,8 +21,12 @@
 //!   once; a batch that cannot start within [`RECORD_BATCH_QUEUE_WAIT`] gets
 //!   `503 Service Unavailable` with `Retry-After`, and the worker keeps it spooled.
 //!
-//! Workers authenticate with `Authorization: Bearer <controlPlane.sharedSecret>`, separate
-//! from the admin API's Basic auth.
+//! - `POST /worker/enroll` enrolls a hub: it presents a one-time enrollment token for its
+//!   site and the public key it generated, and from then on signs short-lived tokens with
+//!   that key ([`queryflux_core::hub_token`]).
+//!
+//! Workers authenticate with `Authorization: Bearer <workerSecret>`, and enrolled hubs with
+//! a token they signed; both are separate from the admin API's Basic auth.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -66,29 +70,22 @@ pub struct WorkerApi {
     /// Capacity quotas for workers (`capacity.mode: quotas`); `None` answers 404, and
     /// workers keep using per-query leases.
     pub quotas: Option<Arc<dyn queryflux_persistence::quota::QuotaStore>>,
-    /// Hubs with their own tokens (`controlPlane.sites`), hashes in lowercase hex.
-    pub sites: Vec<queryflux_core::config::ControlPlaneSite>,
+    /// Enrolled hubs (`POST /worker/enroll`); `None`: this process enrolls none.
+    pub hubs: Option<Arc<crate::hub_directory::HubDirectory>>,
 }
 
 impl WorkerApi {
-    /// The clusters `site` is limited to (`controlPlane.sites[].clusters`), if any.
-    pub fn site_clusters(&self, site: &str) -> Option<&[String]> {
-        self.sites
-            .iter()
-            .find(|s| s.name == site)
-            .and_then(|s| s.clusters.as_deref())
-    }
-
     /// The snapshot as `who` gets it.
     /// ponytail: re-filtered and re-sealed per request; cache per site if many hubs
     /// long-poll one control plane.
-    fn view(&self, who: &Caller, snapshot: WorkerSnapshotV1) -> WorkerSnapshotV1 {
-        match who {
-            Caller::Site(site) => match self.site_clusters(site) {
-                Some(clusters) => snapshot.for_site(clusters),
-                None => snapshot,
-            },
-            Caller::Fleet => snapshot,
+    async fn view(&self, who: &Caller, snapshot: WorkerSnapshotV1) -> WorkerSnapshotV1 {
+        let clusters = match (who, &self.hubs) {
+            (Caller::Site(site), Some(hubs)) => hubs.clusters(site).await,
+            _ => None,
+        };
+        match clusters {
+            Some(clusters) => snapshot.for_site(&clusters),
+            None => snapshot,
         }
     }
 }
@@ -126,6 +123,7 @@ pub fn router_with_ingest_limit(
         .route("/worker/register", post(report))
         .route("/worker/heartbeat", post(report))
         .route("/worker/fleet", post(fleet_report))
+        .route("/worker/enroll", post(enroll))
         .route("/worker/capacity/acquire", post(capacity_acquire))
         .route("/worker/capacity/release", post(capacity_release))
         .route(
@@ -205,26 +203,18 @@ pub(crate) fn authorized(headers: &HeaderMap, secret: &str) -> bool {
 /// Who presented the bearer token.
 #[derive(Debug, PartialEq)]
 enum Caller {
-    /// `controlPlane.sharedSecret`: a worker, or a hub trusted with any site.
+    /// `workerSecret`: a worker, or a hub trusted with any site.
     Fleet,
-    /// A `controlPlane.sites` token: that site's hub, acting only for that site.
+    /// A token signed by an enrolled hub: that site's hub, acting only for that site.
     Site(String),
 }
 
-fn caller(api: &WorkerApi, headers: &HeaderMap) -> Option<Caller> {
+async fn caller(api: &WorkerApi, headers: &HeaderMap) -> Option<Caller> {
     let token = bearer(headers)?;
     if !api.shared_secret.is_empty() && secret_matches(token, &api.shared_secret) {
         return Some(Caller::Fleet);
     }
-    if api.sites.is_empty() {
-        return None;
-    }
-    use sha2::Digest;
-    let hash = format!("{:x}", sha2::Sha256::digest(token.as_bytes()));
-    api.sites
-        .iter()
-        .find(|s| s.tokens.iter().any(|h| secret_matches(&hash, h)))
-        .map(|s| Caller::Site(s.name.clone()))
+    api.hubs.as_ref()?.site_of(token).await.map(Caller::Site)
 }
 
 fn forbidden(message: String) -> Response {
@@ -235,8 +225,12 @@ fn forbidden(message: String) -> Response {
 /// hub's holder prefix). `None` when the call may go ahead.
 /// ponytail: releases and waits name a query id only; those ids are random UUIDs, so
 /// they are not checked against the site.
-fn foreign_holder(st: &WorkerApiState, headers: &HeaderMap, instance_id: &str) -> Option<Response> {
-    match caller(&st.api, headers) {
+async fn foreign_holder(
+    st: &WorkerApiState,
+    headers: &HeaderMap,
+    instance_id: &str,
+) -> Option<Response> {
+    match caller(&st.api, headers).await {
         Some(Caller::Site(site))
             if !instance_id
                 .strip_prefix(site.as_str())
@@ -247,6 +241,96 @@ fn foreign_holder(st: &WorkerApiState, headers: &HeaderMap, instance_id: &str) -
             )))
         }
         _ => None,
+    }
+}
+
+/// `POST /worker/enroll`.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct EnrollRequest {
+    /// The one-time enrollment token an admin created for `site`.
+    token: String,
+    site: String,
+    /// The hub's Ed25519 public key, base64url.
+    public_key: String,
+    #[serde(default)]
+    host: Option<String>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EnrollResponse {
+    /// The `kid` the hub signs its tokens with.
+    pub hub_id: String,
+    pub site: String,
+}
+
+/// The SHA-256 an enrollment token is stored as.
+pub fn enrollment_token_hash(token: &str) -> String {
+    use sha2::Digest;
+    format!("{:x}", sha2::Sha256::digest(token.trim().as_bytes()))
+}
+
+async fn enroll(State(st): State<Arc<WorkerApiState>>, Json(req): Json<EnrollRequest>) -> Response {
+    let Some(hubs) = &st.api.hubs else {
+        return (
+            StatusCode::NOT_FOUND,
+            "this control plane does not enroll hubs (it needs Postgres)",
+        )
+            .into_response();
+    };
+    if queryflux_core::hub_token::decode_public_key(&req.public_key).is_none() {
+        return (
+            StatusCode::BAD_REQUEST,
+            "publicKey is not a base64url Ed25519 public key",
+        )
+            .into_response();
+    }
+    let hub = queryflux_persistence::hub_store::HubKey {
+        id: uuid::Uuid::new_v4().to_string(),
+        site: req.site.trim().to_string(),
+        public_key: req.public_key.trim().to_string(),
+        host: req.host,
+        enrolled_at: chrono::Utc::now(),
+    };
+    match hubs
+        .store()
+        .enroll_hub(&enrollment_token_hash(&req.token), &hub)
+        .await
+    {
+        Ok(true) => {
+            hubs.reload().await;
+            tracing::info!(site = %hub.site, hub = %hub.id, host = ?hub.host, "Hub enrolled");
+            (
+                StatusCode::CREATED,
+                Json(EnrollResponse {
+                    hub_id: hub.id,
+                    site: hub.site,
+                }),
+            )
+                .into_response()
+        }
+        // A hub whose answer was lost retries with the same key and its spent token: the
+        // key is what proves it, so answer with the hub it already is.
+        Ok(false) => match hubs.store().list_hub_keys().await {
+            Ok(keys) => match keys
+                .into_iter()
+                .find(|k| k.site == hub.site && k.public_key == hub.public_key)
+            {
+                Some(k) => Json(EnrollResponse {
+                    hub_id: k.id,
+                    site: k.site,
+                })
+                .into_response(),
+                None => (
+                    StatusCode::UNAUTHORIZED,
+                    "enrollment token is unknown, used, expired, or for another site",
+                )
+                    .into_response(),
+            },
+            Err(e) => unavailable(format!("enrollment failed: {e}")),
+        },
+        Err(e) => unavailable(format!("enrollment failed: {e}")),
     }
 }
 
@@ -295,12 +379,12 @@ fn unauthorized() -> Response {
 }
 
 async fn get_config(State(st): State<Arc<WorkerApiState>>, headers: HeaderMap) -> Response {
-    let Some(who) = caller(&st.api, &headers) else {
+    let Some(who) = caller(&st.api, &headers).await else {
         return unauthorized();
     };
     match (st.api.snapshot)().await {
         Ok(snapshot) => snapshot_response(
-            &st.api.view(&who, snapshot),
+            &st.api.view(&who, snapshot).await,
             headers
                 .get(header::IF_NONE_MATCH)
                 .and_then(|v| v.to_str().ok()),
@@ -321,7 +405,7 @@ async fn wait_config(
     headers: HeaderMap,
     Query(params): Query<WaitParams>,
 ) -> Response {
-    let Some(who) = caller(&st.api, &headers) else {
+    let Some(who) = caller(&st.api, &headers).await else {
         return unauthorized();
     };
     let timeout =
@@ -330,7 +414,7 @@ async fn wait_config(
     let mut changes = st.api.changes.clone();
     loop {
         let snapshot = match (st.api.snapshot)().await {
-            Ok(s) => st.api.view(&who, s),
+            Ok(s) => st.api.view(&who, s).await,
             Err(message) => return unavailable(message),
         };
         if params.since.as_deref() != Some(snapshot.revision.as_str()) {
@@ -360,7 +444,7 @@ async fn report(
     headers: HeaderMap,
     Json(mut worker): Json<WorkerRecord>,
 ) -> Response {
-    let Some(who) = caller(&st.api, &headers) else {
+    let Some(who) = caller(&st.api, &headers).await else {
         return unauthorized();
     };
     if worker.name.trim().is_empty() {
@@ -393,7 +477,7 @@ async fn fleet_report(
     headers: HeaderMap,
     Json(fleet): Json<FleetReportV1>,
 ) -> Response {
-    let Some(who) = caller(&st.api, &headers) else {
+    let Some(who) = caller(&st.api, &headers).await else {
         return unauthorized();
     };
     let site = fleet.site.trim();
@@ -467,7 +551,7 @@ async fn ingest_records(
     headers: HeaderMap,
     Json(mut batch): Json<QueryRecordBatchV1>,
 ) -> Response {
-    let Some(who) = caller(&st.api, &headers) else {
+    let Some(who) = caller(&st.api, &headers).await else {
         return unauthorized();
     };
     // A site token's records are its site's, whatever the batch says.
@@ -598,11 +682,11 @@ pub struct PublishRunning {
 
 /// Authorize the worker and return the coordination store, or the response to send.
 #[allow(clippy::result_large_err)]
-fn coordination(
+async fn coordination(
     st: &WorkerApiState,
     headers: &HeaderMap,
 ) -> Result<Arc<dyn CoordinationStore>, Response> {
-    if caller(&st.api, headers).is_none() {
+    if caller(&st.api, headers).await.is_none() {
         return Err(unauthorized());
     }
     st.api.coordination.clone().ok_or_else(|| {
@@ -623,11 +707,11 @@ async fn capacity_acquire(
     headers: HeaderMap,
     Json(req): Json<AcquireRequest>,
 ) -> Response {
-    let store = match coordination(&st, &headers) {
+    let store = match coordination(&st, &headers).await {
         Ok(s) => s,
         Err(r) => return r,
     };
-    if let Some(r) = foreign_holder(&st, &headers, &req.instance_id) {
+    if let Some(r) = foreign_holder(&st, &headers, &req.instance_id).await {
         return r;
     }
     match store
@@ -649,7 +733,7 @@ async fn capacity_release(
     headers: HeaderMap,
     Json(req): Json<ReleaseRequest>,
 ) -> Response {
-    let store = match coordination(&st, &headers) {
+    let store = match coordination(&st, &headers).await {
         Ok(s) => s,
         Err(r) => return r,
     };
@@ -675,7 +759,7 @@ async fn capacity_wait(
     headers: HeaderMap,
     Json(req): Json<WaitRequest>,
 ) -> Response {
-    let store = match coordination(&st, &headers) {
+    let store = match coordination(&st, &headers).await {
         Ok(s) => s,
         Err(r) => return r,
     };
@@ -692,11 +776,11 @@ async fn capacity_wait(
 /// Authorize the worker and return the quota store, or 404 when this control plane has
 /// no quotas (`capacity.mode: leases`): the worker then keeps per-query leases.
 #[allow(clippy::result_large_err)]
-fn quotas(
+async fn quotas(
     st: &WorkerApiState,
     headers: &HeaderMap,
 ) -> Result<Arc<dyn queryflux_persistence::quota::QuotaStore>, Response> {
-    if caller(&st.api, headers).is_none() {
+    if caller(&st.api, headers).await.is_none() {
         return Err(unauthorized());
     }
     st.api.quotas.clone().ok_or_else(|| {
@@ -722,11 +806,11 @@ async fn capacity_quota(
     headers: HeaderMap,
     Json(req): Json<QuotaReportRequest>,
 ) -> Response {
-    let store = match quotas(&st, &headers) {
+    let store = match quotas(&st, &headers).await {
         Ok(s) => s,
         Err(r) => return r,
     };
-    if let Some(r) = foreign_holder(&st, &headers, &req.instance_id) {
+    if let Some(r) = foreign_holder(&st, &headers, &req.instance_id).await {
         return r;
     }
     match store.report_demand(&req.instance_id, &req.clusters).await {
@@ -741,11 +825,11 @@ async fn capacity_quota_release(
     headers: HeaderMap,
     Json(req): Json<InstanceRequest>,
 ) -> Response {
-    let store = match quotas(&st, &headers) {
+    let store = match quotas(&st, &headers).await {
         Ok(s) => s,
         Err(r) => return r,
     };
-    if let Some(r) = foreign_holder(&st, &headers, &req.instance_id) {
+    if let Some(r) = foreign_holder(&st, &headers, &req.instance_id).await {
         return r;
     }
     match store.release_holder(&req.instance_id).await {
@@ -760,7 +844,7 @@ async fn capacity_release_batch(
     headers: HeaderMap,
     Json(req): Json<ReleaseBatchRequest>,
 ) -> Response {
-    let store = match coordination(&st, &headers) {
+    let store = match coordination(&st, &headers).await {
         Ok(s) => s,
         Err(r) => return r,
     };
@@ -780,11 +864,11 @@ async fn capacity_heartbeat(
     headers: HeaderMap,
     Json(req): Json<InstanceRequest>,
 ) -> Response {
-    let store = match coordination(&st, &headers) {
+    let store = match coordination(&st, &headers).await {
         Ok(s) => s,
         Err(r) => return r,
     };
-    if let Some(r) = foreign_holder(&st, &headers, &req.instance_id) {
+    if let Some(r) = foreign_holder(&st, &headers, &req.instance_id).await {
         return r;
     }
     match store.heartbeat(&req.instance_id).await {
@@ -798,11 +882,11 @@ async fn capacity_release_all(
     headers: HeaderMap,
     Json(req): Json<InstanceRequest>,
 ) -> Response {
-    let store = match coordination(&st, &headers) {
+    let store = match coordination(&st, &headers).await {
         Ok(s) => s,
         Err(r) => return r,
     };
-    if let Some(r) = foreign_holder(&st, &headers, &req.instance_id) {
+    if let Some(r) = foreign_holder(&st, &headers, &req.instance_id).await {
         return r;
     }
     match store.release_all_for_instance(&req.instance_id).await {
@@ -816,7 +900,7 @@ async fn running_get(
     headers: HeaderMap,
     Query(q): Query<ClusterQuery>,
 ) -> Response {
-    let store = match coordination(&st, &headers) {
+    let store = match coordination(&st, &headers).await {
         Ok(s) => s,
         Err(r) => return r,
     };
@@ -831,7 +915,7 @@ async fn running_publish(
     headers: HeaderMap,
     Json(req): Json<PublishRunning>,
 ) -> Response {
-    let store = match coordination(&st, &headers) {
+    let store = match coordination(&st, &headers).await {
         Ok(s) => s,
         Err(r) => return r,
     };
@@ -846,7 +930,7 @@ async fn lease_count(
     headers: HeaderMap,
     Query(q): Query<ClusterQuery>,
 ) -> Response {
-    let store = match coordination(&st, &headers) {
+    let store = match coordination(&st, &headers).await {
         Ok(s) => s,
         Err(r) => return r,
     };
@@ -861,7 +945,7 @@ async fn sweep_lock_acquire(
     headers: HeaderMap,
     axum::extract::Path(name): axum::extract::Path<String>,
 ) -> Response {
-    let store = match coordination(&st, &headers) {
+    let store = match coordination(&st, &headers).await {
         Ok(s) => s,
         Err(r) => return r,
     };
@@ -893,7 +977,7 @@ async fn sweep_lock_release(
     headers: HeaderMap,
     axum::extract::Path((_name, token)): axum::extract::Path<(String, String)>,
 ) -> Response {
-    if let Err(r) = coordination(&st, &headers) {
+    if let Err(r) = coordination(&st, &headers).await {
         return r;
     }
     let guard = st.sweep_locks.lock().await.remove(&token);
@@ -942,7 +1026,7 @@ mod tests {
             coordination: None,
             history: None,
             quotas: None,
-            sites: Vec::new(),
+            hubs: None,
         })
     }
 
@@ -1024,7 +1108,7 @@ mod tests {
             coordination: None,
             history: None,
             quotas: None,
-            sites: Vec::new(),
+            hubs: None,
         })
     }
 
@@ -1122,7 +1206,7 @@ mod tests {
             coordination: Some(store),
             history: None,
             quotas: None,
-            sites: Vec::new(),
+            hubs: None,
         });
         let post = |path: &str, body: serde_json::Value| {
             Request::post(path.to_string())
@@ -1186,7 +1270,7 @@ mod tests {
             coordination: None,
             history: Some(store.clone()),
             quotas: None,
-            sites: Vec::new(),
+            hubs: None,
         });
         let record = serde_json::json!({
             "proxyQueryId": "q-1",
@@ -1235,10 +1319,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_site_token_acts_only_for_its_site() {
-        use sha2::Digest;
-        let hash = |t: &str| format!("{:x}", sha2::Sha256::digest(t.as_bytes()));
+    async fn an_enrolled_hub_acts_only_for_its_site() {
+        use queryflux_core::hub_token;
+        use queryflux_persistence::hub_store::{HubStore, InMemoryHubStore};
         let store = Arc::new(queryflux_persistence::in_memory::InMemoryPersistence::new());
+        let hub_store = Arc::new(InMemoryHubStore::new());
+        let hubs = crate::hub_directory::HubDirectory::new(hub_store.clone());
         let s = snapshot();
         let app = router(WorkerApi {
             // Hubs only: no shared secret.
@@ -1252,18 +1338,7 @@ mod tests {
             coordination: Some(store.clone()),
             history: Some(store.clone()),
             quotas: None,
-            sites: vec![
-                queryflux_core::config::ControlPlaneSite {
-                    name: "dc1".into(),
-                    tokens: vec![hash("old-dc1"), hash("t-dc1")],
-                    clusters: None,
-                },
-                queryflux_core::config::ControlPlaneSite {
-                    name: "dc2".into(),
-                    tokens: vec![hash("t-dc2")],
-                    clusters: None,
-                },
-            ],
+            hubs: Some(hubs.clone()),
         });
         let send = |path: &str, token: &str, body: serde_json::Value| {
             let req = Request::post(path.to_string())
@@ -1272,11 +1347,67 @@ mod tests {
                 .body(Body::from(body.to_string()))
                 .unwrap();
             let app = app.clone();
-            async move { app.oneshot(req).await.unwrap().status() }
+            async move { app.oneshot(req).await.unwrap() }
         };
 
-        // Without a shared secret, an empty or unknown token is no one.
-        for token in ["", "s3cret"] {
+        // An admin creates the sites and one enrollment token each.
+        let later = chrono::Utc::now() + chrono::Duration::hours(1);
+        for site in ["dc1", "dc2"] {
+            hub_store.upsert_hub_site(site, None).await.unwrap();
+            hub_store
+                .create_enrollment_token(site, &enrollment_token_hash(&format!("e-{site}")), later)
+                .await
+                .unwrap();
+        }
+        let enroll = |token: &str, site: &str, key: &hub_token::SigningKey| {
+            send(
+                "/worker/enroll",
+                "",
+                serde_json::json!({
+                    "token": token, "site": site,
+                    "publicKey": hub_token::encode_public_key(&key.verifying_key()),
+                }),
+            )
+        };
+        let (k1, k2) = (hub_token::generate_key(), hub_token::generate_key());
+        // A token is for its own site only, and enrolls one key.
+        assert_eq!(
+            enroll("e-dc1", "dc2", &k1).await.status(),
+            StatusCode::UNAUTHORIZED
+        );
+        let r = enroll("e-dc1", "dc1", &k1).await;
+        assert_eq!(r.status(), StatusCode::CREATED);
+        let id1 = serde_json::from_slice::<EnrollResponse>(
+            &axum::body::to_bytes(r.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap()
+        .hub_id;
+        // A retry with the same key (its answer was lost) gets the same hub; another key
+        // gets nothing for the spent token.
+        let again = enroll("e-dc1", "dc1", &k1).await;
+        assert_eq!(again.status(), StatusCode::OK);
+        assert_eq!(
+            enroll("e-dc1", "dc1", &k2).await.status(),
+            StatusCode::UNAUTHORIZED
+        );
+        let r = enroll("e-dc2", "dc2", &k2).await;
+        let id2 = serde_json::from_slice::<EnrollResponse>(
+            &axum::body::to_bytes(r.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap()
+        .hub_id;
+        let now = chrono::Utc::now().timestamp();
+        let t1 = hub_token::sign(&k1, &id1, now);
+        let t2 = hub_token::sign(&k2, &id2, now);
+
+        // Without a shared secret, an empty or unknown token is no one, and so is a token
+        // signed with another hub's key.
+        let forged = hub_token::sign(&k2, &id1, now);
+        for token in ["", "s3cret", forged.as_str()] {
             assert_eq!(
                 get(app.clone(), Some(&format!("Bearer {token}")), None)
                     .await
@@ -1284,15 +1415,16 @@ mod tests {
                 StatusCode::UNAUTHORIZED
             );
         }
-        // Both of dc1's tokens work during a rotation.
-        for token in ["old-dc1", "t-dc1"] {
-            assert_eq!(
-                get(app.clone(), Some(&format!("Bearer {token}")), None)
-                    .await
-                    .status(),
-                StatusCode::OK
-            );
-        }
+        assert_eq!(
+            get(app.clone(), Some(&format!("Bearer {t1}")), None)
+                .await
+                .status(),
+            StatusCode::OK
+        );
+        let send = |path: &str, token: &str, body: serde_json::Value| {
+            let r = send(path, token, body);
+            async move { r.await.status() }
+        };
 
         // The hub's own report is pinned to its site, whatever it claims.
         let report = serde_json::json!({
@@ -1300,7 +1432,7 @@ mod tests {
             "coordinationMode": "controlPlane", "kind": "worker"
         });
         assert_eq!(
-            send("/worker/heartbeat", "t-dc1", report).await,
+            send("/worker/heartbeat", &t1, report).await,
             StatusCode::NO_CONTENT
         );
         let fleet = |site: &str| {
@@ -1309,11 +1441,11 @@ mod tests {
             ]})
         };
         assert_eq!(
-            send("/worker/fleet", "t-dc1", fleet("dc2")).await,
+            send("/worker/fleet", &t1, fleet("dc2")).await,
             StatusCode::FORBIDDEN
         );
         assert_eq!(
-            send("/worker/fleet", "t-dc1", fleet("dc1")).await,
+            send("/worker/fleet", &t1, fleet("dc1")).await,
             StatusCode::NO_CONTENT
         );
         let workers = store
@@ -1339,19 +1471,19 @@ mod tests {
         };
         for holder in ["dc2/w", "dc1", "dc1x/w"] {
             assert_eq!(
-                send("/worker/capacity/acquire", "t-dc1", acquire(holder)).await,
+                send("/worker/capacity/acquire", &t1, acquire(holder)).await,
                 StatusCode::FORBIDDEN,
                 "{holder}"
             );
         }
         assert_eq!(
-            send("/worker/capacity/acquire", "t-dc1", acquire("dc1/w")).await,
+            send("/worker/capacity/acquire", &t1, acquire("dc1/w")).await,
             StatusCode::OK
         );
         assert_eq!(
             send(
                 "/worker/capacity/release-all",
-                "t-dc2",
+                &t2,
                 serde_json::json!({ "instanceId": "dc1/w" })
             )
             .await,
@@ -1372,11 +1504,11 @@ mod tests {
             })
         };
         assert_eq!(
-            send("/worker/query-records", "t-dc1", batch(Some("dc2"))).await,
+            send("/worker/query-records", &t1, batch(Some("dc2"))).await,
             StatusCode::FORBIDDEN
         );
         assert_eq!(
-            send("/worker/query-records", "t-dc1", batch(None)).await,
+            send("/worker/query-records", &t1, batch(None)).await,
             StatusCode::ACCEPTED
         );
         use queryflux_persistence::QueryHistoryStore;
@@ -1388,6 +1520,16 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(page[0].worker.as_deref(), Some("dc1/w"));
+
+        // A revoked hub is refused.
+        hub_store.delete_hub_key("dc1", &id1).await.unwrap();
+        hubs.reload().await;
+        assert_eq!(
+            get(app.clone(), Some(&format!("Bearer {t1}")), None)
+                .await
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
     }
 
     /// A history store whose batch writes wait until the test opens the gate.
@@ -1438,7 +1580,7 @@ mod tests {
                 coordination: None,
                 history: Some(store.clone()),
                 quotas: None,
-                sites: Vec::new(),
+                hubs: None,
             },
             1,
             std::time::Duration::from_millis(50),

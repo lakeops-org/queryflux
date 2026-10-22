@@ -468,7 +468,7 @@ fn start(
         changes,
         cache: hub.snapshot_cache.then(|| state_dir.join("snapshot.json")),
     });
-    let host = std::env::var("HOSTNAME").unwrap_or_else(|_| "site-hub".to_string());
+    let host = std::env::var("HOSTNAME").unwrap_or_else(|_| "hub".to_string());
     let hub_name = format!("{}/{host}", hub.site);
     let spool = HistorySpool::open(
         state_dir.join("spool"),
@@ -512,7 +512,7 @@ fn start(
         coordination: Some(remote.clone() as Arc<dyn queryflux_persistence::CoordinationStore>),
         history: Some(spool.clone() as Arc<dyn queryflux_persistence::MetricsStore>),
         quotas: Some(remote as Arc<dyn queryflux_persistence::quota::QuotaStore>),
-        sites: Vec::new(),
+        hubs: None,
     };
 
     tokio::spawn(run_relay(
@@ -545,6 +545,160 @@ fn start(
     })
 }
 
+/// This hub's key at upstream, in `stateDir/identity.json` (owner-only). `hub_id` is unset
+/// until upstream accepted the key, so an enrollment whose answer was lost is retried
+/// with the same key.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Identity {
+    site: String,
+    key: String,
+    hub_id: Option<String>,
+    /// SHA-256 of the enrollment token this key was enrolled with. A different
+    /// `enrollToken` in the config means "enroll again": after a revocation, or to rotate.
+    #[serde(default)]
+    enrolled_with: Option<String>,
+}
+
+fn token_hash(token: &Option<String>) -> Option<String> {
+    token
+        .as_deref()
+        .filter(|t| !t.trim().is_empty())
+        .map(queryflux_frontend::worker_api::enrollment_token_hash)
+}
+
+/// The credential this hub presents upstream: `upstream.secret`, or tokens signed with
+/// its enrolled key, enrolling first if it has none.
+async fn upstream_bearer(hub: &HubConfig) -> Result<Bearer> {
+    if let Some(secret) = hub.upstream.secret.clone().filter(|s| !s.trim().is_empty()) {
+        return Ok(Bearer::secret(secret));
+    }
+    let path = PathBuf::from(&hub.state_dir).join("identity.json");
+    let configured = token_hash(&hub.upstream.enroll_token);
+    let existing = match tokio::fs::read(&path).await {
+        Ok(bytes) => Some(
+            serde_json::from_slice::<Identity>(&bytes)
+                .with_context(|| format!("{} does not parse", path.display()))?,
+        ),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(e).with_context(|| format!("read {}", path.display())),
+    };
+    let mut identity = match existing {
+        // Enrolled with another token than the one configured now: enroll a new key.
+        // ponytail: enrolling blocks startup, so a hub given a new token while upstream is
+        // down serves nothing until it answers; start on the old key first if that matters.
+        Some(id)
+            if id.hub_id.is_some() && configured.is_some() && id.enrolled_with != configured =>
+        {
+            tracing::info!("hub.upstream.enrollToken changed: enrolling a new key");
+            None
+        }
+        other => other,
+    }
+    .unwrap_or_else(|| Identity {
+        site: hub.site.clone(),
+        key: queryflux_core::hub_token::encode_key(&queryflux_core::hub_token::generate_key()),
+        hub_id: None,
+        enrolled_with: None,
+    });
+    if identity.hub_id.is_none() {
+        save_identity(&path, &identity).await?;
+    }
+    anyhow::ensure!(
+        identity.site == hub.site,
+        "{} was enrolled for site '{}', not '{}': use a fresh stateDir for another site",
+        path.display(),
+        identity.site,
+        hub.site
+    );
+    let key = queryflux_core::hub_token::decode_key(&identity.key)
+        .with_context(|| format!("{} holds no valid key", path.display()))?;
+    let hub_id = match identity.hub_id.clone() {
+        Some(id) => id,
+        None => {
+            let id = enroll(hub, &key).await?;
+            identity.hub_id = Some(id.clone());
+            identity.enrolled_with = configured;
+            save_identity(&path, &identity).await?;
+            id
+        }
+    };
+    tracing::info!(site = %hub.site, hub = %hub_id, "Hub signs its upstream requests with its enrolled key");
+    let renewed = Mutex::new((String::new(), 0i64));
+    Ok(Bearer::from_fn(move || {
+        let now = Utc::now().timestamp();
+        let mut current = renewed.lock().unwrap_or_else(|e| e.into_inner());
+        // Renew a minute before expiry, so a request never carries an expiring token.
+        if current.1 - now < 60 {
+            *current = (
+                queryflux_core::hub_token::sign(&key, &hub_id, now),
+                now + queryflux_core::hub_token::TOKEN_LIFETIME_SECS,
+            );
+        }
+        current.0.clone()
+    }))
+}
+
+async fn save_identity(path: &std::path::Path, identity: &Identity) -> Result<()> {
+    write_private(path, &serde_json::to_vec_pretty(identity)?)
+        .await
+        .with_context(|| format!("write {}", path.display()))
+}
+
+/// Present `upstream.enrollToken` with this hub's public key until upstream answers.
+/// Returns the hub id; a refused token is final.
+async fn enroll(hub: &HubConfig, key: &queryflux_core::hub_token::SigningKey) -> Result<String> {
+    let token = hub
+        .upstream
+        .enroll_token
+        .clone()
+        .filter(|t| !t.trim().is_empty())
+        .context(
+            "this hub has no enrolled key: set hub.upstream.enrollToken to a token from the \
+             control plane (POST /admin/sites/{site}/enrollment-tokens)",
+        )?;
+    let url = format!(
+        "{}/worker/enroll",
+        hub.upstream.connection.url.trim_end_matches('/')
+    );
+    let body = serde_json::json!({
+        "token": token.trim(),
+        "site": hub.site,
+        "publicKey": queryflux_core::hub_token::encode_public_key(&key.verifying_key()),
+        "host": std::env::var("HOSTNAME").ok(),
+    });
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()
+        .unwrap_or_default();
+    let mut failures = 0u32;
+    loop {
+        match client.post(&url).json(&body).send().await {
+            Ok(r) if r.status().is_success() => {
+                let enrolled: queryflux_frontend::worker_api::EnrollResponse = r
+                    .json()
+                    .await
+                    .context("upstream's enrollment answer does not parse")?;
+                tracing::info!(site = %enrolled.site, hub = %enrolled.hub_id, "Hub enrolled upstream");
+                return Ok(enrolled.hub_id);
+            }
+            Ok(r) if r.status().is_client_error() => {
+                let status = r.status();
+                let why = r.text().await.unwrap_or_default();
+                anyhow::bail!(
+                    "upstream refused this hub's enrollment ({status}): {why}. Create a new \
+                     enrollment token for site '{}' and set hub.upstream.enrollToken",
+                    hub.site
+                );
+            }
+            Ok(r) => tracing::warn!(status = %r.status(), "Hub enrollment failed; retrying"),
+            Err(e) => tracing::warn!("Hub enrollment failed; retrying: {e}"),
+        }
+        failures = failures.saturating_add(1);
+        tokio::time::sleep(Duration::from_secs(2u64.saturating_pow(failures.min(5)))).await;
+    }
+}
+
 /// Run the hub until SIGINT/SIGTERM.
 pub(crate) async fn run(config: ProxyConfig) -> Result<()> {
     let q = &config.queryflux;
@@ -553,18 +707,16 @@ pub(crate) async fn run(config: ProxyConfig) -> Result<()> {
         .worker_secret
         .clone()
         .context("role: hub needs queryflux.workerSecret")?;
-    let upstream_secret = hub
-        .upstream
-        .secret
-        .clone()
-        .context("role: hub needs queryflux.hub.upstream.secret")?;
-    if worker_secret == upstream_secret {
+    if hub.upstream.secret.as_deref() == Some(worker_secret.as_str()) {
         tracing::warn!(
             "workerSecret equals hub.upstream.secret: workers at this site then hold the \
              site's upstream credential. Use a different secret."
         );
     }
-    let bearer = Bearer::secret(upstream_secret);
+    let bearer = tokio::select! {
+        bearer = upstream_bearer(hub) => bearer?,
+        _ = crate::startup::shutdown::shutdown_signal() => return Ok(()),
+    };
     let prometheus = Arc::new(
         PrometheusMetrics::new_with_deny_list(q.metrics.tags_deny_list.clone())
             .context("Failed to init Prometheus metrics")?,
@@ -638,6 +790,9 @@ mod tests {
         changes: watch::Sender<u64>,
         up: Arc<AtomicBool>,
         store: Arc<InMemoryPersistence>,
+        hubs: Arc<queryflux_persistence::hub_store::InMemoryHubStore>,
+        /// dc1's enrollment token: a restarted hub presents the same one and keeps its key.
+        token: String,
     }
 
     impl Upstream {
@@ -645,13 +800,16 @@ mod tests {
             Self::start_limited_to(None).await
         }
 
-        /// dc1 limited to `clusters` (`controlPlane.sites[].clusters`).
+        /// dc1 limited to `clusters` (its site record's clusters).
         async fn start_limited_to(clusters: Option<Vec<String>>) -> Self {
+            use queryflux_persistence::hub_store::HubStore;
             let current = Arc::new(std::sync::Mutex::new(snapshot(3)));
             let (changes, rx) = watch::channel(0u64);
             let up = Arc::new(AtomicBool::new(true));
             let store = Arc::new(InMemoryPersistence::new());
-            // Hubs only, as on a hosted control plane: dc1's hub presents its site token.
+            // Hubs only, as on a hosted control plane: dc1's hub enrolls.
+            let hubs = Arc::new(queryflux_persistence::hub_store::InMemoryHubStore::new());
+            hubs.upsert_hub_site("dc1", clusters).await.unwrap();
             let api = WorkerApi {
                 shared_secret: String::new(),
                 snapshot: {
@@ -666,14 +824,9 @@ mod tests {
                 coordination: Some(store.clone()),
                 history: Some(store.clone()),
                 quotas: None,
-                sites: vec![queryflux_core::config::ControlPlaneSite {
-                    name: "dc1".into(),
-                    tokens: vec![{
-                        use sha2::Digest;
-                        format!("{:x}", sha2::Sha256::digest(b"site-secret"))
-                    }],
-                    clusters,
-                }],
+                hubs: Some(queryflux_frontend::hub_directory::HubDirectory::new(
+                    hubs.clone(),
+                )),
             };
             let gate = up.clone();
             let app = queryflux_frontend::worker_api::router(api).layer(axum::middleware::from_fn(
@@ -695,7 +848,31 @@ mod tests {
                 changes,
                 up,
                 store,
+                token: String::new(),
+                hubs,
             }
+            .with_token()
+            .await
+        }
+
+        async fn with_token(mut self) -> Self {
+            self.token = self.enrollment_token().await;
+            self
+        }
+
+        /// A new one-time enrollment token for dc1.
+        async fn enrollment_token(&self) -> String {
+            use queryflux_persistence::hub_store::HubStore;
+            let token = queryflux_core::hub_token::new_enrollment_token();
+            self.hubs
+                .create_enrollment_token(
+                    "dc1",
+                    &queryflux_frontend::worker_api::enrollment_token_hash(&token),
+                    Utc::now() + chrono::Duration::hours(1),
+                )
+                .await
+                .unwrap();
+            token
         }
 
         fn publish(&self, s: WorkerSnapshotV1) {
@@ -711,12 +888,12 @@ mod tests {
         format!("http://{addr}")
     }
 
-    fn hub_config(upstream: &str, state_dir: &std::path::Path) -> HubConfig {
+    fn hub_config(upstream: &str, token: &str, state_dir: &std::path::Path) -> HubConfig {
         serde_json::from_value(serde_json::json!({
             "site": "dc1",
             "stateDir": state_dir.to_string_lossy(),
             "upstream": {
-                "secret": "site-secret",
+                "enrollToken": token,
                 "url": upstream,
                 "allowInsecureHttp": true,
                 "pollTimeoutSecs": 1,
@@ -726,17 +903,71 @@ mod tests {
         .unwrap()
     }
 
-    /// Start a hub in `dir`; returns its URL and shutdown handle.
-    async fn hub(upstream: &str, dir: &std::path::Path) -> (String, watch::Sender<bool>) {
+    /// Start a hub in `dir`, enrolling it with a new token unless it already has a key
+    /// there; returns its URL and shutdown handle.
+    async fn hub(up: &Upstream, dir: &std::path::Path) -> (String, watch::Sender<bool>) {
         let prometheus = Arc::new(PrometheusMetrics::new().unwrap());
-        let a = start(
-            &hub_config(upstream, dir),
-            "worker-secret".into(),
-            Bearer::secret("site-secret"),
-            prometheus,
-        )
-        .unwrap();
+        let config = hub_config(&up.url, &up.token, dir);
+        let bearer = upstream_bearer(&config).await.unwrap();
+        let a = start(&config, "worker-secret".into(), bearer, prometheus).unwrap();
         (serve(a.router).await, a.shutdown)
+    }
+
+    #[tokio::test]
+    async fn a_hub_enrolls_once_and_keeps_its_key() {
+        let up = Upstream::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let token = up.enrollment_token().await;
+        let config = hub_config(&up.url, &token, dir.path());
+        let bearer = upstream_bearer(&config).await.unwrap();
+        let signed = bearer.get();
+        assert_eq!(
+            worker_config(&up.url, &signed).await.status(),
+            StatusCode::OK,
+            "upstream accepts the hub's signed token"
+        );
+        assert_eq!(
+            bearer.get(),
+            signed,
+            "a fresh token is reused until near expiry"
+        );
+
+        // Restarted with the spent token in its config: it keeps its key, no enrollment.
+        let again = upstream_bearer(&config).await.unwrap();
+        assert_eq!(
+            worker_config(&up.url, &again.get()).await.status(),
+            StatusCode::OK
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(dir.path().join("identity.json"))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o077, 0, "the key file is owner-only");
+        }
+
+        // A new token in the config enrolls a new key: how a revoked hub comes back, or a
+        // key is rotated.
+        let rotated = hub_config(&up.url, &up.enrollment_token().await, dir.path());
+        let fresh = upstream_bearer(&rotated).await.unwrap();
+        assert_ne!(
+            queryflux_core::hub_token::key_id(&fresh.get()),
+            queryflux_core::hub_token::key_id(&signed)
+        );
+        assert_eq!(
+            worker_config(&up.url, &fresh.get()).await.status(),
+            StatusCode::OK
+        );
+
+        // A new hub can't reuse the spent token.
+        let other = tempfile::tempdir().unwrap();
+        let err = upstream_bearer(&hub_config(&up.url, &token, other.path()))
+            .await
+            .err()
+            .unwrap();
+        assert!(format!("{err:#}").contains("refused"), "{err:#}");
     }
 
     async fn get_json(url: &str) -> serde_json::Value {
@@ -776,7 +1007,7 @@ mod tests {
     async fn config_flows_from_upstream_through_the_agent_and_survives_an_outage() {
         let up = Upstream::start().await;
         let dir = tempfile::tempdir().unwrap();
-        let (url, stop) = hub(&up.url, dir.path()).await;
+        let (url, stop) = hub(&up, dir.path()).await;
 
         // The hub serves upstream's snapshot as is, behind the workers' own secret.
         let first = up.current.lock().unwrap().revision.clone();
@@ -830,7 +1061,7 @@ mod tests {
         stop.send(true).unwrap();
 
         // Restarted with upstream still down: serves the disk cache, marked stale.
-        let (url2, _stop2) = hub(&up.url, dir.path()).await;
+        let (url2, _stop2) = hub(&up, dir.path()).await;
         eventually(|| async { served_revision(&url2).await.as_deref() == Some(second.as_str()) })
             .await;
         let st = get_json(&format!("{url2}/hub/status")).await;
@@ -929,7 +1160,7 @@ mod tests {
     async fn history_is_spooled_on_disk_and_reaches_upstream_redacted_and_attributed() {
         let up = Upstream::start().await;
         let dir = tempfile::tempdir().unwrap();
-        let (url, stop) = hub(&up.url, dir.path()).await;
+        let (url, stop) = hub(&up, dir.path()).await;
         eventually(|| async { served_revision(&url).await.is_some() }).await;
 
         // Upstream down: the hub still accepts, onto disk.
@@ -947,7 +1178,7 @@ mod tests {
 
         // The hub restarts before upstream returns: the files are picked up again.
         stop.send(true).unwrap();
-        let (_url2, _stop2) = hub(&up.url, dir.path()).await;
+        let (_url2, _stop2) = hub(&up, dir.path()).await;
         up.up.store(true, Ordering::SeqCst);
         eventually(|| async { upstream_history(&up.store).await.len() == 3 }).await;
         let rows = upstream_history(&up.store).await;
@@ -1004,7 +1235,7 @@ mod tests {
         use queryflux_persistence::CapacityStore;
         let up = Upstream::start().await;
         let dir = tempfile::tempdir().unwrap();
-        let (url, _stop) = hub(&up.url, dir.path()).await;
+        let (url, _stop) = hub(&up, dir.path()).await;
         eventually(|| async { served_revision(&url).await.is_some() }).await;
 
         let cp: UpstreamConfig = serde_json::from_value(serde_json::json!({
@@ -1092,7 +1323,7 @@ mod tests {
         let dc1 = full.for_site(&["duck".to_string()]);
 
         let dir = tempfile::tempdir().unwrap();
-        let (url, _stop) = hub(&up.url, dir.path()).await;
+        let (url, _stop) = hub(&up, dir.path()).await;
         eventually(|| async {
             served_revision(&url).await.as_deref() == Some(dc1.revision.as_str())
         })
@@ -1154,7 +1385,7 @@ mod tests {
         use queryflux_persistence::WorkerRegistryStore;
         let up = Upstream::start().await;
         let dir = tempfile::tempdir().unwrap();
-        let (url, _stop) = hub(&up.url, dir.path()).await;
+        let (url, _stop) = hub(&up, dir.path()).await;
         let worker = serde_json::json!({ "name": "worker-0", "version": "test" });
         let r = reqwest::Client::new()
             .post(format!("{url}/worker/register"))

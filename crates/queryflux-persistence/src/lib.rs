@@ -1,6 +1,7 @@
 pub mod batched_release;
 pub mod cache_store;
 pub mod cluster_config;
+pub mod hub_store;
 pub mod in_memory;
 pub mod metrics_store;
 pub mod migrate;

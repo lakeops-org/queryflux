@@ -64,7 +64,7 @@ queryflux:
       redaction: full         # full | maskLiterals | metadata
 ```
 
-The worker API lives on the admin port, under `/worker/*`. It uses its own bearer secret and does not accept the admin API's credentials. Hubs can instead present a token of their own site (`controlPlane.sites`, see [Site tokens](./hub#site-tokens)); with `sites` set and no `workerSecret`, only hubs are accepted.
+The worker API lives on the admin port, under `/worker/*`. It uses its own bearer secret and does not accept the admin API's credentials. Hubs instead enroll with a key of their own ([Enrolling a hub](./hub#enrolling-a-hub)); with Postgres and no `workerSecret`, only enrolled hubs are accepted.
 
 ### Worker
 

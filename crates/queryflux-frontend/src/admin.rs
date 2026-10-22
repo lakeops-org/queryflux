@@ -168,6 +168,11 @@ mod circuit_breaker_dto_tests {
         health_handler,
         clusters_handler,
         list_workers_handler,
+        list_hub_sites_handler,
+        upsert_hub_site_handler,
+        delete_hub_site_handler,
+        create_enrollment_token_handler,
+        revoke_hub_handler,
         update_cluster_handler,
         engine_registry_handler,
         list_queries_handler,
@@ -219,6 +224,12 @@ mod circuit_breaker_dto_tests {
         ClusterStateDto,
         WorkerFleetDto,
         WorkerView,
+        HubSiteView,
+        UpsertHubSite,
+        CreateEnrollmentToken,
+        EnrollmentTokenDto,
+        queryflux_persistence::hub_store::HubSite,
+        queryflux_persistence::hub_store::HubKey,
         queryflux_persistence::WorkerRecord,
         queryflux_persistence::WorkerStatus,
         queryflux_persistence::WorkerHistoryStatus,
@@ -783,6 +794,16 @@ impl AdminFrontend {
             .route("/admin/queries/{id}", delete(cancel_query_handler))
             .route("/admin/agents", get(list_agents_handler))
             .route("/admin/workers", get(list_workers_handler))
+            .route("/admin/sites", get(list_hub_sites_handler))
+            .route(
+                "/admin/sites/{site}",
+                axum::routing::put(upsert_hub_site_handler).delete(delete_hub_site_handler),
+            )
+            .route(
+                "/admin/sites/{site}/enrollment-tokens",
+                post(create_enrollment_token_handler),
+            )
+            .route("/admin/sites/{site}/hubs/{id}", delete(revoke_hub_handler))
             .route("/admin/conversations", get(list_conversations_handler))
             .route("/admin/conversations/{id}", get(get_conversation_handler))
             .route("/admin/stats", get(get_stats_handler))
@@ -1502,9 +1523,9 @@ async fn list_workers_handler(State(state): State<Arc<AdminState>>) -> impl Into
     let mut per_site = std::collections::HashMap::new();
     let (control_plane_revision, revision_error) = match (api.snapshot)().await {
         Ok(s) => {
-            for site in &api.sites {
-                if let Some(clusters) = api.site_clusters(&site.name) {
-                    per_site.insert(site.name.clone(), s.for_site(clusters).revision);
+            if let Some(hubs) = &api.hubs {
+                for (site, clusters) in hubs.limited_sites().await {
+                    per_site.insert(site, s.for_site(&clusters).revision);
                 }
             }
             (Some(s.revision), None)
@@ -1547,6 +1568,258 @@ async fn list_workers_handler(State(state): State<Arc<AdminState>>) -> impl Into
         workers,
     })
     .into_response()
+}
+
+/// Sites served through hubs, with each site's enrolled hubs (#255).
+#[derive(Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct HubSiteView {
+    #[serde(flatten)]
+    pub site: queryflux_persistence::hub_store::HubSite,
+    pub hubs: Vec<queryflux_persistence::hub_store::HubKey>,
+}
+
+#[derive(Debug, Default, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct UpsertHubSite {
+    /// The clusters this site gets; omit or `null` for every cluster.
+    #[serde(default)]
+    pub clusters: Option<Vec<String>>,
+}
+
+#[derive(Debug, Default, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateEnrollmentToken {
+    /// How long the token may be used. Default 3600; between 60 and 604800 (7 days).
+    #[serde(default)]
+    pub ttl_secs: Option<u64>,
+}
+
+/// A one-time enrollment token. It is shown only here: the control plane keeps its
+/// SHA-256.
+#[derive(Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct EnrollmentTokenDto {
+    pub token: String,
+    pub site: String,
+    pub expires_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// The enrolled-hub directory, or the response to send when this process has none.
+#[allow(clippy::result_large_err)]
+fn hub_directory(
+    state: &AdminState,
+) -> std::result::Result<Arc<crate::hub_directory::HubDirectory>, axum::response::Response> {
+    state
+        .worker_api
+        .as_ref()
+        .and_then(|api| api.hubs.clone())
+        .ok_or_else(|| {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "hub enrollment needs role: controlPlane with Postgres persistence",
+            )
+                .into_response()
+        })
+}
+
+fn valid_site_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 128
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+}
+
+#[utoipa::path(
+    get,
+    path = "/admin/sites",
+    tag = "admin",
+    responses(
+        (status = 200, description = "Sites and their enrolled hubs", body = Vec<HubSiteView>),
+        (status = 503, description = "This process does not enroll hubs", body = str),
+    )
+)]
+async fn list_hub_sites_handler(State(state): State<Arc<AdminState>>) -> impl IntoResponse {
+    let hubs = match hub_directory(&state) {
+        Ok(h) => h,
+        Err(r) => return r,
+    };
+    let (sites, keys) = match (
+        hubs.store().list_hub_sites().await,
+        hubs.store().list_hub_keys().await,
+    ) {
+        (Ok(s), Ok(k)) => (s, k),
+        (Err(e), _) | (_, Err(e)) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+        }
+    };
+    let views: Vec<HubSiteView> = sites
+        .into_iter()
+        .map(|site| HubSiteView {
+            hubs: keys
+                .iter()
+                .filter(|k| k.site == site.name)
+                .cloned()
+                .collect(),
+            site,
+        })
+        .collect();
+    Json(views).into_response()
+}
+
+#[utoipa::path(
+    put,
+    path = "/admin/sites/{site}",
+    tag = "admin",
+    params(("site" = String, Path, description = "Site name: letters, digits, '-', '_' or '.'")),
+    request_body = UpsertHubSite,
+    responses(
+        (status = 204, description = "Site created or updated"),
+        (status = 400, description = "Invalid site name", body = str),
+        (status = 503, description = "This process does not enroll hubs", body = str),
+    )
+)]
+async fn upsert_hub_site_handler(
+    State(state): State<Arc<AdminState>>,
+    Path(site): Path<String>,
+    body: Option<Json<UpsertHubSite>>,
+) -> impl IntoResponse {
+    let hubs = match hub_directory(&state) {
+        Ok(h) => h,
+        Err(r) => return r,
+    };
+    if !valid_site_name(&site) {
+        return (
+            StatusCode::BAD_REQUEST,
+            "site names use letters, digits, '-', '_' and '.' (at most 128)",
+        )
+            .into_response();
+    }
+    let clusters = body.and_then(|Json(b)| b.clusters);
+    match hubs.store().upsert_hub_site(&site, clusters).await {
+        Ok(()) => {
+            hubs.reload().await;
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+#[utoipa::path(
+    delete,
+    path = "/admin/sites/{site}",
+    tag = "admin",
+    params(("site" = String, Path, description = "Site name")),
+    responses(
+        (status = 204, description = "Site deleted; its hubs and unused tokens are revoked"),
+        (status = 404, description = "No such site", body = str),
+        (status = 503, description = "This process does not enroll hubs", body = str),
+    )
+)]
+async fn delete_hub_site_handler(
+    State(state): State<Arc<AdminState>>,
+    Path(site): Path<String>,
+) -> impl IntoResponse {
+    let hubs = match hub_directory(&state) {
+        Ok(h) => h,
+        Err(r) => return r,
+    };
+    match hubs.store().delete_hub_site(&site).await {
+        Ok(true) => {
+            hubs.reload().await;
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Ok(false) => (StatusCode::NOT_FOUND, "no such site").into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+#[utoipa::path(
+    post,
+    path = "/admin/sites/{site}/enrollment-tokens",
+    tag = "admin",
+    params(("site" = String, Path, description = "Site name")),
+    request_body = CreateEnrollmentToken,
+    responses(
+        (status = 201, description = "A one-time token for one hub of this site", body = EnrollmentTokenDto),
+        (status = 400, description = "ttlSecs out of range", body = str),
+        (status = 404, description = "No such site", body = str),
+        (status = 503, description = "This process does not enroll hubs", body = str),
+    )
+)]
+async fn create_enrollment_token_handler(
+    State(state): State<Arc<AdminState>>,
+    Path(site): Path<String>,
+    body: Option<Json<CreateEnrollmentToken>>,
+) -> impl IntoResponse {
+    let hubs = match hub_directory(&state) {
+        Ok(h) => h,
+        Err(r) => return r,
+    };
+    let ttl = body.and_then(|Json(b)| b.ttl_secs).unwrap_or(3600);
+    if !(60..=7 * 24 * 3600).contains(&ttl) {
+        return (
+            StatusCode::BAD_REQUEST,
+            "ttlSecs must be between 60 and 604800",
+        )
+            .into_response();
+    }
+    let token = queryflux_core::hub_token::new_enrollment_token();
+    let expires_at = chrono::Utc::now() + chrono::Duration::seconds(ttl as i64);
+    match hubs
+        .store()
+        .create_enrollment_token(
+            &site,
+            &crate::worker_api::enrollment_token_hash(&token),
+            expires_at,
+        )
+        .await
+    {
+        Ok(true) => (
+            StatusCode::CREATED,
+            Json(EnrollmentTokenDto {
+                token,
+                site,
+                expires_at,
+            }),
+        )
+            .into_response(),
+        Ok(false) => (StatusCode::NOT_FOUND, "no such site").into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+#[utoipa::path(
+    delete,
+    path = "/admin/sites/{site}/hubs/{id}",
+    tag = "admin",
+    params(
+        ("site" = String, Path, description = "Site name"),
+        ("id" = String, Path, description = "Hub id"),
+    ),
+    responses(
+        (status = 204, description = "Hub revoked"),
+        (status = 404, description = "No such hub", body = str),
+        (status = 503, description = "This process does not enroll hubs", body = str),
+    )
+)]
+async fn revoke_hub_handler(
+    State(state): State<Arc<AdminState>>,
+    Path((site, id)): Path<(String, String)>,
+) -> impl IntoResponse {
+    let hubs = match hub_directory(&state) {
+        Ok(h) => h,
+        Err(r) => return r,
+    };
+    match hubs.store().delete_hub_key(&site, &id).await {
+        Ok(true) => {
+            hubs.reload().await;
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Ok(false) => (StatusCode::NOT_FOUND, "no such hub").into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
 }
 
 /// Distinct agents that have run queries, with aggregate stats.
