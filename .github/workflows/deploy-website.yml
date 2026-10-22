@@ -41,7 +41,10 @@ jobs:
 
       - name: Build website
         env:
-          # Optional override; defaults in website/analytics/openpanel.ts
+          # Public OpenPanel project id (Settings → API Keys). Set as a repo/org *variable*
+          # (Settings → Secrets and variables → Actions → Variables), not a secret:
+          # the value is baked into public JS either way; vars avoid empty-string injection
+          # surprises when documenting. Never set OPENPANEL_CLIENT_SECRET here.
           OPENPANEL_CLIENT_ID: ${{ vars.OPENPANEL_CLIENT_ID }}
           # Optional GA4 (G-XXXXXXXX). Set repo/org variable GA_MEASUREMENT_ID to enable.
           GA_MEASUREMENT_ID: ${{ vars.GA_MEASUREMENT_ID }}

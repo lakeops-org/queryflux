@@ -28,10 +28,13 @@ const config: Config = {
   projectName: 'queryflux',
 
   // Baked at build/start time (Node); read in the client via siteConfig.customFields.
+  // OPENPANEL_CLIENT_ID comes from the environment (local export / GitHub Actions vars).
+  // Empty string from unset Actions vars is treated as missing — OpenPanel stays off.
   customFields: {
-    openPanelClientId:
-      process.env.OPENPANEL_CLIENT_ID ?? 'f88d1483-36bc-4a52-8333-7f5865e78d16',
-    openPanelDisabled: process.env.OPENPANEL_DISABLED === 'true',
+    openPanelClientId: process.env.OPENPANEL_CLIENT_ID?.trim() || undefined,
+    openPanelDisabled:
+      process.env.OPENPANEL_DISABLED === 'true' ||
+      !process.env.OPENPANEL_CLIENT_ID?.trim(),
   },
 
   // https://docusaurus.io/docs/deployment#deploying-to-github-pages

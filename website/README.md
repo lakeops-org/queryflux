@@ -13,7 +13,15 @@ npm run serve # preview production build (search works here)
 
 ## Analytics
 
-The site already runs **[OpenPanel](https://openpanel.dev)** (see `src/components/OpenPanelInit.tsx`). Disable with `OPENPANEL_DISABLED=true`.
+**[OpenPanel](https://openpanel.dev)** (see `src/components/OpenPanelInit.tsx`) is enabled only when `OPENPANEL_CLIENT_ID` is set at build/start time. That id is a **public** project key (like GA’s `G-…`); it ends up in the static JS bundle. Abuse is limited by the OpenPanel **CORS / domain allowlist** — never put `clientSecret` in the website build.
+
+```bash
+# Local (optional — analytics off if unset)
+export OPENPANEL_CLIENT_ID=<from OpenPanel → Project → Settings → API Keys>
+npm start
+```
+
+In GitHub Actions, set repository/org **variable** `OPENPANEL_CLIENT_ID` (Settings → Secrets and variables → Actions → Variables). `deploy-website.yml` passes it into the build. Prefer a **variable** over a secret: the value is public in the built site anyway, and an unset Actions expression becomes `""` (we treat that as “off”). Disable explicitly with `OPENPANEL_DISABLED=true`.
 
 **Google Analytics 4** uses [`@docusaurus/plugin-google-gtag`](https://docusaurus.io/docs/api/plugins/@docusaurus/plugin-google-gtag) via the classic preset’s `gtag` option (no extra npm install — it ships with `@docusaurus/preset-classic`). The plugin is **inactive in development** and only runs in production builds.
 

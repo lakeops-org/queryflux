@@ -1,6 +1,10 @@
-/** Browser-safe OpenPanel defaults (no process.env — that runs only in docusaurus.config.ts). */
-export const DEFAULT_OPENPANEL_CLIENT_ID = 'f88d1483-36bc-4a52-8333-7f5865e78d16';
-
+/**
+ * Browser-safe OpenPanel options (no process.env — that runs only in docusaurus.config.ts).
+ *
+ * `clientId` is a public project id (same class as a GA measurement ID). It must be injected
+ * at build/start via OPENPANEL_CLIENT_ID — never commit it, and never put clientSecret here.
+ * Abuse control is the OpenPanel CORS/domain allowlist, not hiding the id.
+ */
 export const OPENPANEL_TRACKING_OPTIONS = {
   trackScreenViews: true,
   trackOutgoingLinks: true,
