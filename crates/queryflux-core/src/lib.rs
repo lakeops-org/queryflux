@@ -6,6 +6,7 @@ pub mod config;
 pub mod config_json;
 pub mod engine_registry;
 pub mod error;
+pub mod hub_token;
 pub mod native_result;
 pub mod params;
 pub mod polyglot_pool;

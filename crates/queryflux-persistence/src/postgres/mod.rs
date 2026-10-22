@@ -32,6 +32,7 @@ use queryflux_core::{
 use sqlx::PgPool;
 
 mod history_batch;
+mod hub_store;
 
 /// Select group rows with `members` as cluster **names** (joined from `cluster_configs` by id).
 const CLUSTER_GROUP_CONFIG_SELECT: &str = r#"
@@ -4472,5 +4473,73 @@ mod tests {
         let untranslated = store.get_conversation(&untranslated_id).await.unwrap();
         assert_eq!(untranslated.len(), 1);
         assert!(untranslated[0].translation.is_none());
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn pg_a_token_enrolls_one_hub_of_its_site() {
+        use crate::hub_store::{HubKey, HubStore};
+        let store = test_store().await;
+        let site = unique_id("site");
+        let hub = |id: &str, site: &str| HubKey {
+            id: id.into(),
+            site: site.into(),
+            public_key: "pk".into(),
+            host: Some("h".into()),
+            enrolled_at: Utc::now(),
+        };
+        let later = Utc::now() + chrono::Duration::hours(1);
+        let token = unique_id("token");
+        assert!(!store
+            .create_enrollment_token(&site, &token, later)
+            .await
+            .unwrap());
+        store
+            .upsert_hub_site(&site, Some(vec!["c1".into()]))
+            .await
+            .unwrap();
+        assert!(store
+            .create_enrollment_token(&site, &token, later)
+            .await
+            .unwrap());
+
+        let id = unique_id("hub");
+        assert!(!store.enroll_hub(&token, &hub(&id, "other")).await.unwrap());
+        assert!(store.enroll_hub(&token, &hub(&id, &site)).await.unwrap());
+        assert!(!store
+            .enroll_hub(&token, &hub(&unique_id("hub"), &site))
+            .await
+            .unwrap());
+
+        let expired = unique_id("token");
+        store
+            .create_enrollment_token(&site, &expired, Utc::now() - chrono::Duration::seconds(1))
+            .await
+            .unwrap();
+        assert!(!store
+            .enroll_hub(&expired, &hub(&unique_id("hub"), &site))
+            .await
+            .unwrap());
+
+        let sites = store.list_hub_sites().await.unwrap();
+        let mine = sites.iter().find(|s| s.name == site).unwrap();
+        assert_eq!(mine.clusters, Some(vec!["c1".to_string()]));
+        let keys: Vec<_> = store
+            .list_hub_keys()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|k| k.site == site)
+            .collect();
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].id, id);
+
+        assert!(store.delete_hub_site(&site).await.unwrap());
+        assert!(!store
+            .list_hub_keys()
+            .await
+            .unwrap()
+            .iter()
+            .any(|k| k.site == site));
     }
 }

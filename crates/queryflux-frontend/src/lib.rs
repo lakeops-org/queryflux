@@ -4,6 +4,7 @@ pub mod admin;
 mod auth;
 pub mod dispatch;
 pub mod flight_sql;
+pub mod hub_directory;
 pub mod mcp;
 pub mod mysql_wire;
 pub mod ops;

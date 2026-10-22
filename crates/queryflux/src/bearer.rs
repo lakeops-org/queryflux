@@ -13,6 +13,10 @@ impl Bearer {
         Self(Arc::new(move || secret.to_string()))
     }
 
+    pub(crate) fn from_fn(f: impl Fn() -> String + Send + Sync + 'static) -> Self {
+        Self(Arc::new(f))
+    }
+
     pub(crate) fn get(&self) -> String {
         (self.0)()
     }
