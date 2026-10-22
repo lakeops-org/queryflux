@@ -1,0 +1,28 @@
+[package]
+name = "queryflux-collector"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Polls engines for what they know about each query run and reports it to the QueryFlux control plane"
+
+[[bin]]
+name = "queryflux-collector"
+path = "src/main.rs"
+
+[dependencies]
+queryflux-core = { workspace = true }
+queryflux-fingerprint = { workspace = true }
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+chrono = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+axum = { workspace = true }

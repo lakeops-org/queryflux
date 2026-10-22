@@ -29,6 +29,7 @@ pub(crate) fn worker_api(
     coordination: Option<Arc<dyn queryflux_persistence::CoordinationStore>>,
     history: Arc<dyn queryflux_persistence::MetricsStore>,
     quotas: Option<Arc<dyn queryflux_persistence::quota::QuotaStore>>,
+    runs: Option<Arc<dyn queryflux_persistence::QueryRunStore>>,
 ) -> Result<Option<WorkerApi>> {
     let Some(api_cfg) = config.queryflux.worker_api.as_ref().filter(|a| a.enabled) else {
         return Ok(None);
@@ -100,6 +101,7 @@ pub(crate) fn worker_api(
         coordination,
         history: Some(history),
         quotas,
+        runs,
     }))
 }
 

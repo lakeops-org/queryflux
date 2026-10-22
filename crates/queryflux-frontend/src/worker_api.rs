@@ -21,8 +21,12 @@
 //!   once; a batch that cannot start within [`RECORD_BATCH_QUEUE_WAIT`] gets
 //!   `503 Service Unavailable` with `Retry-After`, and the worker keeps it spooled.
 //!
-//! Workers authenticate with `Authorization: Bearer <workerApi.sharedSecret>`, separate
-//! from the admin API's Basic auth.
+//! - `POST /collector/runs` stores the runs `queryflux-collector` reports (a
+//!   [`QueryRunBatchV1`]) and advances its watermark; `GET /collector/config?collector=NAME`
+//!   returns where its clocks last stopped. Both share the history-ingest backpressure.
+//!
+//! Workers and collectors authenticate with `Authorization: Bearer
+//! <workerApi.sharedSecret>`, separate from the admin API's Basic auth.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -35,10 +39,11 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use queryflux_core::query_runs::{QueryRunBatchV1, QUERY_RUNS_SCHEMA_VERSION};
 use queryflux_core::worker_snapshot::{WorkerSnapshotV1, WORKER_SNAPSHOT_MEDIA_TYPE};
 use queryflux_persistence::{
-    CoordinationStore, FleetReportV1, MetricsStore, QueryRecordBatchV1, SweepGuard, WorkerRecord,
-    WorkerRegistryStore, QUERY_RECORDS_SCHEMA_VERSION,
+    CoordinationStore, FleetReportV1, MetricsStore, QueryRecordBatchV1, QueryRunStore, SweepGuard,
+    WorkerRecord, WorkerRegistryStore, QUERY_RECORDS_SCHEMA_VERSION,
 };
 
 /// Builds the current snapshot. `Err` carries a message for the worker (for example
@@ -65,6 +70,8 @@ pub struct WorkerApi {
     /// Capacity quotas for workers (`capacity.mode: quotas`); `None` answers 404, and
     /// workers keep using per-query leases.
     pub quotas: Option<Arc<dyn queryflux_persistence::quota::QuotaStore>>,
+    /// Where collector runs are stored (Postgres); `None` refuses them.
+    pub runs: Option<Arc<dyn QueryRunStore>>,
 }
 
 /// Largest query-record batch accepted. Workers send at most a few hundred records.
@@ -124,6 +131,11 @@ pub fn router_with_ingest_limit(
             post(ingest_records)
                 .layer(axum::extract::DefaultBodyLimit::max(MAX_RECORD_BATCH_BYTES)),
         )
+        .route(
+            "/collector/runs",
+            post(ingest_runs).layer(axum::extract::DefaultBodyLimit::max(MAX_RECORD_BATCH_BYTES)),
+        )
+        .route("/collector/config", get(collector_config))
         .route("/worker/sweep-lock/{name}", post(sweep_lock_acquire))
         .route(
             "/worker/sweep-lock/{name}/{token}",
@@ -437,6 +449,81 @@ async fn ingest_records(
         Json(serde_json::json!({ "accepted": accepted })),
     )
         .into_response()
+}
+
+// -- Collector runs -----------------------------------------------------------
+
+async fn ingest_runs(
+    State(st): State<Arc<WorkerApiState>>,
+    headers: HeaderMap,
+    Json(batch): Json<QueryRunBatchV1>,
+) -> Response {
+    if !authorized(&headers, &st.api.shared_secret) {
+        return unauthorized();
+    }
+    let Some(store) = st.api.runs.clone() else {
+        return (
+            StatusCode::NOT_IMPLEMENTED,
+            "this control plane does not store collector runs (needs Postgres)",
+        )
+            .into_response();
+    };
+    if batch.schema_version != QUERY_RUNS_SCHEMA_VERSION {
+        return (
+            StatusCode::BAD_REQUEST,
+            format!(
+                "unsupported query-runs schemaVersion {} (this control plane accepts {})",
+                batch.schema_version, QUERY_RUNS_SCHEMA_VERSION
+            ),
+        )
+            .into_response();
+    }
+    if batch.collector.trim().is_empty() || batch.cluster.trim().is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            "collector and cluster are required",
+        )
+            .into_response();
+    }
+    let _slot = match tokio::time::timeout(st.ingest_queue_wait, st.ingest_slots.acquire()).await {
+        Ok(Ok(permit)) => permit,
+        _ => return retry_later("query run ingest is busy, retry later".to_string()),
+    };
+    if let Err(e) = store.ingest_runs(&batch).await {
+        tracing::warn!(collector = %batch.collector, cluster = %batch.cluster, "Failed to store collector runs: {e}");
+        return retry_later(e.to_string());
+    }
+    (
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({ "accepted": batch.runs.len() })),
+    )
+        .into_response()
+}
+
+#[derive(serde::Deserialize)]
+struct CollectorParams {
+    collector: String,
+}
+
+async fn collector_config(
+    State(st): State<Arc<WorkerApiState>>,
+    headers: HeaderMap,
+    Query(params): Query<CollectorParams>,
+) -> Response {
+    if !authorized(&headers, &st.api.shared_secret) {
+        return unauthorized();
+    }
+    let Some(store) = st.api.runs.clone() else {
+        return (
+            StatusCode::NOT_IMPLEMENTED,
+            "this control plane does not store collector runs (needs Postgres)",
+        )
+            .into_response();
+    };
+    match store.collector_watermarks(&params.collector).await {
+        Ok(config) => Json(config).into_response(),
+        Err(e) => retry_later(e.to_string()),
+    }
 }
 
 /// `503` with `Retry-After`: the worker keeps the batch and sends it again.
@@ -826,6 +913,7 @@ mod tests {
             coordination: None,
             history: None,
             quotas: None,
+            runs: None,
         })
     }
 
@@ -907,6 +995,7 @@ mod tests {
             coordination: None,
             history: None,
             quotas: None,
+            runs: None,
         })
     }
 
@@ -1004,6 +1093,7 @@ mod tests {
             coordination: Some(store),
             history: None,
             quotas: None,
+            runs: None,
         });
         let post = |path: &str, body: serde_json::Value| {
             Request::post(path.to_string())
@@ -1057,6 +1147,108 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn collector_runs_are_stored_and_watermarks_returned() {
+        use queryflux_core::query_runs::{CollectorConfigV1, QueryRunBatchV1};
+        #[derive(Default)]
+        struct Runs(std::sync::Mutex<Vec<QueryRunBatchV1>>);
+        #[async_trait::async_trait]
+        impl QueryRunStore for Runs {
+            async fn ingest_runs(
+                &self,
+                batch: &QueryRunBatchV1,
+            ) -> queryflux_core::error::Result<()> {
+                self.0.lock().unwrap().push(batch.clone());
+                Ok(())
+            }
+            async fn collector_watermarks(
+                &self,
+                collector: &str,
+            ) -> queryflux_core::error::Result<CollectorConfigV1> {
+                let mut config = CollectorConfigV1::default();
+                for b in self
+                    .0
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|b| b.collector == collector)
+                {
+                    config
+                        .watermarks
+                        .entry(b.cluster.clone())
+                        .or_default()
+                        .insert(b.clock.clone(), b.window_end);
+                }
+                Ok(config)
+            }
+        }
+        let runs = Arc::new(Runs::default());
+        let app = router(WorkerApi {
+            shared_secret: "s3cret".into(),
+            snapshot: Arc::new(|| Box::pin(async { Err("unused".to_string()) })),
+            registry: None,
+            changes: None,
+            coordination: None,
+            history: None,
+            quotas: None,
+            runs: Some(runs.clone()),
+        });
+        let batch = serde_json::json!({
+            "schemaVersion": 1, "collector": "c1", "cluster": "trino-a", "engine": "Trino",
+            "clock": "fast", "windowStart": "2026-10-22T10:00:00Z",
+            "windowEnd": "2026-10-22T10:30:00Z",
+            "runs": [{ "engineQueryId": "q1", "bytesScanned": 42 }]
+        });
+        let post = |auth: &str, body: &serde_json::Value| {
+            Request::post("/collector/runs")
+                .header(header::AUTHORIZATION, auth)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap()
+        };
+        let resp = app
+            .clone()
+            .oneshot(post("Bearer wrong", &batch))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        let resp = app
+            .clone()
+            .oneshot(post("Bearer s3cret", &batch))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        assert_eq!(
+            runs.0.lock().unwrap()[0].runs[0].metrics.bytes_scanned,
+            Some(42)
+        );
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::get("/collector/config?collector=c1")
+                    .header(header::AUTHORIZATION, "Bearer s3cret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let config: CollectorConfigV1 = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            config.watermarks["trino-a"]["fast"].to_rfc3339(),
+            "2026-10-22T10:30:00+00:00"
+        );
+
+        let mut future = batch.clone();
+        future["schemaVersion"] = 2.into();
+        let resp = app.oneshot(post("Bearer s3cret", &future)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
     async fn worker_records_are_stored_with_the_worker_name() {
         let store = Arc::new(queryflux_persistence::in_memory::InMemoryPersistence::new());
         let app = router(WorkerApi {
@@ -1067,6 +1259,7 @@ mod tests {
             coordination: None,
             history: Some(store.clone()),
             quotas: None,
+            runs: None,
         });
         let record = serde_json::json!({
             "proxyQueryId": "q-1",
@@ -1162,6 +1355,7 @@ mod tests {
                 coordination: None,
                 history: Some(store.clone()),
                 quotas: None,
+                runs: None,
             },
             1,
             std::time::Duration::from_millis(50),

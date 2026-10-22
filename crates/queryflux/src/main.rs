@@ -160,6 +160,7 @@ async fn main() -> Result<()> {
         history_store,
         quota_store,
         quota_allocator,
+        query_runs,
     } = startup::stores::build_stores(&config).await?;
     // Coordination the control plane serves to workers: its own, only when it enforces
     // capacity with it (otherwise dead workers' leases would never expire).
@@ -859,6 +860,7 @@ async fn main() -> Result<()> {
         quota_store.filter(|_| {
             distributed && capacity_mode == queryflux_core::config::CapacityMode::Quotas
         }),
+        query_runs,
     )?;
     let admin = AdminFrontend::new(
         prometheus.clone(),

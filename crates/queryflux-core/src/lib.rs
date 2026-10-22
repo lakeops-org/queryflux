@@ -10,6 +10,7 @@ pub mod native_result;
 pub mod params;
 pub mod polyglot_pool;
 pub mod query;
+pub mod query_runs;
 pub mod schema_context;
 pub mod security_setting;
 pub mod session;

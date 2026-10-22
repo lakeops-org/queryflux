@@ -105,6 +105,16 @@ ON CONFLICT (query_parameterized_hash) DO UPDATE SET
                                       EXCLUDED.translated_digest_text)
 "#;
 
+/// Runs `queryflux-collector` reported before their records arrived, linked by the
+/// engine query id where the engine's id allows it (`query_runs.link_by_id`).
+const LINK_WAITING_RUNS_SQL: &str = r#"
+UPDATE query_runs q SET proxy_query_id = r.proxy_query_id, matched_by = 'engine_id'
+FROM query_records r
+WHERE r.proxy_query_id = ANY($1) AND r.backend_query_id IS NOT NULL
+  AND q.cluster = r.cluster_name AND q.engine_query_id = r.backend_query_id
+  AND q.proxy_query_id IS NULL AND q.link_by_id
+"#;
+
 /// One fingerprint's share of a batch, folded so that applying it once gives the same
 /// row as applying each record's upsert in order.
 #[derive(Debug, Clone, PartialEq)]
@@ -251,6 +261,13 @@ impl PostgresStore {
                     .await
                     .map_err(|e| err("Upsert query_digest_stats", e))?;
             }
+            // Link runs the collector reported before these records arrived.
+            let ids: Vec<&str> = new_ids.iter().copied().collect();
+            sqlx::query(LINK_WAITING_RUNS_SQL)
+                .bind(&ids)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| err("Link query_runs", e))?;
         }
 
         tx.commit()
@@ -397,7 +414,7 @@ fn bind_digests<'q>(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use queryflux_core::query::{
         ClusterGroupName, ClusterName, EngineType, FrontendProtocol, QueryStatus, SqlDialect,

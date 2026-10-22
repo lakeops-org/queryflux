@@ -5490,6 +5490,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "queryflux-collector"
+version = "0.4.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "axum",
+ "chrono",
+ "queryflux-core",
+ "queryflux-fingerprint",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "queryflux-config"
 version = "0.4.0"
 dependencies = [

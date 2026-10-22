@@ -659,6 +659,21 @@ pub trait WorkerRegistryStore: Send + Sync {
     async fn list_workers(&self, since: DateTime<Utc>) -> Result<Vec<WorkerRecord>>;
 }
 
+/// Where runs reported by `queryflux-collector` are stored.
+#[async_trait]
+pub trait QueryRunStore: Send + Sync {
+    /// Upsert the batch's runs, link them to `query_records` where the engine id allows,
+    /// and advance the collector's watermark to `window_end`, all in one transaction.
+    /// A later value replaces a stored null, never the other way round.
+    async fn ingest_runs(&self, batch: &queryflux_core::query_runs::QueryRunBatchV1) -> Result<()>;
+
+    /// Where the collector's clocks last stopped, per cluster.
+    async fn collector_watermarks(
+        &self,
+        collector: &str,
+    ) -> Result<queryflux_core::query_runs::CollectorConfigV1>;
+}
+
 // ---------------------------------------------------------------------------
 // ConfigSnapshotStore — every config row, read at one point in time
 // ---------------------------------------------------------------------------

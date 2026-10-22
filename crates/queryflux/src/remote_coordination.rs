@@ -506,6 +506,7 @@ mod tests {
             coordination,
             history: None,
             quotas: None,
+            runs: None,
         });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -674,6 +675,7 @@ mod tests {
             coordination: leases(),
             history: None,
             quotas,
+            runs: None,
         });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -738,6 +740,7 @@ mod tests {
             coordination: Some(pg.clone()),
             history: None,
             quotas: Some(pg.clone()),
+            runs: None,
         });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();

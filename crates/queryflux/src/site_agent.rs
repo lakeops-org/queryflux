@@ -510,6 +510,7 @@ fn start(
         coordination: Some(remote.clone() as Arc<dyn queryflux_persistence::CoordinationStore>),
         history: Some(spool.clone() as Arc<dyn queryflux_persistence::MetricsStore>),
         quotas: Some(remote as Arc<dyn queryflux_persistence::quota::QuotaStore>),
+        runs: None,
     };
 
     tokio::spawn(run_relay(
@@ -653,6 +654,7 @@ mod tests {
                 coordination: Some(store.clone()),
                 history: Some(store.clone()),
                 quotas: None,
+                runs: None,
             };
             let gate = up.clone();
             let app = queryflux_frontend::worker_api::router(api).layer(axum::middleware::from_fn(

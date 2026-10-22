@@ -36,6 +36,8 @@ pub(crate) struct Stores {
     /// and the allocator that turns demand into quotas.
     pub(crate) quota_store: Option<Arc<dyn queryflux_persistence::quota::QuotaStore>>,
     pub(crate) quota_allocator: Option<Arc<dyn queryflux_persistence::quota::QuotaAllocator>>,
+    /// Runs reported by `queryflux-collector` (Postgres only).
+    pub(crate) query_runs: Option<Arc<dyn queryflux_persistence::QueryRunStore>>,
 }
 
 /// When Postgres is configured we seed cluster/group config on first run and read from
@@ -135,6 +137,8 @@ pub(crate) async fn build_stores(config: &ProxyConfig) -> Result<Stores> {
         pg_store.clone().map(|pg| pg as _);
     let quota_allocator: Option<Arc<dyn queryflux_persistence::quota::QuotaAllocator>> =
         pg_store.clone().map(|pg| pg as _);
+    let query_runs: Option<Arc<dyn queryflux_persistence::QueryRunStore>> =
+        pg_store.clone().map(|pg| pg as _);
     let coordination: Option<Arc<dyn CoordinationStore>> = pg_store.map(|pg| pg as _);
 
     Ok(Stores {
@@ -150,6 +154,7 @@ pub(crate) async fn build_stores(config: &ProxyConfig) -> Result<Stores> {
         history_store,
         quota_store,
         quota_allocator,
+        query_runs,
     })
 }
 

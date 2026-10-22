@@ -115,8 +115,9 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,id=queryflux-registry \
     rm -rf target/release/build/pyo3-* target/release/build/pyo3_ffi-* \
       target/release/deps/libpyo3_ffi-* \
       target/release/.fingerprint/pyo3-* target/release/.fingerprint/pyo3_ffi-* 2>/dev/null || true; \
-    cargo build --release -p queryflux --bin queryflux && \
+    cargo build --release -p queryflux --bin queryflux -p queryflux-collector --bin queryflux-collector && \
     cp target/release/queryflux /queryflux-binary && \
+    cp target/release/queryflux-collector /queryflux-collector-binary && \
     cp target/release/deps/libduckdb.so /queryflux-libduckdb.so'
 
 # =============================================================================
@@ -155,6 +156,8 @@ RUN python3 -m venv /opt/venv && \
     rm /tmp/requirements.txt
 
 COPY --from=builder /queryflux-binary /app/queryflux
+# The collector ships in the same image; run it with --entrypoint /app/queryflux-collector.
+COPY --from=builder /queryflux-collector-binary /app/queryflux-collector
 COPY --from=builder /queryflux-libduckdb.so /usr/local/lib/libduckdb.so
 COPY --from=dbc /usr/local/bin/dbc /usr/local/bin/dbc
 COPY docker/queryflux/entrypoint.sh /app/entrypoint.sh

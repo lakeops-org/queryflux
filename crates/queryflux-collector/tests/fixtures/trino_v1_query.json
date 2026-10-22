@@ -1,0 +1,79 @@
+[
+  {
+    "queryId": "20261022_100501_00042_abcde",
+    "session": { "queryId": "20261022_100501_00042_abcde", "user": "alice", "source": "queryflux" },
+    "resourceGroupId": ["global"],
+    "state": "FINISHED",
+    "scheduled": true,
+    "self": "http://trino:8080/v1/query/20261022_100501_00042_abcde",
+    "query": "SELECT region, count(*) FROM orders GROUP BY region",
+    "queryType": "SELECT",
+    "retryPolicy": "NONE",
+    "queryStats": {
+      "createTime": "2026-10-22T10:05:01.120Z",
+      "endTime": "2026-10-22T10:05:05.330Z",
+      "queuedTime": "12.00ms",
+      "resourceWaitingTime": "3.00ms",
+      "elapsedTime": "4.21s",
+      "executionTime": "4.19s",
+      "failedTasks": 0,
+      "totalDrivers": 40,
+      "processedInputPositions": 1000000,
+      "spilledDataSize": "0B",
+      "physicalInputDataSize": "52428800B",
+      "physicalWrittenDataSize": "0B",
+      "internalNetworkInputDataSize": "2048B",
+      "cumulativeUserMemory": 1.5E10,
+      "userMemoryReservation": "0B",
+      "totalMemoryReservation": "0B",
+      "peakUserMemoryReservation": "8388608B",
+      "peakTotalMemoryReservation": "9437184B",
+      "planningTime": "150.00ms",
+      "analysisTime": "30.00ms",
+      "totalCpuTime": "9.50s",
+      "totalScheduledTime": "12.00s",
+      "fullyBlocked": false,
+      "blockedReasons": [],
+      "progressPercentage": 100.0
+    }
+  },
+  {
+    "queryId": "20261022_102000_00043_abcde",
+    "session": { "user": "bob" },
+    "state": "FAILED",
+    "query": "SELECT * FROM missing_table",
+    "queryType": "SELECT",
+    "errorType": "USER_ERROR",
+    "errorCode": { "code": 46, "name": "TABLE_NOT_FOUND", "type": "USER_ERROR" },
+    "queryStats": {
+      "createTime": "2026-10-22T10:20:00.000Z",
+      "endTime": "2026-10-22T10:20:00.200Z",
+      "queuedTime": "1.00ms",
+      "elapsedTime": "200.00ms",
+      "executionTime": "0.00ms",
+      "totalCpuTime": "0.00ns",
+      "physicalInputDataSize": "0B"
+    }
+  },
+  {
+    "queryId": "20261022_103000_00044_abcde",
+    "session": { "user": "carol" },
+    "state": "RUNNING",
+    "query": "SELECT count(*) FROM lineitem",
+    "queryStats": {
+      "createTime": "2026-10-22T10:30:00.000Z",
+      "elapsedTime": "30.00s"
+    }
+  },
+  {
+    "queryId": "20261022_090000_00001_abcde",
+    "session": { "user": "dave" },
+    "state": "FINISHED",
+    "query": "SELECT 1",
+    "queryStats": {
+      "createTime": "2026-10-22T09:00:00.000Z",
+      "endTime": "2026-10-22T09:00:00.050Z",
+      "elapsedTime": "50.00ms"
+    }
+  }
+]

@@ -32,6 +32,7 @@ use queryflux_core::{
 use sqlx::PgPool;
 
 mod history_batch;
+mod query_runs;
 
 /// Select group rows with `members` as cluster **names** (joined from `cluster_configs` by id).
 const CLUSTER_GROUP_CONFIG_SELECT: &str = r#"

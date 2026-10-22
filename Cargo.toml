@@ -20,6 +20,7 @@ members = [
     "crates/queryflux-guardrails",
     "crates/queryflux-access-control",
     "crates/queryflux-cli",
+    "crates/queryflux-collector",
 ]
 
 [workspace.package]
