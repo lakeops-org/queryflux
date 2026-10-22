@@ -50,12 +50,11 @@ The control plane must run with Postgres persistence and `workerApi.enabled: tru
 queryflux-collector --config collector.yaml
 ```
 
-The QueryFlux image includes it:
+or with its own image, which reads `/etc/queryflux/collector.yaml` by default:
 
 ```bash
-docker run --entrypoint /app/queryflux-collector \
-  -v $PWD/collector.yaml:/etc/queryflux/collector.yaml \
-  ghcr.io/lakeops-org/queryflux --config /etc/queryflux/collector.yaml
+docker run -v $PWD/collector.yaml:/etc/queryflux/collector.yaml \
+  ghcr.io/lakeops-org/queryflux-collector
 ```
 
 Run one replica per set of clusters. The collector keeps no state on disk: its watermarks are stored by the control plane together with each batch, so a restarted collector resumes after the last stored batch.
