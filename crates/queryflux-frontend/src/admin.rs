@@ -1430,28 +1430,43 @@ pub struct WorkerView {
     pub seconds_since_seen: i64,
 }
 
+/// The site a site agent's record is for.
+fn agent_site(w: &queryflux_persistence::WorkerRecord) -> Option<&str> {
+    w.labels.get("site").map(String::as_str)
+}
+
 /// Whether each worker runs the control plane's current revision; `None` when either is
-/// unknown. A worker behind a site agent runs what the agent serves, a re-sealed copy of
-/// that revision when the agent removed a history endpoint: it is in sync when an in-sync
-/// agent of its site serves what it runs.
+/// unknown. A site limited to some clusters gets its own revision (`per_site`), which its
+/// agent and workers are compared with instead. A worker behind a site agent runs what the
+/// agent serves, a re-sealed copy of that revision when the agent removed a history
+/// endpoint: it is in sync when an in-sync agent of its site serves what it runs.
 fn in_sync_flags(
     workers: &[queryflux_persistence::WorkerRecord],
     control_plane: Option<&str>,
+    per_site: &std::collections::HashMap<String, String>,
 ) -> Vec<Option<bool>> {
+    let expected = |site: Option<&str>| {
+        site.and_then(|s| per_site.get(s))
+            .map(String::as_str)
+            .or(control_plane)
+    };
     let served_at_site: std::collections::HashSet<(&str, &str)> = workers
         .iter()
-        .filter(|a| a.kind == "siteAgent" && a.active_revision.as_deref() == control_plane)
-        .filter_map(|a| {
-            Some((
-                a.labels.get("site")?.as_str(),
-                a.status.served_revision.as_deref()?,
-            ))
+        .filter(|a| {
+            a.kind == "siteAgent"
+                && a.active_revision.is_some()
+                && a.active_revision.as_deref() == expected(agent_site(a))
         })
+        .filter_map(|a| Some((agent_site(a)?, a.status.served_revision.as_deref()?)))
         .collect();
     workers
         .iter()
         .map(|w| {
-            let (cp, active) = (control_plane?, w.active_revision.as_deref()?);
+            let site = match w.kind.as_str() {
+                "siteAgent" => agent_site(w),
+                _ => w.parent.as_deref(),
+            };
+            let (cp, active) = (expected(site)?, w.active_revision.as_deref()?);
             Some(
                 cp == active
                     || w.parent
@@ -1484,8 +1499,16 @@ async fn list_workers_handler(State(state): State<Arc<AdminState>>) -> impl Into
         })
         .into_response();
     };
+    let mut per_site = std::collections::HashMap::new();
     let (control_plane_revision, revision_error) = match (api.snapshot)().await {
-        Ok(s) => (Some(s.revision), None),
+        Ok(s) => {
+            for site in &api.sites {
+                if let Some(clusters) = api.site_clusters(&site.name) {
+                    per_site.insert(site.name.clone(), s.for_site(clusters).revision);
+                }
+            }
+            (Some(s.revision), None)
+        }
         Err(e) => (None, Some(e)),
     };
     let workers = match &api.registry {
@@ -1500,7 +1523,7 @@ async fn list_workers_handler(State(state): State<Arc<AdminState>>) -> impl Into
         }
         None => vec![],
     };
-    let in_sync = in_sync_flags(&workers, control_plane_revision.as_deref());
+    let in_sync = in_sync_flags(&workers, control_plane_revision.as_deref(), &per_site);
     let now = chrono::Utc::now();
     let workers = workers
         .into_iter()
@@ -4015,8 +4038,9 @@ mod tests {
             record(serde_json::json!({ "name": "direct", "activeRevision": "cp" })),
             record(serde_json::json!({ "name": "new" })),
         ];
+        let none = std::collections::HashMap::new();
         assert_eq!(
-            super::in_sync_flags(&workers, Some("cp")),
+            super::in_sync_flags(&workers, Some("cp"), &none),
             vec![
                 Some(true),
                 Some(true),
@@ -4026,6 +4050,28 @@ mod tests {
                 None
             ]
         );
-        assert_eq!(super::in_sync_flags(&workers, None), vec![None; 6]);
+        assert_eq!(super::in_sync_flags(&workers, None, &none), vec![None; 6]);
+
+        // dc1 is limited to some clusters: its agent runs dc1's own revision.
+        let mut workers = workers;
+        workers[0].active_revision = Some("cp-dc1".into());
+        let per_site = std::collections::HashMap::from([("dc1".to_string(), "cp-dc1".to_string())]);
+        assert_eq!(
+            super::in_sync_flags(&workers, Some("cp"), &per_site),
+            vec![
+                Some(true),
+                Some(true),
+                Some(false),
+                Some(false),
+                Some(true),
+                None
+            ]
+        );
+        // Running the full revision is behind for a limited site.
+        workers[0].active_revision = Some("cp".into());
+        assert_eq!(
+            super::in_sync_flags(&workers, Some("cp"), &per_site)[..2],
+            [Some(false), Some(false)]
+        );
     }
 }
