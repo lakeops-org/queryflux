@@ -1,25 +1,25 @@
-//! The site agent role (#255): one process per customer site between the site's workers
+//! The hub role (#255): one process per customer site between the site's workers
 //! and a remote control plane.
 //!
-//! Workers connect to the agent exactly as they would to a control plane: it serves the
+//! Workers connect to the hub exactly as they would to a control plane: it serves the
 //! same worker API (`/worker/config`, `/wait`, `/register`, `/heartbeat`, `/capacity/*`,
 //! `/sweep-lock/*`, `/query-records`), so a worker needs no change beyond its
-//! `worker.upstream.url`. The agent is the only process at the site that talks to upstream,
+//! `worker.upstream.url`. The hub is the only process at the site that talks to upstream,
 //! and every connection is one it opens:
 //!
 //! - **Config:** it long-polls upstream's `/worker/config/wait` and serves the snapshot it
 //!   gets, unchanged, to its workers' long-polls. The last snapshot is kept on disk
-//!   (`siteAgent.snapshotCache`), so after a restart with upstream unreachable the agent
+//!   (`hub.snapshotCache`), so after a restart with upstream unreachable the hub
 //!   still serves it, marked stale.
-//! - **Fleet:** workers register and heartbeat with the agent; it posts them upstream
+//! - **Fleet:** workers register and heartbeat with the hub; it posts them upstream
 //!   (`/worker/fleet`), where they appear as `<site>/<name>`, and registers itself.
 //! - **History:** workers' records go to a spool on disk ([`HistorySpool`]) and from there
-//!   upstream, redacted at the agent.
+//!   upstream, redacted at the hub.
 //! - **Capacity:** acquires, releases, waits, quota reports and sweep locks are forwarded
 //!   upstream, so one `maxRunningQueries` holds across every site. With
 //!   `capacity.mode: quotas` upstream, workers admit within their quota with no round trip.
 //!
-//! The agent runs no query frontends and no engine adapters: only the admin listener.
+//! The hub runs no query frontends and no engine adapters: only the admin listener.
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -28,25 +28,24 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use axum::{extract::State, http::StatusCode, response::IntoResponse, routing::get, Router};
 use chrono::{DateTime, Utc};
-use queryflux_core::config::{
-    OnCoordinationUnavailable, ProxyConfig, SiteAgentConfig, UpstreamConfig,
-};
+use queryflux_core::config::{HubConfig, OnCoordinationUnavailable, ProxyConfig, UpstreamConfig};
 use queryflux_core::worker_snapshot::{
     HistoryPolicy, WorkerSnapshotV1, WORKER_SNAPSHOT_SCHEMA_VERSION,
 };
 use queryflux_frontend::worker_api::WorkerApi;
+use queryflux_metrics::hub as metrics;
 use queryflux_metrics::prometheus_store::PrometheusMetrics;
-use queryflux_metrics::site_agent as metrics;
 use queryflux_persistence::{in_memory::InMemoryPersistence, WorkerRecord, WorkerRegistryStore};
 use tokio::sync::watch;
 
+use crate::bearer::Bearer;
 use crate::config_source::{fetch_snapshot, FetchMode, Fetched, PeerConfig};
 use crate::history_spool::{write_private, HistorySpool, SpoolStatus};
 
 /// Workers that reported within this window are relayed upstream as live.
 const LIVE_WINDOW_SECS: i64 = 60;
 
-/// The snapshot the agent serves, and where it came from.
+/// The snapshot the hub serves, and where it came from.
 #[derive(Clone)]
 struct Served {
     /// What workers get.
@@ -54,14 +53,14 @@ struct Served {
     /// The revision upstream published. Differs from `snapshot.revision` only when
     /// upstream named a history endpoint (see [`for_workers`]).
     upstream_revision: String,
-    /// Upstream's history policy: the redaction the agent applies and, if set, the
+    /// Upstream's history policy: the redaction the hub applies and, if set, the
     /// endpoint it relays history to.
     history: Option<HistoryPolicy>,
 }
 
-/// Workers behind an agent send history to the agent and never past it, so a history
+/// Workers behind a hub send history to the hub and never past it, so a history
 /// endpoint upstream named is removed from what they get (and the snapshot re-sealed);
-/// the agent relays to that endpoint itself.
+/// the hub relays to that endpoint itself.
 fn for_workers(upstream: WorkerSnapshotV1) -> Served {
     let upstream_revision = upstream.revision.clone();
     let history = upstream.history.clone();
@@ -81,17 +80,17 @@ fn for_workers(upstream: WorkerSnapshotV1) -> Served {
     }
 }
 
-/// `/agent/status`.
+/// `/hub/status`.
 #[derive(Debug, Default, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
-struct AgentStatus {
+struct HubStatus {
     site: String,
     upstream: String,
     upstream_up: bool,
     upstream_revision: Option<String>,
     served_revision: Option<String>,
     /// True while the served snapshot came from the disk cache and upstream has not
-    /// confirmed it since this agent started.
+    /// confirmed it since this hub started.
     stale: bool,
     /// When upstream last confirmed the served snapshot.
     confirmed_at: Option<DateTime<Utc>>,
@@ -101,10 +100,10 @@ struct AgentStatus {
     history: SpoolStatus,
 }
 
-/// The agent's copy of upstream's config.
+/// The hub's copy of upstream's config.
 struct Relay {
     served: Mutex<Option<Served>>,
-    status: Mutex<AgentStatus>,
+    status: Mutex<HubStatus>,
     /// Bumped on every new snapshot; wakes workers' long-polls.
     changes: watch::Sender<u64>,
     /// `stateDir/snapshot.json`, when `snapshotCache` is on.
@@ -119,7 +118,7 @@ impl Relay {
             .clone()
     }
 
-    fn status(&self) -> std::sync::MutexGuard<'_, AgentStatus> {
+    fn status(&self) -> std::sync::MutexGuard<'_, HubStatus> {
         self.status.lock().unwrap_or_else(|e| e.into_inner())
     }
 
@@ -140,7 +139,7 @@ impl Relay {
     /// A new snapshot from upstream: serve it and cache it.
     async fn publish(&self, snapshot: WorkerSnapshotV1) {
         let now = Utc::now();
-        tracing::info!(revision = %snapshot.revision, "Site agent serving a new config from upstream");
+        tracing::info!(revision = %snapshot.revision, "Hub serving a new config from upstream");
         if let Some(path) = &self.cache {
             let cached = PeerConfig {
                 snapshot: snapshot.clone(),
@@ -176,7 +175,7 @@ impl Relay {
     }
 
     fn failed(&self, message: String) {
-        tracing::warn!("Site agent upstream sync: {message}");
+        tracing::warn!("Hub upstream sync: {message}");
         let mut st = self.status();
         st.upstream_up = false;
         st.last_error = Some(message);
@@ -226,10 +225,11 @@ impl Relay {
     }
 }
 
-/// Keep the agent's copy of upstream's config current until shutdown.
+/// Keep the hub's copy of upstream's config current until shutdown.
 async fn run_relay(
     relay: Arc<Relay>,
     upstream: UpstreamConfig,
+    bearer: Bearer,
     mut shutdown: watch::Receiver<bool>,
 ) {
     let wait_secs = upstream.poll_timeout_secs.clamp(1, 60);
@@ -239,7 +239,6 @@ async fn run_relay(
         .build()
         .unwrap_or_default();
     let url = format!("{}/worker/config", upstream.url.trim_end_matches('/'));
-    let bearer = upstream.auth.bearer().to_string();
     let mut cache_tried = false;
     loop {
         let (current, stale) = {
@@ -252,8 +251,9 @@ async fn run_relay(
             Some(rev) => FetchMode::Wait(rev, wait_secs),
             None => FetchMode::Now,
         };
+        let token = bearer.get();
         let result = tokio::select! {
-            r = fetch_snapshot(&client, &url, &bearer, mode) => r,
+            r = fetch_snapshot(&client, &url, &token, mode) => r,
             _ = shutdown.wait_for(|v| *v) => return,
         };
         match result {
@@ -278,7 +278,7 @@ async fn run_relay(
     }
 }
 
-/// Every heartbeat interval: post the site's live workers upstream, register this agent,
+/// Every heartbeat interval: post the site's live workers upstream, register this hub,
 /// and refresh the gauges.
 #[allow(clippy::too_many_arguments)]
 async fn run_fleet(
@@ -286,8 +286,9 @@ async fn run_fleet(
     registry: Arc<InMemoryPersistence>,
     spool: Arc<HistorySpool>,
     upstream: UpstreamConfig,
+    bearer: Bearer,
     site: String,
-    agent_name: String,
+    hub_name: String,
     mut shutdown: watch::Receiver<bool>,
 ) {
     let client = reqwest::Client::builder()
@@ -322,7 +323,7 @@ async fn run_fleet(
         };
         match client
             .post(format!("{base}/worker/fleet"))
-            .bearer_auth(upstream.auth.bearer())
+            .bearer_auth(bearer.get())
             .json(&fleet)
             .send()
             .await
@@ -334,7 +335,7 @@ async fn run_fleet(
 
         let history = spool.status();
         let report = WorkerRecord {
-            name: agent_name.clone(),
+            name: hub_name.clone(),
             version: env!("CARGO_PKG_VERSION").to_string(),
             labels: [("site".to_string(), site.clone())].into(),
             coordination_mode: "controlPlane".to_string(),
@@ -366,25 +367,25 @@ async fn run_fleet(
                 }),
                 ..Default::default()
             },
-            kind: "siteAgent".to_string(),
+            kind: "hub".to_string(),
             parent: None,
         };
         let path = if registered { "heartbeat" } else { "register" };
         match client
             .post(format!("{base}/worker/{path}"))
-            .bearer_auth(upstream.auth.bearer())
+            .bearer_auth(bearer.get())
             .json(&report)
             .send()
             .await
         {
             Ok(r) if r.status().is_success() => {
                 if !registered {
-                    tracing::info!(agent = %agent_name, "Site agent registered upstream");
+                    tracing::info!(hub = %hub_name, "Hub registered upstream");
                 }
                 registered = true;
             }
-            Ok(r) => tracing::debug!(status = %r.status(), "Site agent {path} rejected"),
-            Err(e) => tracing::debug!("Site agent {path} failed: {e}"),
+            Ok(r) => tracing::debug!(status = %r.status(), "Hub {path} rejected"),
+            Err(e) => tracing::debug!("Hub {path} failed: {e}"),
         }
     }
 }
@@ -396,7 +397,7 @@ struct OpsState {
     prometheus: Arc<PrometheusMetrics>,
 }
 
-/// Ready once the agent has a config to serve (from upstream or its cache).
+/// Ready once the hub has a config to serve (from upstream or its cache).
 async fn readyz(State(s): State<OpsState>) -> axum::response::Response {
     match s.relay.served() {
         Some(_) => (StatusCode::OK, "ready").into_response(),
@@ -408,14 +409,14 @@ async fn readyz(State(s): State<OpsState>) -> axum::response::Response {
     }
 }
 
-async fn agent_status(State(s): State<OpsState>) -> axum::response::Response {
+async fn hub_status(State(s): State<OpsState>) -> axum::response::Response {
     let mut st = s.relay.status().clone();
     st.history = s.spool.status();
     axum::Json(st).into_response()
 }
 
-/// The agent's listener: the worker API for this site's workers, plus `/health`,
-/// `/readyz`, `/metrics` and `/agent/status`.
+/// The hub's listener: the worker API for this site's workers, plus `/health`,
+/// `/readyz`, `/metrics` and `/hub/status`.
 fn router(api: WorkerApi, ops: OpsState) -> Router {
     queryflux_frontend::worker_api::router(api).merge(
         Router::new()
@@ -431,26 +432,27 @@ fn router(api: WorkerApi, ops: OpsState) -> Router {
                     )
                 }),
             )
-            .route("/agent/status", get(agent_status))
+            .route("/hub/status", get(hub_status))
             .with_state(ops),
     )
 }
 
-/// Everything a running agent needs, wired: started tasks plus the router to serve.
-struct Agent {
+/// Everything a running hub needs, wired: started tasks plus the router to serve.
+struct Hub {
     router: Router,
     shutdown: watch::Sender<bool>,
 }
 
 fn start(
-    agent: &SiteAgentConfig,
+    hub: &HubConfig,
     worker_secret: String,
+    bearer: Bearer,
     prometheus: Arc<PrometheusMetrics>,
-) -> Result<Agent> {
-    let state_dir = PathBuf::from(&agent.state_dir);
+) -> Result<Hub> {
+    let state_dir = PathBuf::from(&hub.state_dir);
     std::fs::create_dir_all(&state_dir).with_context(|| {
         format!(
-            "create siteAgent.stateDir {} (it must be writable by this process)",
+            "create hub.stateDir {} (it must be writable by this process)",
             state_dir.display()
         )
     })?;
@@ -458,39 +460,39 @@ fn start(
     let (changes, changes_rx) = watch::channel(0u64);
     let relay = Arc::new(Relay {
         served: Mutex::new(None),
-        status: Mutex::new(AgentStatus {
-            site: agent.name.clone(),
-            upstream: agent.upstream.url.clone(),
+        status: Mutex::new(HubStatus {
+            site: hub.site.clone(),
+            upstream: hub.upstream.connection.url.clone(),
             ..Default::default()
         }),
         changes,
-        cache: agent
-            .snapshot_cache
-            .then(|| state_dir.join("snapshot.json")),
+        cache: hub.snapshot_cache.then(|| state_dir.join("snapshot.json")),
     });
-    let host = std::env::var("HOSTNAME").unwrap_or_else(|_| "site-agent".to_string());
-    let agent_name = format!("{}/{host}", agent.name);
+    let host = std::env::var("HOSTNAME").unwrap_or_else(|_| "site-hub".to_string());
+    let hub_name = format!("{}/{host}", hub.site);
     let spool = HistorySpool::open(
         state_dir.join("spool"),
-        agent.history_spool.max_bytes,
-        agent_name.clone(),
-        agent.name.clone(),
-        &agent.upstream,
+        hub.history_spool.max_bytes,
+        hub_name.clone(),
+        hub.site.clone(),
+        &hub.upstream.connection,
+        bearer.clone(),
         {
             let relay = relay.clone();
             Arc::new(move || relay.served().and_then(|s| s.history))
         },
     )?;
     let registry = Arc::new(InMemoryPersistence::new());
-    // Capacity is forwarded; when upstream is unreachable the agent answers 503 and each
+    // Capacity is forwarded; when upstream is unreachable the hub answers 503 and each
     // worker's `coordination.onUnavailable` decides.
     // Holders are qualified by site, like fleet and history names.
     let remote = Arc::new(
         crate::remote_coordination::RemoteCoordinationStore::new(
-            &agent.upstream,
+            &hub.upstream.connection,
+            bearer.clone(),
             OnCoordinationUnavailable::FailClosed,
         )
-        .with_holder_prefix(format!("{}/", agent.name)),
+        .with_holder_prefix(format!("{}/", hub.site)),
     );
     let api = WorkerApi {
         shared_secret: worker_secret,
@@ -501,7 +503,7 @@ fn start(
                 Box::pin(async move {
                     served
                         .map(|s| (*s.snapshot).clone())
-                        .ok_or_else(|| "the site agent has no config from upstream yet".to_string())
+                        .ok_or_else(|| "the hub has no config from upstream yet".to_string())
                 })
             })
         },
@@ -515,20 +517,22 @@ fn start(
 
     tokio::spawn(run_relay(
         relay.clone(),
-        agent.upstream.clone(),
+        hub.upstream.connection.clone(),
+        bearer.clone(),
         shutdown_rx.clone(),
     ));
     tokio::spawn(run_fleet(
         relay.clone(),
         registry,
         spool.clone(),
-        agent.upstream.clone(),
-        agent.name.clone(),
-        agent_name,
+        hub.upstream.connection.clone(),
+        bearer,
+        hub.site.clone(),
+        hub_name,
         shutdown_rx.clone(),
     ));
     spool.spawn_flusher(shutdown_rx);
-    Ok(Agent {
+    Ok(Hub {
         router: router(
             api,
             OpsState {
@@ -541,33 +545,39 @@ fn start(
     })
 }
 
-/// Run the site agent until SIGINT/SIGTERM.
+/// Run the hub until SIGINT/SIGTERM.
 pub(crate) async fn run(config: ProxyConfig) -> Result<()> {
     let q = &config.queryflux;
-    let agent = q
-        .site_agent
-        .as_ref()
-        .context("role: siteAgent needs queryflux.siteAgent")?;
-    let worker_secret = agent.shared_secret.clone();
-    if worker_secret == agent.upstream.auth.bearer() {
+    let hub = q.hub.as_ref().context("role: hub needs queryflux.hub")?;
+    let worker_secret = q
+        .worker_secret
+        .clone()
+        .context("role: hub needs queryflux.workerSecret")?;
+    let upstream_secret = hub
+        .upstream
+        .secret
+        .clone()
+        .context("role: hub needs queryflux.hub.upstream.secret")?;
+    if worker_secret == upstream_secret {
         tracing::warn!(
-            "siteAgent.sharedSecret equals siteAgent.upstream's secret: workers at this site \
-             then hold the site's upstream credential. Use a different secret."
+            "workerSecret equals hub.upstream.secret: workers at this site then hold the \
+             site's upstream credential. Use a different secret."
         );
     }
+    let bearer = Bearer::secret(upstream_secret);
     let prometheus = Arc::new(
         PrometheusMetrics::new_with_deny_list(q.metrics.tags_deny_list.clone())
             .context("Failed to init Prometheus metrics")?,
     );
-    let running = start(agent, worker_secret, prometheus)?;
+    let running = start(hub, worker_secret, bearer, prometheus)?;
     let addr = format!("0.0.0.0:{}", q.admin_api.port);
     let listener = tokio::net::TcpListener::bind(&addr)
         .await
         .with_context(|| format!("bind {addr}"))?;
     tracing::info!(
-        site = %agent.name,
-        upstream = %agent.upstream.url,
-        "Site agent on {addr} — worker API, /readyz, /metrics, /agent/status"
+        site = %hub.site,
+        upstream = %hub.upstream.connection.url,
+        "Hub on {addr} — worker API, /readyz, /metrics, /hub/status"
     );
     let mut stop = running.shutdown.subscribe();
     let serve = axum::serve(listener, running.router).with_graceful_shutdown(async move {
@@ -578,7 +588,7 @@ pub(crate) async fn run(config: ProxyConfig) -> Result<()> {
     let _ = running.shutdown.send(true);
     // Accepted history is on disk already; the next start sends what is left.
     serving.await??;
-    tracing::info!("Site agent shutdown complete");
+    tracing::info!("Hub shutdown complete");
     Ok(())
 }
 
@@ -641,7 +651,7 @@ mod tests {
             let (changes, rx) = watch::channel(0u64);
             let up = Arc::new(AtomicBool::new(true));
             let store = Arc::new(InMemoryPersistence::new());
-            // Agents only, as on a hosted control plane: dc1's agent presents its site token.
+            // Hubs only, as on a hosted control plane: dc1's hub presents its site token.
             let api = WorkerApi {
                 shared_secret: String::new(),
                 snapshot: {
@@ -701,28 +711,28 @@ mod tests {
         format!("http://{addr}")
     }
 
-    fn agent_config(upstream: &str, state_dir: &std::path::Path) -> SiteAgentConfig {
+    fn hub_config(upstream: &str, state_dir: &std::path::Path) -> HubConfig {
         serde_json::from_value(serde_json::json!({
-            "name": "dc1",
-            "sharedSecret": "worker-secret",
+            "site": "dc1",
             "stateDir": state_dir.to_string_lossy(),
             "upstream": {
+                "secret": "site-secret",
                 "url": upstream,
                 "allowInsecureHttp": true,
                 "pollTimeoutSecs": 1,
-                "heartbeatIntervalSecs": 1,
-                "auth": { "mode": "sharedSecret", "sharedSecret": "site-secret" }
+                "heartbeatIntervalSecs": 1
             }
         }))
         .unwrap()
     }
 
-    /// Start an agent in `dir`; returns its URL and shutdown handle.
-    async fn agent(upstream: &str, dir: &std::path::Path) -> (String, watch::Sender<bool>) {
+    /// Start a hub in `dir`; returns its URL and shutdown handle.
+    async fn hub(upstream: &str, dir: &std::path::Path) -> (String, watch::Sender<bool>) {
         let prometheus = Arc::new(PrometheusMetrics::new().unwrap());
         let a = start(
-            &agent_config(upstream, dir),
+            &hub_config(upstream, dir),
             "worker-secret".into(),
+            Bearer::secret("site-secret"),
             prometheus,
         )
         .unwrap();
@@ -744,17 +754,17 @@ mod tests {
         panic!("condition not reached in 5s");
     }
 
-    async fn worker_config(agent: &str, secret: &str) -> reqwest::Response {
+    async fn worker_config(hub: &str, secret: &str) -> reqwest::Response {
         reqwest::Client::new()
-            .get(format!("{agent}/worker/config"))
+            .get(format!("{hub}/worker/config"))
             .bearer_auth(secret)
             .send()
             .await
             .unwrap()
     }
 
-    async fn served_revision(agent: &str) -> Option<String> {
-        let r = worker_config(agent, "worker-secret").await;
+    async fn served_revision(hub: &str) -> Option<String> {
+        let r = worker_config(hub, "worker-secret").await;
         if !r.status().is_success() {
             return None;
         }
@@ -766,16 +776,16 @@ mod tests {
     async fn config_flows_from_upstream_through_the_agent_and_survives_an_outage() {
         let up = Upstream::start().await;
         let dir = tempfile::tempdir().unwrap();
-        let (url, stop) = agent(&up.url, dir.path()).await;
+        let (url, stop) = hub(&up.url, dir.path()).await;
 
-        // The agent serves upstream's snapshot as is, behind the workers' own secret.
+        // The hub serves upstream's snapshot as is, behind the workers' own secret.
         let first = up.current.lock().unwrap().revision.clone();
         eventually(|| async { served_revision(&url).await.as_deref() == Some(first.as_str()) })
             .await;
         assert_eq!(
             worker_config(&url, "site-secret").await.status(),
             StatusCode::UNAUTHORIZED,
-            "workers present the agent's secret, not upstream's"
+            "workers present the hub's secret, not upstream's"
         );
         assert_eq!(
             reqwest::get(format!("{url}/readyz"))
@@ -785,7 +795,7 @@ mod tests {
             StatusCode::OK
         );
 
-        // An edit upstream reaches the agent through its long-poll.
+        // An edit upstream reaches the hub through its long-poll.
         up.publish(snapshot(7));
         let second = up.current.lock().unwrap().revision.clone();
         eventually(|| async { served_revision(&url).await.as_deref() == Some(second.as_str()) })
@@ -796,7 +806,7 @@ mod tests {
         bad.clusters[0].max_running_queries = Some(99);
         up.publish(bad);
         eventually(|| async {
-            get_json(&format!("{url}/agent/status")).await["lastError"]
+            get_json(&format!("{url}/hub/status")).await["lastError"]
                 .as_str()
                 .is_some_and(|e| e.contains("integrity"))
         })
@@ -806,11 +816,11 @@ mod tests {
             Some(second.as_str())
         );
 
-        // Upstream down: the agent keeps serving what it has.
+        // Upstream down: the hub keeps serving what it has.
         up.publish(snapshot(7));
         up.up.store(false, Ordering::SeqCst);
         eventually(|| async {
-            get_json(&format!("{url}/agent/status")).await["upstreamUp"] == false
+            get_json(&format!("{url}/hub/status")).await["upstreamUp"] == false
         })
         .await;
         assert_eq!(
@@ -820,15 +830,15 @@ mod tests {
         stop.send(true).unwrap();
 
         // Restarted with upstream still down: serves the disk cache, marked stale.
-        let (url2, _stop2) = agent(&up.url, dir.path()).await;
+        let (url2, _stop2) = hub(&up.url, dir.path()).await;
         eventually(|| async { served_revision(&url2).await.as_deref() == Some(second.as_str()) })
             .await;
-        let st = get_json(&format!("{url2}/agent/status")).await;
+        let st = get_json(&format!("{url2}/hub/status")).await;
         assert_eq!(st["stale"], true, "{st}");
 
         // Upstream back: confirmed, no longer stale.
         up.up.store(true, Ordering::SeqCst);
-        eventually(|| async { get_json(&format!("{url2}/agent/status")).await["stale"] == false })
+        eventually(|| async { get_json(&format!("{url2}/hub/status")).await["stale"] == false })
             .await;
     }
 
@@ -876,7 +886,7 @@ mod tests {
         .unwrap()
     }
 
-    async fn post_records(agent: &str, worker: &str, ids: &[&str]) -> StatusCode {
+    async fn post_records(hub: &str, worker: &str, ids: &[&str]) -> StatusCode {
         let batch = queryflux_persistence::QueryRecordBatchV1 {
             schema_version: queryflux_persistence::QUERY_RECORDS_SCHEMA_VERSION,
             worker: worker.into(),
@@ -884,7 +894,7 @@ mod tests {
             site: None,
         };
         reqwest::Client::new()
-            .post(format!("{agent}/worker/query-records"))
+            .post(format!("{hub}/worker/query-records"))
             .bearer_auth("worker-secret")
             .json(&batch)
             .send()
@@ -919,10 +929,10 @@ mod tests {
     async fn history_is_spooled_on_disk_and_reaches_upstream_redacted_and_attributed() {
         let up = Upstream::start().await;
         let dir = tempfile::tempdir().unwrap();
-        let (url, stop) = agent(&up.url, dir.path()).await;
+        let (url, stop) = hub(&up.url, dir.path()).await;
         eventually(|| async { served_revision(&url).await.is_some() }).await;
 
-        // Upstream down: the agent still accepts, onto disk.
+        // Upstream down: the hub still accepts, onto disk.
         up.up.store(false, Ordering::SeqCst);
         assert_eq!(
             post_records(&url, "worker-a", &["q1", "q2"]).await,
@@ -935,9 +945,9 @@ mod tests {
         let spooled = std::fs::read_dir(dir.path().join("spool")).unwrap().count();
         assert_eq!(spooled, 2, "one file per batch");
 
-        // The agent restarts before upstream returns: the files are picked up again.
+        // The hub restarts before upstream returns: the files are picked up again.
         stop.send(true).unwrap();
-        let (_url2, _stop2) = agent(&up.url, dir.path()).await;
+        let (_url2, _stop2) = hub(&up.url, dir.path()).await;
         up.up.store(true, Ordering::SeqCst);
         eventually(|| async { upstream_history(&up.store).await.len() == 3 }).await;
         let rows = upstream_history(&up.store).await;
@@ -948,7 +958,7 @@ mod tests {
         );
         assert!(
             rows.iter().all(|r| !r.2.contains("bob")),
-            "redacted at the agent (maskLiterals): {rows:?}"
+            "redacted at the hub (maskLiterals): {rows:?}"
         );
         eventually(|| async { std::fs::read_dir(dir.path().join("spool")).unwrap().count() == 0 })
             .await;
@@ -958,17 +968,17 @@ mod tests {
     async fn a_full_spool_drops_the_oldest_batches() {
         let dir = tempfile::tempdir().unwrap();
         let upstream: UpstreamConfig = serde_json::from_value(serde_json::json!({
-            "url": "http://127.0.0.1:9", "allowInsecureHttp": true,
-            "auth": { "mode": "sharedSecret", "sharedSecret": "s" }
+            "url": "http://127.0.0.1:9", "allowInsecureHttp": true
         }))
         .unwrap();
         let one = serde_json::to_vec(&vec![record("q0", "w")]).unwrap().len() as u64;
         let spool = HistorySpool::open(
             dir.path().to_path_buf(),
             one * 2 + one / 2,
-            "dc1/agent".into(),
+            "dc1/hub".into(),
             "dc1".into(),
             &upstream,
+            Bearer::secret("s"),
             Arc::new(|| None),
         )
         .unwrap();
@@ -985,7 +995,7 @@ mod tests {
         assert_eq!(spool.status().files, 2, "a failed upload keeps its file");
     }
 
-    /// A real worker config source pointed at the agent activates upstream's config, and
+    /// A real worker config source pointed at the hub activates upstream's config, and
     /// its capacity calls reach upstream.
     #[tokio::test]
     async fn a_worker_behind_the_agent_activates_config_and_shares_capacity_upstream() {
@@ -994,12 +1004,11 @@ mod tests {
         use queryflux_persistence::CapacityStore;
         let up = Upstream::start().await;
         let dir = tempfile::tempdir().unwrap();
-        let (url, _stop) = agent(&up.url, dir.path()).await;
+        let (url, _stop) = hub(&up.url, dir.path()).await;
         eventually(|| async { served_revision(&url).await.is_some() }).await;
 
         let cp: UpstreamConfig = serde_json::from_value(serde_json::json!({
-            "url": url, "allowInsecureHttp": true, "pollTimeoutSecs": 1,
-            "auth": { "mode": "sharedSecret", "sharedSecret": "worker-secret" }
+            "url": url, "allowInsecureHttp": true, "pollTimeoutSecs": 1
         }))
         .unwrap();
         let state = Arc::new(std::sync::Mutex::new(
@@ -1023,7 +1032,7 @@ mod tests {
             changed: None,
             translation: None,
         };
-        RemoteConfigSource::new(&cp, state.clone())
+        RemoteConfigSource::new(&cp, Bearer::secret("worker-secret"), state.clone())
             .reload(&handles)
             .await;
         let upstream_rev = up.current.lock().unwrap().revision.clone();
@@ -1035,9 +1044,10 @@ mod tests {
         );
         assert!(handles.live.read().await.is_configured());
 
-        // Capacity calls go through the agent to upstream's store.
+        // Capacity calls go through the hub to upstream's store.
         let worker = crate::remote_coordination::remote_coordination(
             &cp,
+            Bearer::secret("worker-secret"),
             OnCoordinationUnavailable::FailClosed,
         );
         worker.publish_running_count("duck", 4).await.unwrap();
@@ -1046,7 +1056,7 @@ mod tests {
         // Upstream has quotas off: the worker is told so and keeps per-query leases.
         assert!(worker.report_demand("w1", &[]).await.unwrap().is_none());
 
-        // Upstream unreachable: the agent answers with an error, and the worker's
+        // Upstream unreachable: the hub answers with an error, and the worker's
         // `onUnavailable` decides.
         up.up.store(false, Ordering::SeqCst);
         assert!(worker.try_acquire("duck", 10, "w1", "q2").await.is_err());
@@ -1082,7 +1092,7 @@ mod tests {
         let dc1 = full.for_site(&["duck".to_string()]);
 
         let dir = tempfile::tempdir().unwrap();
-        let (url, _stop) = agent(&up.url, dir.path()).await;
+        let (url, _stop) = hub(&up.url, dir.path()).await;
         eventually(|| async {
             served_revision(&url).await.as_deref() == Some(dc1.revision.as_str())
         })
@@ -1100,8 +1110,7 @@ mod tests {
 
         // A worker activates it: dc2's group is there, with no cluster.
         let cp: UpstreamConfig = serde_json::from_value(serde_json::json!({
-            "url": url, "allowInsecureHttp": true, "pollTimeoutSecs": 1,
-            "auth": { "mode": "sharedSecret", "sharedSecret": "worker-secret" }
+            "url": url, "allowInsecureHttp": true, "pollTimeoutSecs": 1
         }))
         .unwrap();
         let state = Arc::new(std::sync::Mutex::new(
@@ -1125,7 +1134,7 @@ mod tests {
             changed: None,
             translation: None,
         };
-        RemoteConfigSource::new(&cp, state.clone())
+        RemoteConfigSource::new(&cp, Bearer::secret("worker-secret"), state.clone())
             .reload(&handles)
             .await;
         let synced = state.lock().unwrap().clone();
@@ -1145,7 +1154,7 @@ mod tests {
         use queryflux_persistence::WorkerRegistryStore;
         let up = Upstream::start().await;
         let dir = tempfile::tempdir().unwrap();
-        let (url, _stop) = agent(&up.url, dir.path()).await;
+        let (url, _stop) = hub(&up.url, dir.path()).await;
         let worker = serde_json::json!({ "name": "worker-0", "version": "test" });
         let r = reqwest::Client::new()
             .post(format!("{url}/worker/register"))
@@ -1162,7 +1171,7 @@ mod tests {
             workers
                 .iter()
                 .any(|w| w.name == "dc1/worker-0" && w.parent.as_deref() == Some("dc1"))
-                && workers.iter().any(|w| w.kind == "siteAgent")
+                && workers.iter().any(|w| w.kind == "hub")
         })
         .await;
     }

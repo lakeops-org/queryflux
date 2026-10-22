@@ -38,7 +38,7 @@ const sidebars: SidebarsConfig = {
           type: 'category',
           label: 'Scaling out',
           collapsed: true,
-          items: ['operations/multi-replica', 'operations/sizing', 'operations/worker-mode', 'operations/worker-sidecar', 'operations/site-agent'],
+          items: ['operations/multi-replica', 'operations/sizing', 'operations/worker-mode', 'operations/worker-sidecar', 'operations/hub'],
         },
       ],
     },

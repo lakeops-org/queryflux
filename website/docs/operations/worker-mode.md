@@ -30,7 +30,7 @@ Running QueryFlux without workers works exactly as before. Worker mode is opt-in
 | One QueryFlux deployment, every client reaches it | `role: standalone` (the default). See [Multi-replica operations](./multi-replica) for HA. |
 | QueryFlux next to each application, or in networks that cannot reach the database | `role: controlPlane` plus workers |
 | Many small QueryFlux deployments that should share one config, one set of limits and one query history | `role: controlPlane` plus workers |
-| Workers in a remote network (another data center, a customer site) that may only connect outbound | Workers behind one [site agent](./site-agent) per site |
+| Workers in a remote network (another data center, a customer site) that may only connect outbound | Workers behind one [hub](./hub) per site |
 
 ## Roles
 
@@ -39,9 +39,9 @@ Running QueryFlux without workers works exactly as before. Worker mode is opt-in
 | `standalone` (default) | Yes (YAML or Postgres) | Optional | Yes | No |
 | `controlPlane` | Yes | Yes, for shared capacity | Yes | Yes |
 | `worker` | No, pulled from the control plane | **Never** | No: ops listener only | No |
-| `siteAgent` | No, relayed from the control plane | **Never** | No: worker API and ops endpoints only | Yes, the workers at its site. See [Site agent](./site-agent). |
+| `hub` | No, relayed from the control plane | **Never** | No: worker API and ops endpoints only | Yes, the workers at its site. See [Hub](./hub). |
 
-Keys under `queryflux` apply to every role, except that each role other than `standalone` has its own section: `queryflux.controlPlane`, `queryflux.worker` or `queryflux.siteAgent`. A section set on another role is rejected. Every key, its default and its rules: [Configuration by role](../role-configuration).
+Keys under `queryflux` apply to every role, except that each role other than `standalone` has its own section: `queryflux.controlPlane`, `queryflux.worker` or `queryflux.hub`. A section set on another role is rejected. Every key, its default and its rules: [Configuration by role](../role-configuration).
 
 A control plane without Postgres serves the config it started with, and its workers coordinate with `worker.coordination.mode: local`.
 
@@ -52,32 +52,32 @@ A control plane without Postgres serves the config it started with, and its work
 ```yaml
 queryflux:
   role: controlPlane
+  workerSecret: <long-random-secret>
   persistence:
     type: postgres
     url: postgres://queryflux:<password>@postgres:5432/queryflux
   adminApi:
     port: 9000
   controlPlane:
-    sharedSecret: <long-random-secret>
     history:
       endpoint: null          # optional: workers send history here instead of to the control plane
       redaction: full         # full | maskLiterals | metadata
 ```
 
-The worker API lives on the admin port, under `/worker/*`. It uses its own bearer secret and does not accept the admin API's credentials. Site agents can instead present a token of their own site (`controlPlane.sites`, see [Site tokens](./site-agent#site-tokens)); with `sites` set and no `sharedSecret`, only site agents are accepted.
+The worker API lives on the admin port, under `/worker/*`. It uses its own bearer secret and does not accept the admin API's credentials. Hubs can instead present a token of their own site (`controlPlane.sites`, see [Site tokens](./hub#site-tokens)); with `sites` set and no `workerSecret`, only hubs are accepted.
 
 ### Worker
 
 ```yaml
 queryflux:
   role: worker
+  workerSecret: <long-random-secret>
   worker:
     name: checkout-7f9c      # optional; defaults to the hostname (the pod name)
     labels: { team: checkout }
     labelsFile: /etc/podinfo/labels   # optional: the pod's own labels (downward API), merged over labels
     upstream:
       url: https://queryflux-control:9000
-      auth: { mode: sharedSecret, sharedSecret: <long-random-secret> }
       pollTimeoutSecs: 30          # long-poll hold time
       heartbeatIntervalSecs: 10
       allowInsecureHttp: false     # local demos only: snapshots carry credentials
@@ -246,4 +246,4 @@ See the [Helm chart README](https://github.com/lakeops-org/queryflux/blob/main/c
   - For a shared-service worker with more than one replica, set `service.sessionAffinity: ClientIP` in the Helm values (`worker-values.yaml` does), and use sticky sessions on any external load balancer.
   - Sidecar workers are not affected.
   - Forwarding a request to the worker that owns the query, so that any load balancer works, is planned.
-- Per-worker credentials and secret references in snapshots are planned. For workers in a remote network, see [Site agent](./site-agent).
+- Per-worker credentials and secret references in snapshots are planned. For workers in a remote network, see [Hub](./hub).

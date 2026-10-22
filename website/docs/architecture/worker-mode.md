@@ -24,7 +24,7 @@ This page explains how worker mode works and why it is built this way. To run it
 | `standalone` (default) | yes (YAML or Postgres) | optional | queries, admin API, Studio |
 | `controlPlane` | yes | Postgres | the same, plus workers |
 | `worker` | no, pulled from the control plane | **never** | queries, and an ops listener |
-| `siteAgent` | no, relayed from the control plane | **never** | the worker API for one site's workers, and ops endpoints |
+| `hub` | no, relayed from the control plane | **never** | the worker API for one site's workers, and ops endpoints |
 
 <img
   src="/img/docs/worker-mode-roles-topology.svg"
@@ -199,13 +199,13 @@ The cache key includes a fingerprint of the group's member clusters and their co
 | Per-worker result cache, keyed by group config | A cache shared through the control plane | Result data never leaves the worker's network. Edits invalidate exactly the affected group. |
 | Measure fairness first | A global wait queue now | It may not be needed, and the metrics show when it is. |
 
-## Site agent
+## Hub
 
-A site agent ([operations guide](../operations/site-agent)) lets workers in a remote network reach a control plane through one process that only makes outbound connections. Its design follows from one rule: **workers can't tell.** The agent serves the exact worker API, so a worker needs no change beyond its `worker.upstream.url`.
+A hub ([operations guide](../operations/hub)) lets workers in a remote network reach a control plane through one process that only makes outbound connections. Its design follows from one rule: **workers can't tell.** The hub serves the exact worker API, so a worker needs no change beyond its `worker.upstream.url`.
 
-- **Reuse, not a fork.** The agent is the control plane's `WorkerApi` with different backends:
+- **Reuse, not a fork.** The hub is the control plane's `WorkerApi` with different backends:
 
-  | `WorkerApi` field | Control plane | Site agent |
+  | `WorkerApi` field | Control plane | Hub |
   |---|---|---|
   | `snapshot` | built from Postgres, cached until reload | the snapshot fetched from upstream with the worker's own fetch code (`fetch_snapshot`: long-poll, schema and seal checks) |
   | `changes` | bumped on each reload | bumped on each new upstream revision |
@@ -213,9 +213,9 @@ A site agent ([operations guide](../operations/site-agent)) lets workers in a re
   | `history` | the history store | a spool on disk, posted upstream |
   | `coordination`, `quotas` | Postgres | the worker's `RemoteCoordinationStore`, pointed upstream |
 
-- **The revision passes through.** The agent serves upstream's sealed snapshot as is, so the revision a worker reports is the one upstream published. The one exception: when upstream names a history endpoint, the agent removes it and re-seals, so workers send history only to the agent, which then relays to that endpoint.
+- **The revision passes through.** The hub serves upstream's sealed snapshot as is, so the revision a worker reports is the one upstream published. The one exception: when upstream names a history endpoint, the hub removes it and re-seals, so workers send history only to the hub, which then relays to that endpoint.
 - **History is acknowledged once it is on disk.** Each worker batch is redacted, written durably (temp file, fsync, rename), then acknowledged; a flusher posts the oldest batch upstream with `site` set, so each record keeps its worker's name. Upstream stores it as `<site>/<worker>`.
-- **Capacity is forwarded.** One `maxRunningQueries` holds across every site with no state at the agent, so replicas need no leader. With `capacity.mode: quotas` upstream, per-query admission stays local to each worker.
+- **Capacity is forwarded.** One `maxRunningQueries` holds across every site with no state at the hub, so replicas need no leader. With `capacity.mode: quotas` upstream, per-query admission stays local to each worker.
 - **Names are qualified upstream.** Workers appear as `<site>/<name>` with `parent` set to the site (migration V24 adds `kind` and `parent` to `worker_registry`), so `worker-0` at two sites doesn't collide.
 
 ## Future work
@@ -223,5 +223,5 @@ A site agent ([operations guide](../operations/site-agent)) lets workers in a re
 - **Forward to the owning worker.** Put the worker id in query ids, and forward a request to the worker that owns the query, so shared-service workers work behind any load balancer without sticky sessions.
 - **Per-worker credentials, secret references and signed snapshots,** for lower-trust workers.
 - **Translation scripts and timeout from the control plane:** `translation.pythonScripts` and `schemaResolutionTimeoutMs` still come from each worker's own config.
-- **Site agent follow-ups:** a site-wide quota held by the agent, so a site keeps admitting through a long upstream outage; Studio actions run at the site (test a connection, browse a catalog); per-site credentials; snapshots filtered per site.
+- **Hub follow-ups:** a site-wide quota held by the hub, so a site keeps admitting through a long upstream outage; Studio actions run at the site (test a connection, browse a catalog); per-site credentials; snapshots filtered per site.
 - **Query telemetry:** engine-side details (plans, scan statistics, Iceberg metrics) matched to each query and merged into its history record.

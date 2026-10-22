@@ -10,6 +10,8 @@
 
 queryflux:
   role: worker
+  # The control plane's workerSecret.
+  workerSecret: <long-random-secret>
   worker:
     # name defaults to the pod name (HOSTNAME).
     labels:
@@ -25,9 +27,6 @@ queryflux:
       # instead, and workers can use the in-cluster address:
       #   url: http://queryflux-control.queryflux.svc.cluster.local:9000
       #   allowInsecureHttp: true   # only with mesh mTLS: configs carry engine credentials
-      auth:
-        mode: sharedSecret
-        sharedSecret: <long-random-secret>   # the control plane's controlPlane.sharedSecret
       pollTimeoutSecs: 30
       heartbeatIntervalSecs: 10
       # Start from a running worker's config when the control plane is unreachable. The

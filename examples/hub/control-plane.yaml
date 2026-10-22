@@ -1,7 +1,9 @@
 # Control plane, standing in for a remote (for example hosted) one. It owns the config,
-# serves it to the site agent, shares capacity and stores query history.
+# serves it to the hub, shares capacity and stores query history.
 queryflux:
   role: controlPlane
+  # The hub presents this as hub.upstream.secret.
+  workerSecret: change-me-site-secret
   persistence:
     type: postgres
     url: postgres://queryflux:queryflux@postgres:5432/queryflux
@@ -13,10 +15,8 @@ queryflux:
   capacity:
     mode: quotas
   controlPlane:
-    # The site agent presents this as siteAgent.upstream.auth.sharedSecret.
-    sharedSecret: change-me-site-secret
     history:
-      # full | maskLiterals | metadata. Applied by the workers and again by the agent.
+      # full | maskLiterals | metadata. Applied by the workers and again by the hub.
       redaction: maskLiterals
   frontends:
     trinoHttp:

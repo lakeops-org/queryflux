@@ -134,7 +134,7 @@ See [ADBC drivers](https://queryflux.dev/docs/operations/adbc-drivers) for the f
 - `examples/control-plane-values.yaml` + `examples/control-plane-config.yaml`: a worker-mode control plane (Postgres, `queryflux.controlPlane`).
 - `examples/worker-values.yaml` + `examples/worker-config.yaml`: shared-service workers that pull config from the control plane.
 - `examples/worker-sidecar-manifest.yaml`: a worker as a native sidecar (Kubernetes 1.29+) next to an application container. This is a plain manifest, not Helm values.
-- `examples/site-agent-values.yaml` + `examples/site-agent-config.yaml`: a site agent (StatefulSet, a volume per replica) that relays a remote control plane to the workers at one site.
+- `examples/hub-values.yaml` + `examples/hub-config.yaml`: a hub (StatefulSet, a volume per replica) that relays a remote control plane to the workers at one site.
 
 ## Worker mode
 
@@ -149,7 +149,7 @@ helm install queryflux-workers ./charts/queryflux \
   -f ./charts/queryflux/examples/worker-autoscaling-values.yaml
 ```
 
-- **Control plane:** `role: controlPlane`, Postgres, `queryflux.controlPlane.sharedSecret`. Workers connect to its admin port (`9000`), so put TLS in front of that port. Snapshots carry cluster credentials.
+- **Control plane:** `role: controlPlane`, Postgres, `queryflux.workerSecret`. Workers connect to its admin port (`9000`), so put TLS in front of that port. Snapshots carry cluster credentials.
 - **Workers:** `role: worker`, `worker.upstream.url` and the shared secret. A worker never connects to Postgres, serves no Studio, and its admin port serves only `/health`, `/readyz`, `/metrics` and `/worker/status`.
 - **Probes:** `/readyz` returns 200 once the worker's first config snapshot is active. The startup probe keeps a new pod out of the Service until then. In a native sidecar, it also holds the application container back until then.
 - **Session affinity:** a running query lives in the memory of the worker that started it: Trino result polls, Snowflake and MCP sessions. Shared-service workers with more than one replica therefore need `service.sessionAffinity: ClientIP`, which `examples/worker-values.yaml` sets. An external load balancer in front needs sticky sessions too. Sidecar workers are not affected.
@@ -158,7 +158,7 @@ helm install queryflux-workers ./charts/queryflux \
 - **Per-pod labels:** `worker.labelsFile` reads labels from a downward API file of `metadata.labels`, so sidecar workers sharing one config each report their own pod's labels (`examples/worker-sidecar-manifest.yaml`). Guide: [Add a worker as a sidecar](https://github.com/lakeops-org/queryflux/blob/main/website/docs/operations/worker-sidecar.md).
 - **Peer bootstrap:** `service.headless.enabled: true` adds `<release>-headless`, which resolves to every ready worker. Point `worker.upstream.peerBootstrap.address` at it, so a worker starting while the control plane is down copies its config from a running peer.
 - **Secrets:** QueryFlux does not expand environment variables in its config file, so put the worker config, which holds the shared secret, in a Secret (`config.existingSecret`).
-- **Site agent:** `role: siteAgent` with `workload.kind: StatefulSet` and `workload.volumeClaimTemplates`, so each replica keeps its history spool and snapshot cache on its own volume (`examples/site-agent-values.yaml`). Workers at the site point `worker.upstream.url` at the agent's Service. Guide: [Site agent](https://github.com/lakeops-org/queryflux/blob/main/website/docs/operations/site-agent.md).
+- **Hub:** `role: hub` with `workload.kind: StatefulSet` and `workload.volumeClaimTemplates`, so each replica keeps its history spool and snapshot cache on its own volume (`examples/hub-values.yaml`). Workers at the site point `worker.upstream.url` at the hub's Service. Guide: [Hub](https://github.com/lakeops-org/queryflux/blob/main/website/docs/operations/hub.md).
 
 ## Validation
 

@@ -2,6 +2,7 @@
 # capacity leases from it and sends it query history. It never connects to Postgres.
 queryflux:
   role: worker
+  workerSecret: change-me-worker-secret
   worker:
     name: worker-b
     labels:
@@ -10,9 +11,6 @@ queryflux:
       url: http://control-plane:9000
       # Plain HTTP is for this local demo only: snapshots carry cluster credentials.
       allowInsecureHttp: true
-      auth:
-        mode: sharedSecret
-        sharedSecret: change-me-worker-secret
     coordination:
       mode: controlPlane        # share maxRunningQueries with the fleet
       onUnavailable: failClosed # new queries wait while the control plane is down

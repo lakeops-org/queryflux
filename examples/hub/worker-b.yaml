@@ -1,17 +1,15 @@
 # Worker b: holds no config and has no route to the control plane. It talks only to the
-# site agent, exactly as it would to a control plane.
+# hub, exactly as it would to a control plane.
 queryflux:
   role: worker
+  workerSecret: change-me-worker-secret
   worker:
     name: worker-b
     upstream:
-      url: http://site-agent:9000
+      url: http://hub:9000
       allowInsecureHttp: true
-      auth:
-        mode: sharedSecret
-        sharedSecret: change-me-worker-secret
     coordination:
-      mode: controlPlane         # share maxRunningQueries with every site, through the agent
+      mode: controlPlane         # share maxRunningQueries with every site, through the hub
       onUnavailable: localLimits # keep admitting on this worker's own limit if upstream is down
   externalAddress: http://localhost:8091
   frontends:

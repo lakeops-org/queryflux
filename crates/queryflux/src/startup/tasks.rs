@@ -810,6 +810,7 @@ pub(crate) fn spawn_worker_heartbeat(
         return;
     };
     let cp = worker.upstream;
+    let secret = config.queryflux.worker_secret.clone().unwrap_or_default();
     let base = cp.url.trim_end_matches('/').to_string();
     let name = worker_name(config);
     let config_labels = worker.labels;
@@ -883,7 +884,7 @@ pub(crate) fn spawn_worker_heartbeat(
             let path = if registered { "heartbeat" } else { "register" };
             match client
                 .post(format!("{base}/worker/{path}"))
-                .bearer_auth(cp.auth.bearer())
+                .bearer_auth(&secret)
                 .json(&report)
                 .send()
                 .await

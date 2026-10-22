@@ -22,7 +22,7 @@ const MAX_REMOTE_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
 pub(crate) struct RemoteCoordinationStore {
     client: reqwest::Client,
     base: String,
-    bearer: String,
+    bearer: crate::bearer::Bearer,
     on_unavailable: OnCoordinationUnavailable,
     /// Cleared when the control plane answers 404 to a batch release (a version before
     /// `/worker/capacity/release-batch`); releases are then sent one by one.
@@ -30,7 +30,7 @@ pub(crate) struct RemoteCoordinationStore {
     /// Cleared when the control plane answers 404 to `/worker/capacity/wait` (a version
     /// before it); waits then fall back to sleeping.
     wait_endpoint: std::sync::atomic::AtomicBool,
-    /// Put before every holder (`instanceId`) sent upstream. A site agent sets
+    /// Put before every holder (`instanceId`) sent upstream. A hub sets
     /// `<site>/`, so `worker-0` at two sites holds separate leases and quotas.
     holder_prefix: String,
 }
@@ -38,6 +38,7 @@ pub(crate) struct RemoteCoordinationStore {
 impl RemoteCoordinationStore {
     pub(crate) fn new(
         control_plane: &UpstreamConfig,
+        bearer: crate::bearer::Bearer,
         on_unavailable: OnCoordinationUnavailable,
     ) -> Self {
         Self {
@@ -46,7 +47,7 @@ impl RemoteCoordinationStore {
                 .build()
                 .expect("reqwest client"),
             base: control_plane.url.trim_end_matches('/').to_string(),
-            bearer: control_plane.auth.bearer().to_string(),
+            bearer,
             on_unavailable,
             batch_release: std::sync::atomic::AtomicBool::new(true),
             wait_endpoint: std::sync::atomic::AtomicBool::new(true),
@@ -64,10 +65,11 @@ impl RemoteCoordinationStore {
     }
 
     async fn send(&self, req: reqwest::RequestBuilder) -> Result<reqwest::Response> {
-        let resp =
-            req.bearer_auth(&self.bearer).send().await.map_err(|e| {
-                QueryFluxError::Persistence(format!("control plane unreachable: {e}"))
-            })?;
+        let resp = req
+            .bearer_auth(self.bearer.get())
+            .send()
+            .await
+            .map_err(|e| QueryFluxError::Persistence(format!("control plane unreachable: {e}")))?;
         let status = resp.status();
         if status.is_success() {
             return Ok(resp);
@@ -203,7 +205,7 @@ impl CapacityStore for RemoteCoordinationStore {
                 "queryId": query_id,
                 "waitMs": timeout.as_millis() as u64,
             }))
-            .bearer_auth(&self.bearer)
+            .bearer_auth(self.bearer.get())
             .send()
             .await
             .map_err(|e| QueryFluxError::Persistence(format!("control plane unreachable: {e}")))?;
@@ -244,7 +246,7 @@ impl CapacityStore for RemoteCoordinationStore {
                 .client
                 .post(format!("{}/worker/capacity/release-batch", self.base))
                 .json(&body)
-                .bearer_auth(&self.bearer)
+                .bearer_auth(self.bearer.get())
                 .send()
                 .await
                 .map_err(|e| {
@@ -327,7 +329,7 @@ impl queryflux_persistence::quota::QuotaStore for RemoteCoordinationStore {
             .client
             .post(format!("{}/worker/capacity/quota", self.base))
             .json(&json!({ "instanceId": self.holder(instance_id), "clusters": reports }))
-            .bearer_auth(&self.bearer)
+            .bearer_auth(self.bearer.get())
             .send()
             .await
             .map_err(|e| QueryFluxError::Persistence(format!("control plane unreachable: {e}")))?;
@@ -384,7 +386,7 @@ impl BackendCapabilities for RemoteCoordinationStore {
 struct RemoteSweepGuard {
     client: reqwest::Client,
     url: String,
-    bearer: String,
+    bearer: crate::bearer::Bearer,
 }
 
 #[async_trait]
@@ -393,7 +395,7 @@ impl SweepGuard for RemoteSweepGuard {
         if let Err(e) = self
             .client
             .delete(&self.url)
-            .bearer_auth(&self.bearer)
+            .bearer_auth(self.bearer.get())
             .send()
             .await
         {
@@ -405,9 +407,14 @@ impl SweepGuard for RemoteSweepGuard {
 /// The store as the shared handle `main` passes around.
 pub(crate) fn remote_coordination(
     control_plane: &UpstreamConfig,
+    bearer: crate::bearer::Bearer,
     on_unavailable: OnCoordinationUnavailable,
 ) -> Arc<RemoteCoordinationStore> {
-    Arc::new(RemoteCoordinationStore::new(control_plane, on_unavailable))
+    Arc::new(RemoteCoordinationStore::new(
+        control_plane,
+        bearer,
+        on_unavailable,
+    ))
 }
 
 #[cfg(test)]
@@ -515,11 +522,8 @@ mod tests {
     }
 
     fn client(url: &str, on_unavailable: OnCoordinationUnavailable) -> RemoteCoordinationStore {
-        let cp: UpstreamConfig = serde_yaml::from_str(&format!(
-            "url: {url}\nauth:\n  mode: sharedSecret\n  sharedSecret: s3cret\n"
-        ))
-        .unwrap();
-        RemoteCoordinationStore::new(&cp, on_unavailable)
+        let cp: UpstreamConfig = serde_yaml::from_str(&format!("url: {url}\n")).unwrap();
+        RemoteCoordinationStore::new(&cp, crate::bearer::Bearer::secret("s3cret"), on_unavailable)
     }
 
     #[tokio::test]

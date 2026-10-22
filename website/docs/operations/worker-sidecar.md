@@ -40,12 +40,10 @@ Every pod shares one worker config. Store it in a Secret: it holds the shared se
 ```yaml title="worker-config.yaml"
 queryflux:
   role: worker
+  workerSecret: <the control plane's workerSecret>
   worker:
     upstream:
       url: https://queryflux-control.queryflux.svc:9000
-      auth:
-        mode: sharedSecret
-        sharedSecret: <the control plane's controlPlane.sharedSecret>
     # Report this pod's own labels (mounted below), e.g. app=checkout, team=payments.
     labelsFile: /etc/podinfo/labels
     coordination:

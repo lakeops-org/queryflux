@@ -587,10 +587,10 @@ pub struct WorkerRecord {
     /// Everything else the worker reports about its state.
     #[serde(default)]
     pub status: WorkerStatus,
-    /// `worker` or `siteAgent`.
+    /// `worker` or `hub`.
     #[serde(default = "default_worker_kind")]
     pub kind: String,
-    /// The site agent this worker reports through (`None`: it reports directly).
+    /// The hub this worker reports through (`None`: it reports directly).
     #[serde(default)]
     pub parent: Option<String>,
 }
@@ -599,7 +599,7 @@ fn default_worker_kind() -> String {
     "worker".to_string()
 }
 
-/// A site agent's report of the workers behind it (`POST /worker/fleet`). Upstream
+/// A hub's report of the workers behind it (`POST /worker/fleet`). Upstream
 /// records each one as `<site>/<name>` with `parent` set to the site.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -632,8 +632,8 @@ pub struct WorkerStatus {
     pub history: Option<WorkerHistoryStatus>,
     /// Enabled query frontends, e.g. `trinoHttp:8080`.
     pub frontends: Vec<String>,
-    /// Site agent only: the revision it serves its workers. Differs from `activeRevision`
-    /// (upstream's) when the agent re-sealed the snapshot without a history endpoint.
+    /// Hub only: the revision it serves its workers. Differs from `activeRevision`
+    /// (upstream's) when the hub re-sealed the snapshot without a history endpoint.
     pub served_revision: Option<String>,
 }
 

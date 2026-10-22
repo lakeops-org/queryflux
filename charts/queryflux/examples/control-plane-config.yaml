@@ -11,6 +11,8 @@ queryflux:
   role: controlPlane
   externalAddress: https://queryflux.example.com
   shutdownDrainTimeoutSecs: 30
+  # The same value goes into every worker's workerSecret.
+  workerSecret: <long-random-secret>
   frontends:
     trinoHttp:
       enabled: true
@@ -21,8 +23,6 @@ queryflux:
   adminApi:
     port: 9000
   controlPlane:
-    # The same value goes into every worker's worker.upstream.auth.sharedSecret.
-    sharedSecret: <long-random-secret>
     history:
       # full | maskLiterals | metadata. Workers apply it before records leave them.
       redaction: full

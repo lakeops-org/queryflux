@@ -30,10 +30,12 @@ pub(crate) fn worker_api(
     history: Arc<dyn queryflux_persistence::MetricsStore>,
     quotas: Option<Arc<dyn queryflux_persistence::quota::QuotaStore>>,
 ) -> Result<Option<WorkerApi>> {
-    let Some(api_cfg) = config.queryflux.control_plane.as_ref() else {
+    if config.queryflux.role != queryflux_core::config::Role::ControlPlane {
         return Ok(None);
-    };
-    let shared_secret = api_cfg.shared_secret.clone().unwrap_or_default();
+    }
+    let api_cfg = config.queryflux.control_plane.clone().unwrap_or_default();
+    // Empty when only hubs with their own tokens are accepted.
+    let shared_secret = config.queryflux.worker_secret.clone().unwrap_or_default();
     // Embedded over TLS: the trusted single-fleet model. Secret references for lower-trust
     // workers come later.
     let credentials = CredentialMode::Embedded;

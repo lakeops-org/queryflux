@@ -1,19 +1,19 @@
-# Site agent: one per customer site, between the site's workers and a remote control
+# Hub: one per customer site, between the site's workers and a remote control
 # plane. Run the following from the repository root.
 #
-#   1. Fill in ./charts/queryflux/examples/site-agent-config.yaml and create its Secret:
-#        kubectl -n queryflux create secret generic queryflux-site-agent-config \
-#          --from-file=config.yaml=./charts/queryflux/examples/site-agent-config.yaml
-#   2. helm install queryflux-site-agent ./charts/queryflux -n queryflux \
-#        -f ./charts/queryflux/examples/site-agent-values.yaml
+#   1. Fill in ./charts/queryflux/examples/hub-config.yaml and create its Secret:
+#        kubectl -n queryflux create secret generic queryflux-hub-config \
+#          --from-file=config.yaml=./charts/queryflux/examples/hub-config.yaml
+#   2. helm install queryflux-hub ./charts/queryflux -n queryflux \
+#        -f ./charts/queryflux/examples/hub-values.yaml
 #   3. Point the workers' worker.upstream.url at
-#        http://queryflux-site-agent.queryflux.svc:9000
+#        http://queryflux-hub.queryflux.svc:9000
 #
 # Each replica keeps its own history spool and snapshot cache on its own volume, so a
 # deleted pod loses neither. Replicas need no coordination with each other.
 
 # The config is in a Secret the chart cannot read; this tells the install notes.
-role: siteAgent
+role: hub
 
 replicaCount: 2
 
@@ -32,13 +32,13 @@ workload:
 
 extraVolumeMounts:
   - name: state
-    mountPath: /var/lib/queryflux/site-agent
+    mountPath: /var/lib/queryflux/hub
 
 config:
-  existingSecret: queryflux-site-agent-config
+  existingSecret: queryflux-hub-config
 
-# The agent serves no Studio and no queries: only the worker API and /readyz, /metrics,
-# /agent/status, on the admin port.
+# The hub serves no Studio and no queries: only the worker API and /readyz, /metrics,
+# /hub/status, on the admin port.
 studio:
   enabled: false
 
@@ -52,7 +52,7 @@ service:
     studio:
       enabled: false
 
-# /readyz turns 200 once the agent has a config to serve (from upstream or its cache).
+# /readyz turns 200 once the hub has a config to serve (from upstream or its cache).
 startupProbe:
   httpGet:
     path: /readyz

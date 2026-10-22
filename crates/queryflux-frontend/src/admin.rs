@@ -1430,16 +1430,16 @@ pub struct WorkerView {
     pub seconds_since_seen: i64,
 }
 
-/// The site a site agent's record is for.
-fn agent_site(w: &queryflux_persistence::WorkerRecord) -> Option<&str> {
+/// The site a hub's record is for.
+fn hub_site(w: &queryflux_persistence::WorkerRecord) -> Option<&str> {
     w.labels.get("site").map(String::as_str)
 }
 
 /// Whether each worker runs the control plane's current revision; `None` when either is
 /// unknown. A site limited to some clusters gets its own revision (`per_site`), which its
-/// agent and workers are compared with instead. A worker behind a site agent runs what the
-/// agent serves, a re-sealed copy of that revision when the agent removed a history
-/// endpoint: it is in sync when an in-sync agent of its site serves what it runs.
+/// hub and workers are compared with instead. A worker behind a hub runs what the
+/// hub serves, a re-sealed copy of that revision when the hub removed a history
+/// endpoint: it is in sync when an in-sync hub of its site serves what it runs.
 fn in_sync_flags(
     workers: &[queryflux_persistence::WorkerRecord],
     control_plane: Option<&str>,
@@ -1453,17 +1453,17 @@ fn in_sync_flags(
     let served_at_site: std::collections::HashSet<(&str, &str)> = workers
         .iter()
         .filter(|a| {
-            a.kind == "siteAgent"
+            a.kind == "hub"
                 && a.active_revision.is_some()
-                && a.active_revision.as_deref() == expected(agent_site(a))
+                && a.active_revision.as_deref() == expected(hub_site(a))
         })
-        .filter_map(|a| Some((agent_site(a)?, a.status.served_revision.as_deref()?)))
+        .filter_map(|a| Some((hub_site(a)?, a.status.served_revision.as_deref()?)))
         .collect();
     workers
         .iter()
         .map(|w| {
             let site = match w.kind.as_str() {
-                "siteAgent" => agent_site(w),
+                "hub" => hub_site(w),
                 _ => w.parent.as_deref(),
             };
             let (cp, active) = (expected(site)?, w.active_revision.as_deref()?);
@@ -4015,14 +4015,14 @@ mod tests {
     }
 
     #[test]
-    fn workers_behind_a_site_agent_are_in_sync_with_what_it_serves() {
+    fn workers_behind_a_hub_are_in_sync_with_what_it_serves() {
         let record = |v: serde_json::Value| -> queryflux_persistence::WorkerRecord {
             serde_json::from_value(v).unwrap()
         };
         let workers = vec![
-            // Upstream named a history endpoint: the agent serves a re-sealed "cp-local".
+            // Upstream named a history endpoint: the hub serves a re-sealed "cp-local".
             record(serde_json::json!({
-                "name": "dc1/agent", "kind": "siteAgent", "labels": { "site": "dc1" },
+                "name": "dc1/hub", "kind": "hub", "labels": { "site": "dc1" },
                 "activeRevision": "cp", "status": { "servedRevision": "cp-local" }
             })),
             record(serde_json::json!({
@@ -4031,7 +4031,7 @@ mod tests {
             record(serde_json::json!({
                 "name": "dc1/old", "parent": "dc1", "activeRevision": "older"
             })),
-            // Another site's agent doesn't vouch for this worker.
+            // Another site's hub doesn't vouch for this worker.
             record(serde_json::json!({
                 "name": "dc2/w", "parent": "dc2", "activeRevision": "cp-local"
             })),
@@ -4052,7 +4052,7 @@ mod tests {
         );
         assert_eq!(super::in_sync_flags(&workers, None, &none), vec![None; 6]);
 
-        // dc1 is limited to some clusters: its agent runs dc1's own revision.
+        // dc1 is limited to some clusters: its hub runs dc1's own revision.
         let mut workers = workers;
         workers[0].active_revision = Some("cp-dc1".into());
         let per_site = std::collections::HashMap::from([("dc1".to_string(), "cp-dc1".to_string())]);
