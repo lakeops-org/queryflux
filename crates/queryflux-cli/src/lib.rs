@@ -312,6 +312,7 @@ fn config_requires_translation(config: &ProxyConfig) -> bool {
                                 EngineConfig::ClickHouse => EngineType::ClickHouse,
                                 EngineConfig::Athena => EngineType::Athena,
                                 EngineConfig::Adbc => EngineType::Adbc,
+                                EngineConfig::Snowflake => EngineType::Snowflake,
                             };
                             if engine_type.dialect() != proto_dialect {
                                 return true;

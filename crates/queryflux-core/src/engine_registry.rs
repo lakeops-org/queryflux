@@ -288,6 +288,7 @@ pub fn engine_key(engine: &EngineConfig) -> &'static str {
         EngineConfig::ClickHouse => "clickHouse",
         EngineConfig::Athena => "athena",
         EngineConfig::Adbc => "adbc",
+        EngineConfig::Snowflake => "snowflake",
     }
 }
 
@@ -301,6 +302,7 @@ pub fn parse_engine_key(s: &str) -> Result<EngineConfig, String> {
         "clickHouse" => Ok(EngineConfig::ClickHouse),
         "athena" => Ok(EngineConfig::Athena),
         "adbc" => Ok(EngineConfig::Adbc),
+        "snowflake" => Ok(EngineConfig::Snowflake),
         other => Err(format!("Unknown engine key: '{other}'")),
     }
 }
@@ -315,6 +317,7 @@ impl From<&EngineConfig> for EngineType {
             EngineConfig::ClickHouse => EngineType::ClickHouse,
             EngineConfig::Athena => EngineType::Athena,
             EngineConfig::Adbc => EngineType::Adbc,
+            EngineConfig::Snowflake => EngineType::Snowflake,
         }
     }
 }

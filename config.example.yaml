@@ -57,6 +57,24 @@ clusterGroups:
   #     - name: trino-1
   #       endpoint: http://localhost:8081
 
+  # Snowflake via the native Rust connector — no ADBC driver to install.
+  # snowflake-default:
+  #   engine: snowflake
+  #   maxRunningQueries: 20
+  #   clusters:
+  #     - name: snowflake-1
+  #       account: myorg-myaccount
+  #       warehouse: COMPUTE_WH   # also used for health checks / running counts
+  #       role: ANALYST
+  #       database: ANALYTICS
+  #       schema: PUBLIC
+  #       # maxWaitSecs: 600       # query response timeout; the query is cancelled on expiry
+  #       auth:
+  #         type: keyPair          # or: basic (username + password)
+  #         username: SVC_QUERYFLUX
+  #         privateKeyPem: "-----BEGIN PRIVATE KEY-----\n..."
+  #         # privateKeyPassphrase: "..."
+
   duckdb-local:
     engine: duckDb
     maxRunningQueries: 4
