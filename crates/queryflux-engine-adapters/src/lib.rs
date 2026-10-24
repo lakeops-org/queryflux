@@ -3,6 +3,7 @@ pub mod athena;
 pub mod clickhouse;
 pub mod duckdb;
 pub mod mysql_native;
+pub mod snowflake;
 pub mod starrocks;
 pub mod trino;
 pub mod wire_auth;

@@ -260,6 +260,37 @@ clusterGroups:
 
 `config.example.yaml`, `config.local.yaml`, and the serde types in `queryflux-core` (`config.rs`) are the authoritative reference. For routing semantics and `clusterGroups`, see **[Routing and clusters](/docs/architecture/routing-and-clusters)**.
 
+## Snowflake (native connector)
+
+`engine: snowflake` talks to Snowflake through the Rust [`snowflake-connector-rs`](https://github.com/estie-inc/snowflake-connector-rs) client, so no ADBC driver has to be installed. The ADBC path (`engine: adbc`, `driver: snowflake`) still works and is the one to use for `tokenExchange` or `passthrough` query auth.
+
+```yaml
+clusters:
+  snowflake-1:
+    engine: snowflake
+    account: myorg-myaccount
+    warehouse: COMPUTE_WH
+    role: ANALYST
+    database: ANALYTICS
+    schema: PUBLIC
+    auth:
+      type: keyPair
+      username: SVC_QUERYFLUX
+      privateKeyPem: "-----BEGIN PRIVATE KEY-----\n..."
+```
+
+| Key | Required | Notes |
+|---|---|---|
+| `account` | yes | Account identifier (`orgname-accountname`). |
+| `auth` | yes | `keyPair` (`username`, `privateKeyPem`, optional `privateKeyPassphrase`) or `basic` (`username`, `password`). Snowflake enforces MFA on password logins, so use `keyPair` for service accounts. |
+| `warehouse`, `role`, `database`, `schema` | no | Session defaults. With `warehouse` set, health checks and running-query counts use `SHOW WAREHOUSES`, which never resumes a suspended warehouse. Without it, the health check runs `SELECT 1`. |
+| `endpoint` | no | Base URL override, for example a PrivateLink host. Defaults to `https://<account>.snowflakecomputing.com`. |
+| `maxWaitSecs` | no | How long to wait for a query response before cancelling the query. Defaults to 600. |
+
+All queries share one service-account session, so only `queryAuth: serviceAccount` is supported. Variants work with a `warehouse` override, the same way as in the example below.
+
+With Postgres persistence, the YAML seed doesn't store `privateKeyPem`. Create `keyPair` clusters through the Admin API (`authType: keyPair`, `authUsername`, `authPassword` set to the PEM, `authToken` set to the passphrase) or use `basic` auth.
+
 ## Cluster variants (multi-warehouse)
 
 ADBC clusters (`engine: adbc`) need their driver installed. The QueryFlux image ships none: declare them with `QUERYFLUX_ADBC_DRIVERS` (see **[ADBC drivers](./operations/adbc-drivers)**).

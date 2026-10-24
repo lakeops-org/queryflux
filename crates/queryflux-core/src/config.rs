@@ -1691,6 +1691,8 @@ pub enum EngineConfig {
     Athena,
     /// Generic ADBC adapter — runtime-loaded shared library driver.
     Adbc,
+    /// Snowflake via the native Rust `snowflake-connector-rs` client (no ADBC driver needed).
+    Snowflake,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -1726,6 +1728,18 @@ pub struct ClusterConfig {
     /// On timeout the proxy calls `StopQueryExecution`.
     #[serde(default)]
     pub max_wait_secs: Option<u64>,
+    /// Snowflake account identifier (e.g. `myorg-myaccount`). Required for `snowflake`.
+    #[serde(default)]
+    pub account: Option<String>,
+    /// Snowflake session defaults (`snowflake` engine): warehouse, role, database, schema.
+    #[serde(default)]
+    pub warehouse: Option<String>,
+    #[serde(default)]
+    pub role: Option<String>,
+    #[serde(default)]
+    pub database: Option<String>,
+    #[serde(default)]
+    pub schema: Option<String>,
     /// Max bytes of buffered query data (`maxResultBufferBytes` in JSON/YAML).
     /// For ClickHouse Arrow results, this guards bytes consumed between decoded
     /// batches while the complete result streams. ClickHouse control-plane TSV
@@ -3849,6 +3863,11 @@ queryflux:
             workgroup: None,
             catalog: None,
             max_wait_secs: None,
+            account: None,
+            warehouse: None,
+            role: None,
+            database: None,
+            schema: None,
             max_result_buffer_bytes: None,
             driver: None,
             tls: None,

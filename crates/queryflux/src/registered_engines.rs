@@ -17,6 +17,7 @@ use queryflux_engine_adapters::duckdb::http::{
     DuckDbHttpAdapter, DuckDbHttpConfig, DuckDbHttpFactory,
 };
 use queryflux_engine_adapters::duckdb::{DuckDbAdapter, DuckDbConfig, DuckDbFactory};
+use queryflux_engine_adapters::snowflake::{SnowflakeAdapter, SnowflakeConfig, SnowflakeFactory};
 use queryflux_engine_adapters::starrocks::{StarRocksAdapter, StarRocksConfig, StarRocksFactory};
 use queryflux_engine_adapters::trino::{TrinoAdapter, TrinoConfig, TrinoFactory};
 use queryflux_engine_adapters::{AdapterKind, EngineAdapterFactory, EngineConfigParseable};
@@ -34,6 +35,7 @@ pub fn all_factories() -> Vec<Box<dyn EngineAdapterFactory>> {
         Box::new(ClickHouseFactory),
         Box::new(AthenaFactory),
         Box::new(AdbcFactory),
+        Box::new(SnowflakeFactory),
     ]
 }
 
@@ -128,6 +130,14 @@ pub async fn build_adapter(
                 .map_err(map_qf_err)?;
             AdapterKind::Sync(Arc::new(
                 ClickHouseAdapter::new(cluster_name, placeholder_group, config)
+                    .map_err(map_qf_err)?,
+            ))
+        }
+        EngineConfig::Snowflake => {
+            let config = SnowflakeConfig::from_cluster_config(cluster_cfg, cluster_name_str)
+                .map_err(map_qf_err)?;
+            AdapterKind::Sync(Arc::new(
+                SnowflakeAdapter::new(cluster_name, placeholder_group, config)
                     .map_err(map_qf_err)?,
             ))
         }
