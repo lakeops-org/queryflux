@@ -21,7 +21,7 @@ Client SQL
   → adapter.submit_query / execute_as_arrow
 ```
 
-The implementation lives mainly in the `queryflux-translation` crate (`TranslationService`, `SqlglotTranslator`) and is invoked from shared dispatch code in `queryflux-frontend` (`dispatch_query`, `execute_to_sink`).
+The implementation lives mainly in the `queryflux-sql` crate (`TranslationService`, `SqlglotTranslator`) and is invoked from shared dispatch code in `queryflux-frontend` (`dispatch_query`, `execute_to_sink`).
 
 ## Source and target dialects
 
@@ -42,7 +42,7 @@ If source and target are considered **compatible** and no fixup scripts are conf
 1. **Dialect-only** — When `SchemaContext` is empty: parse one executable statement in the source dialect and emit it in the target dialect, using sqlglot's SQL generator.
 2. **Schema-aware** — When tables/columns are populated: build a `MappingSchema`, run `sqlglot.optimizer.optimize` on a copy of the parsed statement, then emit SQL with the target dialect. If optimization fails, it **falls back** to dialect-only behavior (with a warning).
 
-The Rust type `SchemaContext` (`queryflux_translation::SchemaContext`) carries optional catalog/database and a map of **table → column → SQL type string** for sqlglot's schema-aware path.
+The Rust type `SchemaContext` (`queryflux_sql::SchemaContext`) carries optional catalog/database and a map of **table → column → SQL type string** for sqlglot's schema-aware path.
 
 ### Current default on the hot path
 

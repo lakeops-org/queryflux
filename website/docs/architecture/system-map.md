@@ -24,7 +24,7 @@ QueryFlux is a universal SQL query proxy and router. It accepts queries from cli
 | **② Frontend** | `queryflux-frontend` | Parses the wire protocol, builds `SessionContext`, hands SQL to dispatch. |
 | **③ Router** | `queryflux-routing` | Evaluates the router chain; picks a **cluster group** (or falls back to `routingFallback`). |
 | **④ Cluster manager** | `queryflux-cluster-manager` | Picks a healthy member cluster, enforces capacity (local counters or shared leases in distributed mode), may queue if the group is full. |
-| **⑤ Translation** | `queryflux-translation` | Rewrites SQL when client dialect ≠ engine dialect; skipped when they already match. |
+| **⑤ Translation** | `queryflux-sql` | Rewrites SQL when client dialect ≠ engine dialect; skipped when they already match. |
 | **⑥ Engine** | `queryflux-engine-adapters` | Runs the query on Trino, DuckDB, StarRocks, Athena, or an ADBC SaaS warehouse. |
 
 **After dispatch**, async engines (Trino, Athena) store an in-flight handle in the **persistence layer** so the client can poll until completion. Sync engines return results in one round trip.
@@ -86,9 +86,8 @@ queryflux/
 │   ├── queryflux-cluster-manager/  # ClusterGroupManager: load balancing + queueing
 │   ├── queryflux-persistence/      # Persistence + MetricsStore + ClusterConfigStore traits + impls
 │   ├── queryflux-metrics/          # PrometheusMetrics, BufferedMetricsStore, MultiMetricsStore
-│   ├── queryflux-translation/      # TranslatorTrait + SqlglotTranslator (PyO3)
+│   ├── queryflux-sql/              # Parsing, fingerprints, access-control extraction, translation (PyO3)
 │   ├── queryflux-auth/             # Authentication providers, authorization, identity resolution
-│   ├── queryflux-fingerprint/      # Query fingerprinting (AST-based deduplication)
 │   ├── queryflux-bench/            # Proxy overhead benchmarks (mock backends)
 │   └── queryflux-e2e-tests/        # Integration tests
 ├── prometheus/                     # Prometheus scrape config
@@ -261,7 +260,7 @@ Translation is handled by [sqlglot](https://github.com/tobymao/sqlglot) (Python,
 
 **When translation runs:** when the incoming client dialect differs from the target engine's dialect or fixup scripts are configured. Compatible dialects without fixups pass through unchanged. MCP queries without a declared source dialect also bypass translation.
 
-**Two translation modes** (both implemented in `queryflux-translation`; see [query-translation.md](query-translation.md)):
+**Two translation modes** (both implemented in `queryflux-sql`; see [query-translation.md](query-translation.md)):
 
 1. **Dialect-only** (empty `SchemaContext`): parse one executable statement in the source dialect and emit it in the target dialect. Dispatch resolves schema through the catalog provider first; unavailable schema selects this fallback.
 2. **Schema-aware** (non-empty `SchemaContext`): parse → `sqlglot.optimizer.optimize` with `MappingSchema` → emit in target dialect, with fallback to dialect-only if optimization fails.

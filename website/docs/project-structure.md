@@ -51,10 +51,9 @@ queryflux/
 | `queryflux-cluster-manager` | Cluster groups, load balancing, queueing |
 | `queryflux-routing` | Router chain, `routingFallback`, script routing |
 | `queryflux-persistence` | In-memory & PostgreSQL stores, Refinery migrations (`queryflux migrate`) |
-| `queryflux-translation` | sqlglot via PyO3 |
+| `queryflux-sql` | Everything about a SQL text: parsing and classification, fingerprints, access-control extraction, translation (sqlglot via PyO3) |
 | `queryflux-metrics` | Prometheus instrumentation |
 | `queryflux-auth` | Auth providers & authorization plumbing |
-| `queryflux-fingerprint` | Query fingerprinting (AST-based deduplication) |
 | `queryflux-bench` | Proxy overhead benchmarks (mock backends) |
 | `queryflux-e2e-tests` | Integration tests behind Docker |
 
