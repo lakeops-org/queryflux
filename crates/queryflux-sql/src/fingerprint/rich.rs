@@ -4,7 +4,7 @@
 //! Uses polyglot-sql to parse and re-serialize SQL for consistent normalization across
 //! dialects, then applies regex-based literal replacement.
 //!
-//! Falls back to `crate::fallback` if polyglot-sql cannot parse the input.
+//! Falls back to `super::fallback` if polyglot-sql cannot parse the input.
 
 use std::sync::{Arc, LazyLock};
 
@@ -13,7 +13,7 @@ use queryflux_core::config::DEFAULT_SQL_CACHE_ENTRIES;
 use tracing::warn;
 use xxhash_rust::xxh64::xxh64;
 
-use crate::fallback;
+use super::fallback;
 
 /// The result of rich fingerprinting — everything needed for storage and analytics.
 #[derive(Debug, Clone)]

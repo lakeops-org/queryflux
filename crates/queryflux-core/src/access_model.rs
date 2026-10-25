@@ -2,7 +2,7 @@
 //! table/column allow-deny).
 //!
 //! Pure data — no I/O, no policy-engine wire types. `queryflux-access-control` maps this
-//! to/from a provider's wire format (OPA today); `queryflux-translation` and the dispatch
+//! to/from a provider's wire format (OPA today); `queryflux-sql` and the dispatch
 //! stage consume it. Kept in `queryflux-core` so no crate needs the policy layer just to
 //! speak the vocabulary.
 

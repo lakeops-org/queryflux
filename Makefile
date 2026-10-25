@@ -86,7 +86,7 @@ helm-check:
 ## Run unit tests (`src/`) and integration tests (`tests/`) — no external services needed.
 ## Same command as CI `.github/workflows/ci.yml` (`make test`); uses nextest when installed.
 ## PYO3_PYTHON + PYTHONPATH: PyO3 (routing + translation). The venv must include `sqlglot`
-## (`pip install -r requirements.txt` via `make setup`) for `queryflux-translation` transform tests.
+## (`pip install -r requirements.txt` via `make setup`) for `queryflux-sql` transform tests.
 test:
 	@test -f .venv/bin/python3 || (echo "Run 'make setup' first" && exit 1)
 	PYO3_PYTHON=$(shell pwd)/.venv/bin/python3 \

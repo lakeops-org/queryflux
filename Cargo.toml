@@ -9,14 +9,13 @@ members = [
     "crates/queryflux-cache",
     "crates/queryflux-persistence",
     "crates/queryflux-routing",
-    "crates/queryflux-translation",
+    "crates/queryflux-sql",
     "crates/queryflux-engine-adapters",
     "crates/queryflux-frontend",
     "crates/queryflux-cluster-manager",
     "crates/queryflux-catalog",
     "crates/queryflux-config",
     "crates/queryflux-metrics",
-    "crates/queryflux-fingerprint",
     "crates/queryflux-guardrails",
     "crates/queryflux-access-control",
     "crates/queryflux-cli",
@@ -69,7 +68,7 @@ async-trait = "0.1.89"
 chrono = { version = "0.4.44", features = ["serde"] }
 
 # SQL
-polyglot-sql = "0.9.2"
+polyglot-sql = "=0.13.4"
 
 # Concurrency
 dashmap = "6.1.0"
@@ -80,13 +79,12 @@ queryflux-catalog = { path = "crates/queryflux-catalog" }
 queryflux-auth = { path = "crates/queryflux-auth" }
 queryflux-persistence = { path = "crates/queryflux-persistence" }
 queryflux-routing = { path = "crates/queryflux-routing" }
-queryflux-translation = { path = "crates/queryflux-translation" }
+queryflux-sql = { path = "crates/queryflux-sql" }
 queryflux-engine-adapters = { path = "crates/queryflux-engine-adapters" }
 queryflux-frontend = { path = "crates/queryflux-frontend" }
 queryflux-cluster-manager = { path = "crates/queryflux-cluster-manager" }
 queryflux-config = { path = "crates/queryflux-config" }
 queryflux-metrics = { path = "crates/queryflux-metrics" }
-queryflux-fingerprint = { path = "crates/queryflux-fingerprint" }
 queryflux-guardrails = { path = "crates/queryflux-guardrails" }
 queryflux-access-control = { path = "crates/queryflux-access-control" }
 queryflux-cache = { path = "crates/queryflux-cache" }

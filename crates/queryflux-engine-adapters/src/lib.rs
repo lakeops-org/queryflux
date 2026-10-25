@@ -238,7 +238,7 @@ pub trait SyncAdapter: Send + Sync {
         credentials: &queryflux_auth::QueryCredentials,
         tags: &queryflux_core::tags::QueryTags,
         params: &queryflux_core::params::QueryParams,
-        hints: queryflux_core::sql_classify::ExecutionHints,
+        hints: queryflux_sql::classify::ExecutionHints,
         id_slot: &BackendQueryIdSlot,
     ) -> Result<SyncExecution>;
     fn engine_type(&self) -> queryflux_core::query::EngineType;
@@ -354,7 +354,7 @@ pub trait AsyncAdapter: Send + Sync {
         _credentials: &queryflux_auth::QueryCredentials,
         _tags: &queryflux_core::tags::QueryTags,
         _params: &queryflux_core::params::QueryParams,
-        _hints: queryflux_core::sql_classify::ExecutionHints,
+        _hints: queryflux_sql::classify::ExecutionHints,
         _id_slot: &BackendQueryIdSlot,
     ) -> Result<SyncExecution> {
         Err(queryflux_core::error::QueryFluxError::SyncEngineRequired(

@@ -815,7 +815,7 @@ impl crate::SyncAdapter for ClickHouseAdapter {
         // Dispatch interpolates params into the SQL before calling — this
         // adapter reports `supports_native_params() == false` (the default).
         _params: &queryflux_core::params::QueryParams,
-        _hints: queryflux_core::sql_classify::ExecutionHints,
+        _hints: queryflux_sql::classify::ExecutionHints,
         id_slot: &BackendQueryIdSlot,
     ) -> Result<SyncExecution> {
         let query_id = uuid::Uuid::new_v4().to_string();
@@ -1570,7 +1570,7 @@ mod tests {
                 &credentials,
                 &tags,
                 &params,
-                queryflux_core::sql_classify::ExecutionHints::default(),
+                queryflux_sql::classify::ExecutionHints::default(),
                 &slot,
             ),
         )

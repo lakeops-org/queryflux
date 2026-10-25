@@ -1,10 +1,11 @@
 //! Fingerprints must not change: `query_hash` keys stored history, so a parser upgrade that
-//! changes one silently splits a query's history in two. Recorded with polyglot-sql 0.9.2.
+//! changes one silently splits a query's history in two. Recorded with polyglot-sql 0.9.2;
+//! unchanged on 0.13.4.
 //!
 //! `UPDATE_GOLDEN=1 cargo test --test golden` rewrites the expected values; only do that
 //! when a change in fingerprints is intended and its migration is planned.
 
-use queryflux_fingerprint::rich_fingerprint;
+use queryflux_sql::fingerprint::rich_fingerprint;
 use serde_json::{json, Value};
 
 const CORPUS: &str = include_str!("fixtures/golden_corpus.json");
@@ -36,6 +37,10 @@ fn fingerprints_are_stable() {
         serde_json::from_str(&std::fs::read_to_string(GOLDEN).expect("golden file")).unwrap();
     assert_eq!(want.len(), got.len());
     for (i, (w, g)) in want.iter().zip(&got).enumerate() {
-        assert_eq!(w, g, "fingerprint changed for statement {i}: {}", corpus[i]["sql"]);
+        assert_eq!(
+            w, g,
+            "fingerprint changed for statement {i}: {}",
+            corpus[i]["sql"]
+        );
     }
 }

@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 queryflux-core = { workspace = true }
+queryflux-sql = { workspace = true }
 queryflux-auth = { workspace = true }
 queryflux-metrics = { workspace = true }
 async-trait = { workspace = true }

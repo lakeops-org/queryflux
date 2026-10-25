@@ -21,7 +21,7 @@ use queryflux_guardrails::built_in::Guard;
 use queryflux_guardrails::context::{GuardContext, GuardLayer, GuardResult};
 use queryflux_guardrails::result_to_action;
 use queryflux_persistence::GuardAction;
-use queryflux_translation::{
+use queryflux_sql::{
     apply_write_filters, render_mask, rewrite_table_scans, ExtractedResource, TablePolicy,
 };
 
@@ -55,8 +55,7 @@ pub async fn run_access_control_stage(
     schema: Option<&SchemaContext>,
     tags: &QueryTags,
 ) -> AccessStageOutcome {
-    let parse =
-        queryflux_core::sql_classify::SqlParseCache::new(sql.to_string(), src_dialect.clone());
+    let parse = queryflux_sql::classify::SqlParseCache::new(sql.to_string(), src_dialect.clone());
     let ctx = GuardContext {
         sql,
         original_sql: None,
@@ -205,7 +204,7 @@ impl Guard for OpaAccessGuard {
             ExplainSplit::NotExplain => {}
             ExplainSplit::Inner(offset) => {
                 let inner = &ctx.sql[offset..];
-                let cache = queryflux_core::sql_classify::SqlParseCache::new(
+                let cache = queryflux_sql::classify::SqlParseCache::new(
                     inner.to_string(),
                     ctx.dialect.clone(),
                 );
@@ -271,20 +270,20 @@ impl Guard for OpaAccessGuard {
 
         // Only the parse is cached (keyed on the exact SQL, dialect and schema); every
         // decision below is still made for this query.
-        let statement =
-            match queryflux_translation::extract_resources_cached(ctx.sql, ctx.dialect, schema) {
-                Ok(r) => r,
-                // A query that can't be analyzed has no resources to put in a request, so it can't
-                // be judged at all. `onMissingSchema` is about unresolved *columns* of tables that
-                // were found — not about failing to find them — so this denies in both modes;
-                // allowing it would let anything the parser can't read skip access control.
-                Err(e) => {
-                    return GuardResult::deny(
-                        format!("access control: could not analyze query: {e}"),
-                        "ACCESS_ANALYSIS_FAILED",
-                    )
-                }
-            };
+        let statement = match queryflux_sql::extract_resources_cached(ctx.sql, ctx.dialect, schema)
+        {
+            Ok(r) => r,
+            // A query that can't be analyzed has no resources to put in a request, so it can't
+            // be judged at all. `onMissingSchema` is about unresolved *columns* of tables that
+            // were found — not about failing to find them — so this denies in both modes;
+            // allowing it would let anything the parser can't read skip access control.
+            Err(e) => {
+                return GuardResult::deny(
+                    format!("access control: could not analyze query: {e}"),
+                    "ACCESS_ANALYSIS_FAILED",
+                )
+            }
+        };
 
         if statement.nested_writes {
             return GuardResult::deny(
@@ -609,9 +608,7 @@ fn classify_operation(stmts: Option<&[Expression]>, sql: &str) -> Operation {
             Operation("table.truncate".to_string())
         }
         Some(_) => Operation("statement.other".to_string()),
-        None if queryflux_core::sql_classify::is_read_like_fallback(sql) => {
-            Operation::table_select()
-        }
+        None if queryflux_sql::classify::is_read_like_fallback(sql) => Operation::table_select(),
         None => Operation("statement.other".to_string()),
     }
 }
@@ -670,7 +667,7 @@ fn explain_split(sql: &str) -> ExplainSplit {
     // `-`, isn't alphanumeric), which `NotExplain`s the whole statement. The wrapped statement
     // then never gets classified as anything the guard checks, and — since `ANALYZE` runs
     // it — executes unauthorized.
-    let first = queryflux_core::sql_classify::strip_leading_sql_comments(sql);
+    let first = queryflux_sql::classify::strip_leading_sql_comments(sql);
     let start = sql.len() - first.len();
     let head = word_at(first);
     if !head.eq_ignore_ascii_case("explain") {
@@ -678,7 +675,7 @@ fn explain_split(sql: &str) -> ExplainSplit {
     }
     let mut pos = start + head.len();
     loop {
-        let rest = queryflux_core::sql_classify::strip_leading_sql_comments(&sql[pos..]);
+        let rest = queryflux_sql::classify::strip_leading_sql_comments(&sql[pos..]);
         pos = sql.len() - rest.len();
         let rest = &sql[pos..];
         if let Some(open) = rest.strip_prefix('(') {
@@ -731,8 +728,8 @@ mod tests {
         OpaProviderConfig, ProviderKind,
     };
     use queryflux_core::query::SqlDialect;
-    use queryflux_core::sql_classify::SqlParseCache;
     use queryflux_core::tags::QueryTags;
+    use queryflux_sql::classify::SqlParseCache;
     use tokio::net::TcpListener;
 
     async fn classify(sql: &str) -> Operation {

@@ -54,7 +54,7 @@ use queryflux_routing::{
     implementations::{header::HeaderRouter, protocol_based::ProtocolBasedRouter},
     RouterTrait,
 };
-use queryflux_translation::TranslationService;
+use queryflux_sql::TranslationService;
 use tokio::net::{TcpListener, TcpStream};
 
 struct CapturingMetrics {

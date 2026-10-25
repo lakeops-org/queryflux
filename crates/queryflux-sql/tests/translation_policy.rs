@@ -2,7 +2,7 @@ use queryflux_core::{
     config::TranslationMode,
     query::{SqlDialect, TranslationReason, TranslationStatus},
 };
-use queryflux_translation::{ColumnMap, SchemaContext, TranslationService};
+use queryflux_sql::{ColumnMap, SchemaContext, TranslationService};
 
 #[tokio::test]
 async fn best_effort_preserves_original_sql_on_transpile_error() {

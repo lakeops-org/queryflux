@@ -13,7 +13,7 @@ use queryflux_core::catalog::{CatalogProvider, ColumnDef, TableSchema};
 use queryflux_core::config::{SqlCacheConfig, TranslationMode};
 use queryflux_core::error::Result;
 use queryflux_core::query::{SqlDialect, TranslationStatus};
-use queryflux_translation::{ColumnMap, SchemaContext, TranslationReport, TranslationService};
+use queryflux_sql::{ColumnMap, SchemaContext, TranslationReport, TranslationService};
 
 const SQL: &str = "SELECT id, approx_distinct(name) FROM orders GROUP BY id";
 

@@ -3269,8 +3269,7 @@ async fn access_control_dry_run_handler(
     };
     let query_tags = queryflux_core::tags::QueryTags::new();
     let session_extra = std::collections::HashMap::new();
-    let sql_parse =
-        queryflux_core::sql_classify::SqlParseCache::new(body.sql.clone(), dialect.clone());
+    let sql_parse = queryflux_sql::classify::SqlParseCache::new(body.sql.clone(), dialect.clone());
 
     let catalog = state.live.read().await.catalog.clone();
     let schema_ctx = if let Some(tables) = body.schema.filter(|t| !t.is_empty()) {

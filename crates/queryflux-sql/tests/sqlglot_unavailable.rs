@@ -4,7 +4,7 @@ use queryflux_core::{
     config::TranslationMode,
     query::{SqlDialect, TranslationReason},
 };
-use queryflux_translation::{SchemaContext, TranslationService};
+use queryflux_sql::{SchemaContext, TranslationService};
 
 #[tokio::test]
 async fn import_failure_after_startup_retains_unavailable_reason() {

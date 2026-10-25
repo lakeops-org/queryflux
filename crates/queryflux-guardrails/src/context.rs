@@ -4,9 +4,9 @@ use queryflux_core::{
     query::{ClusterGroupName, EngineType, SqlDialect},
     schema_context::SchemaContext,
     session::AgentContext,
-    sql_classify::SqlParseCache,
     tags::QueryTags,
 };
+use queryflux_sql::classify::SqlParseCache;
 use serde_json::Value;
 
 /// Which pipeline stage a guard runs at.

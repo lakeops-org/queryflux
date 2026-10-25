@@ -258,7 +258,7 @@ queryflux/
 │   ├── queryflux-cluster-manager/  # Load balancing and queueing
 │   ├── queryflux-routing/          # Router implementations
 │   ├── queryflux-persistence/      # State storage (in-memory / PostgreSQL)
-│   ├── queryflux-translation/      # SQL dialect translation (sqlglot via PyO3)
+│   ├── queryflux-sql/              # SQL parsing, classification, fingerprints, access extraction, translation
 │   ├── queryflux-metrics/          # Prometheus metrics
 │   ├── queryflux-auth/             # Authentication and authorization
 │   ├── queryflux-bench/            # Proxy overhead benchmarks

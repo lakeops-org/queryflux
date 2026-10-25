@@ -359,9 +359,8 @@ async fn handle_validation(config_path: &str) -> anyhow::Result<()> {
     let requires_translation = config_requires_translation(&config);
 
     println!("Validating Python & sqlglot environment...");
-    match queryflux_translation::TranslationService::new_sqlglot(
-        config.translation.python_scripts.clone(),
-    ) {
+    match queryflux_sql::TranslationService::new_sqlglot(config.translation.python_scripts.clone())
+    {
         Ok(_) => {
             println!("✓ Python interpreter and 'sqlglot' library are available and correctly configured.");
         }
@@ -390,7 +389,7 @@ async fn handle_validation(config_path: &str) -> anyhow::Result<()> {
 
                     // Re-setup env variables and re-check sqlglot
                     setup_env();
-                    if let Err(e2) = queryflux_translation::TranslationService::new_sqlglot(
+                    if let Err(e2) = queryflux_sql::TranslationService::new_sqlglot(
                         config.translation.python_scripts.clone(),
                     ) {
                         return Err(anyhow::anyhow!(

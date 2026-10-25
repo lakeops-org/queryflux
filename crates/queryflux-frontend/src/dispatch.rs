@@ -10,7 +10,7 @@ use futures::StreamExt;
 use queryflux_auth::{AuthContext, QueryCredentials};
 use queryflux_cluster_manager::{circuit_breaker::BackendOutcome, ClusterGroupManager};
 use queryflux_core::native_result::NativeResultChunk;
-use queryflux_core::params::{interpolate_params, QueryParams};
+use queryflux_core::params::QueryParams;
 use queryflux_core::tags::{merge_tags, QueryTags};
 use queryflux_core::{
     error::{QueryFluxError, Result},
@@ -27,6 +27,7 @@ use queryflux_engine_adapters::{
 };
 use queryflux_guardrails::{GuardChain, GuardChainOutcome, GuardContext, GuardLayer};
 use queryflux_metrics::MetricsStore;
+use queryflux_sql::params::interpolate_params;
 
 use tracing::{debug, info, warn};
 
@@ -62,7 +63,7 @@ fn record_translation(
         .filter(|reason| *reason != queryflux_core::query::TranslationReason::NotNeeded)
     {
         warn!(
-            query_fingerprint = format_args!("{:016x}", queryflux_fingerprint::fast_hash(sql)),
+            query_fingerprint = format_args!("{:016x}", queryflux_sql::fingerprint::fast_hash(sql)),
             reason = reason.as_str(),
             rejected,
             "SQL translation degraded"
@@ -617,18 +618,14 @@ pub async fn dispatch_query(
     // Scoped to only run when access control actually rewrote the query, using the cheap
     // Rust-native (no Python) classifier, so ordinary queries pay nothing extra.
     if access_control_rewrote {
-        let src_read_like = queryflux_core::sql_classify::SqlParseCache::new(
-            original_sql.clone(),
-            src_dialect.clone(),
-        )
-        .is_read_like_async()
-        .await;
-        let final_read_like = queryflux_core::sql_classify::SqlParseCache::new(
-            engine_sql.clone(),
-            tgt_dialect.clone(),
-        )
-        .is_read_like_async()
-        .await;
+        let src_read_like =
+            queryflux_sql::classify::SqlParseCache::new(original_sql.clone(), src_dialect.clone())
+                .is_read_like_async()
+                .await;
+        let final_read_like =
+            queryflux_sql::classify::SqlParseCache::new(engine_sql.clone(), tgt_dialect.clone())
+                .is_read_like_async()
+                .await;
         if src_read_like && !final_read_like {
             let reason = "access-control invariant violated: statement kind changed from read to non-read after rewrite/translation".to_string();
             warn!(id = %query_id, "{reason}");
@@ -701,7 +698,7 @@ pub async fn dispatch_query(
     // Guard chain: runs after translation (SQL is final), before engine submission.
     // Global guards run first; per-group guards are appended after.
     let sql_parse =
-        queryflux_core::sql_classify::SqlParseCache::new(engine_sql.clone(), tgt_dialect.clone());
+        queryflux_sql::classify::SqlParseCache::new(engine_sql.clone(), tgt_dialect.clone());
 
     let guard_ctx = GuardContext {
         sql: &engine_sql,
@@ -1521,7 +1518,7 @@ impl DispatchAdapter {
         credentials: &QueryCredentials,
         tags: &queryflux_core::tags::QueryTags,
         params: &QueryParams,
-        hints: queryflux_core::sql_classify::ExecutionHints,
+        hints: queryflux_sql::classify::ExecutionHints,
         id_slot: &BackendQueryIdSlot,
     ) -> Result<queryflux_engine_adapters::SyncExecution> {
         match self {
@@ -1594,7 +1591,7 @@ struct SyncQuerySetup {
     /// Guard actions collected by the guard chain (allow/warn). Merged into QueryOutcome.
     guard_actions: Vec<queryflux_persistence::GuardAction>,
     /// Shared SQL parse cache — used by guardrails and execution hints.
-    sql_parse: queryflux_core::sql_classify::SqlParseCache,
+    sql_parse: queryflux_sql::classify::SqlParseCache,
     /// The wire auth resolved at submit time — reused by `SyncCancelGuard` so a client
     /// disconnect cancels with the same identity the query was submitted under.
     wire_auth: Option<StoredWireAuth>,
@@ -1989,18 +1986,14 @@ async fn setup_sync_query(
     // Invariant assert (NOT a second guard stage — see the async dispatch path for the
     // full rationale). Scoped to only run when access control actually rewrote the query.
     if access_control_rewrote {
-        let src_read_like = queryflux_core::sql_classify::SqlParseCache::new(
-            original_sql.clone(),
-            src_dialect.clone(),
-        )
-        .is_read_like_async()
-        .await;
-        let final_read_like = queryflux_core::sql_classify::SqlParseCache::new(
-            translated.clone(),
-            tgt_dialect.clone(),
-        )
-        .is_read_like_async()
-        .await;
+        let src_read_like =
+            queryflux_sql::classify::SqlParseCache::new(original_sql.clone(), src_dialect.clone())
+                .is_read_like_async()
+                .await;
+        let final_read_like =
+            queryflux_sql::classify::SqlParseCache::new(translated.clone(), tgt_dialect.clone())
+                .is_read_like_async()
+                .await;
         if src_read_like && !final_read_like {
             let reason = "access-control invariant violated: statement kind changed from read to non-read after rewrite/translation".to_string();
             warn!(id = %query_id, "{reason}");
@@ -2125,7 +2118,7 @@ async fn setup_sync_query(
     Ok(SyncQuerySetup {
         adapter,
         translated: translated.clone(),
-        sql_parse: queryflux_core::sql_classify::SqlParseCache::new(translated, tgt_dialect),
+        sql_parse: queryflux_sql::classify::SqlParseCache::new(translated, tgt_dialect),
         start,
         slot,
         ctx,
@@ -2160,7 +2153,7 @@ async fn execute_stream(
             &setup.credentials,
             &setup.ctx.query_tags,
             &setup.params,
-            queryflux_core::sql_classify::ExecutionHints {
+            queryflux_sql::classify::ExecutionHints {
                 is_read_like: Some(setup.sql_parse.is_read_like_async().await),
             },
             id_slot,
@@ -2438,7 +2431,7 @@ async fn run_plan_guards(
 ) -> std::result::Result<Vec<queryflux_persistence::GuardAction>, String> {
     let engine_type = queryflux_core::query::EngineType::Cache;
     let resolved_agent_ctx = session.resolved_agent_context();
-    let sql_parse = queryflux_core::sql_classify::SqlParseCache::new(
+    let sql_parse = queryflux_sql::classify::SqlParseCache::new(
         sql.to_string(),
         queryflux_core::query::SqlDialect::Generic,
     );
@@ -2540,10 +2533,10 @@ pub async fn execute_to_sink(
     let cache_eligible = if effective_cache.is_some() && !fixups_can_run {
         let sql = sql.clone();
         let dialect =
-            queryflux_fingerprint::polyglot_dialect(&resolve_src_dialect(&session, &protocol));
+            queryflux_sql::fingerprint::polyglot_dialect(&resolve_src_dialect(&session, &protocol));
         // The parser uses a large-stack pool, but waiting on that pool is
         // synchronous. Keep both classification and determinism off Tokio workers.
-        tokio::task::spawn_blocking(move || queryflux_cache::is_cacheable(&sql, &dialect))
+        tokio::task::spawn_blocking(move || queryflux_sql::is_cacheable(&sql, &dialect))
             .await
             .unwrap_or(false)
     } else {
@@ -3361,7 +3354,7 @@ mod translation_policy_tests {
     use queryflux_persistence::{
         in_memory::InMemoryPersistence, query_history::QueryFilters, QueryHistoryStore,
     };
-    use queryflux_translation::TranslationService;
+    use queryflux_sql::TranslationService;
 
     async fn fixture(
         mode: TranslationMode,

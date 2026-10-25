@@ -386,7 +386,7 @@ impl SyncAdapter for DuckDbHttpAdapter {
         _credentials: &QueryCredentials,
         _tags: &QueryTags,
         _params: &queryflux_core::params::QueryParams,
-        _hints: queryflux_core::sql_classify::ExecutionHints,
+        _hints: queryflux_sql::classify::ExecutionHints,
         _id_slot: &BackendQueryIdSlot,
     ) -> Result<SyncExecution> {
         // Community httpserver has no cancel API — leave the slot unset so

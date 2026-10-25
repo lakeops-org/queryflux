@@ -16,7 +16,7 @@ queryflux-engine-adapters = { workspace = true }
 queryflux-cluster-manager = { workspace = true }
 queryflux-core = { workspace = true }
 queryflux-persistence = { workspace = true }
-queryflux-translation = { workspace = true }
+queryflux-sql = { workspace = true }
 queryflux-metrics = { workspace = true }
 queryflux-routing = { workspace = true }
 queryflux-auth = { workspace = true }

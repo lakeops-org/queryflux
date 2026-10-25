@@ -1,5 +1,16 @@
+//! Everything QueryFlux knows about a SQL text: parsing and classification (polyglot-sql),
+//! fingerprints, table and column extraction for access control, and translation (sqlglot).
+//! See `plans/queryflux-sql-plan.md`.
+
 pub mod access;
+pub mod classify;
+mod eligibility;
+pub mod fingerprint;
+pub mod params;
+pub mod polyglot_pool;
 pub mod sqlglot;
+
+pub use eligibility::is_cacheable;
 
 use queryflux_core::bounded_cache::{BoundedCache, ContentHasher, MAX_CACHED_SQL_BYTES};
 

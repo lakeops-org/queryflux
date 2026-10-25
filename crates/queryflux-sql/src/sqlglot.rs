@@ -503,7 +503,7 @@ fn run_fixup_scripts(
     let mut current = sql.to_string();
 
     for (i, script) in scripts.iter().enumerate() {
-        let read_like_before = queryflux_core::sql_classify::is_read_like_sql(&current, &dialect);
+        let read_like_before = crate::classify::is_read_like_sql(&current, &dialect);
 
         // Execute the script in its own globals dict so that top-level imports
         // and helper functions work correctly (same approach as PythonScriptRouter).
@@ -543,7 +543,7 @@ fn run_fixup_scripts(
             ))
         })?;
 
-        let read_like_after = queryflux_core::sql_classify::is_read_like_sql(&current, &dialect);
+        let read_like_after = crate::classify::is_read_like_sql(&current, &dialect);
         if read_like_before && !read_like_after {
             return Err(SqlglotFailure {
                 error: QueryFluxError::Translation(format!(

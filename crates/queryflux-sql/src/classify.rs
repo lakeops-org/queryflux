@@ -7,7 +7,7 @@ use std::sync::OnceLock;
 use polyglot_sql::expressions::Expression;
 use polyglot_sql::DialectType;
 
-use crate::query::SqlDialect;
+use queryflux_core::query::SqlDialect;
 
 #[derive(Debug)]
 enum ParsedStatements {
@@ -220,7 +220,7 @@ pub fn strip_leading_sql_comments(mut s: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::query::SqlDialect;
+    use queryflux_core::query::SqlDialect;
 
     /// `is_read_like_async`/`statements_async` route the actual parse through
     /// `tokio::task::spawn_blocking` instead of blocking the calling task's
