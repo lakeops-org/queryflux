@@ -149,6 +149,31 @@ workers because driver release callbacks can involve network I/O.
 
 ---
 
+## Admin API access
+
+These callers can authenticate to the admin API (the Studio UI and `/admin/*`):
+
+| Caller | How | Scopes |
+|---|---|---|
+| The admin user | Basic auth: `adminApi.username`/`password`, or the password changed in Studio. Set `adminApi.basicAuth: false` to turn it off. | All |
+| Automation | `Authorization: Bearer qfa_…`, a token from `POST /admin/tokens` | The ones it was created with |
+| A platform gateway | A [multi-tenant control plane](./operations/worker-mode.md#one-control-plane-for-many-tenants)'s platform listener, for the callers it authenticated | All, or only those listed in `X-QueryFlux-Scopes` |
+
+**Scopes**
+| Scope | Allows |
+|---|---|
+| `read` | Every `GET` |
+| `operate` | Sites and hubs, cache invalidation, cancelling queries, enabling or disabling a cluster |
+| `config:write` | Every other config change |
+| `credentials` | Admin tokens and the admin password |
+
+**Tokens.**
+- `POST /admin/tokens {"name": "ci", "scopes": ["read"]}` returns the token once. Only its SHA-256 is stored.
+- A caller can only grant scopes it has.
+- `GET /admin/tokens` lists tokens with their last use. `DELETE /admin/tokens/{id}` revokes one immediately.
+
+**Audit.** Every request that needs a scope other than `read` is recorded: the caller, the method and path, and the status. A platform gateway can also say whom it acted for, with `X-QueryFlux-Actor`, such as `user:alice` or `apikey:k1`. That header is ignored from anyone else. Read the log with `GET /admin/audit?limit=100&before=<id>`, newest first.
+
 ## Try it
 
 **[`examples/with-keycloak-oidc`](https://github.com/lakeops-org/queryflux/tree/main/examples/with-keycloak-oidc)** is a runnable Docker Compose stack: Keycloak as the IdP, Trino as the backend, and three ready-to-swap configs — `config.yaml` (`passthrough`), `config-impersonate.yaml`, `config-token-exchange.yaml`.

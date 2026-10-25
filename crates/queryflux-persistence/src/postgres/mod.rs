@@ -31,6 +31,7 @@ use queryflux_core::{
 };
 use sqlx::PgPool;
 
+mod admin_access;
 mod history_batch;
 mod hub_store;
 pub mod tenants;
@@ -3260,6 +3261,58 @@ mod tests {
         store.migrate().await.unwrap();
         store.verify_schema().await.unwrap();
         store
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DATABASE_URL"]
+    async fn pg_admin_tokens_and_audit() {
+        use crate::admin_access::{AdminAccessStore, AdminAuditEntry, AdminToken};
+        let store = schema_store("qf_admin_access_test").await;
+        sqlx::query("TRUNCATE admin_tokens, admin_audit")
+            .execute(&store.admin_pool)
+            .await
+            .unwrap();
+        let token = AdminToken {
+            id: "t1".into(),
+            name: "ci".into(),
+            token_hash: "h1".into(),
+            scopes: vec!["read".into()],
+            created_by: "basic:admin".into(),
+            created_at: chrono::Utc::now(),
+            last_used_at: None,
+            revoked_at: None,
+        };
+        store.create_admin_token(&token).await.unwrap();
+        let used = store.use_admin_token("h1").await.unwrap().unwrap();
+        assert_eq!(used.scopes, vec!["read".to_string()]);
+        assert!(used.last_used_at.is_some());
+        assert!(store.use_admin_token("nope").await.unwrap().is_none());
+        assert!(store.revoke_admin_token("t1").await.unwrap());
+        assert!(!store.revoke_admin_token("t1").await.unwrap());
+        assert!(store.use_admin_token("h1").await.unwrap().is_none());
+        assert!(store.list_admin_tokens().await.unwrap()[0]
+            .revoked_at
+            .is_some());
+
+        for path in ["/a", "/b", "/c"] {
+            let entry = AdminAuditEntry {
+                id: 0,
+                at: chrono::Utc::now(),
+                principal: "platform".into(),
+                actor: Some("user:alice".into()),
+                method: "PUT".into(),
+                path: path.into(),
+                status: 204,
+            };
+            store.record_admin_audit(&entry).await.unwrap();
+        }
+        let page = store.list_admin_audit(2, None).await.unwrap();
+        let paths: Vec<_> = page.iter().map(|e| e.path.as_str()).collect();
+        assert_eq!(paths, ["/c", "/b"]);
+        let rest = store.list_admin_audit(2, Some(page[1].id)).await.unwrap();
+        assert_eq!(rest.len(), 1);
+        assert_eq!(rest[0].path, "/a");
+        assert_eq!(rest[0].actor.as_deref(), Some("user:alice"));
     }
 
     /// Two deployments pinned to two schemas of one database: each migrates into its own

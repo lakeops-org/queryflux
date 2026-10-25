@@ -237,8 +237,10 @@ seconds.
   workers authenticate against that tenant's enrolled hubs, so one tenant's hub is
   refused by every other tenant.
 - The platform port serves every tenant's admin API, `/metrics` and worker API. Choose the
-  tenant with `X-QueryFlux-Tenant: <id>`. These requests skip the admin API's basic auth,
-  because the platform token has already been checked.
+  tenant with `X-QueryFlux-Tenant: <id>`. These callers act as the
+  [platform](../authentication.md#admin-api-access): `X-QueryFlux-Scopes` narrows what a
+  request may do, and `X-QueryFlux-Actor` records whom it acts for in the tenant's audit
+  log.
 - A tenant starts with no clusters; add them through its admin API.
 
 ## Operating workers

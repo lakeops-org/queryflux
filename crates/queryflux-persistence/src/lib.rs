@@ -1,3 +1,4 @@
+pub mod admin_access;
 pub mod batched_release;
 pub mod cache_store;
 pub mod cluster_config;
@@ -498,7 +499,8 @@ pub trait BackendCapabilities: Send + Sync {
 /// supertrait here means `AdminFrontend` only needs one `Arc<dyn AdminStore>`
 /// and the compiler enforces that every method group is present.
 pub trait AdminStore:
-    QueryHistoryStore
+    admin_access::AdminAccessStore
+    + QueryHistoryStore
     + ClusterConfigStore
     + ScriptLibraryStore
     + ProxySettingsStore
@@ -512,7 +514,8 @@ pub trait AdminStore:
 /// Blanket implementation: any type that satisfies all component traits
 /// automatically satisfies `AdminStore`, so implementors only need the components.
 impl<
-        T: QueryHistoryStore
+        T: admin_access::AdminAccessStore
+            + QueryHistoryStore
             + ClusterConfigStore
             + ScriptLibraryStore
             + ProxySettingsStore
