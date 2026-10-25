@@ -529,6 +529,17 @@ impl Guard for OpaAccessGuard {
                 .collect::<Vec<_>>()
                 .join(","),
         );
+        // The injected expressions, one `table: expr` per line, so history consumers can
+        // tell predicates the policy added from the ones the user wrote. History redaction
+        // masks their literals (`maskLiterals`) or drops them (`metadata`).
+        meta.insert(
+            "row_filters".to_string(),
+            policies
+                .iter()
+                .flat_map(|p| p.row_filters.iter().map(|f| format!("{}: {f}", p.table)))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
         meta.insert(
             "masked_columns".to_string(),
             policies
@@ -1183,8 +1194,10 @@ mod tests {
             &[],
         );
         match guard.check(&default_ctx).await {
-            GuardResult::Rewrite { sql, .. } => {
-                assert!(sql.contains("source = 'default'"), "got: {sql}")
+            GuardResult::Rewrite { sql, metadata } => {
+                assert!(sql.contains("source = 'default'"), "got: {sql}");
+                let filters = &metadata.expect("rewrite metadata")["row_filters"];
+                assert!(filters.contains("source = 'default'"), "got: {filters}");
             }
             other => panic!("expected a rewrite from the default connection, got {other:?}"),
         }
