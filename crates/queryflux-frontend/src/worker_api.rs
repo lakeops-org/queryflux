@@ -258,6 +258,24 @@ fn foreign_holder(st: &WorkerApiState, headers: &HeaderMap, instance_id: &str) -
     }
 }
 
+/// A site limited to some clusters (`workerApi.sites[].clusters`) may only take capacity on,
+/// or publish running counts for, those clusters. `None` when the call may go ahead.
+fn foreign_cluster(st: &WorkerApiState, headers: &HeaderMap, cluster: &str) -> Option<Response> {
+    match caller(&st.api, headers) {
+        Some(Caller::Site(site))
+            if st
+                .api
+                .site_clusters(&site)
+                .is_some_and(|own| !own.iter().any(|c| c == cluster)) =>
+        {
+            Some(forbidden(format!(
+                "site {site} may not act on cluster '{cluster}'"
+            )))
+        }
+        _ => None,
+    }
+}
+
 fn etag(revision: &str) -> String {
     format!("\"{revision}\"")
 }
@@ -635,7 +653,9 @@ async fn capacity_acquire(
         Ok(s) => s,
         Err(r) => return r,
     };
-    if let Some(r) = foreign_holder(&st, &headers, &req.instance_id) {
+    if let Some(r) = foreign_holder(&st, &headers, &req.instance_id)
+        .or_else(|| foreign_cluster(&st, &headers, &req.cluster))
+    {
         return r;
     }
     match store
@@ -843,6 +863,11 @@ async fn running_publish(
         Ok(s) => s,
         Err(r) => return r,
     };
+    // Site agents relay their workers' engine counts, so sites may publish, but only for
+    // their own clusters.
+    if let Some(r) = foreign_cluster(&st, &headers, &req.cluster) {
+        return r;
+    }
     match store.publish_running_count(&req.cluster, req.count).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => store_error(e),
@@ -1242,6 +1267,60 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
+    /// A site limited to its clusters takes capacity and publishes running counts only on them.
+    #[tokio::test]
+    async fn a_site_acts_only_on_its_clusters() {
+        use sha2::Digest;
+        let store = Arc::new(queryflux_persistence::in_memory::InMemoryPersistence::new());
+        let s = snapshot();
+        let app = router(WorkerApi {
+            shared_secret: String::new(),
+            snapshot: Arc::new(move || {
+                let s = s.clone();
+                Box::pin(async move { Ok(s) })
+            }),
+            registry: Some(store.clone()),
+            changes: None,
+            coordination: Some(store.clone()),
+            history: Some(store.clone()),
+            quotas: None,
+            sites: vec![queryflux_core::config::WorkerApiSite {
+                name: "dc1".into(),
+                tokens: vec![format!("{:x}", sha2::Sha256::digest(b"t-dc1"))],
+                clusters: Some(vec!["own".into()]),
+            }],
+        });
+        let send = |path: &str, body: serde_json::Value| {
+            let req = Request::post(path.to_string())
+                .header(header::AUTHORIZATION, "Bearer t-dc1")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap();
+            let app = app.clone();
+            async move { app.oneshot(req).await.unwrap().status() }
+        };
+        for (cluster, acquire, publish) in [
+            ("own", StatusCode::OK, StatusCode::NO_CONTENT),
+            ("other", StatusCode::FORBIDDEN, StatusCode::FORBIDDEN),
+        ] {
+            let body = serde_json::json!({
+                "cluster": cluster, "maxRunningQueries": 5,
+                "instanceId": "dc1/w", "queryId": format!("q-{cluster}")
+            });
+            assert_eq!(
+                send("/worker/capacity/acquire", body).await,
+                acquire,
+                "{cluster}"
+            );
+            let body = serde_json::json!({ "cluster": cluster, "count": 3 });
+            assert_eq!(
+                send("/worker/capacity/running", body).await,
+                publish,
+                "{cluster}"
+            );
+        }
+    }
+
     /// A blank bearer token is no one, even against a blank shared secret or a site whose
     /// token list holds the hash of "" (both refused by config validation, but the API must
     /// not rely on that).
@@ -1264,6 +1343,7 @@ mod tests {
             sites: vec![queryflux_core::config::WorkerApiSite {
                 name: "dc1".into(),
                 tokens: vec![empty_hash],
+                clusters: None,
             }],
         });
         for auth in ["Bearer ", "Bearer    ", "bearer "] {
