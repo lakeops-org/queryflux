@@ -184,6 +184,12 @@ impl WorkerSnapshotV1 {
             {
                 strip_credentials(v);
             }
+            // Fields this release doesn't know (`extra`) get the same treatment: a newer
+            // control plane's top-level field must not carry a credential past `Stripped`.
+            self.extra.retain(|k, _| !is_credential_key(k));
+            for v in self.extra.values_mut() {
+                strip_credentials(v);
+            }
         }
         self.clusters.sort_by(|a, b| a.name.cmp(&b.name));
         self.revision = self.compute_revision();
@@ -457,6 +463,29 @@ mod tests {
         let adbc = s.clusters.iter().find(|c| c.name == "adbc-a").unwrap();
         assert_eq!(adbc.config["queryAuth"]["type"], "tokenExchange");
         assert_eq!(adbc.config["dbKwargs"]["warehouse"], "WH");
+    }
+
+    /// Unknown top-level fields are stripped too, also when a site view re-seals.
+    #[test]
+    fn stripped_snapshots_strip_unknown_fields() {
+        let mut s = snapshot(CredentialMode::Stripped);
+        s.extra
+            .insert("apiToken".into(), serde_json::json!("t-top"));
+        s.extra.insert(
+            "future".into(),
+            serde_json::json!({ "clientSecret": "t-nested", "name": "keep-me" }),
+        );
+        let sealed = s.seal();
+        let names: Vec<String> = sealed.clusters.iter().map(|c| c.name.clone()).collect();
+        for snap in [sealed.clone(), sealed.for_site(&names)] {
+            let json = serde_json::to_string(&snap).unwrap();
+            assert!(
+                !json.contains("t-top") && !json.contains("t-nested"),
+                "{json}"
+            );
+            assert_eq!(snap.extra["future"]["name"], "keep-me");
+            assert!(snap.is_sealed());
+        }
     }
 
     /// Guardrail webhook headers carry credentials under arbitrary names.
