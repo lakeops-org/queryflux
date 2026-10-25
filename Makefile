@@ -2,7 +2,7 @@ CARGO        := $(HOME)/.cargo/bin/cargo
 COMPOSE      := docker compose -f docker/docker-compose.yml --project-directory .
 COMPOSE_TEST := docker compose -f docker/docker-compose.test.yml --project-directory .
 
-# site-packages for `.venv` — works for any Python 3.x (CI uses 3.12, dev may use 3.13).
+# site-packages for `.venv` — works for any Python 3.x (CI and the image use 3.14).
 PYTHONPATH_VENV = $(shell test -x .venv/bin/python3 && .venv/bin/python3 -c 'import site; print(site.getsitepackages()[0])')
 
 # DuckDB: on Linux (local dev, not CI), let libduckdb-sys download the prebuilt .so.

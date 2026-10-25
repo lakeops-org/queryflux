@@ -14,7 +14,7 @@
 #   docker buildx build --platform linux/amd64,linux/arm64 -f docker/queryflux/Dockerfile \
 #     -t queryflux:local --push .
 #
-# PyO3/sqlglot: builder + runtime use python:3.12.13-slim-trixie.
+# PyO3/sqlglot: builder + runtime use python:3.14.8-slim-trixie.
 # Rust: rustup 1.91.1. DuckDB: DUCKDB_DOWNLOAD_LIB links a prebuilt libduckdb.
 #
 # Final `cargo build` has no `--locked` (stub vs full crate sources); `cargo chef cook` uses `--locked`.
@@ -25,7 +25,7 @@
 # =============================================================================
 # Chef base — Python + Rust (rustup, cargo-chef)
 # =============================================================================
-FROM python:3.12.13-slim-trixie AS chef
+FROM python:3.14.8-slim-trixie AS chef
 
 ENV RUSTUP_HOME=/usr/local/rustup \
     CARGO_HOME=/usr/local/cargo \
@@ -79,7 +79,7 @@ COPY requirements.txt .
 RUN /usr/local/bin/python3 -m venv /opt/venv && \
     /opt/venv/bin/pip install --no-cache-dir -r requirements.txt && \
     ln -sfn "$(/opt/venv/bin/python3 -c 'import site; print(site.getsitepackages()[0])')" /opt/venv/site-packages && \
-    /opt/venv/bin/python3 -c 'import sys; assert sys.version_info[:2] == (3, 12), f"expected 3.12, got {sys.version}"'
+    /opt/venv/bin/python3 -c 'import sys; assert sys.version_info[:2] == (3, 14), f"expected 3.14, got {sys.version}"'
 
 ENV PYO3_PYTHON=/opt/venv/bin/python3
 ENV PYTHONPATH=/opt/venv/site-packages
@@ -138,7 +138,7 @@ RUN curl -LsSf https://dbc.columnar.tech/install.sh \
 # =============================================================================
 # Runtime: server only
 # =============================================================================
-FROM python:3.12.13-slim-trixie AS runtime-server
+FROM python:3.14.8-slim-trixie AS runtime-server
 
 # curl: container healthchecks (docker compose examples) hit /health with it.
 RUN apt-get update && apt-get install --no-install-recommends -y \
