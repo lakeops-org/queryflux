@@ -1,0 +1,70 @@
+# A hosted control plane ("cell"): one per tenant, serving that tenant's site agents over
+# the internet. It runs no queries (the workers at the customer site do), so it has no
+# query frontend, no Studio sidecar and small requests. Run from the repository root:
+#
+#   1. kubectl create namespace tenant-acme
+#   2. Create the tenant's database on a shared Postgres cluster (one database per tenant,
+#      not one schema: QueryFlux's advisory locks and LISTEN/NOTIFY channels are scoped to
+#      the database):
+#        CREATE ROLE tenant_acme LOGIN PASSWORD '<password>';
+#        CREATE DATABASE tenant_acme OWNER tenant_acme;
+#   3. Fill in ./charts/queryflux/examples/hosted-cell-config.yaml and create its Secret:
+#        kubectl -n tenant-acme create secret generic queryflux-cell-config \
+#          --from-file=config.yaml=./charts/queryflux/examples/hosted-cell-config.yaml
+#   4. Provide the Ingress certificate for the host below, as the Secret `acme-cp-tls`:
+#      either let cert-manager issue it (add a `cert-manager.io/cluster-issuer` annotation
+#      under `ingress.annotations`), or create it from an existing certificate:
+#        kubectl -n tenant-acme create secret tls acme-cp-tls \
+#          --cert=acme.cp.example.com.crt --key=acme.cp.example.com.key
+#      Without it the Ingress cannot serve a trusted certificate and site agents (HTTPS)
+#      cannot connect.
+#   5. helm install queryflux-cell ./charts/queryflux -n tenant-acme \
+#        -f ./charts/queryflux/examples/hosted-cell-values.yaml
+#
+# The worker API shares the admin listener with the admin API and /metrics. The ingress
+# exposes only /worker/*, so the admin API stays reachable from inside the cluster only.
+
+role: controlPlane
+
+# Site agents cache the snapshot on disk and spool history, so they ride out a restart of
+# a single replica.
+replicaCount: 1
+
+config:
+  existingSecret: queryflux-cell-config
+
+# The tenant's UI reaches the admin API from inside the cluster.
+studio:
+  enabled: false
+
+service:
+  ports:
+    trinoHttp:
+      enabled: false
+    studio:
+      enabled: false
+
+# Idle cells are the common case. Raise these for busy tenants (history ingest, many
+# workers on long-polls).
+resources:
+  requests:
+    cpu: 50m
+    memory: 128Mi
+  limits:
+    memory: 512Mi
+
+ingress:
+  enabled: true
+  className: nginx
+  annotations:
+    # Config and capacity waits are long-polls.
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "120"
+  hosts:
+    - host: acme.cp.example.com
+      paths:
+        - path: /worker
+          pathType: Prefix
+          servicePortName: admin
+  tls:
+    - hosts: [acme.cp.example.com]
+      secretName: acme-cp-tls
