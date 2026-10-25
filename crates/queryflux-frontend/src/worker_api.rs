@@ -168,15 +168,18 @@ fn secret_matches(given: &str, expected: &str) -> bool {
     a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
+/// The bearer token, or `None` when there is none or it is blank: a blank token must never
+/// match anything (a blank secret, or a site whose token hash is the hash of "").
 fn bearer(headers: &HeaderMap) -> Option<&str> {
     headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(crate::strip_bearer_prefix)
+        .filter(|token| !token.trim().is_empty())
 }
 
 pub(crate) fn authorized(headers: &HeaderMap, secret: &str) -> bool {
-    bearer(headers).is_some_and(|token| secret_matches(token, secret))
+    !secret.trim().is_empty() && bearer(headers).is_some_and(|token| secret_matches(token, secret))
 }
 
 /// Who presented the bearer token.
@@ -190,7 +193,8 @@ enum Caller {
 
 fn caller(api: &WorkerApi, headers: &HeaderMap) -> Option<Caller> {
     let token = bearer(headers)?;
-    if !api.shared_secret.is_empty() && secret_matches(token, &api.shared_secret) {
+    // Validation accepts a whitespace-only secret as "none set"; so must this.
+    if !api.shared_secret.trim().is_empty() && secret_matches(token, &api.shared_secret) {
         return Some(Caller::Fleet);
     }
     if api.sites.is_empty() {
@@ -200,7 +204,11 @@ fn caller(api: &WorkerApi, headers: &HeaderMap) -> Option<Caller> {
     let hash = format!("{:x}", sha2::Sha256::digest(token.as_bytes()));
     api.sites
         .iter()
-        .find(|s| s.tokens.iter().any(|h| secret_matches(&hash, h)))
+        .find(|s| {
+            s.tokens
+                .iter()
+                .any(|h| secret_matches(&hash, &h.to_ascii_lowercase()))
+        })
         .map(|s| Caller::Site(s.name.clone()))
 }
 
@@ -1209,6 +1217,39 @@ mod tests {
         let future = serde_json::json!({ "schemaVersion": 2, "worker": "w", "records": [] });
         let resp = app.oneshot(post(future)).await.unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// A blank bearer token is no one, even against a blank shared secret or a site whose
+    /// token list holds the hash of "" (both refused by config validation, but the API must
+    /// not rely on that).
+    #[tokio::test]
+    async fn blank_tokens_and_secrets_authenticate_no_one() {
+        use sha2::Digest;
+        let empty_hash = format!("{:x}", sha2::Sha256::digest(b""));
+        let s = snapshot();
+        let app = router(WorkerApi {
+            shared_secret: "   ".into(),
+            snapshot: Arc::new(move || {
+                let s = s.clone();
+                Box::pin(async move { Ok(s) })
+            }),
+            registry: None,
+            changes: None,
+            coordination: None,
+            history: None,
+            quotas: None,
+            sites: vec![queryflux_core::config::WorkerApiSite {
+                name: "dc1".into(),
+                tokens: vec![empty_hash],
+            }],
+        });
+        for auth in ["Bearer ", "Bearer    ", "bearer "] {
+            assert_eq!(
+                get(app.clone(), Some(auth), None).await.status(),
+                StatusCode::UNAUTHORIZED,
+                "{auth:?}"
+            );
+        }
     }
 
     #[tokio::test]

@@ -1247,6 +1247,9 @@ pub struct WorkerApiConfig {
     pub sites: Vec<WorkerApiSite>,
 }
 
+/// SHA-256 of the empty string: never a valid site token hash.
+const EMPTY_TOKEN_SHA256: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+
 /// One site whose agent connects with its own token (`workerApi.sites`).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1291,6 +1294,10 @@ impl WorkerApiConfig {
                 if hash.len() != 64 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
                     issues.push(format!(
                         "queryflux.workerApi.sites['{name}'].tokens: '{hash}' is not a token hash (64 hex characters)"
+                    ));
+                } else if hash.eq_ignore_ascii_case(EMPTY_TOKEN_SHA256) {
+                    issues.push(format!(
+                        "queryflux.workerApi.sites['{name}'].tokens: '{hash}' is the hash of an empty token"
                     ));
                 } else if !hashes.insert(hash.to_ascii_lowercase()) {
                     issues.push(format!(
@@ -4496,6 +4503,11 @@ auth: { provider: static, required: true }
         assert_eq!(sites(&format!("{{ name: dc1, tokens: [{h}] }}")), Ok(()));
         for (list, expected) in [
             ("{ name: dc1, tokens: [] }".to_string(), "tokens is empty"),
+            (
+                "{ name: dc1, tokens: [e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855] }"
+                    .to_string(),
+                "hash of an empty token",
+            ),
             (
                 "{ name: dc1, tokens: [abc] }".to_string(),
                 "not a token hash",
