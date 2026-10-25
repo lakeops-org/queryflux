@@ -1,821 +1,985 @@
 [
   {
     "digest_text": "with recent as (select o.order_id, o.customer_id, o.amount from lake.sales.orders as o where o.dt >= current_date - interval ? day and o.status IN (?.. )) select c.region, sum(r.amount) as revenue from recent as r join lake.crm.customers as c on c.customer_id = r.customer_id where c.region = ? or lower(c.segment) like ? group by c.region having sum(r.amount) > ? order by revenue desc",
+    "fast_hash": "14628840894360118350",
     "query_hash": "7269342379216083869",
     "query_parameterized_hash": "8397326794544475700"
   },
   {
     "digest_text": "select `shop`.`orders`.`region` from `shop`.`orders` where `shop`.`orders`.`id` = ?",
+    "fast_hash": "3616045921953674637",
     "query_hash": "11763654726275994656",
     "query_parameterized_hash": "1752154323615722034"
   },
   {
     "digest_text": "select region, count(*) from shop.orders where dt between ? and ? and id is not ? group by region",
+    "fast_hash": "12216278548778486933",
     "query_hash": "8524587102431944575",
     "query_parameterized_hash": "7658753934485232198"
   },
   {
     "digest_text": "select region, count(*) from orders join customers using (customer_id) where dt = cast(? as date) and tier = ? group by region",
+    "fast_hash": "7885022086286488332",
     "query_hash": "522664783594121633",
     "query_parameterized_hash": "11389985560803108434"
   },
   {
     "digest_text": "select * from events as e where e.user_id in (select u.id from users as u where u.country = ?) and exists(select ? from flags as f where f.user_id = e.user_id and f.enabled)",
+    "fast_hash": "11628084310531471197",
     "query_hash": "3943270437335214458",
     "query_parameterized_hash": "13428379131576983045"
   },
   {
     "digest_text": "select * from analytics.public.events where event_ts >= dateadd(day, -?, current_timestamp()) and event_type not in (?)",
+    "fast_hash": "1716591083972171046",
     "query_hash": "9301223789831886655",
     "query_parameterized_hash": "179107367884908424"
   },
   {
     "digest_text": "select count() from logs.requests prewhere date = today() where status >= ? and path like ?",
+    "fast_hash": "14342748437850372582",
     "query_hash": "13235802368509913030",
     "query_parameterized_hash": "15030730219382196078"
   },
   {
     "digest_text": "select user_id from db.sessions final where has(tags, ?) and duration > ?",
+    "fast_hash": "147258338975598444",
     "query_hash": "950780341107254336",
     "query_parameterized_hash": "15974401572989674766"
   },
   {
     "digest_text": "select name from `proj.dataset.users` where created_at > timestamp_sub(current_timestamp(), interval ? day) and country = @country",
+    "fast_hash": "11820891336210745212",
     "query_hash": "12684510420833331971",
     "query_parameterized_hash": "13383618901337201313"
   },
   {
     "digest_text": "select * from public.sales as s join public.stores as st on s.store_id = st.id where s.sale_date >= $? and st.region IN (?.. )",
+    "fast_hash": "15435039542539578407",
     "query_hash": "9666262025465025948",
     "query_parameterized_hash": "7250727525440258946"
   },
   {
     "digest_text": "select * from main.default.trips where pickup_date = date_sub(current_date(), ?) and fare_amount between ? and ?",
+    "fast_hash": "13664171391344766319",
     "query_hash": "1973795305451938938",
     "query_parameterized_hash": "7687918945247370556"
   },
   {
     "digest_text": "select * from \"awsdatacatalog\".\"logs\".\"cloudfront\" where year = ? and month = ? and status <> ?",
+    "fast_hash": "2633798226199730661",
     "query_hash": "17177314324993278337",
     "query_parameterized_hash": "15278334301249647019"
   },
   {
     "digest_text": "select t.k from (select o.region as k, o.amount from orders as o where o.amount > ?) as t where t.k = ?",
+    "fast_hash": "6335448767941572790",
     "query_hash": "1881834866582981853",
     "query_parameterized_hash": "8133714486908225258"
   },
   {
     "digest_text": "select id from a where x = ? union all select id from b where y = ?",
+    "fast_hash": "4109700976866222374",
     "query_hash": "16515501041809675976",
     "query_parameterized_hash": "16439405378910386310"
   },
   {
     "digest_text": "select e.name from emp as e join emp as m on e.manager_id = m.id where m.title = ?",
+    "fast_hash": "17028826275873705818",
     "query_hash": "10940394748573749527",
     "query_parameterized_hash": "10769739156199767574"
   },
   {
     "digest_text": "select * from shop.orders where created_at >= now() - interval ? hour and (status = ? or priority > ?)",
+    "fast_hash": "10858716363588778515",
     "query_hash": "13467492795339893348",
     "query_parameterized_hash": "11535773300766122362"
   },
   {
     "digest_text": "insert into agg.daily select dt, count(*) from raw.events where dt = cast(? as date) group by dt",
+    "fast_hash": "12239740293464140046",
     "query_hash": "3039151479714226403",
     "query_parameterized_hash": "6043343464328458450"
   },
   {
     "digest_text": "merge into dim.customers as t using staging.customers as s on t.id = s.id when matched then update set t.name = s.name when not matched then insert (id, name) values (s.id, s.name)",
+    "fast_hash": "11394206196605105350",
     "query_hash": "10153973914915357785",
     "query_parameterized_hash": "17493841752575681675"
   },
   {
     "digest_text": "select * from orders where date(created_at) = cast(? as date)",
+    "fast_hash": "4054630713538005529",
     "query_hash": "14612350658835517990",
     "query_parameterized_hash": "14455638766707938768"
   },
   {
     "digest_text": "with a as (select * from t1 where p = ?), b as (select a.* from a where q = ?) select * from b where r = ?",
+    "fast_hash": "11951926191946516659",
     "query_hash": "3175988422667510060",
     "query_parameterized_hash": "7611046659378415276"
   },
   {
     "digest_text": "select * from a where a.id not in (select b.aid from b) and a.deleted_at is ?",
+    "fast_hash": "9212041727657354169",
     "query_hash": "6915782890773424233",
     "query_parameterized_hash": "9126929660713534650"
   },
   {
     "digest_text": "select user_id from events join users on user_id = id where dt = ? and country = ?",
+    "fast_hash": "4284035841808294523",
     "query_hash": "17466871005244874673",
     "query_parameterized_hash": "7124249954946324647"
   },
   {
     "digest_text": "select * from staging.events where dt = ?",
+    "fast_hash": "6715323239717124404",
     "query_hash": "2049513795780572388",
     "query_parameterized_hash": "17209062065435218709"
   },
   {
     "digest_text": "select count(*) from orders as o join customers as c on o.cid = c.id where o.dt = cast(? as date)",
+    "fast_hash": "11365336738816260122",
     "query_hash": "13817559999783286827",
     "query_parameterized_hash": "7448706979155443769"
   },
   {
     "digest_text": "with o as (select * from orders where x = ?) select * from o where y = ?",
+    "fast_hash": "4796261322460843513",
     "query_hash": "12653114327570862005",
     "query_parameterized_hash": "18439994829563349128"
   },
   {
     "digest_text": "select lake.sales.orders.amount from lake.sales.orders where lake.sales.orders.dt = cast(? as date)",
+    "fast_hash": "11700703742925696937",
     "query_hash": "2760014351452763074",
     "query_parameterized_hash": "4266618496335996743"
   },
   {
     "digest_text": "select * from analytics.public.events where public.events.dt = ?",
+    "fast_hash": "349721043125751927",
     "query_hash": "17353660896270539433",
     "query_parameterized_hash": "5372729854220243185"
   },
   {
     "digest_text": "select * from sales.orders as s join crm.orders as c on s.id = c.id where status = ?",
+    "fast_hash": "14947338110359453107",
     "query_hash": "6422126332828428676",
     "query_parameterized_hash": "16682207172154402744"
   },
   {
     "digest_text": "select * from lake.sales.orders as a join warehouse.sales.orders as b on a.id = b.id where region = ?",
+    "fast_hash": "6531984328796744024",
     "query_hash": "3767752410264946634",
     "query_parameterized_hash": "6425477772963435030"
   },
   {
     "digest_text": "with t as (select o.customer_id, sum(o.amount * o.fx) as revenue from orders as o group by ?) select * from t where revenue > ?",
+    "fast_hash": "4981643759011195757",
     "query_hash": "18336492098073617371",
     "query_parameterized_hash": "1442918398445933224"
   },
   {
     "digest_text": "select * from (select s.store, rank() over (partition by s.region order by s.sales desc) as rk from stores as s) as x where rk <= ?",
+    "fast_hash": "3762199434962006246",
     "query_hash": "910932107488366979",
     "query_parameterized_hash": "13246110063505356211"
   },
   {
     "digest_text": "with sales as (select ws_sold_date_sk as sold_date_sk from web_sales union all select cs_sold_date_sk from catalog_sales) select * from sales as s join date_dim as d on s.sold_date_sk = d.d_date_sk where d.d_year = ? and s.sold_date_sk > ?",
+    "fast_hash": "15878328324489724576",
     "query_hash": "11863518173436889290",
     "query_parameterized_hash": "15341607418947450672"
   },
   {
     "digest_text": "select region, count(*) as c from orders group by region having count(*) > ? and region <> ?",
+    "fast_hash": "6568757020719936420",
     "query_hash": "10547744039985805110",
     "query_parameterized_hash": "5292703485182773248"
   },
   {
     "digest_text": "select * from page_views where ts > ? qualify row_number() over (partition by session_id order by ts desc) = ?",
+    "fast_hash": "6603584366452843648",
     "query_hash": "15905073537229685315",
     "query_parameterized_hash": "11380876984873710491"
   },
   {
     "digest_text": "merge into dim.customers as t using staging.customers as s on t.id = s.id when matched and s.deleted then delete when matched then update set t.name = s.name",
+    "fast_hash": "2964528786726634494",
     "query_hash": "17174718878792160143",
     "query_parameterized_hash": "11464941356135447595"
   },
   {
     "digest_text": "update shop.orders set status = ? where created_at < cast(? as date)",
+    "fast_hash": "7693564000316532845",
     "query_hash": "2358389435232372368",
     "query_parameterized_hash": "10852219663235070748"
   },
   {
     "digest_text": "update public.sales set price = p.price from public.prices as p where sales.sku = p.sku and p.region = ?",
+    "fast_hash": "14937979641778198675",
     "query_hash": "249527017731868418",
     "query_parameterized_hash": "2447018597568690407"
   },
   {
     "digest_text": "delete from shop.orders where status = ? and created_at < current_date - interval ? day",
+    "fast_hash": "9017247456482188056",
     "query_hash": "15513724016133918688",
     "query_parameterized_hash": "13909618161358799846"
   },
   {
     "digest_text": "create table agg.daily as select dt, count(*) as n from raw.events where dt > cast(? as date) group by dt",
+    "fast_hash": "9908973975351041106",
     "query_hash": "4140020953038456387",
     "query_parameterized_hash": "12312902074381322151"
   },
   {
     "digest_text": "insert overwrite table agg.daily select dt from raw.events where dt = ?",
+    "fast_hash": "7081342233098277969",
     "query_hash": "2604054294307345816",
     "query_parameterized_hash": "14916247674426701260"
   },
   {
     "digest_text": "select o.id from orders as o cross join unnest(o.items) as i(sku) where i.sku = ? and o.dt = cast(? as date)",
+    "fast_hash": "12137176675217736903",
     "query_hash": "11042200452368893459",
     "query_parameterized_hash": "11973322886476358551"
   },
   {
     "digest_text": "select * from orders where dt >= cast(? as date) - interval ? day",
+    "fast_hash": "13258202109753770026",
     "query_hash": "15596834707222652553",
     "query_parameterized_hash": "3949779682289678193"
   },
   {
     "digest_text": "select * from orders as o where exists(select ? from refunds as r where r.order_id = o.id and r.amount > ?)",
+    "fast_hash": "2907554177748121113",
     "query_hash": "7157116971874421752",
     "query_parameterized_hash": "16061557967478566572"
   },
   {
     "digest_text": "select l_returnflag, l_linestatus, sum(l_quantity) as sum_qty, sum(l_extendedprice) as sum_base_price, sum(l_extendedprice * (? - l_discount)) as sum_disc_price, sum(l_extendedprice * (? - l_discount) * (? + l_tax)) as sum_charge, avg(l_quantity) as avg_qty, avg(l_extendedprice) as avg_price, avg(l_discount) as avg_disc, count(*) as count_order from lineitem where cast(l_shipdate as date) <= cast(? as date) - interval ? day group by l_returnflag, l_linestatus order by l_returnflag, l_linestatus",
+    "fast_hash": "10876377436262458196",
     "query_hash": "1531343755903161768",
     "query_parameterized_hash": "15982061428347127400"
   },
   {
     "digest_text": "select s_acctbal, s_name, n_name, p_partkey, p_mfgr, s_address, s_phone, s_comment from part, supplier, partsupp, nation, region where p_partkey = ps_partkey and s_suppkey = ps_suppkey and p_size = ? and p_type like ? and s_nationkey = n_nationkey and n_regionkey = r_regionkey and r_name = ? and ps_supplycost = (select min(ps_supplycost) from partsupp, supplier, nation, region where p_partkey = ps_partkey and s_suppkey = ps_suppkey and s_nationkey = n_nationkey and n_regionkey = r_regionkey and r_name = ?) order by s_acctbal desc, n_name, s_name, p_partkey limit ?",
+    "fast_hash": "12523356737524854768",
     "query_hash": "9921347351952657798",
     "query_parameterized_hash": "215107047045501198"
   },
   {
     "digest_text": "select l_orderkey, sum(l_extendedprice * (? - l_discount)) as revenue, cast(o_orderdate as varchar) as o_orderdate, o_shippriority from customer, orders, lineitem where c_mktsegment = ? and c_custkey = o_custkey and l_orderkey = o_orderkey and o_orderdate < ? and l_shipdate > ? group by l_orderkey, o_orderdate, o_shippriority order by revenue desc, o_orderdate limit ?",
+    "fast_hash": "10154523842534341406",
     "query_hash": "2183231620048103288",
     "query_parameterized_hash": "16067041188558318832"
   },
   {
     "digest_text": "select o_orderpriority, count(*) as order_count from orders where cast(o_orderdate as date) >= cast(? as date) and cast(o_orderdate as date) < cast(? as date) + interval ? month and exists(select * from lineitem where l_orderkey = o_orderkey and l_commitdate < l_receiptdate) group by o_orderpriority order by o_orderpriority",
+    "fast_hash": "17262289490968938658",
     "query_hash": "5914940972215175942",
     "query_parameterized_hash": "16848196617658348357"
   },
   {
     "digest_text": "select n_name, sum(l_extendedprice * (? - l_discount)) as revenue from customer, orders, lineitem, supplier, nation, region where c_custkey = o_custkey and l_orderkey = o_orderkey and l_suppkey = s_suppkey and c_nationkey = s_nationkey and s_nationkey = n_nationkey and n_regionkey = r_regionkey and r_name = ? and cast(o_orderdate as date) >= cast(? as date) and cast(o_orderdate as date) < cast(? as date) + interval ? year group by n_name order by revenue desc",
+    "fast_hash": "2876994429263880019",
     "query_hash": "348519858499904033",
     "query_parameterized_hash": "11896302019497366288"
   },
   {
     "digest_text": "select sum(l_extendedprice * l_discount) as revenue from lineitem where cast(l_shipdate as date) >= cast(? as date) and cast(l_shipdate as date) < cast(? as date) + interval ? year and l_discount between ? - ? and ? + ? and l_quantity < ?",
+    "fast_hash": "15942639892190320360",
     "query_hash": "8720350425551248360",
     "query_parameterized_hash": "3767561977197750006"
   },
   {
     "digest_text": "select supp_nation, cust_nation, l_year, sum(volume) as revenue from (select n1.n_name as supp_nation, n2.n_name as cust_nation, extract(year from cast(l_shipdate as date)) as l_year, l_extendedprice * (? - l_discount) as volume from supplier, lineitem, orders, customer, nation as n1, nation as n2 where s_suppkey = l_suppkey and o_orderkey = l_orderkey and c_custkey = o_custkey and s_nationkey = n1.n_nationkey and c_nationkey = n2.n_nationkey and ((n1.n_name = ? and n2.n_name = ?) or (n1.n_name = ? and n2.n_name = ?)) and cast(l_shipdate as date) between cast(? as date) and cast(? as date)) as shipping group by supp_nation, cust_nation, l_year order by supp_nation, cust_nation, l_year",
+    "fast_hash": "14985474912226772472",
     "query_hash": "3144349509629043090",
     "query_parameterized_hash": "14064728311256909982"
   },
   {
     "digest_text": "select o_year, sum(case when nation = ? then volume else ? end) / sum(volume) as mkt_share from (select extract(year from cast(o_orderdate as date)) as o_year, l_extendedprice * (? - l_discount) as volume, n2.n_name as nation from part, supplier, lineitem, orders, customer, nation as n1, nation as n2, region where p_partkey = l_partkey and s_suppkey = l_suppkey and l_orderkey = o_orderkey and o_custkey = c_custkey and c_nationkey = n1.n_nationkey and n1.n_regionkey = r_regionkey and r_name = ? and s_nationkey = n2.n_nationkey and cast(o_orderdate as date) between cast(? as date) and cast(? as date) and p_type = ?) as all_nations group by o_year order by o_year",
+    "fast_hash": "10148313554731316182",
     "query_hash": "12641804046654388516",
     "query_parameterized_hash": "13565361467544049447"
   },
   {
     "digest_text": "select nation, o_year, sum(amount) as sum_profit from (select n_name as nation, extract(year from cast(o_orderdate as date)) as o_year, l_extendedprice * (? - l_discount) - ps_supplycost * l_quantity as amount from part, supplier, lineitem, partsupp, orders, nation where s_suppkey = l_suppkey and ps_suppkey = l_suppkey and ps_partkey = l_partkey and p_partkey = l_partkey and o_orderkey = l_orderkey and s_nationkey = n_nationkey and p_name like ?) as profit group by nation, o_year order by nation, o_year desc",
+    "fast_hash": "1911310302710905985",
     "query_hash": "3310063751255037529",
     "query_parameterized_hash": "16611753490371396348"
   },
   {
     "digest_text": "select c_custkey, c_name, sum(l_extendedprice * (? - l_discount)) as revenue, c_acctbal, n_name, c_address, c_phone, c_comment from customer, orders, lineitem, nation where c_custkey = o_custkey and l_orderkey = o_orderkey and cast(o_orderdate as date) >= cast(? as date) and cast(o_orderdate as date) < cast(? as date) + interval ? month and l_returnflag = ? and c_nationkey = n_nationkey group by c_custkey, c_name, c_acctbal, c_phone, n_name, c_address, c_comment order by revenue desc limit ?",
+    "fast_hash": "5859109492011787094",
     "query_hash": "12047426993081006649",
     "query_parameterized_hash": "10633164812992010431"
   },
   {
     "digest_text": "select ps_partkey, sum(ps_supplycost * ps_availqty) as value from partsupp, supplier, nation where ps_suppkey = s_suppkey and s_nationkey = n_nationkey and n_name = ? group by ps_partkey having sum(ps_supplycost * ps_availqty) > (select sum(ps_supplycost * ps_availqty) * ? from partsupp, supplier, nation where ps_suppkey = s_suppkey and s_nationkey = n_nationkey and n_name = ?) order by value desc",
+    "fast_hash": "15906556450539518231",
     "query_hash": "8194548415605154042",
     "query_parameterized_hash": "4395893103441276813"
   },
   {
     "digest_text": "select l_shipmode, sum(case when o_orderpriority = ? or o_orderpriority = ? then ? else ? end) as high_line_count, sum(case when o_orderpriority <> ? and o_orderpriority <> ? then ? else ? end) as low_line_count from orders, lineitem where o_orderkey = l_orderkey and l_shipmode IN (?.. ) and l_commitdate < l_receiptdate and l_shipdate < l_commitdate and cast(l_receiptdate as date) >= cast(? as date) and cast(l_receiptdate as date) < cast(? as date) + interval ? year group by l_shipmode order by l_shipmode",
+    "fast_hash": "8994080682633767448",
     "query_hash": "6737036754501440747",
     "query_parameterized_hash": "66020814790200273"
   },
   {
     "digest_text": "select c_count, count(*) as custdist from (select c_custkey, count(o_orderkey) from customer left outer join orders on c_custkey = o_custkey and o_comment not like ? group by c_custkey) as c_orders(c_custkey, c_count) group by c_count order by custdist desc, c_count desc",
+    "fast_hash": "15434349282617205376",
     "query_hash": "386652145710729516",
     "query_parameterized_hash": "15966834191348089963"
   },
   {
     "digest_text": "select ? * sum(case when p_type like ? then l_extendedprice * (? - l_discount) else ? end) / sum(l_extendedprice * (? - l_discount)) as promo_revenue from lineitem, part where l_partkey = p_partkey and cast(l_shipdate as date) >= cast(? as date) and cast(l_shipdate as date) < cast(? as date) + interval ? month",
+    "fast_hash": "10713525038790964363",
     "query_hash": "10289535596849683029",
     "query_parameterized_hash": "933446816985189206"
   },
   {
     "digest_text": "with revenue(supplier_no, total_revenue) as (select l_suppkey, sum(l_extendedprice * (? - l_discount)) from lineitem where cast(l_shipdate as date) >= cast(? as date) and cast(l_shipdate as date) < cast(? as date) + interval ? month group by l_suppkey) select s_suppkey, s_name, s_address, s_phone, total_revenue from supplier, revenue where s_suppkey = supplier_no and total_revenue = (select max(total_revenue) from revenue) order by s_suppkey",
+    "fast_hash": "17808218736900306318",
     "query_hash": "15000333700802928384",
     "query_parameterized_hash": "18115178432694883056"
   },
   {
     "digest_text": "select p_brand, p_type, p_size, count(distinct ps_suppkey) as supplier_cnt from partsupp, part where p_partkey = ps_partkey and p_brand <> ? and p_type not like ? and p_size IN (?.. ) and ps_suppkey not in (select s_suppkey from supplier where s_comment like ?) group by p_brand, p_type, p_size order by supplier_cnt desc, p_brand, p_type, p_size",
+    "fast_hash": "7365392253709769326",
     "query_hash": "13959247083124435807",
     "query_parameterized_hash": "8183671351059369822"
   },
   {
     "digest_text": "select sum(l_extendedprice) / ? as avg_yearly from lineitem, part where p_partkey = l_partkey and p_brand = ? and p_container = ? and l_quantity < (select ? * avg(l_quantity) from lineitem where l_partkey = p_partkey)",
+    "fast_hash": "8199682728434947714",
     "query_hash": "5946035476792398718",
     "query_parameterized_hash": "13044087536228985694"
   },
   {
     "digest_text": "select c_name, c_custkey, o_orderkey, o_orderdate, o_totalprice, sum(l_quantity) as total_quantity from customer, orders, lineitem where o_orderkey in (select l_orderkey from lineitem group by l_orderkey having sum(l_quantity) > ?) and c_custkey = o_custkey and o_orderkey = l_orderkey group by c_name, c_custkey, o_orderkey, o_orderdate, o_totalprice order by o_totalprice desc, o_orderdate limit ?",
+    "fast_hash": "16576480721460030205",
     "query_hash": "3716326013948163009",
     "query_parameterized_hash": "13363445255722314150"
   },
   {
     "digest_text": "select sum(l_extendedprice * (? - l_discount)) as revenue from lineitem, part where (p_partkey = l_partkey and p_brand = ? and p_container IN (?.. ) and l_quantity >= ? and l_quantity <= ? and p_size between ? and ? and l_shipmode IN (?.. ) and l_shipinstruct = ?) or (p_partkey = l_partkey and p_brand = ? and p_container IN (?.. ) and l_quantity >= ? and l_quantity <= ? and p_size between ? and ? and l_shipmode IN (?.. ) and l_shipinstruct = ?) or (p_partkey = l_partkey and p_brand = ? and p_container IN (?.. ) and l_quantity >= ? and l_quantity <= ? and p_size between ? and ? and l_shipmode IN (?.. ) and l_shipinstruct = ?)",
+    "fast_hash": "16781569565102502154",
     "query_hash": "1276068600762157352",
     "query_parameterized_hash": "5831138046968787006"
   },
   {
     "digest_text": "select s_name, s_address from supplier, nation where s_suppkey in (select ps_suppkey from partsupp where ps_partkey in (select p_partkey from part where p_name like ?) and ps_availqty > (select ? * sum(l_quantity) from lineitem where l_partkey = ps_partkey and l_suppkey = ps_suppkey and cast(l_shipdate as date) >= cast(? as date) and cast(l_shipdate as date) < cast(? as date) + interval ? year)) and s_nationkey = n_nationkey and n_name = ? order by s_name",
+    "fast_hash": "939073270231781134",
     "query_hash": "18315962032263586975",
     "query_parameterized_hash": "6887731040295160914"
   },
   {
     "digest_text": "select s_name, count(*) as numwait from supplier, lineitem as l1, orders, nation where s_suppkey = l1.l_suppkey and o_orderkey = l1.l_orderkey and o_orderstatus = ? and l1.l_receiptdate > l1.l_commitdate and exists(select * from lineitem as l2 where l2.l_orderkey = l1.l_orderkey and l2.l_suppkey <> l1.l_suppkey) and not exists(select * from lineitem as l3 where l3.l_orderkey = l1.l_orderkey and l3.l_suppkey <> l1.l_suppkey and l3.l_receiptdate > l3.l_commitdate) and s_nationkey = n_nationkey and n_name = ? group by s_name order by numwait desc, s_name limit ?",
+    "fast_hash": "16883205476123940394",
     "query_hash": "4444328404628685451",
     "query_parameterized_hash": "11483995957773881935"
   },
   {
     "digest_text": "select cntrycode, count(*) as numcust, sum(c_acctbal) as totacctbal from (select substr(c_phone, ?, ?) as cntrycode, c_acctbal from customer where substr(c_phone, ?, ?) IN (?.. ) and c_acctbal > (select avg(c_acctbal) from customer where c_acctbal > ? and substr(c_phone, ?, ?) IN (?.. )) and not exists(select * from orders where o_custkey = c_custkey)) as custsale group by cntrycode order by cntrycode",
+    "fast_hash": "7884264100496369223",
     "query_hash": "1585099162167844417",
     "query_parameterized_hash": "14524831531458887006"
   },
   {
     "digest_text": "with customer_total_return as (select sr_customer_sk as ctr_customer_sk, sr_store_sk as ctr_store_sk, sum(sr_return_amt) as ctr_total_return from store_returns, date_dim where sr_returned_date_sk = d_date_sk and d_year = ? group by sr_customer_sk, sr_store_sk) select c_customer_id from customer_total_return as ctr1, store, customer where ctr1.ctr_total_return > (select avg(ctr_total_return) * ? from customer_total_return as ctr2 where ctr1.ctr_store_sk = ctr2.ctr_store_sk) and s_store_sk = ctr1.ctr_store_sk and s_state = ? and ctr1.ctr_customer_sk = c_customer_sk order by c_customer_id limit ?",
+    "fast_hash": "2647613210665538410",
     "query_hash": "2917117776230097078",
     "query_parameterized_hash": "9330807327605928779"
   },
   {
     "digest_text": "with wscs as (select sold_date_sk, sales_price from ((select ws_sold_date_sk as sold_date_sk, ws_ext_sales_price as sales_price from web_sales) union all (select cs_sold_date_sk as sold_date_sk, cs_ext_sales_price as sales_price from catalog_sales))), wswscs as (select d_week_seq, sum(case when (d_day_name = ?) then sales_price else ? end) as sun_sales, sum(case when (d_day_name = ?) then sales_price else ? end) as mon_sales, sum(case when (d_day_name = ?) then sales_price else ? end) as tue_sales, sum(case when (d_day_name = ?) then sales_price else ? end) as wed_sales, sum(case when (d_day_name = ?) then sales_price else ? end) as thu_sales, sum(case when (d_day_name = ?) then sales_price else ? end) as fri_sales, sum(case when (d_day_name = ?) then sales_price else ? end) as sat_sales from wscs, date_dim where d_date_sk = sold_date_sk group by d_week_seq) select d_week_seq1, round(sun_sales1 / sun_sales2, ?) as \"_col_1\", round(mon_sales1 / mon_sales2, ?) as \"_col_2\", round(tue_sales1 / tue_sales2, ?) as \"_col_3\", round(wed_sales1 / wed_sales2, ?) as \"_col_4\", round(thu_sales1 / thu_sales2, ?) as \"_col_5\", round(fri_sales1 / fri_sales2, ?) as \"_col_6\", round(sat_sales1 / sat_sales2, ?) as \"_col_7\" from (select wswscs.d_week_seq as d_week_seq1, sun_sales as sun_sales1, mon_sales as mon_sales1, tue_sales as tue_sales1, wed_sales as wed_sales1, thu_sales as thu_sales1, fri_sales as fri_sales1, sat_sales as sat_sales1 from wswscs, date_dim where date_dim.d_week_seq = wswscs.d_week_seq and d_year = ?) as y, (select wswscs.d_week_seq as d_week_seq2, sun_sales as sun_sales2, mon_sales as mon_sales2, tue_sales as tue_sales2, wed_sales as wed_sales2, thu_sales as thu_sales2, fri_sales as fri_sales2, sat_sales as sat_sales2 from wswscs, date_dim where date_dim.d_week_seq = wswscs.d_week_seq and d_year = ? + ?) as z where d_week_seq1 = d_week_seq2 - ? order by d_week_seq1",
+    "fast_hash": "14324327675346833518",
     "query_hash": "17651442682100817585",
     "query_parameterized_hash": "4918211278904816830"
   },
   {
     "digest_text": "select dt.d_year, item.i_brand_id as brand_id, item.i_brand as brand, sum(ss_ext_discount_amt) as sum_agg from date_dim as dt, store_sales, item where dt.d_date_sk = store_sales.ss_sold_date_sk and store_sales.ss_item_sk = item.i_item_sk and item.i_manufact_id = ? and dt.d_moy = ? group by dt.d_year, item.i_brand, item.i_brand_id order by dt.d_year, sum_agg desc, brand_id limit ?",
+    "fast_hash": "15738190311824937039",
     "query_hash": "4459824432095593928",
     "query_parameterized_hash": "3708152922665563621"
   },
   {
     "digest_text": "with year_total as (select c_customer_id as customer_id, c_first_name as customer_first_name, c_last_name as customer_last_name, c_preferred_cust_flag as customer_preferred_cust_flag, c_birth_country as customer_birth_country, c_login as customer_login, c_email_address as customer_email_address, d_year as dyear, sum(((ss_ext_list_price - ss_ext_wholesale_cost - ss_ext_discount_amt) + ss_ext_sales_price) / ?) as year_total, ? as sale_type from customer, store_sales, date_dim where c_customer_sk = ss_customer_sk and ss_sold_date_sk = d_date_sk group by c_customer_id, c_first_name, c_last_name, c_preferred_cust_flag, c_birth_country, c_login, c_email_address, d_year union all select c_customer_id as customer_id, c_first_name as customer_first_name, c_last_name as customer_last_name, c_preferred_cust_flag as customer_preferred_cust_flag, c_birth_country as customer_birth_country, c_login as customer_login, c_email_address as customer_email_address, d_year as dyear, sum((((cs_ext_list_price - cs_ext_wholesale_cost - cs_ext_discount_amt) + cs_ext_sales_price) / ?)) as year_total, ? as sale_type from customer, catalog_sales, date_dim where c_customer_sk = cs_bill_customer_sk and cs_sold_date_sk = d_date_sk group by c_customer_id, c_first_name, c_last_name, c_preferred_cust_flag, c_birth_country, c_login, c_email_address, d_year union all select c_customer_id as customer_id, c_first_name as customer_first_name, c_last_name as customer_last_name, c_preferred_cust_flag as customer_preferred_cust_flag, c_birth_country as customer_birth_country, c_login as customer_login, c_email_address as customer_email_address, d_year as dyear, sum((((ws_ext_list_price - ws_ext_wholesale_cost - ws_ext_discount_amt) + ws_ext_sales_price) / ?)) as year_total, ? as sale_type from customer, web_sales, date_dim where c_customer_sk = ws_bill_customer_sk and ws_sold_date_sk = d_date_sk group by c_customer_id, c_first_name, c_last_name, c_preferred_cust_flag, c_birth_country, c_login, c_email_address, d_year) select t_s_secyear.customer_id, t_s_secyear.customer_first_name, t_s_secyear.customer_last_name, t_s_secyear.customer_preferred_cust_flag from year_total as t_s_firstyear, year_total as t_s_secyear, year_total as t_c_firstyear, year_total as t_c_secyear, year_total as t_w_firstyear, year_total as t_w_secyear where t_s_secyear.customer_id = t_s_firstyear.customer_id and t_s_firstyear.customer_id = t_c_secyear.customer_id and t_s_firstyear.customer_id = t_c_firstyear.customer_id and t_s_firstyear.customer_id = t_w_firstyear.customer_id and t_s_firstyear.customer_id = t_w_secyear.customer_id and t_s_firstyear.sale_type = ? and t_c_firstyear.sale_type = ? and t_w_firstyear.sale_type = ? and t_s_secyear.sale_type = ? and t_c_secyear.sale_type = ? and t_w_secyear.sale_type = ? and t_s_firstyear.dyear = ? and t_s_secyear.dyear = ? + ? and t_c_firstyear.dyear = ? and t_c_secyear.dyear = ? + ? and t_w_firstyear.dyear = ? and t_w_secyear.dyear = ? + ? and t_s_firstyear.year_total > ? and t_c_firstyear.year_total > ? and t_w_firstyear.year_total > ? and case when t_c_firstyear.year_total > ? then t_c_secyear.year_total / t_c_firstyear.year_total else ? end > case when t_s_firstyear.year_total > ? then t_s_secyear.year_total / t_s_firstyear.year_total else ? end and case when t_c_firstyear.year_total > ? then t_c_secyear.year_total / t_c_firstyear.year_total else ? end > case when t_w_firstyear.year_total > ? then t_w_secyear.year_total / t_w_firstyear.year_total else ? end order by t_s_secyear.customer_id, t_s_secyear.customer_first_name, t_s_secyear.customer_last_name, t_s_secyear.customer_preferred_cust_flag limit ?",
+    "fast_hash": "7096282663028562198",
     "query_hash": "9854150984326379429",
     "query_parameterized_hash": "14544987957006979240"
   },
   {
     "digest_text": "with ssr as (select s_store_id, sum(sales_price) as sales, sum(profit) as profit, sum(return_amt) as returns1, sum(net_loss) as profit_loss from (select ss_store_sk as store_sk, ss_sold_date_sk as date_sk, ss_ext_sales_price as sales_price, ss_net_profit as profit, cast(? as decimal(?, ?)) as return_amt, cast(? as decimal(?, ?)) as net_loss from store_sales union all select sr_store_sk as store_sk, sr_returned_date_sk as date_sk, cast(? as decimal(?, ?)) as sales_price, cast(? as decimal(?, ?)) as profit, sr_return_amt as return_amt, sr_net_loss as net_loss from store_returns) as salesreturns, date_dim, store where date_sk = d_date_sk and d_date between cast(? as date) and (cast(? as date) + interval ? day) and store_sk = s_store_sk group by s_store_id), csr as (select cp_catalog_page_id, sum(sales_price) as sales, sum(profit) as profit, sum(return_amt) as returns1, sum(net_loss) as profit_loss from (select cs_catalog_page_sk as page_sk, cs_sold_date_sk as date_sk, cs_ext_sales_price as sales_price, cs_net_profit as profit, cast(? as decimal(?, ?)) as return_amt, cast(? as decimal(?, ?)) as net_loss from catalog_sales union all select cr_catalog_page_sk as page_sk, cr_returned_date_sk as date_sk, cast(? as decimal(?, ?)) as sales_price, cast(? as decimal(?, ?)) as profit, cr_return_amount as return_amt, cr_net_loss as net_loss from catalog_returns) as salesreturns, date_dim, catalog_page where date_sk = d_date_sk and d_date between cast(? as date) and (cast(? as date) + interval ? day) and page_sk = cp_catalog_page_sk group by cp_catalog_page_id), wsr as (select web_site_id, sum(sales_price) as sales, sum(profit) as profit, sum(return_amt) as returns1, sum(net_loss) as profit_loss from (select ws_web_site_sk as wsr_web_site_sk, ws_sold_date_sk as date_sk, ws_ext_sales_price as sales_price, ws_net_profit as profit, cast(? as decimal(?, ?)) as return_amt, cast(? as decimal(?, ?)) as net_loss from web_sales union all select ws_web_site_sk as wsr_web_site_sk, wr_returned_date_sk as date_sk, cast(? as decimal(?, ?)) as sales_price, cast(? as decimal(?, ?)) as profit, wr_return_amt as return_amt, wr_net_loss as net_loss from web_returns left outer join web_sales on (wr_item_sk = ws_item_sk and wr_order_number = ws_order_number)) as salesreturns, date_dim, web_site where date_sk = d_date_sk and d_date between cast(? as date) and (cast(? as date) + interval ? day) and wsr_web_site_sk = web_site_sk group by web_site_id) select channel, id, sum(sales) as sales, sum(returns1) as returns1, sum(profit) as profit from (select ? as channel, ? || s_store_id as id, sales, returns1, (profit - profit_loss) as profit from ssr union all select ? as channel, ? || cp_catalog_page_id as id, sales, returns1, (profit - profit_loss) as profit from csr union all select ? as channel, ? || web_site_id as id, sales, returns1, (profit - profit_loss) as profit from wsr) as x group by rollup (channel, id) order by channel, id limit ?",
+    "fast_hash": "7584036997159458822",
     "query_hash": "14338793487361367732",
     "query_parameterized_hash": "1284142886015964568"
   },
   {
     "digest_text": "select a.ca_state as state, count(*) as cnt from customer_address as a, customer as c, store_sales as s, date_dim as d, item as i where a.ca_address_sk = c.c_current_addr_sk and c.c_customer_sk = s.ss_customer_sk and s.ss_sold_date_sk = d.d_date_sk and s.ss_item_sk = i.i_item_sk and d.d_month_seq = (select distinct (d_month_seq) from date_dim where d_year = ? and d_moy = ?) and i.i_current_price > ? * (select avg(j.i_current_price) from item as j where j.i_category = i.i_category) group by a.ca_state having count(*) >= ? order by cnt limit ?",
+    "fast_hash": "3534114514362146978",
     "query_hash": "14252249011615621993",
     "query_parameterized_hash": "3298653001875591274"
   },
   {
     "digest_text": "select i_item_id, avg(ss_quantity) as agg1, avg(ss_list_price) as agg2, avg(ss_coupon_amt) as agg3, avg(ss_sales_price) as agg4 from store_sales, customer_demographics, date_dim, item, promotion where ss_sold_date_sk = d_date_sk and ss_item_sk = i_item_sk and ss_cdemo_sk = cd_demo_sk and ss_promo_sk = p_promo_sk and cd_gender = ? and cd_marital_status = ? and cd_education_status = ? and (p_channel_email = ? or p_channel_event = ?) and d_year = ? group by i_item_id order by i_item_id limit ?",
+    "fast_hash": "5308610385562162562",
     "query_hash": "5275162506423644435",
     "query_parameterized_hash": "6526342932603308910"
   },
   {
     "digest_text": "select s_store_name, sum(ss_net_profit) from store_sales, date_dim, store, (select ca_zip from (select substr(ca_zip, ?, ?) as ca_zip from customer_address where substr(ca_zip, ?, ?) IN (?.. ) intersect select ca_zip from (select substr(ca_zip, ?, ?) as ca_zip, count(*) as cnt from customer_address, customer where ca_address_sk = c_current_addr_sk and c_preferred_cust_flag = ? group by ca_zip having count(*) > ?) as a1) as a2) as v1 where ss_store_sk = s_store_sk and ss_sold_date_sk = d_date_sk and d_qoy = ? and d_year = ? and (substr(s_zip, ?, ?) = substr(v1.ca_zip, ?, ?)) group by s_store_name order by s_store_name limit ?",
+    "fast_hash": "11430769527831379211",
     "query_hash": "6970795301950216609",
     "query_parameterized_hash": "13544756349115689124"
   },
   {
     "digest_text": "select case when (select count(*) from store_sales where ss_quantity between ? and ?) > ? then (select avg(ss_ext_list_price) from store_sales where ss_quantity between ? and ?) else (select avg(ss_net_profit) from store_sales where ss_quantity between ? and ?) end as bucket1, case when (select count(*) from store_sales where ss_quantity between ? and ?) > ? then (select avg(ss_ext_list_price) from store_sales where ss_quantity between ? and ?) else (select avg(ss_net_profit) from store_sales where ss_quantity between ? and ?) end as bucket2, case when (select count(*) from store_sales where ss_quantity between ? and ?) > ? then (select avg(ss_ext_list_price) from store_sales where ss_quantity between ? and ?) else (select avg(ss_net_profit) from store_sales where ss_quantity between ? and ?) end as bucket3, case when (select count(*) from store_sales where ss_quantity between ? and ?) > ? then (select avg(ss_ext_list_price) from store_sales where ss_quantity between ? and ?) else (select avg(ss_net_profit) from store_sales where ss_quantity between ? and ?) end as bucket4, case when (select count(*) from store_sales where ss_quantity between ? and ?) > ? then (select avg(ss_ext_list_price) from store_sales where ss_quantity between ? and ?) else (select avg(ss_net_profit) from store_sales where ss_quantity between ? and ?) end as bucket5 from reason where r_reason_sk = ?",
+    "fast_hash": "15275615691104009271",
     "query_hash": "13681539539905776343",
     "query_parameterized_hash": "14754902029230384683"
   },
   {
     "digest_text": "select cd_gender, cd_marital_status, cd_education_status, count(*) as cnt1, cd_purchase_estimate, count(*) as cnt2, cd_credit_rating, count(*) as cnt3, cd_dep_count, count(*) as cnt4, cd_dep_employed_count, count(*) as cnt5, cd_dep_college_count, count(*) as cnt6 from customer as c, customer_address as ca, customer_demographics where c.c_current_addr_sk = ca.ca_address_sk and ca_county IN (?.. ) and cd_demo_sk = c.c_current_cdemo_sk and exists(select * from store_sales, date_dim where c.c_customer_sk = ss_customer_sk and ss_sold_date_sk = d_date_sk and d_year = ? and d_moy between ? and ? + ?) and (exists(select * from web_sales, date_dim where c.c_customer_sk = ws_bill_customer_sk and ws_sold_date_sk = d_date_sk and d_year = ? and d_moy between ? and ? + ?) or exists(select * from catalog_sales, date_dim where c.c_customer_sk = cs_ship_customer_sk and cs_sold_date_sk = d_date_sk and d_year = ? and d_moy between ? and ? + ?)) group by cd_gender, cd_marital_status, cd_education_status, cd_purchase_estimate, cd_credit_rating, cd_dep_count, cd_dep_employed_count, cd_dep_college_count order by cd_gender, cd_marital_status, cd_education_status, cd_purchase_estimate, cd_credit_rating, cd_dep_count, cd_dep_employed_count, cd_dep_college_count limit ?",
+    "fast_hash": "5625092190695183726",
     "query_hash": "13166134135495948781",
     "query_parameterized_hash": "16294178300482270796"
   },
   {
     "digest_text": "with year_total as (select c_customer_id as customer_id, c_first_name as customer_first_name, c_last_name as customer_last_name, c_preferred_cust_flag as customer_preferred_cust_flag, c_birth_country as customer_birth_country, c_login as customer_login, c_email_address as customer_email_address, d_year as dyear, sum(ss_ext_list_price - ss_ext_discount_amt) as year_total, ? as sale_type from customer, store_sales, date_dim where c_customer_sk = ss_customer_sk and ss_sold_date_sk = d_date_sk group by c_customer_id, c_first_name, c_last_name, c_preferred_cust_flag, c_birth_country, c_login, c_email_address, d_year union all select c_customer_id as customer_id, c_first_name as customer_first_name, c_last_name as customer_last_name, c_preferred_cust_flag as customer_preferred_cust_flag, c_birth_country as customer_birth_country, c_login as customer_login, c_email_address as customer_email_address, d_year as dyear, sum(ws_ext_list_price - ws_ext_discount_amt) as year_total, ? as sale_type from customer, web_sales, date_dim where c_customer_sk = ws_bill_customer_sk and ws_sold_date_sk = d_date_sk group by c_customer_id, c_first_name, c_last_name, c_preferred_cust_flag, c_birth_country, c_login, c_email_address, d_year) select t_s_secyear.customer_id, t_s_secyear.customer_first_name, t_s_secyear.customer_last_name, t_s_secyear.customer_birth_country from year_total as t_s_firstyear, year_total as t_s_secyear, year_total as t_w_firstyear, year_total as t_w_secyear where t_s_secyear.customer_id = t_s_firstyear.customer_id and t_s_firstyear.customer_id = t_w_secyear.customer_id and t_s_firstyear.customer_id = t_w_firstyear.customer_id and t_s_firstyear.sale_type = ? and t_w_firstyear.sale_type = ? and t_s_secyear.sale_type = ? and t_w_secyear.sale_type = ? and t_s_firstyear.dyear = ? and t_s_secyear.dyear = ? + ? and t_w_firstyear.dyear = ? and t_w_secyear.dyear = ? + ? and t_s_firstyear.year_total > ? and t_w_firstyear.year_total > ? and case when t_w_firstyear.year_total > ? then t_w_secyear.year_total / t_w_firstyear.year_total else ? end > case when t_s_firstyear.year_total > ? then t_s_secyear.year_total / t_s_firstyear.year_total else ? end order by t_s_secyear.customer_id, t_s_secyear.customer_first_name, t_s_secyear.customer_last_name, t_s_secyear.customer_birth_country limit ?",
+    "fast_hash": "7842900968819283343",
     "query_hash": "9772322765239224582",
     "query_parameterized_hash": "10087245783155293304"
   },
   {
     "digest_text": "select i_item_id, i_item_desc, i_category, i_class, i_current_price, sum(ws_ext_sales_price) as itemrevenue, sum(ws_ext_sales_price) * ? / sum(sum(ws_ext_sales_price)) over (partition by i_class) as revenueratio from web_sales, item, date_dim where ws_item_sk = i_item_sk and i_category IN (?.. ) and ws_sold_date_sk = d_date_sk and d_date between cast(? as date) and (cast(? as date) + interval ? day) group by i_item_id, i_item_desc, i_category, i_class, i_current_price order by i_category, i_class, i_item_id, i_item_desc, revenueratio limit ?",
+    "fast_hash": "585678971674758941",
     "query_hash": "9906827333455342759",
     "query_parameterized_hash": "7922714699480836070"
   },
   {
     "digest_text": "select avg(ss_quantity), avg(ss_ext_sales_price), avg(ss_ext_wholesale_cost), sum(ss_ext_wholesale_cost) from store_sales, store, customer_demographics, household_demographics, customer_address, date_dim where s_store_sk = ss_store_sk and ss_sold_date_sk = d_date_sk and d_year = ? and ((ss_hdemo_sk = hd_demo_sk and cd_demo_sk = ss_cdemo_sk and cd_marital_status = ? and cd_education_status = ? and ss_sales_price between ? and ? and hd_dep_count = ?) or (ss_hdemo_sk = hd_demo_sk and cd_demo_sk = ss_cdemo_sk and cd_marital_status = ? and cd_education_status = ? and ss_sales_price between ? and ? and hd_dep_count = ?) or (ss_hdemo_sk = hd_demo_sk and cd_demo_sk = ss_cdemo_sk and cd_marital_status = ? and cd_education_status = ? and ss_sales_price between ? and ? and hd_dep_count = ?)) and ((ss_addr_sk = ca_address_sk and ca_country = ? and ca_state IN (?.. ) and ss_net_profit between ? and ?) or (ss_addr_sk = ca_address_sk and ca_country = ? and ca_state IN (?.. ) and ss_net_profit between ? and ?) or (ss_addr_sk = ca_address_sk and ca_country = ? and ca_state IN (?.. ) and ss_net_profit between ? and ?))",
+    "fast_hash": "3544297635302914616",
     "query_hash": "9406171860086569068",
     "query_parameterized_hash": "2606098703706033310"
   },
   {
     "digest_text": "with cross_items as (select i_item_sk as ss_item_sk from item, (select iss.i_brand_id as brand_id, iss.i_class_id as class_id, iss.i_category_id as category_id from store_sales, item as iss, date_dim as d1 where ss_item_sk = iss.i_item_sk and ss_sold_date_sk = d1.d_date_sk and d1.d_year between ? and ? + ? intersect select ics.i_brand_id, ics.i_class_id, ics.i_category_id from catalog_sales, item as ics, date_dim as d2 where cs_item_sk = ics.i_item_sk and cs_sold_date_sk = d2.d_date_sk and d2.d_year between ? and ? + ? intersect select iws.i_brand_id, iws.i_class_id, iws.i_category_id from web_sales, item as iws, date_dim as d3 where ws_item_sk = iws.i_item_sk and ws_sold_date_sk = d3.d_date_sk and d3.d_year between ? and ? + ?) where i_brand_id = brand_id and i_class_id = class_id and i_category_id = category_id), avg_sales as (select avg(quantity * list_price) as average_sales from (select ss_quantity as quantity, ss_list_price as list_price from store_sales, date_dim where ss_sold_date_sk = d_date_sk and d_year between ? and ? + ? union all select cs_quantity as quantity, cs_list_price as list_price from catalog_sales, date_dim where cs_sold_date_sk = d_date_sk and d_year between ? and ? + ? union all select ws_quantity as quantity, ws_list_price as list_price from web_sales, date_dim where ws_sold_date_sk = d_date_sk and d_year between ? and ? + ?) as x) select channel, i_brand_id, i_class_id, i_category_id, sum(sales), sum(number_sales) from (select ? as channel, i_brand_id, i_class_id, i_category_id, sum(ss_quantity * ss_list_price) as sales, count(*) as number_sales from store_sales, item, date_dim where ss_item_sk in (select ss_item_sk from cross_items) and ss_item_sk = i_item_sk and ss_sold_date_sk = d_date_sk and d_year = ? + ? and d_moy = ? group by i_brand_id, i_class_id, i_category_id having sum(ss_quantity * ss_list_price) > (select average_sales from avg_sales) union all select ? as channel, i_brand_id, i_class_id, i_category_id, sum(cs_quantity * cs_list_price) as sales, count(*) as number_sales from catalog_sales, item, date_dim where cs_item_sk in (select ss_item_sk from cross_items) and cs_item_sk = i_item_sk and cs_sold_date_sk = d_date_sk and d_year = ? + ? and d_moy = ? group by i_brand_id, i_class_id, i_category_id having sum(cs_quantity * cs_list_price) > (select average_sales from avg_sales) union all select ? as channel, i_brand_id, i_class_id, i_category_id, sum(ws_quantity * ws_list_price) as sales, count(*) as number_sales from web_sales, item, date_dim where ws_item_sk in (select ss_item_sk from cross_items) and ws_item_sk = i_item_sk and ws_sold_date_sk = d_date_sk and d_year = ? + ? and d_moy = ? group by i_brand_id, i_class_id, i_category_id having sum(ws_quantity * ws_list_price) > (select average_sales from avg_sales)) as y group by rollup (channel, i_brand_id, i_class_id, i_category_id) order by channel, i_brand_id, i_class_id, i_category_id limit ?",
+    "fast_hash": "5621083746839862395",
     "query_hash": "9010919355345274537",
     "query_parameterized_hash": "2106146769025870028"
   },
   {
     "digest_text": "select ca_zip, sum(cs_sales_price) as \"_col_1\" from catalog_sales, customer, customer_address, date_dim where cs_bill_customer_sk = c_customer_sk and c_current_addr_sk = ca_address_sk and (substr(ca_zip, ?, ?) IN (?.. ) or ca_state IN (?.. ) or cs_sales_price > ?) and cs_sold_date_sk = d_date_sk and d_qoy = ? and d_year = ? group by ca_zip order by ca_zip limit ?",
+    "fast_hash": "15034736880041718258",
     "query_hash": "12847677469356431520",
     "query_parameterized_hash": "9479096586460392132"
   },
   {
     "digest_text": "select count(distinct cs_order_number) as \"order count\", sum(cs_ext_ship_cost) as \"total shipping cost\", sum(cs_net_profit) as \"total net profit\" from catalog_sales as cs1, date_dim, customer_address, call_center where d_date between ? and (cast(? as date) + interval ? day) and cs1.cs_ship_date_sk = d_date_sk and cs1.cs_ship_addr_sk = ca_address_sk and ca_state = ? and cs1.cs_call_center_sk = cc_call_center_sk and cc_county IN (?.. ) and exists(select * from catalog_sales as cs2 where cs1.cs_order_number = cs2.cs_order_number and cs1.cs_warehouse_sk <> cs2.cs_warehouse_sk) and not exists(select * from catalog_returns as cr1 where cs1.cs_order_number = cr1.cr_order_number) order by count(distinct cs_order_number) limit ?",
+    "fast_hash": "14023269787320952035",
     "query_hash": "3567189645295153688",
     "query_parameterized_hash": "12659164152507330535"
   },
   {
     "digest_text": "select i_item_id, i_item_desc, s_state, count(ss_quantity) as store_sales_quantitycount, avg(ss_quantity) as store_sales_quantityave, stddev_samp(ss_quantity) as store_sales_quantitystdev, stddev_samp(ss_quantity) / avg(ss_quantity) as store_sales_quantitycov, count(sr_return_quantity) as store_returns_quantitycount, avg(sr_return_quantity) as store_returns_quantityave, stddev_samp(sr_return_quantity) as store_returns_quantitystdev, stddev_samp(sr_return_quantity) / avg(sr_return_quantity) as store_returns_quantitycov, count(cs_quantity) as catalog_sales_quantitycount, avg(cs_quantity) as catalog_sales_quantityave, stddev_samp(cs_quantity) / avg(cs_quantity) as catalog_sales_quantitystdev, stddev_samp(cs_quantity) / avg(cs_quantity) as catalog_sales_quantitycov from store_sales, store_returns, catalog_sales, date_dim as d1, date_dim as d2, date_dim as d3, store, item where d1.d_quarter_name = ? and d1.d_date_sk = ss_sold_date_sk and i_item_sk = ss_item_sk and s_store_sk = ss_store_sk and ss_customer_sk = sr_customer_sk and ss_item_sk = sr_item_sk and ss_ticket_number = sr_ticket_number and sr_returned_date_sk = d2.d_date_sk and d2.d_quarter_name IN (?.. ) and sr_customer_sk = cs_bill_customer_sk and sr_item_sk = cs_item_sk and cs_sold_date_sk = d3.d_date_sk and d3.d_quarter_name IN (?.. ) group by i_item_id, i_item_desc, s_state order by i_item_id, i_item_desc, s_state limit ?",
+    "fast_hash": "5339695571204351144",
     "query_hash": "609262942076203171",
     "query_parameterized_hash": "813857932542952607"
   },
   {
     "digest_text": "select i_item_id, ca_country, ca_state, ca_county, avg(cast(cs_quantity as decimal(?, ?))) as agg1, avg(cast(cs_list_price as decimal(?, ?))) as agg2, avg(cast(cs_coupon_amt as decimal(?, ?))) as agg3, avg(cast(cs_sales_price as decimal(?, ?))) as agg4, avg(cast(cs_net_profit as decimal(?, ?))) as agg5, avg(cast(c_birth_year as decimal(?, ?))) as agg6, avg(cast(cd1.cd_dep_count as decimal(?, ?))) as agg7 from catalog_sales, customer_demographics as cd1, customer_demographics as cd2, customer, customer_address, date_dim, item where cs_sold_date_sk = d_date_sk and cs_item_sk = i_item_sk and cs_bill_cdemo_sk = cd1.cd_demo_sk and cs_bill_customer_sk = c_customer_sk and cd1.cd_gender = ? and cd1.cd_education_status = ? and c_current_cdemo_sk = cd2.cd_demo_sk and c_current_addr_sk = ca_address_sk and c_birth_month IN (?.. ) and d_year = ? and ca_state IN (?.. ) group by rollup (i_item_id, ca_country, ca_state, ca_county) order by ca_country, ca_state, ca_county, i_item_id limit ?",
+    "fast_hash": "5294910799772088105",
     "query_hash": "14060601049198619485",
     "query_parameterized_hash": "1949926970946191569"
   },
   {
     "digest_text": "select i_brand_id as brand_id, i_brand as brand, i_manufact_id, i_manufact, sum(ss_ext_sales_price) as ext_price from date_dim, store_sales, item, customer, customer_address, store where d_date_sk = ss_sold_date_sk and ss_item_sk = i_item_sk and i_manager_id = ? and d_moy = ? and d_year = ? and ss_customer_sk = c_customer_sk and c_current_addr_sk = ca_address_sk and substr(ca_zip, ?, ?) <> substr(s_zip, ?, ?) and ss_store_sk = s_store_sk group by i_brand, i_brand_id, i_manufact_id, i_manufact order by ext_price desc, i_brand, i_brand_id, i_manufact_id, i_manufact limit ?",
+    "fast_hash": "17747687132419268155",
     "query_hash": "12055772420293378724",
     "query_parameterized_hash": "4329137000514212810"
   },
   {
     "digest_text": "select i_item_id, i_item_desc, i_category, i_class, i_current_price, sum(cs_ext_sales_price) as itemrevenue, sum(cs_ext_sales_price) * ? / sum(sum(cs_ext_sales_price)) over (partition by i_class) as revenueratio from catalog_sales, item, date_dim where cs_item_sk = i_item_sk and i_category IN (?.. ) and cs_sold_date_sk = d_date_sk and d_date between cast(? as date) and (cast(? as date) + interval ? day) group by i_item_id, i_item_desc, i_category, i_class, i_current_price order by i_category, i_class, i_item_id, i_item_desc, revenueratio limit ?",
+    "fast_hash": "1838299363702577224",
     "query_hash": "683667735946739665",
     "query_parameterized_hash": "9893468277464829301"
   },
   {
     "digest_text": "select * from (select w_warehouse_name, i_item_id, sum(case when (cast(d_date as date) < cast(? as date)) then inv_quantity_on_hand else ? end) as inv_before, sum(case when (cast(d_date as date) >= cast(? as date)) then inv_quantity_on_hand else ? end) as inv_after from inventory, warehouse, item, date_dim where i_current_price between ? and ? and i_item_sk = inv_item_sk and inv_warehouse_sk = w_warehouse_sk and inv_date_sk = d_date_sk and d_date between (cast(? as date) - interval ? day) and (cast(? as date) + interval ? day) group by w_warehouse_name, i_item_id) as x where (case when inv_before > ? then inv_after / inv_before else ? end) between ? / ? and ? / ? order by w_warehouse_name, i_item_id limit ?",
+    "fast_hash": "9638841872655447556",
     "query_hash": "404361467171543243",
     "query_parameterized_hash": "6976745651820852164"
   },
   {
     "digest_text": "select i_product_name, i_brand, i_class, i_category, avg(inv_quantity_on_hand) as qoh from inventory, date_dim, item, warehouse where inv_date_sk = d_date_sk and inv_item_sk = i_item_sk and inv_warehouse_sk = w_warehouse_sk and d_month_seq between ? and ? + ? group by rollup (i_product_name, i_brand, i_class, i_category) order by qoh, i_product_name, i_brand, i_class, i_category limit ?",
+    "fast_hash": "6288348009012727577",
     "query_hash": "9925354591959087279",
     "query_parameterized_hash": "1597417028835083993"
   },
   {
     "digest_text": "with frequent_ss_items as (select substr(i_item_desc, ?, ?) as itemdesc, i_item_sk as item_sk, d_date as solddate, count(*) as cnt from store_sales, date_dim, item where ss_sold_date_sk = d_date_sk and ss_item_sk = i_item_sk and d_year in (?, ? + ?, ? + ?, ? + ?) group by substr(i_item_desc, ?, ?), i_item_sk, d_date having count(*) > ?), max_store_sales as (select max(csales) as tpcds_cmax from (select c_customer_sk, sum(ss_quantity * ss_sales_price) as csales from store_sales, customer, date_dim where ss_customer_sk = c_customer_sk and ss_sold_date_sk = d_date_sk and d_year in (?, ? + ?, ? + ?, ? + ?) group by c_customer_sk)), best_ss_customer as (select c_customer_sk, sum(ss_quantity * ss_sales_price) as ssales from store_sales, customer where ss_customer_sk = c_customer_sk group by c_customer_sk having sum(ss_quantity * ss_sales_price) > (? / ?) * (select * from max_store_sales)) select sum(sales) as \"_col_0\" from (select cs_quantity * cs_list_price as sales from catalog_sales, date_dim where d_year = ? and d_moy = ? and cs_sold_date_sk = d_date_sk and cs_item_sk in (select item_sk from frequent_ss_items) and cs_bill_customer_sk in (select c_customer_sk from best_ss_customer) union all select ws_quantity * ws_list_price as sales from web_sales, date_dim where d_year = ? and d_moy = ? and ws_sold_date_sk = d_date_sk and ws_item_sk in (select item_sk from frequent_ss_items) and ws_bill_customer_sk in (select c_customer_sk from best_ss_customer)) limit ?",
+    "fast_hash": "13091641272590023905",
     "query_hash": "15122305738650476581",
     "query_parameterized_hash": "11223372112884593254"
   },
   {
     "digest_text": "with ssales as (select c_last_name, c_first_name, s_store_name, ca_state, s_state, i_color, i_current_price, i_manager_id, i_units, i_size, sum(ss_net_profit) as netpaid from store_sales, store_returns, store, item, customer, customer_address where ss_ticket_number = sr_ticket_number and ss_item_sk = sr_item_sk and ss_customer_sk = c_customer_sk and ss_item_sk = i_item_sk and ss_store_sk = s_store_sk and c_birth_country = upper(ca_country) and s_zip = ca_zip and s_market_id = ? group by c_last_name, c_first_name, s_store_name, ca_state, s_state, i_color, i_current_price, i_manager_id, i_units, i_size) select c_last_name, c_first_name, s_store_name, sum(netpaid) as paid from ssales where i_color = ? group by c_last_name, c_first_name, s_store_name having sum(netpaid) > (select ? * avg(netpaid) from ssales)",
+    "fast_hash": "2231032353708905997",
     "query_hash": "12396640694203270942",
     "query_parameterized_hash": "17311214261782221897"
   },
   {
     "digest_text": "select i_item_id, i_item_desc, s_store_id, s_store_name, max(ss_net_profit) as store_sales_profit, max(sr_net_loss) as store_returns_loss, max(cs_net_profit) as catalog_sales_profit from store_sales, store_returns, catalog_sales, date_dim as d1, date_dim as d2, date_dim as d3, store, item where d1.d_moy = ? and d1.d_year = ? and d1.d_date_sk = ss_sold_date_sk and i_item_sk = ss_item_sk and s_store_sk = ss_store_sk and ss_customer_sk = sr_customer_sk and ss_item_sk = sr_item_sk and ss_ticket_number = sr_ticket_number and sr_returned_date_sk = d2.d_date_sk and d2.d_moy between ? and ? and d2.d_year = ? and sr_customer_sk = cs_bill_customer_sk and sr_item_sk = cs_item_sk and cs_sold_date_sk = d3.d_date_sk and d3.d_moy between ? and ? and d3.d_year = ? group by i_item_id, i_item_desc, s_store_id, s_store_name order by i_item_id, i_item_desc, s_store_id, s_store_name limit ?",
+    "fast_hash": "7200140704438980362",
     "query_hash": "15689860949077794108",
     "query_parameterized_hash": "15334518706825321484"
   },
   {
     "digest_text": "select i_item_id, avg(cs_quantity) as agg1, avg(cs_list_price) as agg2, avg(cs_coupon_amt) as agg3, avg(cs_sales_price) as agg4 from catalog_sales, customer_demographics, date_dim, item, promotion where cs_sold_date_sk = d_date_sk and cs_item_sk = i_item_sk and cs_bill_cdemo_sk = cd_demo_sk and cs_promo_sk = p_promo_sk and cd_gender = ? and cd_marital_status = ? and cd_education_status = ? and (p_channel_email = ? or p_channel_event = ?) and d_year = ? group by i_item_id order by i_item_id limit ?",
+    "fast_hash": "9518238270666150979",
     "query_hash": "16619881821096861204",
     "query_parameterized_hash": "8875606687228463996"
   },
   {
     "digest_text": "select i_item_id, s_state, grouping(s_state) as g_state, avg(ss_quantity) as agg1, avg(ss_list_price) as agg2, avg(ss_coupon_amt) as agg3, avg(ss_sales_price) as agg4 from store_sales, customer_demographics, date_dim, store, item where ss_sold_date_sk = d_date_sk and ss_item_sk = i_item_sk and ss_store_sk = s_store_sk and ss_cdemo_sk = cd_demo_sk and cd_gender = ? and cd_marital_status = ? and cd_education_status = ? and d_year = ? and s_state IN (?.. ) group by rollup (i_item_id, s_state) order by i_item_id, s_state limit ?",
+    "fast_hash": "4537875413336482736",
     "query_hash": "13603389872284834382",
     "query_parameterized_hash": "13049311799394528596"
   },
   {
     "digest_text": "select * from (select avg(ss_list_price) as b1_lp, count(ss_list_price) as b1_cnt, count(distinct ss_list_price) as b1_cntd from store_sales where ss_quantity between ? and ? and (ss_list_price between ? and ? + ? or ss_coupon_amt between ? and ? + ? or ss_wholesale_cost between ? and ? + ?)) as b1, (select avg(ss_list_price) as b2_lp, count(ss_list_price) as b2_cnt, count(distinct ss_list_price) as b2_cntd from store_sales where ss_quantity between ? and ? and (ss_list_price between ? and ? + ? or ss_coupon_amt between ? and ? + ? or ss_wholesale_cost between ? and ? + ?)) as b2, (select avg(ss_list_price) as b3_lp, count(ss_list_price) as b3_cnt, count(distinct ss_list_price) as b3_cntd from store_sales where ss_quantity between ? and ? and (ss_list_price between ? and ? + ? or ss_coupon_amt between ? and ? + ? or ss_wholesale_cost between ? and ? + ?)) as b3, (select avg(ss_list_price) as b4_lp, count(ss_list_price) as b4_cnt, count(distinct ss_list_price) as b4_cntd from store_sales where ss_quantity between ? and ? and (ss_list_price between ? and ? + ? or ss_coupon_amt between ? and ? + ? or ss_wholesale_cost between ? and ? + ?)) as b4, (select avg(ss_list_price) as b5_lp, count(ss_list_price) as b5_cnt, count(distinct ss_list_price) as b5_cntd from store_sales where ss_quantity between ? and ? and (ss_list_price between ? and ? + ? or ss_coupon_amt between ? and ? + ? or ss_wholesale_cost between ? and ? + ?)) as b5, (select avg(ss_list_price) as b6_lp, count(ss_list_price) as b6_cnt, count(distinct ss_list_price) as b6_cntd from store_sales where ss_quantity between ? and ? and (ss_list_price between ? and ? + ? or ss_coupon_amt between ? and ? + ? or ss_wholesale_cost between ? and ? + ?)) as b6 limit ?",
+    "fast_hash": "660234852390236473",
     "query_hash": "473003923778213464",
     "query_parameterized_hash": "9191561221126337424"
   },
   {
     "digest_text": "select i_item_id, i_item_desc, s_store_id, s_store_name, avg(ss_quantity) as store_sales_quantity, avg(sr_return_quantity) as store_returns_quantity, avg(cs_quantity) as catalog_sales_quantity from store_sales, store_returns, catalog_sales, date_dim as d1, date_dim as d2, date_dim as d3, store, item where d1.d_moy = ? and d1.d_year = ? and d1.d_date_sk = ss_sold_date_sk and i_item_sk = ss_item_sk and s_store_sk = ss_store_sk and ss_customer_sk = sr_customer_sk and ss_item_sk = sr_item_sk and ss_ticket_number = sr_ticket_number and sr_returned_date_sk = d2.d_date_sk and d2.d_moy between ? and ? + ? and d2.d_year = ? and sr_customer_sk = cs_bill_customer_sk and sr_item_sk = cs_item_sk and cs_sold_date_sk = d3.d_date_sk and d3.d_year in (?, ? + ?, ? + ?) group by i_item_id, i_item_desc, s_store_id, s_store_name order by i_item_id, i_item_desc, s_store_id, s_store_name limit ?",
+    "fast_hash": "689784935673410847",
     "query_hash": "9307603266510023677",
     "query_parameterized_hash": "1646168120397239289"
   },
   {
     "digest_text": "with customer_total_return as (select wr_returning_customer_sk as ctr_customer_sk, ca_state as ctr_state, sum(wr_return_amt) as ctr_total_return from web_returns, date_dim, customer_address where wr_returned_date_sk = d_date_sk and d_year = ? and wr_returning_addr_sk = ca_address_sk group by wr_returning_customer_sk, ca_state) select c_customer_id, c_salutation, c_first_name, c_last_name, c_preferred_cust_flag, c_birth_day, c_birth_month, c_birth_year, c_birth_country, c_login, c_email_address, c_last_review_date, ctr_total_return from customer_total_return as ctr1, customer_address, customer where ctr1.ctr_total_return > (select avg(ctr_total_return) * ? from customer_total_return as ctr2 where ctr1.ctr_state = ctr2.ctr_state) and ca_address_sk = c_current_addr_sk and ca_state = ? and ctr1.ctr_customer_sk = c_customer_sk order by c_customer_id, c_salutation, c_first_name, c_last_name, c_preferred_cust_flag, c_birth_day, c_birth_month, c_birth_year, c_birth_country, c_login, c_email_address, c_last_review_date, ctr_total_return limit ?",
+    "fast_hash": "7354514628048128584",
     "query_hash": "14392412227517360750",
     "query_parameterized_hash": "9917075474064186469"
   },
   {
     "digest_text": "with ss as (select ca_county, d_qoy, d_year, sum(ss_ext_sales_price) as store_sales from store_sales, date_dim, customer_address where ss_sold_date_sk = d_date_sk and ss_addr_sk = ca_address_sk group by ca_county, d_qoy, d_year), ws as (select ca_county, d_qoy, d_year, sum(ws_ext_sales_price) as web_sales from web_sales, date_dim, customer_address where ws_sold_date_sk = d_date_sk and ws_bill_addr_sk = ca_address_sk group by ca_county, d_qoy, d_year) select ss1.ca_county, ss1.d_year, ws2.web_sales / ws1.web_sales as web_q1_q2_increase, ss2.store_sales / ss1.store_sales as store_q1_q2_increase, ws3.web_sales / ws2.web_sales as web_q2_q3_increase, ss3.store_sales / ss2.store_sales as store_q2_q3_increase from ss as ss1, ss as ss2, ss as ss3, ws as ws1, ws as ws2, ws as ws3 where ss1.d_qoy = ? and ss1.d_year = ? and ss1.ca_county = ss2.ca_county and ss2.d_qoy = ? and ss2.d_year = ? and ss2.ca_county = ss3.ca_county and ss3.d_qoy = ? and ss3.d_year = ? and ss1.ca_county = ws1.ca_county and ws1.d_qoy = ? and ws1.d_year = ? and ws1.ca_county = ws2.ca_county and ws2.d_qoy = ? and ws2.d_year = ? and ws1.ca_county = ws3.ca_county and ws3.d_qoy = ? and ws3.d_year = ? and case when ws1.web_sales > ? then ws2.web_sales / ws1.web_sales else ? end > case when ss1.store_sales > ? then ss2.store_sales / ss1.store_sales else ? end and case when ws2.web_sales > ? then ws3.web_sales / ws2.web_sales else ? end > case when ss2.store_sales > ? then ss3.store_sales / ss2.store_sales else ? end order by ss1.d_year",
+    "fast_hash": "5982026548366776303",
     "query_hash": "8294775067246981404",
     "query_parameterized_hash": "6231091498981562219"
   },
   {
     "digest_text": "select sum(cs_ext_discount_amt) as \"excess discount amount\" from catalog_sales, item, date_dim where i_manufact_id = ? and i_item_sk = cs_item_sk and d_date between ? and (cast(? as date) + interval ? day) and d_date_sk = cs_sold_date_sk and cs_ext_discount_amt > (select ? * avg(cs_ext_discount_amt) from catalog_sales, date_dim where cs_item_sk = i_item_sk and d_date between ? and (cast(? as date) + interval ? day) and d_date_sk = cs_sold_date_sk) limit ?",
+    "fast_hash": "7851201110597836833",
     "query_hash": "4879999005104554681",
     "query_parameterized_hash": "6144308534911489174"
   },
   {
     "digest_text": "with ss as (select i_manufact_id, sum(ss_ext_sales_price) as total_sales from store_sales, date_dim, customer_address, item where i_manufact_id in (select i_manufact_id from item where i_category in (?)) and ss_item_sk = i_item_sk and ss_sold_date_sk = d_date_sk and d_year = ? and d_moy = ? and ss_addr_sk = ca_address_sk and ca_gmt_offset = -? group by i_manufact_id), cs as (select i_manufact_id, sum(cs_ext_sales_price) as total_sales from catalog_sales, date_dim, customer_address, item where i_manufact_id in (select i_manufact_id from item where i_category in (?)) and cs_item_sk = i_item_sk and cs_sold_date_sk = d_date_sk and d_year = ? and d_moy = ? and cs_bill_addr_sk = ca_address_sk and ca_gmt_offset = -? group by i_manufact_id), ws as (select i_manufact_id, sum(ws_ext_sales_price) as total_sales from web_sales, date_dim, customer_address, item where i_manufact_id in (select i_manufact_id from item where i_category in (?)) and ws_item_sk = i_item_sk and ws_sold_date_sk = d_date_sk and d_year = ? and d_moy = ? and ws_bill_addr_sk = ca_address_sk and ca_gmt_offset = -? group by i_manufact_id) select i_manufact_id, sum(total_sales) as total_sales from (select * from ss union all select * from cs union all select * from ws) as tmp1 group by i_manufact_id order by total_sales limit ?",
+    "fast_hash": "2558548812660447255",
     "query_hash": "3798573134471460112",
     "query_parameterized_hash": "13085233075623080575"
   },
   {
     "digest_text": "select c_last_name, c_first_name, c_salutation, c_preferred_cust_flag, ss_ticket_number, cnt from (select ss_ticket_number, ss_customer_sk, count(*) as cnt from store_sales, date_dim, store, household_demographics where store_sales.ss_sold_date_sk = date_dim.d_date_sk and store_sales.ss_store_sk = store.s_store_sk and store_sales.ss_hdemo_sk = household_demographics.hd_demo_sk and (date_dim.d_dom between ? and ? or date_dim.d_dom between ? and ?) and (household_demographics.hd_buy_potential = ? or household_demographics.hd_buy_potential = ?) and household_demographics.hd_vehicle_count > ? and (case when household_demographics.hd_vehicle_count > ? then household_demographics.hd_dep_count / household_demographics.hd_vehicle_count else ? end) > ? and date_dim.d_year in (?, ? + ?, ? + ?) and store.s_county IN (?.. ) group by ss_ticket_number, ss_customer_sk) as dn, customer where ss_customer_sk = c_customer_sk and cnt between ? and ? order by c_last_name, c_first_name, c_salutation, c_preferred_cust_flag desc",
+    "fast_hash": "13375722263500582359",
     "query_hash": "1386840619950229147",
     "query_parameterized_hash": "17486659642077638122"
   },
   {
     "digest_text": "select ca_state, cd_gender, cd_marital_status, cd_dep_count, count(*) as cnt1, stddev_samp(cd_dep_count) as \"_col_5\", avg(cd_dep_count) as \"_col_6\", max(cd_dep_count) as \"_col_7\", cd_dep_employed_count, count(*) as cnt2, stddev_samp(cd_dep_employed_count) as \"_col_10\", avg(cd_dep_employed_count) as \"_col_11\", max(cd_dep_employed_count) as \"_col_12\", cd_dep_college_count, count(*) as cnt3, stddev_samp(cd_dep_college_count) as \"_col_15\", avg(cd_dep_college_count) as \"_col_16\", max(cd_dep_college_count) as \"_col_17\" from customer as c, customer_address as ca, customer_demographics where c.c_current_addr_sk = ca.ca_address_sk and cd_demo_sk = c.c_current_cdemo_sk and exists(select * from store_sales, date_dim where c.c_customer_sk = ss_customer_sk and ss_sold_date_sk = d_date_sk and d_year = ? and d_qoy < ?) and (exists(select * from web_sales, date_dim where c.c_customer_sk = ws_bill_customer_sk and ws_sold_date_sk = d_date_sk and d_year = ? and d_qoy < ?) or exists(select * from catalog_sales, date_dim where c.c_customer_sk = cs_ship_customer_sk and cs_sold_date_sk = d_date_sk and d_year = ? and d_qoy < ?)) group by ca_state, cd_gender, cd_marital_status, cd_dep_count, cd_dep_employed_count, cd_dep_college_count order by ca_state, cd_gender, cd_marital_status, cd_dep_count, cd_dep_employed_count, cd_dep_college_count limit ?",
+    "fast_hash": "17497452673420863963",
     "query_hash": "9504279477672662925",
     "query_parameterized_hash": "9130474960235809829"
   },
   {
     "digest_text": "select sum(ss_net_profit) / sum(ss_ext_sales_price) as gross_margin, i_category, i_class, grouping(i_category) + grouping(i_class) as lochierarchy, rank() over (partition by grouping(i_category) + grouping(i_class), case when grouping(i_class) = ? then i_category end order by sum(ss_net_profit) / sum(ss_ext_sales_price) asc) as rank_within_parent from store_sales, date_dim as d1, item, store where d1.d_year = ? and d1.d_date_sk = ss_sold_date_sk and i_item_sk = ss_item_sk and s_store_sk = ss_store_sk and s_state IN (?.. ) group by rollup (i_category, i_class) order by lochierarchy desc, case when lochierarchy = ? then i_category end, rank_within_parent limit ?",
+    "fast_hash": "6196510743321963952",
     "query_hash": "9527882800734891273",
     "query_parameterized_hash": "9313168841965187574"
   },
   {
     "digest_text": "select i_item_id, i_item_desc, i_current_price from item, inventory, date_dim, catalog_sales where i_current_price between ? and ? + ? and inv_item_sk = i_item_sk and d_date_sk = inv_date_sk and d_date between cast(? as date) and (cast(? as date) + interval ? day) and i_manufact_id IN (?.. ) and inv_quantity_on_hand between ? and ? and cs_item_sk = i_item_sk group by i_item_id, i_item_desc, i_current_price order by i_item_id limit ?",
+    "fast_hash": "14508398901142422440",
     "query_hash": "246628838287202889",
     "query_parameterized_hash": "5048640554693322445"
   },
   {
     "digest_text": "select count(*) as \"_col_0\" from (select distinct c_last_name, c_first_name, d_date from store_sales, date_dim, customer where store_sales.ss_sold_date_sk = date_dim.d_date_sk and store_sales.ss_customer_sk = customer.c_customer_sk and d_month_seq between ? and ? + ? intersect select distinct c_last_name, c_first_name, d_date from catalog_sales, date_dim, customer where catalog_sales.cs_sold_date_sk = date_dim.d_date_sk and catalog_sales.cs_bill_customer_sk = customer.c_customer_sk and d_month_seq between ? and ? + ? intersect select distinct c_last_name, c_first_name, d_date from web_sales, date_dim, customer where web_sales.ws_sold_date_sk = date_dim.d_date_sk and web_sales.ws_bill_customer_sk = customer.c_customer_sk and d_month_seq between ? and ? + ?) as hot_cust limit ?",
+    "fast_hash": "17034290163327542043",
     "query_hash": "6125301334426251649",
     "query_parameterized_hash": "545064720749899783"
   },
   {
     "digest_text": "with inv as (select w_warehouse_name, w_warehouse_sk, i_item_sk, d_moy, stdev, mean, case mean when ? then ? else stdev / mean end as cov from (select w_warehouse_name, w_warehouse_sk, i_item_sk, d_moy, stddev_samp(inv_quantity_on_hand) as stdev, avg(inv_quantity_on_hand) as mean from inventory, item, warehouse, date_dim where inv_item_sk = i_item_sk and inv_warehouse_sk = w_warehouse_sk and inv_date_sk = d_date_sk and d_year = ? group by w_warehouse_name, w_warehouse_sk, i_item_sk, d_moy) as foo where case mean when ? then ? else stdev / mean end > ?) select inv1.w_warehouse_sk, inv1.i_item_sk, inv1.d_moy, inv1.mean, inv1.cov, inv2.w_warehouse_sk, inv2.i_item_sk, inv2.d_moy, inv2.mean, inv2.cov from inv as inv1, inv as inv2 where inv1.i_item_sk = inv2.i_item_sk and inv1.w_warehouse_sk = inv2.w_warehouse_sk and inv1.d_moy = ? and inv2.d_moy = ? + ? order by inv1.w_warehouse_sk, inv1.i_item_sk, inv1.d_moy, inv1.mean, inv1.cov, inv2.d_moy, inv2.mean, inv2.cov",
+    "fast_hash": "205865816495035322",
     "query_hash": "16767374497482250127",
     "query_parameterized_hash": "10441965615104747324"
   },
   {
     "digest_text": "select w_state, i_item_id, sum(case when (cast(d_date as date) < cast(? as date)) then cs_sales_price - coalesce(cr_refunded_cash, ?) else ? end) as sales_before, sum(case when (cast(d_date as date) >= cast(? as date)) then cs_sales_price - coalesce(cr_refunded_cash, ?) else ? end) as sales_after from catalog_sales left outer join catalog_returns on (cs_order_number = cr_order_number and cs_item_sk = cr_item_sk), warehouse, item, date_dim where i_current_price between ? and ? and i_item_sk = cs_item_sk and cs_warehouse_sk = w_warehouse_sk and cs_sold_date_sk = d_date_sk and d_date between (cast(? as date) - interval ? day) and (cast(? as date) + interval ? day) group by w_state, i_item_id order by w_state, i_item_id limit ?",
+    "fast_hash": "12722912073389916816",
     "query_hash": "14954018212934604023",
     "query_parameterized_hash": "14659301186644046587"
   },
   {
     "digest_text": "select distinct (i_product_name) from item as i1 where i_manufact_id between ? and ? + ? and (select count(*) as item_cnt from item where (i_manufact = i1.i_manufact and ((i_category = ? and (i_color = ? or i_color = ?) and (i_units = ? or i_units = ?) and (i_size = ? or i_size = ?)) or (i_category = ? and (i_color = ? or i_color = ?) and (i_units = ? or i_units = ?) and (i_size = ? or i_size = ?)) or (i_category = ? and (i_color = ? or i_color = ?) and (i_units = ? or i_units = ?) and (i_size = ? or i_size = ?)) or (i_category = ? and (i_color = ? or i_color = ?) and (i_units = ? or i_units = ?) and (i_size = ? or i_size = ?)))) or (i_manufact = i1.i_manufact and ((i_category = ? and (i_color = ? or i_color = ?) and (i_units = ? or i_units = ?) and (i_size = ? or i_size = ?)) or (i_category = ? and (i_color = ? or i_color = ?) and (i_units = ? or i_units = ?) and (i_size = ? or i_size = ?)) or (i_category = ? and (i_color = ? or i_color = ?) and (i_units = ? or i_units = ?) and (i_size = ? or i_size = ?)) or (i_category = ? and (i_color = ? or i_color = ?) and (i_units = ? or i_units = ?) and (i_size = ? or i_size = ?))))) > ? order by i_product_name limit ?",
+    "fast_hash": "18091380016939822053",
     "query_hash": "6381059642896842074",
     "query_parameterized_hash": "3884662084765749631"
   },
   {
     "digest_text": "select dt.d_year, item.i_category_id, item.i_category, sum(ss_ext_sales_price) as \"_col_3\" from date_dim as dt, store_sales, item where dt.d_date_sk = store_sales.ss_sold_date_sk and store_sales.ss_item_sk = item.i_item_sk and item.i_manager_id = ? and dt.d_moy = ? and dt.d_year = ? group by dt.d_year, item.i_category_id, item.i_category order by sum(ss_ext_sales_price) desc, dt.d_year, item.i_category_id, item.i_category limit ?",
+    "fast_hash": "6858538835778523908",
     "query_hash": "13542156953513727383",
     "query_parameterized_hash": "6066725711035495838"
   },
   {
     "digest_text": "select s_store_name, s_store_id, sum(case when (d_day_name = ?) then ss_sales_price else ? end) as sun_sales, sum(case when (d_day_name = ?) then ss_sales_price else ? end) as mon_sales, sum(case when (d_day_name = ?) then ss_sales_price else ? end) as tue_sales, sum(case when (d_day_name = ?) then ss_sales_price else ? end) as wed_sales, sum(case when (d_day_name = ?) then ss_sales_price else ? end) as thu_sales, sum(case when (d_day_name = ?) then ss_sales_price else ? end) as fri_sales, sum(case when (d_day_name = ?) then ss_sales_price else ? end) as sat_sales from date_dim, store_sales, store where d_date_sk = ss_sold_date_sk and s_store_sk = ss_store_sk and s_gmt_offset = -? and d_year = ? group by s_store_name, s_store_id order by s_store_name, s_store_id, sun_sales, mon_sales, tue_sales, wed_sales, thu_sales, fri_sales, sat_sales limit ?",
+    "fast_hash": "4428216749855568114",
     "query_hash": "5952621618021192776",
     "query_parameterized_hash": "17989396325463530938"
   },
   {
     "digest_text": "select asceding.rnk, i1.i_product_name as best_performing, i2.i_product_name as worst_performing from (select * from (select item_sk, rank() over (order by rank_col asc) as rnk from (select ss_item_sk as item_sk, avg(ss_net_profit) as rank_col from store_sales as ss1 where ss_store_sk = ? group by ss_item_sk having avg(ss_net_profit) > ? * (select avg(ss_net_profit) as rank_col from store_sales where ss_store_sk = ? and ss_cdemo_sk is ? group by ss_store_sk)) as v1) as v11 where rnk < ?) as asceding, (select * from (select item_sk, rank() over (order by rank_col desc) as rnk from (select ss_item_sk as item_sk, avg(ss_net_profit) as rank_col from store_sales as ss1 where ss_store_sk = ? group by ss_item_sk having avg(ss_net_profit) > ? * (select avg(ss_net_profit) as rank_col from store_sales where ss_store_sk = ? and ss_cdemo_sk is ? group by ss_store_sk)) as v2) as v21 where rnk < ?) as descending, item as i1, item as i2 where asceding.rnk = descending.rnk and i1.i_item_sk = asceding.item_sk and i2.i_item_sk = descending.item_sk order by asceding.rnk limit ?",
+    "fast_hash": "13574368506881979580",
     "query_hash": "11531654338686112336",
     "query_parameterized_hash": "15246887094906805286"
   },
   {
     "digest_text": "select ca_zip, ca_state, sum(ws_sales_price) as \"_col_2\" from web_sales, customer, customer_address, date_dim, item where ws_bill_customer_sk = c_customer_sk and c_current_addr_sk = ca_address_sk and ws_item_sk = i_item_sk and (substr(ca_zip, ?, ?) IN (?.. ) or i_item_id in (select i_item_id from item where i_item_sk IN (?.. ))) and ws_sold_date_sk = d_date_sk and d_qoy = ? and d_year = ? group by ca_zip, ca_state order by ca_zip, ca_state limit ?",
+    "fast_hash": "7865022750213321955",
     "query_hash": "17404149261645491812",
     "query_parameterized_hash": "15019233181234831955"
   },
   {
     "digest_text": "select c_last_name, c_first_name, ca_city, bought_city, ss_ticket_number, amt, profit from (select ss_ticket_number, ss_customer_sk, ca_city as bought_city, sum(ss_coupon_amt) as amt, sum(ss_net_profit) as profit from store_sales, date_dim, store, household_demographics, customer_address where store_sales.ss_sold_date_sk = date_dim.d_date_sk and store_sales.ss_store_sk = store.s_store_sk and store_sales.ss_hdemo_sk = household_demographics.hd_demo_sk and store_sales.ss_addr_sk = customer_address.ca_address_sk and (household_demographics.hd_dep_count = ? or household_demographics.hd_vehicle_count = ?) and date_dim.d_dow IN (?.. ) and date_dim.d_year in (?, ? + ?, ? + ?) and store.s_city IN (?.. ) group by ss_ticket_number, ss_customer_sk, ss_addr_sk, ca_city) as dn, customer, customer_address as current_addr where ss_customer_sk = c_customer_sk and customer.c_current_addr_sk = current_addr.ca_address_sk and current_addr.ca_city <> bought_city order by c_last_name, c_first_name, ca_city, bought_city, ss_ticket_number limit ?",
+    "fast_hash": "14767270223188187931",
     "query_hash": "12672094644937759800",
     "query_parameterized_hash": "5739077712104578532"
   },
   {
     "digest_text": "with v1 as (select i_category, i_brand, s_store_name, s_company_name, d_year, d_moy, sum(ss_sales_price) as sum_sales, avg(sum(ss_sales_price)) over (partition by i_category, i_brand, s_store_name, s_company_name, d_year) as avg_monthly_sales, rank() over (partition by i_category, i_brand, s_store_name, s_company_name order by d_year, d_moy) as rn from item, store_sales, date_dim, store where ss_item_sk = i_item_sk and ss_sold_date_sk = d_date_sk and ss_store_sk = s_store_sk and (d_year = ? or (d_year = ? - ? and d_moy = ?) or (d_year = ? + ? and d_moy = ?)) group by i_category, i_brand, s_store_name, s_company_name, d_year, d_moy), v2 as (select v1.i_category, v1.d_year, v1.d_moy, v1.avg_monthly_sales, v1.sum_sales, v1_lag.sum_sales as psum, v1_lead.sum_sales as nsum from v1, v1 as v1_lag, v1 as v1_lead where v1.i_category = v1_lag.i_category and v1.i_category = v1_lead.i_category and v1.i_brand = v1_lag.i_brand and v1.i_brand = v1_lead.i_brand and v1.s_store_name = v1_lag.s_store_name and v1.s_store_name = v1_lead.s_store_name and v1.s_company_name = v1_lag.s_company_name and v1.s_company_name = v1_lead.s_company_name and v1.rn = v1_lag.rn + ? and v1.rn = v1_lead.rn - ?) select * from v2 where d_year = ? and avg_monthly_sales > ? and case when avg_monthly_sales > ? then abs(sum_sales - avg_monthly_sales) / avg_monthly_sales else ? end > ? order by sum_sales - avg_monthly_sales, ? limit ?",
+    "fast_hash": "9057947812291569503",
     "query_hash": "8156544557285759906",
     "query_parameterized_hash": "3091709006708337318"
   },
   {
     "digest_text": "select sum(ss_quantity) as \"_col_0\" from store_sales, store, customer_demographics, customer_address, date_dim where s_store_sk = ss_store_sk and ss_sold_date_sk = d_date_sk and d_year = ? and ((cd_demo_sk = ss_cdemo_sk and cd_marital_status = ? and cd_education_status = ? and ss_sales_price between ? and ?) or (cd_demo_sk = ss_cdemo_sk and cd_marital_status = ? and cd_education_status = ? and ss_sales_price between ? and ?) or (cd_demo_sk = ss_cdemo_sk and cd_marital_status = ? and cd_education_status = ? and ss_sales_price between ? and ?)) and ((ss_addr_sk = ca_address_sk and ca_country = ? and ca_state IN (?.. ) and ss_net_profit between ? and ?) or (ss_addr_sk = ca_address_sk and ca_country = ? and ca_state IN (?.. ) and ss_net_profit between ? and ?) or (ss_addr_sk = ca_address_sk and ca_country = ? and ca_state IN (?.. ) and ss_net_profit between ? and ?))",
+    "fast_hash": "8039891324838789819",
     "query_hash": "8492492680084423718",
     "query_parameterized_hash": "11551829706286932874"
   },
   {
     "digest_text": "select ? as channel, web.item, web.return_ratio, web.return_rank, web.currency_rank from (select item, return_ratio, currency_ratio, rank() over (order by return_ratio) as return_rank, rank() over (order by currency_ratio) as currency_rank from (select ws.ws_item_sk as item, (cast(sum(coalesce(wr.wr_return_quantity, ?)) as dec(?, ?)) / cast(sum(coalesce(ws.ws_quantity, ?)) as dec(?, ?))) as return_ratio, (cast(sum(coalesce(wr.wr_return_amt, ?)) as dec(?, ?)) / cast(sum(coalesce(ws.ws_net_paid, ?)) as dec(?, ?))) as currency_ratio from web_sales as ws left outer join web_returns as wr on (ws.ws_order_number = wr.wr_order_number and ws.ws_item_sk = wr.wr_item_sk), date_dim where wr.wr_return_amt > ? and ws.ws_net_profit > ? and ws.ws_net_paid > ? and ws.ws_quantity > ? and ws_sold_date_sk = d_date_sk and d_year = ? and d_moy = ? group by ws.ws_item_sk) as in_web) as web where (web.return_rank <= ? or web.currency_rank <= ?) union select ? as channel, catalog.item, catalog.return_ratio, catalog.return_rank, catalog.currency_rank from (select item, return_ratio, currency_ratio, rank() over (order by return_ratio) as return_rank, rank() over (order by currency_ratio) as currency_rank from (select cs.cs_item_sk as item, (cast(sum(coalesce(cr.cr_return_quantity, ?)) as dec(?, ?)) / cast(sum(coalesce(cs.cs_quantity, ?)) as dec(?, ?))) as return_ratio, (cast(sum(coalesce(cr.cr_return_amount, ?)) as dec(?, ?)) / cast(sum(coalesce(cs.cs_net_paid, ?)) as dec(?, ?))) as currency_ratio from catalog_sales as cs left outer join catalog_returns as cr on (cs.cs_order_number = cr.cr_order_number and cs.cs_item_sk = cr.cr_item_sk), date_dim where cr.cr_return_amount > ? and cs.cs_net_profit > ? and cs.cs_net_paid > ? and cs.cs_quantity > ? and cs_sold_date_sk = d_date_sk and d_year = ? and d_moy = ? group by cs.cs_item_sk) as in_cat) as catalog where (catalog.return_rank <= ? or catalog.currency_rank <= ?) union select ? as channel, store.item, store.return_ratio, store.return_rank, store.currency_rank from (select item, return_ratio, currency_ratio, rank() over (order by return_ratio) as return_rank, rank() over (order by currency_ratio) as currency_rank from (select sts.ss_item_sk as item, (cast(sum(coalesce(sr.sr_return_quantity, ?)) as dec(?, ?)) / cast(sum(coalesce(sts.ss_quantity, ?)) as dec(?, ?))) as return_ratio, (cast(sum(coalesce(sr.sr_return_amt, ?)) as dec(?, ?)) / cast(sum(coalesce(sts.ss_net_paid, ?)) as dec(?, ?))) as currency_ratio from store_sales as sts left outer join store_returns as sr on (sts.ss_ticket_number = sr.sr_ticket_number and sts.ss_item_sk = sr.sr_item_sk), date_dim where sr.sr_return_amt > ? and sts.ss_net_profit > ? and sts.ss_net_paid > ? and sts.ss_quantity > ? and ss_sold_date_sk = d_date_sk and d_year = ? and d_moy = ? group by sts.ss_item_sk) as in_store) as store where (store.return_rank <= ? or store.currency_rank <= ?) order by ?, ?, ? limit ?",
+    "fast_hash": "12961242385821384462",
     "query_hash": "9514279650986204393",
     "query_parameterized_hash": "15497741346202671708"
   },
   {
     "digest_text": "select s_store_name, s_company_id, s_street_number, s_street_name, s_street_type, s_suite_number, s_city, s_county, s_state, s_zip, sum(case when (sr_returned_date_sk - ss_sold_date_sk <= ?) then ? else ? end) as \"? days\", sum(case when (sr_returned_date_sk - ss_sold_date_sk > ?) and (sr_returned_date_sk - ss_sold_date_sk <= ?) then ? else ? end) as \"?-? days\", sum(case when (sr_returned_date_sk - ss_sold_date_sk > ?) and (sr_returned_date_sk - ss_sold_date_sk <= ?) then ? else ? end) as \"?-? days\", sum(case when (sr_returned_date_sk - ss_sold_date_sk > ?) and (sr_returned_date_sk - ss_sold_date_sk <= ?) then ? else ? end) as \"?-? days\", sum(case when (sr_returned_date_sk - ss_sold_date_sk > ?) then ? else ? end) as \">? days\" from store_sales, store_returns, store, date_dim as d1, date_dim as d2 where d2.d_year = ? and d2.d_moy = ? and ss_ticket_number = sr_ticket_number and ss_item_sk = sr_item_sk and ss_sold_date_sk = d1.d_date_sk and sr_returned_date_sk = d2.d_date_sk and ss_customer_sk = sr_customer_sk and ss_store_sk = s_store_sk group by s_store_name, s_company_id, s_street_number, s_street_name, s_street_type, s_suite_number, s_city, s_county, s_state, s_zip order by s_store_name, s_company_id, s_street_number, s_street_name, s_street_type, s_suite_number, s_city, s_county, s_state, s_zip limit ?",
+    "fast_hash": "3298477430262871331",
     "query_hash": "5108318934480637997",
     "query_parameterized_hash": "654401174128531504"
   },
   {
     "digest_text": "with web_v1 as (select ws_item_sk as item_sk, d_date, sum(sum(ws_sales_price)) over (partition by ws_item_sk order by d_date rows between unbounded preceding and current row) as cume_sales from web_sales, date_dim where ws_sold_date_sk = d_date_sk and d_month_seq between ? and ? + ? and ws_item_sk is not ? group by ws_item_sk, d_date), store_v1 as (select ss_item_sk as item_sk, d_date, sum(sum(ss_sales_price)) over (partition by ss_item_sk order by d_date rows between unbounded preceding and current row) as cume_sales from store_sales, date_dim where ss_sold_date_sk = d_date_sk and d_month_seq between ? and ? + ? and ss_item_sk is not ? group by ss_item_sk, d_date) select * from (select item_sk, d_date, web_sales, store_sales, max(web_sales) over (partition by item_sk order by d_date rows between unbounded preceding and current row) as web_cumulative, max(store_sales) over (partition by item_sk order by d_date rows between unbounded preceding and current row) as store_cumulative from (select case when web.item_sk is not ? then web.item_sk else store.item_sk end as item_sk, case when web.d_date is not ? then web.d_date else store.d_date end as d_date, web.cume_sales as web_sales, store.cume_sales as store_sales from web_v1 as web full outer join store_v1 as store on (web.item_sk = store.item_sk and web.d_date = store.d_date)) as x) as y where web_cumulative > store_cumulative order by item_sk, d_date limit ?",
+    "fast_hash": "11372415144039566481",
     "query_hash": "15143931891024721777",
     "query_parameterized_hash": "10221315676709171326"
   },
   {
     "digest_text": "select dt.d_year, item.i_brand_id as brand_id, item.i_brand as brand, sum(ss_ext_sales_price) as ext_price from date_dim as dt, store_sales, item where dt.d_date_sk = store_sales.ss_sold_date_sk and store_sales.ss_item_sk = item.i_item_sk and item.i_manager_id = ? and dt.d_moy = ? and dt.d_year = ? group by dt.d_year, item.i_brand, item.i_brand_id order by dt.d_year, ext_price desc, brand_id limit ?",
+    "fast_hash": "6129066793671224707",
     "query_hash": "6424719728665050328",
     "query_parameterized_hash": "10209841263798022120"
   },
   {
     "digest_text": "select * from (select i_manufact_id, sum(ss_sales_price) as sum_sales, avg(sum(ss_sales_price)) over (partition by i_manufact_id) as avg_quarterly_sales from item, store_sales, date_dim, store where ss_item_sk = i_item_sk and ss_sold_date_sk = d_date_sk and ss_store_sk = s_store_sk and d_month_seq in (?, ? + ?, ? + ?, ? + ?, ? + ?, ? + ?, ? + ?, ? + ?, ? + ?, ? + ?, ? + ?, ? + ?) and ((i_category IN (?.. ) and i_class IN (?.. ) and i_brand IN (?.. )) or (i_category IN (?.. ) and i_class IN (?.. ) and i_brand IN (?.. ))) group by i_manufact_id, d_qoy) as tmp1 where case when avg_quarterly_sales > ? then abs(sum_sales - avg_quarterly_sales) / avg_quarterly_sales else ? end > ? order by avg_quarterly_sales, sum_sales, i_manufact_id limit ?",
+    "fast_hash": "15664606022497581916",
     "query_hash": "12835523151349404822",
     "query_parameterized_hash": "8953959309251895338"
   },
   {
     "digest_text": "with my_customers as (select distinct c_customer_sk, c_current_addr_sk from (select cs_sold_date_sk as sold_date_sk, cs_bill_customer_sk as customer_sk, cs_item_sk as item_sk from catalog_sales union all select ws_sold_date_sk as sold_date_sk, ws_bill_customer_sk as customer_sk, ws_item_sk as item_sk from web_sales) as cs_or_ws_sales, item, date_dim, customer where sold_date_sk = d_date_sk and item_sk = i_item_sk and i_category = ? and i_class = ? and c_customer_sk = cs_or_ws_sales.customer_sk and d_moy = ? and d_year = ?), my_revenue as (select c_customer_sk, sum(ss_ext_sales_price) as revenue from my_customers, store_sales, customer_address, store, date_dim where c_current_addr_sk = ca_address_sk and ca_county = s_county and ca_state = s_state and ss_sold_date_sk = d_date_sk and c_customer_sk = ss_customer_sk and d_month_seq between (select distinct d_month_seq + ? from date_dim where d_year = ? and d_moy = ?) and (select distinct d_month_seq + ? from date_dim where d_year = ? and d_moy = ?) group by c_customer_sk), segments as (select cast((revenue / ?) as integer) as segment from my_revenue) select segment, count(*) as num_customers, segment * ? as segment_base from segments group by segment order by segment, num_customers limit ?",
+    "fast_hash": "17473765646457195950",
     "query_hash": "17219893937203211609",
     "query_parameterized_hash": "12384563183882588230"
   },
   {
     "digest_text": "select i_brand_id as brand_id, i_brand as brand, sum(ss_ext_sales_price) as ext_price from date_dim, store_sales, item where d_date_sk = ss_sold_date_sk and ss_item_sk = i_item_sk and i_manager_id = ? and d_moy = ? and d_year = ? group by i_brand, i_brand_id order by ext_price desc, i_brand_id limit ?",
+    "fast_hash": "12621976733583153607",
     "query_hash": "13284596645152390214",
     "query_parameterized_hash": "14152485515292915350"
   },
   {
     "digest_text": "with ss as (select i_item_id, sum(ss_ext_sales_price) as total_sales from store_sales, date_dim, customer_address, item where i_item_id in (select i_item_id from item where i_color IN (?.. )) and ss_item_sk = i_item_sk and ss_sold_date_sk = d_date_sk and d_year = ? and d_moy = ? and ss_addr_sk = ca_address_sk and ca_gmt_offset = -? group by i_item_id), cs as (select i_item_id, sum(cs_ext_sales_price) as total_sales from catalog_sales, date_dim, customer_address, item where i_item_id in (select i_item_id from item where i_color IN (?.. )) and cs_item_sk = i_item_sk and cs_sold_date_sk = d_date_sk and d_year = ? and d_moy = ? and cs_bill_addr_sk = ca_address_sk and ca_gmt_offset = -? group by i_item_id), ws as (select i_item_id, sum(ws_ext_sales_price) as total_sales from web_sales, date_dim, customer_address, item where i_item_id in (select i_item_id from item where i_color IN (?.. )) and ws_item_sk = i_item_sk and ws_sold_date_sk = d_date_sk and d_year = ? and d_moy = ? and ws_bill_addr_sk = ca_address_sk and ca_gmt_offset = -? group by i_item_id) select i_item_id, sum(total_sales) as total_sales from (select * from ss union all select * from cs union all select * from ws) as tmp1 group by i_item_id order by total_sales limit ?",
+    "fast_hash": "16366997682030979277",
     "query_hash": "10476619424674720882",
     "query_parameterized_hash": "8502337808362126004"
   },
   {
     "digest_text": "with v1 as (select i_category, i_brand, cc_name, d_year, d_moy, sum(cs_sales_price) as sum_sales, avg(sum(cs_sales_price)) over (partition by i_category, i_brand, cc_name, d_year) as avg_monthly_sales, rank() over (partition by i_category, i_brand, cc_name order by d_year, d_moy) as rn from item, catalog_sales, date_dim, call_center where cs_item_sk = i_item_sk and cs_sold_date_sk = d_date_sk and cc_call_center_sk = cs_call_center_sk and (d_year = ? or (d_year = ? - ? and d_moy = ?) or (d_year = ? + ? and d_moy = ?)) group by i_category, i_brand, cc_name, d_year, d_moy), v2 as (select v1.i_brand, v1.d_year, v1.avg_monthly_sales, v1.sum_sales, v1_lag.sum_sales as psum, v1_lead.sum_sales as nsum from v1, v1 as v1_lag, v1 as v1_lead where v1.i_category = v1_lag.i_category and v1.i_category = v1_lead.i_category and v1.i_brand = v1_lag.i_brand and v1.i_brand = v1_lead.i_brand and v1.cc_name = v1_lag.cc_name and v1.cc_name = v1_lead.cc_name and v1.rn = v1_lag.rn + ? and v1.rn = v1_lead.rn - ?) select * from v2 where d_year = ? and avg_monthly_sales > ? and case when avg_monthly_sales > ? then abs(sum_sales - avg_monthly_sales) / avg_monthly_sales else ? end > ? order by sum_sales - avg_monthly_sales, ? limit ?",
+    "fast_hash": "17905593745844064711",
     "query_hash": "17219884620852276371",
     "query_parameterized_hash": "6412739061656066003"
   },
   {
     "digest_text": "with ss_items as (select i_item_id as item_id, sum(ss_ext_sales_price) as ss_item_rev from store_sales, item, date_dim where ss_item_sk = i_item_sk and d_date in (select d_date from date_dim where d_week_seq = (select d_week_seq from date_dim where d_date = ?)) and ss_sold_date_sk = d_date_sk group by i_item_id), cs_items as (select i_item_id as item_id, sum(cs_ext_sales_price) as cs_item_rev from catalog_sales, item, date_dim where cs_item_sk = i_item_sk and d_date in (select d_date from date_dim where d_week_seq = (select d_week_seq from date_dim where d_date = ?)) and cs_sold_date_sk = d_date_sk group by i_item_id), ws_items as (select i_item_id as item_id, sum(ws_ext_sales_price) as ws_item_rev from web_sales, item, date_dim where ws_item_sk = i_item_sk and d_date in (select d_date from date_dim where d_week_seq = (select d_week_seq from date_dim where d_date = ?)) and ws_sold_date_sk = d_date_sk group by i_item_id) select ss_items.item_id, ss_item_rev, ss_item_rev / (ss_item_rev + cs_item_rev + ws_item_rev) / ? * ? as ss_dev, cs_item_rev, cs_item_rev / (ss_item_rev + cs_item_rev + ws_item_rev) / ? * ? as cs_dev, ws_item_rev, ws_item_rev / (ss_item_rev + cs_item_rev + ws_item_rev) / ? * ? as ws_dev, (ss_item_rev + cs_item_rev + ws_item_rev) / ? as average from ss_items, cs_items, ws_items where ss_items.item_id = cs_items.item_id and ss_items.item_id = ws_items.item_id and ss_item_rev between ? * cs_item_rev and ? * cs_item_rev and ss_item_rev between ? * ws_item_rev and ? * ws_item_rev and cs_item_rev between ? * ss_item_rev and ? * ss_item_rev and cs_item_rev between ? * ws_item_rev and ? * ws_item_rev and ws_item_rev between ? * ss_item_rev and ? * ss_item_rev and ws_item_rev between ? * cs_item_rev and ? * cs_item_rev order by item_id, ss_item_rev limit ?",
+    "fast_hash": "2172518026696433256",
     "query_hash": "4443302629839978707",
     "query_parameterized_hash": "9218808717139796747"
   },
   {
     "digest_text": "with wss as (select d_week_seq, ss_store_sk, sum(case when (d_day_name = ?) then ss_sales_price else ? end) as sun_sales, sum(case when (d_day_name = ?) then ss_sales_price else ? end) as mon_sales, sum(case when (d_day_name = ?) then ss_sales_price else ? end) as tue_sales, sum(case when (d_day_name = ?) then ss_sales_price else ? end) as wed_sales, sum(case when (d_day_name = ?) then ss_sales_price else ? end) as thu_sales, sum(case when (d_day_name = ?) then ss_sales_price else ? end) as fri_sales, sum(case when (d_day_name = ?) then ss_sales_price else ? end) as sat_sales from store_sales, date_dim where d_date_sk = ss_sold_date_sk group by d_week_seq, ss_store_sk) select s_store_name1, s_store_id1, d_week_seq1, sun_sales1 / sun_sales2 as \"_col_3\", mon_sales1 / mon_sales2 as \"_col_4\", tue_sales1 / tue_sales2 as \"_col_5\", wed_sales1 / wed_sales2 as \"_col_6\", thu_sales1 / thu_sales2 as \"_col_7\", fri_sales1 / fri_sales2 as \"_col_8\", sat_sales1 / sat_sales2 as \"_col_9\" from (select s_store_name as s_store_name1, wss.d_week_seq as d_week_seq1, s_store_id as s_store_id1, sun_sales as sun_sales1, mon_sales as mon_sales1, tue_sales as tue_sales1, wed_sales as wed_sales1, thu_sales as thu_sales1, fri_sales as fri_sales1, sat_sales as sat_sales1 from wss, store, date_dim as d where d.d_week_seq = wss.d_week_seq and ss_store_sk = s_store_sk and d_month_seq between ? and ? + ?) as y, (select s_store_name as s_store_name2, wss.d_week_seq as d_week_seq2, s_store_id as s_store_id2, sun_sales as sun_sales2, mon_sales as mon_sales2, tue_sales as tue_sales2, wed_sales as wed_sales2, thu_sales as thu_sales2, fri_sales as fri_sales2, sat_sales as sat_sales2 from wss, store, date_dim as d where d.d_week_seq = wss.d_week_seq and ss_store_sk = s_store_sk and d_month_seq between ? + ? and ? + ?) as x where s_store_id1 = s_store_id2 and d_week_seq1 = d_week_seq2 - ? order by s_store_name1, s_store_id1, d_week_seq1 limit ?",
+    "fast_hash": "3471521564908716459",
     "query_hash": "8690070721625296133",
     "query_parameterized_hash": "5736111829517454812"
   },
   {
     "digest_text": "with ss as (select i_item_id, sum(ss_ext_sales_price) as total_sales from store_sales, date_dim, customer_address, item where i_item_id in (select i_item_id from item where i_category in (?)) and ss_item_sk = i_item_sk and ss_sold_date_sk = d_date_sk and d_year = ? and d_moy = ? and ss_addr_sk = ca_address_sk and ca_gmt_offset = -? group by i_item_id), cs as (select i_item_id, sum(cs_ext_sales_price) as total_sales from catalog_sales, date_dim, customer_address, item where i_item_id in (select i_item_id from item where i_category in (?)) and cs_item_sk = i_item_sk and cs_sold_date_sk = d_date_sk and d_year = ? and d_moy = ? and cs_bill_addr_sk = ca_address_sk and ca_gmt_offset = -? group by i_item_id), ws as (select i_item_id, sum(ws_ext_sales_price) as total_sales from web_sales, date_dim, customer_address, item where i_item_id in (select i_item_id from item where i_category in (?)) and ws_item_sk = i_item_sk and ws_sold_date_sk = d_date_sk and d_year = ? and d_moy = ? and ws_bill_addr_sk = ca_address_sk and ca_gmt_offset = -? group by i_item_id) select i_item_id, sum(total_sales) as total_sales from (select * from ss union all select * from cs union all select * from ws) as tmp1 group by i_item_id order by i_item_id, total_sales limit ?",
+    "fast_hash": "11018597700973047498",
     "query_hash": "3155799175351900688",
     "query_parameterized_hash": "7814702402412841962"
   },
   {
     "digest_text": "select promotions, total, cast(promotions as decimal(?, ?)) / cast(total as decimal(?, ?)) * ? from (select sum(ss_ext_sales_price) as promotions from store_sales, store, promotion, date_dim, customer, customer_address, item where ss_sold_date_sk = d_date_sk and ss_store_sk = s_store_sk and ss_promo_sk = p_promo_sk and ss_customer_sk = c_customer_sk and ca_address_sk = c_current_addr_sk and ss_item_sk = i_item_sk and ca_gmt_offset = -? and i_category = ? and (p_channel_dmail = ? or p_channel_email = ? or p_channel_tv = ?) and s_gmt_offset = -? and d_year = ? and d_moy = ?) as promotional_sales, (select sum(ss_ext_sales_price) as total from store_sales, store, date_dim, customer, customer_address, item where ss_sold_date_sk = d_date_sk and ss_store_sk = s_store_sk and ss_customer_sk = c_customer_sk and ca_address_sk = c_current_addr_sk and ss_item_sk = i_item_sk and ca_gmt_offset = -? and i_category = ? and s_gmt_offset = -? and d_year = ? and d_moy = ?) as all_sales order by promotions, total limit ?",
+    "fast_hash": "13069411060784636865",
     "query_hash": "12481499105367506769",
     "query_parameterized_hash": "2319707515611052524"
   },
   {
     "digest_text": "select substr(w_warehouse_name, ?, ?) as \"_col_0\", sm_type, web_name, sum(case when (ws_ship_date_sk - ws_sold_date_sk <= ?) then ? else ? end) as \"? days\", sum(case when (ws_ship_date_sk - ws_sold_date_sk > ?) and (ws_ship_date_sk - ws_sold_date_sk <= ?) then ? else ? end) as \"?-? days\", sum(case when (ws_ship_date_sk - ws_sold_date_sk > ?) and (ws_ship_date_sk - ws_sold_date_sk <= ?) then ? else ? end) as \"?-? days\", sum(case when (ws_ship_date_sk - ws_sold_date_sk > ?) and (ws_ship_date_sk - ws_sold_date_sk <= ?) then ? else ? end) as \"?-? days\", sum(case when (ws_ship_date_sk - ws_sold_date_sk > ?) then ? else ? end) as \">? days\" from web_sales, warehouse, ship_mode, web_site, date_dim where d_month_seq between ? and ? + ? and ws_ship_date_sk = d_date_sk and ws_warehouse_sk = w_warehouse_sk and ws_ship_mode_sk = sm_ship_mode_sk and ws_web_site_sk = web_site_sk group by substr(w_warehouse_name, ?, ?), sm_type, web_name order by substr(w_warehouse_name, ?, ?), sm_type, web_name limit ?",
+    "fast_hash": "12216586261825298668",
     "query_hash": "6692267388959593329",
     "query_parameterized_hash": "5164825189863476003"
   },
   {
     "digest_text": "select * from (select i_manager_id, sum(ss_sales_price) as sum_sales, avg(sum(ss_sales_price)) over (partition by i_manager_id) as avg_monthly_sales from item, store_sales, date_dim, store where ss_item_sk = i_item_sk and ss_sold_date_sk = d_date_sk and ss_store_sk = s_store_sk and d_month_seq in (?, ? + ?, ? + ?, ? + ?, ? + ?, ? + ?, ? + ?, ? + ?, ? + ?, ? + ?, ? + ?, ? + ?) and ((i_category IN (?.. ) and i_class IN (?.. ) and i_brand IN (?.. )) or (i_category IN (?.. ) and i_class IN (?.. ) and i_brand IN (?.. ))) group by i_manager_id, d_moy) as tmp1 where case when avg_monthly_sales > ? then abs(sum_sales - avg_monthly_sales) / avg_monthly_sales else ? end > ? order by i_manager_id, avg_monthly_sales, sum_sales limit ?",
+    "fast_hash": "9582682989923923745",
     "query_hash": "9482928951178192766",
     "query_parameterized_hash": "8708716027722248660"
   },
   {
     "digest_text": "with cs_ui as (select cs_item_sk, sum(cs_ext_list_price) as sale, sum(cr_refunded_cash + cr_reversed_charge + cr_store_credit) as refund from catalog_sales, catalog_returns where cs_item_sk = cr_item_sk and cs_order_number = cr_order_number group by cs_item_sk having sum(cs_ext_list_price) > ? * sum(cr_refunded_cash + cr_reversed_charge + cr_store_credit)), cross_sales as (select i_product_name as product_name, i_item_sk as item_sk, s_store_name as store_name, s_zip as store_zip, ad1.ca_street_number as b_street_number, ad1.ca_street_name as b_streen_name, ad1.ca_city as b_city, ad1.ca_zip as b_zip, ad2.ca_street_number as c_street_number, ad2.ca_street_name as c_street_name, ad2.ca_city as c_city, ad2.ca_zip as c_zip, d1.d_year as syear, d2.d_year as fsyear, d3.d_year as s2year, count(*) as cnt, sum(ss_wholesale_cost) as s1, sum(ss_list_price) as s2, sum(ss_coupon_amt) as s3 from store_sales, store_returns, cs_ui, date_dim as d1, date_dim as d2, date_dim as d3, store, customer, customer_demographics as cd1, customer_demographics as cd2, promotion, household_demographics as hd1, household_demographics as hd2, customer_address as ad1, customer_address as ad2, income_band as ib1, income_band as ib2, item where ss_store_sk = s_store_sk and ss_sold_date_sk = d1.d_date_sk and ss_customer_sk = c_customer_sk and ss_cdemo_sk = cd1.cd_demo_sk and ss_hdemo_sk = hd1.hd_demo_sk and ss_addr_sk = ad1.ca_address_sk and ss_item_sk = i_item_sk and ss_item_sk = sr_item_sk and ss_ticket_number = sr_ticket_number and ss_item_sk = cs_ui.cs_item_sk and c_current_cdemo_sk = cd2.cd_demo_sk and c_current_hdemo_sk = hd2.hd_demo_sk and c_current_addr_sk = ad2.ca_address_sk and c_first_sales_date_sk = d2.d_date_sk and c_first_shipto_date_sk = d3.d_date_sk and ss_promo_sk = p_promo_sk and hd1.hd_income_band_sk = ib1.ib_income_band_sk and hd2.hd_income_band_sk = ib2.ib_income_band_sk and cd1.cd_marital_status <> cd2.cd_marital_status and i_color IN (?.. ) and i_current_price between ? and ? + ? and i_current_price between ? + ? and ? + ? group by i_product_name, i_item_sk, s_store_name, s_zip, ad1.ca_street_number, ad1.ca_street_name, ad1.ca_city, ad1.ca_zip, ad2.ca_street_number, ad2.ca_street_name, ad2.ca_city, ad2.ca_zip, d1.d_year, d2.d_year, d3.d_year) select cs1.product_name, cs1.store_name, cs1.store_zip, cs1.b_street_number, cs1.b_streen_name, cs1.b_city, cs1.b_zip, cs1.c_street_number, cs1.c_street_name, cs1.c_city, cs1.c_zip, cs1.syear, cs1.cnt, cs1.s1, cs1.s2, cs1.s3, cs2.s1, cs2.s2, cs2.s3, cs2.syear, cs2.cnt from cross_sales as cs1, cross_sales as cs2 where cs1.item_sk = cs2.item_sk and cs1.syear = ? and cs2.syear = ? + ? and cs2.cnt <= cs1.cnt and cs1.store_name = cs2.store_name and cs1.store_zip = cs2.store_zip order by cs1.product_name, cs1.store_name, cs2.cnt",
+    "fast_hash": "2362893630640729502",
     "query_hash": "14461377898717456364",
     "query_parameterized_hash": "17824893086827377126"
   },
   {
     "digest_text": "select s_store_name, i_item_desc, sc.revenue, i_current_price, i_wholesale_cost, i_brand from store, item, (select ss_store_sk, avg(revenue) as ave from (select ss_store_sk, ss_item_sk, sum(ss_sales_price) as revenue from store_sales, date_dim where ss_sold_date_sk = d_date_sk and d_month_seq between ? and ? + ? group by ss_store_sk, ss_item_sk) as sa group by ss_store_sk) as sb, (select ss_store_sk, ss_item_sk, sum(ss_sales_price) as revenue from store_sales, date_dim where ss_sold_date_sk = d_date_sk and d_month_seq between ? and ? + ? group by ss_store_sk, ss_item_sk) as sc where sb.ss_store_sk = sc.ss_store_sk and sc.revenue <= ? * sb.ave and s_store_sk = sc.ss_store_sk and i_item_sk = sc.ss_item_sk order by s_store_name, i_item_desc limit ?",
+    "fast_hash": "10925943128185968834",
     "query_hash": "15707364624062226720",
     "query_parameterized_hash": "17171096742411572534"
   },
   {
     "digest_text": "select w_warehouse_name, w_warehouse_sq_ft, w_city, w_county, w_state, w_country, ship_carriers, year1, sum(jan_sales) as jan_sales, sum(feb_sales) as feb_sales, sum(mar_sales) as mar_sales, sum(apr_sales) as apr_sales, sum(may_sales) as may_sales, sum(jun_sales) as jun_sales, sum(jul_sales) as jul_sales, sum(aug_sales) as aug_sales, sum(sep_sales) as sep_sales, sum(oct_sales) as oct_sales, sum(nov_sales) as nov_sales, sum(dec_sales) as dec_sales, sum(jan_sales / w_warehouse_sq_ft) as jan_sales_per_sq_foot, sum(feb_sales / w_warehouse_sq_ft) as feb_sales_per_sq_foot, sum(mar_sales / w_warehouse_sq_ft) as mar_sales_per_sq_foot, sum(apr_sales / w_warehouse_sq_ft) as apr_sales_per_sq_foot, sum(may_sales / w_warehouse_sq_ft) as may_sales_per_sq_foot, sum(jun_sales / w_warehouse_sq_ft) as jun_sales_per_sq_foot, sum(jul_sales / w_warehouse_sq_ft) as jul_sales_per_sq_foot, sum(aug_sales / w_warehouse_sq_ft) as aug_sales_per_sq_foot, sum(sep_sales / w_warehouse_sq_ft) as sep_sales_per_sq_foot, sum(oct_sales / w_warehouse_sq_ft) as oct_sales_per_sq_foot, sum(nov_sales / w_warehouse_sq_ft) as nov_sales_per_sq_foot, sum(dec_sales / w_warehouse_sq_ft) as dec_sales_per_sq_foot, sum(jan_net) as jan_net, sum(feb_net) as feb_net, sum(mar_net) as mar_net, sum(apr_net) as apr_net, sum(may_net) as may_net, sum(jun_net) as jun_net, sum(jul_net) as jul_net, sum(aug_net) as aug_net, sum(sep_net) as sep_net, sum(oct_net) as oct_net, sum(nov_net) as nov_net, sum(dec_net) as dec_net from (select w_warehouse_name, w_warehouse_sq_ft, w_city, w_county, w_state, w_country, ? || ? || ? as ship_carriers, d_year as year1, sum(case when d_moy = ? then ws_ext_sales_price * ws_quantity else ? end) as jan_sales, sum(case when d_moy = ? then ws_ext_sales_price * ws_quantity else ? end) as feb_sales, sum(case when d_moy = ? then ws_ext_sales_price * ws_quantity else ? end) as mar_sales, sum(case when d_moy = ? then ws_ext_sales_price * ws_quantity else ? end) as apr_sales, sum(case when d_moy = ? then ws_ext_sales_price * ws_quantity else ? end) as may_sales, sum(case when d_moy = ? then ws_ext_sales_price * ws_quantity else ? end) as jun_sales, sum(case when d_moy = ? then ws_ext_sales_price * ws_quantity else ? end) as jul_sales, sum(case when d_moy = ? then ws_ext_sales_price * ws_quantity else ? end) as aug_sales, sum(case when d_moy = ? then ws_ext_sales_price * ws_quantity else ? end) as sep_sales, sum(case when d_moy = ? then ws_ext_sales_price * ws_quantity else ? end) as oct_sales, sum(case when d_moy = ? then ws_ext_sales_price * ws_quantity else ? end) as nov_sales, sum(case when d_moy = ? then ws_ext_sales_price * ws_quantity else ? end) as dec_sales, sum(case when d_moy = ? then ws_net_paid_inc_ship * ws_quantity else ? end) as jan_net, sum(case when d_moy = ? then ws_net_paid_inc_ship * ws_quantity else ? end) as feb_net, sum(case when d_moy = ? then ws_net_paid_inc_ship * ws_quantity else ? end) as mar_net, sum(case when d_moy = ? then ws_net_paid_inc_ship * ws_quantity else ? end) as apr_net, sum(case when d_moy = ? then ws_net_paid_inc_ship * ws_quantity else ? end) as may_net, sum(case when d_moy = ? then ws_net_paid_inc_ship * ws_quantity else ? end) as jun_net, sum(case when d_moy = ? then ws_net_paid_inc_ship * ws_quantity else ? end) as jul_net, sum(case when d_moy = ? then ws_net_paid_inc_ship * ws_quantity else ? end) as aug_net, sum(case when d_moy = ? then ws_net_paid_inc_ship * ws_quantity else ? end) as sep_net, sum(case when d_moy = ? then ws_net_paid_inc_ship * ws_quantity else ? end) as oct_net, sum(case when d_moy = ? then ws_net_paid_inc_ship * ws_quantity else ? end) as nov_net, sum(case when d_moy = ? then ws_net_paid_inc_ship * ws_quantity else ? end) as dec_net from web_sales, warehouse, date_dim, time_dim, ship_mode where ws_warehouse_sk = w_warehouse_sk and ws_sold_date_sk = d_date_sk and ws_sold_time_sk = t_time_sk and ws_ship_mode_sk = sm_ship_mode_sk and d_year = ? and t_time between ? and ? + ? and sm_carrier IN (?.. ) group by w_warehouse_name, w_warehouse_sq_ft, w_city, w_county, w_state, w_country, d_year union all select w_warehouse_name, w_warehouse_sq_ft, w_city, w_county, w_state, w_country, ? || ? || ? as ship_carriers, d_year as year1, sum(case when d_moy = ? then cs_ext_sales_price * cs_quantity else ? end) as jan_sales, sum(case when d_moy = ? then cs_ext_sales_price * cs_quantity else ? end) as feb_sales, sum(case when d_moy = ? then cs_ext_sales_price * cs_quantity else ? end) as mar_sales, sum(case when d_moy = ? then cs_ext_sales_price * cs_quantity else ? end) as apr_sales, sum(case when d_moy = ? then cs_ext_sales_price * cs_quantity else ? end) as may_sales, sum(case when d_moy = ? then cs_ext_sales_price * cs_quantity else ? end) as jun_sales, sum(case when d_moy = ? then cs_ext_sales_price * cs_quantity else ? end) as jul_sales, sum(case when d_moy = ? then cs_ext_sales_price * cs_quantity else ? end) as aug_sales, sum(case when d_moy = ? then cs_ext_sales_price * cs_quantity else ? end) as sep_sales, sum(case when d_moy = ? then cs_ext_sales_price * cs_quantity else ? end) as oct_sales, sum(case when d_moy = ? then cs_ext_sales_price * cs_quantity else ? end) as nov_sales, sum(case when d_moy = ? then cs_ext_sales_price * cs_quantity else ? end) as dec_sales, sum(case when d_moy = ? then cs_net_paid * cs_quantity else ? end) as jan_net, sum(case when d_moy = ? then cs_net_paid * cs_quantity else ? end) as feb_net, sum(case when d_moy = ? then cs_net_paid * cs_quantity else ? end) as mar_net, sum(case when d_moy = ? then cs_net_paid * cs_quantity else ? end) as apr_net, sum(case when d_moy = ? then cs_net_paid * cs_quantity else ? end) as may_net, sum(case when d_moy = ? then cs_net_paid * cs_quantity else ? end) as jun_net, sum(case when d_moy = ? then cs_net_paid * cs_quantity else ? end) as jul_net, sum(case when d_moy = ? then cs_net_paid * cs_quantity else ? end) as aug_net, sum(case when d_moy = ? then cs_net_paid * cs_quantity else ? end) as sep_net, sum(case when d_moy = ? then cs_net_paid * cs_quantity else ? end) as oct_net, sum(case when d_moy = ? then cs_net_paid * cs_quantity else ? end) as nov_net, sum(case when d_moy = ? then cs_net_paid * cs_quantity else ? end) as dec_net from catalog_sales, warehouse, date_dim, time_dim, ship_mode where cs_warehouse_sk = w_warehouse_sk and cs_sold_date_sk = d_date_sk and cs_sold_time_sk = t_time_sk and cs_ship_mode_sk = sm_ship_mode_sk and d_year = ? and t_time between ? and ? + ? and sm_carrier IN (?.. ) group by w_warehouse_name, w_warehouse_sq_ft, w_city, w_county, w_state, w_country, d_year) as x group by w_warehouse_name, w_warehouse_sq_ft, w_city, w_county, w_state, w_country, ship_carriers, year1 order by w_warehouse_name limit ?",
+    "fast_hash": "13028399311164593343",
     "query_hash": "2878950757088422786",
     "query_parameterized_hash": "13224614284816524615"
   },
   {
     "digest_text": "select * from (select i_category, i_class, i_brand, i_product_name, d_year, d_qoy, d_moy, s_store_id, sumsales, rank() over (partition by i_category order by sumsales desc) as rk from (select i_category, i_class, i_brand, i_product_name, d_year, d_qoy, d_moy, s_store_id, sum(coalesce(ss_sales_price * ss_quantity, ?)) as sumsales from store_sales, date_dim, store, item where ss_sold_date_sk = d_date_sk and ss_item_sk = i_item_sk and ss_store_sk = s_store_sk and d_month_seq between ? and ? + ? group by rollup (i_category, i_class, i_brand, i_product_name, d_year, d_qoy, d_moy, s_store_id)) as dw1) as dw2 where rk <= ? order by i_category, i_class, i_brand, i_product_name, d_year, d_qoy, d_moy, s_store_id, sumsales, rk limit ?",
+    "fast_hash": "2326796534375639967",
     "query_hash": "8968677528247697964",
     "query_parameterized_hash": "9198825155938429265"
   },
   {
     "digest_text": "select c_last_name, c_first_name, ca_city, bought_city, ss_ticket_number, extended_price, extended_tax, list_price from (select ss_ticket_number, ss_customer_sk, ca_city as bought_city, sum(ss_ext_sales_price) as extended_price, sum(ss_ext_list_price) as list_price, sum(ss_ext_tax) as extended_tax from store_sales, date_dim, store, household_demographics, customer_address where store_sales.ss_sold_date_sk = date_dim.d_date_sk and store_sales.ss_store_sk = store.s_store_sk and store_sales.ss_hdemo_sk = household_demographics.hd_demo_sk and store_sales.ss_addr_sk = customer_address.ca_address_sk and date_dim.d_dom between ? and ? and (household_demographics.hd_dep_count = ? or household_demographics.hd_vehicle_count = ?) and date_dim.d_year in (?, ? + ?, ? + ?) and store.s_city IN (?.. ) group by ss_ticket_number, ss_customer_sk, ss_addr_sk, ca_city) as dn, customer, customer_address as current_addr where ss_customer_sk = c_customer_sk and customer.c_current_addr_sk = current_addr.ca_address_sk and current_addr.ca_city <> bought_city order by c_last_name, ss_ticket_number limit ?",
+    "fast_hash": "6053730083500517890",
     "query_hash": "8342135160115678450",
     "query_parameterized_hash": "6438673978837244631"
   },
   {
     "digest_text": "select cd_gender, cd_marital_status, cd_education_status, count(*) as cnt1, cd_purchase_estimate, count(*) as cnt2, cd_credit_rating, count(*) as cnt3 from customer as c, customer_address as ca, customer_demographics where c.c_current_addr_sk = ca.ca_address_sk and ca_state IN (?.. ) and cd_demo_sk = c.c_current_cdemo_sk and exists(select * from store_sales, date_dim where c.c_customer_sk = ss_customer_sk and ss_sold_date_sk = d_date_sk and d_year = ? and d_moy between ? and ? + ?) and (not exists(select * from web_sales, date_dim where c.c_customer_sk = ws_bill_customer_sk and ws_sold_date_sk = d_date_sk and d_year = ? and d_moy between ? and ? + ?) and not exists(select * from catalog_sales, date_dim where c.c_customer_sk = cs_ship_customer_sk and cs_sold_date_sk = d_date_sk and d_year = ? and d_moy between ? and ? + ?)) group by cd_gender, cd_marital_status, cd_education_status, cd_purchase_estimate, cd_credit_rating order by cd_gender, cd_marital_status, cd_education_status, cd_purchase_estimate, cd_credit_rating limit ?",
+    "fast_hash": "17139706991938478293",
     "query_hash": "13375299239810353403",
     "query_parameterized_hash": "13075952978071653512"
   },
   {
     "digest_text": "select sum(ss_net_profit) as total_sum, s_state, s_county, grouping(s_state) + grouping(s_county) as lochierarchy, rank() over (partition by grouping(s_state) + grouping(s_county), case when grouping(s_county) = ? then s_state end order by sum(ss_net_profit) desc) as rank_within_parent from store_sales, date_dim as d1, store where d1.d_month_seq between ? and ? + ? and d1.d_date_sk = ss_sold_date_sk and s_store_sk = ss_store_sk and s_state in (select s_state from (select s_state as s_state, rank() over (partition by s_state order by sum(ss_net_profit) desc) as ranking from store_sales, store, date_dim where d_month_seq between ? and ? + ? and d_date_sk = ss_sold_date_sk and s_store_sk = ss_store_sk group by s_state) as tmp1 where ranking <= ?) group by rollup (s_state, s_county) order by lochierarchy desc, case when lochierarchy = ? then s_state end, rank_within_parent limit ?",
+    "fast_hash": "6333588025682373410",
     "query_hash": "3571272387796220656",
     "query_parameterized_hash": "12413861009870206464"
   },
   {
     "digest_text": "select i_brand_id as brand_id, i_brand as brand, t_hour, t_minute, sum(ext_price) as ext_price from item, (select ws_ext_sales_price as ext_price, ws_sold_date_sk as sold_date_sk, ws_item_sk as sold_item_sk, ws_sold_time_sk as time_sk from web_sales, date_dim where d_date_sk = ws_sold_date_sk and d_moy = ? and d_year = ? union all select cs_ext_sales_price as ext_price, cs_sold_date_sk as sold_date_sk, cs_item_sk as sold_item_sk, cs_sold_time_sk as time_sk from catalog_sales, date_dim where d_date_sk = cs_sold_date_sk and d_moy = ? and d_year = ? union all select ss_ext_sales_price as ext_price, ss_sold_date_sk as sold_date_sk, ss_item_sk as sold_item_sk, ss_sold_time_sk as time_sk from store_sales, date_dim where d_date_sk = ss_sold_date_sk and d_moy = ? and d_year = ?) as tmp, time_dim where sold_item_sk = i_item_sk and i_manager_id = ? and time_sk = t_time_sk and (t_meal_time = ? or t_meal_time = ?) group by i_brand, i_brand_id, t_hour, t_minute order by ext_price desc, i_brand_id",
+    "fast_hash": "7480800487757724011",
     "query_hash": "9338145304281381290",
     "query_parameterized_hash": "17762655052877164042"
   },
   {
     "digest_text": "select i_item_desc, w_warehouse_name, d1.d_week_seq, sum(case when p_promo_sk is ? then ? else ? end) as no_promo, sum(case when p_promo_sk is not ? then ? else ? end) as promo, count(*) as total_cnt from catalog_sales join inventory on (cs_item_sk = inv_item_sk) join warehouse on (w_warehouse_sk = inv_warehouse_sk) join item on (i_item_sk = cs_item_sk) join customer_demographics on (cs_bill_cdemo_sk = cd_demo_sk) join household_demographics on (cs_bill_hdemo_sk = hd_demo_sk) join date_dim as d1 on (cs_sold_date_sk = d1.d_date_sk) join date_dim as d2 on (inv_date_sk = d2.d_date_sk) join date_dim as d3 on (cs_ship_date_sk = d3.d_date_sk) left outer join promotion on (cs_promo_sk = p_promo_sk) left outer join catalog_returns on (cr_item_sk = cs_item_sk and cr_order_number = cs_order_number) where d1.d_week_seq = d2.d_week_seq and inv_quantity_on_hand < cs_quantity and d3.d_date > d1.d_date + interval ? day and hd_buy_potential = ? and d1.d_year = ? and cd_marital_status = ? group by i_item_desc, w_warehouse_name, d1.d_week_seq order by total_cnt desc, i_item_desc, w_warehouse_name, d_week_seq limit ?",
+    "fast_hash": "2869180874319874779",
     "query_hash": "17758063000470166717",
     "query_parameterized_hash": "4144632032223650262"
   },
   {
     "digest_text": "select c_last_name, c_first_name, c_salutation, c_preferred_cust_flag, ss_ticket_number, cnt from (select ss_ticket_number, ss_customer_sk, count(*) as cnt from store_sales, date_dim, store, household_demographics where store_sales.ss_sold_date_sk = date_dim.d_date_sk and store_sales.ss_store_sk = store.s_store_sk and store_sales.ss_hdemo_sk = household_demographics.hd_demo_sk and date_dim.d_dom between ? and ? and (household_demographics.hd_buy_potential = ? or household_demographics.hd_buy_potential = ?) and household_demographics.hd_vehicle_count > ? and case when household_demographics.hd_vehicle_count > ? then household_demographics.hd_dep_count / household_demographics.hd_vehicle_count else ? end > ? and date_dim.d_year in (?, ? + ?, ? + ?) and store.s_county IN (?.. ) group by ss_ticket_number, ss_customer_sk) as dj, customer where ss_customer_sk = c_customer_sk and cnt between ? and ? order by cnt desc, c_last_name asc",
+    "fast_hash": "3272466928715460777",
     "query_hash": "5590459551194720674",
     "query_parameterized_hash": "10106191432493029178"
   },
   {
     "digest_text": "with year_total as (select c_customer_id as customer_id, c_first_name as customer_first_name, c_last_name as customer_last_name, d_year as year1, sum(ss_net_paid) as year_total, ? as sale_type from customer, store_sales, date_dim where c_customer_sk = ss_customer_sk and ss_sold_date_sk = d_date_sk and d_year in (?, ? + ?) group by c_customer_id, c_first_name, c_last_name, d_year union all select c_customer_id as customer_id, c_first_name as customer_first_name, c_last_name as customer_last_name, d_year as year1, sum(ws_net_paid) as year_total, ? as sale_type from customer, web_sales, date_dim where c_customer_sk = ws_bill_customer_sk and ws_sold_date_sk = d_date_sk and d_year in (?, ? + ?) group by c_customer_id, c_first_name, c_last_name, d_year) select t_s_secyear.customer_id, t_s_secyear.customer_first_name, t_s_secyear.customer_last_name from year_total as t_s_firstyear, year_total as t_s_secyear, year_total as t_w_firstyear, year_total as t_w_secyear where t_s_secyear.customer_id = t_s_firstyear.customer_id and t_s_firstyear.customer_id = t_w_secyear.customer_id and t_s_firstyear.customer_id = t_w_firstyear.customer_id and t_s_firstyear.sale_type = ? and t_w_firstyear.sale_type = ? and t_s_secyear.sale_type = ? and t_w_secyear.sale_type = ? and t_s_firstyear.year1 = ? and t_s_secyear.year1 = ? + ? and t_w_firstyear.year1 = ? and t_w_secyear.year1 = ? + ? and t_s_firstyear.year_total > ? and t_w_firstyear.year_total > ? and case when t_w_firstyear.year_total > ? then t_w_secyear.year_total / t_w_firstyear.year_total else ? end > case when t_s_firstyear.year_total > ? then t_s_secyear.year_total / t_s_firstyear.year_total else ? end order by ?, ?, ? limit ?",
+    "fast_hash": "1693805303277359453",
     "query_hash": "7942789626018010750",
     "query_parameterized_hash": "6337538947248921473"
   },
   {
     "digest_text": "with all_sales as (select d_year, i_brand_id, i_class_id, i_category_id, i_manufact_id, sum(sales_cnt) as sales_cnt, sum(sales_amt) as sales_amt from (select d_year, i_brand_id, i_class_id, i_category_id, i_manufact_id, cs_quantity - coalesce(cr_return_quantity, ?) as sales_cnt, cs_ext_sales_price - coalesce(cr_return_amount, ?) as sales_amt from catalog_sales join item on i_item_sk = cs_item_sk join date_dim on d_date_sk = cs_sold_date_sk left join catalog_returns on (cs_order_number = cr_order_number and cs_item_sk = cr_item_sk) where i_category = ? union select d_year, i_brand_id, i_class_id, i_category_id, i_manufact_id, ss_quantity - coalesce(sr_return_quantity, ?) as sales_cnt, ss_ext_sales_price - coalesce(sr_return_amt, ?) as sales_amt from store_sales join item on i_item_sk = ss_item_sk join date_dim on d_date_sk = ss_sold_date_sk left join store_returns on (ss_ticket_number = sr_ticket_number and ss_item_sk = sr_item_sk) where i_category = ? union select d_year, i_brand_id, i_class_id, i_category_id, i_manufact_id, ws_quantity - coalesce(wr_return_quantity, ?) as sales_cnt, ws_ext_sales_price - coalesce(wr_return_amt, ?) as sales_amt from web_sales join item on i_item_sk = ws_item_sk join date_dim on d_date_sk = ws_sold_date_sk left join web_returns on (ws_order_number = wr_order_number and ws_item_sk = wr_item_sk) where i_category = ?) as sales_detail group by d_year, i_brand_id, i_class_id, i_category_id, i_manufact_id) select prev_yr.d_year as prev_year, curr_yr.d_year as year1, curr_yr.i_brand_id, curr_yr.i_class_id, curr_yr.i_category_id, curr_yr.i_manufact_id, prev_yr.sales_cnt as prev_yr_cnt, curr_yr.sales_cnt as curr_yr_cnt, curr_yr.sales_cnt - prev_yr.sales_cnt as sales_cnt_diff, curr_yr.sales_amt - prev_yr.sales_amt as sales_amt_diff from all_sales as curr_yr, all_sales as prev_yr where curr_yr.i_brand_id = prev_yr.i_brand_id and curr_yr.i_class_id = prev_yr.i_class_id and curr_yr.i_category_id = prev_yr.i_category_id and curr_yr.i_manufact_id = prev_yr.i_manufact_id and curr_yr.d_year = ? and prev_yr.d_year = ? - ? and cast(curr_yr.sales_cnt as decimal(?, ?)) / cast(prev_yr.sales_cnt as decimal(?, ?)) < ? order by sales_cnt_diff limit ?",
+    "fast_hash": "2712446321421509206",
     "query_hash": "8023977325095690231",
     "query_parameterized_hash": "13641986453005509038"
   },
   {
     "digest_text": "select channel, col_name, d_year, d_qoy, i_category, count(*) as sales_cnt, sum(ext_sales_price) as sales_amt from (select ? as channel, ? as col_name, d_year, d_qoy, i_category, ss_ext_sales_price as ext_sales_price from store_sales, item, date_dim where ss_hdemo_sk is ? and ss_sold_date_sk = d_date_sk and ss_item_sk = i_item_sk union all select ? as channel, ? as col_name, d_year, d_qoy, i_category, ws_ext_sales_price as ext_sales_price from web_sales, item, date_dim where ws_ship_hdemo_sk is ? and ws_sold_date_sk = d_date_sk and ws_item_sk = i_item_sk union all select ? as channel, ? as col_name, d_year, d_qoy, i_category, cs_ext_sales_price as ext_sales_price from catalog_sales, item, date_dim where cs_warehouse_sk is ? and cs_sold_date_sk = d_date_sk and cs_item_sk = i_item_sk) as foo group by channel, col_name, d_year, d_qoy, i_category order by channel, col_name, d_year, d_qoy, i_category limit ?",
+    "fast_hash": "9854883939059331118",
     "query_hash": "3132153721177535458",
     "query_parameterized_hash": "6908409849842646431"
   },
   {
     "digest_text": "with ss as (select s_store_sk, sum(ss_ext_sales_price) as sales, sum(ss_net_profit) as profit from store_sales, date_dim, store where ss_sold_date_sk = d_date_sk and d_date between cast(? as date) and (cast(? as date) + interval ? day) and ss_store_sk = s_store_sk group by s_store_sk), sr as (select s_store_sk, sum(sr_return_amt) as returns1, sum(sr_net_loss) as profit_loss from store_returns, date_dim, store where sr_returned_date_sk = d_date_sk and d_date between cast(? as date) and (cast(? as date) + interval ? day) and sr_store_sk = s_store_sk group by s_store_sk), cs as (select cs_call_center_sk, sum(cs_ext_sales_price) as sales, sum(cs_net_profit) as profit from catalog_sales, date_dim where cs_sold_date_sk = d_date_sk and d_date between cast(? as date) and (cast(? as date) + interval ? day) group by cs_call_center_sk), cr as (select cr_call_center_sk, sum(cr_return_amount) as returns1, sum(cr_net_loss) as profit_loss from catalog_returns, date_dim where cr_returned_date_sk = d_date_sk and d_date between cast(? as date) and (cast(? as date) + interval ? day) group by cr_call_center_sk), ws as (select wp_web_page_sk, sum(ws_ext_sales_price) as sales, sum(ws_net_profit) as profit from web_sales, date_dim, web_page where ws_sold_date_sk = d_date_sk and d_date between cast(? as date) and (cast(? as date) + interval ? day) and ws_web_page_sk = wp_web_page_sk group by wp_web_page_sk), wr as (select wp_web_page_sk, sum(wr_return_amt) as returns1, sum(wr_net_loss) as profit_loss from web_returns, date_dim, web_page where wr_returned_date_sk = d_date_sk and d_date between cast(? as date) and (cast(? as date) + interval ? day) and wr_web_page_sk = wp_web_page_sk group by wp_web_page_sk) select channel, id, sum(sales) as sales, sum(returns1) as returns1, sum(profit) as profit from (select ? as channel, ss.s_store_sk as id, sales, coalesce(returns1, ?) as returns1, (profit - coalesce(profit_loss, ?)) as profit from ss left join sr on ss.s_store_sk = sr.s_store_sk union all select ? as channel, cs_call_center_sk as id, sales, returns1, (profit - profit_loss) as profit from cs, cr union all select ? as channel, ws.wp_web_page_sk as id, sales, coalesce(returns1, ?) as returns1, (profit - coalesce(profit_loss, ?)) as profit from ws left join wr on ws.wp_web_page_sk = wr.wp_web_page_sk) as x group by rollup (channel, id) order by channel, id limit ?",
+    "fast_hash": "2321892675980373255",
     "query_hash": "10816047378189247612",
     "query_parameterized_hash": "16698404376862816513"
   },
   {
     "digest_text": "with ws as (select d_year as ws_sold_year, ws_item_sk, ws_bill_customer_sk as ws_customer_sk, sum(ws_quantity) as ws_qty, sum(ws_wholesale_cost) as ws_wc, sum(ws_sales_price) as ws_sp from web_sales left join web_returns on wr_order_number = ws_order_number and ws_item_sk = wr_item_sk join date_dim on ws_sold_date_sk = d_date_sk where wr_order_number is ? group by d_year, ws_item_sk, ws_bill_customer_sk), cs as (select d_year as cs_sold_year, cs_item_sk, cs_bill_customer_sk as cs_customer_sk, sum(cs_quantity) as cs_qty, sum(cs_wholesale_cost) as cs_wc, sum(cs_sales_price) as cs_sp from catalog_sales left join catalog_returns on cr_order_number = cs_order_number and cs_item_sk = cr_item_sk join date_dim on cs_sold_date_sk = d_date_sk where cr_order_number is ? group by d_year, cs_item_sk, cs_bill_customer_sk), ss as (select d_year as ss_sold_year, ss_item_sk, ss_customer_sk, sum(ss_quantity) as ss_qty, sum(ss_wholesale_cost) as ss_wc, sum(ss_sales_price) as ss_sp from store_sales left join store_returns on sr_ticket_number = ss_ticket_number and ss_item_sk = sr_item_sk join date_dim on ss_sold_date_sk = d_date_sk where sr_ticket_number is ? group by d_year, ss_item_sk, ss_customer_sk) select ss_item_sk, round(ss_qty / (coalesce(ws_qty + cs_qty, ?)), ?) as ratio, ss_qty as store_qty, ss_wc as store_wholesale_cost, ss_sp as store_sales_price, coalesce(ws_qty, ?) + coalesce(cs_qty, ?) as other_chan_qty, coalesce(ws_wc, ?) + coalesce(cs_wc, ?) as other_chan_wholesale_cost, coalesce(ws_sp, ?) + coalesce(cs_sp, ?) as other_chan_sales_price from ss left join ws on (ws_sold_year = ss_sold_year and ws_item_sk = ss_item_sk and ws_customer_sk = ss_customer_sk) left join cs on (cs_sold_year = ss_sold_year and cs_item_sk = cs_item_sk and cs_customer_sk = ss_customer_sk) where coalesce(ws_qty, ?) > ? and coalesce(cs_qty, ?) > ? and ss_sold_year = ? order by ss_item_sk, ss_qty desc, ss_wc desc, ss_sp desc, other_chan_qty, other_chan_wholesale_cost, other_chan_sales_price, round(ss_qty / (coalesce(ws_qty + cs_qty, ?)), ?) limit ?",
+    "fast_hash": "14763725024077610422",
     "query_hash": "2692599608607108848",
     "query_parameterized_hash": "3809183561008973442"
   },
   {
     "digest_text": "select c_last_name, c_first_name, substr(s_city, ?, ?) as \"_col_2\", ss_ticket_number, amt, profit from (select ss_ticket_number, ss_customer_sk, store.s_city, sum(ss_coupon_amt) as amt, sum(ss_net_profit) as profit from store_sales, date_dim, store, household_demographics where store_sales.ss_sold_date_sk = date_dim.d_date_sk and store_sales.ss_store_sk = store.s_store_sk and store_sales.ss_hdemo_sk = household_demographics.hd_demo_sk and (household_demographics.hd_dep_count = ? or household_demographics.hd_vehicle_count > ?) and date_dim.d_dow = ? and date_dim.d_year in (?, ? + ?, ? + ?) and store.s_number_employees between ? and ? group by ss_ticket_number, ss_customer_sk, ss_addr_sk, store.s_city) as ms, customer where ss_customer_sk = c_customer_sk order by c_last_name, c_first_name, substr(s_city, ?, ?), profit limit ?",
+    "fast_hash": "17534287667351436391",
     "query_hash": "7232796858540926324",
     "query_parameterized_hash": "16045682008615746881"
   },
   {
     "digest_text": "with ssr as (select s_store_id as store_id, sum(ss_ext_sales_price) as sales, sum(coalesce(sr_return_amt, ?)) as returns1, sum(ss_net_profit - coalesce(sr_net_loss, ?)) as profit from store_sales left outer join store_returns on (ss_item_sk = sr_item_sk and ss_ticket_number = sr_ticket_number), date_dim, store, item, promotion where ss_sold_date_sk = d_date_sk and d_date between cast(? as date) and (cast(? as date) + interval ? day) and ss_store_sk = s_store_sk and ss_item_sk = i_item_sk and i_current_price > ? and ss_promo_sk = p_promo_sk and p_channel_tv = ? group by s_store_id), csr as (select cp_catalog_page_id as catalog_page_id, sum(cs_ext_sales_price) as sales, sum(coalesce(cr_return_amount, ?)) as returns1, sum(cs_net_profit - coalesce(cr_net_loss, ?)) as profit from catalog_sales left outer join catalog_returns on (cs_item_sk = cr_item_sk and cs_order_number = cr_order_number), date_dim, catalog_page, item, promotion where cs_sold_date_sk = d_date_sk and d_date between cast(? as date) and (cast(? as date) + interval ? day) and cs_catalog_page_sk = cp_catalog_page_sk and cs_item_sk = i_item_sk and i_current_price > ? and cs_promo_sk = p_promo_sk and p_channel_tv = ? group by cp_catalog_page_id), wsr as (select web_site_id, sum(ws_ext_sales_price) as sales, sum(coalesce(wr_return_amt, ?)) as returns1, sum(ws_net_profit - coalesce(wr_net_loss, ?)) as profit from web_sales left outer join web_returns on (ws_item_sk = wr_item_sk and ws_order_number = wr_order_number), date_dim, web_site, item, promotion where ws_sold_date_sk = d_date_sk and d_date between cast(? as date) and (cast(? as date) + interval ? day) and ws_web_site_sk = web_site_sk and ws_item_sk = i_item_sk and i_current_price > ? and ws_promo_sk = p_promo_sk and p_channel_tv = ? group by web_site_id) select channel, id, sum(sales) as sales, sum(returns1) as returns1, sum(profit) as profit from (select ? as channel, ? || store_id as id, sales, returns1, profit from ssr union all select ? as channel, ? || catalog_page_id as id, sales, returns1, profit from csr union all select ? as channel, ? || web_site_id as id, sales, returns1, profit from wsr) as x group by rollup (channel, id) order by channel, id limit ?",
+    "fast_hash": "5804753006640777042",
     "query_hash": "16713105144009589623",
     "query_parameterized_hash": "4135441065890518629"
   },
   {
     "digest_text": "with customer_total_return as (select cr_returning_customer_sk as ctr_customer_sk, ca_state as ctr_state, sum(cr_return_amt_inc_tax) as ctr_total_return from catalog_returns, date_dim, customer_address where cr_returned_date_sk = d_date_sk and d_year = ? and cr_returning_addr_sk = ca_address_sk group by cr_returning_customer_sk, ca_state) select c_customer_id, c_salutation, c_first_name, c_last_name, ca_street_number, ca_street_name, ca_street_type, ca_suite_number, ca_city, ca_county, ca_state, ca_zip, ca_country, ca_gmt_offset, ca_location_type, ctr_total_return from customer_total_return as ctr1, customer_address, customer where ctr1.ctr_total_return > (select avg(ctr_total_return) * ? from customer_total_return as ctr2 where ctr1.ctr_state = ctr2.ctr_state) and ca_address_sk = c_current_addr_sk and ca_state = ? and ctr1.ctr_customer_sk = c_customer_sk order by c_customer_id, c_salutation, c_first_name, c_last_name, ca_street_number, ca_street_name, ca_street_type, ca_suite_number, ca_city, ca_county, ca_state, ca_zip, ca_country, ca_gmt_offset, ca_location_type, ctr_total_return limit ?",
+    "fast_hash": "5869708120470673864",
     "query_hash": "4179164816618570631",
     "query_parameterized_hash": "3203996508835641755"
   },
   {
     "digest_text": "select i_item_id, i_item_desc, i_current_price from item, inventory, date_dim, store_sales where i_current_price between ? and ? + ? and inv_item_sk = i_item_sk and d_date_sk = inv_date_sk and d_date between cast(? as date) and (cast(? as date) + interval ? day) and i_manufact_id IN (?.. ) and inv_quantity_on_hand between ? and ? and ss_item_sk = i_item_sk group by i_item_id, i_item_desc, i_current_price order by i_item_id limit ?",
+    "fast_hash": "4143786503116544769",
     "query_hash": "8401093271199336577",
     "query_parameterized_hash": "9025943042454489916"
   },
   {
     "digest_text": "with sr_items as (select i_item_id as item_id, sum(sr_return_quantity) as sr_item_qty from store_returns, item, date_dim where sr_item_sk = i_item_sk and d_date in (select d_date from date_dim where d_week_seq in (select d_week_seq from date_dim where d_date IN (?.. ))) and sr_returned_date_sk = d_date_sk group by i_item_id), cr_items as (select i_item_id as item_id, sum(cr_return_quantity) as cr_item_qty from catalog_returns, item, date_dim where cr_item_sk = i_item_sk and d_date in (select d_date from date_dim where d_week_seq in (select d_week_seq from date_dim where d_date IN (?.. ))) and cr_returned_date_sk = d_date_sk group by i_item_id), wr_items as (select i_item_id as item_id, sum(wr_return_quantity) as wr_item_qty from web_returns, item, date_dim where wr_item_sk = i_item_sk and d_date in (select d_date from date_dim where d_week_seq in (select d_week_seq from date_dim where d_date IN (?.. ))) and wr_returned_date_sk = d_date_sk group by i_item_id) select sr_items.item_id, sr_item_qty, sr_item_qty / (sr_item_qty + cr_item_qty + wr_item_qty) / ? * ? as sr_dev, cr_item_qty, cr_item_qty / (sr_item_qty + cr_item_qty + wr_item_qty) / ? * ? as cr_dev, wr_item_qty, wr_item_qty / (sr_item_qty + cr_item_qty + wr_item_qty) / ? * ? as wr_dev, (sr_item_qty + cr_item_qty + wr_item_qty) / ? as average from sr_items, cr_items, wr_items where sr_items.item_id = cr_items.item_id and sr_items.item_id = wr_items.item_id order by sr_items.item_id, sr_item_qty limit ?",
+    "fast_hash": "17425707814112392442",
     "query_hash": "4032687784063982573",
     "query_parameterized_hash": "11896115190594106844"
   },
   {
     "digest_text": "select c_customer_id as customer_id, c_last_name || ? || c_first_name as customername from customer, customer_address, customer_demographics, household_demographics, income_band, store_returns where ca_city = ? and c_current_addr_sk = ca_address_sk and ib_lower_bound >= ? and ib_upper_bound <= ? + ? and ib_income_band_sk = hd_income_band_sk and cd_demo_sk = c_current_cdemo_sk and hd_demo_sk = c_current_hdemo_sk and sr_cdemo_sk = cd_demo_sk order by c_customer_id limit ?",
+    "fast_hash": "15583795360534874747",
     "query_hash": "13842957150562906664",
     "query_parameterized_hash": "2290684553298343030"
   },
   {
     "digest_text": "select substr(r_reason_desc, ?, ?) as \"_col_0\", avg(ws_quantity) as \"_col_1\", avg(wr_refunded_cash) as \"_col_2\", avg(wr_fee) as \"_col_3\" from web_sales, web_returns, web_page, customer_demographics as cd1, customer_demographics as cd2, customer_address, date_dim, reason where ws_web_page_sk = wp_web_page_sk and ws_item_sk = wr_item_sk and ws_order_number = wr_order_number and ws_sold_date_sk = d_date_sk and d_year = ? and cd1.cd_demo_sk = wr_refunded_cdemo_sk and cd2.cd_demo_sk = wr_returning_cdemo_sk and ca_address_sk = wr_refunded_addr_sk and r_reason_sk = wr_reason_sk and ((cd1.cd_marital_status = ? and cd1.cd_marital_status = cd2.cd_marital_status and cd1.cd_education_status = ? and cd1.cd_education_status = cd2.cd_education_status and ws_sales_price between ? and ?) or (cd1.cd_marital_status = ? and cd1.cd_marital_status = cd2.cd_marital_status and cd1.cd_education_status = ? and cd1.cd_education_status = cd2.cd_education_status and ws_sales_price between ? and ?) or (cd1.cd_marital_status = ? and cd1.cd_marital_status = cd2.cd_marital_status and cd1.cd_education_status = ? and cd1.cd_education_status = cd2.cd_education_status and ws_sales_price between ? and ?)) and ((ca_country = ? and ca_state IN (?.. ) and ws_net_profit between ? and ?) or (ca_country = ? and ca_state IN (?.. ) and ws_net_profit between ? and ?) or (ca_country = ? and ca_state IN (?.. ) and ws_net_profit between ? and ?)) group by r_reason_desc order by substr(r_reason_desc, ?, ?), avg(ws_quantity), avg(wr_refunded_cash), avg(wr_fee) limit ?",
+    "fast_hash": "4231418611155203677",
     "query_hash": "11883358628706839349",
     "query_parameterized_hash": "13789492039234397819"
   },
   {
     "digest_text": "select sum(ws_net_paid) as total_sum, i_category, i_class, grouping(i_category) + grouping(i_class) as lochierarchy, rank() over (partition by grouping(i_category) + grouping(i_class), case when grouping(i_class) = ? then i_category end order by sum(ws_net_paid) desc) as rank_within_parent from web_sales, date_dim as d1, item where d1.d_month_seq between ? and ? + ? and d1.d_date_sk = ws_sold_date_sk and i_item_sk = ws_item_sk group by rollup (i_category, i_class) order by lochierarchy desc, case when lochierarchy = ? then i_category end, rank_within_parent limit ?",
+    "fast_hash": "4425447015634773653",
     "query_hash": "4843449539189526927",
     "query_parameterized_hash": "5303206131822159105"
   },
   {
     "digest_text": "select count(*) as \"_col_0\" from ((select distinct c_last_name, c_first_name, d_date from store_sales, date_dim, customer where store_sales.ss_sold_date_sk = date_dim.d_date_sk and store_sales.ss_customer_sk = customer.c_customer_sk and d_month_seq between ? and ? + ?) except (select distinct c_last_name, c_first_name, d_date from catalog_sales, date_dim, customer where catalog_sales.cs_sold_date_sk = date_dim.d_date_sk and catalog_sales.cs_bill_customer_sk = customer.c_customer_sk and d_month_seq between ? and ? + ?) except (select distinct c_last_name, c_first_name, d_date from web_sales, date_dim, customer where web_sales.ws_sold_date_sk = date_dim.d_date_sk and web_sales.ws_bill_customer_sk = customer.c_customer_sk and d_month_seq between ? and ? + ?)) as cool_cust",
+    "fast_hash": "894438891428140380",
     "query_hash": "17279453407480128982",
     "query_parameterized_hash": "14221443909168824397"
   },
   {
     "digest_text": "select * from (select count(*) as h8_30_to_9 from store_sales, household_demographics, time_dim, store where ss_sold_time_sk = time_dim.t_time_sk and ss_hdemo_sk = household_demographics.hd_demo_sk and ss_store_sk = s_store_sk and time_dim.t_hour = ? and time_dim.t_minute >= ? and ((household_demographics.hd_dep_count = -? and household_demographics.hd_vehicle_count <= -? + ?) or (household_demographics.hd_dep_count = ? and household_demographics.hd_vehicle_count <= ? + ?) or (household_demographics.hd_dep_count = ? and household_demographics.hd_vehicle_count <= ? + ?)) and store.s_store_name = ?) as s1, (select count(*) as h9_to_9_30 from store_sales, household_demographics, time_dim, store where ss_sold_time_sk = time_dim.t_time_sk and ss_hdemo_sk = household_demographics.hd_demo_sk and ss_store_sk = s_store_sk and time_dim.t_hour = ? and time_dim.t_minute < ? and ((household_demographics.hd_dep_count = -? and household_demographics.hd_vehicle_count <= -? + ?) or (household_demographics.hd_dep_count = ? and household_demographics.hd_vehicle_count <= ? + ?) or (household_demographics.hd_dep_count = ? and household_demographics.hd_vehicle_count <= ? + ?)) and store.s_store_name = ?) as s2, (select count(*) as h9_30_to_10 from store_sales, household_demographics, time_dim, store where ss_sold_time_sk = time_dim.t_time_sk and ss_hdemo_sk = household_demographics.hd_demo_sk and ss_store_sk = s_store_sk and time_dim.t_hour = ? and time_dim.t_minute >= ? and ((household_demographics.hd_dep_count = -? and household_demographics.hd_vehicle_count <= -? + ?) or (household_demographics.hd_dep_count = ? and household_demographics.hd_vehicle_count <= ? + ?) or (household_demographics.hd_dep_count = ? and household_demographics.hd_vehicle_count <= ? + ?)) and store.s_store_name = ?) as s3, (select count(*) as h10_to_10_30 from store_sales, household_demographics, time_dim, store where ss_sold_time_sk = time_dim.t_time_sk and ss_hdemo_sk = household_demographics.hd_demo_sk and ss_store_sk = s_store_sk and time_dim.t_hour = ? and time_dim.t_minute < ? and ((household_demographics.hd_dep_count = -? and household_demographics.hd_vehicle_count <= -? + ?) or (household_demographics.hd_dep_count = ? and household_demographics.hd_vehicle_count <= ? + ?) or (household_demographics.hd_dep_count = ? and household_demographics.hd_vehicle_count <= ? + ?)) and store.s_store_name = ?) as s4, (select count(*) as h10_30_to_11 from store_sales, household_demographics, time_dim, store where ss_sold_time_sk = time_dim.t_time_sk and ss_hdemo_sk = household_demographics.hd_demo_sk and ss_store_sk = s_store_sk and time_dim.t_hour = ? and time_dim.t_minute >= ? and ((household_demographics.hd_dep_count = -? and household_demographics.hd_vehicle_count <= -? + ?) or (household_demographics.hd_dep_count = ? and household_demographics.hd_vehicle_count <= ? + ?) or (household_demographics.hd_dep_count = ? and household_demographics.hd_vehicle_count <= ? + ?)) and store.s_store_name = ?) as s5, (select count(*) as h11_to_11_30 from store_sales, household_demographics, time_dim, store where ss_sold_time_sk = time_dim.t_time_sk and ss_hdemo_sk = household_demographics.hd_demo_sk and ss_store_sk = s_store_sk and time_dim.t_hour = ? and time_dim.t_minute < ? and ((household_demographics.hd_dep_count = -? and household_demographics.hd_vehicle_count <= -? + ?) or (household_demographics.hd_dep_count = ? and household_demographics.hd_vehicle_count <= ? + ?) or (household_demographics.hd_dep_count = ? and household_demographics.hd_vehicle_count <= ? + ?)) and store.s_store_name = ?) as s6, (select count(*) as h11_30_to_12 from store_sales, household_demographics, time_dim, store where ss_sold_time_sk = time_dim.t_time_sk and ss_hdemo_sk = household_demographics.hd_demo_sk and ss_store_sk = s_store_sk and time_dim.t_hour = ? and time_dim.t_minute >= ? and ((household_demographics.hd_dep_count = -? and household_demographics.hd_vehicle_count <= -? + ?) or (household_demographics.hd_dep_count = ? and household_demographics.hd_vehicle_count <= ? + ?) or (household_demographics.hd_dep_count = ? and household_demographics.hd_vehicle_count <= ? + ?)) and store.s_store_name = ?) as s7, (select count(*) as h12_to_12_30 from store_sales, household_demographics, time_dim, store where ss_sold_time_sk = time_dim.t_time_sk and ss_hdemo_sk = household_demographics.hd_demo_sk and ss_store_sk = s_store_sk and time_dim.t_hour = ? and time_dim.t_minute < ? and ((household_demographics.hd_dep_count = -? and household_demographics.hd_vehicle_count <= -? + ?) or (household_demographics.hd_dep_count = ? and household_demographics.hd_vehicle_count <= ? + ?) or (household_demographics.hd_dep_count = ? and household_demographics.hd_vehicle_count <= ? + ?)) and store.s_store_name = ?) as s8",
+    "fast_hash": "17901009395118460691",
     "query_hash": "16191268676543892334",
     "query_parameterized_hash": "160194805020439037"
   },
   {
     "digest_text": "select * from (select i_category, i_class, i_brand, s_store_name, s_company_name, d_moy, sum(ss_sales_price) as sum_sales, avg(sum(ss_sales_price)) over (partition by i_category, i_brand, s_store_name, s_company_name) as avg_monthly_sales from item, store_sales, date_dim, store where ss_item_sk = i_item_sk and ss_sold_date_sk = d_date_sk and ss_store_sk = s_store_sk and d_year in (?) and ((i_category IN (?.. ) and i_class IN (?.. )) or (i_category IN (?.. ) and i_class IN (?.. ))) group by i_category, i_class, i_brand, s_store_name, s_company_name, d_moy) as tmp1 where case when (avg_monthly_sales <> ?) then (abs(sum_sales - avg_monthly_sales) / avg_monthly_sales) else ? end > ? order by sum_sales - avg_monthly_sales, s_store_name limit ?",
+    "fast_hash": "17995853665053346368",
     "query_hash": "869894345821742618",
     "query_parameterized_hash": "11542913319819988260"
   },
   {
     "digest_text": "select cast(amc as decimal(?, ?)) / cast(pmc as decimal(?, ?)) as am_pm_ratio from (select count(*) as amc from web_sales, household_demographics, time_dim, web_page where ws_sold_time_sk = time_dim.t_time_sk and ws_ship_hdemo_sk = household_demographics.hd_demo_sk and ws_web_page_sk = web_page.wp_web_page_sk and time_dim.t_hour between ? and ? + ? and household_demographics.hd_dep_count = ? and web_page.wp_char_count between ? and ?) as at1, (select count(*) as pmc from web_sales, household_demographics, time_dim, web_page where ws_sold_time_sk = time_dim.t_time_sk and ws_ship_hdemo_sk = household_demographics.hd_demo_sk and ws_web_page_sk = web_page.wp_web_page_sk and time_dim.t_hour between ? and ? + ? and household_demographics.hd_dep_count = ? and web_page.wp_char_count between ? and ?) as pt order by am_pm_ratio limit ?",
+    "fast_hash": "14862157118028615623",
     "query_hash": "6899075792509459392",
     "query_parameterized_hash": "12647935907681069588"
   },
   {
     "digest_text": "select cc_call_center_id as call_center, cc_name as call_center_name, cc_manager as manager, sum(cr_net_loss) as returns_loss from call_center, catalog_returns, date_dim, customer, customer_address, customer_demographics, household_demographics where cr_call_center_sk = cc_call_center_sk and cr_returned_date_sk = d_date_sk and cr_returning_customer_sk = c_customer_sk and cd_demo_sk = c_current_cdemo_sk and hd_demo_sk = c_current_hdemo_sk and ca_address_sk = c_current_addr_sk and d_year = ? and d_moy = ? and ((cd_marital_status = ? and cd_education_status = ?) or (cd_marital_status = ? and cd_education_status = ?)) and hd_buy_potential like ? and ca_gmt_offset = -? group by cc_call_center_id, cc_name, cc_manager, cd_marital_status, cd_education_status order by sum(cr_net_loss) desc",
+    "fast_hash": "11904159793079503151",
     "query_hash": "9580530509060423704",
     "query_parameterized_hash": "5344362500074741702"
   },
   {
     "digest_text": "select sum(ws_ext_discount_amt) as \"excess discount amount\" from web_sales, item, date_dim where i_manufact_id = ? and i_item_sk = ws_item_sk and d_date between ? and (cast(? as date) + interval ? day) and d_date_sk = ws_sold_date_sk and ws_ext_discount_amt > (select ? * avg(ws_ext_discount_amt) from web_sales, date_dim where ws_item_sk = i_item_sk and d_date between ? and (cast(? as date) + interval ? day) and d_date_sk = ws_sold_date_sk) order by sum(ws_ext_discount_amt) limit ?",
+    "fast_hash": "18090212176110643176",
     "query_hash": "17204516394477839824",
     "query_parameterized_hash": "8033498469455041055"
   },
   {
     "digest_text": "select ss_customer_sk, sum(act_sales) as sumsales from (select ss_item_sk, ss_ticket_number, ss_customer_sk, case when sr_return_quantity is not ? then (ss_quantity - sr_return_quantity) * ss_sales_price else (ss_quantity * ss_sales_price) end as act_sales from store_sales left outer join store_returns on (sr_item_sk = ss_item_sk and sr_ticket_number = ss_ticket_number), reason where sr_reason_sk = r_reason_sk and r_reason_desc = ?) as t group by ss_customer_sk order by sumsales, ss_customer_sk limit ?",
+    "fast_hash": "8624239867268526323",
     "query_hash": "5571795603895534920",
     "query_parameterized_hash": "8499924736851745276"
   },
   {
     "digest_text": "select count(distinct ws_order_number) as \"order count\", sum(ws_ext_ship_cost) as \"total shipping cost\", sum(ws_net_profit) as \"total net profit\" from web_sales as ws1, date_dim, customer_address, web_site where d_date between ? and (cast(? as date) + interval ? day) and ws1.ws_ship_date_sk = d_date_sk and ws1.ws_ship_addr_sk = ca_address_sk and ca_state = ? and ws1.ws_web_site_sk = web_site_sk and web_company_name = ? and exists(select * from web_sales as ws2 where ws1.ws_order_number = ws2.ws_order_number and ws1.ws_warehouse_sk <> ws2.ws_warehouse_sk) and not exists(select * from web_returns as wr1 where ws1.ws_order_number = wr1.wr_order_number) order by count(distinct ws_order_number) limit ?",
+    "fast_hash": "8320080615103029099",
     "query_hash": "7943344483413415970",
     "query_parameterized_hash": "14131664311490759931"
   },
   {
     "digest_text": "with ws_wh as (select ws1.ws_order_number, ws1.ws_warehouse_sk as wh1, ws2.ws_warehouse_sk as wh2 from web_sales as ws1, web_sales as ws2 where ws1.ws_order_number = ws2.ws_order_number and ws1.ws_warehouse_sk <> ws2.ws_warehouse_sk) select count(distinct ws_order_number) as \"order count\", sum(ws_ext_ship_cost) as \"total shipping cost\", sum(ws_net_profit) as \"total net profit\" from web_sales as ws1, date_dim, customer_address, web_site where d_date between ? and (cast(? as date) + interval ? day) and ws1.ws_ship_date_sk = d_date_sk and ws1.ws_ship_addr_sk = ca_address_sk and ca_state = ? and ws1.ws_web_site_sk = web_site_sk and web_company_name = ? and ws1.ws_order_number in (select ws_order_number from ws_wh) and ws1.ws_order_number in (select wr_order_number from web_returns, ws_wh where wr_order_number = ws_wh.ws_order_number) order by count(distinct ws_order_number) limit ?",
+    "fast_hash": "10974126941558950554",
     "query_hash": "15923513516541629979",
     "query_parameterized_hash": "11144713293443405878"
   },
   {
     "digest_text": "select count(*) as \"_col_0\" from store_sales, household_demographics, time_dim, store where ss_sold_time_sk = time_dim.t_time_sk and ss_hdemo_sk = household_demographics.hd_demo_sk and ss_store_sk = s_store_sk and time_dim.t_hour = ? and time_dim.t_minute >= ? and household_demographics.hd_dep_count = ? and store.s_store_name = ? order by count(*) limit ?",
+    "fast_hash": "18239587253126794392",
     "query_hash": "15853816510368499130",
     "query_parameterized_hash": "6337080454990223661"
   },
   {
     "digest_text": "with ssci as (select ss_customer_sk as customer_sk, ss_item_sk as item_sk from store_sales, date_dim where ss_sold_date_sk = d_date_sk and d_month_seq between ? and ? + ? group by ss_customer_sk, ss_item_sk), csci as (select cs_bill_customer_sk as customer_sk, cs_item_sk as item_sk from catalog_sales, date_dim where cs_sold_date_sk = d_date_sk and d_month_seq between ? and ? + ? group by cs_bill_customer_sk, cs_item_sk) select sum(case when ssci.customer_sk is not ? and csci.customer_sk is ? then ? else ? end) as store_only, sum(case when ssci.customer_sk is ? and csci.customer_sk is not ? then ? else ? end) as catalog_only, sum(case when ssci.customer_sk is not ? and csci.customer_sk is not ? then ? else ? end) as store_and_catalog from ssci full outer join csci on (ssci.customer_sk = csci.customer_sk and ssci.item_sk = csci.item_sk) limit ?",
+    "fast_hash": "16984179773204512799",
     "query_hash": "7536263119429897956",
     "query_parameterized_hash": "3913110986549447522"
   },
   {
     "digest_text": "select i_item_id, i_item_desc, i_category, i_class, i_current_price, sum(ss_ext_sales_price) as itemrevenue, sum(ss_ext_sales_price) * ? / sum(sum(ss_ext_sales_price)) over (partition by i_class) as revenueratio from store_sales, item, date_dim where ss_item_sk = i_item_sk and i_category IN (?.. ) and ss_sold_date_sk = d_date_sk and d_date between cast(? as date) and (cast(? as date) + interval ? day) group by i_item_id, i_item_desc, i_category, i_class, i_current_price order by i_category, i_class, i_item_id, i_item_desc, revenueratio",
+    "fast_hash": "18216969522782774432",
     "query_hash": "9511646538053350958",
     "query_parameterized_hash": "16464790394028426516"
   },
   {
     "digest_text": "select substr(w_warehouse_name, ?, ?) as \"_col_0\", sm_type, cc_name, sum(case when (cs_ship_date_sk - cs_sold_date_sk <= ?) then ? else ? end) as \"? days\", sum(case when (cs_ship_date_sk - cs_sold_date_sk > ?) and (cs_ship_date_sk - cs_sold_date_sk <= ?) then ? else ? end) as \"?-? days\", sum(case when (cs_ship_date_sk - cs_sold_date_sk > ?) and (cs_ship_date_sk - cs_sold_date_sk <= ?) then ? else ? end) as \"?-? days\", sum(case when (cs_ship_date_sk - cs_sold_date_sk > ?) and (cs_ship_date_sk - cs_sold_date_sk <= ?) then ? else ? end) as \"?-? days\", sum(case when (cs_ship_date_sk - cs_sold_date_sk > ?) then ? else ? end) as \">? days\" from catalog_sales, warehouse, ship_mode, call_center, date_dim where d_month_seq between ? and ? + ? and cs_ship_date_sk = d_date_sk and cs_warehouse_sk = w_warehouse_sk and cs_ship_mode_sk = sm_ship_mode_sk and cs_call_center_sk = cc_call_center_sk group by substr(w_warehouse_name, ?, ?), sm_type, cc_name order by substr(w_warehouse_name, ?, ?), sm_type, cc_name limit ?",
+    "fast_hash": "3760301650157489573",
     "query_hash": "14248572022478702152",
     "query_parameterized_hash": "17360356701689220496"
   }
