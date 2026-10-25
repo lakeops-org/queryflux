@@ -132,7 +132,7 @@ struct Args {
     #[arg(long)]
     worker_api_url: Option<String>,
 
-    /// http transport with --worker-api-url: controlPlane.sharedSecret.
+    /// http transport with --worker-api-url: workerSecret.
     #[arg(long, default_value = "")]
     worker_secret: String,
 

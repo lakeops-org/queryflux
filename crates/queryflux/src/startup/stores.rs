@@ -30,6 +30,8 @@ pub(crate) struct Stores {
     pub(crate) coordination: Option<Arc<dyn CoordinationStore>>,
     /// Consistent config reads for the worker API; `None` in in-memory mode.
     pub(crate) snapshot_store: Option<Arc<dyn queryflux_persistence::ConfigSnapshotStore>>,
+    /// Enrolled hubs (Postgres only).
+    pub(crate) hub_store: Option<Arc<dyn queryflux_persistence::hub_store::HubStore>>,
     /// Where worker registrations and heartbeats are recorded.
     pub(crate) worker_registry: Arc<dyn queryflux_persistence::WorkerRegistryStore>,
     /// Capacity quotas (Postgres only): where this process and its workers report demand,
@@ -123,6 +125,8 @@ pub(crate) async fn build_stores(config: &ProxyConfig) -> Result<Stores> {
         pg_store.clone().map(|pg| pg as _);
     let snapshot_store: Option<Arc<dyn queryflux_persistence::ConfigSnapshotStore>> =
         pg_store.clone().map(|pg| pg as _);
+    let hub_store: Option<Arc<dyn queryflux_persistence::hub_store::HubStore>> =
+        pg_store.clone().map(|pg| pg as _);
     let worker_registry: Arc<dyn queryflux_persistence::WorkerRegistryStore> =
         match (&pg_store, &mem_store) {
             (Some(pg), _) => pg.clone(),
@@ -146,6 +150,7 @@ pub(crate) async fn build_stores(config: &ProxyConfig) -> Result<Stores> {
         distributed_backend,
         coordination,
         snapshot_store,
+        hub_store,
         worker_registry,
         history_store,
         quota_store,

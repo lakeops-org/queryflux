@@ -1,21 +1,22 @@
 # Hub config (examples/hub-values.yaml mounts it from a Secret: it holds the
-# site's upstream credential).
+# enrollment token and the workers' secret). The enrolled key is kept in stateDir.
 queryflux:
   role: hub
-  # What this site's workers present (their workerSecret). Use a different value from
-  # hub.upstream.secret, so workers never hold the site's upstream credential.
+  # What this site's workers present (their workerSecret).
   workerSecret: change-me-worker-secret
   adminApi:
     port: 9000
   hub:
-    # Unique per upstream. This site's workers appear upstream as <site>/<worker>.
+    # The site created on the control plane (PUT /admin/sites/{site}). This site's
+    # workers appear upstream as <site>/<worker>.
     site: us-east-dc1
     # The persistent volume from hub-values.yaml.
     stateDir: /var/lib/queryflux/hub
     upstream:
       url: https://queryflux-control-plane.example.com:9000
-      # This site's credential upstream (the control plane's workerSecret).
-      secret: change-me-site-secret
+      # One-time token from the control plane (POST /admin/sites/{site}/enrollment-tokens).
+      # On first start the hub enrolls its own key and keeps it in stateDir.
+      enrollToken: qfe_change-me
       pollTimeoutSecs: 30
       heartbeatIntervalSecs: 10
     historySpool:

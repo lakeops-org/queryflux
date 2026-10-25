@@ -23,6 +23,7 @@ use crate::live_config::{
 pub(crate) fn worker_api(
     config: &ProxyConfig,
     store: Option<Arc<dyn ConfigSnapshotStore>>,
+    hub_store: Option<Arc<dyn queryflux_persistence::hub_store::HubStore>>,
     startup_inputs: &LiveConfigInputs,
     registry: Arc<dyn queryflux_persistence::WorkerRegistryStore>,
     changes: tokio::sync::watch::Receiver<u64>,
@@ -33,7 +34,6 @@ pub(crate) fn worker_api(
     if config.queryflux.role != queryflux_core::config::Role::ControlPlane {
         return Ok(None);
     }
-    let api_cfg = config.queryflux.control_plane.clone().unwrap_or_default();
     // Empty when only hubs with their own tokens are accepted.
     let shared_secret = config.queryflux.worker_secret.clone().unwrap_or_default();
     // Embedded over TLS: the trusted single-fleet model. Secret references for lower-trust
@@ -102,15 +102,7 @@ pub(crate) fn worker_api(
         coordination,
         history: Some(history),
         quotas,
-        sites: api_cfg
-            .sites
-            .iter()
-            .map(|s| queryflux_core::config::ControlPlaneSite {
-                name: s.name.trim().to_string(),
-                tokens: s.tokens.iter().map(|h| h.to_ascii_lowercase()).collect(),
-                clusters: s.clusters.clone(),
-            })
-            .collect(),
+        hubs: hub_store.map(queryflux_frontend::hub_directory::HubDirectory::new),
     }))
 }
 
