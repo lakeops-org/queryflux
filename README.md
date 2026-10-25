@@ -104,23 +104,41 @@ Once the password has been changed through the UI, YAML/env credentials are igno
 
 ## Benchmark (proxy overhead)
 
-End-to-end overhead is measured by [`queryflux-bench`](crates/queryflux-bench) (`cargo run --bin queryflux-bench` after `cargo build --bin queryflux`). It uses **mock** backends (Trino HTTP + MySQL wire for StarRocks), **50** warmup queries per path, then **500** timed iterations of `SELECT 1` — direct to the mock vs the same request through QueryFlux (Trino HTTP frontend). Numbers vary by machine; CI tracks trends via [`.github/workflows/benchmark.yml`](.github/workflows/benchmark.yml).
+End-to-end overhead is measured by [`queryflux-bench`](crates/queryflux-bench) (`cargo build --release --bin queryflux --bin queryflux-bench`, then `target/release/queryflux-bench`). It uses **mock** backends (a Trino HTTP coordinator and a StarRocks MySQL-wire FE) that answer instantly, **50** warmup queries per path, then **500** timed iterations — direct to the mock vs the same request through QueryFlux's Trino HTTP frontend. Overhead is the difference. Numbers below: median of 3 runs on an Apple M1 Max (10 cores, 32 GB); they vary by machine, so compare runs on the same one.
 
-### Trino (mock HTTP coordinator)
-
-| | p50 | p95 | p99 |
-| --- | ---: | ---: | ---: |
-| Direct | 0.21 ms | 0.29 ms | 0.35 ms |
-| Via QueryFlux | 0.57 ms | 0.81 ms | 1.21 ms |
-| **Overhead** | **0.36 ms** | **0.52 ms** | **0.86 ms** |
-
-### StarRocks path (mock MySQL FE)
+### Trino (mock HTTP coordinator), `SELECT 1`
 
 | | p50 | p95 | p99 |
 | --- | ---: | ---: | ---: |
-| Direct (MySQL `SELECT 1`) | 0.36 ms | 0.54 ms | 1.20 ms |
-| Via QueryFlux | 0.70 ms | 1.21 ms | 4.20 ms |
-| **Overhead** | **0.34 ms** | **0.67 ms** | **3.01 ms** |
+| Direct | 0.09 ms | 0.13 ms | 0.15 ms |
+| Via QueryFlux | 0.20 ms | 0.25 ms | 0.28 ms |
+| **Overhead** | **0.12 ms** | **0.13 ms** | **0.13 ms** |
+
+### StarRocks path (mock MySQL FE), `SELECT 1`
+
+| | p50 | p95 | p99 |
+| --- | ---: | ---: | ---: |
+| Direct (one reused MySQL connection) | 0.03 ms | 0.09 ms | 0.12 ms |
+| Via QueryFlux | 0.19 ms | 0.26 ms | 0.32 ms |
+| **Overhead** | **0.16 ms** | **0.17 ms** | **0.20 ms** |
+
+### Overhead per feature (Trino path)
+
+Each feature scenario runs QueryFlux with one feature turned on; the dashboard-style query is the baseline, with none (`QUERYFLUX_BENCH_SCENARIOS` picks a subset):
+
+| Scenario | p50 | p95 | p99 |
+| --- | ---: | ---: | ---: |
+| Dashboard-style query (CTE, join, filters, `GROUP BY`, `LIMIT`) | 0.09 ms | 0.12 ms | 0.12 ms |
+| Translation, cache hit (same SQL repeated) | 0.11 ms | 0.12 ms | 0.12 ms |
+| Translation, cache miss (new SQL every query) | 1.91 ms | 2.26 ms | 2.59 ms |
+| Built-in guards (`read_only`, `row_limit`, `require_predicate`) | 0.19 ms | 0.22 ms | 0.26 ms |
+| Python `check(ctx)` guard | 0.19 ms | 0.23 ms | 0.29 ms |
+| Router chain (header, tags, regex, Python), none matching | 0.15 ms | 0.18 ms | 0.21 ms |
+| Access control, OPA allows | 0.22 ms | 0.28 ms | 0.35 ms |
+| Access control, OPA adds a row filter (query rewritten) | 2.47 ms | 2.92 ms | 3.67 ms |
+| Result cache hit (no backend call) | 0.37 ms | 0.51 ms | 1.06 ms |
+
+The two multi-millisecond rows are sqlglot running on every query: a translation-cache miss (repeated SQL is cached), and the row-filter rewrite, which is not cached yet.
 
 ## Getting started
 
