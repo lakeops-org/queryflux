@@ -37,6 +37,10 @@ pub struct SqlParseCache {
     /// Times this cache ran polyglot-sql: at most one, or two if concurrent first callers
     /// raced in [`Self::ensure_parsed`].
     parses: AtomicU32,
+    /// The sqlglot parse, shared by the catalog table references and access-control
+    /// extraction and rewrite; `None` when sqlglot cannot parse the SQL.
+    sqlglot: OnceLock<Option<pyo3::Py<pyo3::PyAny>>>,
+    sqlglot_parses: AtomicU32,
 }
 
 impl SqlParseCache {
@@ -46,6 +50,8 @@ impl SqlParseCache {
             dialect,
             cache: OnceLock::new(),
             parses: AtomicU32::new(0),
+            sqlglot: OnceLock::new(),
+            sqlglot_parses: AtomicU32::new(0),
         }
     }
 
@@ -59,6 +65,8 @@ impl SqlParseCache {
             dialect,
             cache,
             parses: AtomicU32::new(0),
+            sqlglot: OnceLock::new(),
+            sqlglot_parses: AtomicU32::new(0),
         }
     }
 
@@ -80,6 +88,37 @@ impl SqlParseCache {
     /// How many times this cache has parsed its SQL (see the `parses` field).
     pub fn parse_count(&self) -> u32 {
         self.parses.load(Ordering::Relaxed)
+    }
+
+    /// The SQL parsed by sqlglot in this cache's dialect, once. Callers that change the tree
+    /// copy it first (the Python side does). `None` when sqlglot cannot parse it: callers
+    /// parse again themselves so they report sqlglot's error.
+    pub fn sqlglot_tree<'py>(
+        &self,
+        py: pyo3::Python<'py>,
+    ) -> Option<pyo3::Bound<'py, pyo3::PyAny>> {
+        use pyo3::prelude::*;
+        use pyo3::types::PyDict;
+        self.sqlglot
+            .get_or_init(|| {
+                self.sqlglot_parses.fetch_add(1, Ordering::Relaxed);
+                let kwargs = PyDict::new(py);
+                let dialect = self.dialect.sqlglot_write_name();
+                kwargs
+                    .set_item("dialect", (!dialect.is_empty()).then_some(dialect))
+                    .ok()?;
+                py.import("sqlglot")
+                    .and_then(|m| m.call_method("parse_one", (self.sql.as_str(),), Some(&kwargs)))
+                    .ok()
+                    .map(Bound::unbind)
+            })
+            .as_ref()
+            .map(|t| t.bind(py).clone())
+    }
+
+    /// How many times this cache has run sqlglot's parser (at most once).
+    pub fn sqlglot_parse_count(&self) -> u32 {
+        self.sqlglot_parses.load(Ordering::Relaxed)
     }
 
     /// Populate the cache without blocking the calling task's worker thread.

@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use pyo3::prelude::*;
@@ -9,7 +10,7 @@ use queryflux_core::{
 };
 use tracing::debug;
 
-use crate::{SchemaContext, TranslatorTrait};
+use crate::{classify::SqlParseCache, SchemaContext, TranslatorTrait};
 
 /// A table reference as written in the SQL, before catalog/database defaulting.
 /// Distinct from (and unrelated to) the `TableRef` used elsewhere in this org for
@@ -31,21 +32,28 @@ pub fn extract_table_refs(sql: &str, dialect: &str) -> Result<Vec<TableRef>> {
     Python::attach(|py| extract_table_refs_with_gil(py, sql, dialect))
 }
 
-/// Async wrapper around `extract_table_refs`, off the async executor (same
-/// `spawn_blocking` pattern `SqlglotTranslator::translate` already uses for GIL work).
-pub async fn extract_table_refs_async(sql: String, dialect: String) -> Result<Vec<TableRef>> {
-    tokio::task::spawn_blocking(move || extract_table_refs(&sql, &dialect))
+/// Async [`extract_table_refs_parsed`], off the async executor (same `spawn_blocking`
+/// pattern `SqlglotTranslator::translate` already uses for GIL work).
+pub async fn extract_table_refs_async(parse: Arc<SqlParseCache>) -> Result<Vec<TableRef>> {
+    tokio::task::spawn_blocking(move || extract_table_refs_parsed(&parse))
         .await
         .map_err(|e| QueryFluxError::Translation(format!("spawn_blocking error: {e}")))?
+}
+
+/// [`extract_table_refs`] on the handle's shared sqlglot tree.
+pub fn extract_table_refs_parsed(parse: &SqlParseCache) -> Result<Vec<TableRef>> {
+    Python::attach(|py| match parse.sqlglot_tree(py) {
+        Some(tree) => table_refs_in(py, &tree),
+        None => {
+            debug!("extract_table_refs: sqlglot cannot parse, treating as no refs");
+            Ok(vec![])
+        }
+    })
 }
 
 fn extract_table_refs_with_gil(py: Python<'_>, sql: &str, dialect: &str) -> Result<Vec<TableRef>> {
     let sqlglot = PyModule::import(py, "sqlglot")
         .map_err(|e| QueryFluxError::Translation(format!("Failed to import sqlglot: {e}")))?;
-    let exp = PyModule::import(py, "sqlglot.expressions").map_err(|e| {
-        QueryFluxError::Translation(format!("Failed to import sqlglot.expressions: {e}"))
-    })?;
-
     let parse_kwargs = PyDict::new(py);
     parse_kwargs.set_item("dialect", dialect).ok();
     let tree = match sqlglot.call_method("parse_one", (sql,), Some(&parse_kwargs)) {
@@ -55,6 +63,13 @@ fn extract_table_refs_with_gil(py: Python<'_>, sql: &str, dialect: &str) -> Resu
             return Ok(vec![]);
         }
     };
+    table_refs_in(py, &tree)
+}
+
+fn table_refs_in(py: Python<'_>, tree: &Bound<'_, PyAny>) -> Result<Vec<TableRef>> {
+    let exp = PyModule::import(py, "sqlglot.expressions").map_err(|e| {
+        QueryFluxError::Translation(format!("Failed to import sqlglot.expressions: {e}"))
+    })?;
 
     // CTE aliases shadow same-named real tables within this query — an unqualified
     // reference to one is never a catalog lookup target.
@@ -714,9 +729,8 @@ mod extract_table_refs_tests {
 
     #[tokio::test]
     async fn async_wrapper_matches_sync_result() {
-        let refs = extract_table_refs_async("SELECT * FROM t".to_string(), "trino".to_string())
-            .await
-            .unwrap();
+        let parse = Arc::new(SqlParseCache::new("SELECT * FROM t", SqlDialect::Trino));
+        let refs = extract_table_refs_async(parse).await.unwrap();
         assert_eq!(refs.len(), 1);
         assert_eq!(refs[0].table, "t");
     }

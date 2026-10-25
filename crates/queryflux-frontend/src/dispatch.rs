@@ -454,16 +454,17 @@ pub async fn dispatch_query(
     let original_sql = sql.clone();
     // One parse of the client's SQL for every check below (access control, the rewrite
     // invariant).
-    let src_parse =
-        queryflux_sql::classify::SqlParseCache::new(original_sql.clone(), src_dialect.clone());
+    let src_parse = Arc::new(queryflux_sql::classify::SqlParseCache::new(
+        original_sql.clone(),
+        src_dialect.clone(),
+    ));
     let attempt_translation = should_attempt_translation(&session, &protocol);
     let schema_context =
         if should_resolve_schema(attempt_translation, access_control_guard.is_some()) {
             state
                 .translation
-                .resolve_schema_context(
-                    &sql,
-                    &src_dialect,
+                .resolve_schema_context_parsed(
+                    &src_parse,
                     &catalog,
                     session.catalog(),
                     session.database(),
@@ -1832,9 +1833,8 @@ async fn setup_sync_query(
         if should_resolve_schema(attempt_translation, access_control_guard.is_some()) {
             state
                 .translation
-                .resolve_schema_context(
-                    &original_sql,
-                    &src_dialect,
+                .resolve_schema_context_parsed(
+                    &src_parse,
                     &catalog,
                     session.catalog(),
                     session.database(),
@@ -2580,12 +2580,10 @@ pub async fn execute_to_sink(
         if let Some(guard) = &access_control_guard {
             if guard.enabled_for_group(&group.0) {
                 use crate::access_control_guard::{run_access_control_stage, AccessStageOutcome};
-                let src_dialect = resolve_src_dialect(&session, &protocol);
                 let schema_context = state
                     .translation
-                    .resolve_schema_context(
-                        &sql,
-                        &src_dialect,
+                    .resolve_schema_context_parsed(
+                        &src_parse,
                         &catalog,
                         session.catalog(),
                         session.database(),

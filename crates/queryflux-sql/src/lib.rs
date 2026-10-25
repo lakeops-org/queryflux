@@ -16,13 +16,15 @@ use queryflux_core::bounded_cache::{BoundedCache, ContentHasher, MAX_CACHED_SQL_
 
 pub use access::{
     apply_write_filters, extract_resources, extract_resources_cached, extraction_cache,
-    render_mask, rewrite_table_scans, ExtractedResource, ExtractedStatement, MaskRenderError,
-    TablePolicy,
+    render_mask, rewrite_table_scans, rewrite_table_scans_parsed, ExtractedResource,
+    ExtractedStatement, MaskRenderError, TablePolicy,
 };
 
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
+
+use classify::SqlParseCache;
 
 use async_trait::async_trait;
 pub use queryflux_core::schema_context::{ColumnMap, SchemaContext};
@@ -408,11 +410,12 @@ impl TranslationService {
 
     /// Table references in `sql`, cached by (SQL, dialect). Parse failures yield an empty
     /// list (deterministic, cached); import errors, panics and timeouts are not cached.
-    async fn table_refs(&self, sql: &str, dialect: String) -> Option<Arc<Vec<TableRef>>> {
+    async fn table_refs(&self, parse: &Arc<SqlParseCache>) -> Option<Arc<Vec<TableRef>>> {
+        let sql = parse.sql();
         let key = (self.table_refs.is_enabled() && sql.len() <= MAX_CACHED_SQL_BYTES).then(|| {
             TableRefsKey {
                 sql: sql.to_string(),
-                dialect: dialect.clone(),
+                dialect: parse.dialect().sqlglot_write_name().to_string(),
             }
         });
         if let Some(refs) = key.as_ref().and_then(|k| self.table_refs.get(k)) {
@@ -420,7 +423,7 @@ impl TranslationService {
         }
         let refs = match tokio::time::timeout(
             self.schema_resolution_timeout,
-            extract_table_refs_async(sql.to_string(), dialect),
+            extract_table_refs_async(parse.clone()),
         )
         .await
         {
@@ -458,13 +461,26 @@ impl TranslationService {
         default_catalog: Option<&str>,
         default_database: Option<&str>,
     ) -> SchemaContext {
+        let parse = Arc::new(SqlParseCache::new(sql, src_dialect.clone()));
+        self.resolve_schema_context_parsed(&parse, catalog, default_catalog, default_database)
+            .await
+    }
+
+    /// [`Self::resolve_schema_context`] reading the table references from `parse`'s
+    /// shared sqlglot tree.
+    pub async fn resolve_schema_context_parsed(
+        &self,
+        parse: &Arc<SqlParseCache>,
+        catalog: &Arc<dyn CatalogProvider>,
+        default_catalog: Option<&str>,
+        default_database: Option<&str>,
+    ) -> SchemaContext {
         if catalog.is_null() {
             return SchemaContext::default();
         }
         let timeout = self.schema_resolution_timeout;
 
-        let dialect = src_dialect.sqlglot_write_name().to_string();
-        let refs = match self.table_refs(sql, dialect).await {
+        let refs = match self.table_refs(parse).await {
             Some(refs) if !refs.is_empty() => refs,
             _ => return SchemaContext::default(),
         };
