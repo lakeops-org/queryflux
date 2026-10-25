@@ -1725,7 +1725,9 @@ mod tests {
                 script_id: None,
                 script: Some("def check(ctx):\n    return {'action': 'allow'}".to_string()),
                 url: None,
-                timeout_ms: Some(500),
+                // Generous: the first call in a test process also starts the interpreter,
+                // which can exceed a tight budget on a loaded CI runner.
+                timeout_ms: Some(10_000),
                 retry_count: None,
                 fail_behavior: None,
                 headers: None,
@@ -1736,7 +1738,7 @@ mod tests {
                 .expect("chain should be built");
             let ctx = plan_ctx(&engine, &group, &tags);
             let (_, outcome) = chain.run(&ctx, GuardLayer::Plan).await;
-            assert!(!is_blocked(&outcome));
+            assert!(!is_blocked(&outcome), "{outcome:?}");
         }
 
         #[tokio::test]
