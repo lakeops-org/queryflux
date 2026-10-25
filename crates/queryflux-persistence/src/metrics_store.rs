@@ -79,6 +79,9 @@ pub struct QueryRecord {
     pub query_hash: Option<i64>,
     /// xxHash-64 of the parameterized original SQL (literals → `?`).
     pub query_parameterized_hash: Option<i64>,
+    /// `fingerprint::fast_hash` of the original SQL: the key routing rules are looked up by.
+    #[serde(default)]
+    pub fast_hash: Option<i64>,
     /// xxHash-64 of the parameterized translated SQL. None when no translation occurred.
     pub translated_query_hash: Option<i64>,
     /// Parameterized (literals → `?`) original SQL — the human-readable digest stored in `query_digest_stats`.

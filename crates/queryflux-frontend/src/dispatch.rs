@@ -2656,7 +2656,10 @@ pub async fn execute_to_sink(
 
                 let ctx = QueryContext {
                     query_id: ProxyQueryId::new(),
-                    sql: sql.chars().take(500).collect(),
+                    // The full text: fingerprints are computed from it (`record_query` trims
+                    // the stored preview itself), and a cut text hashes differently from the
+                    // same query's other runs.
+                    sql: sql.clone(),
                     session: session.clone(),
                     protocol: protocol.clone(),
                     group: group.clone(),

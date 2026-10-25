@@ -387,6 +387,7 @@ impl AppState {
             translated_query_hash: None,
             digest_text: None,
             translated_digest_text: None,
+            fast_hash: None,
             agent_id,
             conversation_id,
             step_index,
@@ -399,6 +400,7 @@ impl AppState {
         };
         let metrics = self.metrics.clone();
         tokio::spawn(async move {
+            record.fast_hash = Some(queryflux_sql::fingerprint::fast_hash(&original_sql) as i64);
             if let Some(fp) = rich_fingerprint(
                 &original_sql,
                 translated_sql_for_fp.as_deref(),

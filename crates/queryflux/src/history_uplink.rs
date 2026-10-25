@@ -472,6 +472,7 @@ mod tests {
             query_tags: Default::default(),
             query_hash: Some(1),
             query_parameterized_hash: Some(2),
+            fast_hash: None,
             translated_query_hash: None,
             digest_text: Some("SELECT * FROM t WHERE name = ?".into()),
             translated_digest_text: None,

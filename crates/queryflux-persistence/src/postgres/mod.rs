@@ -4411,6 +4411,7 @@ mod tests {
             query_tags: Default::default(),
             query_hash: None,
             query_parameterized_hash: Some(digest_hash),
+            fast_hash: None,
             translated_query_hash: None,
             digest_text: Some("select 1".into()),
             translated_digest_text: None,

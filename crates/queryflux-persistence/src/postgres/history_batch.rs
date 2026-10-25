@@ -32,7 +32,7 @@ INSERT INTO query_records
      total_splits, cluster_group_id, cluster_id, query_tags,
      query_hash, query_parameterized_hash, translated_query_hash,
      agent_id, conversation_id, step_index, tool_call_id, query_intent,
-     guard_actions, was_guard_blocked, cache_hit, translation, worker)
+     guard_actions, was_guard_blocked, cache_hit, translation, worker, fast_hash)
 SELECT
     u.proxy_query_id, u.backend_query_id, u.cluster_group, u.cluster_name, u.engine_type,
     u.frontend_protocol, u.source_dialect, u.target_dialect, u.was_rewritten, u.was_translated,
@@ -53,7 +53,7 @@ SELECT
     u.query_tags,
     u.query_hash, u.query_parameterized_hash, u.translated_query_hash,
     u.agent_id, u.conversation_id, u.step_index, u.tool_call_id, u.query_intent,
-    u.guard_actions, u.was_guard_blocked, u.cache_hit, u.translation, u.worker
+    u.guard_actions, u.was_guard_blocked, u.cache_hit, u.translation, u.worker, u.fast_hash
 FROM UNNEST(
     $1::text[], $2::text[], $3::text[], $4::text[], $5::text[],
     $6::text[], $7::text[], $8::text[], $9::bool[], $10::bool[],
@@ -64,7 +64,7 @@ FROM UNNEST(
     $31::int4[], $32::int8[], $33::int8[], $34::jsonb[],
     $35::int8[], $36::int8[], $37::int8[],
     $38::text[], $39::text[], $40::int4[], $41::text[], $42::text[],
-    $43::jsonb[], $44::bool[], $45::bool[], $46::jsonb[], $47::text[]
+    $43::jsonb[], $44::bool[], $45::bool[], $46::jsonb[], $47::text[], $48::int8[]
 ) WITH ORDINALITY AS u(
     proxy_query_id, backend_query_id, cluster_group, cluster_name, engine_type,
     frontend_protocol, source_dialect, target_dialect, was_rewritten, was_translated,
@@ -75,7 +75,7 @@ FROM UNNEST(
     total_splits, cluster_group_config_id, cluster_config_id, query_tags,
     query_hash, query_parameterized_hash, translated_query_hash,
     agent_id, conversation_id, step_index, tool_call_id, query_intent,
-    guard_actions, was_guard_blocked, cache_hit, translation, worker, ord)
+    guard_actions, was_guard_blocked, cache_hit, translation, worker, fast_hash, ord)
 -- Ids follow batch order, as if the records were inserted one at a time.
 ORDER BY u.ord
 ON CONFLICT (proxy_query_id) DO NOTHING
@@ -290,7 +290,7 @@ fn is_rejected_data(e: &ChunkError) -> bool {
 
 type PgArgs = sqlx::postgres::PgArguments;
 
-/// Bind the 47 column arrays of [`INSERT_RECORDS_SQL`], one element per record.
+/// Bind the 48 column arrays of [`INSERT_RECORDS_SQL`], one element per record.
 fn bind_records<'q, O>(
     q: sqlx::query::QueryScalar<'q, sqlx::Postgres, O, PgArgs>,
     rs: &'q [QueryRecord],
@@ -362,6 +362,7 @@ fn bind_records<'q, O>(
             })
         }))
         .bind(col(rs, |r| r.worker.as_deref()))
+        .bind(col(rs, |r| r.fast_hash))
 }
 
 fn bind_digests<'q>(
@@ -435,6 +436,7 @@ mod tests {
             query_tags: Default::default(),
             query_hash: None,
             query_parameterized_hash: hash,
+            fast_hash: hash,
             translated_query_hash: None,
             digest_text: None,
             translated_digest_text: None,
@@ -957,7 +959,7 @@ mod tests {
                  total_splits, cluster_group_id, cluster_id, query_tags,
                  query_hash, query_parameterized_hash, translated_query_hash,
                  agent_id, conversation_id, step_index, tool_call_id, query_intent,
-                 guard_actions, was_guard_blocked, cache_hit, translation, worker)
+                 guard_actions, was_guard_blocked, cache_hit, translation, worker, fast_hash)
                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,
                        $21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,
                        -- Records from workers (#255) carry names, not this database's
@@ -970,7 +972,7 @@ mod tests {
                        COALESCE((SELECT id FROM cluster_configs WHERE id = $33),
                                 (SELECT id FROM cluster_configs
                                   WHERE $47::text IS NOT NULL AND name = $4)),
-                       $34,$35,$36,$37,$38,$39,$40,$41,$42,$43,$44,$45,$46,$47)
+                       $34,$35,$36,$37,$38,$39,$40,$41,$42,$43,$44,$45,$46,$47,$48)
                ON CONFLICT (proxy_query_id) DO NOTHING"#,
         )
         .bind(&r.proxy_query_id)
@@ -1022,6 +1024,7 @@ mod tests {
             serde_json::to_value(outcome).expect("serializable translation outcome")
         }))
         .bind(&r.worker)
+        .bind(r.fast_hash)
         .execute(&store.admin_pool)
         .await
         .map_err(|e| QueryFluxError::Persistence(format!("Insert query_records: {e}")))?;
