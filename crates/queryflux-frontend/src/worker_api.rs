@@ -181,7 +181,7 @@ struct WorkerApiState {
 
 /// Constant-time comparison, so response timing does not leak how much of the
 /// secret matched.
-fn secret_matches(given: &str, expected: &str) -> bool {
+pub fn secret_matches(given: &str, expected: &str) -> bool {
     let (a, b) = (given.as_bytes(), expected.as_bytes());
     if a.len() != b.len() {
         return false;
