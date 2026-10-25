@@ -30,23 +30,36 @@ pub fn interpolate_params(
         return Ok(sql.to_string());
     }
 
-    use polyglot_sql::expressions::{BooleanLiteral, Expression, Literal, Null, ParameterStyle};
-    use polyglot_sql::traversal::transform;
-    use polyglot_sql::{generate, parse};
-    use std::cell::Cell;
-
     let pg_dialect = crate::classify::to_polyglot_dialect(dialect);
 
     // polyglot-sql can overflow the default Tokio stack — parse off-worker.
     let sql_owned = sql.to_string();
-    let statements = crate::polyglot_pool::run(move || parse(&sql_owned, pg_dialect))
+    let statements = crate::polyglot_pool::run(move || polyglot_sql::parse(&sql_owned, pg_dialect))
         .ok_or_else(|| anyhow::anyhow!("SQL parse worker failed"))?
         .map_err(|e| anyhow::anyhow!("SQL parse error: {e}"))?;
+    interpolate_statements(statements, params, dialect).map(|(sql, _)| sql)
+}
+
+/// [`interpolate_params`] on statements already parsed with `dialect`. Also returns the
+/// rewritten statements, which are the parse of the returned SQL, so a
+/// [`crate::classify::SqlParseCache`] for it needs no parse of its own.
+pub fn interpolate_statements(
+    statements: Vec<polyglot_sql::expressions::Expression>,
+    params: &[QueryParam],
+    dialect: &SqlDialect,
+) -> anyhow::Result<(String, Vec<polyglot_sql::expressions::Expression>)> {
+    use polyglot_sql::expressions::{BooleanLiteral, Expression, Literal, Null, ParameterStyle};
+    use polyglot_sql::generate;
+    use polyglot_sql::traversal::transform;
+    use std::cell::Cell;
+
+    let pg_dialect = crate::classify::to_polyglot_dialect(dialect);
 
     // Cell<usize> gives us interior mutability so the Fn closure can advance the index.
     let param_idx = Cell::new(0usize);
 
     let mut parts = Vec::with_capacity(statements.len());
+    let mut rewritten_all = Vec::with_capacity(statements.len());
 
     for stmt in statements {
         let rewritten = transform(stmt, &|e| {
@@ -91,6 +104,7 @@ pub fn interpolate_params(
         let sql_part = generate(&rewritten, pg_dialect)
             .map_err(|e| anyhow::anyhow!("SQL generate error: {e}"))?;
         parts.push(sql_part);
+        rewritten_all.push(rewritten);
     }
 
     if param_idx.get() != params.len() {
@@ -101,7 +115,7 @@ pub fn interpolate_params(
         ));
     }
 
-    Ok(parts.join(";\n"))
+    Ok((parts.join(";\n"), rewritten_all))
 }
 
 // ---------------------------------------------------------------------------

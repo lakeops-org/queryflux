@@ -7,15 +7,19 @@ use polyglot_sql::{expressions::Expression, traversal::DfsIter};
 pub fn is_cacheable(sql: &str, dialect: &str) -> bool {
     let owned_sql = sql.to_owned();
     let owned_dialect = dialect.to_owned();
-    let read_only = crate::polyglot_pool::run(move || {
+    crate::polyglot_pool::run(move || {
         polyglot_sql::parse_by_name(&owned_sql, &owned_dialect)
-            .map(|statements| {
-                !statements.is_empty() && statements.iter().all(|s| is_query(s) && safe_tree(s))
-            })
+            .map(|statements| cacheable_statements(&owned_sql, &statements))
             .unwrap_or(false)
     })
-    .unwrap_or(false);
-    read_only && crate::fingerprint::is_deterministic(sql, dialect)
+    .unwrap_or(false)
+}
+
+/// [`is_cacheable`] on statements already parsed from `sql` with the same dialect.
+pub(crate) fn cacheable_statements(sql: &str, statements: &[Expression]) -> bool {
+    !statements.is_empty()
+        && statements.iter().all(|s| is_query(s) && safe_tree(s))
+        && crate::fingerprint::rich::deterministic_statements(sql, statements)
 }
 
 /// Recognize supported query roots; nested read-only safety is checked separately.
