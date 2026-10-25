@@ -148,6 +148,7 @@ pub fn router_with_ingest_limit(
             post(ingest_records)
                 .layer(axum::extract::DefaultBodyLimit::max(MAX_RECORD_BATCH_BYTES)),
         )
+        .route("/.well-known/hub-keys.json", get(hub_keys))
         .route("/worker/sweep-lock/{name}", post(sweep_lock_acquire))
         .route(
             "/worker/sweep-lock/{name}/{token}",
@@ -394,6 +395,38 @@ fn unauthorized() -> Response {
     (
         StatusCode::UNAUTHORIZED,
         "invalid or missing worker credential",
+    )
+        .into_response()
+}
+
+/// The enrolled hubs' public keys as a JWKS (RFC 7517/8037), so a service that receives
+/// what hubs send (query history, say) can check their tokens and attribute each request
+/// to a hub and site without reading this control plane's tables. A hub token is an
+/// EdDSA JWT whose `kid` is the hub id; each key carries its hub's `site`. A revoked hub
+/// drops out within the hub directory's reload interval (10 s).
+async fn hub_keys(State(st): State<Arc<WorkerApiState>>) -> Response {
+    let Some(hubs) = &st.api.hubs else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let keys: Vec<_> = hubs
+        .keys()
+        .await
+        .into_iter()
+        .map(|(id, site, x)| {
+            serde_json::json!({
+                "kty": "OKP",
+                "crv": "Ed25519",
+                "alg": "EdDSA",
+                "use": "sig",
+                "kid": id,
+                "x": x,
+                "site": site,
+            })
+        })
+        .collect();
+    (
+        [(header::CACHE_CONTROL, "max-age=10")],
+        Json(serde_json::json!({ "keys": keys })),
     )
         .into_response()
 }
@@ -1625,6 +1658,36 @@ mod tests {
         let now = chrono::Utc::now().timestamp();
         let t1 = hub_token::sign(&k1, &id1, now);
         let t2 = hub_token::sign(&k2, &id2, now);
+
+        // The key set lists both hubs with their sites, and is enough to check a hub's
+        // token without anything else from this control plane.
+        let res = app
+            .clone()
+            .oneshot(
+                Request::get("/.well-known/hub-keys.json")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let set: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(res.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let keys = set["keys"].as_array().unwrap();
+        assert_eq!(keys.len(), 2);
+        let jwk = keys.iter().find(|k| k["kid"] == id1.as_str()).unwrap();
+        assert_eq!(
+            (jwk["kty"].as_str(), jwk["crv"].as_str()),
+            (Some("OKP"), Some("Ed25519"))
+        );
+        assert_eq!(jwk["site"], "dc1");
+        let published = hub_token::decode_public_key(jwk["x"].as_str().unwrap()).unwrap();
+        assert!(hub_token::verify(&t1, &published, now).is_ok());
+        assert!(hub_token::verify(&t2, &published, now).is_err());
 
         // Without a shared secret, an empty or unknown token is no one, and so is a token
         // signed with another hub's key.

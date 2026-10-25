@@ -103,6 +103,27 @@ The site can also act only on those clusters. Capacity calls (acquire, release, 
 
 With no `workerSecret` on the control plane, only enrolled hubs can connect: the setting for a hosted control plane, where nothing at a customer site should reach it except its hub.
 
+### Checking hub tokens elsewhere
+
+A hub's token is an EdDSA JWT whose `kid` is the hub's id. The control plane publishes
+the enrolled hubs' public keys as a JWKS at `GET /.well-known/hub-keys.json`, each key
+with its hub's `site`:
+
+```json
+{"keys": [{"kty": "OKP", "crv": "Ed25519", "alg": "EdDSA", "use": "sig",
+           "kid": "7e5e9919-…", "x": "RikW6mUi…", "site": "eu1"}]}
+```
+
+Another service that receives what hubs send, such as a query-history receiver, can
+verify their tokens with any JWT library: check the signature, `aud: queryflux-worker-api`
+and `exp`. It then knows which hub and site sent each request, without reading the
+control plane's tables. A revoked hub drops out of the set within 10 seconds, so cache it
+for no longer than its `Cache-Control` allows.
+
+On a [multi-tenant control plane](./worker-mode.md#one-control-plane-for-many-tenants),
+each tenant has its own set. It is served on the platform listener
+(`X-QueryFlux-Tenant`), not on the public one.
+
 ### Workers
 
 A worker behind a hub is an ordinary worker whose `worker.upstream.url` points at the hub:

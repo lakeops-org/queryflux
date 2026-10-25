@@ -111,6 +111,21 @@ impl HubDirectory {
         }
     }
 
+    /// Every enrolled hub as `(hub id, site, public key)`, the key base64url.
+    pub async fn keys(&self) -> Vec<(String, String, String)> {
+        self.fresh(MAX_AGE).await;
+        let mut keys: Vec<_> = self
+            .cache
+            .read()
+            .await
+            .keys
+            .iter()
+            .map(|(id, (site, key))| (id.clone(), site.clone(), hub_token::encode_public_key(key)))
+            .collect();
+        keys.sort();
+        keys
+    }
+
     /// The clusters `site` is limited to, if any.
     pub async fn clusters(&self, site: &str) -> Option<Vec<String>> {
         self.fresh(MAX_AGE).await;
