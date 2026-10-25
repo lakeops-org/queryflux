@@ -197,6 +197,18 @@ static NON_DETERMINISTIC_FALLBACK: std::sync::LazyLock<regex::Regex> = std::sync
     },
 );
 
+/// [`is_deterministic`] on statements already parsed from `sql`.
+pub(crate) fn deterministic_statements(
+    sql: &str,
+    statements: &[polyglot_sql::expressions::Expression],
+) -> bool {
+    let regex_ok = !NON_DETERMINISTIC_FALLBACK.is_match(sql);
+    if statements.is_empty() {
+        return regex_ok;
+    }
+    regex_ok && !statements.iter().any(contains_nondeterministic_expr)
+}
+
 fn try_determinism_check(sql: &str, dialect: &str) -> Option<bool> {
     use polyglot_sql::parse_by_name;
     let statements = parse_by_name(sql, dialect).ok()?;

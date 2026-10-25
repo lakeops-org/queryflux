@@ -12,8 +12,8 @@ use queryflux_access_control::{
 };
 use queryflux_core::access_config::OnMissingSchema;
 use queryflux_core::access_model::{AccessDecision, AccessRequest, GrantDetail};
+use queryflux_core::query::ClusterGroupName;
 use queryflux_core::query::EngineType;
-use queryflux_core::query::{ClusterGroupName, SqlDialect};
 use queryflux_core::schema_context::SchemaContext;
 use queryflux_core::session::SessionContext;
 use queryflux_core::tags::QueryTags;
@@ -46,8 +46,8 @@ pub enum AccessStageOutcome {
 #[allow(clippy::too_many_arguments)]
 pub async fn run_access_control_stage(
     guard: &OpaAccessGuard,
-    sql: &str,
-    src_dialect: &SqlDialect,
+    // The source SQL and its parse, shared with the caller's other checks.
+    parse: &queryflux_sql::classify::SqlParseCache,
     engine_type: &EngineType,
     group: &ClusterGroupName,
     auth_ctx: &AuthContext,
@@ -55,11 +55,10 @@ pub async fn run_access_control_stage(
     schema: Option<&SchemaContext>,
     tags: &QueryTags,
 ) -> AccessStageOutcome {
-    let parse = queryflux_sql::classify::SqlParseCache::new(sql.to_string(), src_dialect.clone());
     let ctx = GuardContext {
-        sql,
+        sql: parse.sql(),
         original_sql: None,
-        dialect: src_dialect,
+        dialect: parse.dialect(),
         engine_type,
         cluster_group: group,
         user: session.user(),
@@ -70,7 +69,7 @@ pub async fn run_access_control_stage(
         query_tags: tags,
         session_extra: &session.extra,
         schema,
-        sql_parse: Some(&parse),
+        sql_parse: Some(parse),
     };
     let result = guard.check(&ctx).await;
     let action = result_to_action(guard.name(), &result);

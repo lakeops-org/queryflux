@@ -27,7 +27,6 @@ use queryflux_engine_adapters::{
 };
 use queryflux_guardrails::{GuardChain, GuardChainOutcome, GuardContext, GuardLayer};
 use queryflux_metrics::MetricsStore;
-use queryflux_sql::params::interpolate_params;
 
 use tracing::{debug, info, warn};
 
@@ -453,6 +452,10 @@ pub async fn dispatch_query(
     let src_dialect = resolve_src_dialect(&session, &protocol);
     let engine_type = adapter_kind.engine_type();
     let original_sql = sql.clone();
+    // One parse of the client's SQL for every check below (access control, the rewrite
+    // invariant).
+    let src_parse =
+        queryflux_sql::classify::SqlParseCache::new(original_sql.clone(), src_dialect.clone());
     let attempt_translation = should_attempt_translation(&session, &protocol);
     let schema_context =
         if should_resolve_schema(attempt_translation, access_control_guard.is_some()) {
@@ -480,8 +483,7 @@ pub async fn dispatch_query(
             use crate::access_control_guard::{run_access_control_stage, AccessStageOutcome};
             match run_access_control_stage(
                 guard,
-                &sql,
-                &src_dialect,
+                &src_parse,
                 &engine_type,
                 &group,
                 auth_ctx,
@@ -617,15 +619,12 @@ pub async fn dispatch_query(
     // and `maybe_translate`, guarding against a bug in either turning a read into a write.
     // Scoped to only run when access control actually rewrote the query, using the cheap
     // Rust-native (no Python) classifier, so ordinary queries pay nothing extra.
+    // One parse of the engine's SQL for the invariant, interpolation and the guards.
+    let engine_parse =
+        queryflux_sql::classify::SqlParseCache::new(engine_sql.clone(), tgt_dialect.clone());
     if access_control_rewrote {
-        let src_read_like =
-            queryflux_sql::classify::SqlParseCache::new(original_sql.clone(), src_dialect.clone())
-                .is_read_like_async()
-                .await;
-        let final_read_like =
-            queryflux_sql::classify::SqlParseCache::new(engine_sql.clone(), tgt_dialect.clone())
-                .is_read_like_async()
-                .await;
+        let src_read_like = src_parse.is_read_like_async().await;
+        let final_read_like = engine_parse.is_read_like_async().await;
         if src_read_like && !final_read_like {
             let reason = "access-control invariant violated: statement kind changed from read to non-read after rewrite/translation".to_string();
             warn!(id = %query_id, "{reason}");
@@ -677,15 +676,14 @@ pub async fn dispatch_query(
         access_control_rewrote,
     );
 
-    // Fallback interpolation for async adapters that don't support native params.
-    let (engine_sql, effective_params) = if !params.is_empty() {
-        (
-            interpolate_params(&engine_sql, &params, &tgt_dialect)?,
-            vec![],
-        )
+    // Fallback interpolation for async adapters that don't support native params. The
+    // interpolated SQL's parse comes with it, so the guards below don't parse again.
+    let (engine_parse, effective_params) = if !params.is_empty() {
+        (engine_parse.interpolate(&params).await?, vec![])
     } else {
-        (engine_sql, params)
+        (engine_parse, params)
     };
+    let engine_sql = engine_parse.sql().to_string();
 
     if pipeline.was_translated {
         info!(id = %query_id, src = ?src_dialect, tgt = ?tgt_dialect, "SQL translated");
@@ -697,8 +695,7 @@ pub async fn dispatch_query(
 
     // Guard chain: runs after translation (SQL is final), before engine submission.
     // Global guards run first; per-group guards are appended after.
-    let sql_parse =
-        queryflux_sql::classify::SqlParseCache::new(engine_sql.clone(), tgt_dialect.clone());
+    let sql_parse = engine_parse;
 
     let guard_ctx = GuardContext {
         sql: &engine_sql,
@@ -1650,6 +1647,8 @@ async fn setup_sync_query(
     group: ClusterGroupName,
     auth_ctx: &AuthContext,
     group_fixups: &[String],
+    // The caller's parse of `sql`, reused when it was made with the same dialect.
+    src_parse: Option<Arc<queryflux_sql::classify::SqlParseCache>>,
 ) -> Result<SyncQuerySetup> {
     let query_id = ProxyQueryId::new();
 
@@ -1819,6 +1818,14 @@ async fn setup_sync_query(
     let engine_type = adapter.engine_type();
     let start = Instant::now();
     let original_sql = sql.clone();
+    let src_parse = src_parse
+        .filter(|p| p.sql() == original_sql && p.dialect() == &src_dialect)
+        .unwrap_or_else(|| {
+            Arc::new(queryflux_sql::classify::SqlParseCache::new(
+                original_sql.clone(),
+                src_dialect.clone(),
+            ))
+        });
     let attempt_translation = should_attempt_translation(&session, &protocol);
 
     let schema_context =
@@ -1847,8 +1854,7 @@ async fn setup_sync_query(
             use crate::access_control_guard::{run_access_control_stage, AccessStageOutcome};
             match run_access_control_stage(
                 guard,
-                &original_sql,
-                &src_dialect,
+                &src_parse,
                 &engine_type,
                 &group,
                 auth_ctx,
@@ -1985,15 +1991,11 @@ async fn setup_sync_query(
 
     // Invariant assert (NOT a second guard stage — see the async dispatch path for the
     // full rationale). Scoped to only run when access control actually rewrote the query.
+    let engine_parse =
+        queryflux_sql::classify::SqlParseCache::new(translated.clone(), tgt_dialect.clone());
     if access_control_rewrote {
-        let src_read_like =
-            queryflux_sql::classify::SqlParseCache::new(original_sql.clone(), src_dialect.clone())
-                .is_read_like_async()
-                .await;
-        let final_read_like =
-            queryflux_sql::classify::SqlParseCache::new(translated.clone(), tgt_dialect.clone())
-                .is_read_like_async()
-                .await;
+        let src_read_like = src_parse.is_read_like_async().await;
+        let final_read_like = engine_parse.is_read_like_async().await;
         if src_read_like && !final_read_like {
             let reason = "access-control invariant violated: statement kind changed from read to non-read after rewrite/translation".to_string();
             warn!(id = %query_id, "{reason}");
@@ -2079,15 +2081,12 @@ async fn setup_sync_query(
     // Fallback interpolation: when the adapter does not support native params,
     // substitute `?` placeholders with typed literals now so the adapter receives
     // a fully-resolved SQL string and empty params.
-    let (translated, effective_params) = if !params.is_empty() && !adapter.supports_native_params()
-    {
-        (
-            interpolate_params(&translated, &params, &tgt_dialect)?,
-            vec![],
-        )
-    } else {
-        (translated, params)
-    };
+    let (engine_parse, effective_params) =
+        if !params.is_empty() && !adapter.supports_native_params() {
+            (engine_parse.interpolate(&params).await?, vec![])
+        } else {
+            (engine_parse, params)
+        };
 
     let (was_rewritten, rewritten_sql, was_translated, translated_sql) =
         crate::sql_pipeline::pipeline_fields(&pipeline);
@@ -2117,8 +2116,8 @@ async fn setup_sync_query(
 
     Ok(SyncQuerySetup {
         adapter,
-        translated: translated.clone(),
-        sql_parse: queryflux_sql::classify::SqlParseCache::new(translated, tgt_dialect),
+        translated: engine_parse.sql().to_string(),
+        sql_parse: engine_parse,
         start,
         slot,
         ctx,
@@ -2530,15 +2529,14 @@ pub async fn execute_to_sink(
     // execution so a reload cannot change the SQL after cache eligibility is decided.
     let fixups_can_run = should_attempt_translation(&session, &protocol)
         && (!group_fixups.is_empty() || state.translation.has_global_fixups());
+    // One parse of the client's SQL for cache eligibility, the cache-path access check and
+    // the query's own setup.
+    let src_parse = Arc::new(queryflux_sql::classify::SqlParseCache::new(
+        sql.clone(),
+        resolve_src_dialect(&session, &protocol),
+    ));
     let cache_eligible = if effective_cache.is_some() && !fixups_can_run {
-        let sql = sql.clone();
-        let dialect =
-            queryflux_sql::fingerprint::polyglot_dialect(&resolve_src_dialect(&session, &protocol));
-        // The parser uses a large-stack pool, but waiting on that pool is
-        // synchronous. Keep both classification and determinism off Tokio workers.
-        tokio::task::spawn_blocking(move || queryflux_sql::is_cacheable(&sql, &dialect))
-            .await
-            .unwrap_or(false)
+        src_parse.is_cacheable_async().await
     } else {
         false
     };
@@ -2606,8 +2604,7 @@ pub async fn execute_to_sink(
                 // context, could wrongly deny a query the real engine's policy would allow.
                 match run_access_control_stage(
                     guard,
-                    &sql,
-                    &src_dialect,
+                    &src_parse,
                     &queryflux_core::query::EngineType::Cache,
                     &group,
                     auth_ctx,
@@ -2751,6 +2748,7 @@ pub async fn execute_to_sink(
             guard_chain,
             group_guard_chain,
             &group_fixups,
+            Some(src_parse.clone()),
         )
         .await;
         tee.finalize_cache(result.is_ok()).await;
@@ -2772,6 +2770,7 @@ pub async fn execute_to_sink(
             guard_chain,
             group_guard_chain,
             &group_fixups,
+            Some(src_parse.clone()),
         )
         .await
     }
@@ -2813,6 +2812,7 @@ async fn execute_to_sink_inner(
     guard_chain: Option<Arc<GuardChain>>,
     group_guard_chain: Option<Arc<GuardChain>>,
     group_fixups: &[String],
+    src_parse: Option<Arc<queryflux_sql::classify::SqlParseCache>>,
 ) -> Result<()> {
     let mut setup = match setup_sync_query(
         state,
@@ -2824,6 +2824,7 @@ async fn execute_to_sink_inner(
         group,
         auth_ctx,
         group_fixups,
+        src_parse,
     )
     .await
     {
@@ -3212,6 +3213,7 @@ mod capacity_wait_tests {
             ClusterGroupName("default".into()),
             &auth,
             &[],
+            None,
         )
         .await;
         assert!(
@@ -3536,6 +3538,7 @@ mod translation_policy_tests {
                         ClusterGroupName("default".into()),
                         &auth,
                         &[],
+                        None,
                     )
                     .await
                     .err()
@@ -3620,6 +3623,7 @@ mod translation_policy_tests {
                 ClusterGroupName("default".into()),
                 &AuthContext::default(),
                 &[],
+                None,
             )
             .await
             .expect("access-controlled execution setup");
@@ -3866,6 +3870,7 @@ mod translation_policy_tests {
                     ClusterGroupName("default".into()),
                     &auth,
                     &[],
+                    None,
                 )
                 .await
                 .err()
@@ -3920,6 +3925,7 @@ mod translation_policy_tests {
                 ClusterGroupName("default".into()),
                 &auth,
                 &[],
+                None,
             )
             .await
             .expect("compatible request after strict rejection");
@@ -3956,6 +3962,7 @@ mod translation_policy_tests {
                 ClusterGroupName("default".into()),
                 &AuthContext::default(),
                 &[],
+                None,
             )
             .await
             .expect("execution setup should succeed");

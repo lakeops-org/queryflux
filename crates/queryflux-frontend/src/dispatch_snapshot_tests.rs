@@ -266,6 +266,7 @@ async fn sync_admission_keeps_adapter_and_tags_from_routing_generation() {
                 ClusterGroupName("old".into()),
                 &AuthContext { user: "alice".into(), ..Default::default() },
                 &[],
+                None,
             )
             .await
         });

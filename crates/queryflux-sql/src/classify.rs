@@ -2,6 +2,7 @@
 //! and engine adapters. Parse results are cached per [`SqlParseCache`] instance so
 //! multiple consumers on the same query only hit `polyglot_sql` once.
 
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::OnceLock;
 
 use polyglot_sql::expressions::Expression;
@@ -15,12 +16,27 @@ enum ParsedStatements {
     Err,
 }
 
+/// The one place a [`SqlParseCache`] parses. polyglot-sql can overflow the default Tokio
+/// (~2 MiB) stack; always parse on the dedicated large-stack pool (see polyglot_pool).
+fn parse_on_pool(sql: String, dialect: &SqlDialect) -> ParsedStatements {
+    let dialect = to_polyglot_dialect(dialect);
+    crate::polyglot_pool::run(move || {
+        polyglot_sql::parse(&sql, dialect)
+            .map(ParsedStatements::Ok)
+            .unwrap_or(ParsedStatements::Err)
+    })
+    .unwrap_or(ParsedStatements::Err)
+}
+
 /// Lazily parses SQL once and exposes shared classification helpers.
 #[derive(Debug)]
 pub struct SqlParseCache {
     sql: String,
     dialect: SqlDialect,
     cache: OnceLock<ParsedStatements>,
+    /// Times this cache ran polyglot-sql: at most one, or two if concurrent first callers
+    /// raced in [`Self::ensure_parsed`].
+    parses: AtomicU32,
 }
 
 impl SqlParseCache {
@@ -29,6 +45,20 @@ impl SqlParseCache {
             sql: sql.into(),
             dialect,
             cache: OnceLock::new(),
+            parses: AtomicU32::new(0),
+        }
+    }
+
+    /// A cache for `sql` whose parse is already known: `statements` must be what parsing
+    /// `sql` with `dialect` gives, as [`Self::interpolate`] guarantees.
+    fn with_statements(sql: String, dialect: SqlDialect, statements: Vec<Expression>) -> Self {
+        let cache = OnceLock::new();
+        let _ = cache.set(ParsedStatements::Ok(statements));
+        Self {
+            sql,
+            dialect,
+            cache,
+            parses: AtomicU32::new(0),
         }
     }
 
@@ -42,17 +72,14 @@ impl SqlParseCache {
 
     fn parsed(&self) -> &ParsedStatements {
         self.cache.get_or_init(|| {
-            // polyglot-sql can overflow the default Tokio (~2 MiB) stack; always
-            // parse on the dedicated large-stack pool (see polyglot_pool).
-            let sql = self.sql.clone();
-            let dialect = to_polyglot_dialect(&self.dialect);
-            crate::polyglot_pool::run(move || {
-                polyglot_sql::parse(&sql, dialect)
-                    .map(ParsedStatements::Ok)
-                    .unwrap_or(ParsedStatements::Err)
-            })
-            .unwrap_or(ParsedStatements::Err)
+            self.parses.fetch_add(1, Ordering::Relaxed);
+            parse_on_pool(self.sql.clone(), &self.dialect)
         })
+    }
+
+    /// How many times this cache has parsed its SQL (see the `parses` field).
+    pub fn parse_count(&self) -> u32 {
+        self.parses.load(Ordering::Relaxed)
     }
 
     /// Populate the cache without blocking the calling task's worker thread.
@@ -73,19 +100,12 @@ impl SqlParseCache {
         if self.cache.get().is_some() {
             return;
         }
+        self.parses.fetch_add(1, Ordering::Relaxed);
         let sql = self.sql.clone();
         let dialect = self.dialect.clone();
-        let parsed = tokio::task::spawn_blocking(move || {
-            let dialect = to_polyglot_dialect(&dialect);
-            crate::polyglot_pool::run(move || {
-                polyglot_sql::parse(&sql, dialect)
-                    .map(ParsedStatements::Ok)
-                    .unwrap_or(ParsedStatements::Err)
-            })
-            .unwrap_or(ParsedStatements::Err)
-        })
-        .await
-        .unwrap_or(ParsedStatements::Err);
+        let parsed = tokio::task::spawn_blocking(move || parse_on_pool(sql, &dialect))
+            .await
+            .unwrap_or(ParsedStatements::Err);
         // Ignore "already set": a concurrent caller raced us and won. Same
         // result either way — at worst we duplicated the parse once.
         let _ = self.cache.set(parsed);
@@ -134,6 +154,42 @@ impl SqlParseCache {
     pub async fn is_read_like_async(&self) -> bool {
         self.ensure_parsed().await;
         self.is_read_like()
+    }
+
+    /// [`crate::is_cacheable`] for this SQL. Uses this cache's parse when it parses with the
+    /// dialect cache eligibility is defined in; otherwise (Athena, custom sqlglot dialects,
+    /// which fingerprinting parses differently) checks it the way `is_cacheable` always has.
+    pub async fn is_cacheable_async(&self) -> bool {
+        let name = crate::fingerprint::polyglot_dialect(&self.dialect);
+        if name.parse::<DialectType>().ok() == Some(to_polyglot_dialect(&self.dialect)) {
+            return match self.statements_async().await {
+                Some(stmts) => crate::eligibility::cacheable_statements(&self.sql, stmts),
+                None => false,
+            };
+        }
+        let sql = self.sql.clone();
+        tokio::task::spawn_blocking(move || crate::is_cacheable(&sql, &name))
+            .await
+            .unwrap_or(false)
+    }
+
+    /// [`crate::params::interpolate_params`] from this cache's parse. The result's cache
+    /// already holds the parse of the interpolated SQL, so it never parses.
+    pub async fn interpolate(
+        &self,
+        params: &[queryflux_core::params::QueryParam],
+    ) -> anyhow::Result<Self> {
+        if params.is_empty() {
+            return Ok(Self::new(self.sql.clone(), self.dialect.clone()));
+        }
+        let Some(stmts) = self.statements_async().await else {
+            // Unparseable: report the parser's own error.
+            return crate::params::interpolate_params(&self.sql, params, &self.dialect)
+                .map(|sql| Self::new(sql, self.dialect.clone()));
+        };
+        let (sql, statements) =
+            crate::params::interpolate_statements(stmts.to_vec(), params, &self.dialect)?;
+        Ok(Self::with_statements(sql, self.dialect.clone(), statements))
     }
 }
 
@@ -220,7 +276,55 @@ pub fn strip_leading_sql_comments(mut s: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use queryflux_core::params::QueryParam;
     use queryflux_core::query::SqlDialect;
+
+    #[tokio::test]
+    async fn one_parse_serves_every_check() {
+        let sql = "SELECT * FROM orders WHERE id = ? AND region = 'eu'";
+        let cache = SqlParseCache::new(sql, SqlDialect::Trino);
+        assert!(cache.is_read_like_async().await);
+        assert!(cache.is_cacheable_async().await);
+        let bound = cache
+            .interpolate(&[QueryParam::Numeric("7".into())])
+            .await
+            .unwrap();
+        assert_eq!(cache.parse_count(), 1);
+
+        // The interpolated SQL's cache holds its parse already.
+        assert!(bound.sql().contains("id = 7"), "{}", bound.sql());
+        assert!(bound.is_read_like_async().await);
+        assert_eq!(bound.parse_count(), 0);
+        assert_eq!(
+            bound.sql(),
+            crate::params::interpolate_params(
+                sql,
+                &[QueryParam::Numeric("7".into())],
+                &SqlDialect::Trino
+            )
+            .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn cacheable_matches_the_standalone_check() {
+        for (sql, dialect) in [
+            ("SELECT count(*) FROM orders", SqlDialect::Trino),
+            ("SELECT now()", SqlDialect::Trino),
+            ("INSERT INTO t SELECT 1", SqlDialect::Postgres),
+            // Fingerprinting parses Athena as presto: checked the standalone way.
+            ("SELECT * FROM logs WHERE year = '2026'", SqlDialect::Athena),
+            ("SELECT rand()", SqlDialect::Athena),
+        ] {
+            let name = crate::fingerprint::polyglot_dialect(&dialect);
+            let cache = SqlParseCache::new(sql, dialect);
+            assert_eq!(
+                cache.is_cacheable_async().await,
+                crate::is_cacheable(sql, &name),
+                "{sql}"
+            );
+        }
+    }
 
     /// `is_read_like_async`/`statements_async` route the actual parse through
     /// `tokio::task::spawn_blocking` instead of blocking the calling task's
