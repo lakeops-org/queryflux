@@ -1866,6 +1866,7 @@ mod tests {
                 query_tags: Default::default(),
                 query_hash: None,
                 query_parameterized_hash: None,
+                fast_hash: None,
                 translated_query_hash: None,
                 digest_text: None,
                 translated_digest_text: None,
