@@ -172,6 +172,11 @@ These callers can authenticate to the admin API (the Studio UI and `/admin/*`):
 - A caller can only grant scopes it has.
 - `GET /admin/tokens` lists tokens with their last use. `DELETE /admin/tokens/{id}` revokes one immediately.
 
+**Concurrent edits.**
+- Config reads (`GET /admin/config/...`) return the config revision as `ETag` (`"r42"`).
+- Send it back as `If-Match` on a write. If anyone changed config since your read, the write is refused with `412 Precondition Failed` and the current `ETag`, so you can read again and reapply your change.
+- Writes without `If-Match`, or with `If-Match: *`, are unconditional, as before.
+
 **Audit.** Every request that needs a scope other than `read` is recorded: the caller, the method and path, and the status. A platform gateway can also say whom it acted for, with `X-QueryFlux-Actor`, such as `user:alice` or `apikey:k1`. That header is ignored from anyone else. Read the log with `GET /admin/audit?limit=100&before=<id>`, newest first.
 
 ## Try it
