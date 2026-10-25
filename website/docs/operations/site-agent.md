@@ -84,8 +84,11 @@ A caller presenting a site's token is that site's agent, and it can act only for
 - Its fleet reports and history must name its own site, or they're refused with `403`. History that names no site is attributed to the token's site.
 - Its own record is stored as `<site>/<name>`, with kind `siteAgent` and label `site` set to its site, whatever it reports.
 - It can hold capacity only as `<site>/<worker>`, the agent's holder prefix.
+- Its workers' sweeps (engine reconcile, zombie and stale-queue eviction, …) run under the site's own locks (`<site>/<sweep>`), so one worker per site runs each sweep and sites never wait on each other.
 
 With `clusters` set, the site's agent gets a snapshot with only those clusters: other sites' endpoints and credentials never reach it. Groups keep only those members. A group left with no member stays, so routes to it still resolve, and its queries fail at this site with no cluster available. The site gets its own revision, and the fleet view compares the site's agent and workers with it.
+
+The site can also act only on those clusters. Capacity calls (acquire, release, wait, quota reports) and running counts (read and publish) for any other cluster are refused with `403`. A site without `clusters` isn't limited.
 
 To rotate a token, list the new hash next to the old one, restart the control plane, move the agent to the new token, then remove the old hash. Agents serve their cached config while the control plane restarts. A token can't be recovered from its hash; a lost token is replaced the same way.
 
