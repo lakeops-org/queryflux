@@ -1,6 +1,7 @@
 pub mod abort;
 pub mod access_control_guard;
 pub mod admin;
+pub mod admin_access;
 mod auth;
 pub mod dispatch;
 pub mod flight_sql;
