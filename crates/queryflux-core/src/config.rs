@@ -1250,6 +1250,16 @@ pub struct WorkerApiConfig {
 /// SHA-256 of the empty string: never a valid site token hash.
 const EMPTY_TOKEN_SHA256: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 
+/// `workerApi.sites[].clusters` when the key is present: always a list, never unset. A blank
+/// `clusters:` is far more likely a mistake than a request for every cluster, and "every
+/// cluster" would hand this site other sites' endpoints and credentials.
+fn deserialize_site_clusters<'de, D>(d: D) -> std::result::Result<Option<Vec<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Vec::<String>::deserialize(d).map(Some)
+}
+
 /// One site whose agent connects with its own token (`workerApi.sites`).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1260,8 +1270,14 @@ pub struct WorkerApiSite {
     /// List two while rotating.
     pub tokens: Vec<String>,
     /// The clusters this site's workers use. When set, the site gets only these
-    /// clusters (groups keep only these members). Unset: the site gets the whole config.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// clusters (groups keep only these members). Omitted: the site gets the whole config.
+    /// A present but blank value never means "all": YAML reads a blank `clusters:` as an
+    /// empty list (no clusters), and an explicit JSON `null` is refused.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_site_clusters"
+    )]
     pub clusters: Option<Vec<String>>,
 }
 
@@ -4507,6 +4523,21 @@ auth: { provider: static, required: true }
             .validate_role()
         };
         assert_eq!(sites(&format!("{{ name: dc1, tokens: [{h}] }}")), Ok(()));
+        // `clusters`: omitted means every cluster; a blank value never does. YAML reads a
+        // blank `clusters:` as no clusters, and a JSON `null` is refused.
+        let site: WorkerApiSite =
+            serde_yaml::from_str(&format!("{{ name: dc1, tokens: [{h}] }}")).unwrap();
+        assert_eq!(site.clusters, None);
+        let site: WorkerApiSite =
+            serde_yaml::from_str(&format!("{{ name: dc1, tokens: [{h}], clusters: [] }}")).unwrap();
+        assert_eq!(site.clusters, Some(vec![]));
+        let blank: WorkerApiSite =
+            serde_yaml::from_str(&format!("{{ name: dc1, tokens: [{h}], clusters: }}")).unwrap();
+        assert_eq!(blank.clusters, Some(vec![]));
+        assert!(serde_json::from_value::<WorkerApiSite>(serde_json::json!({
+            "name": "dc1", "tokens": [h], "clusters": null
+        }))
+        .is_err());
         // A malformed entry is likely a raw token: the error names its position, not its value.
         let raw = sites("{ name: dc1, tokens: [my-raw-secret-token] }").unwrap_err();
         assert!(
