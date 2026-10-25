@@ -5,7 +5,7 @@ This guide is for working on the QueryFlux **Rust workspace** and its local depe
 ## Prerequisites
 
 - **Rust** (stable toolchain), `cargo`, `rustfmt`, `clippy`
-- **Python 3.10+** (3.13 is used in some Makefile `PYTHONPATH` examples; adjust paths if your venv uses another minor version)
+- **Python 3.10+** (CI and the image use 3.14; the `PYTHONPATH` examples below say 3.13, adjust them to your venv)
 - **Docker** and **Docker Compose** (for `make dev`, `make test-e2e`, and the full stack)
 
 ## First-time setup
