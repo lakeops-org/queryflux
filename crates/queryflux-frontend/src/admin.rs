@@ -2133,15 +2133,13 @@ macro_rules! require_store {
 /// When a persistence backend with `ConfigRevisionStore` is available (e.g.
 /// Postgres), bumps the shared revision counter which triggers `LISTEN/NOTIFY`
 /// to all replicas. Always also wakes the local reload task via `Notify` as a
-/// fast-path for the instance that made the change.
-fn notify_live_config_reload(state: &AdminState) {
+/// fast-path for the instance that made the change. The bump is awaited, so the
+/// response's `ETag` and any read after it already carry the new revision.
+async fn notify_live_config_reload(state: &AdminState) {
     if let Some(store) = &state.admin_store {
-        let store = store.clone();
-        tokio::spawn(async move {
-            if let Err(e) = store.bump_revision().await {
-                tracing::warn!("Failed to bump config revision: {e}");
-            }
-        });
+        if let Err(e) = store.bump_revision().await {
+            tracing::warn!("Failed to bump config revision: {e}");
+        }
     }
     state.config_reload_notify.notify_one();
 }
@@ -2250,7 +2248,7 @@ async fn upsert_cluster_config_handler(
     }
     match pg.upsert_cluster_config(&name, &body).await {
         Ok(r) => {
-            notify_live_config_reload(&state);
+            notify_live_config_reload(&state).await;
             Json(redacted_cluster_config(r)).into_response()
         }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
@@ -2279,7 +2277,7 @@ async fn rename_cluster_config_handler(
     let pg = require_store!(state);
     match pg.rename_cluster_config(&name, &body.new_name).await {
         Ok(r) => {
-            notify_live_config_reload(&state);
+            notify_live_config_reload(&state).await;
             Json(redacted_cluster_config(r)).into_response()
         }
         Err(e) => (rename_persistence_error_status(&e), e.to_string()).into_response(),
@@ -2306,7 +2304,7 @@ async fn delete_cluster_config_handler(
     let pg = require_store!(state);
     match pg.delete_cluster_config(&name).await {
         Ok(true) => {
-            notify_live_config_reload(&state);
+            notify_live_config_reload(&state).await;
             StatusCode::NO_CONTENT.into_response()
         }
         Ok(false) => (StatusCode::NOT_FOUND, "Cluster config not found").into_response(),
@@ -2430,7 +2428,7 @@ async fn upsert_group_config_handler(
     let pg = require_store!(state);
     match pg.upsert_group_config(&name, &body).await {
         Ok(r) => {
-            notify_live_config_reload(&state);
+            notify_live_config_reload(&state).await;
             Json(r).into_response()
         }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
@@ -2459,7 +2457,7 @@ async fn rename_group_config_handler(
     let pg = require_store!(state);
     match pg.rename_group_config(&name, &body.new_name).await {
         Ok(r) => {
-            notify_live_config_reload(&state);
+            notify_live_config_reload(&state).await;
             Json(r).into_response()
         }
         Err(e) => (rename_persistence_error_status(&e), e.to_string()).into_response(),
@@ -2487,7 +2485,7 @@ async fn delete_group_config_handler(
     let pg = require_store!(state);
     match pg.delete_group_config(&name).await {
         Ok(true) => {
-            notify_live_config_reload(&state);
+            notify_live_config_reload(&state).await;
             StatusCode::NO_CONTENT.into_response()
         }
         Ok(false) => (StatusCode::NOT_FOUND, "Group config not found").into_response(),
@@ -2557,7 +2555,7 @@ async fn create_user_script_handler(
     let pg = require_store!(state);
     match pg.create_user_script(&body).await {
         Ok(r) => {
-            notify_live_config_reload(&state);
+            notify_live_config_reload(&state).await;
             (StatusCode::CREATED, Json(r)).into_response()
         }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
@@ -2610,7 +2608,7 @@ async fn update_user_script_handler(
     let pg = require_store!(state);
     match pg.update_user_script(id, &body).await {
         Ok(r) => {
-            notify_live_config_reload(&state);
+            notify_live_config_reload(&state).await;
             Json(r).into_response()
         }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
@@ -2637,7 +2635,7 @@ async fn delete_user_script_handler(
     let pg = require_store!(state);
     match pg.delete_user_script(id).await {
         Ok(true) => {
-            notify_live_config_reload(&state);
+            notify_live_config_reload(&state).await;
             StatusCode::NO_CONTENT.into_response()
         }
         Ok(false) => (StatusCode::NOT_FOUND, "Script not found").into_response(),
@@ -2824,7 +2822,7 @@ async fn put_security_config_handler(
 
     match store.set_proxy_setting("security_config", value).await {
         Ok(()) => {
-            notify_live_config_reload(&state);
+            notify_live_config_reload(&state).await;
             StatusCode::NO_CONTENT.into_response()
         }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
@@ -2932,7 +2930,7 @@ async fn put_routing_config_handler(
         .await
     {
         Ok(()) => {
-            notify_live_config_reload(&state);
+            notify_live_config_reload(&state).await;
             StatusCode::NO_CONTENT.into_response()
         }
         Err(e) => {
@@ -3195,7 +3193,7 @@ async fn put_guardrails_config_handler(
     }
     match store.set_proxy_setting("guardrails_config", body).await {
         Ok(()) => {
-            notify_live_config_reload(&state);
+            notify_live_config_reload(&state).await;
             StatusCode::NO_CONTENT.into_response()
         }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
@@ -3408,7 +3406,7 @@ async fn put_access_control_config_handler(
         .await
     {
         Ok(()) => {
-            notify_live_config_reload(&state);
+            notify_live_config_reload(&state).await;
             StatusCode::NO_CONTENT.into_response()
         }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
@@ -3662,7 +3660,7 @@ async fn put_catalog_config_handler(
     }
     match store.set_proxy_setting("catalog_config", body).await {
         Ok(()) => {
-            notify_live_config_reload(&state);
+            notify_live_config_reload(&state).await;
             StatusCode::NO_CONTENT.into_response()
         }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),

@@ -128,8 +128,55 @@ pub async fn authorize(
         )
             .into_response();
     }
+    // Config is versioned by the config revision: reads carry it as `ETag`, and a write
+    // with `If-Match` proceeds only if no other write landed since.
+    let versioned = path.starts_with("/admin/config/") || need == Scope::ConfigWrite;
+    let read_revision = match (&st.store, need == Scope::Read && versioned) {
+        (Some(store), true) => store.current_revision().await.ok(),
+        _ => None,
+    };
+    if let (Some(store), Some(if_match), true) = (
+        &st.store,
+        req.headers().get(header::IF_MATCH),
+        need == Scope::ConfigWrite,
+    ) {
+        let expected = if_match.to_str().ok().map(str::trim);
+        if expected != Some("*") {
+            let claimed = match expected.and_then(parse_etag) {
+                Some(rev) => match store.bump_revision_if(rev).await {
+                    Ok(claimed) => claimed,
+                    Err(e) => {
+                        warn!("Admin API: revision check failed: {e}");
+                        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+                    }
+                },
+                None => None,
+            };
+            if claimed.is_none() {
+                let mut response = (
+                    StatusCode::PRECONDITION_FAILED,
+                    "config changed since it was read; read it again",
+                )
+                    .into_response();
+                if let Ok(rev) = store.current_revision().await {
+                    set_etag(&mut response, rev);
+                }
+                return response;
+            }
+        }
+    }
     req.extensions_mut().insert(caller.clone());
-    let response = next.run(req).await;
+    let mut response = next.run(req).await;
+    if let (Some(store), true) = (&st.store, versioned) {
+        let rev = match read_revision {
+            Some(rev) => Some(rev),
+            None if response.status().is_success() => store.current_revision().await.ok(),
+            None => None,
+        };
+        if let Some(rev) = rev {
+            set_etag(&mut response, rev);
+        }
+    }
     if need != Scope::Read {
         if let Some(store) = &st.store {
             let entry = AdminAuditEntry {
@@ -218,6 +265,21 @@ async fn authenticate(
         );
     }
     Err(response)
+}
+
+/// `"r42"` (also weak, or bare) → 42.
+fn parse_etag(tag: &str) -> Option<u64> {
+    tag.trim_start_matches("W/")
+        .trim_matches('"')
+        .strip_prefix('r')?
+        .parse()
+        .ok()
+}
+
+fn set_etag(response: &mut Response, revision: u64) {
+    if let Ok(v) = header::HeaderValue::from_str(&format!("\"r{revision}\"")) {
+        response.headers_mut().insert(header::ETAG, v);
+    }
 }
 
 fn parse_basic(header: &str) -> Option<(String, String)> {
@@ -417,6 +479,18 @@ mod tests {
         body: &str,
         platform: bool,
     ) -> (StatusCode, serde_json::Value) {
+        let (status, _, body) = call_full(app, method, path, headers, body, platform).await;
+        (status, body)
+    }
+
+    async fn call_full(
+        app: &Router,
+        method: &str,
+        path: &str,
+        headers: &[(&str, &str)],
+        body: &str,
+        platform: bool,
+    ) -> (StatusCode, Option<String>, serde_json::Value) {
         let mut req = Request::builder().method(method).uri(path);
         for (k, v) in headers {
             req = req.header(*k, *v);
@@ -430,10 +504,48 @@ mod tests {
         }
         let res = app.clone().oneshot(req).await.unwrap();
         let status = res.status();
+        let etag = res
+            .headers()
+            .get(header::ETAG)
+            .map(|v| v.to_str().unwrap().to_string());
         let bytes = axum::body::to_bytes(res.into_body(), 1 << 20)
             .await
             .unwrap();
-        (status, serde_json::from_slice(&bytes).unwrap_or_default())
+        (
+            status,
+            etag,
+            serde_json::from_slice(&bytes).unwrap_or_default(),
+        )
+    }
+
+    #[tokio::test]
+    async fn of_two_writers_that_read_the_same_config_only_the_first_wins() {
+        let (app, _) = make_app(true);
+        let path = "/admin/config/routing";
+        let (_, read, _) = call_full(&app, "GET", path, &[ADMIN], "", false).await;
+        let read = read.expect("config reads carry an ETag");
+        let if_match = [ADMIN, ("if-match", read.as_str())];
+        let (first, after, _) = call_full(&app, "PUT", path, &if_match, "", false).await;
+        assert_eq!(first, StatusCode::OK);
+        assert_ne!(after.as_deref(), Some(read.as_str()));
+        let (second, current, _) = call_full(&app, "PUT", path, &if_match, "", false).await;
+        assert_eq!(second, StatusCode::PRECONDITION_FAILED);
+        assert_eq!(current, after, "the refusal says what to read");
+        // Without If-Match, or with `*`, a write is unconditional as before.
+        let plain = call(&app, "PUT", path, &[ADMIN], "", false).await;
+        assert_eq!(plain.0, StatusCode::OK);
+        let star = call(&app, "PUT", path, &[ADMIN, ("if-match", "*")], "", false).await;
+        assert_eq!(star.0, StatusCode::OK);
+        let junk = call(
+            &app,
+            "PUT",
+            path,
+            &[ADMIN, ("if-match", "\"x\"")],
+            "",
+            false,
+        )
+        .await;
+        assert_eq!(junk.0, StatusCode::PRECONDITION_FAILED);
     }
 
     const ADMIN: (&str, &str) = ("authorization", "Basic YWRtaW46cHc="); // admin:pw
