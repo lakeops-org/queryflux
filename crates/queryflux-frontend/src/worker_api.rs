@@ -251,7 +251,11 @@ async fn foreign_holder(
 /// A site limited to some clusters (its hub's `clusters`) may only act on those clusters:
 /// capacity (acquire, release, wait, quota reports) and counts (read and publish). A site
 /// without `clusters` is not limited. `None` when the call may go ahead.
-async fn foreign_cluster(st: &WorkerApiState, headers: &HeaderMap, cluster: &str) -> Option<Response> {
+async fn foreign_cluster(
+    st: &WorkerApiState,
+    headers: &HeaderMap,
+    cluster: &str,
+) -> Option<Response> {
     let Some(Caller::Site(site)) = caller(&st.api, headers).await else {
         return None;
     };
@@ -842,8 +846,6 @@ async fn capacity_quota(
         if let Some(r) = foreign_cluster(&st, &headers, &d.cluster).await {
             return r;
         }
-    }
-        return r;
     }
     match store.report_demand(&req.instance_id, &req.clusters).await {
         Ok(Some(resp)) => Json(resp).into_response(),
