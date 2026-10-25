@@ -39,11 +39,14 @@ use tokio::sync::RwLock;
 #[derive(Default)]
 struct Metrics {
     hits: AtomicUsize,
+    records: std::sync::Mutex<Vec<QueryRecord>>,
 }
 #[async_trait]
 impl MetricsStore for Metrics {
-    /// Discard query history so cache assertions depend only on synchronous hit counters.
-    async fn record_query(&self, _: QueryRecord) -> Result<()> {
+    /// Keep query history for the fingerprint assertions; cache assertions use the
+    /// synchronous hit counter.
+    async fn record_query(&self, record: QueryRecord) -> Result<()> {
+        self.records.lock().unwrap().push(record);
         Ok(())
     }
     /// Ignore cluster snapshots, which are unrelated to result-cache behavior.
@@ -383,6 +386,31 @@ async fn deterministic_selects_still_hit_cache() {
         assert_eq!(first.batches, second.batches);
         assert_eq!(f.hits(), before + 1, "{sql}");
     }
+}
+
+/// A cache hit records the same fingerprints as the run that filled the cache, also for
+/// SQL longer than the 500-character preview.
+#[tokio::test]
+async fn cache_hit_records_the_same_fingerprints() {
+    let f = Fixture::new().await;
+    let sql = format!("SELECT 42 AS answer /* {} */", "x".repeat(600));
+    f.run(&sql).await;
+    f.run(&sql).await;
+    assert_eq!(f.hits(), 1);
+    // Fingerprints are computed in a spawned task before the record is stored.
+    let records = loop {
+        let records = f.metrics.records.lock().unwrap().clone();
+        if records.len() == 2 {
+            break records;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    };
+    let (run, hit) = (&records[0], &records[1]);
+    assert!(hit.cache_hit && !run.cache_hit);
+    assert!(run.fast_hash.is_some());
+    assert_eq!(hit.fast_hash, run.fast_hash);
+    assert_eq!(hit.query_hash, run.query_hash);
+    assert_eq!(hit.sql_preview.chars().count(), 500);
 }
 
 /// Both configuration scopes can turn a deterministic read into a sequence advance.
