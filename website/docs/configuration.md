@@ -202,6 +202,18 @@ queryflux:
 
 Turn it on only once every standalone or control-plane replica runs a version with quotas. How it works: [Capacity and throughput](./architecture/capacity-and-throughput#capacity-quotas).
 
+**One database, many deployments.** Set `persistence.schema` to keep a deployment's tables in their own schema, so several deployments (for example one per tenant) can share one database:
+
+```yaml
+queryflux:
+  persistence:
+    type: postgres
+    url: postgres://qf:secret@db:5432/queryflux
+    schema: tenant_acme   # lowercase identifier; created by migrations if missing
+```
+
+Every connection gets the schema as its `search_path`; migrations run in it and keep their own ledger there; startup stops if a connection resolves to another schema (for example a role whose own `search_path` overrides it). Postgres advisory locks and `LISTEN`/`NOTIFY` channels are database-wide, so in a pinned schema QueryFlux scopes its lock keys and channel names to the schema: two deployments never wait on each other's sweeps or capacity locks, or wake on each other's config changes. Without `schema`, nothing changes.
+
 **Connection pools.** Each process opens three pools: query state (`queryPoolSize`, default 7), coordination for capacity leases, queue claims and sweep locks (`coordinationPoolSize`, default 8), and admin (`adminPoolSize`, default 2), plus one `LISTEN` connection. Connections open on demand. Size `coordinationPoolSize` to the admissions per second you expect × about 1 ms. The legacy `poolSize` instead sets one budget split 60/20/20, and is ignored when any of the three is set.
 
 **Query history retention.** `queryHistoryRetentionDays` deletes query records, digest stats and cluster snapshots older than that many days. With Postgres it runs hourly, on every replica (deleting the same rows twice is harmless), in batches of 10,000 rows, each its own short transaction. A large backlog, such as after turning retention on for an existing database, is worked through over successive batches. Each statement stays short, and autovacuum keeps up. Omit it to keep history forever.

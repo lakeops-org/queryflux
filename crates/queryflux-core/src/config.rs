@@ -1370,6 +1370,13 @@ pub struct PostgresPersistenceConfig {
     /// Full `postgres://` connection string. When non-empty, `host` / `user` / … are ignored.
     #[serde(default)]
     pub url: Option<String>,
+    /// Keep every table, migration and coordination primitive in this schema (a lowercase
+    /// identifier), so several deployments can share one database with a schema each.
+    /// Every connection gets it as its `search_path`; migrations create it when missing;
+    /// startup refuses to run if the connection resolves to another schema. Unset: the
+    /// database's default (`public`), unchanged.
+    #[serde(default)]
+    pub schema: Option<String>,
     #[serde(default)]
     pub host: Option<String>,
     #[serde(default)]
@@ -1418,6 +1425,7 @@ impl Default for PostgresPersistenceConfig {
     fn default() -> Self {
         Self {
             url: None,
+            schema: None,
             host: None,
             port: None,
             user: None,
@@ -1434,9 +1442,83 @@ impl Default for PostgresPersistenceConfig {
     }
 }
 
+/// `url` with `-c search_path=<schema>` added to its `options` parameter, which every
+/// Postgres connection QueryFlux opens (pools, listeners, locks, migrations) applies.
+fn with_search_path(url: &str, schema: &str) -> Result<String, String> {
+    let mut u =
+        url::Url::parse(url).map_err(|e| format!("postgres persistence: invalid url: {e}"))?;
+    let mut options = None;
+    let rest: Vec<(String, String)> = u
+        .query_pairs()
+        .filter_map(|(k, v)| {
+            if k == "options" {
+                options = Some(v.into_owned());
+                None
+            } else {
+                Some((k.into_owned(), v.into_owned()))
+            }
+        })
+        .collect();
+    let search_path = format!("-c search_path={schema}");
+    let options = match options {
+        Some(o) if o.contains("search_path") => {
+            return Err(
+                "postgres persistence: set the schema with `schema`, not a search_path in the url options"
+                    .into(),
+            )
+        }
+        Some(o) => format!("{o} {search_path}"),
+        None => search_path,
+    };
+    {
+        let mut q = u.query_pairs_mut();
+        q.clear();
+        for (k, v) in &rest {
+            q.append_pair(k, v);
+        }
+        q.append_pair("options", &options);
+    }
+    Ok(u.to_string())
+}
+
 impl PostgresPersistenceConfig {
     /// Connection URL for sqlx / `PgPool` (includes password encoding for special characters).
     pub fn connection_url(&self) -> Result<String, String> {
+        let base = self.base_connection_url()?;
+        match self.pinned_schema()? {
+            Some(schema) => with_search_path(&base, schema),
+            None => Ok(base),
+        }
+    }
+
+    /// `schema`, validated: a lowercase SQL identifier, so it never needs quoting.
+    pub fn pinned_schema(&self) -> Result<Option<&str>, String> {
+        let Some(schema) = self
+            .schema
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        else {
+            return Ok(None);
+        };
+        let valid = schema.len() <= 63
+            && schema
+                .bytes()
+                .next()
+                .is_some_and(|b| b.is_ascii_lowercase() || b == b'_')
+            && schema
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_');
+        if !valid {
+            return Err(format!(
+                "postgres persistence: schema '{schema}' must be a lowercase identifier \
+                 (a-z, 0-9, _; at most 63 characters; not starting with a digit)"
+            ));
+        }
+        Ok(Some(schema))
+    }
+
+    fn base_connection_url(&self) -> Result<String, String> {
         if let Some(ref u) = self.url {
             let u = u.trim();
             if !u.is_empty() {
@@ -3336,6 +3418,69 @@ guardrails:
             ..Default::default()
         };
         assert_eq!(c.resolve_pool_sizes().unwrap(), (12, 3, 5));
+    }
+
+    #[test]
+    fn a_pinned_schema_becomes_every_connection_search_path() {
+        let c = PostgresPersistenceConfig {
+            url: Some("postgres://u:p@h:5432/db?sslmode=require".into()),
+            schema: Some("tenant_abc".into()),
+            ..Default::default()
+        };
+        let u = url::Url::parse(&c.connection_url().unwrap()).unwrap();
+        let pairs: std::collections::HashMap<_, _> = u.query_pairs().into_owned().collect();
+        assert_eq!(pairs["options"], "-c search_path=tenant_abc");
+        assert_eq!(pairs["sslmode"], "require", "other parameters are kept");
+
+        // Existing options are extended, not replaced.
+        let c = PostgresPersistenceConfig {
+            url: Some("postgres://u@h/db?options=-c%20statement_timeout%3D5000".into()),
+            schema: Some("t1".into()),
+            ..Default::default()
+        };
+        let u = url::Url::parse(&c.connection_url().unwrap()).unwrap();
+        let options: String = u
+            .query_pairs()
+            .find(|(k, _)| k == "options")
+            .unwrap()
+            .1
+            .into_owned();
+        assert_eq!(options, "-c statement_timeout=5000 -c search_path=t1");
+
+        // Unset schema: the url is untouched.
+        let c = PostgresPersistenceConfig {
+            url: Some("postgres://u:p@h:5432/db".into()),
+            ..Default::default()
+        };
+        assert_eq!(c.connection_url().unwrap(), "postgres://u:p@h:5432/db");
+    }
+
+    #[test]
+    fn a_schema_must_be_a_plain_lowercase_identifier() {
+        for bad in [
+            "Tenant",
+            "1tenant",
+            "a-b",
+            "a;drop",
+            "x\"y",
+            &"a".repeat(64),
+        ] {
+            let c = PostgresPersistenceConfig {
+                url: Some("postgres://u@h/db".into()),
+                schema: Some(bad.to_string()),
+                ..Default::default()
+            };
+            assert!(c.connection_url().is_err(), "{bad} must be refused");
+        }
+        let c = PostgresPersistenceConfig {
+            url: Some("postgres://u@h/db?options=-c%20search_path%3Dx".into()),
+            schema: Some("t1".into()),
+            ..Default::default()
+        };
+        assert!(
+            c.connection_url().is_err(),
+            "two search paths are ambiguous"
+        );
     }
 
     #[test]
