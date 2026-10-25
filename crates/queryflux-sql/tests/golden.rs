@@ -1,11 +1,11 @@
 //! Fingerprints must not change: `query_hash` keys stored history, so a parser upgrade that
-//! changes one silently splits a query's history in two. Recorded with polyglot-sql 0.9.2;
-//! unchanged on 0.13.4.
+//! changes one silently splits a query's history in two, and `fast_hash` keys routing rules,
+//! so a change makes every rule miss. Recorded with polyglot-sql 0.9.2; unchanged on 0.13.4.
 //!
 //! `UPDATE_GOLDEN=1 cargo test --test golden` rewrites the expected values; only do that
 //! when a change in fingerprints is intended and its migration is planned.
 
-use queryflux_sql::fingerprint::rich_fingerprint;
+use queryflux_sql::fingerprint::{fast_hash, rich_fingerprint};
 use serde_json::{json, Value};
 
 const CORPUS: &str = include_str!("fixtures/golden_corpus.json");
@@ -18,14 +18,16 @@ fn fingerprints_are_stable() {
         .iter()
         .map(|c| {
             let (sql, d) = (c["sql"].as_str().unwrap(), c["dialect"].as_str().unwrap());
+            // u64s as strings: JSON numbers above 2^53 lose precision in many readers.
+            let fast = fast_hash(sql).to_string();
             match rich_fingerprint(sql, None, d, d) {
-                // u64s as strings: JSON numbers above 2^53 lose precision in many readers.
                 Some(f) => json!({
                     "query_hash": f.query_hash.to_string(),
                     "query_parameterized_hash": f.query_parameterized_hash.to_string(),
                     "digest_text": f.digest_text,
+                    "fast_hash": fast,
                 }),
-                None => Value::Null,
+                None => json!({ "fast_hash": fast }),
             }
         })
         .collect();
