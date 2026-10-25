@@ -9,7 +9,6 @@ keywords:
   - SQL proxy
   - documentation
 ---
-
 import {DocCards, DocCard} from '@site/src/components/DocCards';
 
 # QueryFlux documentation
@@ -45,7 +44,7 @@ Modern stacks mix **many query engines** — each with its own wire protocol and
 - **SLA protection** — cap concurrent queries per group; queue at the proxy instead of overloading backends.
 - **Transparent migration** — split traffic by weight between engines without client changes.
 
-For a deeper product rationale, see **[Motivation and goals](/docs/architecture/motivation-and-goals)** and **[Benchmarks](/docs/benchmarks)**. On the QueryFlux blog: **[Why QueryFlux](/blog/why-queryflux)**, **[Iceberg on Trino and StarRocks](/blog/iceberg-trino-starrocks-one-endpoint)**, and **[Offload Snowflake queries](/blog/offload-snowflake-queries)**. For the broader control-plane argument, see **[The Future Isn't One Engine](https://lakeops.dev/blog/the-future-isnt-one-engine)** on the LakeOps blog.
+For a deeper product rationale, see **[Motivation and goals](/docs/architecture/motivation-and-goals)** and **[Benchmarks](/docs/benchmarks)**. On the QueryFlux blog: **[Why QueryFlux](/blog/why-queryflux)**, **[Iceberg on Trino and StarRocks](/blog/iceberg-trino-starrocks-one-endpoint)**, **[Offload Snowflake queries](/blog/offload-snowflake-queries)**, and **[Row filters above the engines](/blog/row-filters-above-the-engines)**. For the broader control-plane argument, see **[The Future Isn't One Engine](https://lakeops.dev/blog/the-future-isnt-one-engine)** on the LakeOps blog.
 
 ---
 
@@ -111,5 +110,5 @@ Use these when you already know what you are looking for:
 | **[Contribute](/docs/contribute)** | PRs, issues, community |
 | **[Project structure](/docs/project-structure)** | Repository layout |
 | **[Roadmap](/docs/roadmap)** | Shipped vs planned features |
-| **[QueryFlux blog](/blog)** | Why QueryFlux, agents, Iceberg routing, Snowflake offload |
+| **[QueryFlux blog](/blog)** | Why QueryFlux, agents, row filters / column masks, Iceberg routing, Snowflake offload |
 | **[The Future Isn't One Engine](https://lakeops.dev/blog/the-future-isnt-one-engine)** | Why routing belongs in a control plane, not inside a warehouse |

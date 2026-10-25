@@ -6,7 +6,7 @@ import styles from './styles.module.css';
 
 const START = [
   {title: 'Getting started', body: 'Docker Compose stacks with Trino, Studio, and Postgres — up in one command.', to: '/docs/getting-started'},
-  {title: 'Blog', body: 'Why QueryFlux exists, agents with guardrails, Iceberg routing, and Snowflake offload.', to: '/blog'},
+  {title: 'Blog', body: 'Why QueryFlux exists, agents with guardrails, row filters and column masks, Iceberg routing, and Snowflake offload.', to: '/blog'},
   {title: 'Architecture', body: 'Frontends, router, translation, admission, and observability end to end.', to: '/docs/architecture/overview'},
 ];
 

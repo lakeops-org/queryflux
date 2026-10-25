@@ -1,7 +1,7 @@
 ---
 sidebar_label: Overview
 title: Access Control Overview
-description: Data-level access control in QueryFlux — table allow/deny, row filters, and column masks via a pluggable policy provider (OPA or Cerbos).
+description: Data-level access control in QueryFlux — table allow/deny, row filters, and column masks via OPA or Cerbos, enforced before dialect translation.
 image: img/queryflux-hero-banner.png
 ---
 # Access control
@@ -425,6 +425,7 @@ Column masks on `SELECT *` need a column list. Configure a [catalog integration]
 
 ## Related reading
 
+- [Blog: Put the row filter above the engines](/blog/row-filters-above-the-engines) — why filters belong in the proxy, not in every client
 - [OPA provider](opa.md) — wire format, Rego, demo (`examples/with-opa/`)
 - [Cerbos provider](cerbos.md) — wire format, policy YAML, demo (`examples/with-cerbos/`)
 - [Customer API row filters](customer-api-row-filters) — service account + `sessionParamKeys`

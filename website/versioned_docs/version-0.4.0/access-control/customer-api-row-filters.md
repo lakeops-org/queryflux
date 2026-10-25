@@ -1,7 +1,7 @@
 ---
 sidebar_label: Customer API row filters
-title: Customer API — per-tenant row filters
-description: Connect to QueryFlux as a service account, pass the customer id your auth service resolved, and let OPA return a row-filter predicate.
+title: Customer API Row Filters
+description: Per-tenant row filters for a customer API — service-account identity, session params, and OPA/Cerbos predicates in the QueryFlux path.
 image: img/queryflux-hero-banner.png
 ---
 # Customer API — per-tenant row filters

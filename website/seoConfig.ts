@@ -92,6 +92,7 @@ function sitemapPriority(pathname: string): number {
     pathname === '/docs/architecture/overview' ||
     pathname === '/docs/architecture/routing-and-clusters' ||
     pathname === '/docs/architecture/guardrails' ||
+    pathname === '/docs/access-control/overview' ||
     pathname === '/docs/agentic/overview' ||
     pathname === '/docs/quickstart/ai-agent-mcp'
   ) {

@@ -1,7 +1,8 @@
 ---
-description: Guardrails — SQL-level safety controls for agentic and human queries, with per-group overrides, access control (`opa_access`), and full agentic audit trails.
+title: Guardrails
+description: SQL-shape safety in the query path — read-only, row limits, require_predicate, custom guards, and the opa_access rewrite for row filters and column masks.
+image: img/queryflux-hero-banner.png
 ---
-
 # Guardrails
 
 Guardrails are a configurable chain of safety checks that run on every query **before** it reaches a backend engine. They are designed primarily for agentic workloads — where an AI agent generates SQL dynamically — but apply equally to human clients.
