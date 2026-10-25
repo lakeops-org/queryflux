@@ -1,4 +1,4 @@
-//! Query fingerprinting for QueryFlux.
+//! Query fingerprinting.
 //!
 //! Two paths:
 //! - [`fast_hash`] — zero-allocation hot-path hash (~200 ns). Used by the router.
@@ -8,7 +8,6 @@
 
 pub mod fallback;
 pub mod fast;
-pub mod polyglot_pool;
 pub mod rich;
 
 pub use fast::fast_hash;
@@ -17,8 +16,6 @@ pub use rich::{
 };
 
 /// Map a `SqlDialect` to the dialect name string polyglot-sql expects.
-/// Kept here — not in queryflux-core — because polyglot-sql is an implementation
-/// detail of this crate only.
 pub fn polyglot_dialect(dialect: &queryflux_core::query::SqlDialect) -> String {
     use queryflux_core::query::SqlDialect;
     match dialect {

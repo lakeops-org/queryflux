@@ -3,7 +3,7 @@
 //! Ignored by default: it is a timing harness, not a correctness test. Run with
 //!
 //! ```text
-//! cargo test --release -p queryflux-translation --test per_query_cost -- --ignored --nocapture
+//! cargo test --release -p queryflux-sql --test per_query_cost -- --ignored --nocapture
 //! ```
 //!
 //! Each step runs the same SQL repeatedly (the common case at high qps) and reports the
@@ -14,10 +14,10 @@ use std::time::{Duration, Instant};
 
 use queryflux_core::config::SqlCacheConfig;
 use queryflux_core::query::SqlDialect;
-use queryflux_core::sql_classify::SqlParseCache;
-use queryflux_translation::access::ExtractionCache;
-use queryflux_translation::sqlglot::extract_table_refs;
-use queryflux_translation::{extract_resources, ColumnMap, SchemaContext, TranslationService};
+use queryflux_sql::access::ExtractionCache;
+use queryflux_sql::classify::SqlParseCache;
+use queryflux_sql::sqlglot::extract_table_refs;
+use queryflux_sql::{extract_resources, ColumnMap, SchemaContext, TranslationService};
 
 const ITERS: usize = 200;
 
@@ -132,8 +132,8 @@ async fn per_query_cost() {
         });
     let cached_service = TranslationService::new_sqlglot(vec![]).expect("sqlglot available");
     let extraction_cache = ExtractionCache::new(1024);
-    let no_fp_cache = queryflux_fingerprint::FingerprintCache::new(0);
-    let fp_cache = queryflux_fingerprint::FingerprintCache::new(1024);
+    let no_fp_cache = queryflux_sql::fingerprint::FingerprintCache::new(0);
+    let fp_cache = queryflux_sql::fingerprint::FingerprintCache::new(1024);
     let fixup = "def transform(sql, src, dst):\n    return sql\n".to_string();
     let schema = schema();
     let empty = SchemaContext::default();

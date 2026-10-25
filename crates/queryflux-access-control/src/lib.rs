@@ -6,7 +6,7 @@
 //! provider implementations ([`providers::opa`], [`providers::cerbos`]).
 //!
 //! The `Guard` implementation that plugs this into the guardrail chain lives in
-//! `queryflux-frontend` (it needs `queryflux-guardrails` + `queryflux-translation`, which
+//! `queryflux-frontend` (it needs `queryflux-guardrails` + `queryflux-sql`, which
 //! this crate deliberately does not).
 
 pub mod config;

@@ -14,7 +14,7 @@ use queryflux_frontend::{
     FrontendListenerTrait,
 };
 use queryflux_persistence::AdminStore;
-use queryflux_translation::TranslationService;
+use queryflux_sql::TranslationService;
 use tracing::info;
 
 mod config_source;
@@ -378,9 +378,9 @@ async fn main() -> Result<()> {
     );
     // Process-wide caches used outside the translation service: access-control table
     // extraction and query-history fingerprints.
-    queryflux_translation::extraction_cache()
-        .set_capacity(config.translation.cache.table_extraction);
-    queryflux_fingerprint::fingerprint_cache().set_capacity(config.translation.cache.fingerprints);
+    queryflux_sql::extraction_cache().set_capacity(config.translation.cache.table_extraction);
+    queryflux_sql::fingerprint::fingerprint_cache()
+        .set_capacity(config.translation.cache.fingerprints);
 
     // --- Build catalog provider ---
     // Feeds `translation.resolve_schema_context` so sqlglot's optimizer can qualify

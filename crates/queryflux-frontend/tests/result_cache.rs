@@ -28,7 +28,7 @@ use queryflux_frontend::{
 use queryflux_metrics::{ClusterSnapshot, MetricsStore, QueryRecord};
 use queryflux_persistence::{cache_store::CacheStore, in_memory::InMemoryPersistence};
 use queryflux_routing::chain::RouterChain;
-use queryflux_translation::TranslationService;
+use queryflux_sql::TranslationService;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::{
     collections::HashMap,

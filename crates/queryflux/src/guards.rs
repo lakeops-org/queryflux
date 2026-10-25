@@ -108,7 +108,7 @@ pub(crate) fn build_authorization(
 }
 
 /// Drops any persisted translation fixup script that fails
-/// [`queryflux_translation::sqlglot::validate_fixup_script`] — most commonly one written
+/// [`queryflux_sql::sqlglot::validate_fixup_script`] — most commonly one written
 /// against the pre-this-PR `transform(ast, src, dst) -> None` contract rather than the
 /// current `transform(sql: str, src: str, dst: str) -> str`. Scripts are user/admin-editable
 /// (Studio), so a stale one must not block the whole proxy from starting or reloading;
@@ -125,7 +125,7 @@ pub(crate) fn validate_group_translation_scripts(
                 .into_iter()
                 .enumerate()
                 .filter_map(|(i, script)| {
-                    match queryflux_translation::sqlglot::validate_fixup_script(&script) {
+                    match queryflux_sql::sqlglot::validate_fixup_script(&script) {
                         Ok(()) => Some(script),
                         Err(e) => {
                             tracing::error!(

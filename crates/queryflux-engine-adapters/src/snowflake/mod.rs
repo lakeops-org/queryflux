@@ -378,7 +378,7 @@ impl SyncAdapter for SnowflakeAdapter {
         _credentials: &queryflux_auth::QueryCredentials,
         _tags: &queryflux_core::tags::QueryTags,
         _params: &queryflux_core::params::QueryParams,
-        _hints: queryflux_core::sql_classify::ExecutionHints,
+        _hints: queryflux_sql::classify::ExecutionHints,
         id_slot: &BackendQueryIdSlot,
     ) -> Result<SyncExecution> {
         let (mut cursor, guard) = self.start(sql, id_slot).await?;

@@ -2,12 +2,10 @@
 //! Python `transform(sql: str, src: str, dst: str) -> str`.
 //!
 //! Requires a working PyO3 interpreter with `sqlglot` on `PYTHONPATH` (same as CI: venv + `pip install -r requirements.txt`).
-//! Run: `cargo test -p queryflux-translation`
+//! Run: `cargo test -p queryflux-sql`
 
 use queryflux_core::{error::QueryFluxError, query::SqlDialect};
-use queryflux_translation::{
-    SchemaContext, SqlglotTranslator, TranslationService, TranslatorTrait,
-};
+use queryflux_sql::{SchemaContext, SqlglotTranslator, TranslationService, TranslatorTrait};
 
 fn require_sqlglot() {
     SqlglotTranslator::check_available().expect(

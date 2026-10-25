@@ -30,7 +30,7 @@ pub(crate) struct LiveHandles {
     /// Bumped after every reload attempt; the worker API's long-polls wait on it.
     pub(crate) changed: Option<watch::Sender<u64>>,
     /// A worker applies its snapshot's translation policy here.
-    pub(crate) translation: Option<Arc<queryflux_translation::TranslationService>>,
+    pub(crate) translation: Option<Arc<queryflux_sql::TranslationService>>,
 }
 
 #[async_trait]
@@ -928,7 +928,7 @@ mod tests {
         let current = Arc::new(std::sync::Mutex::new(snap.seal()));
         let url = control_plane(current).await;
         let (src, _state) = source(&url, "s3cret");
-        let service = Arc::new(queryflux_translation::TranslationService::disabled());
+        let service = Arc::new(queryflux_sql::TranslationService::disabled());
         let h = LiveHandles {
             translation: Some(service.clone()),
             ..handles()

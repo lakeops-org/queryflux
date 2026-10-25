@@ -637,9 +637,9 @@ pub async fn post_statement(
         let caching_requested = live.group_cache_settings.contains_key(&group.0)
             || queryflux_cache::extract_cache_hint(&sql, &session).is_some();
         caching_requested
-            && queryflux_cache::is_deterministic(
+            && queryflux_sql::fingerprint::is_deterministic(
                 &sql,
-                &queryflux_fingerprint::polyglot_dialect(&protocol.default_dialect()),
+                &queryflux_sql::fingerprint::polyglot_dialect(&protocol.default_dialect()),
             )
     };
 
@@ -1005,9 +1005,9 @@ pub async fn get_queued_statement(
         let caching_requested = live.group_cache_settings.contains_key(&group.0)
             || queryflux_cache::extract_cache_hint(&sql, &session).is_some();
         caching_requested
-            && queryflux_cache::is_deterministic(
+            && queryflux_sql::fingerprint::is_deterministic(
                 &sql,
-                &queryflux_fingerprint::polyglot_dialect(&protocol.default_dialect()),
+                &queryflux_sql::fingerprint::polyglot_dialect(&protocol.default_dialect()),
             )
     };
 
@@ -1575,7 +1575,7 @@ mod cancel_executing_statement_tests {
     use queryflux_metrics::NoopMetricsStore;
     use queryflux_persistence::in_memory::InMemoryPersistence;
     use queryflux_routing::chain::RouterChain;
-    use queryflux_translation::TranslationService;
+    use queryflux_sql::TranslationService;
     use tokio::sync::RwLock;
 
     use super::{delete_executing_statement, get_executing_statement};

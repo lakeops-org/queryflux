@@ -65,7 +65,7 @@ The Cargo workspace lives under `crates/`. Common places to touch code:
 | `queryflux-frontend` | HTTP/frontends, dispatch, Trino handlers |
 | `queryflux-routing` | `RouterTrait` implementations and `RouterChain` |
 | `queryflux-cluster-manager` | Group capacity, strategies, `acquire_cluster` / `release_cluster` |
-| `queryflux-translation` | sqlglot / `TranslationService` |
+| `queryflux-sql` | Everything about a SQL text: parsing and classification (polyglot-sql), fingerprints, access-control extraction and `TranslationService` (sqlglot) |
 | `queryflux-engine-adapters` | Trino, DuckDB, StarRocks, … |
 | `queryflux-persistence` | In-memory and PostgreSQL stores |
 | `queryflux-e2e-tests` | Integration tests behind Docker |

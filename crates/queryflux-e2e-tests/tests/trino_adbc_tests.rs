@@ -93,7 +93,7 @@ async fn count_arrow_rows(adapter: &AdbcAdapter, sql: &str) -> usize {
             &creds,
             &tags,
             &vec![],
-            queryflux_core::sql_classify::ExecutionHints::default(),
+            queryflux_sql::classify::ExecutionHints::default(),
             &queryflux_engine_adapters::BackendQueryIdSlot::new(),
         )
         .await
@@ -250,7 +250,7 @@ async fn trino_adbc_ddl_uses_execute_update_empty_stream() {
     let tags = QueryTags::new();
 
     // Force the update path explicitly (same path dispatch takes for classified DDL).
-    let hints = queryflux_core::sql_classify::ExecutionHints {
+    let hints = queryflux_sql::classify::ExecutionHints {
         is_read_like: Some(false),
     };
 
@@ -305,7 +305,7 @@ async fn trino_adbc_ddl_uses_execute_update_empty_stream() {
             &creds,
             &tags,
             &vec![],
-            queryflux_core::sql_classify::ExecutionHints::default(),
+            queryflux_sql::classify::ExecutionHints::default(),
             &queryflux_engine_adapters::BackendQueryIdSlot::new(),
         )
         .await
@@ -331,7 +331,7 @@ async fn trino_adbc_select_does_not_set_affected_rows() {
     let session = empty_trino_session();
     let creds = QueryCredentials::ServiceAccount;
     let tags = QueryTags::new();
-    let hints = queryflux_core::sql_classify::ExecutionHints {
+    let hints = queryflux_sql::classify::ExecutionHints {
         is_read_like: Some(true),
     };
 
@@ -371,7 +371,7 @@ async fn trino_adbc_select_zero_rows_still_yields_schema() {
     let session = empty_trino_session();
     let creds = QueryCredentials::ServiceAccount;
     let tags = QueryTags::new();
-    let hints = queryflux_core::sql_classify::ExecutionHints {
+    let hints = queryflux_sql::classify::ExecutionHints {
         is_read_like: Some(true),
     };
 

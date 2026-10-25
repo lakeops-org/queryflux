@@ -594,7 +594,7 @@ impl AsyncAdapter for TrinoAdapter {
         credentials: &queryflux_auth::QueryCredentials,
         tags: &queryflux_core::tags::QueryTags,
         params: &queryflux_core::params::QueryParams,
-        _hints: queryflux_core::sql_classify::ExecutionHints,
+        _hints: queryflux_sql::classify::ExecutionHints,
         id_slot: &BackendQueryIdSlot,
     ) -> crate::Result<crate::SyncExecution> {
         use crate::SyncExecution;

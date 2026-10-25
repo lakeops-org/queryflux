@@ -606,11 +606,11 @@ mod session_schema {
         params::QueryParams,
         query::{ClusterGroupName, EngineType, FrontendProtocol},
         session::SessionContext,
-        sql_classify::ExecutionHints,
         tags::QueryTags,
     };
     use queryflux_engine_adapters::{AdapterKind, BackendQueryIdSlot, SyncAdapter, SyncExecution};
     use queryflux_routing::{chain::RouterChain, RouterTrait, RoutingDecision};
+    use queryflux_sql::classify::ExecutionHints;
 
     #[derive(Default)]
     struct ObservedSessions {

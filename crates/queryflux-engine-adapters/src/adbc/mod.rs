@@ -1252,7 +1252,7 @@ impl SyncAdapter for AdbcAdapter {
         credentials: &queryflux_auth::QueryCredentials,
         _tags: &QueryTags,
         params: &queryflux_core::params::QueryParams,
-        hints: queryflux_core::sql_classify::ExecutionHints,
+        hints: queryflux_sql::classify::ExecutionHints,
         _id_slot: &BackendQueryIdSlot,
     ) -> Result<SyncExecution> {
         // ADBC `Statement::cancel` requires the live statement (`&mut self`)
@@ -1300,7 +1300,7 @@ impl SyncAdapter for AdbcAdapter {
         };
         let sql = sql.to_string();
         let is_query = hints.is_read_like.unwrap_or_else(|| {
-            queryflux_core::sql_classify::is_read_like_sql(&sql, &self.translation_dialect)
+            queryflux_sql::classify::is_read_like_sql(&sql, &self.translation_dialect)
         });
         let param_batch = if params.is_empty() {
             None

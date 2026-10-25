@@ -7,7 +7,7 @@ use polyglot_sql::{expressions::Expression, traversal::DfsIter};
 pub fn is_cacheable(sql: &str, dialect: &str) -> bool {
     let owned_sql = sql.to_owned();
     let owned_dialect = dialect.to_owned();
-    let read_only = queryflux_core::polyglot_pool::run(move || {
+    let read_only = crate::polyglot_pool::run(move || {
         polyglot_sql::parse_by_name(&owned_sql, &owned_dialect)
             .map(|statements| {
                 !statements.is_empty() && statements.iter().all(|s| is_query(s) && safe_tree(s))
@@ -15,7 +15,7 @@ pub fn is_cacheable(sql: &str, dialect: &str) -> bool {
             .unwrap_or(false)
     })
     .unwrap_or(false);
-    read_only && crate::is_deterministic(sql, dialect)
+    read_only && crate::fingerprint::is_deterministic(sql, dialect)
 }
 
 /// Recognize supported query roots; nested read-only safety is checked separately.
@@ -149,6 +149,24 @@ fn safe_tree(expr: &Expression) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fingerprint::is_deterministic;
+
+    #[test]
+    fn determinism_check_catches_now() {
+        assert!(!is_deterministic("SELECT NOW()", "generic"));
+        assert!(!is_deterministic("select random()", "generic"));
+        assert!(!is_deterministic("SELECT uuid()", "generic"));
+        assert!(!is_deterministic("SELECT CURRENT_TIMESTAMP", "generic"));
+    }
+
+    #[test]
+    fn determinism_check_passes_normal() {
+        assert!(is_deterministic(
+            "SELECT * FROM orders WHERE id = 1",
+            "generic"
+        ));
+        assert!(is_deterministic("SELECT count(*) FROM users", "generic"));
+    }
 
     /// Keep supported reads cacheable across comments, CTEs, set operations, and batches.
     #[test]
@@ -201,7 +219,7 @@ mod tests {
     #[test]
     fn determinism_is_not_read_only_classification() {
         let sql = "INSERT INTO t VALUES (1) RETURNING id";
-        assert!(crate::is_deterministic(sql, "duckdb"));
+        assert!(crate::fingerprint::is_deterministic(sql, "duckdb"));
         assert!(!is_cacheable(sql, "duckdb"));
     }
 
@@ -270,7 +288,7 @@ mod tests {
                 "TRUE",
             ),
         ] {
-            queryflux_core::polyglot_pool::run(move || {
+            crate::polyglot_pool::run(move || {
                 let statements = polyglot_sql::parse_by_name(sql, dialect).unwrap();
                 assert_eq!(statements.len(), 1, "{sql}");
                 assert!(is_query(&statements[0]), "read root: {sql}");
@@ -299,7 +317,7 @@ mod tests {
             "SELECT CASE WHEN true THEN (WITH w AS (DELETE FROM t RETURNING id) SELECT id FROM w) ELSE 0 END",
             "SELECT COUNT((WITH w AS (DELETE FROM t RETURNING id) SELECT id FROM w))",
         ] {
-            queryflux_core::polyglot_pool::run(move || {
+            crate::polyglot_pool::run(move || {
                 let statements = polyglot_sql::parse_by_name(sql, "postgresql").unwrap();
                 assert_eq!(statements.len(), 1);
                 assert!(is_query(&statements[0]), "read root: {sql}");

@@ -126,7 +126,7 @@ async fn fixup_script_turning_read_into_write_is_rejected() {
     // A row filter is configured too, but it no longer changes what arms this rejection:
     // `run_fixup_scripts` now rejects any read-to-write statement-kind change
     // unconditionally, inside dialect translation, whether or not access control also
-    // rewrote the query. See `queryflux_translation::run_fixup_scripts`.
+    // rewrote the query. See `queryflux_sql::run_fixup_scripts`.
     stub.lock().unwrap().filter("orders", "amount > 0");
 
     let guard = build_guard(&opa_url);

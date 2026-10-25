@@ -16,12 +16,12 @@ use queryflux_core::{
     tags::QueryTags,
 };
 use queryflux_engine_adapters::AdapterKind;
-use queryflux_fingerprint::{polyglot_dialect, rich_fingerprint};
 use queryflux_guardrails::GuardChain;
 use queryflux_metrics::{GuardAction, MetricsStore, QueryRecord};
 use queryflux_persistence::{CapacityStore, Persistence, QueueCoordinator};
 use queryflux_routing::chain::{RouterChain, RoutingTrace};
-use queryflux_translation::TranslationService;
+use queryflux_sql::fingerprint::{polyglot_dialect, rich_fingerprint};
+use queryflux_sql::TranslationService;
 
 /// Everything that can be hot-reloaded from the DB without restarting the proxy.
 ///
@@ -738,7 +738,7 @@ pub mod test_fixtures {
     use queryflux_metrics::{MetricsStore, NoopMetricsStore};
     use queryflux_persistence::in_memory::InMemoryPersistence;
     use queryflux_routing::chain::RouterChain;
-    use queryflux_translation::TranslationService;
+    use queryflux_sql::TranslationService;
     use tokio::sync::RwLock;
 
     use super::{AppState, LiveConfig};

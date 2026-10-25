@@ -281,7 +281,7 @@ impl SyncAdapter for DuckDbAdapter {
         _credentials: &queryflux_auth::QueryCredentials,
         _tags: &QueryTags,
         params: &QueryParams,
-        _hints: queryflux_core::sql_classify::ExecutionHints,
+        _hints: queryflux_sql::classify::ExecutionHints,
         id_slot: &BackendQueryIdSlot,
     ) -> Result<SyncExecution> {
         debug!(cluster = %self.cluster_name, "Executing DuckDB query as Arrow");
@@ -758,7 +758,7 @@ mod tests {
             &creds,
             &tags,
             &params,
-            queryflux_core::sql_classify::ExecutionHints::default(),
+            queryflux_sql::classify::ExecutionHints::default(),
             &slot,
         );
         let done = std::sync::atomic::AtomicBool::new(false);
@@ -848,7 +848,7 @@ mod tests {
                         &creds,
                         &tags,
                         &params,
-                        queryflux_core::sql_classify::ExecutionHints::default(),
+                        queryflux_sql::classify::ExecutionHints::default(),
                         &slot_a,
                     )
                     .await
@@ -881,7 +881,7 @@ mod tests {
                         &creds,
                         &tags,
                         &params,
-                        queryflux_core::sql_classify::ExecutionHints::default(),
+                        queryflux_sql::classify::ExecutionHints::default(),
                         &slot_b,
                     )
                     .await
@@ -926,7 +926,7 @@ mod tests {
                 &QueryCredentials::ServiceAccount,
                 &QueryTags::new(),
                 &params,
-                queryflux_core::sql_classify::ExecutionHints::default(),
+                queryflux_sql::classify::ExecutionHints::default(),
                 &BackendQueryIdSlot::new(),
             )
             .await
@@ -977,7 +977,7 @@ mod tests {
                 &QueryCredentials::ServiceAccount,
                 &QueryTags::new(),
                 &params,
-                queryflux_core::sql_classify::ExecutionHints::default(),
+                queryflux_sql::classify::ExecutionHints::default(),
                 &BackendQueryIdSlot::new(),
             )
             .await
@@ -1026,7 +1026,7 @@ mod tests {
                 &QueryCredentials::ServiceAccount,
                 &QueryTags::new(),
                 &params,
-                queryflux_core::sql_classify::ExecutionHints::default(),
+                queryflux_sql::classify::ExecutionHints::default(),
                 &BackendQueryIdSlot::new(),
             )
             .await

@@ -5,7 +5,7 @@
 //! needs the `CatalogProvider` trait, not any concrete implementation).
 //!
 //! Requires a working PyO3 interpreter with `sqlglot` on `PYTHONPATH` (same as CI:
-//! venv + `pip install -r requirements.txt`). Run: `cargo test -p queryflux-translation`
+//! venv + `pip install -r requirements.txt`). Run: `cargo test -p queryflux-sql`
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -14,7 +14,7 @@ use async_trait::async_trait;
 use queryflux_core::catalog::{CatalogProvider, ColumnDef, TableSchema};
 use queryflux_core::error::Result;
 use queryflux_core::query::SqlDialect;
-use queryflux_translation::{
+use queryflux_sql::{
     ColumnMap, SchemaContext, SqlglotTranslator, TranslationService, TranslatorTrait,
 };
 

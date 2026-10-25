@@ -454,7 +454,7 @@ struct PostgresCommandTag {
 
 impl PostgresCommandTag {
     fn classify(sql: &str) -> Self {
-        let s = queryflux_core::sql_classify::strip_leading_sql_comments(sql);
+        let s = queryflux_sql::classify::strip_leading_sql_comments(sql);
         let mut words = s.split_whitespace();
         // Trim trailing punctuation (e.g. a semicolon on a single-statement,
         // single-word command like `COMMIT;`) — real Postgres never includes it

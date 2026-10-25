@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use polyglot_sql::expressions::{Expression, Literal};
-use queryflux_core::sql_classify::{is_read_like_fallback, is_read_stmt, to_polyglot_dialect};
+use queryflux_sql::classify::{is_read_like_fallback, is_read_stmt, to_polyglot_dialect};
 
 use crate::context::{GuardContext, GuardLayer, GuardResult};
 
@@ -18,7 +18,7 @@ async fn guard_statements<'a>(
     let sql = ctx.sql.to_string();
     let dialect = to_polyglot_dialect(ctx.dialect);
     tokio::task::spawn_blocking(move || {
-        queryflux_core::polyglot_pool::run(move || polyglot_sql::parse(&sql, dialect))
+        queryflux_sql::polyglot_pool::run(move || polyglot_sql::parse(&sql, dialect))
     })
     .await
     .ok()
