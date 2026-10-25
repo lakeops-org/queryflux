@@ -51,6 +51,7 @@ pub type WorkerSnapshotFn = Arc<
 
 #[derive(Clone)]
 pub struct WorkerApi {
+    /// Empty when only site agents are accepted.
     pub shared_secret: String,
     pub snapshot: WorkerSnapshotFn,
     /// Where registrations and heartbeats are recorded; `None` accepts and drops them.
@@ -65,6 +66,8 @@ pub struct WorkerApi {
     /// Capacity quotas for workers (`capacity.mode: quotas`); `None` answers 404, and
     /// workers keep using per-query leases.
     pub quotas: Option<Arc<dyn queryflux_persistence::quota::QuotaStore>>,
+    /// Site agents with their own tokens (`workerApi.sites`), hashes in lowercase hex.
+    pub sites: Vec<queryflux_core::config::WorkerApiSite>,
 }
 
 /// Largest query-record batch accepted. Workers send at most a few hundred records.
@@ -165,12 +168,71 @@ fn secret_matches(given: &str, expected: &str) -> bool {
     a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
-pub(crate) fn authorized(headers: &HeaderMap, secret: &str) -> bool {
+/// The bearer token, or `None` when there is none or it is blank: a blank token must never
+/// match anything (a blank secret, or a site whose token hash is the hash of "").
+fn bearer(headers: &HeaderMap) -> Option<&str> {
     headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(crate::strip_bearer_prefix)
-        .is_some_and(|token| secret_matches(token, secret))
+        .filter(|token| !token.trim().is_empty())
+}
+
+pub(crate) fn authorized(headers: &HeaderMap, secret: &str) -> bool {
+    !secret.trim().is_empty() && bearer(headers).is_some_and(|token| secret_matches(token, secret))
+}
+
+/// Who presented the bearer token.
+#[derive(Debug, PartialEq)]
+enum Caller {
+    /// `workerApi.sharedSecret`: a worker, or a site agent trusted with any site.
+    Fleet,
+    /// A `workerApi.sites` token: that site's agent, acting only for that site.
+    Site(String),
+}
+
+fn caller(api: &WorkerApi, headers: &HeaderMap) -> Option<Caller> {
+    let token = bearer(headers)?;
+    // Validation accepts a whitespace-only secret as "none set"; so must this.
+    if !api.shared_secret.trim().is_empty() && secret_matches(token, &api.shared_secret) {
+        return Some(Caller::Fleet);
+    }
+    if api.sites.is_empty() {
+        return None;
+    }
+    use sha2::Digest;
+    let hash = format!("{:x}", sha2::Sha256::digest(token.as_bytes()));
+    api.sites
+        .iter()
+        .find(|s| {
+            s.tokens
+                .iter()
+                .any(|h| secret_matches(&hash, &h.to_ascii_lowercase()))
+        })
+        .map(|s| Caller::Site(s.name.clone()))
+}
+
+fn forbidden(message: String) -> Response {
+    (StatusCode::FORBIDDEN, message).into_response()
+}
+
+/// A site agent may only hold capacity as its own site's workers (`<site>/<worker>`, the
+/// agent's holder prefix). `None` when the call may go ahead.
+/// ponytail: releases and waits name a query id only; those ids are random UUIDs, so
+/// they are not checked against the site.
+fn foreign_holder(st: &WorkerApiState, headers: &HeaderMap, instance_id: &str) -> Option<Response> {
+    match caller(&st.api, headers) {
+        Some(Caller::Site(site))
+            if !instance_id
+                .strip_prefix(site.as_str())
+                .is_some_and(|rest| rest.starts_with('/')) =>
+        {
+            Some(forbidden(format!(
+                "site {site} may only hold capacity as '{site}/<worker>'"
+            )))
+        }
+        _ => None,
+    }
 }
 
 fn etag(revision: &str) -> String {
@@ -218,7 +280,7 @@ fn unauthorized() -> Response {
 }
 
 async fn get_config(State(st): State<Arc<WorkerApiState>>, headers: HeaderMap) -> Response {
-    if !authorized(&headers, &st.api.shared_secret) {
+    if caller(&st.api, &headers).is_none() {
         return unauthorized();
     }
     match (st.api.snapshot)().await {
@@ -244,7 +306,7 @@ async fn wait_config(
     headers: HeaderMap,
     Query(params): Query<WaitParams>,
 ) -> Response {
-    if !authorized(&headers, &st.api.shared_secret) {
+    if caller(&st.api, &headers).is_none() {
         return unauthorized();
     }
     let timeout =
@@ -281,13 +343,23 @@ async fn wait_config(
 async fn report(
     State(st): State<Arc<WorkerApiState>>,
     headers: HeaderMap,
-    Json(worker): Json<WorkerRecord>,
+    Json(mut worker): Json<WorkerRecord>,
 ) -> Response {
-    if !authorized(&headers, &st.api.shared_secret) {
+    let Some(who) = caller(&st.api, &headers) else {
         return unauthorized();
-    }
+    };
     if worker.name.trim().is_empty() {
         return (StatusCode::BAD_REQUEST, "worker name is required").into_response();
+    }
+    // A site token reports its own agent only, named under its site so another site's
+    // agent can't overwrite it.
+    if let Caller::Site(site) = who {
+        if !worker.name.starts_with(&format!("{site}/")) {
+            worker.name = format!("{site}/{}", worker.name);
+        }
+        worker.kind = "siteAgent".to_string();
+        worker.parent = None;
+        worker.labels.insert("site".to_string(), site);
     }
     if let Some(registry) = &st.api.registry {
         if let Err(e) = registry.upsert_worker(&worker).await {
@@ -306,9 +378,9 @@ async fn fleet_report(
     headers: HeaderMap,
     Json(fleet): Json<FleetReportV1>,
 ) -> Response {
-    if !authorized(&headers, &st.api.shared_secret) {
+    let Some(who) = caller(&st.api, &headers) else {
         return unauthorized();
-    }
+    };
     let site = fleet.site.trim();
     if site.is_empty() || site.contains('/') {
         return (
@@ -316,6 +388,11 @@ async fn fleet_report(
             "site is required and must not contain '/'",
         )
             .into_response();
+    }
+    if let Caller::Site(own) = &who {
+        if own != site {
+            return forbidden(format!("this token is for site {own}, not {site}"));
+        }
     }
     let Some(registry) = &st.api.registry else {
         return StatusCode::NO_CONTENT.into_response();
@@ -373,10 +450,19 @@ async fn warn_on_unshared_capacity(st: &WorkerApiState, registry: &dyn WorkerReg
 async fn ingest_records(
     State(st): State<Arc<WorkerApiState>>,
     headers: HeaderMap,
-    Json(batch): Json<QueryRecordBatchV1>,
+    Json(mut batch): Json<QueryRecordBatchV1>,
 ) -> Response {
-    if !authorized(&headers, &st.api.shared_secret) {
+    let Some(who) = caller(&st.api, &headers) else {
         return unauthorized();
+    };
+    // A site token's records are its site's, whatever the batch says.
+    if let Caller::Site(own) = who {
+        if let Some(claimed) = batch.site.as_deref().filter(|s| !s.trim().is_empty()) {
+            if claimed != own {
+                return forbidden(format!("this token is for site {own}, not {claimed}"));
+            }
+        }
+        batch.site = Some(own);
     }
     let Some(store) = st.api.history.clone() else {
         return (
@@ -501,7 +587,7 @@ fn coordination(
     st: &WorkerApiState,
     headers: &HeaderMap,
 ) -> Result<Arc<dyn CoordinationStore>, Response> {
-    if !authorized(headers, &st.api.shared_secret) {
+    if caller(&st.api, headers).is_none() {
         return Err(unauthorized());
     }
     st.api.coordination.clone().ok_or_else(|| {
@@ -526,6 +612,9 @@ async fn capacity_acquire(
         Ok(s) => s,
         Err(r) => return r,
     };
+    if let Some(r) = foreign_holder(&st, &headers, &req.instance_id) {
+        return r;
+    }
     match store
         .try_acquire(
             &req.cluster,
@@ -592,7 +681,7 @@ fn quotas(
     st: &WorkerApiState,
     headers: &HeaderMap,
 ) -> Result<Arc<dyn queryflux_persistence::quota::QuotaStore>, Response> {
-    if !authorized(headers, &st.api.shared_secret) {
+    if caller(&st.api, headers).is_none() {
         return Err(unauthorized());
     }
     st.api.quotas.clone().ok_or_else(|| {
@@ -622,6 +711,9 @@ async fn capacity_quota(
         Ok(s) => s,
         Err(r) => return r,
     };
+    if let Some(r) = foreign_holder(&st, &headers, &req.instance_id) {
+        return r;
+    }
     match store.report_demand(&req.instance_id, &req.clusters).await {
         Ok(Some(resp)) => Json(resp).into_response(),
         Ok(None) => (StatusCode::NOT_FOUND, "capacity quotas are off").into_response(),
@@ -638,6 +730,9 @@ async fn capacity_quota_release(
         Ok(s) => s,
         Err(r) => return r,
     };
+    if let Some(r) = foreign_holder(&st, &headers, &req.instance_id) {
+        return r;
+    }
     match store.release_holder(&req.instance_id).await {
         Ok(n) => Json(serde_json::json!({ "released": n })).into_response(),
         Err(e) => store_error(e),
@@ -674,6 +769,9 @@ async fn capacity_heartbeat(
         Ok(s) => s,
         Err(r) => return r,
     };
+    if let Some(r) = foreign_holder(&st, &headers, &req.instance_id) {
+        return r;
+    }
     match store.heartbeat(&req.instance_id).await {
         Ok(n) => Json(serde_json::json!({ "renewed": n })).into_response(),
         Err(e) => store_error(e),
@@ -689,6 +787,9 @@ async fn capacity_release_all(
         Ok(s) => s,
         Err(r) => return r,
     };
+    if let Some(r) = foreign_holder(&st, &headers, &req.instance_id) {
+        return r;
+    }
     match store.release_all_for_instance(&req.instance_id).await {
         Ok(n) => Json(serde_json::json!({ "released": n })).into_response(),
         Err(e) => store_error(e),
@@ -826,6 +927,7 @@ mod tests {
             coordination: None,
             history: None,
             quotas: None,
+            sites: Vec::new(),
         })
     }
 
@@ -907,6 +1009,7 @@ mod tests {
             coordination: None,
             history: None,
             quotas: None,
+            sites: Vec::new(),
         })
     }
 
@@ -1004,6 +1107,7 @@ mod tests {
             coordination: Some(store),
             history: None,
             quotas: None,
+            sites: Vec::new(),
         });
         let post = |path: &str, body: serde_json::Value| {
             Request::post(path.to_string())
@@ -1067,6 +1171,7 @@ mod tests {
             coordination: None,
             history: Some(store.clone()),
             quotas: None,
+            sites: Vec::new(),
         });
         let record = serde_json::json!({
             "proxyQueryId": "q-1",
@@ -1112,6 +1217,197 @@ mod tests {
         let future = serde_json::json!({ "schemaVersion": 2, "worker": "w", "records": [] });
         let resp = app.oneshot(post(future)).await.unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// A blank bearer token is no one, even against a blank shared secret or a site whose
+    /// token list holds the hash of "" (both refused by config validation, but the API must
+    /// not rely on that).
+    #[tokio::test]
+    async fn blank_tokens_and_secrets_authenticate_no_one() {
+        use sha2::Digest;
+        let empty_hash = format!("{:x}", sha2::Sha256::digest(b""));
+        let s = snapshot();
+        let app = router(WorkerApi {
+            shared_secret: "   ".into(),
+            snapshot: Arc::new(move || {
+                let s = s.clone();
+                Box::pin(async move { Ok(s) })
+            }),
+            registry: None,
+            changes: None,
+            coordination: None,
+            history: None,
+            quotas: None,
+            sites: vec![queryflux_core::config::WorkerApiSite {
+                name: "dc1".into(),
+                tokens: vec![empty_hash],
+            }],
+        });
+        for auth in ["Bearer ", "Bearer    ", "bearer "] {
+            assert_eq!(
+                get(app.clone(), Some(auth), None).await.status(),
+                StatusCode::UNAUTHORIZED,
+                "{auth:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_site_token_acts_only_for_its_site() {
+        use sha2::Digest;
+        let hash = |t: &str| format!("{:x}", sha2::Sha256::digest(t.as_bytes()));
+        let store = Arc::new(queryflux_persistence::in_memory::InMemoryPersistence::new());
+        let s = snapshot();
+        let app = router(WorkerApi {
+            // Agents only: no shared secret.
+            shared_secret: String::new(),
+            snapshot: Arc::new(move || {
+                let s = s.clone();
+                Box::pin(async move { Ok(s) })
+            }),
+            registry: Some(store.clone()),
+            changes: None,
+            coordination: Some(store.clone()),
+            history: Some(store.clone()),
+            quotas: None,
+            sites: vec![
+                queryflux_core::config::WorkerApiSite {
+                    name: "dc1".into(),
+                    tokens: vec![hash("old-dc1"), hash("t-dc1")],
+                },
+                queryflux_core::config::WorkerApiSite {
+                    name: "dc2".into(),
+                    tokens: vec![hash("t-dc2")],
+                },
+            ],
+        });
+        let send = |path: &str, token: &str, body: serde_json::Value| {
+            let req = Request::post(path.to_string())
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap();
+            let app = app.clone();
+            async move { app.oneshot(req).await.unwrap().status() }
+        };
+
+        // Without a shared secret, an empty or unknown token is no one.
+        for token in ["", "s3cret"] {
+            assert_eq!(
+                get(app.clone(), Some(&format!("Bearer {token}")), None)
+                    .await
+                    .status(),
+                StatusCode::UNAUTHORIZED
+            );
+        }
+        // Both of dc1's tokens work during a rotation.
+        for token in ["old-dc1", "t-dc1"] {
+            assert_eq!(
+                get(app.clone(), Some(&format!("Bearer {token}")), None)
+                    .await
+                    .status(),
+                StatusCode::OK
+            );
+        }
+
+        // The agent's own report is pinned to its site, whatever it claims.
+        let report = serde_json::json!({
+            "name": "agent-0", "version": "0.5.0", "labels": { "site": "dc2" },
+            "coordinationMode": "controlPlane", "kind": "worker"
+        });
+        assert_eq!(
+            send("/worker/heartbeat", "t-dc1", report).await,
+            StatusCode::NO_CONTENT
+        );
+        let fleet = |site: &str| {
+            serde_json::json!({ "site": site, "workers": [
+                { "name": "w", "version": "0.5.0", "coordinationMode": "controlPlane" }
+            ]})
+        };
+        assert_eq!(
+            send("/worker/fleet", "t-dc1", fleet("dc2")).await,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            send("/worker/fleet", "t-dc1", fleet("dc1")).await,
+            StatusCode::NO_CONTENT
+        );
+        let workers = store
+            .list_workers(chrono::Utc::now() - chrono::Duration::seconds(10))
+            .await
+            .unwrap();
+        let mut names: Vec<_> = workers
+            .iter()
+            .map(|w| (w.name.as_str(), w.kind.as_str()))
+            .collect();
+        names.sort();
+        assert_eq!(names, [("dc1/agent-0", "siteAgent"), ("dc1/w", "worker")]);
+        assert_eq!(
+            workers
+                .iter()
+                .find(|w| w.kind == "siteAgent")
+                .unwrap()
+                .labels["site"],
+            "dc1"
+        );
+
+        // Capacity only as dc1's workers.
+        let acquire = |holder: &str| {
+            serde_json::json!({
+                "cluster": "c", "maxRunningQueries": 5, "instanceId": holder, "queryId": holder
+            })
+        };
+        for holder in ["dc2/w", "dc1", "dc1x/w"] {
+            assert_eq!(
+                send("/worker/capacity/acquire", "t-dc1", acquire(holder)).await,
+                StatusCode::FORBIDDEN,
+                "{holder}"
+            );
+        }
+        assert_eq!(
+            send("/worker/capacity/acquire", "t-dc1", acquire("dc1/w")).await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            send(
+                "/worker/capacity/release-all",
+                "t-dc2",
+                serde_json::json!({ "instanceId": "dc1/w" })
+            )
+            .await,
+            StatusCode::FORBIDDEN
+        );
+
+        // History is attributed to the token's site.
+        let batch = |site: Option<&str>| {
+            serde_json::json!({
+                "schemaVersion": 1, "worker": "agent-0", "site": site, "records": [{
+                    "proxyQueryId": "q-1", "clusterGroup": "g", "clusterName": "c",
+                    "engineType": "duckDb", "frontendProtocol": "trinoHttp",
+                    "sourceDialect": "trino", "targetDialect": "duckDb",
+                    "wasRewritten": false, "wasTranslated": false, "sqlPreview": "SELECT 1",
+                    "status": "success", "queueDurationMs": 0, "executionDurationMs": 3,
+                    "createdAt": "2026-10-14T00:00:00Z", "worker": "w"
+                }]
+            })
+        };
+        assert_eq!(
+            send("/worker/query-records", "t-dc1", batch(Some("dc2"))).await,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            send("/worker/query-records", "t-dc1", batch(None)).await,
+            StatusCode::ACCEPTED
+        );
+        use queryflux_persistence::QueryHistoryStore;
+        let page = store
+            .list_queries(&queryflux_persistence::query_history::QueryFilters {
+                limit: 10,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(page[0].worker.as_deref(), Some("dc1/w"));
     }
 
     /// A history store whose batch writes wait until the test opens the gate.
@@ -1162,6 +1458,7 @@ mod tests {
                 coordination: None,
                 history: Some(store.clone()),
                 quotas: None,
+                sites: Vec::new(),
             },
             1,
             std::time::Duration::from_millis(50),

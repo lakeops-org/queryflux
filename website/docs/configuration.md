@@ -226,7 +226,7 @@ queryflux:
   coordination: { mode: controlPlane, onUnavailable: failClosed }
 ```
 
-The control plane enables `queryflux.workerApi` (`enabled`, `sharedSecret`, `history.endpoint`, `history.redaction`). Every key, and how config, capacity and history flow: **[Worker mode](./operations/worker-mode)**.
+The control plane enables `queryflux.workerApi` (`enabled`, `sharedSecret`, `sites`, `history.endpoint`, `history.redaction`). Every key, and how config, capacity and history flow: **[Worker mode](./operations/worker-mode)**.
 
 ## Query Cache
 
