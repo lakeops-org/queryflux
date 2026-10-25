@@ -1294,14 +1294,16 @@ impl WorkerApiConfig {
                     "queryflux.workerApi.sites['{name}'].tokens is empty"
                 ));
             }
-            for hash in &site.tokens {
+            // Entries are reported by position, never by value: a malformed entry is
+            // most likely a raw token pasted by mistake.
+            for (i, hash) in site.tokens.iter().enumerate() {
                 if hash.len() != 64 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
                     issues.push(format!(
-                        "queryflux.workerApi.sites['{name}'].tokens: '{hash}' is not a token hash (64 hex characters)"
+                        "queryflux.workerApi.sites['{name}'].tokens[{i}] is not a token hash (64 hex characters)"
                     ));
                 } else if hash.eq_ignore_ascii_case(EMPTY_TOKEN_SHA256) {
                     issues.push(format!(
-                        "queryflux.workerApi.sites['{name}'].tokens: '{hash}' is the hash of an empty token"
+                        "queryflux.workerApi.sites['{name}'].tokens[{i}] is the hash of an empty token"
                     ));
                 } else if !hashes.insert(hash.to_ascii_lowercase()) {
                     issues.push(format!(
@@ -4505,6 +4507,12 @@ auth: { provider: static, required: true }
             .validate_role()
         };
         assert_eq!(sites(&format!("{{ name: dc1, tokens: [{h}] }}")), Ok(()));
+        // A malformed entry is likely a raw token: the error names its position, not its value.
+        let raw = sites("{ name: dc1, tokens: [my-raw-secret-token] }").unwrap_err();
+        assert!(
+            raw.iter().all(|i| !i.contains("my-raw-secret-token")),
+            "{raw:?}"
+        );
         for (list, expected) in [
             ("{ name: dc1, tokens: [] }".to_string(), "tokens is empty"),
             (
@@ -4514,7 +4522,7 @@ auth: { provider: static, required: true }
             ),
             (
                 "{ name: dc1, tokens: [abc] }".to_string(),
-                "not a token hash",
+                "tokens[0] is not a token hash",
             ),
             (format!("{{ name: a/b, tokens: [{h}] }}"), "contain no '/'"),
             (

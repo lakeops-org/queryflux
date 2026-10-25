@@ -447,6 +447,9 @@ fn start(
     worker_secret: String,
     prometheus: Arc<PrometheusMetrics>,
 ) -> Result<Agent> {
+    // Upstream trims site names (validation and `workerApi.sites`); every site-derived value
+    // here uses the same trimmed name, so a stray space can't split this site's identity.
+    let site_name = agent.site_name.trim().to_string();
     let state_dir = PathBuf::from(&agent.state_dir);
     std::fs::create_dir_all(&state_dir).with_context(|| {
         format!(
@@ -459,7 +462,7 @@ fn start(
     let relay = Arc::new(Relay {
         served: Mutex::new(None),
         status: Mutex::new(AgentStatus {
-            site: agent.site_name.clone(),
+            site: site_name.clone(),
             upstream: agent.upstream.url.clone(),
             ..Default::default()
         }),
@@ -469,12 +472,12 @@ fn start(
             .then(|| state_dir.join("snapshot.json")),
     });
     let host = std::env::var("HOSTNAME").unwrap_or_else(|_| "site-agent".to_string());
-    let agent_name = format!("{}/{host}", agent.site_name);
+    let agent_name = format!("{site_name}/{host}");
     let spool = HistorySpool::open(
         state_dir.join("spool"),
         agent.history_spool.max_bytes,
         agent_name.clone(),
-        agent.site_name.clone(),
+        site_name.clone(),
         &agent.upstream,
         {
             let relay = relay.clone();
@@ -490,7 +493,7 @@ fn start(
             &agent.upstream,
             OnCoordinationUnavailable::FailClosed,
         )
-        .with_holder_prefix(format!("{}/", agent.site_name)),
+        .with_holder_prefix(format!("{site_name}/")),
     );
     let api = WorkerApi {
         shared_secret: worker_secret,
@@ -523,7 +526,7 @@ fn start(
         registry,
         spool.clone(),
         agent.upstream.clone(),
-        agent.site_name.clone(),
+        site_name.clone(),
         agent_name,
         shutdown_rx.clone(),
     ));
