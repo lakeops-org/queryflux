@@ -73,12 +73,11 @@ The Cargo workspace lives under `crates/`. Common places to touch code:
 | `queryflux-frontend` | HTTP/frontends, dispatch, Trino handlers |
 | `queryflux-routing` | `RouterTrait` implementations and `RouterChain` |
 | `queryflux-cluster-manager` | Group capacity, strategies, `acquire_cluster` / `release_cluster` |
-| `queryflux-translation` | sqlglot / `TranslationService` |
+| `queryflux-sql` | Parsing and classification, fingerprints, access-control extraction, sqlglot / `TranslationService` |
 | `queryflux-engine-adapters` | Trino, DuckDB, StarRocks, Athena, ADBC, … |
 | `queryflux-persistence` | In-memory and PostgreSQL stores |
 | `queryflux-metrics` | Prometheus instrumentation, buffered metrics |
 | `queryflux-auth` | Auth providers, authorization, identity resolution |
-| `queryflux-fingerprint` | Query fingerprinting (AST-based deduplication) |
 | `queryflux-bench` | Proxy overhead benchmarks (mock backends) and the capacity admission benchmark (`queryflux-bench capacity`) |
 | `queryflux-e2e-tests` | Integration tests behind Docker |
 
