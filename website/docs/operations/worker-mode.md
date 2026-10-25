@@ -196,6 +196,51 @@ Workers keep no durable history. Each finished query's record goes upstream:
 
 Cluster snapshots are not sent upstream. With shared capacity, the control plane's own snapshots already count every worker's running queries.
 
+## One control plane for many tenants
+
+A provider hosting control planes for many customers can run them in one process.
+Every tenant is a complete control plane with its own Postgres schema
+([`persistence.schema`](../configuration.md)), so tenants share nothing but the database
+and the process.
+
+```yaml
+queryflux:
+  role: controlPlane
+  adminApi: { port: 8080 }        # public: hubs and workers
+  persistence:
+    type: postgres
+    url: postgres://qf:secret@db:5432/queryflux
+    poolSize: 4                   # per tenant
+  controlPlane:
+    tenancy:
+      hostSuffix: .cp.example.com # acme.cp.example.com → tenant acme
+      platformPort: 9100          # internal: tenant lifecycle and admin APIs
+```
+
+Set `QUERYFLUX_PLATFORM_TOKEN` (at least 16 characters). Every request to the platform
+listener must carry it as `Authorization: Bearer <token>`.
+
+**Adding and removing tenants** is done on the platform listener:
+
+| Call | Effect |
+|---|---|
+| `PUT /platform/tenants/{id}` | Registers the tenant and starts it, after creating and migrating its schema. The body `{"schema": "..."}` is optional; the default is `tenant_<id>`. Returns `201`, `200` if it was already registered, or `409` if the id or schema belongs to another tenant. |
+| `GET /platform/tenants[/{id}]` | Shows each tenant's schema, host, whether it is running, and any startup error. |
+| `DELETE /platform/tenants/{id}` | Stops the tenant and unregisters it. Its schema and data are kept; drop them yourself. |
+
+A tenant id is a lowercase DNS label, because it is the first label of the tenant's host.
+Each replica starts the tenants that are registered and follows changes within 10
+seconds.
+
+**Serving tenants.**
+- The public port serves only `/worker/*`, for the tenant named by the host. Hubs and
+  workers authenticate against that tenant's enrolled hubs, so one tenant's hub is
+  refused by every other tenant.
+- The platform port serves every tenant's admin API, `/metrics` and worker API. Choose the
+  tenant with `X-QueryFlux-Tenant: <id>`. These requests skip the admin API's basic auth,
+  because the platform token has already been checked.
+- A tenant starts with no clusters; add them through its admin API.
+
 ## Operating workers
 
 **Ops listener** (the worker's `adminApi.port`):

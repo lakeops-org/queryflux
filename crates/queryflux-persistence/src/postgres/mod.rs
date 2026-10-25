@@ -33,6 +33,7 @@ use sqlx::PgPool;
 
 mod history_batch;
 mod hub_store;
+pub mod tenants;
 
 /// Select group rows with `members` as cluster **names** (joined from `cluster_configs` by id).
 const CLUSTER_GROUP_CONFIG_SELECT: &str = r#"

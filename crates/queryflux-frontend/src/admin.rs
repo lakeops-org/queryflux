@@ -744,6 +744,17 @@ impl AdminFrontend {
     }
 
     fn router(&self) -> Router {
+        self.build_router(true)
+    }
+
+    /// The admin and worker API for a gateway that authenticates callers itself (a
+    /// multi-tenant control plane's platform listener): the admin routes skip basic auth.
+    /// Never serve this router on a listener of its own.
+    pub fn router_behind_gateway(&self) -> Router {
+        self.build_router(false)
+    }
+
+    fn build_router(&self, basic_auth: bool) -> Router {
         let state = Arc::new(AdminState {
             prometheus: self.prometheus.clone(),
             live: self.live.clone(),
@@ -885,11 +896,15 @@ impl AdminFrontend {
             )
             // Auth management endpoints
             .route("/admin/auth/status", get(auth_status_handler))
-            .route("/admin/auth/change-password", post(change_password_handler))
-            .layer(middleware::from_fn_with_state(
+            .route("/admin/auth/change-password", post(change_password_handler));
+        let protected = if basic_auth {
+            protected.layer(middleware::from_fn_with_state(
                 state.clone(),
                 admin_auth_middleware,
-            ));
+            ))
+        } else {
+            protected
+        };
 
         let cors = if self.cors_allowed_origins.is_empty() {
             CorsLayer::new()

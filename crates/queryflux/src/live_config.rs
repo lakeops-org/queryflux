@@ -135,9 +135,12 @@ pub(crate) fn validate_live_config_refs(
     group_members: &HashMap<String, Vec<String>>,
     adapters: &HashMap<String, queryflux_engine_adapters::AdapterKind>,
 ) -> Vec<String> {
-    let mut issues = router_ref_issues(routers_cfg, routing_fallback, |g| {
-        group_members.contains_key(g)
-    });
+    let mut issues = router_ref_issues(
+        routers_cfg,
+        routing_fallback,
+        !group_members.is_empty(),
+        |g| group_members.contains_key(g),
+    );
     for (group, members) in group_members {
         for member in members {
             if !adapters.contains_key(member.as_str()) {
@@ -151,16 +154,21 @@ pub(crate) fn validate_live_config_refs(
 }
 
 /// Routers and the fallback must target groups that exist (`group_exists`).
+///
+/// A config with no groups, routers or fallback yet is accepted: a new control plane whose
+/// clusters are added through the admin API routes nothing, but nothing in it dangles.
 fn router_ref_issues(
     routers_cfg: &[queryflux_core::config::RouterConfig],
     routing_fallback: &str,
+    has_groups: bool,
     group_exists: impl Fn(&str) -> bool,
 ) -> Vec<String> {
     use queryflux_core::config::RouterConfig;
 
     let mut issues: Vec<String> = Vec::new();
+    let unconfigured = routing_fallback.is_empty() && routers_cfg.is_empty() && !has_groups;
 
-    if !group_exists(routing_fallback) {
+    if !unconfigured && !group_exists(routing_fallback) {
         issues.push(format!(
             "routing_fallback references unknown group '{routing_fallback}'"
         ));
@@ -600,9 +608,12 @@ pub(crate) fn validate_snapshot_inputs(inputs: &LiveConfigInputs) -> Vec<String>
         .filter(|(_, g)| g.enabled)
         .map(|(n, _)| n.as_str())
         .collect();
-    let mut issues = router_ref_issues(&inputs.routers, &inputs.routing_fallback, |g| {
-        enabled_groups.contains(g)
-    });
+    let mut issues = router_ref_issues(
+        &inputs.routers,
+        &inputs.routing_fallback,
+        !inputs.groups.is_empty(),
+        |g| enabled_groups.contains(g),
+    );
     let clusters = match runtime_clusters(&inputs.clusters) {
         Ok(c) => c,
         Err(e) => {
@@ -1983,6 +1994,26 @@ mod tests {
             vec![("g", group(serde_json::json!({ "members": ["duck::a"] })))],
         );
         assert!(validate_snapshot_inputs(&i).is_empty());
+    }
+
+    #[test]
+    fn an_empty_config_is_valid_but_a_missing_fallback_is_not() {
+        let mut empty = inputs(vec![], vec![]);
+        empty.routing_fallback = String::new();
+        assert!(validate_snapshot_inputs(&empty).is_empty());
+        let mut grouped = inputs(
+            vec![persisted(
+                "duck",
+                serde_json::json!({}),
+                serde_json::json!([]),
+            )],
+            vec![("g", group(serde_json::json!({ "members": ["duck"] })))],
+        );
+        grouped.routing_fallback = String::new();
+        assert_eq!(
+            validate_snapshot_inputs(&grouped),
+            vec!["routing_fallback references unknown group ''".to_string()]
+        );
     }
 
     #[test]

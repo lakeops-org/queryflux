@@ -27,6 +27,7 @@ mod live_config;
 mod registered_engines;
 mod remote_coordination;
 mod startup;
+mod tenancy;
 mod worker_labels;
 
 use crate::config_source::{
@@ -69,7 +70,7 @@ async fn main() -> Result<()> {
 
     // Load config before initializing the tracing subscriber so that
     // `otlpEndpoint` from the config file can feed the OTel layer.
-    let mut config = YamlFileConfigProvider::new(&config_path)
+    let config = YamlFileConfigProvider::new(&config_path)
         .load()
         .await
         .context("Failed to load config")?;
@@ -133,6 +134,38 @@ async fn main() -> Result<()> {
     if config.queryflux.role == queryflux_core::config::Role::Hub {
         return hub::run(config).await;
     }
+    if config
+        .queryflux
+        .control_plane
+        .as_ref()
+        .is_some_and(|c| c.tenancy.is_some())
+    {
+        return tenancy::run(config).await;
+    }
+    run(config, RunMode::Process).await
+}
+
+/// How [`run`] serves what it builds.
+pub(crate) enum RunMode {
+    /// This process is the deployment: it listens on its ports until SIGINT or SIGTERM.
+    Process,
+    /// One tenant of a multi-tenant control plane: hand the admin and worker API to the
+    /// gateway as a router (`router`), open no listener, and stop when `stop` turns true.
+    Tenant {
+        router: tokio::sync::oneshot::Sender<axum::Router>,
+        stop: tokio::sync::watch::Receiver<bool>,
+    },
+}
+
+/// Build and serve one deployment from `config`, until shutdown.
+pub(crate) async fn run(
+    mut config: queryflux_core::config::ProxyConfig,
+    mode: RunMode,
+) -> Result<()> {
+    let (tenant_router, tenant_stop) = match mode {
+        RunMode::Process => (None, None),
+        RunMode::Tenant { router, stop } => (Some(router), Some(stop)),
+    };
     // A worker owns no config: it starts empty and pulls its config from the control
     // plane (`RemoteConfigSource`), serves an ops-only listener instead of the admin API,
     // and skips the config-loading and security checks below, which describe config it
@@ -1087,6 +1120,10 @@ async fn main() -> Result<()> {
             let rx = shutdown_rx.clone();
             async move { ops.listen(rx).await }
         });
+    } else if let Some(router) = tenant_router {
+        // The gateway authenticates platform callers, and serves only `/worker/*` (hub
+        // and worker auth) on its public listener.
+        let _ = router.send(admin.router_behind_gateway());
     } else {
         frontend_tasks.spawn("Admin", {
             let rx = shutdown_rx.clone();
@@ -1101,7 +1138,12 @@ async fn main() -> Result<()> {
         &shutdown_rx,
     );
 
-    startup::shutdown::wait_for_shutdown(&mut frontend_tasks).await;
+    match tenant_stop {
+        Some(mut stop) => {
+            let _ = stop.wait_for(|stop| *stop).await;
+        }
+        None => startup::shutdown::wait_for_shutdown(&mut frontend_tasks).await,
+    }
     startup::shutdown::graceful_shutdown(
         &shutdown_tx,
         &mut frontend_tasks,

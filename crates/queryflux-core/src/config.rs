@@ -293,6 +293,26 @@ impl ProxyConfig {
                             .to_string(),
                     );
                 }
+                let tenancy = q.control_plane.as_ref().and_then(|c| c.tenancy.as_ref());
+                if let Some(t) = tenancy {
+                    if !enrolls_hubs {
+                        issues
+                            .push("controlPlane.tenancy requires Postgres persistence".to_string());
+                    }
+                    if !t.host_suffix.starts_with('.') || t.host_suffix.len() < 2 {
+                        issues.push(
+                            "controlPlane.tenancy.hostSuffix must start with '.', \
+                             e.g. .cp.example.com"
+                                .to_string(),
+                        );
+                    }
+                    if t.platform_port == q.admin_api.port {
+                        issues.push(
+                            "controlPlane.tenancy.platformPort must differ from adminApi.port"
+                                .to_string(),
+                        );
+                    }
+                }
             }
             Role::Standalone => {
                 if let Err(e) = q.capacity.validate() {
@@ -1235,6 +1255,30 @@ pub struct ControlPlaneConfig {
     /// Sent to workers in the snapshot: where they send query history and its redaction.
     #[serde(default)]
     pub history: Option<crate::worker_snapshot::HistoryPolicy>,
+    /// Host many tenants in this one control plane. Omitted: the process is one deployment.
+    #[serde(default)]
+    pub tenancy: Option<TenancyConfig>,
+}
+
+/// `queryflux.controlPlane.tenancy`: one control plane for many tenants. Each tenant is a
+/// full control-plane deployment in its own Postgres schema (`persistence.schema`), run
+/// inside this process. Tenants are added and removed through the platform listener.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TenancyConfig {
+    /// A request for host `<tenant><hostSuffix>` on the admin port reaches that tenant's
+    /// worker API (`/worker/*`), for example `.cp.example.com`. Nothing else is served
+    /// there.
+    pub host_suffix: String,
+    /// The platform listener: the tenant lifecycle API (`/platform/tenants`) and every
+    /// tenant's admin API, chosen with `X-QueryFlux-Tenant`. Callers present
+    /// `Authorization: Bearer $QUERYFLUX_PLATFORM_TOKEN`. Keep it on an internal network.
+    #[serde(default = "default_platform_port")]
+    pub platform_port: u16,
+}
+
+fn default_platform_port() -> u16 {
+    9100
 }
 
 impl QueryFluxConfig {
