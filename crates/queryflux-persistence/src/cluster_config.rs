@@ -186,6 +186,20 @@ impl UpsertClusterConfig {
         if let Some(v) = &cfg.catalog {
             config.insert("catalog".into(), v.clone().into());
         }
+        for (key, v) in [
+            ("account", &cfg.account),
+            ("warehouse", &cfg.warehouse),
+            ("role", &cfg.role),
+            ("database", &cfg.database),
+            ("schema", &cfg.schema),
+        ] {
+            if let Some(v) = v {
+                config.insert(key.into(), v.clone().into());
+            }
+        }
+        if let Some(n) = cfg.max_wait_secs {
+            config.insert("maxWaitSecs".into(), serde_json::json!(n));
+        }
         if let Some(n) = cfg.pool_size {
             config.insert("poolSize".into(), serde_json::json!(n));
         }

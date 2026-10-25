@@ -71,8 +71,8 @@ mod databricks;
 mod introspection;
 mod redshift;
 mod scoped_pools;
-mod snowflake;
-mod sql_helpers;
+pub(crate) mod snowflake;
+pub(crate) mod sql_helpers;
 #[cfg(test)]
 mod test_fixtures;
 
