@@ -70,6 +70,29 @@ pub struct WorkerApi {
     pub sites: Vec<queryflux_core::config::WorkerApiSite>,
 }
 
+impl WorkerApi {
+    /// The clusters `site` is limited to (`workerApi.sites[].clusters`), if any.
+    pub fn site_clusters(&self, site: &str) -> Option<&[String]> {
+        self.sites
+            .iter()
+            .find(|s| s.name == site)
+            .and_then(|s| s.clusters.as_deref())
+    }
+
+    /// The snapshot as `who` gets it.
+    /// ponytail: re-filtered and re-sealed per request; cache per site if many agents
+    /// long-poll one control plane.
+    fn view(&self, who: &Caller, snapshot: WorkerSnapshotV1) -> WorkerSnapshotV1 {
+        match who {
+            Caller::Site(site) => match self.site_clusters(site) {
+                Some(clusters) => snapshot.for_site(clusters),
+                None => snapshot,
+            },
+            Caller::Fleet => snapshot,
+        }
+    }
+}
+
 /// Largest query-record batch accepted. Workers send at most a few hundred records.
 const MAX_RECORD_BATCH_BYTES: usize = 32 * 1024 * 1024;
 /// Query-record batches written at once. Each holds one connection of the admin pool
@@ -280,12 +303,12 @@ fn unauthorized() -> Response {
 }
 
 async fn get_config(State(st): State<Arc<WorkerApiState>>, headers: HeaderMap) -> Response {
-    if caller(&st.api, &headers).is_none() {
+    let Some(who) = caller(&st.api, &headers) else {
         return unauthorized();
-    }
+    };
     match (st.api.snapshot)().await {
         Ok(snapshot) => snapshot_response(
-            &snapshot,
+            &st.api.view(&who, snapshot),
             headers
                 .get(header::IF_NONE_MATCH)
                 .and_then(|v| v.to_str().ok()),
@@ -306,16 +329,16 @@ async fn wait_config(
     headers: HeaderMap,
     Query(params): Query<WaitParams>,
 ) -> Response {
-    if caller(&st.api, &headers).is_none() {
+    let Some(who) = caller(&st.api, &headers) else {
         return unauthorized();
-    }
+    };
     let timeout =
         std::time::Duration::from_secs(params.timeout_secs.unwrap_or(30).min(MAX_WAIT_SECS));
     let deadline = tokio::time::Instant::now() + timeout;
     let mut changes = st.api.changes.clone();
     loop {
         let snapshot = match (st.api.snapshot)().await {
-            Ok(s) => s,
+            Ok(s) => st.api.view(&who, s),
             Err(message) => return unavailable(message),
         };
         if params.since.as_deref() != Some(snapshot.revision.as_str()) {
@@ -1274,10 +1297,12 @@ mod tests {
                 queryflux_core::config::WorkerApiSite {
                     name: "dc1".into(),
                     tokens: vec![hash("old-dc1"), hash("t-dc1")],
+                    clusters: None,
                 },
                 queryflux_core::config::WorkerApiSite {
                     name: "dc2".into(),
                     tokens: vec![hash("t-dc2")],
+                    clusters: None,
                 },
             ],
         });

@@ -1259,6 +1259,10 @@ pub struct WorkerApiSite {
     /// Hex SHA-256 of each token accepted for this site (`printf %s "$TOKEN" | sha256sum`).
     /// List two while rotating.
     pub tokens: Vec<String>,
+    /// The clusters this site's workers use. When set, the site gets only these
+    /// clusters (groups keep only these members). Unset: the site gets the whole config.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clusters: Option<Vec<String>>,
 }
 
 impl WorkerApiConfig {
