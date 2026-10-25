@@ -254,16 +254,17 @@ impl ProxyConfig {
                     }
                 }
                 match &q.worker_api {
-                    Some(api)
-                        if api.enabled
-                            && api
-                                .shared_secret
-                                .as_deref()
-                                .is_some_and(|s| !s.trim().is_empty()) =>
-                    {
+                    Some(api) if api.enabled && api.has_shared_secret() => {
                         if api.history.is_some() {
                             issues.push(
                                 "queryflux.workerApi.history comes from upstream on a site agent; remove it"
+                                    .to_string(),
+                            );
+                        }
+                        if !api.sites.is_empty() {
+                            issues.push(
+                                "queryflux.workerApi.sites only applies to a control plane: a site \
+                                 agent's workers present workerApi.sharedSecret"
                                     .to_string(),
                             );
                         }
@@ -310,17 +311,13 @@ impl ProxyConfig {
                     }
                 }
                 if let Some(api) = &q.worker_api {
-                    if api.enabled
-                        && api
-                            .shared_secret
-                            .as_deref()
-                            .is_none_or(|s| s.trim().is_empty())
-                    {
+                    if api.enabled && !api.has_shared_secret() && api.sites.is_empty() {
                         issues.push(
-                            "queryflux.workerApi.enabled requires workerApi.sharedSecret"
+                            "queryflux.workerApi.enabled requires workerApi.sharedSecret or workerApi.sites"
                                 .to_string(),
                         );
                     }
+                    issues.extend(api.site_issues());
                 }
             }
         }
@@ -1238,11 +1235,72 @@ pub struct WorkerApiConfig {
     #[serde(default)]
     pub enabled: bool,
     /// The secret workers present (`controlPlane.auth.sharedSecret` on the worker).
+    /// Optional when `sites` is set: without it, only site agents are accepted.
     #[serde(default)]
     pub shared_secret: Option<String>,
     /// Sent to workers in the snapshot: where they send query history and its redaction.
     #[serde(default)]
     pub history: Option<crate::worker_snapshot::HistoryPolicy>,
+    /// Site agents with their own tokens. A caller presenting a site's token is that
+    /// site's agent and may only report, ingest history and hold capacity for that site.
+    #[serde(default)]
+    pub sites: Vec<WorkerApiSite>,
+}
+
+/// One site whose agent connects with its own token (`workerApi.sites`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkerApiSite {
+    /// The agent's `siteAgent.siteName`.
+    pub name: String,
+    /// Hex SHA-256 of each token accepted for this site (`printf %s "$TOKEN" | sha256sum`).
+    /// List two while rotating.
+    pub tokens: Vec<String>,
+}
+
+impl WorkerApiConfig {
+    fn has_shared_secret(&self) -> bool {
+        self.shared_secret
+            .as_deref()
+            .is_some_and(|s| !s.trim().is_empty())
+    }
+
+    /// Problems with `sites`.
+    fn site_issues(&self) -> Vec<String> {
+        let mut issues = Vec::new();
+        let mut names = std::collections::HashSet::new();
+        let mut hashes = std::collections::HashSet::new();
+        for site in &self.sites {
+            let name = site.name.trim();
+            if name.is_empty() || name.contains('/') {
+                issues.push(format!(
+                    "queryflux.workerApi.sites: name '{}' must be non-empty and contain no '/'",
+                    site.name
+                ));
+            } else if !names.insert(name) {
+                issues.push(format!(
+                    "queryflux.workerApi.sites: '{name}' is listed twice"
+                ));
+            }
+            if site.tokens.is_empty() {
+                issues.push(format!(
+                    "queryflux.workerApi.sites['{name}'].tokens is empty"
+                ));
+            }
+            for hash in &site.tokens {
+                if hash.len() != 64 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+                    issues.push(format!(
+                        "queryflux.workerApi.sites['{name}'].tokens: '{hash}' is not a token hash (64 hex characters)"
+                    ));
+                } else if !hashes.insert(hash.to_ascii_lowercase()) {
+                    issues.push(format!(
+                        "queryflux.workerApi.sites['{name}'].tokens: a token is used by more than one site"
+                    ));
+                }
+            }
+        }
+        issues
+    }
 }
 
 impl QueryFluxConfig {
@@ -4418,11 +4476,52 @@ auth: { provider: static, required: true }
     #[test]
     fn the_worker_api_needs_a_secret() {
         let c = parse("queryflux:\n  role: controlPlane\n  workerApi: { enabled: true }\n");
-        assert!(c.validate_role().unwrap_err()[0].contains("requires workerApi.sharedSecret"));
+        assert!(c.validate_role().unwrap_err()[0]
+            .contains("requires workerApi.sharedSecret or workerApi.sites"));
         let ok = parse(
             "queryflux:\n  role: controlPlane\n  workerApi: { enabled: true, sharedSecret: s }\n",
         );
         assert!(ok.validate_role().is_ok());
+    }
+
+    #[test]
+    fn site_tokens_replace_the_shared_secret_and_are_checked() {
+        let h = "a".repeat(64);
+        let sites = |list: &str| {
+            parse(&format!(
+                "queryflux:\n  role: controlPlane\n  workerApi: {{ enabled: true, sites: [{list}] }}\n"
+            ))
+            .validate_role()
+        };
+        assert_eq!(sites(&format!("{{ name: dc1, tokens: [{h}] }}")), Ok(()));
+        for (list, expected) in [
+            ("{ name: dc1, tokens: [] }".to_string(), "tokens is empty"),
+            (
+                "{ name: dc1, tokens: [abc] }".to_string(),
+                "not a token hash",
+            ),
+            (format!("{{ name: a/b, tokens: [{h}] }}"), "contain no '/'"),
+            (
+                format!(
+                    "{{ name: dc1, tokens: [{h}] }}, {{ name: dc1, tokens: [{}] }}",
+                    "b".repeat(64)
+                ),
+                "listed twice",
+            ),
+            (
+                format!(
+                    "{{ name: dc1, tokens: [{h}] }}, {{ name: dc2, tokens: [{}] }}",
+                    h.to_uppercase()
+                ),
+                "more than one site",
+            ),
+        ] {
+            let issues = sites(&list).unwrap_err();
+            assert!(
+                issues.iter().any(|i| i.contains(expected)),
+                "{list}: {issues:?}"
+            );
+        }
     }
 
     const SITE_AGENT: &str = r#"

@@ -47,3 +47,4 @@ otlp = ["opentelemetry", "opentelemetry_sdk", "opentelemetry-otlp", "tracing-ope
 [dev-dependencies]
 serde_yaml = { workspace = true }
 tempfile = "3"
+sha2 = "0.10"

@@ -59,9 +59,32 @@ queryflux:
     sharedSecret: <what this site's workers present>
 ```
 
-- `siteAgent.upstream.auth.sharedSecret` is the control plane's `workerApi.sharedSecret`.
+- `siteAgent.upstream.auth.sharedSecret` is this site's token on the control plane (see [Site tokens](#site-tokens)), or the control plane's `workerApi.sharedSecret`.
 - `workerApi.sharedSecret` is what the site's workers present. Use a different value, so a worker never holds the site's upstream credential. The agent logs a warning when the two are equal.
 - A site agent rejects everything it gets from upstream (`clusters`, `clusterGroups`, `routers`, `auth`, `guardrails`, `capacity`, …), a `persistence` block, and worker-only keys (`controlPlane`, `workerName`, `coordination`, `history`).
+
+### Site tokens
+
+Give each site its own token on the control plane, and list only its SHA-256 there:
+
+```yaml
+# control plane
+queryflux:
+  workerApi:
+    enabled: true
+    # sharedSecret: omit it to accept site agents only (no worker connects directly)
+    sites:
+      - name: us-east-dc1      # the agent's siteName
+        tokens:                # printf %s "$TOKEN" | sha256sum
+          - <64 hex characters>
+```
+
+A caller presenting a site's token is that site's agent, and it can act only for that site:
+- Its fleet reports and history must name its own site, or they're refused with `403`. History that names no site is attributed to the token's site.
+- Its own record is stored as `<site>/<name>`, with kind `siteAgent` and label `site` set to its site, whatever it reports.
+- It can hold capacity only as `<site>/<worker>`, the agent's holder prefix.
+
+To rotate a token, list the new hash next to the old one, restart the control plane, move the agent to the new token, then remove the old hash. Agents serve their cached config while the control plane restarts. A token can't be recovered from its hash; a lost token is replaced the same way.
 
 ### Workers
 
@@ -156,8 +179,8 @@ Alert on `queryflux_agent_upstream_up == 0` lasting longer than you expect, and 
 
 - The cached snapshot can carry engine credentials. The file is written `0600`. Put `stateDir` on an encrypted volume, or set `snapshotCache: false`; without the cache, an agent that restarts while upstream is down has no config to serve.
 - Use separate secrets for upstream and for the site's workers.
+- Give each site its own token ([Site tokens](#site-tokens)). With only the control plane's `workerApi.sharedSecret`, upstream trusts the `site` each agent reports, and any agent can act for any site.
 - Serve the control plane's worker API over TLS: `siteAgent.upstream.url` must be `https://` unless `allowInsecureHttp: true`.
-- Today every agent authenticates to upstream with the control plane's one `workerApi.sharedSecret`, so upstream trusts the `site` each agent reports. Per-site credentials are planned.
 
 ## Limitations
 
