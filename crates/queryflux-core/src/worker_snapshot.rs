@@ -59,6 +59,15 @@ pub struct WorkerSnapshotV1 {
     /// worker's default (best effort).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub translation: Option<TranslationPolicy>,
+    /// Top-level fields from a newer control plane that this version doesn't know. Kept
+    /// as received, so the revision still verifies and they pass unchanged through site
+    /// agents, snapshot caches and peers to workers that do know them. Only top-level
+    /// fields get this: a field added inside a typed value (a group, a router, the history
+    /// policy) is dropped by an older worker, so its revision check fails. Add new data at
+    /// the top level, or bump [`WORKER_SNAPSHOT_SCHEMA_VERSION`]. See "Version skew" in the
+    /// worker-mode docs.
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, serde_json::Value>,
 }
 
 /// The control plane's `translation.mode` and `translation.errorOnUnsupported`.
@@ -173,6 +182,12 @@ impl WorkerSnapshotV1 {
             .into_iter()
             .flatten()
             {
+                strip_credentials(v);
+            }
+            // Fields this release doesn't know (`extra`) get the same treatment: a newer
+            // control plane's top-level field must not carry a credential past `Stripped`.
+            self.extra.retain(|k, _| !is_credential_key(k));
+            for v in self.extra.values_mut() {
                 strip_credentials(v);
             }
         }
@@ -324,6 +339,7 @@ mod tests {
             group_translation_scripts: BTreeMap::new(),
             history: None,
             translation: None,
+            extra: Default::default(),
             settings: SnapshotSettings {
                 security: Some(serde_json::json!({
                     "provider": "oidc",
@@ -332,6 +348,42 @@ mod tests {
                 ..SnapshotSettings::default()
             },
         }
+    }
+
+    /// A sealed snapshot as this schema version's first release serves it. Never edit it:
+    /// it stands for control planes and hubs already deployed.
+    const GOLDEN_V1: &str = include_str!("../tests/fixtures/worker-snapshot-v1.json");
+
+    /// What a control plane computes as the revision of `value` (a snapshot as JSON).
+    fn revision_of(value: &serde_json::Value) -> String {
+        let mut v = value.clone();
+        v.as_object_mut().unwrap().remove("revision");
+        let mut bytes = Vec::new();
+        write_canonical(&v, &mut bytes);
+        format!("{:016x}", xxh64(&bytes, 0))
+    }
+
+    #[test]
+    fn a_snapshot_from_an_older_control_plane_still_verifies() {
+        let golden: serde_json::Value = serde_json::from_str(GOLDEN_V1).unwrap();
+        let s: WorkerSnapshotV1 = serde_json::from_value(golden.clone()).unwrap();
+        assert!(
+            s.is_sealed() && serde_json::to_value(&s).unwrap() == golden,
+            "a v{WORKER_SNAPSHOT_SCHEMA_VERSION} snapshot from an older control plane no longer \
+             verifies: give a new field #[serde(default, skip_serializing_if = ...)] so an \
+             absent field round-trips, or bump WORKER_SNAPSHOT_SCHEMA_VERSION"
+        );
+    }
+
+    #[test]
+    fn a_snapshot_from_a_newer_control_plane_verifies_and_keeps_its_new_fields() {
+        let mut newer: serde_json::Value = serde_json::from_str(GOLDEN_V1).unwrap();
+        newer["futureField"] = serde_json::json!({ "mode": "x", "limits": [1, 2] });
+        newer["revision"] = revision_of(&newer).into();
+        let s: WorkerSnapshotV1 = serde_json::from_value(newer.clone()).unwrap();
+        assert!(s.is_sealed());
+        // Passed on (a hub, a disk cache, a peer) exactly as received.
+        assert_eq!(serde_json::to_value(&s).unwrap(), newer);
     }
 
     #[test]
@@ -411,6 +463,29 @@ mod tests {
         let adbc = s.clusters.iter().find(|c| c.name == "adbc-a").unwrap();
         assert_eq!(adbc.config["queryAuth"]["type"], "tokenExchange");
         assert_eq!(adbc.config["dbKwargs"]["warehouse"], "WH");
+    }
+
+    /// Unknown top-level fields are stripped too, also when a site view re-seals.
+    #[test]
+    fn stripped_snapshots_strip_unknown_fields() {
+        let mut s = snapshot(CredentialMode::Stripped);
+        s.extra
+            .insert("apiToken".into(), serde_json::json!("t-top"));
+        s.extra.insert(
+            "future".into(),
+            serde_json::json!({ "clientSecret": "t-nested", "name": "keep-me" }),
+        );
+        let sealed = s.seal();
+        let names: Vec<String> = sealed.clusters.iter().map(|c| c.name.clone()).collect();
+        for snap in [sealed.clone(), sealed.for_site(&names)] {
+            let json = serde_json::to_string(&snap).unwrap();
+            assert!(
+                !json.contains("t-top") && !json.contains("t-nested"),
+                "{json}"
+            );
+            assert_eq!(snap.extra["future"]["name"], "keep-me");
+            assert!(snap.is_sealed());
+        }
     }
 
     /// Guardrail webhook headers carry credentials under arbitrary names.
