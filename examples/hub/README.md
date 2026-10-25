@@ -62,5 +62,5 @@ It shows up in the control plane's query history as `demo-site/worker-a`, with i
 | File | Role |
 |------|------|
 | `control-plane.yaml` | `role: controlPlane`: Postgres, `controlPlane`, `capacity.mode: quotas` |
-| `hub.yaml` | `role: hub`: `hub.upstream` (with this site's `secret`), `stateDir`, `workerSecret` for the site's workers |
+| `hub.yaml` | `role: hub`: `hub.upstream` (with the control plane's `workerSecret` as `secret`, to keep the demo to one command; in production a hub enrolls with a one-time token, see the [Hub guide](../../website/docs/operations/hub.md#enrolling-a-hub)), `stateDir`, `workerSecret` for the site's workers |
 | `worker-a.yaml`, `worker-b.yaml` | `role: worker` with `worker.upstream.url` pointing at the hub |

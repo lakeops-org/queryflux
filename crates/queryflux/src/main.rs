@@ -160,6 +160,7 @@ async fn main() -> Result<()> {
         distributed_backend,
         coordination,
         snapshot_store,
+        hub_store,
         worker_registry,
         history_store,
         quota_store,
@@ -858,6 +859,7 @@ async fn main() -> Result<()> {
     let worker_api = startup::worker_api::worker_api(
         &config,
         snapshot_store,
+        hub_store,
         &inputs,
         worker_registry,
         config_changed_rx,

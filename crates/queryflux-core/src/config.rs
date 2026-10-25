@@ -254,17 +254,19 @@ impl ProxyConfig {
                             ));
                         }
                         check_upstream("hub.upstream", &hub.upstream.connection, &mut issues);
-                        if hub
-                            .upstream
-                            .secret
-                            .as_deref()
-                            .is_none_or(|s| s.trim().is_empty())
-                        {
-                            issues.push(
-                                "role: hub requires queryflux.hub.upstream.secret (this site's \
-                                 credential upstream)"
+                        let set =
+                            |v: &Option<String>| v.as_deref().is_some_and(|s| !s.trim().is_empty());
+                        match (set(&hub.upstream.secret), set(&hub.upstream.enroll_token)) {
+                            (true, true) => issues.push(
+                                "queryflux.hub.upstream: set secret or enrollToken, not both"
                                     .to_string(),
-                            );
+                            ),
+                            (false, false) => issues.push(
+                                "role: hub requires queryflux.hub.upstream.enrollToken (or \
+                                 secret: the control plane's workerSecret)"
+                                    .to_string(),
+                            ),
+                            _ => {}
                         }
                         if hub.state_dir.trim().is_empty() {
                             issues.push("queryflux.hub.stateDir is empty".to_string());
@@ -283,15 +285,13 @@ impl ProxyConfig {
                 if let Err(e) = q.capacity.validate() {
                     issues.push(e);
                 }
-                let sites = q.control_plane.as_ref().filter(|cp| !cp.sites.is_empty());
-                match sites {
-                    Some(cp) => issues.extend(cp.site_issues()),
-                    None if !worker_secret => issues.push(
-                        "role: controlPlane requires queryflux.workerSecret or \
-                         queryflux.controlPlane.sites (what workers and hubs present)"
+                let enrolls_hubs = matches!(q.persistence, PersistenceConfig::Postgres { .. });
+                if !worker_secret && !enrolls_hubs {
+                    issues.push(
+                        "role: controlPlane requires queryflux.workerSecret, or Postgres \
+                         persistence to enroll hubs"
                             .to_string(),
-                    ),
-                    None => {}
+                    );
                 }
             }
             Role::Standalone => {
@@ -991,9 +991,14 @@ fn default_hub_state_dir() -> String {
 pub struct HubUpstreamConfig {
     #[serde(flatten)]
     pub connection: UpstreamConfig,
-    /// What the hub presents upstream: the control plane's `workerSecret`. Use a
-    /// different value from this site's `workerSecret`, so a worker never holds the
-    /// site's upstream credential.
+    /// A one-time enrollment token for this site (`POST /admin/sites/{site}/enrollment-tokens`
+    /// on the control plane). On first start the hub enrolls with it and keeps its own key
+    /// in `stateDir`; after that the token is spent and ignored.
+    #[serde(default)]
+    pub enroll_token: Option<String>,
+    /// Instead of enrolling: the control plane's `workerSecret`. The control plane then
+    /// trusts whatever site the hub reports. Use a different value from this site's
+    /// `workerSecret`, so a worker never holds the site's upstream credential.
     #[serde(default)]
     pub secret: Option<String>,
 }
@@ -1230,89 +1235,6 @@ pub struct ControlPlaneConfig {
     /// Sent to workers in the snapshot: where they send query history and its redaction.
     #[serde(default)]
     pub history: Option<crate::worker_snapshot::HistoryPolicy>,
-    /// Hubs with their own tokens. A caller presenting a site's token is that
-    /// site's hub and may only report, ingest history and hold capacity for that site.
-    #[serde(default)]
-    pub sites: Vec<ControlPlaneSite>,
-}
-
-/// SHA-256 of the empty string: never a valid site token hash.
-const EMPTY_TOKEN_SHA256: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
-
-/// `controlPlane.sites[].clusters` when the key is present: always a list, never unset. A
-/// blank `clusters:` is far more likely a mistake than a request for every cluster, and
-/// "every cluster" would hand this site other sites' endpoints and credentials.
-fn deserialize_site_clusters<'de, D>(d: D) -> std::result::Result<Option<Vec<String>>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    Vec::<String>::deserialize(d).map(Some)
-}
-
-/// One site whose hub connects with its own token (`controlPlane.sites`).
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ControlPlaneSite {
-    /// The hub's `hub.site`.
-    pub name: String,
-    /// Hex SHA-256 of each token accepted for this site (`printf %s "$TOKEN" | sha256sum`).
-    /// List two while rotating.
-    pub tokens: Vec<String>,
-    /// The clusters this site's workers use. When set, the site gets only these
-    /// clusters (groups keep only these members). Omitted: the site gets the whole config.
-    /// A present but blank value never means "all": YAML reads a blank `clusters:` as an
-    /// empty list (no clusters), and an explicit JSON `null` is refused.
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        deserialize_with = "deserialize_site_clusters"
-    )]
-    pub clusters: Option<Vec<String>>,
-}
-
-impl ControlPlaneConfig {
-    /// Problems with `sites`.
-    fn site_issues(&self) -> Vec<String> {
-        let mut issues = Vec::new();
-        let mut names = std::collections::HashSet::new();
-        let mut hashes = std::collections::HashSet::new();
-        for site in &self.sites {
-            let name = site.name.trim();
-            if name.is_empty() || name.contains('/') {
-                issues.push(format!(
-                    "queryflux.controlPlane.sites: name '{}' must be non-empty and contain no '/'",
-                    site.name
-                ));
-            } else if !names.insert(name) {
-                issues.push(format!(
-                    "queryflux.controlPlane.sites: '{name}' is listed twice"
-                ));
-            }
-            if site.tokens.is_empty() {
-                issues.push(format!(
-                    "queryflux.controlPlane.sites['{name}'].tokens is empty"
-                ));
-            }
-            // Entries are reported by position, never by value: a malformed entry is
-            // most likely a raw token pasted by mistake.
-            for (i, hash) in site.tokens.iter().enumerate() {
-                if hash.len() != 64 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
-                    issues.push(format!(
-                        "queryflux.controlPlane.sites['{name}'].tokens[{i}] is not a token hash (64 hex characters)"
-                    ));
-                } else if hash.eq_ignore_ascii_case(EMPTY_TOKEN_SHA256) {
-                    issues.push(format!(
-                        "queryflux.controlPlane.sites['{name}'].tokens[{i}] is the hash of an empty token"
-                    ));
-                } else if !hashes.insert(hash.to_ascii_lowercase()) {
-                    issues.push(format!(
-                        "queryflux.controlPlane.sites['{name}'].tokens: a token is used by more than one site"
-                    ));
-                }
-            }
-        }
-        issues
-    }
 }
 
 impl QueryFluxConfig {
@@ -4497,77 +4419,17 @@ auth: { provider: static, required: true }
     fn a_control_plane_needs_a_secret() {
         let c = parse("queryflux:\n  role: controlPlane\n");
         assert!(c.validate_role().unwrap_err()[0]
-            .contains("requires queryflux.workerSecret or queryflux.controlPlane.sites"));
+            .contains("requires queryflux.workerSecret, or Postgres persistence"));
         let ok = parse("queryflux:\n  role: controlPlane\n  workerSecret: s\n");
         assert!(ok.validate_role().is_ok());
     }
 
     #[test]
-    fn site_tokens_replace_the_shared_secret_and_are_checked() {
-        let h = "a".repeat(64);
-        let sites = |list: &str| {
-            parse(&format!(
-                "queryflux:\n  role: controlPlane\n  controlPlane: {{ sites: [{list}] }}\n"
-            ))
-            .validate_role()
-        };
-        assert_eq!(sites(&format!("{{ name: dc1, tokens: [{h}] }}")), Ok(()));
-        // `clusters`: omitted means every cluster; a blank value never does. YAML reads a
-        // blank `clusters:` as no clusters, and a JSON `null` is refused.
-        let site: ControlPlaneSite =
-            serde_yaml::from_str(&format!("{{ name: dc1, tokens: [{h}] }}")).unwrap();
-        assert_eq!(site.clusters, None);
-        let site: ControlPlaneSite =
-            serde_yaml::from_str(&format!("{{ name: dc1, tokens: [{h}], clusters: [] }}")).unwrap();
-        assert_eq!(site.clusters, Some(vec![]));
-        let blank: ControlPlaneSite =
-            serde_yaml::from_str(&format!("{{ name: dc1, tokens: [{h}], clusters: }}")).unwrap();
-        assert_eq!(blank.clusters, Some(vec![]));
-        assert!(
-            serde_json::from_value::<ControlPlaneSite>(serde_json::json!({
-                "name": "dc1", "tokens": [h], "clusters": null
-            }))
-            .is_err()
+    fn a_control_plane_with_postgres_may_accept_enrolled_hubs_only() {
+        let c = parse(
+            "queryflux:\n  role: controlPlane\n  persistence: { type: postgres, url: postgres://x/y }\n",
         );
-        // A malformed entry is likely a raw token: the error names its position, not its value.
-        let raw = sites("{ name: dc1, tokens: [my-raw-secret-token] }").unwrap_err();
-        assert!(
-            raw.iter().all(|i| !i.contains("my-raw-secret-token")),
-            "{raw:?}"
-        );
-        for (list, expected) in [
-            ("{ name: dc1, tokens: [] }".to_string(), "tokens is empty"),
-            (
-                "{ name: dc1, tokens: [e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855] }"
-                    .to_string(),
-                "hash of an empty token",
-            ),
-            (
-                "{ name: dc1, tokens: [abc] }".to_string(),
-                "tokens[0] is not a token hash",
-            ),
-            (format!("{{ name: a/b, tokens: [{h}] }}"), "contain no '/'"),
-            (
-                format!(
-                    "{{ name: dc1, tokens: [{h}] }}, {{ name: dc1, tokens: [{}] }}",
-                    "b".repeat(64)
-                ),
-                "listed twice",
-            ),
-            (
-                format!(
-                    "{{ name: dc1, tokens: [{h}] }}, {{ name: dc2, tokens: [{}] }}",
-                    h.to_uppercase()
-                ),
-                "more than one site",
-            ),
-        ] {
-            let issues = sites(&list).unwrap_err();
-            assert!(
-                issues.iter().any(|i| i.contains(expected)),
-                "{list}: {issues:?}"
-            );
-        }
+        assert_eq!(c.validate_role(), Ok(()));
     }
 
     const HUB: &str = r#"
@@ -4609,7 +4471,7 @@ queryflux:
         for needle in [
             "hub.site",
             "requires queryflux.workerSecret",
-            "requires queryflux.hub.upstream.secret",
+            "requires queryflux.hub.upstream.enrollToken",
         ] {
             assert!(
                 issues.iter().any(|i| i.contains(needle)),

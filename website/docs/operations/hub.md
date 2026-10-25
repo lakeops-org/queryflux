@@ -47,49 +47,61 @@ queryflux:
   adminApi:
     port: 9000                       # the worker API and /readyz, /metrics, /hub/status
   hub:
-    site: us-east-dc1                # unique per upstream; no '/'
+    site: us-east-dc1                # the site you created on the control plane
     stateDir: /var/lib/queryflux/hub
     snapshotCache: true              # default
     historySpool:
       maxBytes: 1073741824           # default 1 GiB; the oldest batches are dropped beyond it
     upstream:                        # the same block as a worker's upstream
       url: https://cp.example.com:9000
-      secret: <site credential>
+      enrollToken: qfe_…             # one-time token from the control plane
       pollTimeoutSecs: 30
       heartbeatIntervalSecs: 10
 ```
 
-- `hub.upstream.secret` is this site's token on the control plane (see [Site tokens](#site-tokens)), or the control plane's `workerSecret`.
-- `workerSecret` is what the site's workers present. Use a different value, so a worker never holds the site's upstream credential. The hub logs a warning when the two are equal.
+- `hub.upstream.enrollToken` is a one-time token for this site (see [Enrolling a hub](#enrolling-a-hub)). Instead, `hub.upstream.secret` can hold the control plane's `workerSecret`; the control plane then trusts whatever site the hub reports.
+- `workerSecret` is what the site's workers present. Use a different value from the upstream credential, so a worker never holds it.
 - A hub rejects everything it gets from upstream (`clusters`, `clusterGroups`, `routers`, `auth`, `guardrails`, `capacity`, …), a `persistence` block, and the `worker` and `controlPlane` sections.
 
-### Site tokens
+### Enrolling a hub
 
-Give each site its own token on the control plane, and list only its SHA-256 there:
+Each hub proves its site with a key of its own. The control plane stores only the public key, and the hub signs every request with a token that expires within 5 minutes, so nothing stored or sent can be replayed for long. Enrollment needs a control plane with Postgres.
 
-```yaml
-# control plane
-queryflux:
-  # workerSecret: omit it to accept hubs only (no worker connects directly)
-  controlPlane:
-    sites:
-      - name: us-east-dc1      # the hub's hub.site
-        tokens:                # printf %s "$TOKEN" | sha256sum
-          - <64 hex characters>
-        clusters: [trino-dc1]  # optional: the only clusters this site gets
-```
+1. Create the site, optionally limited to some clusters, and a one-time token for it (admin API, Basic auth):
 
-A caller presenting a site's token is that site's hub, and it can act only for that site:
-- Its fleet reports and history must name its own site, or they're refused with `403`. History that names no site is attributed to the token's site.
+   ```bash
+   curl -u admin:… -X PUT  https://cp.example.com:9000/admin/sites/us-east-dc1 \
+        -H 'content-type: application/json' -d '{"clusters": ["trino-dc1"]}'
+   curl -u admin:… -X POST https://cp.example.com:9000/admin/sites/us-east-dc1/enrollment-tokens \
+        -H 'content-type: application/json' -d '{"ttlSecs": 3600}'
+   # {"token":"qfe_…","site":"us-east-dc1","expiresAt":"…"}
+   ```
+
+   The token is shown once; the control plane keeps its SHA-256. It works for one hub, for `ttlSecs` (default 1 hour, at most 7 days).
+2. Put it in the hub's `hub.upstream.enrollToken` and start the hub. On first start the hub generates an Ed25519 key, presents the token and its public key to `POST /worker/enroll`, and keeps the key in `stateDir/identity.json` (owner-only). The token is then spent; later starts use the key.
+3. Check `GET /admin/sites`: it lists each site with its clusters and enrolled hubs.
+
+| Admin endpoint | What it does |
+|---|---|
+| `GET /admin/sites` | Sites, their clusters and enrolled hubs |
+| `PUT /admin/sites/{site}` | Create a site, or set its `clusters` (omit or `null`: every cluster) |
+| `DELETE /admin/sites/{site}` | Delete a site; its hubs and unused tokens are revoked |
+| `POST /admin/sites/{site}/enrollment-tokens` | A one-time token for one hub of the site |
+| `DELETE /admin/sites/{site}/hubs/{id}` | Revoke one hub |
+
+A hub acts only for its own site:
+- Its fleet reports and history must name its own site, or they're refused with `403`. History that names no site is attributed to the hub's site.
 - Its own record is stored as `<site>/<name>`, with kind `hub` and label `site` set to its site, whatever it reports.
 - It can hold capacity only as `<site>/<worker>`, the hub's holder prefix.
 - Its workers' sweeps (engine reconcile, zombie and stale-queue eviction, …) run under the site's own locks (`<site>/<sweep>`), so one worker per site runs each sweep and sites never wait on each other.
 
-With `clusters` set, the site's hub gets a snapshot with only those clusters: other sites' cluster endpoints and cluster credentials never reach it. It is not full tenant isolation: only clusters and group members are filtered. Group definitions, routers and the routing fallback, per-group translation scripts, and the global settings (`security`, `catalog`, `guardrails`, `accessControl` and guard script bodies) reach every site. Leaving `clusters` out gives the site every cluster. A blank `clusters:` gives it none, so a mistake can't hand it every cluster. Groups keep only those members. A group left with no member stays, so routes to it still resolve, and its queries fail at this site with no cluster available. The site gets its own revision, and the fleet view compares the site's hub and workers with it.
+With `clusters` set, the site's hub gets a snapshot with only those clusters: other sites' cluster endpoints and cluster credentials never reach it. It is not full tenant isolation: only clusters and group members are filtered. Group definitions, routers and the routing fallback, per-group translation scripts, and the global settings (`security`, `catalog`, `guardrails`, `accessControl` and guard script bodies) reach every site. A site whose `clusters` is unset (omitted or `null` in `PUT /admin/sites/{site}`) gets every cluster; `[]` gives it none. Groups keep only those members. A group left with no member stays, so routes to it still resolve, and its queries fail at this site with no cluster available. The site gets its own revision, and the fleet view compares the site's hub and workers with it.
 
 The site can also act only on those clusters. Capacity calls (acquire, release, wait, quota reports) and running counts (read and publish) for any other cluster are refused with `403`. A site without `clusters` isn't limited.
 
-To rotate a token, list the new hash next to the old one, restart the control plane, move the hub to the new token, then remove the old hash. Hubs serve their cached config while the control plane restarts. A token can't be recovered from its hash; a lost token is replaced the same way.
+**Revoking and rotating.** Revoking a hub takes effect at once on the replica that handled the call and within 10 seconds on the others. A revoked hub keeps serving its cached config to its workers, as during an outage, until you stop it. To bring a hub back, or to rotate its key, create a new token and set it as `enrollToken`: a hub given a different token than the one it enrolled with enrolls a new key at its next start. To run several hubs for one site, give each its own token.
+
+With no `workerSecret` on the control plane, only enrolled hubs can connect: the setting for a hosted control plane, where nothing at a customer site should reach it except its hub.
 
 ### Workers
 
@@ -109,7 +121,7 @@ queryflux:
 
 ### Control plane
 
-Nothing changes. Set `workerSecret` as for workers, and set `capacity.mode: quotas` (see [Capacity](#capacity)).
+Use Postgres persistence, so hubs can enroll, and set `capacity.mode: quotas` (see [Capacity](#capacity)). Set `workerSecret` only if workers also connect directly.
 
 ## Deploying
 
@@ -185,11 +197,13 @@ Alert on `queryflux_hub_upstream_up == 0` lasting longer than you expect, and on
 
 - The cached snapshot can carry engine credentials. The file is written `0600`. Put `stateDir` on an encrypted volume, or set `snapshotCache: false`; without the cache, a hub that restarts while upstream is down has no config to serve.
 - Use separate secrets for upstream and for the site's workers.
-- Give each site its own token ([Site tokens](#site-tokens)). With only the control plane's `workerSecret`, upstream trusts the `site` each hub reports, and any hub can act for any site.
+- Enroll each hub ([Enrolling a hub](#enrolling-a-hub)). A hub presenting the control plane's `workerSecret` instead is trusted with whatever site it reports, and could act for any site.
+- The key in `stateDir/identity.json` is the hub's credential: keep `stateDir` on a persistent, encrypted volume. If it is lost, enroll the hub again with a new token.
 - Serve the control plane's worker API over TLS: `hub.upstream.url` must be `https://` unless `allowInsecureHttp: true`.
 
 ## Limitations
 
-- A site without `controlPlane.sites[].clusters` gets the whole config.
+- A site without `clusters` gets the whole config.
+- Changing `enrollToken` makes the hub enroll at startup; if the control plane is down then, it serves nothing until it answers.
 - Capacity is forwarded, not held at the site. A site-wide quota held by the hub, which would keep admitting after per-worker quotas expire during a long outage, is planned.
 - Studio actions that must reach engines from inside the site (test a connection, browse a catalog) do not run through the hub yet.

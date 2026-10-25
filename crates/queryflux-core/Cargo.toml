@@ -19,3 +19,6 @@ bytes = { workspace = true }
 tokio = { workspace = true }
 xxhash-rust = { workspace = true }
 lru = "0.14"
+base64 = "0.22"
+ed25519-dalek = "2.2"
+rand = "0.8"

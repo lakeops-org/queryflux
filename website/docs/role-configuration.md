@@ -83,10 +83,6 @@ queryflux:
   capacity:
     mode: quotas
   controlPlane:
-    sites:
-      - name: us-east-dc1
-        tokens: [<hash of the site's token>]
-        clusters: [trino-us-east]
     history:
       endpoint: null
       redaction: maskLiterals
@@ -94,14 +90,12 @@ queryflux:
 
 | Key | Default | Meaning |
 |---|---|---|
-| `controlPlane.sites` | `[]` | Hubs that connect with their own token. See [Site tokens](./operations/hub#site-tokens). |
-| `controlPlane.sites[].name` | required | The hub's `hub.site`. Must be non-empty, contain no `/`, and be unique. |
-| `controlPlane.sites[].tokens` | required | The accepted tokens for this site, each stored as the hex SHA-256 of the token (`printf %s "$TOKEN" \| sha256sum`). List two while rotating. A token may belong to only one site. |
-| `controlPlane.sites[].clusters` | all clusters | Limits the site to these clusters: other clusters are removed from the config it gets, and groups keep only these members. A hub that connects with the `workerSecret` instead of a token always gets the whole config. |
 | `controlPlane.history.endpoint` | the control plane's `/worker/query-records` | Where workers send query history, if not to the control plane. |
 | `controlPlane.history.redaction` | `full` | How much SQL leaves each worker: `full`, `maskLiterals` (SQL as its parameterized digest, with literals replaced by `?`), or `metadata` (no SQL or error text). |
 
-**Rules:** set `workerSecret`, `sites`, or both. With `sites` set and no `workerSecret`, only hubs can connect, and no worker can connect directly. A hub may also present the `workerSecret`, but then the control plane trusts whatever site it reports. `capacity` must pass the limits above.
+Sites and enrolled hubs are not config keys: they live in Postgres and are managed through the admin API (`/admin/sites`), so a hub can be added, limited to some clusters, or revoked without a restart. See [Enrolling a hub](./operations/hub#enrolling-a-hub).
+
+**Rules:** set `workerSecret`, use Postgres persistence, or both. With Postgres and no `workerSecret`, only enrolled hubs can connect, and no worker can connect directly. A hub may also present the `workerSecret`, but then the control plane trusts whatever site it reports. `capacity` must pass the limits above.
 
 ## Worker
 
@@ -155,7 +149,7 @@ queryflux:
     site: us-east-dc1
     upstream:
       url: https://cp.example.com:9000
-      secret: <this site's token>
+      enrollToken: <one-time token for this site>
     stateDir: /var/lib/queryflux/hub
     snapshotCache: true
     historySpool:
@@ -164,18 +158,19 @@ queryflux:
 
 | Key | Default | Meaning |
 |---|---|---|
-| `hub.site` | required | Unique per control plane, with no `/`. This site's workers appear upstream as `<site>/<worker>`. With [site tokens](./operations/hub#site-tokens), it must match the site's `controlPlane.sites[].name`. |
+| `hub.site` | required | Unique per control plane, with no `/`. This site's workers appear upstream as `<site>/<worker>`. When the hub enrolls, it must be the site its enrollment token was created for. |
 | `hub.upstream` | required | The control plane. See [`upstream`](#upstream). |
-| `hub.upstream.secret` | required | What the hub presents upstream: this site's token, or the control plane's `workerSecret`. Use a different value from this hub's own `workerSecret`, so a worker never holds the site's upstream credential; the hub logs a warning when they match. |
-| `hub.stateDir` | `/var/lib/queryflux/hub` | Where the config cache and the history spool live. Use a persistent, encrypted volume: the cached config can carry engine credentials. |
+| `hub.upstream.enrollToken` | one of these two | A one-time token from `POST /admin/sites/{site}/enrollment-tokens`. On first start the hub enrolls its own key with it and keeps the key in `stateDir`; later starts ignore the spent token. A different token makes the hub enroll a new key: how a revoked hub comes back, or a key is rotated. |
+| `hub.upstream.secret` | one of these two | Instead of enrolling: the control plane's `workerSecret`. The control plane then trusts whatever site the hub reports. Use a different value from this hub's own `workerSecret`; the hub logs a warning when they match. |
+| `hub.stateDir` | `/var/lib/queryflux/hub` | Where the hub's key, the config cache and the history spool live. Use a persistent, encrypted volume: the key is the hub's credential, and the cached config can carry engine credentials. |
 | `hub.snapshotCache` | `true` | Keep the last config on disk, so the hub can serve its workers after a restart while upstream is unreachable. |
 | `hub.historySpool.maxBytes` | `1073741824` (1 GiB) | When the history spool grows past this, the oldest batches are dropped. |
 
-**Rules:** `workerSecret`, `hub.site`, `hub.upstream` and `hub.upstream.secret` are required, and `stateDir` can't be empty. `persistence` (other than `inMemory`), `capacity` and the keys the hub gets from upstream are rejected.
+**Rules:** `workerSecret`, `hub.site`, `hub.upstream`, and one of `hub.upstream.enrollToken` or `hub.upstream.secret` are required, and `stateDir` can't be empty. `persistence` (other than `inMemory`), `capacity` and the keys the hub gets from upstream are rejected.
 
 ## `upstream`
 
-`worker.upstream` and `hub.upstream` use the same block. The credential is not part of it: a worker presents `workerSecret`, and a hub presents `hub.upstream.secret`.
+`worker.upstream` and `hub.upstream` use the same block. A worker presents `workerSecret` upstream; a hub presents tokens signed with its enrolled key, or `hub.upstream.secret`.
 
 | Key | Default | Meaning |
 |---|---|---|
