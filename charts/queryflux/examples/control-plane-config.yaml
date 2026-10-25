@@ -11,6 +11,8 @@ queryflux:
   role: controlPlane
   externalAddress: https://queryflux.example.com
   shutdownDrainTimeoutSecs: 30
+  # The same value goes into every worker's workerSecret.
+  workerSecret: <long-random-secret>
   frontends:
     trinoHttp:
       enabled: true
@@ -20,10 +22,7 @@ queryflux:
     url: postgres://queryflux:<password>@postgres.example.internal:5432/queryflux
   adminApi:
     port: 9000
-  workerApi:
-    enabled: true
-    # The same value goes into every worker's controlPlane.auth.sharedSecret.
-    sharedSecret: <long-random-secret>
+  controlPlane:
     history:
       # full | maskLiterals | metadata. Workers apply it before records leave them.
       redaction: full

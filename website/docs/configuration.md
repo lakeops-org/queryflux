@@ -215,18 +215,19 @@ Helm / Kubernetes: see **[Run multiple replicas](./installation/kubernetes.md#ru
 
 ## Worker mode
 
-`queryflux.role` selects how a process gets its config: `standalone` (the default), `controlPlane`, `worker`, or `siteAgent` (relays a remote control plane to the workers at one site; see [Site agent](./operations/site-agent)). A worker pulls its config, capacity leases and history endpoint from a control plane, and never connects to Postgres:
+`queryflux.role` selects how a process gets its config: `standalone` (the default), `controlPlane`, `worker`, or `hub` (relays a remote control plane to the workers at one site; see [Hub](./operations/hub)). A worker pulls its config, capacity leases and history endpoint from a control plane, and never connects to Postgres:
 
 ```yaml
 queryflux:
   role: worker
-  controlPlane:
-    url: https://queryflux-control:9000
-    auth: { mode: sharedSecret, sharedSecret: <secret> }
-  coordination: { mode: controlPlane, onUnavailable: failClosed }
+  workerSecret: <secret>
+  worker:
+    upstream:
+      url: https://queryflux-control:9000
+    coordination: { mode: controlPlane, onUnavailable: failClosed }
 ```
 
-The control plane enables `queryflux.workerApi` (`enabled`, `sharedSecret`, `sites`, `history.endpoint`, `history.redaction`). Every key, and how config, capacity and history flow: **[Worker mode](./operations/worker-mode)**.
+A worker and whatever serves it share `queryflux.workerSecret`. Each role other than `standalone` has its own section: `queryflux.controlPlane` (`sites`, `history.endpoint`, `history.redaction`), `queryflux.worker` and `queryflux.hub`. Every key for each role: **[Configuration by role](./role-configuration)**. How config, capacity and history flow: **[Worker mode](./operations/worker-mode)**.
 
 ## Query Cache
 

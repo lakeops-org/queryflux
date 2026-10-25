@@ -661,12 +661,12 @@ pub(crate) fn translation_policy(
     }
 }
 
-/// The history policy a control plane hands its workers (`workerApi.history`).
+/// The history policy a control plane hands its workers (`controlPlane.history`).
 pub(crate) fn history_policy(
     yaml: &queryflux_core::config::ProxyConfig,
 ) -> Option<queryflux_core::worker_snapshot::HistoryPolicy> {
     yaml.queryflux
-        .worker_api
+        .control_plane
         .as_ref()
         .and_then(|w| w.history.clone())
 }

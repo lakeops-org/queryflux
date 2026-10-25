@@ -1,0 +1,22 @@
+# Hub config (examples/hub-values.yaml mounts it from a Secret: it holds the
+# site's upstream credential).
+queryflux:
+  role: hub
+  # What this site's workers present (their workerSecret). Use a different value from
+  # hub.upstream.secret, so workers never hold the site's upstream credential.
+  workerSecret: change-me-worker-secret
+  adminApi:
+    port: 9000
+  hub:
+    # Unique per upstream. This site's workers appear upstream as <site>/<worker>.
+    site: us-east-dc1
+    # The persistent volume from hub-values.yaml.
+    stateDir: /var/lib/queryflux/hub
+    upstream:
+      url: https://queryflux-control-plane.example.com:9000
+      # This site's credential upstream (the control plane's workerSecret).
+      secret: change-me-site-secret
+      pollTimeoutSecs: 30
+      heartbeatIntervalSecs: 10
+    historySpool:
+      maxBytes: 1073741824

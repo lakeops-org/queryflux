@@ -21,10 +21,10 @@ This page explains how worker mode works and why it is built this way. To run it
 
 | `queryflux.role` | Owns config | Database | Serves |
 |---|---|---|---|
-| `standalone` (default) | yes (YAML or Postgres) | optional | queries, admin API, Studio; also workers with `workerApi.enabled` |
+| `standalone` (default) | yes (YAML or Postgres) | optional | queries, admin API, Studio |
 | `controlPlane` | yes | Postgres | the same, plus workers |
 | `worker` | no, pulled from the control plane | **never** | queries, and an ops listener |
-| `siteAgent` | no, relayed from the control plane | **never** | the worker API for one site's workers, and ops endpoints |
+| `hub` | no, relayed from the control plane | **never** | the worker API for one site's workers, and ops endpoints |
 
 <img
   src="/img/docs/worker-mode-roles-topology.svg"
@@ -85,7 +85,7 @@ Any config a worker starts with while the control plane is down may be missing r
   alt="Peer bootstrap sequence: new worker copies config from a running peer when the control plane is unreachable, then confirms when the control plane returns"
 />
 
-- **Where peers come from:** `controlPlane.peerBootstrap.address` is usually a headless Service. Each address is tried in turn, and only ready workers, which all have a config, are listed.
+- **Where peers come from:** `worker.upstream.peerBootstrap.address` is usually a headless Service. Each address is tried in turn, and only ready workers, which all have a config, are listed.
 - **Age limit:** `confirmedAt` is when the control plane last confirmed that config. It is carried along when one peer copies from another, so `maxAgeSecs` bounds the true age.
 - **Visibility:** a copied config is reported as `configSource: peer` and `stale: true`, and `queryflux_worker_config_stale` is `1`. Once the control plane answers, the worker confirms or replaces the config with a conditional `GET`. It doesn't use a long-poll here, because a long-poll would delay confirmation.
 - **Rejected alternative:** a seed config shipped in a Secret. Edits made in Studio after the export would be silently lost.
@@ -107,7 +107,7 @@ Any config a worker starts with while the control plane is down may be missing r
 - **Local work stays local.** A worker's zombie and stale-queue sweeps clean its own memory, so they never take fleet-wide locks.
 - **Cost:** one round trip per query to acquire a lease, with a 5-second timeout. The release is off the query path: a finishing query doesn't wait for it. Releases that finish together share one request; a query that finishes alone still sends its own.
 
-| | `coordination.mode: controlPlane` (default) | `coordination.mode: local` |
+| | `worker.coordination.mode: controlPlane` (default) | `worker.coordination.mode: local` |
 |---|---|---|
 | Limit applies to | the whole fleet | each worker separately |
 | Limit 10, three workers | at most 10 queries | up to 30 queries |
@@ -199,13 +199,13 @@ The cache key includes a fingerprint of the group's member clusters and their co
 | Per-worker result cache, keyed by group config | A cache shared through the control plane | Result data never leaves the worker's network. Edits invalidate exactly the affected group. |
 | Measure fairness first | A global wait queue now | It may not be needed, and the metrics show when it is. |
 
-## Site agent
+## Hub
 
-A site agent ([operations guide](../operations/site-agent)) lets workers in a remote network reach a control plane through one process that only makes outbound connections. Its design follows from one rule: **workers can't tell.** The agent serves the exact worker API, so a worker needs no change beyond its `controlPlane.url`.
+A hub ([operations guide](../operations/hub)) lets workers in a remote network reach a control plane through one process that only makes outbound connections. Its design follows from one rule: **workers can't tell.** The hub serves the exact worker API, so a worker needs no change beyond its `worker.upstream.url`.
 
-- **Reuse, not a fork.** The agent is the control plane's `WorkerApi` with different backends:
+- **Reuse, not a fork.** The hub is the control plane's `WorkerApi` with different backends:
 
-  | `WorkerApi` field | Control plane | Site agent |
+  | `WorkerApi` field | Control plane | Hub |
   |---|---|---|
   | `snapshot` | built from Postgres, cached until reload | the snapshot fetched from upstream with the worker's own fetch code (`fetch_snapshot`: long-poll, schema and seal checks) |
   | `changes` | bumped on each reload | bumped on each new upstream revision |
@@ -213,9 +213,9 @@ A site agent ([operations guide](../operations/site-agent)) lets workers in a re
   | `history` | the history store | a spool on disk, posted upstream |
   | `coordination`, `quotas` | Postgres | the worker's `RemoteCoordinationStore`, pointed upstream |
 
-- **The revision passes through.** The agent serves upstream's sealed snapshot as is, so the revision a worker reports is the one upstream published. The one exception: when upstream names a history endpoint, the agent removes it and re-seals, so workers send history only to the agent, which then relays to that endpoint.
+- **The revision passes through.** The hub serves upstream's sealed snapshot as is, so the revision a worker reports is the one upstream published. The one exception: when upstream names a history endpoint, the hub removes it and re-seals, so workers send history only to the hub, which then relays to that endpoint.
 - **History is acknowledged once it is on disk.** Each worker batch is redacted, written durably (temp file, fsync, rename), then acknowledged; a flusher posts the oldest batch upstream with `site` set, so each record keeps its worker's name. Upstream stores it as `<site>/<worker>`.
-- **Capacity is forwarded.** One `maxRunningQueries` holds across every site with no state at the agent, so replicas need no leader. With `capacity.mode: quotas` upstream, per-query admission stays local to each worker.
+- **Capacity is forwarded.** One `maxRunningQueries` holds across every site with no state at the hub, so replicas need no leader. With `capacity.mode: quotas` upstream, per-query admission stays local to each worker.
 - **Names are qualified upstream.** Workers appear as `<site>/<name>` with `parent` set to the site (migration V24 adds `kind` and `parent` to `worker_registry`), so `worker-0` at two sites doesn't collide.
 
 ## Future work
@@ -223,5 +223,5 @@ A site agent ([operations guide](../operations/site-agent)) lets workers in a re
 - **Forward to the owning worker.** Put the worker id in query ids, and forward a request to the worker that owns the query, so shared-service workers work behind any load balancer without sticky sessions.
 - **Per-worker credentials, secret references and signed snapshots,** for lower-trust workers.
 - **Translation scripts and timeout from the control plane:** `translation.pythonScripts` and `schemaResolutionTimeoutMs` still come from each worker's own config.
-- **Site agent follow-ups:** a site-wide quota held by the agent, so a site keeps admitting through a long upstream outage; Studio actions run at the site (test a connection, browse a catalog); per-site credentials; snapshots filtered per site.
+- **Hub follow-ups:** a site-wide quota held by the hub, so a site keeps admitting through a long upstream outage; Studio actions run at the site (test a connection, browse a catalog); per-site credentials; snapshots filtered per site.
 - **Query telemetry:** engine-side details (plans, scan statistics, Iceberg metrics) matched to each query and merged into its history record.

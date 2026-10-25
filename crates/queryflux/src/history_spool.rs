@@ -1,9 +1,9 @@
-//! A site agent's query history spool (#255): workers' records, on disk until upstream
+//! A hub's query history spool (#255): workers' records, on disk until upstream
 //! has them.
 //!
 //! Each batch a worker sends is redacted under the served snapshot's policy, then written
 //! as one file (`<seq>-<records>.json`: temp file, fsync, rename) before the worker gets
-//! its `202`. So a batch the agent accepted survives an agent restart, and no unredacted
+//! its `202`. So a batch the hub accepted survives a hub restart, and no unredacted
 //! SQL is written at the site. A flusher posts the oldest file upstream as a
 //! [`QueryRecordBatchV1`] with `site` set, so each record keeps its worker's name, and
 //! deletes it once upstream accepts it. When the spool is over `maxBytes`, the oldest
@@ -39,7 +39,7 @@ struct SpoolFile {
     records: u64,
 }
 
-/// Delivery counters, shown in `/agent/status`.
+/// Delivery counters, shown in `/hub/status`.
 #[derive(Debug, Default, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct SpoolStatus {
@@ -61,12 +61,12 @@ pub(crate) struct HistorySpool {
     status: Mutex<SpoolStatus>,
     wake: Notify,
     client: reqwest::Client,
-    /// Name the agent reports upstream; `site` qualifies each record's worker.
-    agent: String,
+    /// Name the hub reports upstream; `site` qualifies each record's worker.
+    hub: String,
     site: String,
     /// The upstream control plane, without a trailing slash.
     upstream: String,
-    bearer: String,
+    bearer: crate::bearer::Bearer,
     policy: PolicyFn,
 }
 
@@ -105,9 +105,10 @@ impl HistorySpool {
     pub(crate) fn open(
         dir: PathBuf,
         max_bytes: u64,
-        agent: String,
+        hub: String,
         site: String,
-        upstream: &queryflux_core::config::ControlPlaneClientConfig,
+        upstream: &queryflux_core::config::UpstreamConfig,
+        bearer: crate::bearer::Bearer,
         policy: PolicyFn,
     ) -> anyhow::Result<Arc<Self>> {
         use anyhow::Context;
@@ -167,10 +168,10 @@ impl HistorySpool {
                 .timeout(Duration::from_secs(30))
                 .build()
                 .expect("reqwest client"),
-            agent,
+            hub,
             site,
             upstream: upstream.url.trim_end_matches('/').to_string(),
-            bearer: upstream.auth.bearer().to_string(),
+            bearer,
             policy,
         });
         spool.refresh_status();
@@ -201,7 +202,7 @@ impl HistorySpool {
         st.files = count;
         st.bytes = bytes;
         st.queued_records = records;
-        queryflux_metrics::site_agent::SPOOL_BYTES.set(bytes as i64);
+        queryflux_metrics::hub::SPOOL_BYTES.set(bytes as i64);
     }
 
     /// Upstream's history endpoint, or its `/worker/query-records`.
@@ -250,14 +251,14 @@ impl HistorySpool {
             for (seq, f) in &evicted {
                 let _ = tokio::fs::remove_file(self.path(*seq, *f)).await;
             }
-            queryflux_metrics::site_agent::HISTORY_DROPPED.inc_by(dropped);
+            queryflux_metrics::hub::HISTORY_DROPPED.inc_by(dropped);
             self.status
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .dropped += dropped;
             tracing::warn!(
                 dropped,
-                "Query history spool over siteAgent.historySpool.maxBytes; dropped the oldest records"
+                "Query history spool over hub.historySpool.maxBytes; dropped the oldest records"
             );
         }
         self.refresh_status();
@@ -281,7 +282,7 @@ impl HistorySpool {
             let records: Vec<QueryRecord> = match tokio::fs::read(&path).await {
                 Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_else(|e| {
                     tracing::warn!(file = %path.display(), "Unreadable history spool file, dropping it: {e}");
-                    queryflux_metrics::site_agent::HISTORY_DROPPED.inc_by(file.records);
+                    queryflux_metrics::hub::HISTORY_DROPPED.inc_by(file.records);
                     self.status.lock().unwrap_or_else(|e| e.into_inner()).dropped += file.records;
                     Vec::new()
                 }),
@@ -296,7 +297,7 @@ impl HistorySpool {
                     st.last_error = Some(e.to_string());
                     return Err(e);
                 }
-                queryflux_metrics::site_agent::HISTORY_SENT.inc_by(file.records);
+                queryflux_metrics::hub::HISTORY_SENT.inc_by(file.records);
                 let mut st = self.status.lock().unwrap_or_else(|e| e.into_inner());
                 st.endpoint = Some(endpoint);
                 st.sent += file.records;
@@ -319,14 +320,14 @@ impl HistorySpool {
         use crate::history_uplink::UploadError;
         let batch = QueryRecordBatchV1 {
             schema_version: QUERY_RECORDS_SCHEMA_VERSION,
-            worker: self.agent.clone(),
+            worker: self.hub.clone(),
             records,
             site: Some(self.site.clone()),
         };
         let mut req = self.client.post(endpoint).json(&batch);
         // Upstream's secret goes only to upstream's origin.
         if same_origin(endpoint, &self.upstream) {
-            req = req.bearer_auth(&self.bearer);
+            req = req.bearer_auth(self.bearer.get());
         }
         match req.send().await {
             Ok(resp) if resp.status().is_success() => Ok(()),
