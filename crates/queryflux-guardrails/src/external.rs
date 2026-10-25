@@ -356,7 +356,8 @@ mod tests {
     async fn python_script_guard_allows() {
         let guard = PythonScriptGuard {
             script: "def check(ctx):\n    return {'action': 'allow', 'metadata': {'user': ctx['user']}}\n".to_string(),
-            timeout_ms: Some(500),
+            // Generous: the first call in a test process also starts the interpreter.
+            timeout_ms: Some(10_000),
         };
         let tc = TestCtx::new("SELECT 1");
         let result = guard.check(&tc.ctx()).await;
@@ -367,7 +368,8 @@ mod tests {
     async fn python_script_guard_denies() {
         let guard = PythonScriptGuard {
             script: "def check(ctx):\n    return {'action': 'deny', 'reason': 'blocked', 'code': 'BLOCKED'}\n".to_string(),
-            timeout_ms: Some(500),
+            // Generous: the first call in a test process also starts the interpreter.
+            timeout_ms: Some(10_000),
         };
         let tc = TestCtx::new("SELECT 1");
         let result = guard.check(&tc.ctx()).await;
