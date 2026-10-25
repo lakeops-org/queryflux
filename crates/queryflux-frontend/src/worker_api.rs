@@ -399,6 +399,44 @@ fn unauthorized() -> Response {
         .into_response()
 }
 
+/// A query-record batch, plain or gzipped (hubs send gzip). Decompressed into at most
+/// [`MAX_RECORD_BATCH_BYTES`], so a small body can't expand without limit.
+fn decode_batch(headers: &HeaderMap, body: &[u8]) -> Result<QueryRecordBatchV1, Box<Response>> {
+    let encoding = headers
+        .get(header::CONTENT_ENCODING)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.trim().to_ascii_lowercase());
+    let refuse = |status: StatusCode, why: String| Box::new((status, why).into_response());
+    let json: std::borrow::Cow<[u8]> = match encoding.as_deref() {
+        None | Some("identity") => body.into(),
+        Some("gzip") => {
+            use std::io::Read;
+            let mut out = Vec::new();
+            let read = flate2::read::GzDecoder::new(body)
+                .take(MAX_RECORD_BATCH_BYTES as u64 + 1)
+                .read_to_end(&mut out);
+            match read {
+                Ok(n) if n > MAX_RECORD_BATCH_BYTES => {
+                    return Err(refuse(
+                        StatusCode::PAYLOAD_TOO_LARGE,
+                        "batch too large once decompressed".into(),
+                    ))
+                }
+                Ok(_) => out.into(),
+                Err(e) => return Err(refuse(StatusCode::BAD_REQUEST, format!("bad gzip: {e}"))),
+            }
+        }
+        Some(other) => {
+            return Err(refuse(
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                format!("unsupported Content-Encoding '{other}'"),
+            ))
+        }
+    };
+    serde_json::from_slice(&json)
+        .map_err(|e| refuse(StatusCode::BAD_REQUEST, format!("bad batch: {e}")))
+}
+
 /// The enrolled hubs' public keys as a JWKS (RFC 7517/8037), so a service that receives
 /// what hubs send (query history, say) can check their tokens and attribute each request
 /// to a hub and site without reading this control plane's tables. A hub token is an
@@ -602,10 +640,14 @@ async fn warn_on_unshared_capacity(st: &WorkerApiState, registry: &dyn WorkerReg
 async fn ingest_records(
     State(st): State<Arc<WorkerApiState>>,
     headers: HeaderMap,
-    Json(mut batch): Json<QueryRecordBatchV1>,
+    body: axum::body::Bytes,
 ) -> Response {
     let Some(who) = caller(&st.api, &headers).await else {
         return unauthorized();
+    };
+    let mut batch = match decode_batch(&headers, &body) {
+        Ok(batch) => batch,
+        Err(response) => return *response,
     };
     // A site token's records are its site's, whatever the batch says.
     if let Caller::Site(own) = who {
@@ -1367,23 +1409,26 @@ mod tests {
             quotas: None,
             hubs: None,
         });
-        let record = serde_json::json!({
-            "proxyQueryId": "q-1",
-            "clusterGroup": "g",
-            "clusterName": "c",
-            "engineType": "duckDb",
-            "frontendProtocol": "trinoHttp",
-            "sourceDialect": "trino",
-            "targetDialect": "duckDb",
-            "wasRewritten": false,
-            "wasTranslated": false,
-            "sqlPreview": "SELECT 1",
-            "status": "success",
-            "queueDurationMs": 0,
-            "executionDurationMs": 3,
-            "createdAt": "2026-10-14T00:00:00Z",
-            "worker": "spoofed"
-        });
+        let record_json = |id: &str| {
+            serde_json::json!({
+                "proxyQueryId": id,
+                "clusterGroup": "g",
+                "clusterName": "c",
+                "engineType": "duckDb",
+                "frontendProtocol": "trinoHttp",
+                "sourceDialect": "trino",
+                "targetDialect": "duckDb",
+                "wasRewritten": false,
+                "wasTranslated": false,
+                "sqlPreview": "SELECT 1",
+                "status": "success",
+                "queueDurationMs": 0,
+                "executionDurationMs": 3,
+                "createdAt": "2026-10-14T00:00:00Z",
+                "worker": "spoofed"
+            })
+        };
+        let record = record_json("q-1");
         let post = |body: serde_json::Value| {
             Request::post("/worker/query-records")
                 .header(header::AUTHORIZATION, "Bearer s3cret")
@@ -1409,8 +1454,48 @@ mod tests {
         assert_eq!(page[0].worker.as_deref(), Some("worker-a"));
 
         let future = serde_json::json!({ "schemaVersion": 2, "worker": "w", "records": [] });
-        let resp = app.oneshot(post(future)).await.unwrap();
+        let resp = app.clone().oneshot(post(future)).await.unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        // Gzipped batches are read too, but never decompressed past the batch limit.
+        let gzip = |data: &[u8]| {
+            use std::io::Write;
+            let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
+            enc.write_all(data).unwrap();
+            enc.finish().unwrap()
+        };
+        let post_gzip = |body: Vec<u8>, encoding: &str| {
+            Request::post("/worker/query-records")
+                .header(header::AUTHORIZATION, "Bearer s3cret")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::CONTENT_ENCODING, encoding)
+                .body(Body::from(body))
+                .unwrap()
+        };
+        let mut other = record_json("q-2");
+        other["worker"] = "x".into();
+        let batch =
+            serde_json::json!({ "schemaVersion": 1, "worker": "worker-b", "records": [other] });
+        let resp = app
+            .clone()
+            .oneshot(post_gzip(gzip(batch.to_string().as_bytes()), "gzip"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        let bomb = gzip(&vec![b' '; MAX_RECORD_BATCH_BYTES + 1]);
+        assert!(bomb.len() < 64 * 1024);
+        let resp = app.clone().oneshot(post_gzip(bomb, "gzip")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let resp = app.oneshot(post_gzip(vec![1, 2, 3], "br")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        let page = store
+            .list_queries(&queryflux_persistence::query_history::QueryFilters {
+                limit: 10,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(page.len(), 2);
     }
 
     /// A hub whose site is limited to some clusters takes capacity and publishes running
