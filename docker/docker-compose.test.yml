@@ -56,7 +56,9 @@ services:
         hard: 65535
     # FE HTTP can take many minutes on starved GHA runners; use 127.0.0.1 (avoid localhost → IPv6).
     healthcheck:
-      test: ["CMD", "curl", "-sf", "http://127.0.0.1:8030/api/health"]
+      # The FE reports healthy about 10 s before it sees the BE alive; queries in that window
+      # fail with "Backend node not found". Wait for both.
+      test: ["CMD-SHELL", "curl -sf http://127.0.0.1:8030/api/health >/dev/null && mysql -h127.0.0.1 -P9030 -uroot -e 'SHOW BACKENDS\\G' | grep -q 'Alive: true'"]
       interval: 10s
       timeout: 25s
       retries: 60

@@ -24,7 +24,9 @@ services:
       - "9030:9030"   # MySQL wire protocol (FE query port)
       - "8030:8030"   # FE HTTP API
     healthcheck:
-      test: ["CMD", "curl", "-sf", "http://localhost:8030/api/health"]
+      # The FE reports healthy about 10 s before it sees the BE alive; queries in that window
+      # fail with "Backend node not found". Wait for both.
+      test: ["CMD-SHELL", "curl -sf http://localhost:8030/api/health >/dev/null && mysql -h127.0.0.1 -P9030 -uroot -e 'SHOW BACKENDS\\G' | grep -q 'Alive: true'"]
       interval: 15s
       timeout: 10s
       retries: 20
