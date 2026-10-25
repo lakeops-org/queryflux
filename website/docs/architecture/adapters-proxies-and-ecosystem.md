@@ -146,7 +146,7 @@ Access governance and multi-engine routing are complementary layers (more on Hoo
 | Technique | Useful for | Limits in this context |
 |---|---|---|
 | **Unix domain sockets** | Co-locating ProxySQL ↔ QueryFlux with lower overhead than TCP localhost | Still a second hop; fine when conversion is needed |
-| **Shared memory / custom IPC** | Specialized high-QPS internal meshes | High implementation cost; QueryFlux’s measured proxy overhead on simple paths is already sub-millisecond p50 in bench mocks — often not the bottleneck vs engine time |
+| **Shared memory / custom IPC** | Specialized high-QPS internal meshes | High implementation cost; QueryFlux’s measured proxy overhead on simple [mock paths](../benchmarks.md#proxy-overhead) is already sub-millisecond p50 — often not the bottleneck vs engine time |
 | **eBPF** | Observability, L4 steering, security hooks | Does not parse SQL dialects or re-encode result protocols |
 | **DSR** | L4 paths where backend speaks the client protocol natively | Breaks once QueryFlux (or anyone) must rewrite SQL or re-encode results; the return path must hit the adapter |
 
