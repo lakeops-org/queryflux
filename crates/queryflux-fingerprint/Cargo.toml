@@ -10,3 +10,6 @@ xxhash-rust = { version = "0.8", features = ["xxh64"] }
 polyglot-sql = { workspace = true, features = ["all-dialects"] }
 regex = "1"
 tracing = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
