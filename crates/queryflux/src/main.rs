@@ -1023,7 +1023,7 @@ async fn main() -> Result<()> {
     // With no query frontend this process runs no queries, so there is nothing to probe
     // engines for. On a hosted control plane they sit in the customer's network and every
     // probe would fail.
-    if startup::tasks::enabled_frontends(&config.queryflux.frontends).is_empty() {
+    if !startup::tasks::serves_queries(&config.queryflux.frontends) {
         tracing::info!("No query frontend enabled: not health-checking engines");
     } else {
         startup::tasks::spawn_health_checks(&app_state, &shutdown_rx);

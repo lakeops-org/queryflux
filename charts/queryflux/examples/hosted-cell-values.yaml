@@ -11,7 +11,14 @@
 #   3. Fill in ./charts/queryflux/examples/hosted-cell-config.yaml and create its Secret:
 #        kubectl -n tenant-acme create secret generic queryflux-cell-config \
 #          --from-file=config.yaml=./charts/queryflux/examples/hosted-cell-config.yaml
-#   4. helm install queryflux-cell ./charts/queryflux -n tenant-acme \
+#   4. Provide the Ingress certificate for the host below, as the Secret `acme-cp-tls`:
+#      either let cert-manager issue it (add a `cert-manager.io/cluster-issuer` annotation
+#      under `ingress.annotations`), or create it from an existing certificate:
+#        kubectl -n tenant-acme create secret tls acme-cp-tls \
+#          --cert=acme.cp.example.com.crt --key=acme.cp.example.com.key
+#      Without it the Ingress cannot serve a trusted certificate and site agents (HTTPS)
+#      cannot connect.
+#   5. helm install queryflux-cell ./charts/queryflux -n tenant-acme \
 #        -f ./charts/queryflux/examples/hosted-cell-values.yaml
 #
 # The worker API shares the admin listener with the admin API and /metrics. The ingress

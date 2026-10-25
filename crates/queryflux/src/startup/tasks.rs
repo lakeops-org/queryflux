@@ -800,6 +800,14 @@ pub(crate) fn enabled_frontends(f: &queryflux_core::config::FrontendsConfig) -> 
     out
 }
 
+/// Whether a query listener starts: `clickhouseHttp` can be enabled in config but has no
+/// listener yet (see `spawn_query_frontends`), so it does not count.
+pub(crate) fn serves_queries(f: &queryflux_core::config::FrontendsConfig) -> bool {
+    enabled_frontends(f)
+        .iter()
+        .any(|name| !name.starts_with("clickhouseHttp:"))
+}
+
 pub(crate) fn spawn_worker_heartbeat(
     config: &ProxyConfig,
     sync_state: &Arc<std::sync::Mutex<crate::config_source::WorkerSyncState>>,
@@ -902,4 +910,24 @@ pub(crate) fn spawn_worker_heartbeat(
             }
         }
     });
+}
+
+#[cfg(test)]
+mod serves_queries_tests {
+    use super::*;
+
+    #[test]
+    fn clickhouse_http_alone_starts_no_listener() {
+        let mut f: queryflux_core::config::FrontendsConfig = serde_json::from_value(
+            serde_json::json!({ "trinoHttp": { "enabled": false, "port": 8080 } }),
+        )
+        .unwrap();
+        assert!(!serves_queries(&f));
+        f.clickhouse_http = Some(
+            serde_json::from_value(serde_json::json!({ "enabled": true, "port": 8123 })).unwrap(),
+        );
+        assert!(!serves_queries(&f), "clickhouseHttp has no listener");
+        f.trino_http.enabled = true;
+        assert!(serves_queries(&f));
+    }
 }
