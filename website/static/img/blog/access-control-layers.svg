@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="340" viewBox="0 0 960 340" role="img" aria-label="Four layers: auth, authorization, guardrails, access control">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#0b0614"/>
+      <stop offset="100%" stop-color="#050508"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="30%" cy="40%" r="50%">
+      <stop offset="0%" stop-color="#7c3aed" stop-opacity="0.2"/>
+      <stop offset="100%" stop-color="#7c3aed" stop-opacity="0"/>
+    </radialGradient>
+    <pattern id="dots" width="22" height="22" patternUnits="userSpaceOnUse">
+      <circle cx="1" cy="1" r="0.8" fill="rgba(255,255,255,0.05)"/>
+    </pattern>
+  </defs>
+
+  <rect width="960" height="340" rx="20" fill="url(#bg)"/>
+  <rect width="960" height="340" rx="20" fill="url(#glow)"/>
+  <rect width="960" height="340" rx="20" fill="url(#dots)"/>
+  <rect x="1" y="1" width="958" height="338" rx="19" fill="none" stroke="rgba(255,255,255,0.08)"/>
+
+  <text x="40" y="42" fill="#fafafa" font-family="ui-sans-serif, system-ui, sans-serif" font-size="18" font-weight="650">Four different questions</text>
+  <text x="40" y="66" fill="#a1a1aa" font-family="ui-sans-serif, system-ui, sans-serif" font-size="12">Mixing them is how people end up with a LIMIT and call it security.</text>
+
+  <g font-family="ui-sans-serif, system-ui, sans-serif">
+    <rect x="40" y="100" width="210" height="170" rx="14" fill="rgba(255,255,255,0.04)" stroke="rgba(255,255,255,0.14)"/>
+    <text x="145" y="140" text-anchor="middle" fill="#f4f4f5" font-size="15" font-weight="650">Auth</text>
+    <text x="145" y="172" text-anchor="middle" fill="#a1a1aa" font-size="12">Who is this?</text>
+    <text x="145" y="210" text-anchor="middle" fill="#71717a" font-size="11">OIDC / LDAP /</text>
+    <text x="145" y="228" text-anchor="middle" fill="#71717a" font-size="11">static user</text>
+
+    <rect x="270" y="100" width="210" height="170" rx="14" fill="rgba(255,255,255,0.04)" stroke="rgba(255,255,255,0.14)"/>
+    <text x="375" y="140" text-anchor="middle" fill="#f4f4f5" font-size="15" font-weight="650">Authorization</text>
+    <text x="375" y="172" text-anchor="middle" fill="#a1a1aa" font-size="12">Which pool?</text>
+    <text x="375" y="210" text-anchor="middle" fill="#71717a" font-size="11">cluster group</text>
+    <text x="375" y="228" text-anchor="middle" fill="#71717a" font-size="11">allow-lists</text>
+
+    <rect x="500" y="100" width="210" height="170" rx="14" fill="rgba(255,118,25,0.08)" stroke="#ff7619" stroke-width="1.5"/>
+    <text x="605" y="140" text-anchor="middle" fill="#ffedd5" font-size="15" font-weight="650">Guardrails</text>
+    <text x="605" y="172" text-anchor="middle" fill="#fdba74" font-size="12">Is the SQL safe?</text>
+    <text x="605" y="210" text-anchor="middle" fill="#a16207" font-size="11">read_only / LIMIT</text>
+    <text x="605" y="228" text-anchor="middle" fill="#a16207" font-size="11">require_predicate</text>
+
+    <rect x="730" y="100" width="190" height="170" rx="14" fill="rgba(139,92,246,0.14)" stroke="#8b5cf6" stroke-width="1.75"/>
+    <text x="825" y="140" text-anchor="middle" fill="#ede9fe" font-size="15" font-weight="650">Access control</text>
+    <text x="825" y="172" text-anchor="middle" fill="#c4b5fd" font-size="12">Which rows?</text>
+    <text x="825" y="210" text-anchor="middle" fill="#a78bfa" font-size="11">row filter</text>
+    <text x="825" y="228" text-anchor="middle" fill="#a78bfa" font-size="11">column mask</text>
+  </g>
+
+  <text x="480" y="310" text-anchor="middle" fill="#71717a" font-family="ui-sans-serif, system-ui, sans-serif" font-size="12">Access control is another guard in the same chain - policy lives in OPA or Cerbos.</text>
+</svg>

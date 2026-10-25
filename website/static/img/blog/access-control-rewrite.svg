@@ -1,0 +1,62 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="420" viewBox="0 0 960 420" role="img" aria-label="Client SQL rewritten with a row filter and column mask before the engine">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#0b0614"/>
+      <stop offset="100%" stop-color="#050508"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="55%" cy="35%" r="55%">
+      <stop offset="0%" stop-color="#7c3aed" stop-opacity="0.22"/>
+      <stop offset="100%" stop-color="#7c3aed" stop-opacity="0"/>
+    </radialGradient>
+    <marker id="arr" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto">
+      <path d="M0,0 L7,3 L0,6 Z" fill="#a78bfa"/>
+    </marker>
+    <pattern id="dots" width="22" height="22" patternUnits="userSpaceOnUse">
+      <circle cx="1" cy="1" r="0.8" fill="rgba(255,255,255,0.05)"/>
+    </pattern>
+  </defs>
+
+  <rect width="960" height="420" rx="20" fill="url(#bg)"/>
+  <rect width="960" height="420" rx="20" fill="url(#glow)"/>
+  <rect width="960" height="420" rx="20" fill="url(#dots)"/>
+  <rect x="1" y="1" width="958" height="418" rx="19" fill="none" stroke="rgba(255,255,255,0.08)"/>
+
+  <text x="40" y="42" fill="#fafafa" font-family="ui-sans-serif, system-ui, sans-serif" font-size="18" font-weight="650">Scan-site rewrite - not an outer WHERE</text>
+  <text x="40" y="66" fill="#a1a1aa" font-family="ui-sans-serif, system-ui, sans-serif" font-size="12">Filter and mask land inside every table scan, including CTEs and self-joins.</text>
+
+  <g font-family="ui-monospace, Menlo, monospace">
+    <rect x="40" y="96" width="360" height="200" rx="14" fill="rgba(255,255,255,0.04)" stroke="rgba(255,255,255,0.14)"/>
+    <text x="58" y="126" fill="#71717a" font-size="11" font-family="ui-sans-serif, system-ui, sans-serif">Client SQL</text>
+    <text x="58" y="158" fill="#e4e4e7" font-size="13">SELECT name, ssn</text>
+    <text x="58" y="184" fill="#e4e4e7" font-size="13">FROM customers</text>
+    <text x="58" y="220" fill="#52525b" font-size="12">- no WHERE</text>
+    <text x="58" y="246" fill="#52525b" font-size="12">- full SSN in the projection</text>
+  </g>
+
+  <line x1="420" y1="196" x2="468" y2="196" stroke="#a78bfa" stroke-width="2" marker-end="url(#arr)"/>
+
+  <g font-family="ui-sans-serif, system-ui, sans-serif">
+    <rect x="480" y="96" width="140" height="200" rx="14" fill="rgba(139,92,246,0.14)" stroke="#8b5cf6" stroke-width="1.75"/>
+    <text x="550" y="150" text-anchor="middle" fill="#ede9fe" font-size="14" font-weight="650">OPA / Cerbos</text>
+    <text x="550" y="178" text-anchor="middle" fill="#c4b5fd" font-size="11">region = 'EU'</text>
+    <text x="550" y="202" text-anchor="middle" fill="#c4b5fd" font-size="11">SHOW_LAST_4(ssn)</text>
+    <text x="550" y="238" text-anchor="middle" fill="#a78bfa" font-size="10">one decision</text>
+  </g>
+
+  <line x1="640" y1="196" x2="688" y2="196" stroke="#a78bfa" stroke-width="2" marker-end="url(#arr)"/>
+
+  <g font-family="ui-monospace, Menlo, monospace">
+    <rect x="700" y="86" width="220" height="220" rx="14" fill="rgba(163,230,53,0.07)" stroke="rgba(163,230,53,0.4)"/>
+    <text x="718" y="116" fill="#86efac" font-size="11" font-family="ui-sans-serif, system-ui, sans-serif">Rewritten SQL</text>
+    <text x="718" y="148" fill="#d9f99d" font-size="11">SELECT name, ssn FROM (</text>
+    <text x="730" y="172" fill="#d9f99d" font-size="11">SELECT name,</text>
+    <text x="730" y="196" fill="#fbbf24" font-size="11">  **** + last4(ssn)</text>
+    <text x="730" y="220" fill="#d9f99d" font-size="11">FROM customers</text>
+    <text x="730" y="244" fill="#86efac" font-size="11">WHERE region = 'EU'</text>
+    <text x="718" y="272" fill="#d9f99d" font-size="11">) customers</text>
+  </g>
+
+  <text x="480" y="350" text-anchor="middle" fill="#a1a1aa" font-family="ui-sans-serif, system-ui, sans-serif" font-size="13">Then dialect translation, then the engine - same policy on Trino, DuckDB, StarRocks, Snowflake.</text>
+  <text x="480" y="380" text-anchor="middle" fill="#71717a" font-family="ui-sans-serif, system-ui, sans-serif" font-size="12">Studio records the rewrite next to any other guard that ran.</text>
+</svg>

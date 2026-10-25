@@ -1,7 +1,7 @@
 ---
 sidebar_label: OPA
-title: OPA Access Control Provider
-description: Connect QueryFlux to Open Policy Agent — wire format, row filters, column masks, and the local demo. Rego stays in the OPA bundle.
+title: OPA Access Control
+description: Configure Open Policy Agent with QueryFlux — Rego decisions for allow/deny, row-filter expressions, and column mask types.
 image: img/queryflux-hero-banner.png
 ---
 # OPA provider

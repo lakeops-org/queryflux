@@ -1,7 +1,7 @@
 ---
 sidebar_label: Cerbos
-title: Cerbos Access Control Provider
-description: Connect QueryFlux to Cerbos — wire format, the outputs-based row-filter/column-mask contract, server auth, and the local demo.
+title: Cerbos Access Control
+description: Configure Cerbos with QueryFlux — CEL policies that return the same allow/deny, row filter, and column mask model as OPA.
 image: img/queryflux-hero-banner.png
 ---
 # Cerbos provider
