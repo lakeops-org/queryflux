@@ -29,7 +29,6 @@ fn parse_on_pool(sql: String, dialect: &SqlDialect) -> ParsedStatements {
 }
 
 /// Lazily parses SQL once and exposes shared classification helpers.
-#[derive(Debug)]
 pub struct SqlParseCache {
     sql: String,
     dialect: SqlDialect,
@@ -37,6 +36,24 @@ pub struct SqlParseCache {
     /// Times this cache ran polyglot-sql: at most one, or two if concurrent first callers
     /// raced in [`Self::ensure_parsed`].
     parses: AtomicU32,
+    /// The sqlglot parse, shared by the catalog table references and access-control
+    /// extraction and rewrite; `None` when sqlglot cannot parse the SQL. A `PyOnceLock`, not
+    /// a `OnceLock`: the parse runs Python, which can release the GIL mid-initialization,
+    /// and a `OnceLock` waiter holding the GIL would then deadlock with it.
+    sqlglot: pyo3::sync::PyOnceLock<Option<pyo3::Py<pyo3::PyAny>>>,
+    sqlglot_parses: AtomicU32,
+}
+
+impl std::fmt::Debug for SqlParseCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SqlParseCache")
+            .field("sql", &self.sql)
+            .field("dialect", &self.dialect)
+            .field("cache", &self.cache)
+            .field("parses", &self.parses)
+            .field("sqlglot_parses", &self.sqlglot_parses)
+            .finish_non_exhaustive()
+    }
 }
 
 impl SqlParseCache {
@@ -46,6 +63,8 @@ impl SqlParseCache {
             dialect,
             cache: OnceLock::new(),
             parses: AtomicU32::new(0),
+            sqlglot: pyo3::sync::PyOnceLock::new(),
+            sqlglot_parses: AtomicU32::new(0),
         }
     }
 
@@ -59,6 +78,8 @@ impl SqlParseCache {
             dialect,
             cache,
             parses: AtomicU32::new(0),
+            sqlglot: pyo3::sync::PyOnceLock::new(),
+            sqlglot_parses: AtomicU32::new(0),
         }
     }
 
@@ -80,6 +101,38 @@ impl SqlParseCache {
     /// How many times this cache has parsed its SQL (see the `parses` field).
     pub fn parse_count(&self) -> u32 {
         self.parses.load(Ordering::Relaxed)
+    }
+
+    /// The SQL parsed by sqlglot in this cache's dialect, once. Callers that change the tree
+    /// copy it first (the Python side does). `None` when sqlglot cannot parse it: callers
+    /// parse again themselves so they report sqlglot's error.
+    pub fn sqlglot_tree<'py>(
+        &self,
+        py: pyo3::Python<'py>,
+    ) -> Option<pyo3::Bound<'py, pyo3::PyAny>> {
+        use pyo3::prelude::*;
+        use pyo3::types::PyDict;
+        self.sqlglot
+            .get_or_init(py, || {
+                self.sqlglot_parses.fetch_add(1, Ordering::Relaxed);
+                let kwargs = PyDict::new(py);
+                let dialect = self.dialect.sqlglot_write_name();
+                kwargs
+                    .set_item("dialect", (!dialect.is_empty()).then_some(dialect))
+                    .ok()?;
+                py.import("sqlglot")
+                    .and_then(|m| m.call_method("parse_one", (self.sql.as_str(),), Some(&kwargs)))
+                    .ok()
+                    .map(Bound::unbind)
+            })
+            .as_ref()
+            .map(|t| t.bind(py).clone())
+    }
+
+    /// How many times this cache has run sqlglot's parser: once, unless threads raced on the
+    /// first call, in which case each parsed and one tree was kept.
+    pub fn sqlglot_parse_count(&self) -> u32 {
+        self.sqlglot_parses.load(Ordering::Relaxed)
     }
 
     /// Populate the cache without blocking the calling task's worker thread.

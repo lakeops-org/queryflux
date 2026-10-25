@@ -314,12 +314,13 @@ def _admin_statement(tree, sql, dialect):
     return None
 
 
-def extract_resources(sql, dialect, schema_json):
+def extract_resources(sql, dialect, schema_json, tree=None):
+    """`tree`: `sql` already parsed with `dialect` (the query's shared parse), or None."""
     schema = json.loads(schema_json) if schema_json else {}
     # A parse failure must surface as an error, never as "no tables": the backend engine may
     # accept SQL that sqlglot rejects, so an empty result here would let it through unchecked.
     try:
-        tree = sqlglot.parse_one(sql, dialect=dialect or None)
+        tree = tree.copy() if tree is not None else sqlglot.parse_one(sql, dialect=dialect or None)
     except Exception as e:
         return json.dumps({"error": str(e)})
 
@@ -464,10 +465,11 @@ def apply_write_filters(sql, dialect, filters_json):
     return tree.where(*conditions, append=True, copy=False).sql(dialect=dialect or None)
 
 
-def rewrite_table_scans(sql, dialect, schema_json, policies_json):
+def rewrite_table_scans(sql, dialect, schema_json, policies_json, tree=None):
+    """`tree`: `sql` already parsed with `dialect` (the query's shared parse), or None."""
     schema = json.loads(schema_json) if schema_json else {}
     policies = json.loads(policies_json)
-    tree = sqlglot.parse_one(sql, dialect=dialect or None)
+    tree = tree.copy() if tree is not None else sqlglot.parse_one(sql, dialect=dialect or None)
     ctes = _cte_names(tree)
     # The write target is not a scan site: swapping it for a filtered subquery would
     # produce invalid SQL (`UPDATE (SELECT ...) AS t ...`) and would not restrict anything.

@@ -15,6 +15,8 @@ use queryflux_core::error::{QueryFluxError, Result};
 use queryflux_core::query::SqlDialect;
 use queryflux_core::schema_context::SchemaContext;
 
+use crate::classify::SqlParseCache;
+
 /// A table's referenced columns, as extracted from a query.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExtractedResource {
@@ -164,7 +166,20 @@ pub fn extract_resources(
 ) -> Result<ExtractedStatement> {
     let dialect = dialect_kwarg(src_dialect);
     let schema_json = schema_to_json(schema);
-    Python::attach(|py| extract_resources_gil(py, sql, &dialect, &schema_json))
+    Python::attach(|py| extract_resources_gil(py, sql, &dialect, &schema_json, None))
+}
+
+/// [`extract_resources`] on `parse`'s SQL, from its shared sqlglot tree.
+fn extract_resources_parsed(
+    parse: &SqlParseCache,
+    schema: &SchemaContext,
+) -> Result<ExtractedStatement> {
+    let dialect = dialect_kwarg(parse.dialect());
+    let schema_json = schema_to_json(schema);
+    Python::attach(|py| {
+        let tree = parse.sqlglot_tree(py);
+        extract_resources_gil(py, parse.sql(), &dialect, &schema_json, tree.as_ref())
+    })
 }
 
 /// What [`extract_resources`] depends on: the SQL verbatim (so two statements never share
@@ -250,13 +265,15 @@ pub fn extraction_cache() -> &'static ExtractionCache {
     &EXTRACTION_CACHE
 }
 
-/// [`extract_resources`] through the process-wide [`extraction_cache`].
+/// [`extract_resources`] on `parse`'s SQL through the process-wide [`extraction_cache`]; on a
+/// miss it reads the query's shared sqlglot parse instead of parsing again.
 pub fn extract_resources_cached(
-    sql: &str,
-    src_dialect: &SqlDialect,
+    parse: &SqlParseCache,
     schema: &SchemaContext,
 ) -> Result<ExtractedStatement> {
-    EXTRACTION_CACHE.extract(sql, src_dialect, schema)
+    EXTRACTION_CACHE.extract_with(parse.sql(), parse.dialect(), schema, |_, _, schema| {
+        extract_resources_parsed(parse, schema)
+    })
 }
 
 /// Apply row filters and (pre-rendered, source-dialect) column-mask expressions at every
@@ -273,7 +290,34 @@ pub fn rewrite_table_scans(
     let dialect = dialect_kwarg(src_dialect);
     let schema_json = schema_to_json(schema);
     let policies_json = policies_to_json(policies);
-    Python::attach(|py| rewrite_table_scans_gil(py, sql, &dialect, &schema_json, &policies_json))
+    Python::attach(|py| {
+        rewrite_table_scans_gil(py, sql, &dialect, &schema_json, &policies_json, None)
+    })
+}
+
+/// [`rewrite_table_scans`] on `parse`'s SQL, from its shared sqlglot tree.
+pub fn rewrite_table_scans_parsed(
+    parse: &SqlParseCache,
+    schema: &SchemaContext,
+    policies: &[TablePolicy],
+) -> Result<String> {
+    if policies.is_empty() {
+        return Ok(parse.sql().to_string());
+    }
+    let dialect = dialect_kwarg(parse.dialect());
+    let schema_json = schema_to_json(schema);
+    let policies_json = policies_to_json(policies);
+    Python::attach(|py| {
+        let tree = parse.sqlglot_tree(py);
+        rewrite_table_scans_gil(
+            py,
+            parse.sql(),
+            &dialect,
+            &schema_json,
+            &policies_json,
+            tree.as_ref(),
+        )
+    })
 }
 
 /// Scope an `UPDATE`/`DELETE`/`MERGE` to the rows a policy allows: for `UPDATE`/`DELETE`,
@@ -362,11 +406,12 @@ fn extract_resources_gil(
     sql: &str,
     dialect: &str,
     schema_json: &str,
+    tree: Option<&Bound<'_, PyAny>>,
 ) -> Result<ExtractedStatement> {
     let module = load_module(py)?;
     let json: String = module
         .getattr("extract_resources")
-        .and_then(|f| f.call1((sql, dialect, schema_json)))
+        .and_then(|f| f.call1((sql, dialect, schema_json, tree)))
         .and_then(|v| v.extract())
         .map_err(|e| QueryFluxError::Translation(format!("extract_resources: {e}")))?;
     let raw: RawOutput = serde_json::from_str(&json)
@@ -455,11 +500,12 @@ fn rewrite_table_scans_gil(
     dialect: &str,
     schema_json: &str,
     policies_json: &str,
+    tree: Option<&Bound<'_, PyAny>>,
 ) -> Result<String> {
     let module = load_module(py)?;
     let out: String = module
         .getattr("rewrite_table_scans")
-        .and_then(|f| f.call1((sql, dialect, schema_json, policies_json)))
+        .and_then(|f| f.call1((sql, dialect, schema_json, policies_json, tree)))
         .and_then(|v| v.extract())
         .map_err(|e| QueryFluxError::Translation(format!("rewrite_table_scans: {e}")))?;
     Ok(out)
@@ -1944,5 +1990,30 @@ mod extraction_cache_tests {
         }
         assert_eq!(cache.stats(), CacheStatsSnapshot::default());
         assert!(cache.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod shared_parse_tests {
+    use super::*;
+
+    /// Access-control extraction, the rewrite and the catalog table references all read one
+    /// sqlglot parse.
+    #[test]
+    fn one_sqlglot_parse_serves_every_reader() {
+        let parse = SqlParseCache::new(
+            "SELECT o.id FROM orders o JOIN customers c ON o.cid = c.id WHERE c.region = 'eu' -- shared",
+            SqlDialect::Trino,
+        );
+        let schema = SchemaContext::default();
+        extract_resources_cached(&parse, &schema).unwrap();
+        let policy = TablePolicy {
+            table: "customers".into(),
+            row_filters: vec!["region = 'eu'".into()],
+            masked_columns: vec![],
+        };
+        rewrite_table_scans_parsed(&parse, &schema, &[policy]).unwrap();
+        crate::sqlglot::extract_table_refs_parsed(&parse).unwrap();
+        assert_eq!(parse.sqlglot_parse_count(), 1);
     }
 }

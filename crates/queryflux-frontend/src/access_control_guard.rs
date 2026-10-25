@@ -22,7 +22,7 @@ use queryflux_guardrails::context::{GuardContext, GuardLayer, GuardResult};
 use queryflux_guardrails::result_to_action;
 use queryflux_persistence::GuardAction;
 use queryflux_sql::{
-    apply_write_filters, render_mask, rewrite_table_scans, ExtractedResource, TablePolicy,
+    apply_write_filters, render_mask, rewrite_table_scans_parsed, ExtractedResource, TablePolicy,
 };
 
 use queryflux_auth::AuthContext;
@@ -266,11 +266,21 @@ impl Guard for OpaAccessGuard {
 
         let empty_schema = SchemaContext::default();
         let schema = ctx.schema.unwrap_or(&empty_schema);
+        // The query's shared parse, whose sqlglot tree the extraction and the rewrite below
+        // both read.
+        let own_parse;
+        let parse = match ctx.sql_parse {
+            Some(p) => p,
+            None => {
+                own_parse =
+                    queryflux_sql::classify::SqlParseCache::new(ctx.sql, ctx.dialect.clone());
+                &own_parse
+            }
+        };
 
         // Only the parse is cached (keyed on the exact SQL, dialect and schema); every
         // decision below is still made for this query.
-        let statement = match queryflux_sql::extract_resources_cached(ctx.sql, ctx.dialect, schema)
-        {
+        let statement = match queryflux_sql::extract_resources_cached(parse, schema) {
             Ok(r) => r,
             // A query that can't be analyzed has no resources to put in a request, so it can't
             // be judged at all. `onMissingSchema` is about unresolved *columns* of tables that
@@ -542,12 +552,12 @@ impl Guard for OpaAccessGuard {
         );
 
         let rewritten =
-            rewrite_table_scans(ctx.sql, ctx.dialect, schema, &policies).and_then(|sql| {
-                match &write_scope {
+            rewrite_table_scans_parsed(parse, schema, &policies).and_then(
+                |sql| match &write_scope {
                     Some((_, filters)) => apply_write_filters(&sql, ctx.dialect, filters),
                     None => Ok(sql),
-                }
-            });
+                },
+            );
         match rewritten {
             Ok(sql) => GuardResult::Rewrite {
                 sql,
