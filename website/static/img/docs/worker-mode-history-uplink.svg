@@ -33,5 +33,5 @@
   <text x="360" y="135" text-anchor="middle" fill="#d4d4d8" font-family="ui-sans-serif, system-ui, sans-serif" font-size="12">History endpoint (optional)</text>
 
   <text x="520" y="91" fill="#71717a" font-family="ui-monospace, Menlo, monospace" font-size="10">POST /worker/query-records</text>
-  <text x="520" y="135" fill="#71717a" font-family="ui-monospace, Menlo, monospace" font-size="10">workerApi.history.endpoint</text>
+  <text x="520" y="135" fill="#71717a" font-family="ui-monospace, Menlo, monospace" font-size="10">controlPlane.history.endpoint</text>
 </svg>

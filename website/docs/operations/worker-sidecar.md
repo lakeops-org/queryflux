@@ -40,15 +40,14 @@ Every pod shares one worker config. Store it in a Secret: it holds the shared se
 ```yaml title="worker-config.yaml"
 queryflux:
   role: worker
-  controlPlane:
-    url: https://queryflux-control.queryflux.svc:9000
-    auth:
-      mode: sharedSecret
-      sharedSecret: <the control plane's workerApi.sharedSecret>
-  # Report this pod's own labels (mounted below), e.g. app=checkout, team=payments.
-  workerLabelsFile: /etc/podinfo/labels
-  coordination:
-    mode: controlPlane       # share maxRunningQueries with every other worker
+  workerSecret: <the control plane's workerSecret>
+  worker:
+    upstream:
+      url: https://queryflux-control.queryflux.svc:9000
+    # Report this pod's own labels (mounted below), e.g. app=checkout, team=payments.
+    labelsFile: /etc/podinfo/labels
+    coordination:
+      mode: controlPlane       # share maxRunningQueries with every other worker
   # Enable only the protocols your application speaks. The worker shares the pod's
   # network with the application: pick ports the application does not use itself.
   frontends:
@@ -66,7 +65,7 @@ queryflux:
 kubectl create secret generic queryflux-worker-config --from-file=config.yaml=worker-config.yaml
 ```
 
-The worker's name defaults to the pod name, so every pod reports itself separately. Leave `workerName` unset.
+The worker's name defaults to the pod name, so every pod reports itself separately. Leave `worker.name` unset.
 
 ## 2. Add the sidecar to your Deployment
 
@@ -111,7 +110,7 @@ spec:
       volumes:
         - name: queryflux-config
           secret: { secretName: queryflux-worker-config }
-        - name: podinfo                      # this pod's labels, for workerLabelsFile
+        - name: podinfo                      # this pod's labels, for worker.labelsFile
           downwardAPI:
             items:
               - path: labels
@@ -163,7 +162,7 @@ curl -s localhost:19000/worker/status
 - **Resources:** start at 100m CPU and 256Mi memory per worker, and raise them for large result sets or heavy translation.
 - **Control-plane outages:** a running pod keeps serving with the config it has. A new pod waits on its startup probe until it gets one. To let new pods start during an outage, enable [peer bootstrap](./worker-mode#starting-while-the-control-plane-is-down):
   1. Add a headless Service selecting your application's pods on the worker's ops port (19000 here).
-  2. Set `controlPlane.peerBootstrap.address` to it.
+  2. Set `worker.upstream.peerBootstrap.address` to it.
 
   A new pod then copies the config from a running pod of the same application.
 - **Kubernetes older than 1.29:** native sidecars aren't available. Run the worker as a regular second container. Kubernetes then doesn't order startup or shutdown, so make the application retry its first connection, and accept that the worker may stop before the application on shutdown.
@@ -174,6 +173,6 @@ curl -s localhost:19000/worker/status
 |---|---|
 | Pod stuck in `Init` | The worker can't get a config. `kubectl logs <pod> -c queryflux` shows the sync errors: wrong control plane URL or secret, TLS, or the control plane can't build its config. |
 | Queries get `503` or "not configured yet" | Same as above. The worker is up but hasn't activated a config. |
-| Queries wait, then time out | The shared limit is full (`queryflux_capacity_lease_denied_total` rises), or the control plane is unreachable and `coordination.onUnavailable` is `failClosed`. |
+| Queries wait, then time out | The shared limit is full (`queryflux_capacity_lease_denied_total` rises), or the control plane is unreachable and `worker.coordination.onUnavailable` is `failClosed`. |
 | Worker missing in Studio | It heartbeats to the control plane every 10s. Check its logs for "Registered with the control plane". |
-| Wrong labels in Studio | `workerLabelsFile` must point at the mounted downward API file, and the `podinfo` volume must be mounted. |
+| Wrong labels in Studio | `worker.labelsFile` must point at the mounted downward API file, and the `podinfo` volume must be mounted. |

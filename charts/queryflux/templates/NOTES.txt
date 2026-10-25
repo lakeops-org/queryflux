@@ -1,7 +1,7 @@
 {{- $role := include "queryflux.role" . -}}
 {{- $multi := or .Values.autoscaling.enabled (gt (int .Values.replicaCount) 1) -}}
-{{- if eq $role "siteAgent" -}}
-QueryFlux has been installed as a site agent. This site's workers connect to it as their
+{{- if eq $role "hub" -}}
+QueryFlux has been installed as a hub. This site's workers connect to it as their
 control plane; it is the only process here that connects to the upstream control plane.
 
 Point the workers' controlPlane.url at:
@@ -9,12 +9,12 @@ Point the workers' controlPlane.url at:
 
 Status (upstream link, served revision, workers, history spool):
   kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "queryflux.fullname" . }} {{ .Values.service.ports.admin.port }}:{{ .Values.service.ports.admin.port }}
-  curl -s localhost:{{ .Values.service.ports.admin.port }}/agent/status
+  curl -s localhost:{{ .Values.service.ports.admin.port }}/hub/status
 {{- if ne .Values.workload.kind "StatefulSet" }}
 
-WARNING: workload.kind is not StatefulSet, so siteAgent.stateDir is not on a persistent
+WARNING: workload.kind is not StatefulSet, so hub.stateDir is not on a persistent
 volume per pod: spooled query history and the snapshot cache are lost when a pod is
-deleted. See charts/queryflux/examples/site-agent-values.yaml.
+deleted. See charts/queryflux/examples/hub-values.yaml.
 {{- end }}
 {{- else if eq $role "worker" -}}
 QueryFlux has been installed as a worker. It takes its config, capacity limits and

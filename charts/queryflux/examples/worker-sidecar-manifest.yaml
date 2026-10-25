@@ -68,7 +68,7 @@ spec:
               readOnly: true
             - name: tmp
               mountPath: /tmp
-            # This pod's labels, for workerLabelsFile: /etc/podinfo/labels in the config.
+            # This pod's labels, for worker.labelsFile: /etc/podinfo/labels in the config.
             - name: podinfo
               mountPath: /etc/podinfo
               readOnly: true

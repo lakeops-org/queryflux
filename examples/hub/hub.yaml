@@ -1,0 +1,18 @@
+# Hub: the site's only connection to the control plane. Workers connect to it as
+# their control plane; it relays config down and fleet status and query history up.
+queryflux:
+  role: hub
+  # What this site's workers present. Different from the upstream secret, so workers
+  # never hold the site's upstream credential.
+  workerSecret: change-me-worker-secret
+  adminApi:
+    port: 9000
+  hub:
+    # Workers behind this hub appear upstream as demo-site/worker-a, demo-site/worker-b.
+    site: demo-site
+    stateDir: /var/lib/queryflux/hub
+    upstream:
+      secret: change-me-site-secret
+      url: http://control-plane:9000
+      # Plain HTTP is for this local demo only: snapshots carry cluster credentials.
+      allowInsecureHttp: true

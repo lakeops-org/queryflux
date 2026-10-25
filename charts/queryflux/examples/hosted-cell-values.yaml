@@ -1,4 +1,4 @@
-# A hosted control plane ("cell"): one per tenant, serving that tenant's site agents over
+# A hosted control plane ("cell"): one per tenant, serving that tenant's hubs over
 # the internet. It runs no queries (the workers at the customer site do), so it has no
 # query frontend, no Studio sidecar and small requests. Run from the repository root:
 #
@@ -16,7 +16,7 @@
 #      under `ingress.annotations`), or create it from an existing certificate:
 #        kubectl -n tenant-acme create secret tls acme-cp-tls \
 #          --cert=acme.cp.example.com.crt --key=acme.cp.example.com.key
-#      Without it the Ingress cannot serve a trusted certificate and site agents (HTTPS)
+#      Without it the Ingress cannot serve a trusted certificate and hubs (HTTPS)
 #      cannot connect.
 #   5. helm install queryflux-cell ./charts/queryflux -n tenant-acme \
 #        -f ./charts/queryflux/examples/hosted-cell-values.yaml
