@@ -254,16 +254,31 @@ fn scenarios(opa_port: u16) -> Vec<Scenario> {
 async fn bench_trino(cfg: &BenchConfig) -> anyhow::Result<Vec<Value>> {
     let mock_port = spawn_mock_trino(cfg.trino_poll).await?;
     let opa_port = spawn_mock_opa().await?;
-    let only = std::env::var("QUERYFLUX_BENCH_SCENARIOS").ok();
+    let all = scenarios(opa_port);
+    // Unset or empty runs every scenario; a name that matches none is an error, not an
+    // empty result.
+    let only: Vec<String> = std::env::var("QUERYFLUX_BENCH_SCENARIOS")
+        .unwrap_or_default()
+        .split(',')
+        .map(|n| n.trim().to_string())
+        .filter(|n| !n.is_empty())
+        .collect();
+    if let Some(unknown) = only
+        .iter()
+        .find(|n| all.iter().all(|s| s.name != n.as_str()))
+    {
+        let names: Vec<&str> = all.iter().map(|s| s.name).collect();
+        anyhow::bail!(
+            "QUERYFLUX_BENCH_SCENARIOS: unknown scenario {unknown:?}; known: {}",
+            names.join(", ")
+        );
+    }
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
         .build()?;
     let mut entries = Vec::new();
-    for scenario in scenarios(opa_port) {
-        let selected = only
-            .as_deref()
-            .is_none_or(|only| only.split(',').any(|n| n.trim() == scenario.name));
-        if selected {
+    for scenario in all {
+        if only.is_empty() || only.iter().any(|n| n == scenario.name) {
             entries.extend(run_trino_scenario(cfg, &client, mock_port, &scenario).await?);
         }
     }
@@ -339,13 +354,7 @@ routingFallback: bench-trino-group
     let config_path = std::env::temp_dir().join(format!("queryflux-bench-{}.yaml", scenario.name));
     std::fs::write(&config_path, &config_content)?;
 
-    let mut qf_proc = std::process::Command::new(find_queryflux_bin()?)
-        .arg("--config")
-        .arg(&config_path)
-        .env("RUST_LOG", "error")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()?;
+    let _qf = QueryFluxProcess::spawn(config_path)?;
     wait_for_health(admin_port).await?;
 
     let mut n = 1000u64;
@@ -401,10 +410,6 @@ routingFallback: bench-trino-group
         QUERY_COUNTER.load(Ordering::Relaxed) - reached_before,
         cfg.iterations
     );
-
-    let _ = qf_proc.kill();
-    let _ = qf_proc.wait();
-    let _ = std::fs::remove_file(&config_path);
 
     Ok(build_result_entries(&label, &direct_ms, &proxy_ms))
 }
@@ -475,15 +480,7 @@ routingFallback: bench-sr-group
     let config_path = std::env::temp_dir().join("queryflux-bench-starrocks.yaml");
     std::fs::write(&config_path, &config_content)?;
 
-    let queryflux_bin = find_queryflux_bin()?;
-    let mut qf_proc = std::process::Command::new(&queryflux_bin)
-        .arg("--config")
-        .arg(&config_path)
-        .env("RUST_LOG", "error")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()?;
-
+    let _qf = QueryFluxProcess::spawn(config_path)?;
     wait_for_health(admin_port).await?;
 
     let client = reqwest::Client::builder()
@@ -521,9 +518,6 @@ routingFallback: bench-sr-group
         send_trino_until_done(&client, qf_port, "SELECT 1").await?;
         proxy_ms.push(t.elapsed().as_secs_f64() * 1000.0);
     }
-
-    let _ = qf_proc.kill();
-    let _ = std::fs::remove_file(&config_path);
 
     Ok(build_result_entries("StarRocks", &direct_ms, &proxy_ms))
 }
@@ -810,6 +804,34 @@ async fn send_trino_until_done(
     }
 
     Ok(())
+}
+
+/// A QueryFlux child process and its config file, killed and removed when dropped, so a run
+/// that fails early (`?`) leaves no process holding its ports.
+struct QueryFluxProcess {
+    child: std::process::Child,
+    config_path: std::path::PathBuf,
+}
+
+impl QueryFluxProcess {
+    fn spawn(config_path: std::path::PathBuf) -> anyhow::Result<Self> {
+        let child = std::process::Command::new(find_queryflux_bin()?)
+            .arg("--config")
+            .arg(&config_path)
+            .env("RUST_LOG", "error")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()?;
+        Ok(Self { child, config_path })
+    }
+}
+
+impl Drop for QueryFluxProcess {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        let _ = std::fs::remove_file(&self.config_path);
+    }
 }
 
 fn free_port() -> u16 {

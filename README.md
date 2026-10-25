@@ -118,13 +118,13 @@ End-to-end overhead is measured by [`queryflux-bench`](crates/queryflux-bench) (
 
 | | p50 | p95 | p99 |
 | --- | ---: | ---: | ---: |
-| Direct (one pooled MySQL connection) | 0.03 ms | 0.09 ms | 0.12 ms |
+| Direct (one reused MySQL connection) | 0.03 ms | 0.09 ms | 0.12 ms |
 | Via QueryFlux | 0.19 ms | 0.26 ms | 0.32 ms |
 | **Overhead** | **0.16 ms** | **0.17 ms** | **0.20 ms** |
 
 ### Overhead per feature (Trino path)
 
-Each scenario runs QueryFlux with one feature turned on (`QUERYFLUX_BENCH_SCENARIOS` picks a subset):
+Each feature scenario runs QueryFlux with one feature turned on; the dashboard-style query is the baseline, with none (`QUERYFLUX_BENCH_SCENARIOS` picks a subset):
 
 | Scenario | p50 | p95 | p99 |
 | --- | ---: | ---: | ---: |
