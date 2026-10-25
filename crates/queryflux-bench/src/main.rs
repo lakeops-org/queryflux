@@ -1,7 +1,12 @@
 //! End-to-end overhead benchmark for QueryFlux.
 //!
-//! Runs two scenarios (mock Trino HTTP backend, mock StarRocks MySQL backend), each
-//! comparing direct backend latency vs the same workload through QueryFlux via Trino HTTP.
+//! Compares direct backend latency with the same workload through QueryFlux's Trino HTTP
+//! frontend, against a mock Trino coordinator and a mock StarRocks (MySQL wire) FE.
+//!
+//! The Trino path runs one scenario per feature, each with its own QueryFlux config (see
+//! [`scenarios`]): `SELECT 1`, a dashboard-style query, translation (cached and uncached),
+//! built-in and script guards, a router chain, access control (allow and row-filter
+//! rewrite, against a mock OPA) and the result cache.
 //! Prints one JSON array in `customSmallerIsBetter` format for
 //! `benchmark-action/github-action-benchmark`.
 //!
@@ -14,6 +19,7 @@
 //! Configuration (environment):
 //!   `QUERYFLUX_BENCH_WARMUP` — warmup rounds per path (default `50`).
 //!   `QUERYFLUX_BENCH_ITERATIONS` — timed iterations (default `500`).
+//!   `QUERYFLUX_BENCH_SCENARIOS` — comma-separated scenario names to run (default: all).
 //!   `QUERYFLUX_BENCH_TRINO_POLL` — if `1`/`true`, mock Trino uses `POST` + one `GET` on a
 //!   Trino-shaped `nextUri` (`/v1/statement/executing/…`, so QueryFlux can rewrite and forward
 //!   poll requests). Default `0`.
@@ -103,18 +109,174 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn bench_trino(cfg: &BenchConfig) -> anyhow::Result<Vec<Value>> {
-    let mock_port = free_port();
-    let qf_port = free_port();
-    let admin_port = free_port();
+/// A dashboard-style query: a CTE, a join, filters, grouping and a limit. `{n}` is replaced
+/// by a per-request counter in scenarios that need every request to be a new SQL text.
+const ANALYTIC_SQL: &str = "WITH recent AS (SELECT o.order_id, o.customer_id, o.amount \
+    FROM lake.sales.orders o WHERE o.dt >= DATE '2026-01-01' AND o.status IN ('paid', 'shipped')) \
+    SELECT c.region, sum(r.amount) AS revenue, count(*) AS n FROM recent r \
+    JOIN lake.crm.customers c ON c.customer_id = r.customer_id WHERE c.region = 'eu' \
+    GROUP BY c.region HAVING sum(r.amount) > {n} ORDER BY revenue DESC LIMIT 100";
 
+/// One QueryFlux configuration measured against the same mock Trino coordinator: the YAML
+/// it adds to the baseline config, and the SQL each request sends.
+struct Scenario {
+    name: &'static str,
+    /// Per-request SQL; `{n}` becomes a counter when `unique` is set, else `1000`.
+    sql: &'static str,
+    unique: bool,
+    /// Lines under `queryflux:` (two-space indent).
+    queryflux: String,
+    /// Lines under the cluster group (four-space indent).
+    group: String,
+    /// The `routers:` block.
+    routers: String,
+    /// Other top-level sections.
+    top: String,
+}
+
+impl Scenario {
+    fn new(name: &'static str, sql: &'static str) -> Self {
+        Self {
+            name,
+            sql,
+            unique: false,
+            queryflux: String::new(),
+            group: String::new(),
+            routers: "routers: []".into(),
+            top: String::new(),
+        }
+    }
+}
+
+/// Every scenario, cheapest first. `QUERYFLUX_BENCH_SCENARIOS=select1,analytic` runs a subset.
+fn scenarios(opa_port: u16) -> Vec<Scenario> {
+    let access_control = |decision: &str| {
+        format!(
+            r#"accessControl:
+  enabled: true
+  defaultConnection: bench
+  connections:
+    bench:
+      provider: opa
+      opa:
+        url: "http://127.0.0.1:{opa_port}"
+        decisionPath: /v1/data/queryflux/{decision}
+        timeoutMs: 1000
+      operations: [table.select]
+"#
+        )
+    };
+    let fixup = r#"translation:
+  pythonScripts:
+    - |
+      def transform(sql, src, dst):
+          return sql
+"#;
+    let cache_root = std::env::temp_dir().join("queryflux-bench-cache");
+    vec![
+        Scenario::new("select1", "SELECT 1"),
+        Scenario::new("analytic", ANALYTIC_SQL),
+        Scenario {
+            top: fixup.into(),
+            ..Scenario::new("translation", ANALYTIC_SQL)
+        },
+        Scenario {
+            unique: true,
+            top: fixup.into(),
+            ..Scenario::new("translation-uncached", ANALYTIC_SQL)
+        },
+        Scenario {
+            top: r#"guardrails:
+  global:
+    - kind: built_in
+      name: read_only
+    - kind: built_in
+      name: row_limit
+      max_rows: 10000
+    - kind: built_in
+      name: require_predicate
+"#
+            .into(),
+            ..Scenario::new("guardrails", ANALYTIC_SQL)
+        },
+        Scenario {
+            top: r#"guardrails:
+  global:
+    - kind: python_script
+      script: |
+        def check(ctx):
+            return None
+"#
+            .into(),
+            ..Scenario::new("guard-script", ANALYTIC_SQL)
+        },
+        Scenario {
+            routers: r#"routers:
+  - type: header
+    headerName: x-bench-target
+    headerValueToGroup:
+      nowhere: bench-trino-group
+  - type: tags
+    rules:
+      - tags:
+          team: nowhere
+        targetGroup: bench-trino-group
+  - type: queryRegex
+    rules:
+      - regex: "^\\s*DELETE"
+        targetGroup: bench-trino-group
+  - type: pythonScript
+    script: |
+      def route(query, ctx):
+          return None"#
+                .into(),
+            ..Scenario::new("routing", ANALYTIC_SQL)
+        },
+        Scenario {
+            top: access_control("allow"),
+            ..Scenario::new("access-control", ANALYTIC_SQL)
+        },
+        Scenario {
+            top: access_control("rewrite"),
+            ..Scenario::new("access-control-rewrite", ANALYTIC_SQL)
+        },
+        Scenario {
+            queryflux: format!(
+                "  cacheBackend:\n    scheme: fs\n    options:\n      root: \"{}\"",
+                cache_root.display()
+            ),
+            group: "    cache:\n      enabled: true\n      ttlSecs: 300".into(),
+            ..Scenario::new("result-cache", ANALYTIC_SQL)
+        },
+    ]
+}
+
+async fn bench_trino(cfg: &BenchConfig) -> anyhow::Result<Vec<Value>> {
+    let mock_port = spawn_mock_trino(cfg.trino_poll).await?;
+    let opa_port = spawn_mock_opa().await?;
+    let only = std::env::var("QUERYFLUX_BENCH_SCENARIOS").ok();
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()?;
+    let mut entries = Vec::new();
+    for scenario in scenarios(opa_port) {
+        let selected = only
+            .as_deref()
+            .is_none_or(|only| only.split(',').any(|n| n.trim() == scenario.name));
+        if selected {
+            entries.extend(run_trino_scenario(cfg, &client, mock_port, &scenario).await?);
+        }
+    }
+    Ok(entries)
+}
+
+async fn spawn_mock_trino(two_phase: bool) -> anyhow::Result<u16> {
+    let mock_port = free_port();
     let mock_cfg = Arc::new(MockTrinoConfig {
         port: mock_port,
-        two_phase: cfg.trino_poll,
+        two_phase,
     });
-
     let mock_listener = TcpListener::bind(format!("127.0.0.1:{mock_port}")).await?;
-    let mock_cfg_serve = mock_cfg.clone();
     tokio::spawn(async move {
         let app = Router::new()
             .route("/v1/statement", post(mock_trino_statement))
@@ -124,11 +286,21 @@ async fn bench_trino(cfg: &BenchConfig) -> anyhow::Result<Vec<Value>> {
             )
             .route("/v1/info", get(mock_trino_info))
             .route("/v1/cluster", get(mock_trino_cluster))
-            .with_state(mock_cfg_serve);
+            .with_state(mock_cfg);
         axum::serve(mock_listener, app).await.unwrap();
     });
     sleep(Duration::from_millis(100)).await;
+    Ok(mock_port)
+}
 
+async fn run_trino_scenario(
+    cfg: &BenchConfig,
+    client: &reqwest::Client,
+    mock_port: u16,
+    scenario: &Scenario,
+) -> anyhow::Result<Vec<Value>> {
+    let qf_port = free_port();
+    let admin_port = free_port();
     let config_content = format!(
         r#"queryflux:
   externalAddress: "http://127.0.0.1:{qf_port}"
@@ -140,6 +312,7 @@ async fn bench_trino(cfg: &BenchConfig) -> anyhow::Result<Vec<Value>> {
     type: inMemory
   adminApi:
     port: {admin_port}
+{queryflux_extra}
 
 clusters:
   mock-trino-1:
@@ -152,67 +325,117 @@ clusterGroups:
     enabled: true
     maxRunningQueries: 100000
     members: [mock-trino-1]
+{group_extra}
 
-routers: []
+{routers}
 routingFallback: bench-trino-group
-"#
+
+{top}"#,
+        queryflux_extra = scenario.queryflux,
+        group_extra = scenario.group,
+        routers = scenario.routers,
+        top = scenario.top,
     );
-    let config_path = std::env::temp_dir().join("queryflux-bench-trino.yaml");
+    let config_path = std::env::temp_dir().join(format!("queryflux-bench-{}.yaml", scenario.name));
     std::fs::write(&config_path, &config_content)?;
 
-    let queryflux_bin = find_queryflux_bin()?;
-    let mut qf_proc = std::process::Command::new(&queryflux_bin)
+    let mut qf_proc = std::process::Command::new(find_queryflux_bin()?)
         .arg("--config")
         .arg(&config_path)
         .env("RUST_LOG", "error")
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()?;
-
     wait_for_health(admin_port).await?;
 
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .build()?;
-
-    let engine_label = if cfg.trino_poll {
-        "Trino (POST+poll)"
-    } else {
-        "Trino"
+    let mut n = 1000u64;
+    let mut next_sql = || {
+        if scenario.unique {
+            n += 1;
+        }
+        scenario.sql.replace("{n}", &n.to_string())
+    };
+    let label = match (scenario.name, cfg.trino_poll) {
+        ("select1", false) => "Trino".to_string(),
+        ("select1", true) => "Trino (POST+poll)".to_string(),
+        (name, false) => format!("Trino · {name}"),
+        (name, true) => format!("Trino (POST+poll) · {name}"),
     };
 
-    eprintln!("[Trino] Warming up ({} queries each)...", cfg.warmup);
+    eprintln!("[{label}] Warming up ({} queries each)...", cfg.warmup);
     for _ in 0..cfg.warmup {
-        let _ = send_trino_until_done(&client, mock_port).await;
-        let _ = send_trino_until_done(&client, qf_port).await;
+        let sql = next_sql();
+        let _ = send_trino_until_done(client, mock_port, &sql).await;
+        send_trino_until_done(client, qf_port, &sql)
+            .await
+            .map_err(|e| anyhow::anyhow!("[{label}] warmup through QueryFlux failed: {e}"))?;
     }
 
     eprintln!(
-        "[Trino] Benchmarking direct ({} queries)...",
+        "[{label}] Benchmarking direct ({} queries)...",
         cfg.iterations
     );
     let mut direct_ms = Vec::with_capacity(cfg.iterations);
     for _ in 0..cfg.iterations {
+        let sql = next_sql();
         let t = Instant::now();
-        send_trino_until_done(&client, mock_port).await?;
+        send_trino_until_done(client, mock_port, &sql).await?;
         direct_ms.push(t.elapsed().as_secs_f64() * 1000.0);
     }
 
     eprintln!(
-        "[Trino] Benchmarking through QueryFlux ({} queries)...",
+        "[{label}] Benchmarking through QueryFlux ({} queries)...",
         cfg.iterations
     );
     let mut proxy_ms = Vec::with_capacity(cfg.iterations);
+    let reached_before = QUERY_COUNTER.load(Ordering::Relaxed);
     for _ in 0..cfg.iterations {
+        let sql = next_sql();
         let t = Instant::now();
-        send_trino_until_done(&client, qf_port).await?;
+        send_trino_until_done(client, qf_port, &sql).await?;
         proxy_ms.push(t.elapsed().as_secs_f64() * 1000.0);
     }
+    // Fewer than `iterations` means QueryFlux answered some itself (the result cache).
+    eprintln!(
+        "[{label}] {} of {} queries through QueryFlux reached the backend",
+        QUERY_COUNTER.load(Ordering::Relaxed) - reached_before,
+        cfg.iterations
+    );
 
     let _ = qf_proc.kill();
+    let _ = qf_proc.wait();
     let _ = std::fs::remove_file(&config_path);
 
-    Ok(build_result_entries(engine_label, &direct_ms, &proxy_ms))
+    Ok(build_result_entries(&label, &direct_ms, &proxy_ms))
+}
+
+/// OPA stand-in: allows every requested table. Under `/rewrite` it also returns a row
+/// filter for `orders`, so access control rewrites the query.
+async fn spawn_mock_opa() -> anyhow::Result<u16> {
+    async fn decide(Path(mode): Path<String>, Json(body): Json<Value>) -> Json<Value> {
+        let resources = body["input"]["action"]["resources"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|r| {
+                let table = r["table"].as_str().or(r["name"].as_str()).unwrap_or("");
+                let mut decision = json!({ "table": table, "allow": true });
+                if mode == "rewrite" && table == "orders" {
+                    decision["rowFilters"] = json!([{ "expression": "status <> 'test'" }]);
+                }
+                decision
+            })
+            .collect::<Vec<_>>();
+        Json(json!({ "result": { "resources": resources } }))
+    }
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let port = listener.local_addr()?.port();
+    tokio::spawn(async move {
+        let app = Router::new().route("/v1/data/queryflux/{mode}", post(decide));
+        axum::serve(listener, app).await.unwrap();
+    });
+    Ok(port)
 }
 
 async fn bench_starrocks(cfg: &BenchConfig) -> anyhow::Result<Vec<Value>> {
@@ -267,12 +490,14 @@ routingFallback: bench-sr-group
         .timeout(Duration::from_secs(10))
         .build()?;
 
-    let mysql_opts = mysql_opts_mock(&mysql_url)?;
+    // One connection for the direct path, as QueryFlux reuses pooled connections: opening
+    // one per query would time a handshake QueryFlux never pays.
+    let mut direct = Conn::new(mysql_opts_mock(&mysql_url)?).await?;
 
     eprintln!("[StarRocks] Warming up ({} queries each)...", cfg.warmup);
     for _ in 0..cfg.warmup {
-        let _ = send_mysql_select_one(&mysql_opts).await;
-        let _ = send_trino_until_done(&client, qf_port).await;
+        let _ = direct.query_drop("SELECT 1").await;
+        let _ = send_trino_until_done(&client, qf_port, "SELECT 1").await;
     }
 
     eprintln!(
@@ -282,7 +507,7 @@ routingFallback: bench-sr-group
     let mut direct_ms = Vec::with_capacity(cfg.iterations);
     for _ in 0..cfg.iterations {
         let t = Instant::now();
-        send_mysql_select_one(&mysql_opts).await?;
+        direct.query_drop("SELECT 1").await?;
         direct_ms.push(t.elapsed().as_secs_f64() * 1000.0);
     }
 
@@ -293,7 +518,7 @@ routingFallback: bench-sr-group
     let mut proxy_ms = Vec::with_capacity(cfg.iterations);
     for _ in 0..cfg.iterations {
         let t = Instant::now();
-        send_trino_until_done(&client, qf_port).await?;
+        send_trino_until_done(&client, qf_port, "SELECT 1").await?;
         proxy_ms.push(t.elapsed().as_secs_f64() * 1000.0);
     }
 
@@ -307,12 +532,6 @@ fn mysql_opts_mock(url: &str) -> anyhow::Result<Opts> {
     let base = Opts::from_url(url).map_err(|e| anyhow::anyhow!("invalid mysql url: {e}"))?;
     let opts = OptsBuilder::from_opts(base).prefer_socket(false).into();
     Ok(opts)
-}
-
-async fn send_mysql_select_one(opts: &Opts) -> anyhow::Result<()> {
-    let mut conn = Conn::new(opts.clone()).await?;
-    conn.query_drop("SELECT 1").await?;
-    Ok(())
 }
 
 /// MySQL wire mock sufficient for `mysql_async` + StarRocks adapter (`SELECT 1`, `USE`, settings query).
@@ -540,7 +759,11 @@ async fn mock_trino_cluster() -> Json<Value> {
 }
 
 /// Full Trino client round-trip: `POST /v1/statement`, then follow `nextUri` until a terminal page.
-async fn send_trino_until_done(client: &reqwest::Client, port: u16) -> anyhow::Result<()> {
+async fn send_trino_until_done(
+    client: &reqwest::Client,
+    port: u16,
+    sql: &str,
+) -> anyhow::Result<()> {
     let stmt_url = format!("http://127.0.0.1:{port}/v1/statement");
     let mut url = stmt_url;
     let mut is_post = true;
@@ -550,7 +773,7 @@ async fn send_trino_until_done(client: &reqwest::Client, port: u16) -> anyhow::R
             client
                 .post(&url)
                 .header("X-Trino-User", "bench")
-                .body("SELECT 1")
+                .body(sql.to_string())
                 .send()
                 .await?
         } else {
@@ -574,7 +797,11 @@ async fn send_trino_until_done(client: &reqwest::Client, port: u16) -> anyhow::R
 
         let next = page.get("nextUri").and_then(|v| v.as_str());
 
-        if next.is_none() || state == "FINISHED" || state == "FAILED" {
+        // A failed query is not a fast success: stop the run instead of timing an error.
+        if state == "FAILED" || page.get("error").is_some() {
+            anyhow::bail!("query failed: {}", page["error"]);
+        }
+        if next.is_none() || state == "FINISHED" {
             break;
         }
 
