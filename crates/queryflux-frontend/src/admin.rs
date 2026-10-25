@@ -2,9 +2,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::{
-    extract::{Path, Query, Request, State},
-    http::{header::AUTHORIZATION, Method, StatusCode},
-    middleware::{self, Next},
+    extract::{Path, Query, State},
+    http::{Method, StatusCode},
+    middleware,
     response::{IntoResponse, Response},
     routing::{delete, get, patch, post},
     Json, Router,
@@ -696,9 +696,17 @@ pub struct AdminFrontend {
     result_cache: Arc<dyn queryflux_cache::QueryResultCache>,
     app: Arc<AppState>,
     worker_api: Option<crate::worker_api::WorkerApi>,
+    basic_auth: bool,
 }
 
 impl AdminFrontend {
+    /// Whether the admin user's basic auth is accepted (`adminApi.basicAuth`). On by
+    /// default; with it off, only admin tokens and the platform get in.
+    pub fn with_basic_auth(mut self, enabled: bool) -> Self {
+        self.basic_auth = enabled;
+        self
+    }
+
     /// Serve the worker API (`/worker/*`) on this listener (#255).
     pub fn with_worker_api(mut self, api: crate::worker_api::WorkerApi) -> Self {
         self.worker_api = Some(api);
@@ -744,10 +752,14 @@ impl AdminFrontend {
             result_cache,
             app,
             worker_api: None,
+            basic_auth: true,
         }
     }
 
-    fn router(&self) -> Router {
+    /// The admin and worker API. A gateway in this process can serve it without a
+    /// listener of its own, marking callers it authenticated with
+    /// [`crate::admin_access::PlatformCaller`].
+    pub fn router(&self) -> Router {
         let state = Arc::new(AdminState {
             prometheus: self.prometheus.clone(),
             live: self.live.clone(),
@@ -890,11 +902,7 @@ impl AdminFrontend {
             )
             // Auth management endpoints
             .route("/admin/auth/status", get(auth_status_handler))
-            .route("/admin/auth/change-password", post(change_password_handler))
-            .layer(middleware::from_fn_with_state(
-                state.clone(),
-                admin_auth_middleware,
-            ));
+            .route("/admin/auth/change-password", post(change_password_handler));
 
         let cors = if self.cors_allowed_origins.is_empty() {
             CorsLayer::new()
@@ -927,10 +935,21 @@ impl AdminFrontend {
                 .allow_headers(Any)
         };
 
+        let access = Arc::new(crate::admin_access::AccessState {
+            store: self.admin_store.clone(),
+            creds: self.admin_creds.clone(),
+            basic_auth: self.basic_auth,
+        });
+        let protected = protected
+            .with_state(state.clone())
+            .merge(crate::admin_access::routes().with_state(access.clone()))
+            .layer(middleware::from_fn_with_state(
+                access,
+                crate::admin_access::authorize,
+            ));
         let router = Router::new()
-            .merge(public)
-            .merge(protected)
-            .with_state(state);
+            .merge(public.with_state(state))
+            .merge(protected);
         let router = match &self.worker_api {
             Some(api) => router.merge(crate::worker_api::router(api.clone())),
             None => router,
@@ -975,58 +994,6 @@ async fn metrics_handler(State(state): State<Arc<AdminState>>) -> impl IntoRespo
 // ---------------------------------------------------------------------------
 // Auth middleware
 // ---------------------------------------------------------------------------
-
-/// Axum middleware that enforces HTTP Basic authentication on all protected routes.
-///
-/// Expects `Authorization: Basic <base64(username:password)>` on every request.
-/// Returns `401 Unauthorized` with a `WWW-Authenticate` challenge on failure.
-async fn admin_auth_middleware(
-    State(state): State<Arc<AdminState>>,
-    req: Request,
-    next: Next,
-) -> Response {
-    let auth_header = req
-        .headers()
-        .get(AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-
-    if let Some((username, password)) = parse_basic_auth(auth_header) {
-        if state.admin_creds.verify(&username, &password).await {
-            return next.run(req).await;
-        }
-        warn!(username, "Admin API: invalid credentials");
-    } else {
-        warn!("Admin API: missing or malformed Authorization header");
-    }
-
-    (
-        StatusCode::UNAUTHORIZED,
-        [(
-            "WWW-Authenticate",
-            r#"Basic realm="QueryFlux Admin", charset="UTF-8""#,
-        )],
-        "Unauthorized",
-    )
-        .into_response()
-}
-
-/// Parse `Authorization: Basic <base64(user:pass)>` → `(username, password)`.
-fn parse_basic_auth(header: &str) -> Option<(String, String)> {
-    let encoded = header.strip_prefix("Basic ")?;
-    let decoded = base64_decode(encoded)?;
-    let (user, pass) = decoded.split_once(':')?;
-    Some((user.to_string(), pass.to_string()))
-}
-
-/// Minimal base64 decoder (no extra deps — same approach as Trino HTTP frontend).
-fn base64_decode(encoded: &str) -> Option<String> {
-    use base64::Engine;
-    let bytes = base64::engine::general_purpose::STANDARD
-        .decode(encoded.trim())
-        .ok()?;
-    String::from_utf8(bytes).ok()
-}
 
 // ---------------------------------------------------------------------------
 // Auth management handlers
