@@ -73,6 +73,8 @@ pub struct PostgresStore {
     coordination_pool: PgPool,
     admin_pool: PgPool,
     database_url: String,
+    /// `persistence.schema`, already in `database_url` as the `search_path`.
+    schema: Option<String>,
     /// `capacity.quotaLeaseSecs` and `capacity.reportIntervalMs`, returned to holders with
     /// their grants.
     quota_lease_secs: std::sync::atomic::AtomicU64,
@@ -146,6 +148,10 @@ impl PostgresStore {
             coordination_pool,
             admin_pool,
             database_url: database_url.to_string(),
+            schema: conn
+                .pinned_schema()
+                .map_err(QueryFluxError::Persistence)?
+                .map(String::from),
             quota_lease_secs: std::sync::atomic::AtomicU64::new(15),
             quota_report_interval_ms: std::sync::atomic::AtomicU64::new(1000),
             grant_waiters: Arc::default(),
@@ -158,7 +164,30 @@ impl PostgresStore {
     /// Prefer [`crate::SchemaMigrator`] / [`crate::run_persistence_migrations`] from CLI and
     /// other callers so non-Postgres backends can plug in the same interface later.
     pub async fn migrate(&self) -> Result<()> {
-        crate::migrate::run_postgres_refinery_migrations(&self.database_url).await
+        crate::migrate::run_postgres_refinery_migrations(&self.database_url, self.schema.as_deref())
+            .await
+    }
+
+    /// With a pinned schema, check that connections resolve to it: a missing schema, or a
+    /// role whose own `search_path` setting wins, would otherwise read and write another
+    /// schema's tables. Call after migrations (which create the schema).
+    pub async fn verify_schema(&self) -> Result<()> {
+        let Some(expected) = self.schema.as_deref() else {
+            return Ok(());
+        };
+        let current: Option<String> = sqlx::query_scalar("SELECT current_schema()")
+            .fetch_one(&self.admin_pool)
+            .await
+            .map_err(|e| QueryFluxError::Persistence(format!("schema check: {e}")))?;
+        match current.as_deref() {
+            Some(c) if c == expected => Ok(()),
+            Some(c) => Err(QueryFluxError::Persistence(format!(
+                "persistence.schema is '{expected}' but connections resolve to '{c}'"
+            ))),
+            None => Err(QueryFluxError::Persistence(format!(
+                "persistence.schema '{expected}' does not exist (run migrations, or create it)"
+            ))),
+        }
     }
 }
 
@@ -184,6 +213,20 @@ async fn build_pg_pool(
     opts.connect(database_url)
         .await
         .map_err(|e| QueryFluxError::Persistence(format!("Failed to connect to Postgres: {e}")))
+}
+
+/// LISTEN on `base`'s channel in this connection's schema (`queryflux_channel`, V27): the
+/// plain name in `public`, a schema-specific one otherwise, so deployments sharing a
+/// database never wake each other.
+async fn listen_scoped(
+    listener: &mut sqlx::postgres::PgListener,
+    base: &str,
+) -> std::result::Result<(), sqlx::Error> {
+    let channel: String = sqlx::query_scalar("SELECT queryflux_channel($1)")
+        .bind(base)
+        .fetch_one(&mut *listener)
+        .await?;
+    listener.listen(&channel).await
 }
 
 /// Rows deleted per statement by the history purge.
@@ -236,7 +279,7 @@ impl SweepCoordinator for PostgresStore {
             .map_err(|e| QueryFluxError::Persistence(format!("sweep lock connect: {e}")))?;
 
         let got: bool =
-            sqlx::query_scalar("SELECT pg_try_advisory_lock(hashtext('sweep:' || $1)::bigint)")
+            sqlx::query_scalar("SELECT pg_try_advisory_lock(queryflux_lock_key('sweep:' || $1))")
                 .bind(name)
                 .fetch_one(&mut conn)
                 .await
@@ -271,7 +314,7 @@ pub struct SweepLock {
 
 impl SweepLock {
     async fn unlock(mut conn: sqlx::PgConnection, name: &str) {
-        let res = sqlx::query("SELECT pg_advisory_unlock(hashtext('sweep:' || $1)::bigint)")
+        let res = sqlx::query("SELECT pg_advisory_unlock(queryflux_lock_key('sweep:' || $1))")
             .bind(name)
             .execute(&mut conn)
             .await;
@@ -2015,7 +2058,7 @@ impl ConfigRevisionStore for PostgresStore {
                     }
                 };
 
-                if let Err(e) = listener.listen("config_revision_changed").await {
+                if let Err(e) = listen_scoped(&mut listener, "config_revision_changed").await {
                     tracing::warn!("PgListener LISTEN failed, retrying in {backoff:?}: {e}");
                     tokio::time::sleep(backoff).await;
                     backoff = (backoff * 2).min(MAX_BACKOFF);
@@ -2156,7 +2199,9 @@ impl PostgresStore {
                                 continue;
                             }
                         };
-                        if let Err(e) = listener.listen("queryflux_capacity_granted").await {
+                        if let Err(e) =
+                            listen_scoped(&mut listener, "queryflux_capacity_granted").await
+                        {
                             tracing::warn!("Capacity grant LISTEN failed: {e}");
                             tokio::time::sleep(backoff).await;
                             backoff = (backoff * 2).min(MAX_BACKOFF);
@@ -2237,7 +2282,7 @@ impl crate::quota::QuotaAllocator for PostgresStore {
         }
 
         sqlx::query(
-            "SELECT pg_advisory_xact_lock(hashtext('capacity:' || c)::bigint) FROM UNNEST($1::text[]) AS c ORDER BY c",
+            "SELECT pg_advisory_xact_lock(queryflux_lock_key('capacity:' || c)) FROM UNNEST($1::text[]) AS c ORDER BY c",
         )
         .bind(&clusters)
         .execute(&mut *tx)
@@ -3199,6 +3244,132 @@ mod tests {
         let far_future = chrono::Utc::now() + chrono::Duration::hours(1);
         store.expire_stale(far_future).await.unwrap();
         assert_eq!(store.active_lease_count(&cluster).await.unwrap(), 0);
+    }
+
+    async fn schema_store(schema: &str) -> PostgresStore {
+        let url = std::env::var("DATABASE_URL").unwrap();
+        let conn = queryflux_core::config::PostgresPersistenceConfig {
+            url: Some(url),
+            schema: Some(schema.to_string()),
+            ..Default::default()
+        };
+        let store = PostgresStore::connect_from_config(&conn.connection_url().unwrap(), &conn)
+            .await
+            .unwrap();
+        store.migrate().await.unwrap();
+        store.verify_schema().await.unwrap();
+        store
+    }
+
+    /// Two deployments pinned to two schemas of one database: each migrates into its own
+    /// schema with its own ledger, and their locks and channels never collide with each
+    /// other or with `public`, which keeps its names.
+    #[tokio::test]
+    #[ignore]
+    async fn pg_pinned_schemas_share_a_database_without_interfering() {
+        let suffix = unique_id("").trim_start_matches('-').to_string();
+        let (a, b) = (format!("qf_a_{suffix}"), format!("qf_b_{suffix}"));
+        let (sa, sb) = (schema_store(&a).await, schema_store(&b).await);
+        let public = test_store().await;
+
+        let tables_in = |schema: String| {
+            let pool = public.admin_pool.clone();
+            async move {
+                sqlx::query_scalar::<_, i64>(
+                    "SELECT count(*) FROM information_schema.tables WHERE table_schema = $1 \
+                     AND table_name IN ('query_records', 'refinery_schema_history')",
+                )
+                .bind(schema)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+            }
+        };
+        assert_eq!(tables_in(a.clone()).await, 2);
+        assert_eq!(tables_in(b.clone()).await, 2);
+        // Migrating again is a no-op: the ledger is per schema.
+        sa.migrate().await.unwrap();
+
+        // Sweep locks: one holder per schema, and each schema's own holders still exclude
+        // each other.
+        let held_a = sa.try_sweep_lock("zombie-eviction").await.unwrap();
+        assert!(held_a.is_some());
+        let held_b = sb.try_sweep_lock("zombie-eviction").await.unwrap();
+        assert!(held_b.is_some(), "schema b must not wait on schema a");
+        assert!(sa
+            .try_sweep_lock("zombie-eviction")
+            .await
+            .unwrap()
+            .is_none());
+        drop((held_a, held_b));
+
+        // Channels and lock keys: plain in public, distinct per schema.
+        let channel = |pool: PgPool| async move {
+            sqlx::query_scalar::<_, String>("SELECT queryflux_channel('config_revision_changed')")
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+        };
+        let (ca, cb, cp) = (
+            channel(sa.admin_pool.clone()).await,
+            channel(sb.admin_pool.clone()).await,
+            channel(public.admin_pool.clone()).await,
+        );
+        assert_eq!(cp, "config_revision_changed");
+        assert_ne!(ca, cb);
+        assert!(ca.len() < 64 && cb.len() < 64);
+        let key = |pool: PgPool| async move {
+            sqlx::query_scalar::<_, i64>("SELECT queryflux_lock_key('capacity:trino')")
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+        };
+        let public_key: i64 = sqlx::query_scalar("SELECT hashtext('capacity:trino')::bigint")
+            .fetch_one(&public.admin_pool)
+            .await
+            .unwrap();
+        assert_eq!(key(public.admin_pool.clone()).await, public_key);
+        assert_ne!(
+            key(sa.admin_pool.clone()).await,
+            key(sb.admin_pool.clone()).await
+        );
+
+        // Capacity works inside a pinned schema.
+        let cluster = unique_id("pinned");
+        assert!(sa.try_acquire(&cluster, 1, "w1", "q1").await.unwrap());
+        assert!(!sa.try_acquire(&cluster, 1, "w1", "q2").await.unwrap());
+        assert!(
+            sb.try_acquire(&cluster, 1, "w1", "q1").await.unwrap(),
+            "separate tables"
+        );
+
+        for s in [&a, &b] {
+            sqlx::query(&format!("DROP SCHEMA {s} CASCADE"))
+                .execute(&public.admin_pool)
+                .await
+                .unwrap();
+        }
+    }
+
+    /// Without migrations, a pinned schema that doesn't exist is refused at startup rather
+    /// than silently resolving to another schema.
+    #[tokio::test]
+    #[ignore]
+    async fn pg_a_missing_pinned_schema_is_refused() {
+        let url = std::env::var("DATABASE_URL").unwrap();
+        let conn = queryflux_core::config::PostgresPersistenceConfig {
+            url: Some(url),
+            schema: Some(format!(
+                "qf_missing_{}",
+                unique_id("").trim_start_matches('-')
+            )),
+            ..Default::default()
+        };
+        let store = PostgresStore::connect_from_config(&conn.connection_url().unwrap(), &conn)
+            .await
+            .unwrap();
+        let err = store.verify_schema().await.unwrap_err().to_string();
+        assert!(err.contains("does not exist"), "{err}");
     }
 
     #[tokio::test]
