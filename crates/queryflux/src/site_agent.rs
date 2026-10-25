@@ -447,6 +447,9 @@ fn start(
     worker_secret: String,
     prometheus: Arc<PrometheusMetrics>,
 ) -> Result<Agent> {
+    // Upstream trims site names (validation and `workerApi.sites`); every site-derived value
+    // here uses the same trimmed name, so a stray space can't split this site's identity.
+    let site_name = agent.site_name.trim().to_string();
     let state_dir = PathBuf::from(&agent.state_dir);
     std::fs::create_dir_all(&state_dir).with_context(|| {
         format!(
@@ -459,7 +462,7 @@ fn start(
     let relay = Arc::new(Relay {
         served: Mutex::new(None),
         status: Mutex::new(AgentStatus {
-            site: agent.site_name.clone(),
+            site: site_name.clone(),
             upstream: agent.upstream.url.clone(),
             ..Default::default()
         }),
@@ -469,12 +472,12 @@ fn start(
             .then(|| state_dir.join("snapshot.json")),
     });
     let host = std::env::var("HOSTNAME").unwrap_or_else(|_| "site-agent".to_string());
-    let agent_name = format!("{}/{host}", agent.site_name);
+    let agent_name = format!("{site_name}/{host}");
     let spool = HistorySpool::open(
         state_dir.join("spool"),
         agent.history_spool.max_bytes,
         agent_name.clone(),
-        agent.site_name.clone(),
+        site_name.clone(),
         &agent.upstream,
         {
             let relay = relay.clone();
@@ -490,7 +493,7 @@ fn start(
             &agent.upstream,
             OnCoordinationUnavailable::FailClosed,
         )
-        .with_holder_prefix(format!("{}/", agent.site_name)),
+        .with_holder_prefix(format!("{site_name}/")),
     );
     let api = WorkerApi {
         shared_secret: worker_secret,
@@ -523,7 +526,7 @@ fn start(
         registry,
         spool.clone(),
         agent.upstream.clone(),
-        agent.site_name.clone(),
+        site_name.clone(),
         agent_name,
         shutdown_rx.clone(),
     ));
@@ -636,6 +639,11 @@ mod tests {
 
     impl Upstream {
         async fn start() -> Self {
+            Self::start_limited_to(None).await
+        }
+
+        /// dc1 limited to `clusters` (`workerApi.sites[].clusters`).
+        async fn start_limited_to(clusters: Option<Vec<String>>) -> Self {
             let current = Arc::new(std::sync::Mutex::new(snapshot(3)));
             let (changes, rx) = watch::channel(0u64);
             let up = Arc::new(AtomicBool::new(true));
@@ -661,6 +669,7 @@ mod tests {
                         use sha2::Digest;
                         format!("{:x}", sha2::Sha256::digest(b"site-secret"))
                     }],
+                    clusters,
                 }],
             };
             let gate = up.clone();
@@ -1047,6 +1056,94 @@ mod tests {
         // `onUnavailable` decides.
         up.up.store(false, Ordering::SeqCst);
         assert!(worker.try_acquire("duck", 10, "w1", "q2").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_site_limited_to_its_clusters_gets_only_those() {
+        use crate::config_source::{ConfigSource, LiveHandles, RemoteConfigSource};
+        let up = Upstream::start_limited_to(Some(vec!["duck".into()])).await;
+        let mut full = snapshot(3);
+        full.clusters.push(SnapshotCluster {
+            name: "trino-dc2".into(),
+            enabled: true,
+            engine_key: "trino".into(),
+            max_running_queries: None,
+            config: serde_json::json!({
+                "endpoint": "http://trino.dc2:8080",
+                "authType": "basic",
+                "authUsername": "svc",
+                "authPassword": "dc2-s3cret"
+            }),
+            variants: serde_json::json!([]),
+        });
+        full.groups.insert(
+            "dc2".into(),
+            serde_json::from_value(serde_json::json!({
+                "members": ["trino-dc2"], "maxRunningQueries": 10
+            }))
+            .unwrap(),
+        );
+        let full = full.seal();
+        up.publish(full.clone());
+        let dc1 = full.for_site(&["duck".to_string()]);
+
+        let dir = tempfile::tempdir().unwrap();
+        let (url, _stop) = agent(&up.url, dir.path()).await;
+        eventually(|| async {
+            served_revision(&url).await.as_deref() == Some(dc1.revision.as_str())
+        })
+        .await;
+        let served = reqwest::Client::new()
+            .get(format!("{url}/worker/config"))
+            .bearer_auth("worker-secret")
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        assert!(!served.contains("dc2-s3cret"), "{served}");
+
+        // A worker activates it: dc2's group is there, with no cluster.
+        let cp: ControlPlaneClientConfig = serde_json::from_value(serde_json::json!({
+            "url": url, "allowInsecureHttp": true, "pollTimeoutSecs": 1,
+            "auth": { "mode": "sharedSecret", "sharedSecret": "worker-secret" }
+        }))
+        .unwrap();
+        let state = Arc::new(std::sync::Mutex::new(
+            crate::config_source::WorkerSyncState::default(),
+        ));
+        let handles = LiveHandles {
+            live: Arc::new(tokio::sync::RwLock::new(
+                crate::live_config::empty_live_config(),
+            )),
+            cache: Arc::new(tokio::sync::Mutex::new(
+                crate::live_config::AdapterReloadCache {
+                    adapters: Default::default(),
+                    config_json: Default::default(),
+                    cluster_states: Default::default(),
+                    routing_fallback: String::new(),
+                    routers_cfg: Vec::new(),
+                    strategies: Default::default(),
+                },
+            )),
+            metrics: Arc::new(queryflux_metrics::NoopMetricsStore),
+            changed: None,
+            translation: None,
+        };
+        RemoteConfigSource::new(&cp, state.clone())
+            .reload(&handles)
+            .await;
+        let synced = state.lock().unwrap().clone();
+        assert_eq!(
+            synced.active_revision.as_deref(),
+            Some(dc1.revision.as_str()),
+            "{:?}",
+            synced.last_error
+        );
+        let cache = handles.cache.lock().await;
+        assert!(cache.adapters.contains_key("duck"));
+        assert!(!cache.adapters.contains_key("trino-dc2"));
     }
 
     #[tokio::test]

@@ -77,12 +77,18 @@ queryflux:
       - name: us-east-dc1      # the agent's siteName
         tokens:                # printf %s "$TOKEN" | sha256sum
           - <64 hex characters>
+        clusters: [trino-dc1]  # optional: the only clusters this site gets
 ```
 
 A caller presenting a site's token is that site's agent, and it can act only for that site:
 - Its fleet reports and history must name its own site, or they're refused with `403`. History that names no site is attributed to the token's site.
 - Its own record is stored as `<site>/<name>`, with kind `siteAgent` and label `site` set to its site, whatever it reports.
 - It can hold capacity only as `<site>/<worker>`, the agent's holder prefix.
+- Its workers' sweeps (engine reconcile, zombie and stale-queue eviction, …) run under the site's own locks (`<site>/<sweep>`), so one worker per site runs each sweep and sites never wait on each other.
+
+With `clusters` set, the site's agent gets a snapshot with only those clusters: other sites' cluster endpoints and cluster credentials never reach it. It is not full tenant isolation: only clusters and group members are filtered. Group definitions, routers and the routing fallback, per-group translation scripts, and the global settings (`security`, `catalog`, `guardrails`, `accessControl` and guard script bodies) reach every site. Leaving `clusters` out gives the site every cluster. A blank `clusters:` gives it none, so a mistake can't hand it every cluster. Groups keep only those members. A group left with no member stays, so routes to it still resolve, and its queries fail at this site with no cluster available. The site gets its own revision, and the fleet view compares the site's agent and workers with it.
+
+The site can also act only on those clusters. Capacity calls (acquire, release, wait, quota reports) and running counts (read and publish) for any other cluster are refused with `403`. A site without `clusters` isn't limited.
 
 To rotate a token, list the new hash next to the old one, restart the control plane, move the agent to the new token, then remove the old hash. Agents serve their cached config while the control plane restarts. A token can't be recovered from its hash; a lost token is replaced the same way.
 
@@ -184,6 +190,6 @@ Alert on `queryflux_agent_upstream_up == 0` lasting longer than you expect, and 
 
 ## Limitations
 
-- Upstream sends every site the whole config; it doesn't filter the snapshot per site.
+- A site without `workerApi.sites[].clusters` gets the whole config.
 - Capacity is forwarded, not held at the site. A site-wide quota held by the agent, which would keep admitting after per-worker quotas expire during a long outage, is planned.
 - Studio actions that must reach engines from inside the site (test a connection, browse a catalog) do not run through the agent yet.

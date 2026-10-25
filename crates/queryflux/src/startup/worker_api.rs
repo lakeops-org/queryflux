@@ -106,6 +106,7 @@ pub(crate) fn worker_api(
             .map(|s| queryflux_core::config::WorkerApiSite {
                 name: s.name.trim().to_string(),
                 tokens: s.tokens.iter().map(|h| h.to_ascii_lowercase()).collect(),
+                clusters: s.clusters.clone(),
             })
             .collect(),
     }))

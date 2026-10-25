@@ -70,6 +70,29 @@ pub struct WorkerApi {
     pub sites: Vec<queryflux_core::config::WorkerApiSite>,
 }
 
+impl WorkerApi {
+    /// The clusters `site` is limited to (`workerApi.sites[].clusters`), if any.
+    pub fn site_clusters(&self, site: &str) -> Option<&[String]> {
+        self.sites
+            .iter()
+            .find(|s| s.name == site)
+            .and_then(|s| s.clusters.as_deref())
+    }
+
+    /// The snapshot as `who` gets it.
+    /// ponytail: re-filtered and re-sealed per request; cache per site if many agents
+    /// long-poll one control plane.
+    fn view(&self, who: &Caller, snapshot: WorkerSnapshotV1) -> WorkerSnapshotV1 {
+        match who {
+            Caller::Site(site) => match self.site_clusters(site) {
+                Some(clusters) => snapshot.for_site(clusters),
+                None => snapshot,
+            },
+            Caller::Fleet => snapshot,
+        }
+    }
+}
+
 /// Largest query-record batch accepted. Workers send at most a few hundred records.
 const MAX_RECORD_BATCH_BYTES: usize = 32 * 1024 * 1024;
 /// Query-record batches written at once. Each holds one connection of the admin pool
@@ -235,6 +258,25 @@ fn foreign_holder(st: &WorkerApiState, headers: &HeaderMap, instance_id: &str) -
     }
 }
 
+/// A site limited to some clusters (`workerApi.sites[].clusters`) may only act on those
+/// clusters: capacity (acquire, release, wait, quota reports) and counts (read and publish).
+/// A site without `clusters` is not limited. `None` when the call may go ahead.
+fn foreign_cluster(st: &WorkerApiState, headers: &HeaderMap, cluster: &str) -> Option<Response> {
+    match caller(&st.api, headers) {
+        Some(Caller::Site(site))
+            if st
+                .api
+                .site_clusters(&site)
+                .is_some_and(|own| !own.iter().any(|c| c == cluster)) =>
+        {
+            Some(forbidden(format!(
+                "site {site} may not act on cluster '{cluster}'"
+            )))
+        }
+        _ => None,
+    }
+}
+
 fn etag(revision: &str) -> String {
     format!("\"{revision}\"")
 }
@@ -280,12 +322,12 @@ fn unauthorized() -> Response {
 }
 
 async fn get_config(State(st): State<Arc<WorkerApiState>>, headers: HeaderMap) -> Response {
-    if caller(&st.api, &headers).is_none() {
+    let Some(who) = caller(&st.api, &headers) else {
         return unauthorized();
-    }
+    };
     match (st.api.snapshot)().await {
         Ok(snapshot) => snapshot_response(
-            &snapshot,
+            &st.api.view(&who, snapshot),
             headers
                 .get(header::IF_NONE_MATCH)
                 .and_then(|v| v.to_str().ok()),
@@ -306,16 +348,16 @@ async fn wait_config(
     headers: HeaderMap,
     Query(params): Query<WaitParams>,
 ) -> Response {
-    if caller(&st.api, &headers).is_none() {
+    let Some(who) = caller(&st.api, &headers) else {
         return unauthorized();
-    }
+    };
     let timeout =
         std::time::Duration::from_secs(params.timeout_secs.unwrap_or(30).min(MAX_WAIT_SECS));
     let deadline = tokio::time::Instant::now() + timeout;
     let mut changes = st.api.changes.clone();
     loop {
         let snapshot = match (st.api.snapshot)().await {
-            Ok(s) => s,
+            Ok(s) => st.api.view(&who, s),
             Err(message) => return unavailable(message),
         };
         if params.since.as_deref() != Some(snapshot.revision.as_str()) {
@@ -612,7 +654,9 @@ async fn capacity_acquire(
         Ok(s) => s,
         Err(r) => return r,
     };
-    if let Some(r) = foreign_holder(&st, &headers, &req.instance_id) {
+    if let Some(r) = foreign_holder(&st, &headers, &req.instance_id)
+        .or_else(|| foreign_cluster(&st, &headers, &req.cluster))
+    {
         return r;
     }
     match store
@@ -638,6 +682,9 @@ async fn capacity_release(
         Ok(s) => s,
         Err(r) => return r,
     };
+    if let Some(r) = foreign_cluster(&st, &headers, &req.cluster) {
+        return r;
+    }
     match store.release(&req.cluster, &req.query_id).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => store_error(e),
@@ -664,6 +711,9 @@ async fn capacity_wait(
         Ok(s) => s,
         Err(r) => return r,
     };
+    if let Some(r) = foreign_cluster(&st, &headers, &req.cluster) {
+        return r;
+    }
     let wait = std::time::Duration::from_millis(req.wait_ms.min(5_000));
     match store
         .wait_for_grant(&req.cluster, &req.query_id, wait)
@@ -711,7 +761,11 @@ async fn capacity_quota(
         Ok(s) => s,
         Err(r) => return r,
     };
-    if let Some(r) = foreign_holder(&st, &headers, &req.instance_id) {
+    if let Some(r) = foreign_holder(&st, &headers, &req.instance_id).or_else(|| {
+        req.clusters
+            .iter()
+            .find_map(|d| foreign_cluster(&st, &headers, &d.cluster))
+    }) {
         return r;
     }
     match store.report_demand(&req.instance_id, &req.clusters).await {
@@ -749,6 +803,13 @@ async fn capacity_release_batch(
         Ok(s) => s,
         Err(r) => return r,
     };
+    if let Some(r) = req
+        .leases
+        .iter()
+        .find_map(|l| foreign_cluster(&st, &headers, &l.cluster))
+    {
+        return r;
+    }
     let leases: Vec<(String, String)> = req
         .leases
         .into_iter()
@@ -805,6 +866,9 @@ async fn running_get(
         Ok(s) => s,
         Err(r) => return r,
     };
+    if let Some(r) = foreign_cluster(&st, &headers, &q.cluster) {
+        return r;
+    }
     match store.active_count(&q.cluster).await {
         Ok(n) => Json(serde_json::json!({ "count": n })).into_response(),
         Err(e) => store_error(e),
@@ -820,6 +884,11 @@ async fn running_publish(
         Ok(s) => s,
         Err(r) => return r,
     };
+    // Site agents relay their workers' engine counts, so sites may publish, but only for
+    // their own clusters.
+    if let Some(r) = foreign_cluster(&st, &headers, &req.cluster) {
+        return r;
+    }
     match store.publish_running_count(&req.cluster, req.count).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => store_error(e),
@@ -835,9 +904,22 @@ async fn lease_count(
         Ok(s) => s,
         Err(r) => return r,
     };
+    if let Some(r) = foreign_cluster(&st, &headers, &q.cluster) {
+        return r;
+    }
     match store.active_lease_count(&q.cluster).await {
         Ok(n) => Json(serde_json::json!({ "count": n })).into_response(),
         Err(e) => store_error(e),
+    }
+}
+
+/// The lock a sweep runs under. A site's workers coordinate sweeps among themselves
+/// (`<site>/<name>`): with per-site cluster lists, one fleet-wide `engine-reconcile` holder
+/// would only reconcile its own site's engines. The fleet keeps the plain name.
+fn sweep_lock_name(who: Option<&Caller>, name: String) -> String {
+    match who {
+        Some(Caller::Site(site)) => format!("{site}/{name}"),
+        _ => name,
     }
 }
 
@@ -862,6 +944,7 @@ async fn sweep_lock_acquire(
             guard.release().await;
         }
     }
+    let name = sweep_lock_name(caller(&st.api, &headers).as_ref(), name);
     match store.try_sweep_lock(&name).await {
         Ok(Some(guard)) => {
             let token = uuid::Uuid::new_v4().to_string();
@@ -1219,6 +1302,117 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
+    /// A site limited to its clusters takes capacity and publishes running counts only on them.
+    #[tokio::test]
+    async fn a_site_acts_only_on_its_clusters() {
+        use sha2::Digest;
+        let store = Arc::new(queryflux_persistence::in_memory::InMemoryPersistence::new());
+        let s = snapshot();
+        let app = router(WorkerApi {
+            shared_secret: "fleet-secret".into(),
+            snapshot: Arc::new(move || {
+                let s = s.clone();
+                Box::pin(async move { Ok(s) })
+            }),
+            registry: Some(store.clone()),
+            changes: None,
+            coordination: Some(store.clone()),
+            history: Some(store.clone()),
+            quotas: None,
+            sites: vec![queryflux_core::config::WorkerApiSite {
+                name: "dc1".into(),
+                tokens: vec![format!("{:x}", sha2::Sha256::digest(b"t-dc1"))],
+                clusters: Some(vec!["own".into()]),
+            }],
+        });
+        let call = |method: &str, path: String, token: &str, body: Option<serde_json::Value>| {
+            let req = Request::builder()
+                .method(method)
+                .uri(path)
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(body.map_or_else(Body::empty, |b| Body::from(b.to_string())))
+                .unwrap();
+            let app = app.clone();
+            async move { app.oneshot(req).await.unwrap() }
+        };
+        let site = |method: &'static str, path: &str, body: Option<serde_json::Value>| {
+            let fut = call(method, path.to_string(), "t-dc1", body);
+            async move { fut.await.status() }
+        };
+
+        for (cluster, ok) in [("own", true), ("other", false)] {
+            let expect = |status: StatusCode| if ok { status } else { StatusCode::FORBIDDEN };
+            let q = format!("q-{cluster}");
+            let lease = serde_json::json!({ "cluster": cluster, "queryId": q });
+            let cases = [
+                (
+                    "POST",
+                    "/worker/capacity/acquire".to_string(),
+                    Some(serde_json::json!({
+                        "cluster": cluster, "maxRunningQueries": 5,
+                        "instanceId": "dc1/w", "queryId": q
+                    })),
+                    StatusCode::OK,
+                ),
+                (
+                    "POST",
+                    "/worker/capacity/wait".to_string(),
+                    Some(serde_json::json!({ "cluster": cluster, "queryId": q })),
+                    StatusCode::OK,
+                ),
+                (
+                    "POST",
+                    "/worker/capacity/release".to_string(),
+                    Some(lease.clone()),
+                    StatusCode::NO_CONTENT,
+                ),
+                (
+                    "POST",
+                    "/worker/capacity/release-batch".to_string(),
+                    Some(serde_json::json!({ "leases": [lease] })),
+                    StatusCode::NO_CONTENT,
+                ),
+                (
+                    "POST",
+                    "/worker/capacity/running".to_string(),
+                    Some(serde_json::json!({ "cluster": cluster, "count": 3 })),
+                    StatusCode::NO_CONTENT,
+                ),
+                (
+                    "GET",
+                    format!("/worker/capacity/running?cluster={cluster}"),
+                    None,
+                    StatusCode::OK,
+                ),
+                (
+                    "GET",
+                    format!("/worker/capacity/leases?cluster={cluster}"),
+                    None,
+                    StatusCode::OK,
+                ),
+            ];
+            for (method, path, body, status) in cases {
+                assert_eq!(
+                    site(method, &path, body).await,
+                    expect(status),
+                    "{method} {path}"
+                );
+            }
+        }
+
+        // A site's sweeps are its own; the fleet keeps the plain name.
+        let site = Caller::Site("dc1".into());
+        assert_eq!(
+            sweep_lock_name(Some(&site), "engine-reconcile".into()),
+            "dc1/engine-reconcile"
+        );
+        assert_eq!(
+            sweep_lock_name(Some(&Caller::Fleet), "engine-reconcile".into()),
+            "engine-reconcile"
+        );
+    }
+
     /// A blank bearer token is no one, even against a blank shared secret or a site whose
     /// token list holds the hash of "" (both refused by config validation, but the API must
     /// not rely on that).
@@ -1241,6 +1435,7 @@ mod tests {
             sites: vec![queryflux_core::config::WorkerApiSite {
                 name: "dc1".into(),
                 tokens: vec![empty_hash],
+                clusters: None,
             }],
         });
         for auth in ["Bearer ", "Bearer    ", "bearer "] {
@@ -1274,10 +1469,12 @@ mod tests {
                 queryflux_core::config::WorkerApiSite {
                     name: "dc1".into(),
                     tokens: vec![hash("old-dc1"), hash("t-dc1")],
+                    clusters: None,
                 },
                 queryflux_core::config::WorkerApiSite {
                     name: "dc2".into(),
                     tokens: vec![hash("t-dc2")],
+                    clusters: None,
                 },
             ],
         });
