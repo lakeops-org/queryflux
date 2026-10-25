@@ -2041,6 +2041,18 @@ impl ConfigRevisionStore for PostgresStore {
         Ok(row.0 as u64)
     }
 
+    async fn bump_revision_if(&self, expected: u64) -> Result<Option<u64>> {
+        let row: Option<(i64,)> = sqlx::query_as(
+            "UPDATE config_revision SET revision = revision + 1, updated_at = now()
+             WHERE id = TRUE AND revision = $1 RETURNING revision",
+        )
+        .bind(expected as i64)
+        .fetch_optional(&self.admin_pool)
+        .await
+        .map_err(|e| QueryFluxError::Persistence(format!("bump_revision_if: {e}")))?;
+        Ok(row.map(|(r,)| r as u64))
+    }
+
     async fn subscribe_revisions(&self) -> Result<Option<tokio::sync::mpsc::Receiver<u64>>> {
         let database_url = self.database_url.clone();
         let (tx, rx) = tokio::sync::mpsc::channel::<u64>(16);
@@ -3261,6 +3273,16 @@ mod tests {
         store.migrate().await.unwrap();
         store.verify_schema().await.unwrap();
         store
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DATABASE_URL"]
+    async fn pg_a_revision_is_claimed_once() {
+        let store = schema_store("qf_revision_claim_test").await;
+        let now = store.current_revision().await.unwrap();
+        assert_eq!(store.bump_revision_if(now).await.unwrap(), Some(now + 1));
+        assert_eq!(store.bump_revision_if(now).await.unwrap(), None);
+        assert_eq!(store.current_revision().await.unwrap(), now + 1);
     }
 
     #[tokio::test]

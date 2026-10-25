@@ -305,6 +305,11 @@ pub trait ConfigRevisionStore: Send + Sync {
     /// Must be called inside (or immediately after) every admin write.
     async fn bump_revision(&self) -> Result<u64>;
 
+    /// Increment the revision only if it is still `expected`: the new revision, or `None`
+    /// when it moved. A conditional write claims its revision with this before writing,
+    /// so of two writers that read the same revision only one proceeds.
+    async fn bump_revision_if(&self, expected: u64) -> Result<Option<u64>>;
+
     /// Return a receiver that yields the new revision each time it changes.
     /// `None` means push is not supported; callers should poll
     /// [`Self::current_revision`] on a timer instead.
