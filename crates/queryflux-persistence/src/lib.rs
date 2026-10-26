@@ -644,6 +644,20 @@ pub struct WorkerStatus {
     /// Hub only: the revision it serves its workers. Differs from `activeRevision`
     /// (upstream's) when the hub re-sealed the snapshot without a history endpoint.
     pub served_revision: Option<String>,
+    /// Worker only: each engine cluster as this worker's health checks last saw it. A
+    /// control plane that cannot reach the engines (hosted away from them) learns their
+    /// health from here.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub clusters: Vec<ClusterHealthStatus>,
+}
+
+#[derive(
+    Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize, utoipa::ToSchema,
+)]
+#[serde(rename_all = "camelCase")]
+pub struct ClusterHealthStatus {
+    pub name: String,
+    pub healthy: bool,
 }
 
 #[derive(
