@@ -817,8 +817,19 @@ pub(crate) async fn run(
         backend.is_some(),
     ));
 
-    let test_cluster_fn: TestClusterFn = Arc::new(|engine_key, config_json| {
+    // A control plane with no query listener runs away from the engines (hosted): it
+    // cannot reach them, and their health comes from the workers at the site.
+    let reaches_engines = config.queryflux.role != queryflux_core::config::Role::ControlPlane
+        || startup::tasks::serves_queries(&config.queryflux.frontends);
+    let test_cluster_fn: TestClusterFn = Arc::new(move |engine_key, config_json| {
         Box::pin(async move {
+            if !reaches_engines {
+                anyhow::bail!(
+                    "This control plane does not connect to engines; the site's workers do. \
+                     Save the cluster, then check its health in each worker's \
+                     status.clusters (GET /admin/workers)."
+                );
+            }
             let adapter = registered_engines::build_adapter_from_record(
                 ClusterName("__test__".to_string()),
                 ClusterGroupName("__test__".to_string()),
@@ -1062,7 +1073,12 @@ pub(crate) async fn run(
         };
         tokio::spawn(run_reload_loop(source, handles, shutdown_rx.clone()));
         if is_worker {
-            startup::tasks::spawn_worker_heartbeat(&config, &worker_sync_state, &shutdown_rx);
+            startup::tasks::spawn_worker_heartbeat(
+                &config,
+                &worker_sync_state,
+                &live,
+                &shutdown_rx,
+            );
             if let Some(uplink) = &history_uplink {
                 uplink.spawn_flusher(shutdown_rx.clone());
             }
