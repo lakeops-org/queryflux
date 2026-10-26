@@ -55,10 +55,11 @@ async fn main() -> Result<()> {
                         .unwrap_or_else(|_| "queryflux=info".into()),
                 )
                 .init();
-            let config = YamlFileConfigProvider::new(&config)
+            let mut config = YamlFileConfigProvider::new(&config)
                 .load()
                 .await
                 .context("Failed to load config")?;
+            config.apply_env_overrides(|k| std::env::var(k).ok());
             queryflux_persistence::run_persistence_migrations(&config.queryflux.persistence)
                 .await
                 .context("Migration failed")?;
@@ -70,10 +71,11 @@ async fn main() -> Result<()> {
 
     // Load config before initializing the tracing subscriber so that
     // `otlpEndpoint` from the config file can feed the OTel layer.
-    let config = YamlFileConfigProvider::new(&config_path)
+    let mut config = YamlFileConfigProvider::new(&config_path)
         .load()
         .await
         .context("Failed to load config")?;
+    config.apply_env_overrides(|k| std::env::var(k).ok());
 
     // Initialize tracing subscriber — with OTel if configured.
     {

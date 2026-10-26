@@ -1,0 +1,90 @@
+# A site's hub, installed with one command: the config is rendered by the chart and the
+# two secrets come from a Secret, so nothing has to be hand-written into a config file.
+#
+#   kubectl -n queryflux create secret generic queryflux-site \
+#     --from-literal=enrollToken=qfe_...      # POST /admin/sites/{site}/enrollment-tokens
+#     --from-literal=workerSecret=$(openssl rand -hex 32)
+#   helm install queryflux-hub ./charts/queryflux -n queryflux \
+#     -f ./charts/queryflux/examples/site-hub-values.yaml \
+#     --set config.data.queryflux.hub.site=us-east-dc1 \
+#     --set config.data.queryflux.hub.upstream.url=https://acme.cp.example.com
+#
+# Then install the site's workers with site-workers-values.yaml (same Secret). On first
+# start the hub enrolls its own key and keeps it on its volume; the token is then spent.
+
+replicaCount: 1
+
+workload:
+  kind: StatefulSet
+  volumeClaimTemplates:
+    - metadata:
+        name: state
+      spec:
+        accessModes: [ReadWriteOnce]
+        # The cached snapshot can carry engine credentials: use an encrypted storage class.
+        resources:
+          requests:
+            storage: 2Gi
+
+extraVolumeMounts:
+  - name: state
+    mountPath: /var/lib/queryflux/hub
+
+env:
+  - name: QUERYFLUX_HUB_ENROLL_TOKEN
+    valueFrom:
+      secretKeyRef: { name: queryflux-site, key: enrollToken }
+  - name: QUERYFLUX_WORKER_SECRET
+    valueFrom:
+      secretKeyRef: { name: queryflux-site, key: workerSecret }
+
+config:
+  data:
+    queryflux:
+      role: hub
+      externalAddress: null
+      frontends:
+        trinoHttp:
+          enabled: false
+      persistence: null
+      hub:
+        site: ""
+        stateDir: /var/lib/queryflux/hub
+        upstream:
+          url: ""
+          pollTimeoutSecs: 30
+          heartbeatIntervalSecs: 10
+        historySpool:
+          maxBytes: 1073741824
+    # A hub has no config of its own: it serves upstream's.
+    clusterGroups: null
+    translation: null
+    routers: null
+    routingFallback: null
+
+studio:
+  enabled: false
+
+service:
+  headless:
+    enabled: true
+  ports:
+    trinoHttp:
+      enabled: false
+    studio:
+      enabled: false
+
+startupProbe:
+  httpGet:
+    path: /readyz
+    port: admin
+  periodSeconds: 2
+  timeoutSeconds: 2
+  failureThreshold: 150
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    memory: 512Mi
