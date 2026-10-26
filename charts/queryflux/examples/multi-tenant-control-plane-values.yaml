@@ -1,0 +1,96 @@
+# One control plane for many tenants (controlPlane.tenancy). Each tenant's state is in
+# its own schema of one Postgres database.
+#
+#   kubectl -n queryflux create secret generic queryflux-platform \
+#     --from-literal=persistenceUrl=postgres://qf:...@db:5432/queryflux \
+#     --from-literal=platformToken=$(openssl rand -hex 32)
+#   helm install queryflux-cp ./charts/queryflux -n queryflux \
+#     -f ./charts/queryflux/examples/multi-tenant-control-plane-values.yaml
+#
+# Hubs reach https://<tenant>.cp.example.com/worker/* through the Ingress. The platform
+# API (port 9100: tenants, and each tenant's admin API with X-QueryFlux-Tenant) has no
+# Ingress: keep it on the internal network.
+
+replicaCount: 2
+
+env:
+  - name: QUERYFLUX_PERSISTENCE_URL
+    valueFrom:
+      secretKeyRef: { name: queryflux-platform, key: persistenceUrl }
+  - name: QUERYFLUX_PLATFORM_TOKEN
+    valueFrom:
+      secretKeyRef: { name: queryflux-platform, key: platformToken }
+
+config:
+  data:
+    queryflux:
+      role: controlPlane
+      externalAddress: null
+      frontends:
+        trinoHttp:
+          enabled: false
+      persistence:
+        type: postgres
+        # From QUERYFLUX_PERSISTENCE_URL.
+        url: ""
+        # Per tenant: every tenant holds 3 pools of this size.
+        poolSize: 4
+      controlPlane:
+        tenancy:
+          hostSuffix: .cp.example.com
+          platformPort: 9100
+    # Tenants start empty; their clusters come through their admin API.
+    clusterGroups: null
+    translation: null
+    routers: null
+    routingFallback: null
+
+studio:
+  enabled: false
+
+service:
+  ports:
+    trinoHttp:
+      enabled: false
+    studio:
+      enabled: false
+    platform:
+      enabled: true
+      name: platform
+      port: 9100
+      targetPort: 9100
+      protocol: TCP
+
+# The admin port answers /health; tenant paths need a tenant's host.
+startupProbe:
+  httpGet:
+    path: /health
+    port: admin
+  periodSeconds: 2
+  timeoutSeconds: 2
+  failureThreshold: 60
+livenessProbe:
+  httpGet:
+    path: /health
+    port: admin
+readinessProbe:
+  httpGet:
+    path: /health
+    port: admin
+
+pdb:
+  enabled: true
+  maxUnavailable: 1
+
+ingress:
+  enabled: true
+  className: nginx
+  hosts:
+    - host: "*.cp.example.com"
+      paths:
+        - path: /worker
+          pathType: Prefix
+          servicePortName: admin
+  tls:
+    - hosts: ["*.cp.example.com"]
+      secretName: queryflux-cp-wildcard-tls

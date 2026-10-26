@@ -329,7 +329,7 @@ fn config_requires_translation(config: &ProxyConfig) -> bool {
 async fn handle_validation(config_path: &str) -> anyhow::Result<()> {
     println!("Validating configuration file: {}", config_path);
     let config_res = YamlFileConfigProvider::new(config_path).load().await;
-    let config = match config_res {
+    let mut config = match config_res {
         Ok(c) => {
             println!("✓ Configuration file is valid YAML and matches the schema.");
             c
@@ -342,6 +342,8 @@ async fn handle_validation(config_path: &str) -> anyhow::Result<()> {
         }
     };
 
+    // As at startup: secrets may come from the environment.
+    config.apply_env_overrides(|k| std::env::var(k).ok());
     if let Err(issues) = config.validate_role() {
         for issue in &issues {
             eprintln!("✗ {issue}");

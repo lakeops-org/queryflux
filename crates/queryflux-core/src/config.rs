@@ -148,7 +148,31 @@ pub struct ProxyConfig {
     pub access_control: Option<crate::access_config::AccessControlConfig>,
 }
 
+/// Environment variables that override secrets in the config file, so the file can be a
+/// plain ConfigMap and the secrets come from a Kubernetes Secret.
+pub const ENV_WORKER_SECRET: &str = "QUERYFLUX_WORKER_SECRET";
+pub const ENV_HUB_ENROLL_TOKEN: &str = "QUERYFLUX_HUB_ENROLL_TOKEN";
+pub const ENV_PERSISTENCE_URL: &str = "QUERYFLUX_PERSISTENCE_URL";
+
 impl ProxyConfig {
+    /// Apply [`ENV_WORKER_SECRET`], [`ENV_HUB_ENROLL_TOKEN`] (when `hub` is configured)
+    /// and [`ENV_PERSISTENCE_URL`] (when persistence is Postgres) over the file's values.
+    /// Empty variables are ignored.
+    pub fn apply_env_overrides(&mut self, var: impl Fn(&str) -> Option<String>) {
+        let var = |name: &str| var(name).filter(|v| !v.trim().is_empty());
+        if let Some(secret) = var(ENV_WORKER_SECRET) {
+            self.queryflux.worker_secret = Some(secret);
+        }
+        if let (Some(token), Some(hub)) = (var(ENV_HUB_ENROLL_TOKEN), self.queryflux.hub.as_mut()) {
+            hub.upstream.enroll_token = Some(token);
+        }
+        if let (Some(url), PersistenceConfig::Postgres { conn }) =
+            (var(ENV_PERSISTENCE_URL), &mut self.queryflux.persistence)
+        {
+            conn.url = Some(url);
+        }
+    }
+
     /// Check the settings that depend on `queryflux.role`. Returns every problem found.
     ///
     /// A worker owns no config: it rejects settings that the control plane provides
@@ -4703,5 +4727,34 @@ queryflux:
         assert!(issues
             .iter()
             .any(|i| i.contains("only applies to role: hub")));
+    }
+    #[test]
+    fn secrets_can_come_from_the_environment() {
+        let mut c = parse(HUB);
+        let env: std::collections::HashMap<&str, &str> = [
+            (ENV_WORKER_SECRET, "ws-env"),
+            (ENV_HUB_ENROLL_TOKEN, "qfe_env"),
+            (ENV_PERSISTENCE_URL, "postgres://env/db"),
+        ]
+        .into();
+        c.apply_env_overrides(|k| env.get(k).map(|v| v.to_string()));
+        assert_eq!(c.queryflux.worker_secret.as_deref(), Some("ws-env"));
+        assert_eq!(
+            c.queryflux.hub.unwrap().upstream.enroll_token.as_deref(),
+            Some("qfe_env")
+        );
+        // Not Postgres: the URL is not applied. Empty variables change nothing.
+        let mut pg = parse(
+            "queryflux:\n  workerSecret: file\n  persistence: { type: postgres, url: postgres://file/db }\n",
+        );
+        pg.apply_env_overrides(|k| match k {
+            ENV_PERSISTENCE_URL => Some("postgres://env/db".into()),
+            _ => Some("  ".into()),
+        });
+        assert_eq!(pg.queryflux.worker_secret.as_deref(), Some("file"));
+        let PersistenceConfig::Postgres { conn } = &pg.queryflux.persistence else {
+            panic!()
+        };
+        assert_eq!(conn.url.as_deref(), Some("postgres://env/db"));
     }
 }

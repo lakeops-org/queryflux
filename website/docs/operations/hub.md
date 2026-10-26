@@ -157,6 +157,22 @@ helm install queryflux-hub ./charts/queryflux -n queryflux \
 
 `examples/hub-values.yaml` sets `workload.kind: StatefulSet`, a `volumeClaimTemplates` entry mounted at `stateDir`, two replicas and a PodDisruptionBudget, and turns off Studio and the query ports. Then point the workers' `worker.upstream.url` at `http://queryflux-hub.<namespace>.svc:9000`.
 
+**A site in two commands.** Instead of writing a config file, keep the two secrets in a Secret. The chart renders the rest:
+
+```bash
+kubectl -n queryflux create secret generic queryflux-site \
+  --from-literal=enrollToken=qfe_... \
+  --from-literal=workerSecret=$(openssl rand -hex 32)
+helm install queryflux-hub ./charts/queryflux -n queryflux \
+  -f ./charts/queryflux/examples/site-hub-values.yaml \
+  --set config.data.queryflux.hub.site=us-east-dc1 \
+  --set config.data.queryflux.hub.upstream.url=https://cp.example.com
+helm install queryflux-workers ./charts/queryflux -n queryflux \
+  -f ./charts/queryflux/examples/site-workers-values.yaml
+```
+
+QueryFlux reads `QUERYFLUX_HUB_ENROLL_TOKEN` and `QUERYFLUX_WORKER_SECRET` from the environment over the config file's `hub.upstream.enrollToken` and `workerSecret`, and `QUERYFLUX_PERSISTENCE_URL` over a Postgres `persistence.url`. `queryflux validate` reads them too.
+
 **Docker Compose.** [`examples/hub`](https://github.com/lakeops-org/queryflux/tree/main/examples/hub) runs a control plane, a hub and two workers on a site network with no route to the control plane.
 
 **High availability.** Run two or more replicas behind one Service. Replicas don't coordinate with each other:

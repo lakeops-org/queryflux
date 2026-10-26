@@ -217,6 +217,8 @@ queryflux:
       platformPort: 9100          # internal: tenant lifecycle and admin APIs
 ```
 
+On Kubernetes, start from `charts/queryflux/examples/multi-tenant-control-plane-values.yaml`. It sets a wildcard Ingress for `/worker/*` and an internal platform port. The database URL and platform token come from a Secret.
+
 Set `QUERYFLUX_PLATFORM_TOKEN` (at least 16 characters). Every request to the platform
 listener must carry it as `Authorization: Bearer <token>`.
 
