@@ -812,8 +812,10 @@ pub(crate) fn serves_queries(f: &queryflux_core::config::FrontendsConfig) -> boo
 pub(crate) fn spawn_worker_heartbeat(
     config: &ProxyConfig,
     sync_state: &Arc<std::sync::Mutex<crate::config_source::WorkerSyncState>>,
+    live: &Arc<tokio::sync::RwLock<queryflux_frontend::state::LiveConfig>>,
     shutdown_rx: &watch::Receiver<bool>,
 ) {
+    let live = live.clone();
     let Some(worker) = config.queryflux.worker.clone() else {
         return;
     };
@@ -848,6 +850,16 @@ pub(crate) fn spawn_worker_heartbeat(
                 break;
             }
             let st = sync_state.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            let clusters = live
+                .read()
+                .await
+                .health_check_targets
+                .iter()
+                .map(|(_, c)| queryflux_persistence::ClusterHealthStatus {
+                    name: c.cluster_name.0.clone(),
+                    healthy: c.is_healthy(),
+                })
+                .collect();
             let report = queryflux_persistence::WorkerRecord {
                 name: name.clone(),
                 version: env!("CARGO_PKG_VERSION").to_string(),
@@ -885,6 +897,7 @@ pub(crate) fn spawn_worker_heartbeat(
                     }),
                     frontends: frontends.clone(),
                     served_revision: None,
+                    clusters,
                 },
                 kind: "worker".to_string(),
                 parent: None,

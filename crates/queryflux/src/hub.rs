@@ -1450,7 +1450,11 @@ mod tests {
         let up = Upstream::start().await;
         let dir = tempfile::tempdir().unwrap();
         let (url, _stop) = hub(&up, dir.path()).await;
-        let worker = serde_json::json!({ "name": "worker-0", "version": "test" });
+        // Engine health is seen at the site and reported up with the worker.
+        let worker = serde_json::json!({
+            "name": "worker-0", "version": "test",
+            "status": { "clusters": [{ "name": "trino-a", "healthy": false }] }
+        });
         let r = reqwest::Client::new()
             .post(format!("{url}/worker/register"))
             .bearer_auth("worker-secret")
@@ -1469,5 +1473,14 @@ mod tests {
                 && workers.iter().any(|w| w.kind == "hub")
         })
         .await;
+        let workers = up.store.list_workers(since).await.unwrap();
+        let relayed = workers.iter().find(|w| w.name == "dc1/worker-0").unwrap();
+        assert_eq!(
+            relayed.status.clusters,
+            vec![queryflux_persistence::ClusterHealthStatus {
+                name: "trino-a".into(),
+                healthy: false
+            }]
+        );
     }
 }
