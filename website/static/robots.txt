@@ -1,12 +1,29 @@
-# Dev/fallback copy — production build overwrites build/robots.txt via seoConfig.ts
+# Generated at build time — do not edit build/robots.txt by hand.
 # https://docusaurus.io/docs/seo#robots-file
+# Latest docs are /docs/. Drafts are /docs/next/ and carry noindex.
+# Allow lines are longer than the draft Disallow, so indexable docs stay crawlable.
+# GitHub Pages also serves each page at a .html URL; those duplicates are disallowed.
+# LLM index: https://queryflux.dev/llms.txt
+
 User-agent: *
+Allow: /llms.txt$
+Allow: /docs/architecture/frontends/overview$
+Allow: /docs/architecture/query-translation$
+Allow: /docs/architecture/auth-authz-design$
+Allow: /docs/
+Allow: /blog/
 Allow: /
-Disallow: /docs/next
+Disallow: /docs/next$
 Disallow: /docs/next/
-Disallow: /blog/tags
+Disallow: /blog/tags$
 Disallow: /blog/tags/
-Disallow: /blog/archive
-Disallow: /blog/authors
+Disallow: /blog/archive$
+Disallow: /blog/archive/
+Disallow: /blog/authors$
+Disallow: /blog/authors/
+Disallow: /index.html$
+Disallow: /community.html$
+Disallow: /docs/*.html$
+Disallow: /blog/*.html$
 
 Sitemap: https://queryflux.dev/sitemap.xml

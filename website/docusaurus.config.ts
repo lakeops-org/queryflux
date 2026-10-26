@@ -304,8 +304,9 @@ const config: Config = {
       {name: 'twitter:card', content: 'summary_large_image'},
       {name: 'twitter:site', content: '@lakeops'},
       {name: 'twitter:image:alt', content: 'QueryFlux multi-engine query routing overview'},
-      {property: 'og:image:width', content: '1024'},
-      {property: 'og:image:height', content: '682'},
+      {property: 'og:image:type', content: 'image/png'},
+      {property: 'og:image:width', content: '1200'},
+      {property: 'og:image:height', content: '799'},
     ],
   } satisfies Preset.ThemeConfig,
 };

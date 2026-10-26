@@ -1,6 +1,6 @@
 ---
-title: Hub
-description: Run one QueryFlux hub per site, so workers in a remote network reach the control plane through a single outbound connection, keep running during outages, and never need a route to it.
+title: Site hub for remote workers
+description: One QueryFlux hub per site. Remote workers reach the control plane through one outbound connection and keep running if that link drops.
 image: img/queryflux-hero-banner.png
 ---
 

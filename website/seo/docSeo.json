@@ -6,8 +6,8 @@
       "description": "QueryFlux docs — multi-engine SQL proxy for Trino, PostgreSQL, MySQL, Snowflake, and Flight. Routing, dialect translation, and observability in one place."
     },
     "getting-started": {
-      "title": "Getting Started",
-      "description": "Run QueryFlux with Docker Compose, connect SQL clients, smoke-test Trino HTTP routing, and open Studio in minutes."
+      "title": "Quickstarts",
+      "description": "Hands-on QueryFlux tutorials — route your first query, run locally, build a multi-engine lakehouse, add monitoring, connect AI agents, and secure with OIDC."
     },
     "studio": {
       "title": "QueryFlux Studio",
@@ -81,6 +81,10 @@
       "title": "Snowflake Frontend",
       "description": "Snowflake HTTP wire and SQL API v2 on one port — SnowSQL, Python connector, and JDBC without a Snowflake account."
     },
+    "architecture/frontends/mcp": {
+      "title": "MCP frontend for agents",
+      "description": "MCP frontend for AI agents over streamable HTTP. Same routing, auth, guardrails, and query history as every other QueryFlux client."
+    },
     "architecture/adding-support/overview": {
       "title": "Extending QueryFlux Overview",
       "description": "Add a backend engine adapter or a new client protocol — Rust crates, Studio UI, and documentation checklist."
@@ -102,8 +106,8 @@
       "description": "Contribution guidelines for QueryFlux — PR conventions, code style, tests, documentation updates, and Apache 2.0 license."
     },
     "benchmarks": {
-      "title": "Proxy Benchmarks",
-      "description": "QueryFlux proxy overhead benchmarks — mock-backend latency for Trino HTTP and MySQL wire paths (~0.35 ms p50)."
+      "title": "Proxy and capacity benchmarks",
+      "description": "QueryFlux benchmarks — proxy overhead against mock backends (~0.1 ms p50) and per feature, and the capacity admission benchmark for shared maxRunningQueries leases."
     },
     "project-structure": {
       "title": "Project Structure",
@@ -132,6 +136,50 @@
     "access-control/customer-api-row-filters": {
       "title": "Customer API Row Filters",
       "description": "Per-tenant row filters for a customer API — service-account identity, session params, and OPA/Cerbos predicates in the QueryFlux path."
+    },
+    "access-control/internal-analysts": {
+      "title": "Analyst grants, region filters, masks",
+      "description": "Humans connect as themselves with OIDC or a static user. Policy grants tables by group, adds region row filters, and masks PII columns."
+    },
+    "access-control/support-on-behalf-of": {
+      "title": "Support — query on behalf of an account",
+      "description": "A support agent authenticates as themselves, passes a verified account_id, and policy returns a row filter plus masked payment fields."
+    },
+    "agentic/agent-context": {
+      "title": "Set agent context",
+      "description": "Attach agent id, conversation, and step to every query with HTTP headers, SQL session parameters, or MCP tool arguments."
+    },
+    "agentic/session-replay": {
+      "title": "Session replay and guardrails",
+      "description": "What QueryFlux stores for each agent query, how to replay a full session from history, and where guardrail decisions show up."
+    },
+    "architecture/access-control": {
+      "title": "Data access control",
+      "description": "These docs moved to Access Control: overview, OPA, and Cerbos. Enforcement is the opa_access guard in the query path."
+    },
+    "architecture/adapters-proxies-and-ecosystem": {
+      "title": "Adapters, proxies, and the ecosystem",
+      "description": "Why QueryFlux is a SQL adapter rather than a fork of Nginx, Envoy, or ProxySQL, and how it composes with existing gateways."
+    },
+    "architecture/caching": {
+      "title": "Query result cache",
+      "description": "Cache deterministic query results and replay them from storage on a hit, keyed by SQL, user, parameters, and catalog."
+    },
+    "architecture/capacity-and-throughput": {
+      "title": "Capacity and throughput",
+      "description": "How maxRunningQueries holds across replicas and workers, what each admission costs, and how the shared limit stays cheap at high rates."
+    },
+    "architecture/catalog-integration": {
+      "title": "Catalog provider",
+      "description": "Load table and column metadata from a catalog so schema-aware translation can qualify columns and types, not only SQL syntax."
+    },
+    "operations/hub": {
+      "title": "Site hub for remote workers",
+      "description": "One QueryFlux hub per site. Remote workers reach the control plane through one outbound connection and keep running if that link drops."
+    },
+    "operations/sizing": {
+      "title": "Sizing for high query rates",
+      "description": "Size control-plane replicas, connection pools, and Postgres for a target query rate, and the metrics that show a fleet running out of headroom."
     }
   }
 }

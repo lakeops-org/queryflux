@@ -4,6 +4,7 @@ import type {LoadContext, Plugin} from '@docusaurus/types';
 import type * as Preset from '@docusaurus/preset-classic';
 import type {PluginOptions as SitemapPluginOptions} from '@docusaurus/plugin-sitemap';
 import docSeoJson from './seo/docSeo.json';
+import {buildLlmsTxt, buildRobotsTxt} from './seo/siteFiles.mjs';
 
 export const SITE_NAME = 'QueryFlux';
 export const DEFAULT_OG_IMAGE = docSeoJson.DEFAULT_OG_IMAGE;
@@ -67,6 +68,10 @@ function shouldOmitFromSitemap(pathname: string): boolean {
     pathname === '/blog/tags' ||
     pathname.startsWith('/blog/tags/')
   ) {
+    return true;
+  }
+  // Moved stub. The Access Control section is the indexable URL.
+  if (pathname === '/docs/architecture/access-control') {
     return true;
   }
   return false;
@@ -143,24 +148,9 @@ export function robotsTxtPlugin(_context: LoadContext): Plugin {
   return {
     name: 'queryflux-robots-txt',
     async postBuild({outDir, siteConfig}) {
-      const base = siteConfig.baseUrl.replace(/\/$/, '');
-      const sitemapUrl = `${siteConfig.url}${base}/sitemap.xml`;
-      const contents = `# Generated at build time — do not edit build/robots.txt by hand.
-# https://docusaurus.io/docs/seo#robots-file
-User-agent: *
-Allow: /
-# Unreleased "Next" docs (also noIndex)
-Disallow: /docs/next
-Disallow: /docs/next/
-# Thin blog utility pages (also omitted from sitemap)
-Disallow: /blog/tags
-Disallow: /blog/tags/
-Disallow: /blog/archive
-Disallow: /blog/authors
-
-Sitemap: ${sitemapUrl}
-`;
-      fs.writeFileSync(path.join(outDir, 'robots.txt'), contents, 'utf8');
+      const origin = `${siteConfig.url}${siteConfig.baseUrl.replace(/\/$/, '')}`;
+      fs.writeFileSync(path.join(outDir, 'robots.txt'), buildRobotsTxt(origin), 'utf8');
+      fs.writeFileSync(path.join(outDir, 'llms.txt'), buildLlmsTxt(origin), 'utf8');
     },
   };
 }
