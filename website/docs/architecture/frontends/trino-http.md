@@ -94,7 +94,7 @@ curl -X POST http://localhost:8080/v1/statement \
 
 | Feature | Status |
 |---------|--------|
-| Prepared statements | Not supported. The Trino HTTP protocol does not use a separate prepare/execute flow; all queries arrive as raw SQL. |
+| Prepared statements | Forwarded, not inspected. Trino clients send `EXECUTE <name>` with the statement text in the `X-Trino-Prepared-Statement` header (or `EXECUTE IMMEDIATE '<sql>'`), and QueryFlux passes `X-Trino-*` headers through. With access control enabled, `EXECUTE` and `PREPARE` are denied, since the SQL they run is not in the statement QueryFlux checks. |
 | TLS termination | Not handled by QueryFlux. Use an external TLS terminator in front of the Trino HTTP listener. |
 
 ## Related
