@@ -2109,6 +2109,9 @@ async fn update_cluster_handler(
 // Persisted cluster config CRUD
 // ---------------------------------------------------------------------------
 
+/// What a redacted secret reads as. Sent back on a write, it keeps the stored value.
+const REDACTED: &str = "***REDACTED***";
+
 /// Redact sensitive fields from a cluster config JSON value in-place.
 fn redact_cluster_config_secrets(config: &mut serde_json::Value) {
     if let Some(obj) = config.as_object_mut() {
@@ -2123,7 +2126,7 @@ fn redact_cluster_config_secrets(config: &mut serde_json::Value) {
             if obj.contains_key(key) {
                 obj.insert(
                     key.to_string(),
-                    serde_json::Value::String("***REDACTED***".to_string()),
+                    serde_json::Value::String(REDACTED.to_string()),
                 );
             }
         }
@@ -2136,6 +2139,32 @@ fn redact_cluster_config_secrets(config: &mut serde_json::Value) {
                 }
             }
         }
+    }
+}
+
+/// Replace each [`REDACTED`] value in `incoming` with the value at the same path in
+/// `stored`, so a client can send back a config it read without knowing its secrets.
+/// Returns the path of a placeholder that has no stored value.
+fn restore_redacted_secrets(
+    incoming: &mut serde_json::Value,
+    stored: Option<&serde_json::Value>,
+    path: &str,
+) -> std::result::Result<(), String> {
+    match incoming {
+        serde_json::Value::String(s) if s == REDACTED => match stored {
+            Some(v) if v.is_string() => {
+                *incoming = v.clone();
+                Ok(())
+            }
+            _ => Err(path.to_string()),
+        },
+        serde_json::Value::Object(obj) => obj.iter_mut().try_for_each(|(k, v)| {
+            restore_redacted_secrets(v, stored.and_then(|s| s.get(k)), &format!("{path}.{k}"))
+        }),
+        serde_json::Value::Array(items) => items.iter_mut().enumerate().try_for_each(|(i, v)| {
+            restore_redacted_secrets(v, stored.and_then(|s| s.get(i)), &format!("{path}[{i}]"))
+        }),
+        _ => Ok(()),
     }
 }
 
@@ -2275,9 +2304,20 @@ fn validate_query_auth_for_upsert(body: &UpsertClusterConfig) -> std::result::Re
 async fn upsert_cluster_config_handler(
     State(state): State<Arc<AdminState>>,
     Path(name): Path<String>,
-    Json(body): Json<UpsertClusterConfig>,
+    Json(mut body): Json<UpsertClusterConfig>,
 ) -> impl IntoResponse {
     let pg = require_store!(state);
+    let stored = match pg.get_cluster_config(&name).await {
+        Ok(r) => r.map(|r| r.config),
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    };
+    if let Err(path) = restore_redacted_secrets(&mut body.config, stored.as_ref(), "config") {
+        return (
+            StatusCode::BAD_REQUEST,
+            format!("{path} is {REDACTED} but no value is stored for it: send the secret"),
+        )
+            .into_response();
+    }
     if let Err(e) = validate_query_auth_for_upsert(&body) {
         return (StatusCode::BAD_REQUEST, e).into_response();
     }
@@ -3762,8 +3802,9 @@ async fn invalidate_group_cache_handler(
 #[cfg(test)]
 mod tests {
     use super::{
-        collect_running_queries, delete_queued_if_exists, sql_preview, AccessControlDryRunRequest,
-        GuardrailsConfigDto, SecurityConfigDto,
+        collect_running_queries, delete_queued_if_exists, redact_cluster_config_secrets,
+        restore_redacted_secrets, sql_preview, AccessControlDryRunRequest, GuardrailsConfigDto,
+        SecurityConfigDto, REDACTED,
     };
     use chrono::Utc;
     use queryflux_core::config::{
@@ -3778,6 +3819,33 @@ mod tests {
     use serde_json::json;
     use std::collections::HashMap;
     use std::sync::Arc;
+
+    #[test]
+    fn a_redacted_secret_sent_back_keeps_the_stored_value() {
+        let stored =
+            json!({"endpoint": "https://t:8443", "auth": {"type": "basic", "password": "s3cret"}});
+        let mut read = stored.clone();
+        redact_cluster_config_secrets(&mut read);
+        assert_eq!(read["auth"]["password"], REDACTED);
+
+        // Round trip with an edit elsewhere: the password survives.
+        read["endpoint"] = json!("https://t2:8443");
+        restore_redacted_secrets(&mut read, Some(&stored), "config").unwrap();
+        assert_eq!(read["auth"]["password"], "s3cret");
+        assert_eq!(read["endpoint"], "https://t2:8443");
+
+        // A new value replaces it.
+        let mut replaced = json!({"auth": {"password": "n3w"}});
+        restore_redacted_secrets(&mut replaced, Some(&stored), "config").unwrap();
+        assert_eq!(replaced["auth"]["password"], "n3w");
+
+        // A placeholder with nothing stored behind it is refused, never saved.
+        let mut new_cluster = json!({"auth": {"password": REDACTED}});
+        assert_eq!(
+            restore_redacted_secrets(&mut new_cluster, None, "config"),
+            Err("config.auth.password".to_string())
+        );
+    }
 
     #[test]
     fn security_config_dto_omits_static_user_passwords() {
