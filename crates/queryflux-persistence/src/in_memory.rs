@@ -172,9 +172,8 @@ impl Persistence for InMemoryPersistence {
     async fn get(&self, id: &BackendQueryId) -> Result<Option<ExecutingQuery>> {
         Ok(self.executing.get(&id.0).map(|e| e.value().clone()))
     }
-    async fn delete(&self, id: &BackendQueryId) -> Result<()> {
-        self.executing.remove(&id.0);
-        Ok(())
+    async fn delete(&self, id: &BackendQueryId) -> Result<bool> {
+        Ok(self.executing.remove(&id.0).is_some())
     }
     async fn list_all(&self) -> Result<Vec<ExecutingQuery>> {
         Ok(self.executing.iter().map(|e| e.value().clone()).collect())
