@@ -1398,21 +1398,15 @@ pub(crate) async fn cancel_executing_query(
         );
         return Err("failed to cancel query on backend".to_string());
     }
-    app.record_executing_cancelled(
-        executing,
-        protocol,
-        adapter.engine_type(),
-        adapter.translation_target_dialect(),
-        reason,
-    );
-    app.release_query_slot(
-        &executing.cluster_group,
-        &executing.cluster_name,
-        &executing.id.0,
-    )
-    .await;
-    if let Err(e) = app.persistence.delete(&executing.backend_query_id).await {
-        return Err(e.to_string());
+    // A poll or client cancel may have ended the query meanwhile, and released it there.
+    if app.end_executing_query(executing).await {
+        app.record_executing_cancelled(
+            executing,
+            protocol,
+            adapter.engine_type(),
+            adapter.translation_target_dialect(),
+            reason,
+        );
     }
     info!(
         id = %executing.id,

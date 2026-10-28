@@ -1766,12 +1766,32 @@ impl Persistence for PostgresStore {
         }
     }
 
-    async fn delete(&self, id: &BackendQueryId) -> Result<()> {
-        sqlx::query("DELETE FROM executing_queries WHERE id = $1")
+    async fn delete(&self, id: &BackendQueryId) -> Result<bool> {
+        let result = sqlx::query("DELETE FROM executing_queries WHERE id = $1")
             .bind(&id.0)
             .execute(&self.query_pool)
             .await
             .map_err(|e| QueryFluxError::Persistence(format!("Delete executing_queries: {e}")))?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    async fn touch_executing_last_accessed(
+        &self,
+        id: &BackendQueryId,
+        at: DateTime<Utc>,
+    ) -> Result<()> {
+        // Same JSON encoding `upsert` writes for the field.
+        let at = serde_json::to_value(at)
+            .map_err(|e| QueryFluxError::Persistence(format!("Serialize error: {e}")))?;
+        sqlx::query(
+            "UPDATE executing_queries SET data = jsonb_set(data, '{last_accessed}', $2)
+             WHERE id = $1",
+        )
+        .bind(&id.0)
+        .bind(at)
+        .execute(&self.query_pool)
+        .await
+        .map_err(|e| QueryFluxError::Persistence(format!("touch_executing_last_accessed: {e}")))?;
         Ok(())
     }
 

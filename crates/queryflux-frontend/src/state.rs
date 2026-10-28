@@ -322,6 +322,28 @@ impl AppState {
         }
     }
 
+    /// End an executing query: remove its record and give back its slot, once. Several
+    /// requests can end the same query together (a retried final poll, a cancel racing the
+    /// last page, the zombie sweep); only the one that removes the record releases the
+    /// slot. Returns whether this call ended the query, i.e. should record its outcome.
+    /// If the record can't be removed the slot is released anyway, so it never leaks.
+    pub async fn end_executing_query(&self, executing: &ExecutingQuery) -> bool {
+        match self.persistence.delete(&executing.backend_query_id).await {
+            Ok(false) => return false,
+            Ok(true) => {}
+            Err(e) => {
+                tracing::warn!(id = %executing.id, "Failed to delete executing record: {e}")
+            }
+        }
+        self.release_query_slot(
+            &executing.cluster_group,
+            &executing.cluster_name,
+            &executing.id.0,
+        )
+        .await;
+        true
+    }
+
     /// Fire-and-forget: build a `QueryRecord` and write it to the metrics store asynchronously.
     /// Called once per query at completion (success, failure, or cancellation).
     pub fn record_query(&self, ctx: &QueryContext, outcome: QueryOutcome) {
