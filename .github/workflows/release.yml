@@ -234,6 +234,26 @@ jobs:
             $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
             $(printf '${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@sha256:%s ' *)
 
+  # The chart of a release installs that release's server image (Chart.yaml appVersion), so
+  # it's pushed only once the image is.
+  helm_chart:
+    name: Publish Helm chart
+    needs: [release_please, manifest-slim]
+    if: ${{ needs.release_please.outputs.releases_created == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: azure/setup-helm@v4
+
+      - name: Package and push to GHCR
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "$GITHUB_TOKEN" | helm registry login ${{ env.REGISTRY }} -u ${{ github.actor }} --password-stdin
+          helm package charts/queryflux --destination /tmp/chart
+          helm push /tmp/chart/queryflux-*.tgz oci://${{ env.REGISTRY }}/${{ github.repository_owner }}/charts
+
   publish:
     name: GitHub Release summary
     needs: [release_please, manifest-slim, docker_tag_base]

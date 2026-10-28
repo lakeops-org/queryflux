@@ -59,6 +59,16 @@ grep -Eq '^apiVersion:[[:space:]]*v2[[:space:]]*$' "$CHART_DIR/Chart.yaml" || fa
 grep -Eq '^name:[[:space:]]*queryflux[[:space:]]*$' "$CHART_DIR/Chart.yaml" || fail "Chart.yaml name must be queryflux"
 grep -Eq '^type:[[:space:]]*application[[:space:]]*$' "$CHART_DIR/Chart.yaml" || fail "Chart.yaml type must be application"
 
+# The chart ships with the release it's cut from: version and appVersion match the workspace
+# version (Release Please bumps all three), so the default image is that release's server.
+workspace_version="$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\(.*\)"/\1/p' "$ROOT/Cargo.toml")"
+[ -n "$workspace_version" ] || fail "could not read the workspace version from Cargo.toml"
+chart_field() { sed -n "s/^$1:[[:space:]]*\"\{0,1\}\([^\"]*\)\"\{0,1\}[[:space:]]*$/\1/p" "$CHART_DIR/Chart.yaml"; }
+[ "$(chart_field version)" = "$workspace_version" ] \
+  || fail "Chart.yaml version $(chart_field version) must match the workspace version $workspace_version"
+[ "$(chart_field appVersion)" = "$workspace_version" ] \
+  || fail "Chart.yaml appVersion $(chart_field appVersion) must match the workspace version $workspace_version"
+
 # values.schema.json must be valid JSON (helm also enforces this on lint).
 python3 -m json.tool "$CHART_DIR/values.schema.json" >/dev/null 2>&1 \
   || fail "values.schema.json is not valid JSON"

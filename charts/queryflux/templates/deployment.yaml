@@ -68,7 +68,7 @@ spec:
         - name: adbc-drivers
           securityContext:
             {{- toYaml .Values.securityContext | nindent 12 }}
-          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          image: {{ include "queryflux.image" . | quote }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           command: ["/app/adbc-drivers.sh"]
           env:
@@ -92,7 +92,7 @@ spec:
         - name: {{ .Chart.Name }}
           securityContext:
             {{- toYaml .Values.securityContext | nindent 12 }}
-          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          image: {{ include "queryflux.image" . | quote }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           {{- with .Values.args }}
           args:
