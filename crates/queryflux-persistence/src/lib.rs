@@ -61,6 +61,13 @@ pub trait Persistence: Send + Sync {
     /// already gone, so concurrent callers can tell which of them ended the query.
     async fn delete(&self, id: &BackendQueryId) -> Result<bool>;
     async fn list_all(&self) -> Result<Vec<ExecutingQuery>>;
+    /// Set `last_accessed` of an executing query, if it is still recorded. Update-only: a
+    /// poll that refreshes a query a cancel just ended must not bring its record back.
+    async fn touch_executing_last_accessed(
+        &self,
+        id: &BackendQueryId,
+        at: DateTime<Utc>,
+    ) -> Result<()>;
 
     // --- Queued queries (waiting for cluster capacity) ---
     async fn upsert_queued(&self, query: QueuedQuery) -> Result<()>;

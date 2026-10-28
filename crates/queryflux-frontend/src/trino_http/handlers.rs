@@ -1203,9 +1203,11 @@ pub async fn get_executing_statement(
     const LAST_ACCESSED_UPDATE_INTERVAL: i64 = 120;
     let now = Utc::now();
     if (now - executing.last_accessed).num_seconds() >= LAST_ACCESSED_UPDATE_INTERVAL {
-        let mut refreshed = executing.clone();
-        refreshed.last_accessed = now;
-        let _ = state.persistence.upsert(refreshed).await;
+        // Update-only: a cancel may have removed the record since it was loaded.
+        let _ = state
+            .persistence
+            .touch_executing_last_accessed(&executing.backend_query_id, now)
+            .await;
     }
 
     let elapsed_ms = (Utc::now() - executing.creation_time)

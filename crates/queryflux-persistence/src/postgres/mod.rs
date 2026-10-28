@@ -1775,6 +1775,26 @@ impl Persistence for PostgresStore {
         Ok(result.rows_affected() > 0)
     }
 
+    async fn touch_executing_last_accessed(
+        &self,
+        id: &BackendQueryId,
+        at: DateTime<Utc>,
+    ) -> Result<()> {
+        // Same JSON encoding `upsert` writes for the field.
+        let at = serde_json::to_value(at)
+            .map_err(|e| QueryFluxError::Persistence(format!("Serialize error: {e}")))?;
+        sqlx::query(
+            "UPDATE executing_queries SET data = jsonb_set(data, '{last_accessed}', $2)
+             WHERE id = $1",
+        )
+        .bind(&id.0)
+        .bind(at)
+        .execute(&self.query_pool)
+        .await
+        .map_err(|e| QueryFluxError::Persistence(format!("touch_executing_last_accessed: {e}")))?;
+        Ok(())
+    }
+
     async fn list_all(&self) -> Result<Vec<ExecutingQuery>> {
         let rows: Vec<(serde_json::Value,)> =
             sqlx::query_as("SELECT data FROM executing_queries ORDER BY created_at")

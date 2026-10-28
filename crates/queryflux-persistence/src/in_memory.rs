@@ -178,6 +178,16 @@ impl Persistence for InMemoryPersistence {
     async fn list_all(&self) -> Result<Vec<ExecutingQuery>> {
         Ok(self.executing.iter().map(|e| e.value().clone()).collect())
     }
+    async fn touch_executing_last_accessed(
+        &self,
+        id: &BackendQueryId,
+        at: DateTime<Utc>,
+    ) -> Result<()> {
+        if let Some(mut entry) = self.executing.get_mut(&id.0) {
+            entry.last_accessed = at;
+        }
+        Ok(())
+    }
 
     async fn upsert_queued(&self, mut query: QueuedQuery) -> Result<()> {
         // Re-queues rebuild the QueuedQuery with a fresh creation_time; keep
@@ -1497,6 +1507,22 @@ mod tests {
         });
         let parsed: ExecutingQuery = serde_json::from_value(legacy).unwrap();
         assert_eq!(parsed.queue_duration_ms, 0);
+
+        // Refreshing `last_accessed` updates the record, and does not recreate it once a
+        // cancel or the final poll has removed it.
+        let id = BackendQueryId("backend-qd".into());
+        let later = now + chrono::Duration::minutes(3);
+        store
+            .touch_executing_last_accessed(&id, later)
+            .await
+            .unwrap();
+        assert_eq!(store.get(&id).await.unwrap().unwrap().last_accessed, later);
+        assert!(store.delete(&id).await.unwrap());
+        store
+            .touch_executing_last_accessed(&id, later)
+            .await
+            .unwrap();
+        assert!(store.get(&id).await.unwrap().is_none());
     }
 
     #[tokio::test]
