@@ -1766,13 +1766,13 @@ impl Persistence for PostgresStore {
         }
     }
 
-    async fn delete(&self, id: &BackendQueryId) -> Result<()> {
-        sqlx::query("DELETE FROM executing_queries WHERE id = $1")
+    async fn delete(&self, id: &BackendQueryId) -> Result<bool> {
+        let result = sqlx::query("DELETE FROM executing_queries WHERE id = $1")
             .bind(&id.0)
             .execute(&self.query_pool)
             .await
             .map_err(|e| QueryFluxError::Persistence(format!("Delete executing_queries: {e}")))?;
-        Ok(())
+        Ok(result.rows_affected() > 0)
     }
 
     async fn list_all(&self) -> Result<Vec<ExecutingQuery>> {

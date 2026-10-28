@@ -1165,16 +1165,7 @@ pub async fn get_executing_statement(
                     "Adapter for cluster {}/{} is not async",
                     executing.cluster_group, executing.cluster_name
                 );
-                state
-                    .release_query_slot(
-                        &executing.cluster_group,
-                        &executing.cluster_name,
-                        &executing.id.0,
-                    )
-                    .await;
-                if let Err(e) = state.persistence.delete(&backend_id).await {
-                    warn!(id = %executing.id, "Failed to delete executing record: {e}");
-                }
+                state.end_executing_query(&executing).await;
                 return StatusCode::INTERNAL_SERVER_ERROR.into_response();
             }
         },
@@ -1183,16 +1174,7 @@ pub async fn get_executing_statement(
                 "No adapter for cluster {}/{}",
                 executing.cluster_group, executing.cluster_name
             );
-            state
-                .release_query_slot(
-                    &executing.cluster_group,
-                    &executing.cluster_name,
-                    &executing.id.0,
-                )
-                .await;
-            if let Err(e) = state.persistence.delete(&backend_id).await {
-                warn!(id = %executing.id, "Failed to delete executing record: {e}");
-            }
+            state.end_executing_query(&executing).await;
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     };
@@ -1294,31 +1276,24 @@ pub async fn get_executing_statement(
                 return json_response(&resp).into_response();
             }
             error!(id = %executing.id, "Permanent poll error: {e}");
-            state.record_query(
-                &ctx,
-                QueryOutcome {
-                    backend_query_id: Some(backend_id.0.clone()),
-                    status: QueryStatus::Failed,
-                    execution_ms: elapsed_ms,
-                    rows: None,
-                    error: Some(e.to_string()),
-                    routing_trace: None,
-                    engine_stats: None,
-                    guard_actions: submit_guard_actions,
-                    was_guard_blocked: submit_was_guard_blocked,
-                    queue_duration_ms: executing.queue_duration_ms,
-                    cache_hit: false,
-                },
-            );
-            state
-                .release_query_slot(
-                    &executing.cluster_group,
-                    &executing.cluster_name,
-                    &executing.id.0,
-                )
-                .await;
-            if let Err(del_err) = state.persistence.delete(&backend_id).await {
-                warn!(id = %executing.id, "Failed to delete executing record after poll error: {del_err}");
+            // Only the request that ends the query records it and frees its slot.
+            if state.end_executing_query(&executing).await {
+                state.record_query(
+                    &ctx,
+                    QueryOutcome {
+                        backend_query_id: Some(backend_id.0.clone()),
+                        status: QueryStatus::Failed,
+                        execution_ms: elapsed_ms,
+                        rows: None,
+                        error: Some(e.to_string()),
+                        routing_trace: None,
+                        engine_stats: None,
+                        guard_actions: submit_guard_actions,
+                        was_guard_blocked: submit_was_guard_blocked,
+                        queue_duration_ms: executing.queue_duration_ms,
+                        cache_hit: false,
+                    },
+                );
             }
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
@@ -1332,31 +1307,24 @@ pub async fn get_executing_statement(
         } => {
             if poll_token.is_none() {
                 // Final page — query complete.
-                state.record_query(
-                    &ctx,
-                    QueryOutcome {
-                        backend_query_id: Some(backend_id.0.clone()),
-                        status: QueryStatus::Success,
-                        execution_ms: elapsed_ms,
-                        rows: None,
-                        error: None,
-                        routing_trace: None,
-                        engine_stats,
-                        guard_actions: submit_guard_actions,
-                        was_guard_blocked: submit_was_guard_blocked,
-                        queue_duration_ms: executing.queue_duration_ms,
-                        cache_hit: false,
-                    },
-                );
-                state
-                    .release_query_slot(
-                        &executing.cluster_group,
-                        &executing.cluster_name,
-                        &executing.id.0,
-                    )
-                    .await;
-                if let Err(e) = state.persistence.delete(&backend_id).await {
-                    warn!(id = %executing.id, "Failed to delete executing record on completion: {e}");
+                // Only the request that ends the query records it and frees its slot.
+                if state.end_executing_query(&executing).await {
+                    state.record_query(
+                        &ctx,
+                        QueryOutcome {
+                            backend_query_id: Some(backend_id.0.clone()),
+                            status: QueryStatus::Success,
+                            execution_ms: elapsed_ms,
+                            rows: None,
+                            error: None,
+                            routing_trace: None,
+                            engine_stats,
+                            guard_actions: submit_guard_actions,
+                            was_guard_blocked: submit_was_guard_blocked,
+                            queue_duration_ms: executing.queue_duration_ms,
+                            cache_hit: false,
+                        },
+                    );
                 }
                 return raw_response_with_rewritten_next_uri(body, None).into_response();
             }
@@ -1369,33 +1337,26 @@ pub async fn get_executing_statement(
         }
 
         QueryPollResult::Failed { message, .. } => {
-            state.record_query(
-                &ctx,
-                QueryOutcome {
-                    backend_query_id: Some(backend_id.0.clone()),
-                    status: QueryStatus::Failed,
-                    execution_ms: elapsed_ms,
-                    rows: None,
-                    error: Some(message.clone()),
-                    routing_trace: None,
-                    engine_stats: None,
-                    guard_actions: submit_guard_actions,
-                    was_guard_blocked: submit_was_guard_blocked,
-                    queue_duration_ms: executing.queue_duration_ms,
-                    cache_hit: false,
-                },
-            );
-            state
-                .release_query_slot(
-                    &executing.cluster_group,
-                    &executing.cluster_name,
-                    &executing.id.0,
-                )
-                .await;
-            warn!(id = %executing.id, "Query failed: {message}");
-            if let Err(e) = state.persistence.delete(&backend_id).await {
-                warn!(id = %executing.id, "Failed to delete executing record on failure: {e}");
+            // Only the request that ends the query records it and frees its slot.
+            if state.end_executing_query(&executing).await {
+                state.record_query(
+                    &ctx,
+                    QueryOutcome {
+                        backend_query_id: Some(backend_id.0.clone()),
+                        status: QueryStatus::Failed,
+                        execution_ms: elapsed_ms,
+                        rows: None,
+                        error: Some(message.clone()),
+                        routing_trace: None,
+                        engine_stats: None,
+                        guard_actions: submit_guard_actions,
+                        was_guard_blocked: submit_was_guard_blocked,
+                        queue_duration_ms: executing.queue_duration_ms,
+                        cache_hit: false,
+                    },
+                );
             }
+            warn!(id = %executing.id, "Query failed: {message}");
             let error_resp = TrinoResponse {
                 id: executing.id.0.clone(),
                 next_uri: None,
@@ -1512,22 +1473,15 @@ pub async fn delete_executing_statement(
         return (StatusCode::BAD_GATEWAY, "failed to cancel query on backend").into_response();
     }
 
-    state.record_executing_cancelled(
-        &executing,
-        FrontendProtocol::TrinoHttp,
-        adapter.engine_type(),
-        adapter.translation_target_dialect(),
-        "client cancelled",
-    );
-    state
-        .release_query_slot(
-            &executing.cluster_group,
-            &executing.cluster_name,
-            &executing.id.0,
-        )
-        .await;
-    if let Err(e) = state.persistence.delete(&backend_id).await {
-        warn!(id = %executing.id, "Failed to delete executing record on cancel: {e}");
+    // A poll may have ended the query meanwhile: then it was recorded and released there.
+    if state.end_executing_query(&executing).await {
+        state.record_executing_cancelled(
+            &executing,
+            FrontendProtocol::TrinoHttp,
+            adapter.engine_type(),
+            adapter.translation_target_dialect(),
+            "client cancelled",
+        );
     }
 
     StatusCode::NO_CONTENT.into_response()
@@ -1917,6 +1871,128 @@ mod cancel_executing_statement_tests {
                 .is_some(),
             "slot must not be released when backend cancel fails"
         );
+    }
+
+    /// Answers every poll with the final page (Trino serves the same page again for a
+    /// retried token), after a short delay so concurrent requests overlap.
+    struct FinalPageAdapter;
+
+    #[async_trait]
+    impl AsyncAdapter for FinalPageAdapter {
+        async fn submit_query(
+            &self,
+            _sql: &str,
+            _session: &queryflux_core::session::SessionContext,
+            _credentials: &queryflux_auth::QueryCredentials,
+            _tags: &queryflux_core::tags::QueryTags,
+            _params: &queryflux_core::params::QueryParams,
+        ) -> Result<QueryExecution> {
+            Err(QueryFluxError::Engine("not used".into()))
+        }
+
+        async fn poll_query(
+            &self,
+            _backend_id: &BackendQueryId,
+            _poll_token: Option<&str>,
+            _wire_auth: Option<&queryflux_core::query::StoredWireAuth>,
+        ) -> Result<QueryPollResult> {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            Ok(QueryPollResult::Raw {
+                body: bytes::Bytes::from_static(br#"{"id":"q","stats":{"state":"FINISHED"}}"#),
+                poll_token: None,
+                engine_stats: None,
+            })
+        }
+
+        async fn cancel_query(
+            &self,
+            _backend_id: &BackendQueryId,
+            _wire_auth: Option<&queryflux_core::query::StoredWireAuth>,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        fn engine_type(&self) -> EngineType {
+            EngineType::Trino
+        }
+
+        fn translation_target_dialect(&self) -> SqlDialect {
+            SqlDialect::Trino
+        }
+
+        async fn health_check(&self) -> bool {
+            true
+        }
+
+        async fn list_catalogs(&self) -> Result<Vec<String>> {
+            Ok(vec![])
+        }
+
+        async fn list_databases(&self, _catalog: &str) -> Result<Vec<String>> {
+            Ok(vec![])
+        }
+
+        async fn list_tables(&self, _catalog: &str, _database: &str) -> Result<Vec<String>> {
+            Ok(vec![])
+        }
+
+        async fn describe_table(
+            &self,
+            _catalog: &str,
+            _database: &str,
+            _table: &str,
+        ) -> Result<Option<queryflux_core::catalog::TableSchema>> {
+            Ok(None)
+        }
+    }
+
+    async fn running_queries(state: &AppState) -> u64 {
+        let (group, cluster) = test_cluster_names();
+        let mgr = state.live.read().await.cluster_manager.clone();
+        mgr.cluster_state(&group, &cluster)
+            .await
+            .expect("cluster state")
+            .expect("cluster exists")
+            .running_queries
+    }
+
+    /// Two requests that both end one executing query (a retried final poll, or a
+    /// cancel that races it) must give back its slot once. Another query is running
+    /// too, so a second release would hand out a slot that is still in use.
+    #[tokio::test]
+    async fn concurrent_terminal_requests_release_the_slot_once() {
+        for cancel_second in [false, true] {
+            let state = test_state(Some(AdapterKind::Async(Arc::new(FinalPageAdapter)))).await;
+            let (group, _) = test_cluster_names();
+            let mgr = state.live.read().await.cluster_manager.clone();
+            // This query's slot, and another query's.
+            mgr.acquire_cluster(&group).await.unwrap().unwrap();
+            mgr.acquire_cluster(&group).await.unwrap().unwrap();
+            seed_executing(&state, "trino-q-race").await;
+            assert_eq!(running_queries(&state).await, 2);
+
+            let path = "executing/trino-q-race/x/1".to_string();
+            let poll =
+                get_executing_statement(State(state.clone()), Path(path.clone()), HeaderMap::new());
+            let second = async {
+                if cancel_second {
+                    delete_executing_statement(State(state.clone()), Path(path), HeaderMap::new())
+                        .await
+                        .into_response()
+                } else {
+                    get_executing_statement(State(state.clone()), Path(path), HeaderMap::new())
+                        .await
+                        .into_response()
+                }
+            };
+            let _ = tokio::join!(async { poll.await.into_response() }, second);
+
+            assert_eq!(
+                running_queries(&state).await,
+                1,
+                "the other query still holds its slot (cancel_second={cancel_second})"
+            );
+        }
     }
 
     #[tokio::test]

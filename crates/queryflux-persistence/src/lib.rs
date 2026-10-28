@@ -57,7 +57,9 @@ pub trait Persistence: Send + Sync {
     // --- Executing queries (submitted to an engine backend) ---
     async fn upsert(&self, query: ExecutingQuery) -> Result<()>;
     async fn get(&self, id: &BackendQueryId) -> Result<Option<ExecutingQuery>>;
-    async fn delete(&self, id: &BackendQueryId) -> Result<()>;
+    /// Remove an executing query. `true` when this call removed it, `false` when it was
+    /// already gone, so concurrent callers can tell which of them ended the query.
+    async fn delete(&self, id: &BackendQueryId) -> Result<bool>;
     async fn list_all(&self) -> Result<Vec<ExecutingQuery>>;
 
     // --- Queued queries (waiting for cluster capacity) ---
