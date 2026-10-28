@@ -280,19 +280,20 @@ impl Guard for OpaAccessGuard {
 
         // Only the parse is cached (keyed on the exact SQL, dialect and schema); every
         // decision below is still made for this query.
-        let statement = match queryflux_sql::extract_resources_cached(parse, schema) {
-            Ok(r) => r,
-            // A query that can't be analyzed has no resources to put in a request, so it can't
-            // be judged at all. `onMissingSchema` is about unresolved *columns* of tables that
-            // were found — not about failing to find them — so this denies in both modes;
-            // allowing it would let anything the parser can't read skip access control.
-            Err(e) => {
-                return GuardResult::deny(
-                    format!("access control: could not analyze query: {e}"),
-                    "ACCESS_ANALYSIS_FAILED",
-                )
-            }
-        };
+        let statement =
+            match off_async_worker(|| queryflux_sql::extract_resources_cached(parse, schema)) {
+                Ok(r) => r,
+                // A query that can't be analyzed has no resources to put in a request, so it can't
+                // be judged at all. `onMissingSchema` is about unresolved *columns* of tables that
+                // were found — not about failing to find them — so this denies in both modes;
+                // allowing it would let anything the parser can't read skip access control.
+                Err(e) => {
+                    return GuardResult::deny(
+                        format!("access control: could not analyze query: {e}"),
+                        "ACCESS_ANALYSIS_FAILED",
+                    )
+                }
+            };
 
         if statement.nested_writes {
             return GuardResult::deny(
@@ -562,13 +563,14 @@ impl Guard for OpaAccessGuard {
                 .join(","),
         );
 
-        let rewritten =
+        let rewritten = off_async_worker(|| {
             rewrite_table_scans_parsed(parse, schema, &policies).and_then(
                 |sql| match &write_scope {
                     Some((_, filters)) => apply_write_filters(&sql, ctx.dialect, filters),
                     None => Ok(sql),
                 },
-            );
+            )
+        });
         match rewritten {
             Ok(sql) => GuardResult::Rewrite {
                 sql,
@@ -630,6 +632,19 @@ fn classify_operation(stmts: Option<&[Expression]>, sql: &str) -> Operation {
         Some(_) => Operation("statement.other".to_string()),
         None if queryflux_sql::classify::is_read_like_fallback(sql) => Operation::table_select(),
         None => Operation("statement.other".to_string()),
+    }
+}
+
+/// Run `f`, which takes the GIL and runs sqlglot, without parking a Tokio worker: on the
+/// multi-thread runtime the worker's other tasks move to another thread while it runs, so
+/// waiting for the GIL (held by translation or a script) can't stall unrelated requests.
+/// The parse cache is borrowed, so `spawn_blocking` isn't an option.
+fn off_async_worker<T>(f: impl FnOnce() -> T) -> T {
+    match tokio::runtime::Handle::try_current() {
+        Ok(h) if h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(f)
+        }
+        _ => f(),
     }
 }
 
@@ -1502,5 +1517,91 @@ mod tests {
             }
             other => panic!("expected a rewrite with filter + mask, got {other:?}"),
         }
+    }
+
+    /// The sqlglot extraction (Python, under the GIL) must not run on a Tokio worker: on a
+    /// one-worker runtime a ticker task has to keep firing while a large query is checked.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn sqlglot_extraction_does_not_stall_the_async_worker() {
+        async fn allow_all(Json(body): Json<serde_json::Value>) -> Json<serde_json::Value> {
+            let resources: Vec<serde_json::Value> = body["input"]["action"]["resources"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|r| serde_json::json!({ "table": r["table"], "allow": true }))
+                .collect();
+            Json(serde_json::json!({ "result": { "resources": resources } }))
+        }
+        let app = Router::new().route("/v1/data/queryflux/access", post(allow_all));
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind stub");
+        let url = format!("http://{}", listener.local_addr().expect("stub addr"));
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+        let cfg = AccessControlConfig {
+            enabled: true,
+            default_connection: Some("default".to_string()),
+            connections: HashMap::from([("default".to_string(), opa_connection(&url))]),
+            groups: HashMap::new(),
+        };
+        let guard = OpaAccessGuard::try_from_config(&cfg).expect("build guard");
+        // Warm Python and sqlglot so the measurement is the parse, not the import.
+        let warm = SqlParseCache::new("SELECT 1 FROM warm_up".to_string(), SqlDialect::Trino);
+        let _ = queryflux_sql::extract_resources_cached(&warm, &SchemaContext::default());
+
+        let ids: Vec<String> = (0..30_000).map(|i| i.to_string()).collect();
+        let sql = format!(
+            "SELECT id FROM stall_orders WHERE id IN ({})",
+            ids.join(",")
+        );
+        let parse = SqlParseCache::new(sql.clone(), SqlDialect::Trino);
+        parse.ensure_parsed().await;
+
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ticker = {
+            let stop = stop.clone();
+            tokio::spawn(async move {
+                let mut worst = std::time::Duration::ZERO;
+                let mut last = std::time::Instant::now();
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                    worst = worst.max(last.elapsed());
+                    last = std::time::Instant::now();
+                }
+                worst
+            })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        let (dialect, engine_type) = (SqlDialect::Trino, EngineType::Trino);
+        let group = ClusterGroupName("g".to_string());
+        let (attributes, query_tags, session_extra) =
+            (BTreeMap::new(), QueryTags::new(), HashMap::new());
+        let ctx = GuardContext {
+            sql: &sql,
+            original_sql: None,
+            dialect: &dialect,
+            engine_type: &engine_type,
+            cluster_group: &group,
+            user: Some("alice"),
+            groups: &[],
+            roles: &[],
+            attributes: &attributes,
+            agent_context: None,
+            query_tags: &query_tags,
+            session_extra: &session_extra,
+            schema: None,
+            sql_parse: Some(&parse),
+        };
+        let started = std::time::Instant::now();
+        let result = guard.check(&ctx).await;
+        let check_took = started.elapsed();
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let worst = ticker.await.unwrap();
+        assert!(!result.is_deny(), "{result:?}");
+        assert!(
+            worst < std::time::Duration::from_millis(50),
+            "the async worker was blocked for {worst:?} (check took {check_took:?})"
+        );
     }
 }
