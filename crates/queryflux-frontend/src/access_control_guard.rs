@@ -232,6 +232,17 @@ impl Guard for OpaAccessGuard {
             }
         }
 
+        // `EXECUTE <name>` runs a statement prepared earlier (Trino clients send its text in
+        // the `X-Trino-Prepared-Statement` header, which the Trino adapter forwards) and
+        // `EXECUTE IMMEDIATE '<sql>'` runs a string. Neither SQL is in front of us, so
+        // neither can be judged. `PREPARE` goes with them: its only use is a later EXECUTE.
+        if runs_sql_it_does_not_show(ctx.sql) && evaluates_anything(&conn.controller) {
+            return GuardResult::deny(
+                "access control: EXECUTE and PREPARE statements are not supported",
+                "ACCESS_UNSUPPORTED_STATEMENT",
+            );
+        }
+
         let stmts = match ctx.sql_parse {
             Some(cache) => cache.statements_async().await.map(<[_]>::to_vec),
             None => None,
@@ -631,6 +642,12 @@ fn classify_operation(stmts: Option<&[Expression]>, sql: &str) -> Operation {
         None if queryflux_sql::classify::is_read_like_fallback(sql) => Operation::table_select(),
         None => Operation("statement.other".to_string()),
     }
+}
+
+/// `EXECUTE …` or `PREPARE …`: statements whose SQL is not their own text.
+fn runs_sql_it_does_not_show(sql: &str) -> bool {
+    let head = word_at(queryflux_sql::classify::strip_leading_sql_comments(sql));
+    head.eq_ignore_ascii_case("execute") || head.eq_ignore_ascii_case("prepare")
 }
 
 /// Whether the connection evaluates any operation at all.
@@ -1503,4 +1520,75 @@ mod tests {
             other => panic!("expected a rewrite with filter + mask, got {other:?}"),
         }
     }
+
+    /// A Trino client can send the statement text in the `X-Trino-Prepared-Statement`
+    /// header and only `EXECUTE <name>` in the body; the Trino adapter forwards every
+    /// `X-Trino-*` header, so Trino runs the header's SQL. The guard must not allow an
+    /// `EXECUTE` (or a `PREPARE`) it can't see the tables of.
+    #[tokio::test]
+    async fn execute_of_a_prepared_statement_is_not_allowed_unchecked() {
+        async fn deny_all(Json(body): Json<serde_json::Value>) -> Json<serde_json::Value> {
+            let resources: Vec<serde_json::Value> = body["input"]["action"]["resources"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|r| serde_json::json!({ "table": r["table"], "allow": false }))
+                .collect();
+            Json(serde_json::json!({ "result": { "resources": resources } }))
+        }
+        let app = Router::new().route("/v1/data/queryflux/access", post(deny_all));
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind stub");
+        let url = format!("http://{}", listener.local_addr().expect("stub addr"));
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+        let cfg = AccessControlConfig {
+            enabled: true,
+            default_connection: Some("default".to_string()),
+            connections: HashMap::from([("default".to_string(), opa_connection(&url))]),
+            groups: HashMap::new(),
+        };
+        let guard = OpaAccessGuard::try_from_config(&cfg).expect("build guard");
+        let (dialect, engine_type) = (SqlDialect::Trino, EngineType::Trino);
+        let group = ClusterGroupName("g".to_string());
+        let (attributes, query_tags, session_extra) =
+            (BTreeMap::new(), QueryTags::new(), HashMap::new());
+        let check = |sql: &'static str| {
+            let (guard, dialect, engine_type, group) = (&guard, &dialect, &engine_type, &group);
+            let (attributes, query_tags, session_extra) =
+                (&attributes, &query_tags, &session_extra);
+            async move {
+                let parse = SqlParseCache::new(sql.to_string(), dialect.clone());
+                let ctx = GuardContext {
+                    sql,
+                    original_sql: None,
+                    dialect,
+                    engine_type,
+                    cluster_group: group,
+                    user: Some("bob"),
+                    groups: &[],
+                    roles: &[],
+                    attributes,
+                    agent_context: None,
+                    query_tags,
+                    session_extra,
+                    schema: None,
+                    sql_parse: Some(&parse),
+                };
+                guard.check(&ctx).await
+            }
+        };
+
+        // Control: the table itself is denied.
+        assert!(check("SELECT * FROM salaries").await.is_deny());
+        for sql in [
+            "EXECUTE q",
+            "EXECUTE q USING 1",
+            "PREPARE q FROM SELECT * FROM salaries",
+            "EXECUTE IMMEDIATE 'SELECT * FROM salaries'",
+        ] {
+            assert!(check(sql).await.is_deny(), "{sql} must not be allowed");
+        }
+    }
+
 }
