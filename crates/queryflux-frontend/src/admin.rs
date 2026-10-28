@@ -31,7 +31,7 @@ use queryflux_persistence::{
     },
     query_history::{
         AgentSummary, ConversationSummary, DashboardStats, EngineStatRow, GroupStatRow,
-        QueryFilters, QuerySummary,
+        HistogramBy, HistogramRow, QueryFilters, QuerySummary, TimeRange,
     },
     routing_json::{enrich_routers_for_api, resolve_routers_for_storage},
     script_library::{UpsertUserScript, UserScriptRecord, KIND_GUARD},
@@ -176,6 +176,7 @@ mod circuit_breaker_dto_tests {
         update_cluster_handler,
         engine_registry_handler,
         list_queries_handler,
+        query_histogram_handler,
         list_running_queries_handler,
         cancel_query_handler,
         get_stats_handler,
@@ -221,6 +222,9 @@ mod circuit_breaker_dto_tests {
         get_conversation_handler,
     ),
     components(schemas(
+        QueryHistogramDto,
+        HistogramRow,
+        HistogramBy,
         ClusterStateDto,
         WorkerFleetDto,
         WorkerView,
@@ -790,6 +794,7 @@ impl AdminFrontend {
         let protected = Router::new()
             .route("/admin/clusters", get(clusters_handler))
             .route("/admin/queries", get(list_queries_handler))
+            .route("/admin/queries/histogram", get(query_histogram_handler))
             .route("/admin/queries/running", get(list_running_queries_handler))
             .route("/admin/queries/{id}", delete(cancel_query_handler))
             .route("/admin/agents", get(list_agents_handler))
@@ -1170,7 +1175,11 @@ async fn clusters_handler(State(state): State<Arc<AdminState>>) -> impl IntoResp
     }
 }
 
-/// Paginated query history. Requires Postgres persistence.
+/// Paginated query history, newest first. Requires Postgres persistence.
+///
+/// List filters repeat (`?status=Failed&status=Cancelled`): any value matches. Use
+/// `from`/`to` for a time range, and the last row's `created_at`/`id` as
+/// `before`/`before_id` for the next page.
 #[utoipa::path(
     get,
     path = "/admin/queries",
@@ -1178,13 +1187,14 @@ async fn clusters_handler(State(state): State<Arc<AdminState>>) -> impl IntoResp
     params(QueryFilters),
     responses(
         (status = 200, description = "Query records (newest first)", body = Vec<QuerySummary>),
+        (status = 400, description = "Invalid filter", body = str),
         (status = 503, description = "Postgres persistence not configured", body = str),
         (status = 500, description = "Internal error", body = str),
     )
 )]
 async fn list_queries_handler(
     State(state): State<Arc<AdminState>>,
-    Query(filters): Query<QueryFilters>,
+    Query(pairs): Query<Vec<(String, String)>>,
 ) -> impl IntoResponse {
     let Some(pg) = &state.admin_store else {
         return (
@@ -1193,8 +1203,111 @@ async fn list_queries_handler(
         )
             .into_response();
     };
+    let filters = match QueryFilters::from_pairs(pairs) {
+        Ok(f) => f,
+        Err(e) => return (StatusCode::BAD_REQUEST, e).into_response(),
+    };
     match pg.list_queries(&filters).await {
         Ok(rows) => Json::<Vec<QuerySummary>>(rows).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+/// Query counts over time, for a timeline above the history.
+#[derive(Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct QueryHistogramDto {
+    pub from: chrono::DateTime<chrono::Utc>,
+    pub to: chrono::DateTime<chrono::Utc>,
+    pub bucket_secs: i64,
+    pub by: HistogramBy,
+    /// Non-empty buckets only, oldest first.
+    pub rows: Vec<HistogramRow>,
+}
+
+/// Most buckets one histogram may have.
+const MAX_HISTOGRAM_BUCKETS: i64 = 2000;
+
+/// Query counts per time bucket, split by status or cluster group. Takes the same filters
+/// as `GET /admin/queries`, plus `bucket` (seconds; default: about 60 buckets over the
+/// range) and `by` (`status`, the default, or `cluster_group`). The range defaults to the
+/// last 24 hours. Requires Postgres persistence.
+#[utoipa::path(
+    get,
+    path = "/admin/queries/histogram",
+    tag = "admin",
+    params(
+        QueryFilters,
+        ("bucket" = Option<i64>, Query, description = "Bucket width in seconds"),
+        ("by" = Option<HistogramBy>, Query, description = "Split each bucket by `status` or `cluster_group`"),
+    ),
+    responses(
+        (status = 200, description = "Query counts per bucket", body = QueryHistogramDto),
+        (status = 400, description = "Invalid filter, or too many buckets", body = str),
+        (status = 503, description = "Postgres persistence not configured", body = str),
+        (status = 500, description = "Internal error", body = str),
+    )
+)]
+async fn query_histogram_handler(
+    State(state): State<Arc<AdminState>>,
+    Query(pairs): Query<Vec<(String, String)>>,
+) -> impl IntoResponse {
+    let Some(pg) = &state.admin_store else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Postgres persistence not configured",
+        )
+            .into_response();
+    };
+    let bad = |m: String| (StatusCode::BAD_REQUEST, m).into_response();
+    let mut bucket = None;
+    let mut by = HistogramBy::Status;
+    let mut rest = Vec::with_capacity(pairs.len());
+    for (k, v) in pairs {
+        match k.as_str() {
+            "bucket" => match v.parse::<i64>() {
+                Ok(b) if b >= 1 => bucket = Some(b),
+                _ => return bad("bucket: a number of seconds, at least 1".into()),
+            },
+            "by" => {
+                by = match v.as_str() {
+                    "status" => HistogramBy::Status,
+                    "cluster_group" | "group" => HistogramBy::ClusterGroup,
+                    _ => return bad("by: status or cluster_group".into()),
+                }
+            }
+            _ => rest.push((k, v)),
+        }
+    }
+    let mut filters = match QueryFilters::from_pairs(rest) {
+        Ok(f) => f,
+        Err(e) => return bad(e),
+    };
+    let to = filters.to.unwrap_or_else(chrono::Utc::now);
+    let from = filters.from.unwrap_or(to - chrono::Duration::hours(24));
+    if from >= to {
+        return bad("from must be before to".into());
+    }
+    filters.from = Some(from);
+    filters.to = Some(to);
+    let span = (to - from).num_seconds().max(1);
+    let bucket_secs =
+        bucket.unwrap_or_else(|| queryflux_persistence::query_history::histogram_bucket_secs(span));
+    if span / bucket_secs > MAX_HISTOGRAM_BUCKETS {
+        return bad(format!(
+            "{} buckets of {bucket_secs}s; at most {MAX_HISTOGRAM_BUCKETS}: use a wider bucket",
+            span / bucket_secs
+        ));
+    }
+    match pg.query_histogram(&filters, bucket_secs, by).await {
+        Ok(rows) => Json(QueryHistogramDto {
+            from,
+            to,
+            bucket_secs,
+            by,
+            rows,
+        })
+        .into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
@@ -1989,7 +2102,9 @@ async fn list_engines_handler(State(state): State<Arc<AdminState>>) -> impl Into
     path = "/admin/engine-stats",
     tag = "admin",
     params(
-        ("hours" = Option<i64>, Query, description = "Look-back window in hours (default 24)")
+        ("hours" = Option<i64>, Query, description = "Look-back window in hours (default 24, at most 168); ignored with `from`"),
+        ("from" = Option<String>, Query, description = "Start of the range (RFC 3339)"),
+        ("to" = Option<String>, Query, description = "End of the range (RFC 3339, default now)"),
     ),
     responses(
         (status = 200, description = "Per-engine aggregated stats", body = Vec<EngineStatRow>),
@@ -2008,8 +2123,11 @@ async fn get_engine_stats_handler(
         )
             .into_response();
     };
-    let hours = params.hours.unwrap_or(24).clamp(1, 168);
-    match pg.get_engine_stats(hours).await {
+    let range = match params.range() {
+        Ok(r) => r,
+        Err(e) => return (StatusCode::BAD_REQUEST, e).into_response(),
+    };
+    match pg.get_engine_stats(range).await {
         Ok(rows) => Json::<Vec<EngineStatRow>>(rows).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
@@ -2021,7 +2139,9 @@ async fn get_engine_stats_handler(
     path = "/admin/group-stats",
     tag = "admin",
     params(
-        ("hours" = Option<i64>, Query, description = "Look-back window in hours (default 24)")
+        ("hours" = Option<i64>, Query, description = "Look-back window in hours (default 24, at most 168); ignored with `from`"),
+        ("from" = Option<String>, Query, description = "Start of the range (RFC 3339)"),
+        ("to" = Option<String>, Query, description = "End of the range (RFC 3339, default now)"),
     ),
     responses(
         (status = 200, description = "Per-group aggregated stats", body = Vec<GroupStatRow>),
@@ -2040,8 +2160,11 @@ async fn get_group_stats_handler(
         )
             .into_response();
     };
-    let hours = params.hours.unwrap_or(24).clamp(1, 168);
-    match pg.get_group_stats(hours).await {
+    let range = match params.range() {
+        Ok(r) => r,
+        Err(e) => return (StatusCode::BAD_REQUEST, e).into_response(),
+    };
+    match pg.get_group_stats(range).await {
         Ok(rows) => Json::<Vec<GroupStatRow>>(rows).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
@@ -2050,6 +2173,25 @@ async fn get_group_stats_handler(
 #[derive(Debug, serde::Deserialize)]
 struct EngineStatsParams {
     hours: Option<i64>,
+    from: Option<chrono::DateTime<chrono::Utc>>,
+    to: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+impl EngineStatsParams {
+    /// `from`/`to` when given, else the last `hours` hours.
+    fn range(&self) -> std::result::Result<TimeRange, String> {
+        match self.from {
+            Some(from) => {
+                if self.to.is_some_and(|to| from >= to) {
+                    return Err("from must be before to".into());
+                }
+                Ok(TimeRange { from, to: self.to })
+            }
+            None => Ok(TimeRange::last_hours(
+                self.hours.unwrap_or(24).clamp(1, 168),
+            )),
+        }
+    }
 }
 
 /// Request body for `PATCH /admin/clusters/:group/:cluster`.
