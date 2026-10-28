@@ -2489,8 +2489,14 @@ impl CapacityStore for PostgresStore {
     }
 
     async fn heartbeat(&self, instance_id: &str) -> Result<u64> {
+        // Also renews the leases of queries still recorded as executing, whichever replica
+        // took them: a Trino HTTP query outlives the replica that submitted it (any replica
+        // serves its polls), and its lease must stay until a poll, cancel or the zombie sweep
+        // ends it.
         let result = sqlx::query(
-            "UPDATE cluster_capacity_leases SET heartbeat_at = now() WHERE instance_id = $1",
+            "UPDATE cluster_capacity_leases SET heartbeat_at = now()
+             WHERE instance_id = $1
+                OR query_id IN (SELECT data->>'id' FROM executing_queries)",
         )
         .bind(instance_id)
         .execute(&self.coordination_pool)
@@ -2585,11 +2591,17 @@ impl CapacityStore for PostgresStore {
     }
 
     async fn release_all_for_instance(&self, instance_id: &str) -> Result<u64> {
-        let result = sqlx::query("DELETE FROM cluster_capacity_leases WHERE instance_id = $1")
-            .bind(instance_id)
-            .execute(&self.coordination_pool)
-            .await
-            .map_err(|e| QueryFluxError::Persistence(format!("release_all_for_instance: {e}")))?;
+        // Keep the leases of queries still recorded as executing: they keep running on the
+        // engine after this replica goes, and are ended (and released) through another one.
+        let result = sqlx::query(
+            "DELETE FROM cluster_capacity_leases
+             WHERE instance_id = $1
+               AND query_id NOT IN (SELECT data->>'id' FROM executing_queries)",
+        )
+        .bind(instance_id)
+        .execute(&self.coordination_pool)
+        .await
+        .map_err(|e| QueryFluxError::Persistence(format!("release_all_for_instance: {e}")))?;
         Ok(result.rows_affected())
     }
 }
