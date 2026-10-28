@@ -2187,9 +2187,14 @@ impl EngineStatsParams {
                 }
                 Ok(TimeRange { from, to: self.to })
             }
-            None => Ok(TimeRange::last_hours(
-                self.hours.unwrap_or(24).clamp(1, 168),
-            )),
+            None => {
+                let hours = self.hours.unwrap_or(24).clamp(1, 168);
+                let end = self.to.unwrap_or_else(chrono::Utc::now);
+                Ok(TimeRange {
+                    from: end - chrono::Duration::hours(hours),
+                    to: self.to,
+                })
+            }
         }
     }
 }
