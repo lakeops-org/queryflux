@@ -339,3 +339,21 @@ async fn statement_trivia_survives_schema_translation_and_same_dialect_fixups() 
         assert_eq!(report.outcome.status, TranslationStatus::Yes);
     }
 }
+
+/// MCP `describe_table` sends ANSI-quoted DDL with `dialect = "trino"`; Athena's DDL parser
+/// only accepts backticks.
+#[tokio::test]
+async fn ansi_quoted_describe_is_requoted_for_athena() {
+    let service = TranslationService::new_sqlglot(vec![]).unwrap();
+    let sql = service
+        .maybe_translate(
+            r#"DESCRIBE "db"."tbl""#,
+            &SqlDialect::Sqlglot("trino".into()),
+            &SqlDialect::Athena,
+            &SchemaContext::default(),
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(sql, "DESCRIBE `db`.`tbl`");
+}
