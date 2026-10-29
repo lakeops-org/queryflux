@@ -45,7 +45,10 @@ use crate::state::{AppState, LiveConfig, QueryContext, QueryOutcome};
 /// declared it would make the audit trail wrong, not just the translation.
 fn resolve_src_dialect(session: &SessionContext, protocol: &FrontendProtocol) -> SqlDialect {
     if let Some(name) = session.extra.get("dialect") {
-        return SqlDialect::Sqlglot(name.clone());
+        // Known names map to their variant so `is_compatible_with` can skip sqlglot
+        // when the declared dialect already matches the target engine.
+        return SqlDialect::from_known_name(name)
+            .unwrap_or_else(|| SqlDialect::Sqlglot(name.clone()));
     }
     protocol.default_dialect()
 }
@@ -3268,7 +3271,7 @@ mod resolve_src_dialect_tests {
             .extra
             .insert("dialect".to_string(), "bigquery".to_string());
         let resolved = resolve_src_dialect(&session, &FrontendProtocol::Mcp);
-        assert_eq!(resolved, SqlDialect::Sqlglot("bigquery".to_string()));
+        assert_eq!(resolved, SqlDialect::BigQuery);
     }
 
     #[test]
@@ -3278,7 +3281,15 @@ mod resolve_src_dialect_tests {
             .extra
             .insert("dialect".to_string(), "snowflake".to_string());
         let resolved = resolve_src_dialect(&session, &FrontendProtocol::TrinoHttp);
-        assert_eq!(resolved, SqlDialect::Sqlglot("snowflake".to_string()));
+        assert_eq!(resolved, SqlDialect::Snowflake);
+    }
+
+    #[test]
+    fn unknown_override_stays_a_raw_sqlglot_name() {
+        let mut session = SessionContext::default();
+        session.extra.insert("dialect".to_string(), String::new());
+        let resolved = resolve_src_dialect(&session, &FrontendProtocol::Mcp);
+        assert_eq!(resolved, SqlDialect::Sqlglot(String::new()));
     }
 }
 

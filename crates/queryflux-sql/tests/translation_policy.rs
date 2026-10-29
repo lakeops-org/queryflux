@@ -340,7 +340,7 @@ async fn statement_trivia_survives_schema_translation_and_same_dialect_fixups() 
     }
 }
 
-/// MCP `describe_table` sends ANSI-quoted DDL with `dialect = "trino"`; Athena's DDL parser
+/// MCP `describe_table` sends ANSI-quoted SQL declared as `postgres`. Athena's DDL parser
 /// only accepts backticks.
 #[tokio::test]
 async fn ansi_quoted_describe_is_requoted_for_athena() {
@@ -348,7 +348,7 @@ async fn ansi_quoted_describe_is_requoted_for_athena() {
     let sql = service
         .maybe_translate(
             r#"DESCRIBE "db"."tbl""#,
-            &SqlDialect::Sqlglot("trino".into()),
+            &SqlDialect::Postgres,
             &SqlDialect::Athena,
             &SchemaContext::default(),
             &[],
@@ -356,4 +356,31 @@ async fn ansi_quoted_describe_is_requoted_for_athena() {
         .await
         .unwrap();
     assert_eq!(sql, "DESCRIBE `db`.`tbl`");
+}
+
+/// Schema-aware optimization must keep quoted identifier spelling: Snowflake treats quoted
+/// names as case-sensitive.
+#[tokio::test]
+async fn ansi_quoted_describe_keeps_identifier_case_with_schema() {
+    let service = TranslationService::new_sqlglot(vec![]).unwrap();
+    let schema = SchemaContext {
+        tables: std::collections::HashMap::from([(
+            "ORDERS".into(),
+            ColumnMap::from([("ID".into(), "INT".into())]),
+        )]),
+        ..Default::default()
+    };
+    for sql in [r#"DESCRIBE "ORDERS""#, r#"SELECT * FROM "ORDERS" LIMIT 1"#] {
+        let translated = service
+            .maybe_translate(
+                sql,
+                &SqlDialect::Postgres,
+                &SqlDialect::Snowflake,
+                &schema,
+                &[],
+            )
+            .await
+            .unwrap();
+        assert!(translated.contains(r#""ORDERS""#), "{translated}");
+    }
 }

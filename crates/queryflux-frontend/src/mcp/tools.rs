@@ -380,12 +380,14 @@ fn qualify_table(schema: Option<&str>, table: &str) -> String {
 
 /// `describe_table` writes its own SQL with ANSI-quoted identifiers, so unlike
 /// `execute_query` it knows the source dialect. Declaring it lets translation re-quote
-/// for the target engine; Athena's DDL parser, for one, rejects double quotes.
+/// for the target engine; Athena's DDL parser, for one, rejects double quotes. Postgres
+/// rather than Trino: schema-aware optimization lowercases quoted identifiers under a
+/// case-insensitive dialect, which breaks case-sensitive targets such as Snowflake.
 fn describe_session_for(auth: &AuthContext, agent_context: AgentContext) -> SessionContext {
     let mut session = session_for(auth, agent_context);
     session
         .extra
-        .insert("dialect".to_string(), "trino".to_string());
+        .insert("dialect".to_string(), "postgres".to_string());
     session
 }
 
