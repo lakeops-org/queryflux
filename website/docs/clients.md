@@ -26,7 +26,7 @@ Ports below are the usual defaults from [`config.example.yaml`](https://github.c
 | `psql`, Postgres JDBC/Python in simple-query mode | PostgreSQL wire | `postgresWire` | **5432** | Postgres |
 | `mysql` / `mariadb` CLI, MySQL JDBC/Python | MySQL wire | `mysqlWire` | **3306** | MySQL |
 | SnowSQL, Snowflake JDBC/ODBC/Python, REST v2 | Snowflake HTTP + SQL API v2 | `snowflakeHttp` | **set in YAML** (often **8443** or **8445**) | Snowflake |
-| Flight SQL JDBC, ADBC, DuckDB `ATTACH` | Arrow Flight SQL | `flightSql` | **50051** (gRPC) | Generic |
+| Flight SQL JDBC, ADBC | Arrow Flight SQL | `flightSql` | **50051** (gRPC) | Generic |
 
 Enable each frontend in config before connecting. Snowflake has **no implicit port** — you must set `snowflakeHttp.port`. Wire and SQL API v2 share that listener; routing distinguishes `snowflakeHttp` vs `snowflakeSqlApi`.
 
@@ -46,10 +46,25 @@ trino --server http://localhost:8080 --user dev --execute "SELECT 42"
 
 **curl**
 
+The POST below submits the statement only. Sync backends may return rows in that JSON; async-capable cluster groups return a `nextUri` you must poll until it disappears (see [Trino HTTP](/docs/architecture/frontends/trino-http#execution-model)).
+
 ```bash
 curl -X POST http://localhost:8080/v1/statement \
   -H "X-Trino-User: dev" \
   -d "SELECT current_date"
+```
+
+Poll when the response includes `nextUri` (requires `jq`):
+
+```bash
+NEXT=$(curl -s -X POST http://localhost:8080/v1/statement \
+  -H "X-Trino-User: dev" \
+  -d "SELECT current_date" | jq -r '.nextUri // empty')
+while [ -n "$NEXT" ]; do
+  RESP=$(curl -s -H "X-Trino-User: dev" "$NEXT")
+  echo "$RESP"
+  NEXT=$(echo "$RESP" | jq -r '.nextUri // empty')
+done
 ```
 
 **Python (`trino` package)**
@@ -99,10 +114,10 @@ print(cur.fetchone())
 **JDBC (PostgreSQL driver)** — disable SSL if the driver insists on TLS:
 
 ```text
-jdbc:postgresql://localhost:5432/my_catalog?user=dev&sslmode=disable
+jdbc:postgresql://localhost:5432/my_catalog?user=dev&sslmode=disable&preferQueryMode=simple
 ```
 
-**What the client sends for auth:** username (and password when configured) in the startup message.
+**What the client sends for auth:** username in the startup message. Client passwords are **not** passed to the auth provider — with `auth.provider: static` and `auth.required: true`, queries are rejected even when the client supplies a password. Use [Trino HTTP](/docs/architecture/frontends/trino-http) or [Flight SQL](/docs/architecture/frontends/flight-sql) when password-based auth is required.
 
 Protocol reference: [PostgreSQL wire](/docs/architecture/frontends/postgres-wire).
 
@@ -143,7 +158,7 @@ print(cur.fetchone())
 jdbc:mysql://127.0.0.1:3306/my_catalog?user=dev&useSSL=false
 ```
 
-**What the client sends for auth:** username and password in the handshake.
+**What the client sends for auth:** username in the handshake (password bytes are not passed to the auth provider). The same static-auth limitation as PostgreSQL wire applies — use Trino HTTP, Snowflake, or Flight SQL when password verification is required.
 
 Protocol reference: [MySQL wire](/docs/architecture/frontends/mysql-wire).
 
@@ -151,12 +166,14 @@ Protocol reference: [MySQL wire](/docs/architecture/frontends/mysql-wire).
 
 ### Snowflake HTTP + SQL API v2 (`snowflakeHttp`)
 
-Both Snowflake wire and REST API v2 listen on the **same port** you configure. QueryFlux does not terminate TLS — use `protocol=http` to QueryFlux directly, or HTTPS/`--insecure` only when a TLS terminator sits in front.
+Both Snowflake wire and REST API v2 listen on the **same port** you configure. QueryFlux does not terminate TLS — use `protocol=http` with the Python connector to QueryFlux directly, or HTTPS to a **TLS terminator** in front of QueryFlux for SnowSQL and other wire clients.
 
 **SnowSQL**
 
+SnowSQL connects over HTTPS. Terminate TLS on the port SnowSQL uses (for example **8443**), forwarding plain HTTP to QueryFlux. For dev/test with a self-signed terminator certificate, pass `-o insecure_mode=True` (SnowSQL option, not a CLI flag named `--insecure`):
+
 ```bash
-snowsql -a <account-placeholder> -u dev -h localhost -p 8443 --protocol https --insecure
+snowsql -a queryflux -u dev -h localhost -p 8443 -o insecure_mode=True -q "SELECT 42 AS answer"
 ```
 
 **Python (`snowflake-connector-python`)**
@@ -200,23 +217,13 @@ Protocol reference: [Snowflake frontend](/docs/architecture/frontends/snowflake)
 
 gRPC **plaintext** to QueryFlux unless you add an external TLS terminator. Catalog/schema RPCs are not implemented — run SQL via `GetFlightInfo` + `DoGet` only.
 
-**Python (ADBC Flight SQL driver)**
+**Flight SQL JDBC driver** — plaintext gRPC to QueryFlux:
 
-```python
-import adbc_driver_flightsql.dbapi as flight_sql
-
-conn = flight_sql.connect(uri="grpc://localhost:50051")
-cur = conn.cursor()
-cur.execute("SELECT 42 AS answer")
-print(cur.fetchone())
+```text
+jdbc:arrow-flight-sql://localhost:50051/?useEncryption=false
 ```
 
-**DuckDB (Flight SQL extension)**
-
-```sql
-ATTACH 'grpc://localhost:50051' AS qf (TYPE flight_sql);
-SELECT * FROM qf.my_catalog.my_schema.my_table LIMIT 10;
-```
+**Python (ADBC Flight SQL driver)** — QueryFlux returns an empty `FlightInfo` schema for statement queries today. The ADBC driver validates `DoGet` batch schemas against that metadata and `cur.execute(...)` can fail on queries that return columns. Prefer the JDBC driver above until `FlightInfo` carries the result schema (see [Flight SQL frontend](/docs/architecture/frontends/flight-sql)).
 
 **What the client sends for auth:** gRPC metadata `authorization: Bearer …` or `Basic …`.
 
@@ -231,13 +238,13 @@ Who may connect and which credential each frontend accepts are configured under 
 | Frontend | Typical client credential |
 | --- | --- |
 | Trino HTTP | Basic, Bearer, or `X-Trino-User` |
-| PostgreSQL wire | Startup `user` / password |
-| MySQL wire | Handshake user / password |
+| PostgreSQL wire | Startup `user` only (password not verified) |
+| MySQL wire | Handshake user only (password not verified) |
 | Snowflake wire | Login body + session token header |
 | Snowflake SQL API v2 | Bearer token per request |
 | Flight SQL | gRPC `authorization` metadata |
 
-When `auth.required: true`, unauthenticated requests are rejected on every enabled frontend.
+When `auth.required: true`, unauthenticated requests are rejected on every enabled frontend — except with `auth.provider: none`, which only requires a non-empty username and does **not** verify credentials (clients may supply any username). That combination is not an authentication boundary; use `static`, OIDC, or LDAP when you need verified identity.
 
 ---
 
@@ -253,6 +260,7 @@ These are the most common “it works against the engine but fails against Query
 | SSL on PostgreSQL wire | PostgreSQL | Wire protocol declines SSL; use `sslmode=disable` or external TLS. |
 | Snowflake session stickiness | Snowflake wire | Enable session affinity when running multiple replicas. |
 | Flight SQL metadata RPCs | Flight SQL | No `GetTables` / catalogs — only statement execution RPCs. |
+| Password auth on wire frontends | PostgreSQL wire, MySQL wire | Client passwords are not passed to `auth`; use Trino HTTP, Snowflake, or Flight SQL for password-based auth. |
 
 For full protocol behavior, open the linked frontend page under **[Frontends](/docs/architecture/frontends/overview)**.
 
