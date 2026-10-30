@@ -99,6 +99,7 @@ curl -X POST http://localhost:8080/v1/statement \
 
 ## Related
 
+- [Connect a SQL client](../../clients) — copy-paste recipes for Trino CLI, JDBC, curl, and Python
 - [Frontends overview](overview.md) — shared dispatch and session model
 - [Routing and clusters](/docs/architecture/routing-and-clusters) — how `protocolBased` maps `trinoHttp` to a group
 - [Query tags](/docs/architecture/query-tags) — tag-based routing from Trino sessions

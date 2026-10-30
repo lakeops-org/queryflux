@@ -25,6 +25,7 @@ The ideas mirror what proxies like [ProxySQL](https://proxysql.com/documentation
 
 <DocCards>
   <DocCard title="Getting started" to="/docs/getting-started">Run QueryFlux with Docker Compose, connect a SQL client, smoke-test Trino HTTP.</DocCard>
+  <DocCard title="Connect a client" to="/docs/clients">Choose a frontend, copy connection recipes, and avoid common TLS and protocol gotchas.</DocCard>
   <DocCard title="Installation" to="/docs/installation/overview">Deploy on Kubernetes with the Helm chart, run the Docker image, or install the binary.</DocCard>
   <DocCard title="QueryFlux Studio" to="/docs/studio">Use the web UI for clusters, routing, query history, and admin security.</DocCard>
   <DocCard title="Authentication & identity" to="/docs/authentication">Set up OIDC/LDAP client auth and choose a backend identity mode (passthrough, impersonate, token exchange).</DocCard>

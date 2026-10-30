@@ -93,5 +93,6 @@ print(cur.fetchone())
 
 ## Related
 
+- [Connect a SQL client](../../clients) — `psql`, JDBC, and Python connection examples
 - [Frontends overview](overview.md) — shared dispatch and session model
 - [Routing and clusters](/docs/architecture/routing-and-clusters) — `protocolBased` router with `postgresWire`
