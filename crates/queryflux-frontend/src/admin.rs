@@ -3565,7 +3565,8 @@ async fn access_control_dry_run_handler(
     };
     let query_tags = queryflux_core::tags::QueryTags::new();
     let session_extra = std::collections::HashMap::new();
-    let sql_parse = queryflux_sql::classify::SqlParseCache::new(body.sql.clone(), dialect.clone());
+    //let sql_parse = queryflux_sql::classify::SqlParseCache::new(body.sql.clone(), dialect.clone());
+    let sql_parse = Arc::new(queryflux_sql::classify::SqlParseCache::new(body.sql.to_string(), dialect.clone()));
 
     let catalog = state.live.read().await.catalog.clone();
     let schema_ctx = if let Some(tables) = body.schema.filter(|t| !t.is_empty()) {
@@ -3605,7 +3606,8 @@ async fn access_control_dry_run_handler(
         query_tags: &query_tags,
         session_extra: &session_extra,
         schema: Some(&schema_ctx),
-        sql_parse: Some(&sql_parse),
+        //sql_parse: Some(&sql_parse),
+        sql_parse: Some(Arc::clone(&sql_parse))
     };
 
     let result = {
