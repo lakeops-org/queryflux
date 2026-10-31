@@ -1,0 +1,81 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="400" viewBox="0 0 960 400" role="img" aria-label="Planned flow: an agent asks QueryFlux for metrics by dimensions; QueryFlux looks up the Ossie model, routes to an engine, compiles SQL for that engine with ossiec, applies guardrails, row filters and impersonation, and runs it">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#0b0614"/>
+      <stop offset="100%" stop-color="#050508"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="45%" cy="45%" r="55%">
+      <stop offset="0%" stop-color="#7c3aed" stop-opacity="0.28"/>
+      <stop offset="100%" stop-color="#7c3aed" stop-opacity="0"/>
+    </radialGradient>
+    <marker id="arr" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto">
+      <path d="M0,0 L7,3 L0,6 Z" fill="#a78bfa"/>
+    </marker>
+    <marker id="arrG" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto">
+      <path d="M0,0 L7,3 L0,6 Z" fill="#86efac"/>
+    </marker>
+    <pattern id="dots" width="22" height="22" patternUnits="userSpaceOnUse">
+      <circle cx="1" cy="1" r="0.8" fill="rgba(255,255,255,0.05)"/>
+    </pattern>
+  </defs>
+
+  <rect width="960" height="400" rx="20" fill="url(#bg)"/>
+  <rect width="960" height="400" rx="20" fill="url(#glow)"/>
+  <rect width="960" height="400" rx="20" fill="url(#dots)"/>
+  <rect x="1" y="1" width="958" height="398" rx="19" fill="none" stroke="rgba(255,255,255,0.08)"/>
+
+  <g font-family="ui-sans-serif, system-ui, sans-serif">
+    <text x="40" y="42" fill="#fafafa" font-size="18" font-weight="650">Agents ask for metrics. QueryFlux compiles, routes and guards.</text>
+    <text x="40" y="66" fill="#a1a1aa" font-size="12">Planned flow. ossiec is available today; the QueryFlux semantic tools are on the roadmap.</text>
+
+    <!-- Agent -->
+    <rect x="40" y="120" width="160" height="170" rx="16" fill="rgba(255,118,25,0.1)" stroke="#ff7619" stroke-width="1.5"/>
+    <circle cx="120" cy="160" r="22" fill="rgba(255,118,25,0.2)" stroke="#ff7619"/>
+    <circle cx="120" cy="154" r="7" fill="#fdba74"/>
+    <path d="M104 174c4-10 28-10 32 0" fill="none" stroke="#fdba74" stroke-width="2" stroke-linecap="round"/>
+    <text x="120" y="208" text-anchor="middle" fill="#ffedd5" font-size="14" font-weight="650">Agent</text>
+    <text x="120" y="230" text-anchor="middle" fill="#fdba74" font-size="11">query_semantic_model</text>
+    <text x="120" y="250" text-anchor="middle" fill="#a16207" font-size="10">total_stock</text>
+    <text x="120" y="266" text-anchor="middle" fill="#a16207" font-size="10">by customers.region</text>
+
+    <line x1="200" y1="205" x2="238" y2="205" stroke="#a78bfa" stroke-width="2" marker-end="url(#arr)"/>
+
+    <!-- QueryFlux -->
+    <rect x="240" y="96" width="460" height="260" rx="16" fill="rgba(139,92,246,0.14)" stroke="#8b5cf6" stroke-width="1.75"/>
+    <text x="470" y="126" text-anchor="middle" fill="#ede9fe" font-size="15" font-weight="650">QueryFlux</text>
+
+    <rect x="264" y="146" width="196" height="54" rx="10" fill="rgba(0,0,0,0.28)"/>
+    <text x="362" y="169" text-anchor="middle" fill="#ede9fe" font-size="12" font-weight="600">1. Ossie model registry</text>
+    <text x="362" y="188" text-anchor="middle" fill="#c4b5fd" font-size="10">metrics, joins, keys, ai_context</text>
+
+    <rect x="480" y="146" width="196" height="54" rx="10" fill="rgba(0,0,0,0.28)"/>
+    <text x="578" y="169" text-anchor="middle" fill="#ede9fe" font-size="12" font-weight="600">2. Route</text>
+    <text x="578" y="188" text-anchor="middle" fill="#c4b5fd" font-size="10">pick the engine first</text>
+
+    <rect x="264" y="214" width="412" height="54" rx="10" fill="rgba(134,239,172,0.08)" stroke="#86efac" stroke-opacity="0.5"/>
+    <text x="470" y="237" text-anchor="middle" fill="#dcfce7" font-size="12" font-weight="600">3. ossiec: compile for that engine</text>
+    <text x="470" y="256" text-anchor="middle" fill="#86efac" font-size="10">one statement, no double counting, engine-native dialect</text>
+
+    <rect x="264" y="282" width="412" height="54" rx="10" fill="rgba(0,0,0,0.28)"/>
+    <text x="470" y="305" text-anchor="middle" fill="#ede9fe" font-size="12" font-weight="600">4. Same pipeline as any query</text>
+    <text x="470" y="324" text-anchor="middle" fill="#c4b5fd" font-size="10">guardrails · row filters and masks · impersonation · history</text>
+
+    <line x1="700" y1="226" x2="738" y2="226" stroke="#86efac" stroke-width="2" marker-end="url(#arrG)"/>
+
+    <!-- Engines -->
+    <rect x="740" y="120" width="180" height="212" rx="16" fill="rgba(255,255,255,0.03)" stroke="rgba(255,255,255,0.18)"/>
+    <text x="830" y="150" text-anchor="middle" fill="#fafafa" font-size="14" font-weight="650">Engines</text>
+    <g font-size="11" fill="#d4d4d8" text-anchor="middle">
+      <rect x="764" y="166" width="132" height="26" rx="7" fill="rgba(255,255,255,0.05)"/>
+      <text x="830" y="183">Trino</text>
+      <rect x="764" y="198" width="132" height="26" rx="7" fill="rgba(255,255,255,0.05)"/>
+      <text x="830" y="215">StarRocks</text>
+      <rect x="764" y="230" width="132" height="26" rx="7" fill="rgba(255,255,255,0.05)"/>
+      <text x="830" y="247">ClickHouse</text>
+      <rect x="764" y="262" width="132" height="26" rx="7" fill="rgba(255,255,255,0.05)"/>
+      <text x="830" y="279">Snowflake, Postgres …</text>
+    </g>
+    <text x="830" y="314" text-anchor="middle" fill="#71717a" font-size="10">same rows on every engine</text>
+  </g>
+</svg>
