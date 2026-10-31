@@ -10,7 +10,7 @@ use crate::context::{GuardContext, GuardLayer, GuardResult};
 async fn guard_statements<'a>(
     ctx: &'a GuardContext<'a>,
 ) -> Result<std::borrow::Cow<'a, [Expression]>, ()> {
-    if let Some(cache) = ctx.sql_parse {
+    if let Some(cache) = ctx.sql_parse.as_ref()  {
         cache.ensure_parsed().await;
         return cache.statements().map(std::borrow::Cow::Borrowed).ok_or(());
     }
