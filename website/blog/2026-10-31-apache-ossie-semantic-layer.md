@@ -15,6 +15,7 @@ keywords:
   - ossiec
   - fan trap
   - text-to-SQL
+image: img/blog/ossie-hero.jpg
 ---
 
 Ask an agent for "units in stock by customer region" over an ordinary star schema, and it will write something like this:
@@ -31,10 +32,10 @@ It runs and it looks right, but the numbers are wrong. Stock lives on `products`
 
 | region | agent's SQL | correct |
 |---|---:|---:|
-| EU | 250 | 150 |
+| EU | 350 | 150 |
 | US | 60 | 30 |
 
-Nothing errors and nothing warns, so the dashboard or the agent's answer ships with a number that is off by 2×.
+Nothing errors and nothing warns, so the dashboard or the agent's answer ships with a number that is more than double the truth.
 
 > **An agent that can write SQL still doesn't know what your metrics mean.** Something has to hold that meaning, and something has to turn it into SQL that is correct on the engine that runs it.
 
@@ -92,10 +93,15 @@ So we built [**ossiec**](https://github.com/lakeops-org/ossiec), an open-source 
 
 The rules that make the answer correct live in the compiler instead of in each prompt:
 
-- **No double counting.** Joins only go from many to one, starting at a single root. A measure that reads the "one" side of a join, like `SUM(products.stock)` from orders, is computed over rows de-duplicated on that dataset's primary key, as the Ossie spec describes. That is how 250 becomes 150.
+- **No double counting.** Joins only go from many to one, starting at a single root. A measure that reads the "one" side of a join, like `SUM(products.stock)` from orders, is computed over rows de-duplicated on that dataset's primary key, as the Ossie spec describes. That is how 350 becomes 150 (figure below).
 - **Separate facts stay separate.** Store sales and web sales share `item` and `date` but not each other. ossiec computes each fact on its own and stacks the results, instead of joining two fact tables and multiplying both.
 - **Ambiguity is an error, not a guess.** If a date can be reached by "first purchase" and "first shipment", ossiec refuses and names the choices, so the caller can pick one (`customer_first_sales.d_year`).
 - **Errors speak the model's language.** `unknown metric 'revenue'; available: total_revenue, …` is a message an agent can act on and correct itself.
+
+<figure class="blog-figure">
+  <img src="/img/blog/ossie-fan-trap.svg" alt="EU has five orders over two products. Summing stock over the joined rows counts product 10 twice and product 11 three times, giving 350. ossiec sums each product once, by primary key, giving 150." />
+  <figcaption>The joined rows repeat each product once per order. ossiec sums stock over one row per product instead.</figcaption>
+</figure>
 
 The output is engine-native SQL for Trino, StarRocks, ClickHouse, Postgres, MySQL, Snowflake, BigQuery and more. Engines differ in subtle ways, so every test case runs on six real engines (DuckDB, Postgres, Trino, StarRocks, ClickHouse and MySQL) and must return the same rows on each. The tests include official TPC-DS queries over generated TPC-DS data.
 
