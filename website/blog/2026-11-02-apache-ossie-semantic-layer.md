@@ -43,7 +43,7 @@ Every table is right. Every join is right. It runs, and it returns this:
 
 Stock belongs to a product, but the join repeats each product once per *order*. A product ordered three times gets its stock counted three times. No error, no warning, and the number is more than double the truth.
 
-A better prompt won't fix this, and neither will a bigger model. The schema simply doesn't say that `stock` is a property of a product, not of an order.
+A better prompt won't fix this, and neither will a bigger model. Nothing in the schema says that `total_stock` has to be counted once per product *before* it's grouped through orders, so the join multiplies it.
 
 > **An agent that can write SQL still doesn't know what your metrics mean.**
 
@@ -51,7 +51,7 @@ A better prompt won't fix this, and neither will a bigger model. The schema simp
 
 ## The model knows what the schema doesn't
 
-An [Apache Ossie](https://ossie.apache.org/) model is a YAML file that describes your datasets, how they join, and what each metric means. Two small details in it fix the query above:
+An [Apache Ossie](https://ossie.apache.org/) model is a YAML (or JSON) document that describes your datasets, how they join, and what each metric means. Two small details in it fix the query above:
 
 ```yaml
 datasets:
@@ -78,9 +78,9 @@ So we built [**ossiec**](https://github.com/lakeops-org/ossiec), an open-source 
 
 and ossiec returns one SQL statement for the target engine, with the correctness rules built in:
 
-- **No double counting.** When a metric reads the "one" side of a join, like stock from orders, ossiec first reduces it to one row per product, then sums. That's how 350 becomes 150.
+- **No double counting.** When a metric reads the "one" side of a join, like stock from products while grouping through orders, ossiec first reduces it to one row per product, then sums. That's how 350 becomes 150.
 - **Separate facts stay separate.** Store sales and web sales are computed on their own and combined, never joined to each other.
-- **Ambiguity is an error, not a guess.** If a date can mean "first purchase" or "first shipment", ossiec asks which one instead of picking.
+- **Ambiguity is an error, not a guess.** ossiec follows the most direct join path. If two paths are equally direct, say a date reached through "first purchase" or through "first shipment", it refuses and names both, and the caller picks one by role (`customer_first_sales.d_year`).
 - **Errors an agent can fix.** `unknown metric 'revenue'; available: total_revenue, …` gets fixed in one retry.
 
 <figure class="blog-figure">
@@ -96,7 +96,7 @@ That testing caught bugs that never raise an error:
 
 - **ClickHouse** returns `0` instead of `NULL` for the first row of `LAG`, so growth for the first period is computed against zero.
 - **MySQL** has no `NULLS LAST`. Translators quietly drop it, and your "top 10" starts with unknowns.
-- **ClickHouse 25.8–26.4** can merge distinct rows inside a `UNION ALL`, which is exactly the shape double-count protection produces ([fixed in 26.5](https://github.com/ClickHouse/ClickHouse/pull/104114)).
+- **ClickHouse 25.8–26.4** can drop a column from a `SELECT DISTINCT` inside a `UNION ALL`, so rows that should stay distinct collapse. That's exactly the shape double-count protection produces ([fixed in 26.5](https://github.com/ClickHouse/ClickHouse/pull/104114)).
 
 ossiec handles each of these, so the same request means the same thing everywhere.
 
@@ -110,7 +110,7 @@ A compiler produces SQL; it doesn't run it. Someone still has to pick the engine
 </figure>
 
 - **Route, then compile.** QueryFlux picks the engine, then ossiec writes SQL in that engine's own dialect, with the fixes above intact.
-- **No side door.** The SQL goes through the same [guardrails](/docs/architecture/guardrails), [row filters](/blog/row-filters-above-the-engines) and audit as any other query. A metric can't show rows a user isn't allowed to see.
+- **No side door.** The SQL goes through the same [guardrails](/docs/architecture/guardrails), [row filters](/blog/row-filters-above-the-engines) and audit as any other query. With access policies configured, a metric can't show rows a user isn't allowed to see.
 - **Tools built for metrics.** Agents get MCP tools to list models, look up real dimension values (`'EU'`, not a guessed `'Europe'`) and run `query_semantic_model`.
 - **Raw SQL is your call.** Each deployment chooses whether agents may still write their own SQL: `allow`, `warn` or `deny`.
 
