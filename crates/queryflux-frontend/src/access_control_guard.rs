@@ -695,7 +695,7 @@ fn runs_sql_it_does_not_show(sql: &str, controller: &AccessController) -> Option
     let s = queryflux_sql::classify::strip_leading_sql_comments(sql);
     let head = word_at(s).to_ascii_lowercase();
     match head.as_str() {
-        "execute" => Some("EXECUTE"),
+        "execute" | "exec" => Some("EXECUTE"),
         "prepare" => Some("PREPARE"),
         "do" => Some("DO"),
         "declare" => Some("procedural block"),
