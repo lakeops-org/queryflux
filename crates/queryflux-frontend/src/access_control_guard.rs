@@ -695,6 +695,7 @@ fn runs_sql_it_does_not_show(sql: &str, controller: &AccessController) -> Option
     let s = queryflux_sql::classify::strip_leading_sql_comments(sql);
     let head = word_at(s).to_ascii_lowercase();
     match head.as_str() {
+        // `EXEC` is SQL Server's spelling.
         "execute" | "exec" => Some("EXECUTE"),
         "prepare" => Some("PREPARE"),
         "do" => Some("DO"),
@@ -702,7 +703,9 @@ fn runs_sql_it_does_not_show(sql: &str, controller: &AccessController) -> Option
         "begin" => {
             let rest = queryflux_sql::classify::strip_leading_sql_comments(&s[head.len()..]);
             let next = word_at(rest).to_ascii_lowercase();
-            let rest_is_empty = rest.trim_start_matches(';').trim().is_empty();
+            let rest_is_empty =
+                queryflux_sql::classify::strip_leading_sql_comments(rest.trim_start_matches(';'))
+                    .is_empty();
             (!rest_is_empty && !BEGIN_TRANSACTION_WORDS.contains(&next.as_str()))
                 .then_some("procedural block")
         }
@@ -1664,6 +1667,7 @@ mod tests {
         for sql in [
             "EXECUTE q",
             "execute q USING 1",
+            "EXEC build_report",
             "/* x */ EXECUTE q",
             "-- run it\nEXECUTE q",
             "PREPARE q FROM SELECT * FROM salaries",
@@ -1683,6 +1687,8 @@ mod tests {
         for sql in [
             "BEGIN",
             "BEGIN;",
+            "BEGIN; -- start",
+            "BEGIN /* x */;",
             "BEGIN TRANSACTION",
             "begin work",
             "SELECT 1",
@@ -1701,7 +1707,7 @@ mod tests {
         let url = start_deny_all_stub().await;
         let guard = guard_for(&url, Some(&["table.select", "procedure.call"]));
         let result = check_trino(&guard, "CALL build_report()").await;
-        assert_ne!(deny_code(&result), Some("ACCESS_UNSUPPORTED_STATEMENT"));
+        assert_eq!(deny_code(&result), Some("ACCESS_DENIED"));
     }
 
     #[test]
