@@ -696,9 +696,7 @@ pub async fn dispatch_query(
 
     // Guard chain: runs after translation (SQL is final), before engine submission.
     // Global guards run first; per-group guards are appended after.
-    //let sql_parse = engine_parse;
     let sql_parse = Arc::new(engine_parse);
-
     let guard_ctx = GuardContext {
         sql: &engine_sql,
         original_sql: Some(&original_sql),
@@ -713,7 +711,6 @@ pub async fn dispatch_query(
         query_tags: &effective_tags,
         session_extra: &session.extra,
         schema: None,
-        //sql_parse: Some(&sql_parse),
         sql_parse: Some(Arc::clone(&sql_parse))
     };
 
@@ -1591,7 +1588,6 @@ struct SyncQuerySetup {
     /// Guard actions collected by the guard chain (allow/warn). Merged into QueryOutcome.
     guard_actions: Vec<queryflux_persistence::GuardAction>,
     /// Shared SQL parse cache — used by guardrails and execution hints.
-    //sql_parse: queryflux_sql::classify::SqlParseCache,
     sql_parse: Arc<queryflux_sql::classify::SqlParseCache>,
     /// The wire auth resolved at submit time — reused by `SyncCancelGuard` so a client
     /// disconnect cancels with the same identity the query was submitted under.
@@ -2120,7 +2116,6 @@ async fn setup_sync_query(
     Ok(SyncQuerySetup {
         adapter,
         translated: engine_parse.sql().to_string(),
-        //sql_parse: engine_parse,
         sql_parse: Arc::new(engine_parse),
         start,
         slot,
@@ -2434,10 +2429,6 @@ async fn run_plan_guards(
 ) -> std::result::Result<Vec<queryflux_persistence::GuardAction>, String> {
     let engine_type = queryflux_core::query::EngineType::Cache;
     let resolved_agent_ctx = session.resolved_agent_context();
-    // let sql_parse = queryflux_sql::classify::SqlParseCache::new(
-    //     sql.to_string(),
-    //     queryflux_core::query::SqlDialect::Generic,
-    // );
     let sql_parse = Arc::new(
         queryflux_sql::classify::SqlParseCache::new(
             sql.to_string(),
@@ -2459,7 +2450,6 @@ async fn run_plan_guards(
         query_tags: effective_tags,
         session_extra: &session.extra,
         schema: None,
-        //sql_parse: Some(&sql_parse),
         sql_parse: Some(Arc::clone(&sql_parse))
     };
 
@@ -2849,7 +2839,6 @@ async fn execute_to_sink_inner(
     // before submitting to the engine. Global guards run first; per-group guards are appended.
     {
         let ctx = &setup.ctx;
-        //let sql_parse = Arc::new(setup.sql_parse);
         let guard_ctx = GuardContext {
             sql: ctx.translated_sql.as_deref().unwrap_or(&setup.translated),
             original_sql: Some(ctx.sql.as_str()),
@@ -2864,7 +2853,6 @@ async fn execute_to_sink_inner(
             query_tags: &ctx.query_tags,
             session_extra: &ctx.session.extra,
             schema: None,
-            //sql_parse: Some(&setup.sql_parse),
             sql_parse: Some(Arc::clone(&setup.sql_parse)),
         };
 

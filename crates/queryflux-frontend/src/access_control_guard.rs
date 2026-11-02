@@ -279,54 +279,26 @@ impl Guard for OpaAccessGuard {
 
 		// The query's shared parse, whose sqlglot tree the extraction and the rewrite below
 		// both read.
-		// let own_parse;
-		// let parse = match ctx.sql_parse {
-		//     Some(p) => p,
-		//     None => {
-		//         own_parse = queryflux_sql::classify::SqlParseCache::new(ctx.sql, ctx.dialect.clone());
-		//         &own_parse
-		//     }
-		// };
-
 		let parse = match ctx.sql_parse.as_ref() {
 			Some(p) => Arc::clone(p),
 			None => Arc::new(queryflux_sql::classify::SqlParseCache::new(ctx.sql, ctx.dialect.clone()))
 		};
 		let parse_for_blocking = Arc::clone(&parse);
-		// // Only the parse is cached (keyed on the exact SQL, dialect and schema); every
-		// // decision below is still made for this query.
-		// let statement = match queryflux_sql::extract_resources_cached(parse, schema) {
-		//     Ok(r) => r,
-		//     // A query that can't be analyzed has no resources to put in a request, so it can't
-		//     // be judged at all. `onMissingSchema` is about unresolved *columns* of tables that
-		//     // were found — not about failing to find them — so this denies in both modes;
-		//     // allowing it would let anything the parser can't read skip access control.
-		//     Err(e) => {
-		//         return GuardResult::deny(
-		//             format!("access control: could not analyze query: {e}"),
-		//             "ACCESS_ANALYSIS_FAILED",
-		//         )
-		//     }
-		// };
-
+		// Only the parse is cached (keyed on the exact SQL, dialect and schema); every
+		// decision below is still made for this query.
 		let result = execute_blocking(move || {
-			queryflux_sql::extract_resources_cached(
-				parse_for_blocking.as_ref(),
-				&schema_owned,
-			)
+			queryflux_sql::extract_resources_cached(parse_for_blocking.as_ref(), &schema_owned)
 		})
-			.await;
+		.await;
 
 		let statement = match result {
 			Ok(Ok(statement)) => statement,
-
 			Ok(Err(e)) => {
 				return GuardResult::deny(
 					format!("access control: could not analyze query: {e}"),
 					"ACCESS_ANALYSIS_FAILED",
 				);
 			}
-
 			Err(e) => {
 				return GuardResult::deny(
 					format!("access control: blocking task failed: {e}"),
@@ -602,14 +574,6 @@ impl Guard for OpaAccessGuard {
 				.collect::<Vec<_>>()
 				.join(","),
 		);
-
-		// let rewritten =
-		// 	rewrite_table_scans_parsed(&parse, schema, &policies).and_then(
-		// 		|sql| match &write_scope {
-		// 			Some((_, filters)) => apply_write_filters(&sql, ctx.dialect, filters),
-		// 			None => Ok(sql),
-		// 		},
-		// 	);
 
 		let parse_for_blocking: Arc<queryflux_sql::classify::SqlParseCache> = Arc::clone(&parse);
 		let schema_for_blocking: SchemaContext = (*schema).clone();

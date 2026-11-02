@@ -2,40 +2,40 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::{
-    extract::{Path, Query, Request, State},
-    http::{header::AUTHORIZATION, Method, StatusCode},
-    middleware::{self, Next},
-    response::{IntoResponse, Response},
-    routing::{delete, get, patch, post},
-    Json, Router,
+	extract::{Path, Query, Request, State},
+	http::{header::AUTHORIZATION, Method, StatusCode},
+	middleware::{self, Next},
+	response::{IntoResponse, Response},
+	routing::{delete, get, patch, post},
+	Json, Router,
 };
 use queryflux_auth::AdminCredentialsManager;
 use queryflux_cluster_manager::{
-    circuit_breaker::CircuitState, cluster_state::ClusterStateSnapshot,
+	circuit_breaker::CircuitState, cluster_state::ClusterStateSnapshot,
 };
 use queryflux_core::{
-    config::{
-        AuthConfig, AuthProviderConfig, AuthorizationConfig, AuthorizationProviderConfig,
-        ClusterGroupConfig, FrontendConfig, FrontendsConfig, OpenFgaCredentials, RouterConfig,
-    },
-    engine_registry::EngineRegistry,
-    error::{QueryFluxError, Result},
-    query::{BackendQueryId, ClusterGroupName, ClusterName, ExecutingQuery, ProxyQueryId},
-    schema_context::SchemaContext,
+	config::{
+		AuthConfig, AuthProviderConfig, AuthorizationConfig, AuthorizationProviderConfig,
+		ClusterGroupConfig, FrontendConfig, FrontendsConfig, OpenFgaCredentials, RouterConfig,
+	},
+	engine_registry::EngineRegistry,
+	error::{QueryFluxError, Result},
+	query::{BackendQueryId, ClusterGroupName, ClusterName, ExecutingQuery, ProxyQueryId},
+	schema_context::SchemaContext,
 };
 use queryflux_metrics::prometheus_store::PrometheusMetrics;
 use queryflux_persistence::{
-    cluster_config::{
-        ClusterConfigRecord, ClusterGroupConfigRecord, RenameConfigRequest, UpsertClusterConfig,
-        UpsertClusterGroupConfig,
-    },
-    query_history::{
-        AgentSummary, ConversationSummary, DashboardStats, EngineStatRow, GroupStatRow,
-        QueryFilters, QuerySummary,
-    },
-    routing_json::{enrich_routers_for_api, resolve_routers_for_storage},
-    script_library::{UpsertUserScript, UserScriptRecord, KIND_GUARD},
-    AdminStore,
+	cluster_config::{
+		ClusterConfigRecord, ClusterGroupConfigRecord, RenameConfigRequest, UpsertClusterConfig,
+		UpsertClusterGroupConfig,
+	},
+	query_history::{
+		AgentSummary, ConversationSummary, DashboardStats, EngineStatRow, GroupStatRow,
+		QueryFilters, QuerySummary,
+	},
+	routing_json::{enrich_routers_for_api, resolve_routers_for_storage},
+	script_library::{UpsertUserScript, UserScriptRecord, KIND_GUARD},
+	AdminStore,
 };
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
@@ -47,17 +47,17 @@ use std::future::Future;
 use std::pin::Pin;
 
 use crate::{
-    state::{AppState, LiveConfig},
-    FrontendListenerTrait, ShutdownRx,
+	state::{AppState, LiveConfig},
+	FrontendListenerTrait, ShutdownRx,
 };
 
 /// Callback type for testing a cluster config without persisting it.
 /// Receives `(engine_key, config_json)` → returns `Ok(true)` if healthy, `Ok(false)` if
 /// adapter built but health check failed, `Err(msg)` if adapter construction failed.
 pub type TestClusterFn = Arc<
-    dyn Fn(String, serde_json::Value) -> Pin<Box<dyn Future<Output = anyhow::Result<bool>> + Send>>
-        + Send
-        + Sync,
+	dyn Fn(String, serde_json::Value) -> Pin<Box<dyn Future<Output = anyhow::Result<bool>> + Send>>
+	+ Send
+	+ Sync,
 >;
 
 /// Callback type for testing a `catalogProvider` config without persisting it.
@@ -66,11 +66,11 @@ pub type TestClusterFn = Arc<
 /// or the connectivity check failed (message explains which and why), `Err(msg)`
 /// if the config didn't even parse into a `CatalogProviderConfig`.
 pub type TestCatalogProviderFn = Arc<
-    dyn Fn(
-            serde_json::Value,
-        ) -> Pin<Box<dyn Future<Output = anyhow::Result<(bool, String)>> + Send>>
-        + Send
-        + Sync,
+	dyn Fn(
+		serde_json::Value,
+	) -> Pin<Box<dyn Future<Output = anyhow::Result<(bool, String)>> + Send>>
+	+ Send
+	+ Sync,
 >;
 
 // ---------------------------------------------------------------------------
@@ -80,186 +80,186 @@ pub type TestCatalogProviderFn = Arc<
 /// Live state snapshot of a single cluster returned by /admin/clusters.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct ClusterStateDto {
-    pub group_name: String,
-    pub cluster_name: String,
-    pub engine_type: String,
-    /// The HTTP endpoint of the cluster (e.g. `http://trino-1:8080`). Null for engines without a network endpoint (e.g. DuckDB).
-    pub endpoint: Option<String>,
-    pub running_queries: u64,
-    pub queued_queries: u64,
-    pub max_running_queries: u64,
-    /// Whether the most recent health check (every 30s) passed.
-    pub is_healthy: bool,
-    /// Whether this cluster is administratively enabled.
-    pub enabled: bool,
-    /// Closed, open, or halfOpen; null when circuit breaking is disabled.
-    pub breaker_state: Option<String>,
-    /// Whether this member can accept a new query before checking capacity.
-    pub can_accept_query: bool,
+	pub group_name: String,
+	pub cluster_name: String,
+	pub engine_type: String,
+	/// The HTTP endpoint of the cluster (e.g. `http://trino-1:8080`). Null for engines without a network endpoint (e.g. DuckDB).
+	pub endpoint: Option<String>,
+	pub running_queries: u64,
+	pub queued_queries: u64,
+	pub max_running_queries: u64,
+	/// Whether the most recent health check (every 30s) passed.
+	pub is_healthy: bool,
+	/// Whether this cluster is administratively enabled.
+	pub enabled: bool,
+	/// Closed, open, or halfOpen; null when circuit breaking is disabled.
+	pub breaker_state: Option<String>,
+	/// Whether this member can accept a new query before checking capacity.
+	pub can_accept_query: bool,
 }
 
 impl From<ClusterStateSnapshot> for ClusterStateDto {
-    fn from(snapshot: ClusterStateSnapshot) -> Self {
-        Self {
-            group_name: snapshot.group_name.0,
-            cluster_name: snapshot.cluster_name.0,
-            engine_type: format!("{:?}", snapshot.engine_type),
-            endpoint: snapshot.endpoint,
-            running_queries: snapshot.running_queries,
-            queued_queries: snapshot.queued_queries,
-            max_running_queries: snapshot.max_running_queries,
-            is_healthy: snapshot.is_healthy,
-            enabled: snapshot.enabled,
-            breaker_state: snapshot.breaker_state.map(|state| match state {
-                CircuitState::Closed => "closed".to_string(),
-                CircuitState::Open => "open".to_string(),
-                CircuitState::HalfOpen => "halfOpen".to_string(),
-            }),
-            can_accept_query: snapshot.can_accept_query,
-        }
-    }
+	fn from(snapshot: ClusterStateSnapshot) -> Self {
+		Self {
+			group_name: snapshot.group_name.0,
+			cluster_name: snapshot.cluster_name.0,
+			engine_type: format!("{:?}", snapshot.engine_type),
+			endpoint: snapshot.endpoint,
+			running_queries: snapshot.running_queries,
+			queued_queries: snapshot.queued_queries,
+			max_running_queries: snapshot.max_running_queries,
+			is_healthy: snapshot.is_healthy,
+			enabled: snapshot.enabled,
+			breaker_state: snapshot.breaker_state.map(|state| match state {
+				CircuitState::Closed => "closed".to_string(),
+				CircuitState::Open => "open".to_string(),
+				CircuitState::HalfOpen => "halfOpen".to_string(),
+			}),
+			can_accept_query: snapshot.can_accept_query,
+		}
+	}
 }
 
 #[cfg(test)]
 mod circuit_breaker_dto_tests {
-    use super::*;
-    use queryflux_cluster_manager::{circuit_breaker::BackendOutcome, cluster_state::ClusterState};
-    use queryflux_core::{config::CircuitBreakerConfig, query::EngineType};
+	use super::*;
+	use queryflux_cluster_manager::{circuit_breaker::BackendOutcome, cluster_state::ClusterState};
+	use queryflux_core::{config::CircuitBreakerConfig, query::EngineType};
 
-    #[test]
-    fn cluster_state_dto_and_openapi_expose_breaker_fields() {
-        let state = ClusterState::new(
-            ClusterName("trino-a".into()),
-            ClusterGroupName("analytics".into()),
-            None,
-            None,
-            EngineType::Trino,
-            None,
-            10,
-            true,
-        )
-        .with_circuit_breaker(
-            Some(CircuitBreakerConfig {
-                min_requests: 1,
-                ..CircuitBreakerConfig::default()
-            }),
-            None,
-        );
-        state.record_backend_outcome(BackendOutcome::Failure);
-        let dto = serde_json::to_value(ClusterStateDto::from(state.snapshot())).unwrap();
-        assert_eq!(dto["breaker_state"], "open");
-        assert_eq!(dto["can_accept_query"], false);
+	#[test]
+	fn cluster_state_dto_and_openapi_expose_breaker_fields() {
+		let state = ClusterState::new(
+			ClusterName("trino-a".into()),
+			ClusterGroupName("analytics".into()),
+			None,
+			None,
+			EngineType::Trino,
+			None,
+			10,
+			true,
+		)
+			.with_circuit_breaker(
+				Some(CircuitBreakerConfig {
+					min_requests: 1,
+					..CircuitBreakerConfig::default()
+				}),
+				None,
+			);
+		state.record_backend_outcome(BackendOutcome::Failure);
+		let dto = serde_json::to_value(ClusterStateDto::from(state.snapshot())).unwrap();
+		assert_eq!(dto["breaker_state"], "open");
+		assert_eq!(dto["can_accept_query"], false);
 
-        let schema = serde_json::to_value(ApiDoc::openapi()).unwrap();
-        let properties = &schema["components"]["schemas"]["ClusterStateDto"]["properties"];
-        assert!(properties.get("breaker_state").is_some());
-        assert!(properties.get("can_accept_query").is_some());
-    }
+		let schema = serde_json::to_value(ApiDoc::openapi()).unwrap();
+		let properties = &schema["components"]["schemas"]["ClusterStateDto"]["properties"];
+		assert!(properties.get("breaker_state").is_some());
+		assert!(properties.get("can_accept_query").is_some());
+	}
 }
 
 #[derive(OpenApi)]
 #[openapi(
-    info(
-        title = "QueryFlux Admin API",
-        version = "0.1.0",
-        description = "Admin REST API for QueryFlux Studio — query history, cluster state, and dashboard stats."
-    ),
-    paths(
-        health_handler,
-        clusters_handler,
-        list_workers_handler,
-        list_hub_sites_handler,
-        upsert_hub_site_handler,
-        delete_hub_site_handler,
-        create_enrollment_token_handler,
-        revoke_hub_handler,
-        update_cluster_handler,
-        engine_registry_handler,
-        list_queries_handler,
-        list_running_queries_handler,
-        cancel_query_handler,
-        get_stats_handler,
-        list_engines_handler,
-        get_engine_stats_handler,
-        get_group_stats_handler,
-        frontends_status_handler,
-        // Persisted cluster config CRUD
-        list_cluster_configs_handler,
-        get_cluster_config_handler,
-        upsert_cluster_config_handler,
-        rename_cluster_config_handler,
-        delete_cluster_config_handler,
-        test_cluster_config_handler,
-        // Persisted cluster group config CRUD
-        list_group_configs_handler,
-        get_group_config_handler,
-        upsert_group_config_handler,
-        rename_group_config_handler,
-        delete_group_config_handler,
-        // User scripts
-        list_user_scripts_handler,
-        create_user_script_handler,
-        get_user_script_handler,
-        update_user_script_handler,
-        delete_user_script_handler,
-        // Security / routing / guardrails config
-        get_security_config_handler,
-        put_security_config_handler,
-        get_routing_config_handler,
-        put_routing_config_handler,
-        get_guardrails_config_handler,
-        put_guardrails_config_handler,
-        access_control_dry_run_handler,
-        get_access_control_config_handler,
-        put_access_control_config_handler,
-        get_catalog_config_handler,
-        put_catalog_config_handler,
-        test_catalog_config_handler,
-        // Agents & conversations
-        list_agents_handler,
-        list_conversations_handler,
-        get_conversation_handler,
-    ),
-    components(schemas(
-        ClusterStateDto,
-        WorkerFleetDto,
-        WorkerView,
-        HubSiteView,
-        UpsertHubSite,
-        CreateEnrollmentToken,
-        EnrollmentTokenDto,
-        queryflux_persistence::hub_store::HubSite,
-        queryflux_persistence::hub_store::HubKey,
-        queryflux_persistence::WorkerRecord,
-        queryflux_persistence::WorkerStatus,
-        queryflux_persistence::WorkerHistoryStatus,
-        ClusterUpdateRequest,
-        AccessControlDryRunRequest,
-        DryRunIdentity,
-        QuerySummary,
-        RunningQueryDto,
-        DashboardStats,
-        EngineStatRow,
-        GroupStatRow,
-        UserScriptRecord,
-        UpsertUserScript,
-        ProtocolFrontendDto,
-        FrontendsStatusDto,
-        queryflux_persistence::cluster_config::ClusterConfigRecord,
-        queryflux_persistence::cluster_config::UpsertClusterConfig,
-        queryflux_persistence::cluster_config::ClusterGroupConfigRecord,
-        queryflux_persistence::cluster_config::UpsertClusterGroupConfig,
-        queryflux_persistence::cluster_config::RenameConfigRequest,
-        queryflux_persistence::query_history::AgentSummary,
-        queryflux_persistence::query_history::ConversationSummary,
-        TestCatalogProviderRequest,
-        TestCatalogProviderResponse,
-    )),
-    tags(
+	info(
+		title = "QueryFlux Admin API",
+		version = "0.1.0",
+		description = "Admin REST API for QueryFlux Studio — query history, cluster state, and dashboard stats."
+	),
+	paths(
+		health_handler,
+		clusters_handler,
+		list_workers_handler,
+		list_hub_sites_handler,
+		upsert_hub_site_handler,
+		delete_hub_site_handler,
+		create_enrollment_token_handler,
+		revoke_hub_handler,
+		update_cluster_handler,
+		engine_registry_handler,
+		list_queries_handler,
+		list_running_queries_handler,
+		cancel_query_handler,
+		get_stats_handler,
+		list_engines_handler,
+		get_engine_stats_handler,
+		get_group_stats_handler,
+		frontends_status_handler,
+		// Persisted cluster config CRUD
+		list_cluster_configs_handler,
+		get_cluster_config_handler,
+		upsert_cluster_config_handler,
+		rename_cluster_config_handler,
+		delete_cluster_config_handler,
+		test_cluster_config_handler,
+		// Persisted cluster group config CRUD
+		list_group_configs_handler,
+		get_group_config_handler,
+		upsert_group_config_handler,
+		rename_group_config_handler,
+		delete_group_config_handler,
+		// User scripts
+		list_user_scripts_handler,
+		create_user_script_handler,
+		get_user_script_handler,
+		update_user_script_handler,
+		delete_user_script_handler,
+		// Security / routing / guardrails config
+		get_security_config_handler,
+		put_security_config_handler,
+		get_routing_config_handler,
+		put_routing_config_handler,
+		get_guardrails_config_handler,
+		put_guardrails_config_handler,
+		access_control_dry_run_handler,
+		get_access_control_config_handler,
+		put_access_control_config_handler,
+		get_catalog_config_handler,
+		put_catalog_config_handler,
+		test_catalog_config_handler,
+		// Agents & conversations
+		list_agents_handler,
+		list_conversations_handler,
+		get_conversation_handler,
+	),
+	components(schemas(
+		ClusterStateDto,
+		WorkerFleetDto,
+		WorkerView,
+		HubSiteView,
+		UpsertHubSite,
+		CreateEnrollmentToken,
+		EnrollmentTokenDto,
+		queryflux_persistence::hub_store::HubSite,
+		queryflux_persistence::hub_store::HubKey,
+		queryflux_persistence::WorkerRecord,
+		queryflux_persistence::WorkerStatus,
+		queryflux_persistence::WorkerHistoryStatus,
+		ClusterUpdateRequest,
+		AccessControlDryRunRequest,
+		DryRunIdentity,
+		QuerySummary,
+		RunningQueryDto,
+		DashboardStats,
+		EngineStatRow,
+		GroupStatRow,
+		UserScriptRecord,
+		UpsertUserScript,
+		ProtocolFrontendDto,
+		FrontendsStatusDto,
+		queryflux_persistence::cluster_config::ClusterConfigRecord,
+		queryflux_persistence::cluster_config::UpsertClusterConfig,
+		queryflux_persistence::cluster_config::ClusterGroupConfigRecord,
+		queryflux_persistence::cluster_config::UpsertClusterGroupConfig,
+		queryflux_persistence::cluster_config::RenameConfigRequest,
+		queryflux_persistence::query_history::AgentSummary,
+		queryflux_persistence::query_history::ConversationSummary,
+		TestCatalogProviderRequest,
+		TestCatalogProviderResponse,
+	)),
+	tags(
         (name = "admin", description = "Cluster and query management"),
         (name = "config", description = "Persisted cluster / group / script configuration"),
         (name = "metrics", description = "Prometheus metrics endpoint"),
-    )
+	)
 )]
 struct ApiDoc;
 
@@ -269,85 +269,85 @@ struct ApiDoc;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct SecurityConfigDto {
-    pub auth_provider: String,
-    pub auth_required: bool,
-    pub oidc: Option<OidcConfigDto>,
-    pub ldap: Option<LdapConfigDto>,
-    /// Number of users defined when provider = "static". Passwords are never exposed.
-    pub static_user_count: Option<usize>,
-    /// Usernames + groups/roles so Studio can re-save without wiping the user list.
-    /// Passwords are never included.
-    #[serde(default)]
-    pub static_user_summaries: Vec<StaticUserSummaryDto>,
-    pub authorization_provider: String,
-    pub openfga: Option<OpenFgaConfigDto>,
-    /// Per-cluster-group simple allow-lists (used when authorization_provider = "none").
-    pub group_authorization: HashMap<String, GroupAuthzDto>,
-    /// IdP roles that may cancel any query.
-    #[serde(default)]
-    pub operator_roles: Vec<String>,
-    /// IdP groups that may cancel any query.
-    #[serde(default)]
-    pub operator_groups: Vec<String>,
+	pub auth_provider: String,
+	pub auth_required: bool,
+	pub oidc: Option<OidcConfigDto>,
+	pub ldap: Option<LdapConfigDto>,
+	/// Number of users defined when provider = "static". Passwords are never exposed.
+	pub static_user_count: Option<usize>,
+	/// Usernames + groups/roles so Studio can re-save without wiping the user list.
+	/// Passwords are never included.
+	#[serde(default)]
+	pub static_user_summaries: Vec<StaticUserSummaryDto>,
+	pub authorization_provider: String,
+	pub openfga: Option<OpenFgaConfigDto>,
+	/// Per-cluster-group simple allow-lists (used when authorization_provider = "none").
+	pub group_authorization: HashMap<String, GroupAuthzDto>,
+	/// IdP roles that may cancel any query.
+	#[serde(default)]
+	pub operator_roles: Vec<String>,
+	/// IdP groups that may cancel any query.
+	#[serde(default)]
+	pub operator_groups: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct OidcConfigDto {
-    pub issuer: String,
-    pub jwks_uri: String,
-    pub audience: Option<String>,
-    pub groups_claim: String,
-    pub roles_claim: Option<String>,
+	pub issuer: String,
+	pub jwks_uri: String,
+	pub audience: Option<String>,
+	pub groups_claim: String,
+	pub roles_claim: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct LdapConfigDto {
-    pub url: String,
-    pub bind_dn: String,
-    pub user_search_base: String,
-    pub user_search_filter: String,
-    pub user_dn_template: Option<String>,
-    pub group_search_base: Option<String>,
-    pub group_name_attribute: String,
+	pub url: String,
+	pub bind_dn: String,
+	pub user_search_base: String,
+	pub user_search_filter: String,
+	pub user_dn_template: Option<String>,
+	pub group_search_base: Option<String>,
+	pub group_name_attribute: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct OpenFgaConfigDto {
-    pub url: String,
-    pub store_id: String,
-    /// Credential method: "api_key" | "client_credentials" | null
-    pub credentials_method: Option<String>,
+	pub url: String,
+	pub store_id: String,
+	/// Credential method: "api_key" | "client_credentials" | null
+	pub credentials_method: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct GroupAuthzDto {
-    pub allow_groups: Vec<String>,
-    pub allow_users: Vec<String>,
+	pub allow_groups: Vec<String>,
+	pub allow_users: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct StaticUserSummaryDto {
-    pub username: String,
-    pub groups: Vec<String>,
-    pub roles: Vec<String>,
+	pub username: String,
+	pub groups: Vec<String>,
+	pub roles: Vec<String>,
 }
 
 impl Default for SecurityConfigDto {
-    fn default() -> Self {
-        Self {
-            auth_provider: "none".to_string(),
-            auth_required: false,
-            oidc: None,
-            ldap: None,
-            static_user_count: None,
-            static_user_summaries: Vec::new(),
-            authorization_provider: "none".to_string(),
-            openfga: None,
-            group_authorization: HashMap::new(),
-            operator_roles: Vec::new(),
-            operator_groups: Vec::new(),
-        }
-    }
+	fn default() -> Self {
+		Self {
+			auth_provider: "none".to_string(),
+			auth_required: false,
+			oidc: None,
+			ldap: None,
+			static_user_count: None,
+			static_user_summaries: Vec::new(),
+			authorization_provider: "none".to_string(),
+			openfga: None,
+			group_authorization: HashMap::new(),
+			operator_roles: Vec::new(),
+			operator_groups: Vec::new(),
+		}
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -357,277 +357,277 @@ impl Default for SecurityConfigDto {
 /// One entry protocol / client surface (Trino HTTP, MySQL wire, …).
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct ProtocolFrontendDto {
-    /// Stable id: `trino_http`, `mysql_wire`, `flight_sql`, …
-    pub id: String,
-    pub label: String,
-    pub short_description: String,
-    pub enabled: bool,
-    /// Listening port when enabled and configured; `null` when the block is absent in config.
-    pub port: Option<u16>,
+	/// Stable id: `trino_http`, `mysql_wire`, `flight_sql`, …
+	pub id: String,
+	pub label: String,
+	pub short_description: String,
+	pub enabled: bool,
+	/// Listening port when enabled and configured; `null` when the block is absent in config.
+	pub port: Option<u16>,
 }
 
 /// Effective frontends from the running process config (not hot-reloaded).
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct FrontendsStatusDto {
-    pub external_address: Option<String>,
-    pub admin_api_port: u16,
-    pub protocols: Vec<ProtocolFrontendDto>,
+	pub external_address: Option<String>,
+	pub admin_api_port: u16,
+	pub protocols: Vec<ProtocolFrontendDto>,
 }
 
 /// Build the snapshot returned by [`frontends_status_handler`] from the loaded `FrontendsConfig`.
 pub fn build_frontends_status(
-    frontends: &FrontendsConfig,
-    admin_api_port: u16,
-    external_address: Option<String>,
+	frontends: &FrontendsConfig,
+	admin_api_port: u16,
+	external_address: Option<String>,
 ) -> FrontendsStatusDto {
-    fn opt_fe(
-        id: &str,
-        label: &str,
-        desc: &str,
-        cfg: Option<&FrontendConfig>,
-    ) -> ProtocolFrontendDto {
-        match cfg {
-            None => ProtocolFrontendDto {
-                id: id.to_string(),
-                label: label.to_string(),
-                short_description: desc.to_string(),
-                enabled: false,
-                port: None,
-            },
-            Some(c) => ProtocolFrontendDto {
-                id: id.to_string(),
-                label: label.to_string(),
-                short_description: desc.to_string(),
-                enabled: c.enabled,
-                port: Some(c.port),
-            },
-        }
-    }
+	fn opt_fe(
+		id: &str,
+		label: &str,
+		desc: &str,
+		cfg: Option<&FrontendConfig>,
+	) -> ProtocolFrontendDto {
+		match cfg {
+			None => ProtocolFrontendDto {
+				id: id.to_string(),
+				label: label.to_string(),
+				short_description: desc.to_string(),
+				enabled: false,
+				port: None,
+			},
+			Some(c) => ProtocolFrontendDto {
+				id: id.to_string(),
+				label: label.to_string(),
+				short_description: desc.to_string(),
+				enabled: c.enabled,
+				port: Some(c.port),
+			},
+		}
+	}
 
-    let trino = &frontends.trino_http;
-    let protocols = vec![
-        ProtocolFrontendDto {
-            id: "trino_http".to_string(),
-            label: "Trino HTTP".to_string(),
-            short_description: "Trino-compatible REST API (POST /v1/statement, poll nextUri)."
-                .to_string(),
-            enabled: trino.enabled,
-            port: Some(trino.port),
-        },
-        opt_fe(
-            "mysql_wire",
-            "MySQL wire",
-            "MySQL protocol (mysql CLI, JDBC mysql://, many drivers).",
-            frontends.mysql_wire.as_ref(),
-        ),
-        opt_fe(
-            "postgres_wire",
-            "PostgreSQL wire",
-            "PostgreSQL wire protocol (psql, JDBC postgresql://, etc.).",
-            frontends.postgres_wire.as_ref(),
-        ),
-        opt_fe(
-            "clickhouse_http",
-            "ClickHouse HTTP",
-            "ClickHouse HTTP interface (if implemented in this build).",
-            frontends.clickhouse_http.as_ref(),
-        ),
-        opt_fe(
-            "flight_sql",
-            "Flight SQL",
-            "Arrow Flight SQL / gRPC-style access (driver-dependent).",
-            frontends.flight_sql.as_ref(),
-        ),
-        match &frontends.snowflake_http {
-            None => ProtocolFrontendDto {
-                id: "snowflake_http".to_string(),
-                label: "Snowflake HTTP".to_string(),
-                short_description:
-                    "Snowflake wire protocol + SQL API v2 on one port (session and query endpoints)."
-                        .to_string(),
-                enabled: false,
-                port: None,
-            },
-            Some(c) => ProtocolFrontendDto {
-                id: "snowflake_http".to_string(),
-                label: "Snowflake HTTP".to_string(),
-                short_description:
-                    "Snowflake wire protocol + SQL API v2 on one port (session and query endpoints)."
-                        .to_string(),
-                enabled: c.enabled,
-                port: Some(c.port),
-            },
-        },
-        opt_fe(
-            "mcp",
-            "MCP",
-            "Model Context Protocol streamable-HTTP tool calls for AI agents.",
-            frontends.mcp.as_ref(),
-        ),
-    ];
+	let trino = &frontends.trino_http;
+	let protocols = vec![
+		ProtocolFrontendDto {
+			id: "trino_http".to_string(),
+			label: "Trino HTTP".to_string(),
+			short_description: "Trino-compatible REST API (POST /v1/statement, poll nextUri)."
+				.to_string(),
+			enabled: trino.enabled,
+			port: Some(trino.port),
+		},
+		opt_fe(
+			"mysql_wire",
+			"MySQL wire",
+			"MySQL protocol (mysql CLI, JDBC mysql://, many drivers).",
+			frontends.mysql_wire.as_ref(),
+		),
+		opt_fe(
+			"postgres_wire",
+			"PostgreSQL wire",
+			"PostgreSQL wire protocol (psql, JDBC postgresql://, etc.).",
+			frontends.postgres_wire.as_ref(),
+		),
+		opt_fe(
+			"clickhouse_http",
+			"ClickHouse HTTP",
+			"ClickHouse HTTP interface (if implemented in this build).",
+			frontends.clickhouse_http.as_ref(),
+		),
+		opt_fe(
+			"flight_sql",
+			"Flight SQL",
+			"Arrow Flight SQL / gRPC-style access (driver-dependent).",
+			frontends.flight_sql.as_ref(),
+		),
+		match &frontends.snowflake_http {
+			None => ProtocolFrontendDto {
+				id: "snowflake_http".to_string(),
+				label: "Snowflake HTTP".to_string(),
+				short_description:
+				"Snowflake wire protocol + SQL API v2 on one port (session and query endpoints)."
+					.to_string(),
+				enabled: false,
+				port: None,
+			},
+			Some(c) => ProtocolFrontendDto {
+				id: "snowflake_http".to_string(),
+				label: "Snowflake HTTP".to_string(),
+				short_description:
+				"Snowflake wire protocol + SQL API v2 on one port (session and query endpoints)."
+					.to_string(),
+				enabled: c.enabled,
+				port: Some(c.port),
+			},
+		},
+		opt_fe(
+			"mcp",
+			"MCP",
+			"Model Context Protocol streamable-HTTP tool calls for AI agents.",
+			frontends.mcp.as_ref(),
+		),
+	];
 
-    FrontendsStatusDto {
-        external_address,
-        admin_api_port,
-        protocols,
-    }
+	FrontendsStatusDto {
+		external_address,
+		admin_api_port,
+		protocols,
+	}
 }
 
 impl SecurityConfigDto {
-    pub fn from_config(
-        auth: &AuthConfig,
-        authz: &AuthorizationConfig,
-        groups: &HashMap<String, ClusterGroupConfig>,
-    ) -> Self {
-        let auth_provider = match auth.provider {
-            AuthProviderConfig::None => "none",
-            AuthProviderConfig::Static => "static",
-            AuthProviderConfig::Oidc => "oidc",
-            AuthProviderConfig::Ldap => "ldap",
-        }
-        .to_string();
+	pub fn from_config(
+		auth: &AuthConfig,
+		authz: &AuthorizationConfig,
+		groups: &HashMap<String, ClusterGroupConfig>,
+	) -> Self {
+		let auth_provider = match auth.provider {
+			AuthProviderConfig::None => "none",
+			AuthProviderConfig::Static => "static",
+			AuthProviderConfig::Oidc => "oidc",
+			AuthProviderConfig::Ldap => "ldap",
+		}
+			.to_string();
 
-        let oidc = auth.oidc.as_ref().map(|o| OidcConfigDto {
-            issuer: o.issuer.clone(),
-            jwks_uri: o.jwks_uri.clone(),
-            audience: o.audience.clone(),
-            groups_claim: o.groups_claim.clone(),
-            roles_claim: o.roles_claim.clone(),
-        });
+		let oidc = auth.oidc.as_ref().map(|o| OidcConfigDto {
+			issuer: o.issuer.clone(),
+			jwks_uri: o.jwks_uri.clone(),
+			audience: o.audience.clone(),
+			groups_claim: o.groups_claim.clone(),
+			roles_claim: o.roles_claim.clone(),
+		});
 
-        let ldap = auth.ldap.as_ref().map(|l| LdapConfigDto {
-            url: l.url.clone(),
-            bind_dn: l.bind_dn.clone(),
-            user_search_base: l.user_search_base.clone(),
-            user_search_filter: l.user_search_filter.clone(),
-            user_dn_template: l.user_dn_template.clone(),
-            group_search_base: l.group_search_base.clone(),
-            group_name_attribute: l.group_name_attribute.clone(),
-        });
+		let ldap = auth.ldap.as_ref().map(|l| LdapConfigDto {
+			url: l.url.clone(),
+			bind_dn: l.bind_dn.clone(),
+			user_search_base: l.user_search_base.clone(),
+			user_search_filter: l.user_search_filter.clone(),
+			user_dn_template: l.user_dn_template.clone(),
+			group_search_base: l.group_search_base.clone(),
+			group_name_attribute: l.group_name_attribute.clone(),
+		});
 
-        let static_user_summaries: Vec<StaticUserSummaryDto> = auth
-            .static_users
-            .as_ref()
-            .map(|s| {
-                s.users
-                    .iter()
-                    .map(|(username, entry)| StaticUserSummaryDto {
-                        username: username.clone(),
-                        groups: entry.groups.clone(),
-                        roles: entry.roles.clone(),
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-        let static_user_count = if static_user_summaries.is_empty() {
-            None
-        } else {
-            Some(static_user_summaries.len())
-        };
+		let static_user_summaries: Vec<StaticUserSummaryDto> = auth
+			.static_users
+			.as_ref()
+			.map(|s| {
+				s.users
+					.iter()
+					.map(|(username, entry)| StaticUserSummaryDto {
+						username: username.clone(),
+						groups: entry.groups.clone(),
+						roles: entry.roles.clone(),
+					})
+					.collect()
+			})
+			.unwrap_or_default();
+		let static_user_count = if static_user_summaries.is_empty() {
+			None
+		} else {
+			Some(static_user_summaries.len())
+		};
 
-        let authorization_provider = match authz.provider {
-            AuthorizationProviderConfig::None => "none",
-            AuthorizationProviderConfig::OpenFga => "openfga",
-        }
-        .to_string();
+		let authorization_provider = match authz.provider {
+			AuthorizationProviderConfig::None => "none",
+			AuthorizationProviderConfig::OpenFga => "openfga",
+		}
+			.to_string();
 
-        let openfga = authz.openfga.as_ref().map(|o| {
-            let credentials_method = o.credentials.as_ref().map(|c| match c {
-                OpenFgaCredentials::ApiKey { .. } => "api_key".to_string(),
-                OpenFgaCredentials::ClientCredentials { .. } => "client_credentials".to_string(),
-            });
-            OpenFgaConfigDto {
-                url: o.url.clone(),
-                store_id: o.store_id.clone(),
-                credentials_method,
-            }
-        });
+		let openfga = authz.openfga.as_ref().map(|o| {
+			let credentials_method = o.credentials.as_ref().map(|c| match c {
+				OpenFgaCredentials::ApiKey { .. } => "api_key".to_string(),
+				OpenFgaCredentials::ClientCredentials { .. } => "client_credentials".to_string(),
+			});
+			OpenFgaConfigDto {
+				url: o.url.clone(),
+				store_id: o.store_id.clone(),
+				credentials_method,
+			}
+		});
 
-        let group_authorization = groups
-            .iter()
-            .filter(|(_, g)| {
-                !g.authorization.allow_groups.is_empty() || !g.authorization.allow_users.is_empty()
-            })
-            .map(|(name, g)| {
-                (
-                    name.clone(),
-                    GroupAuthzDto {
-                        allow_groups: g.authorization.allow_groups.clone(),
-                        allow_users: g.authorization.allow_users.clone(),
-                    },
-                )
-            })
-            .collect();
+		let group_authorization = groups
+			.iter()
+			.filter(|(_, g)| {
+				!g.authorization.allow_groups.is_empty() || !g.authorization.allow_users.is_empty()
+			})
+			.map(|(name, g)| {
+				(
+					name.clone(),
+					GroupAuthzDto {
+						allow_groups: g.authorization.allow_groups.clone(),
+						allow_users: g.authorization.allow_users.clone(),
+					},
+				)
+			})
+			.collect();
 
-        Self {
-            auth_provider,
-            auth_required: auth.required,
-            oidc,
-            ldap,
-            static_user_count,
-            static_user_summaries,
-            authorization_provider,
-            openfga,
-            group_authorization,
-            operator_roles: auth.operator_roles.clone(),
-            operator_groups: auth.operator_groups.clone(),
-        }
-    }
+		Self {
+			auth_provider,
+			auth_required: auth.required,
+			oidc,
+			ldap,
+			static_user_count,
+			static_user_summaries,
+			authorization_provider,
+			openfga,
+			group_authorization,
+			operator_roles: auth.operator_roles.clone(),
+			operator_groups: auth.operator_groups.clone(),
+		}
+	}
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
 pub struct RoutingConfigDto {
-    /// JSON key `routingFallback` — matches `ProxyConfig` / YAML camelCase.
-    #[serde(rename = "routingFallback")]
-    pub routing_fallback: String,
-    /// Stable DB id of the fallback cluster group (when known).
-    #[serde(
-        rename = "routingFallbackGroupId",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub routing_fallback_group_id: Option<i64>,
-    pub routers: Vec<serde_json::Value>,
+	/// JSON key `routingFallback` — matches `ProxyConfig` / YAML camelCase.
+	#[serde(rename = "routingFallback")]
+	pub routing_fallback: String,
+	/// Stable DB id of the fallback cluster group (when known).
+	#[serde(
+		rename = "routingFallbackGroupId",
+		skip_serializing_if = "Option::is_none"
+	)]
+	pub routing_fallback_group_id: Option<i64>,
+	pub routers: Vec<serde_json::Value>,
 }
 
 impl RoutingConfigDto {
-    pub fn from_config(fallback: &str, routers: &[RouterConfig]) -> Self {
-        Self {
-            routing_fallback: fallback.to_string(),
-            routing_fallback_group_id: None,
-            routers: routers
-                .iter()
-                .map(|r| serde_json::to_value(r).unwrap_or(serde_json::Value::Null))
-                .collect(),
-        }
-    }
+	pub fn from_config(fallback: &str, routers: &[RouterConfig]) -> Self {
+		Self {
+			routing_fallback: fallback.to_string(),
+			routing_fallback_group_id: None,
+			routers: routers
+				.iter()
+				.map(|r| serde_json::to_value(r).unwrap_or(serde_json::Value::Null))
+				.collect(),
+		}
+	}
 }
 
 /// Request body for PUT /admin/config/security
 #[derive(Debug, Deserialize, Serialize, ToSchema)]
 pub struct UpsertSecurityConfig {
-    pub auth_provider: String,
-    pub auth_required: bool,
-    pub oidc: Option<serde_json::Value>,
-    pub ldap: Option<serde_json::Value>,
-    pub static_users: Option<serde_json::Value>,
-    pub authorization_provider: String,
-    pub openfga: Option<serde_json::Value>,
-    #[serde(default)]
-    pub operator_roles: Option<Vec<String>>,
-    #[serde(default)]
-    pub operator_groups: Option<Vec<String>>,
+	pub auth_provider: String,
+	pub auth_required: bool,
+	pub oidc: Option<serde_json::Value>,
+	pub ldap: Option<serde_json::Value>,
+	pub static_users: Option<serde_json::Value>,
+	pub authorization_provider: String,
+	pub openfga: Option<serde_json::Value>,
+	#[serde(default)]
+	pub operator_roles: Option<Vec<String>>,
+	#[serde(default)]
+	pub operator_groups: Option<Vec<String>>,
 }
 
 /// Request body for PUT /admin/config/routing
 #[derive(Debug, Deserialize, Serialize, ToSchema)]
 pub struct UpsertRoutingConfig {
-    /// Accept `routingFallback` (canonical) or legacy `routing_fallback` from older clients.
-    #[serde(rename = "routingFallback", alias = "routing_fallback", default)]
-    pub routing_fallback: String,
-    #[serde(rename = "routingFallbackGroupId", default)]
-    pub routing_fallback_group_id: Option<i64>,
-    #[serde(default)]
-    pub routers: Vec<serde_json::Value>,
+	/// Accept `routingFallback` (canonical) or legacy `routing_fallback` from older clients.
+	#[serde(rename = "routingFallback", alias = "routing_fallback", default)]
+	pub routing_fallback: String,
+	#[serde(rename = "routingFallbackGroupId", default)]
+	pub routing_fallback_group_id: Option<i64>,
+	#[serde(default)]
+	pub routers: Vec<serde_json::Value>,
 }
 
 // ---------------------------------------------------------------------------
@@ -635,38 +635,38 @@ pub struct UpsertRoutingConfig {
 // ---------------------------------------------------------------------------
 
 struct AdminState {
-    prometheus: Arc<PrometheusMetrics>,
-    /// Hot-reloadable live config — used to get the current cluster manager.
-    live: Arc<tokio::sync::RwLock<LiveConfig>>,
-    /// Present when a full-featured persistence backend is configured (e.g. Postgres).
-    /// None when running with in-memory persistence.
-    admin_store: Option<Arc<dyn AdminStore>>,
-    security_config: Arc<SecurityConfigDto>,
-    routing_config: Arc<RoutingConfigDto>,
-    /// Startup (YAML) `catalogProvider` config — GET's fallback when nothing has
-    /// been persisted via the admin API yet.
-    catalog_provider_config: Arc<queryflux_core::config::CatalogProviderConfig>,
-    /// Startup (YAML) `accessControl` — GET's fallback when nothing has been persisted yet.
-    access_control_config: Arc<Option<queryflux_core::access_config::AccessControlConfig>>,
-    engine_registry: Arc<EngineRegistry>,
-    /// Wake the config reload task immediately after mutating persisted config.
-    /// Uses `ConfigRevisionStore::bump_revision()` for distributed notification
-    /// and falls back to `tokio::sync::Notify` for in-memory/local-only mode.
-    config_reload_notify: Arc<tokio::sync::Notify>,
-    /// Snapshot of protocol listeners from startup config (YAML); not hot-reloaded.
-    frontends_status: FrontendsStatusDto,
-    /// Admin API credential manager — validates Basic auth and handles password changes.
-    admin_creds: Arc<AdminCredentialsManager>,
-    /// Test a cluster config (build adapter + health_check) without persisting it.
-    test_cluster_fn: TestClusterFn,
-    /// Test a catalogProvider config (build it + smoke-test) without persisting it.
-    test_catalog_provider_fn: TestCatalogProviderFn,
-    /// Query result cache for invalidation endpoints.
-    result_cache: Arc<dyn queryflux_cache::QueryResultCache>,
-    /// Shared proxy state — in-flight queries, adapters, slot release.
-    app: Arc<AppState>,
-    /// The worker API this listener serves, for the fleet view.
-    worker_api: Option<crate::worker_api::WorkerApi>,
+	prometheus: Arc<PrometheusMetrics>,
+	/// Hot-reloadable live config — used to get the current cluster manager.
+	live: Arc<tokio::sync::RwLock<LiveConfig>>,
+	/// Present when a full-featured persistence backend is configured (e.g. Postgres).
+	/// None when running with in-memory persistence.
+	admin_store: Option<Arc<dyn AdminStore>>,
+	security_config: Arc<SecurityConfigDto>,
+	routing_config: Arc<RoutingConfigDto>,
+	/// Startup (YAML) `catalogProvider` config — GET's fallback when nothing has
+	/// been persisted via the admin API yet.
+	catalog_provider_config: Arc<queryflux_core::config::CatalogProviderConfig>,
+	/// Startup (YAML) `accessControl` — GET's fallback when nothing has been persisted yet.
+	access_control_config: Arc<Option<queryflux_core::access_config::AccessControlConfig>>,
+	engine_registry: Arc<EngineRegistry>,
+	/// Wake the config reload task immediately after mutating persisted config.
+	/// Uses `ConfigRevisionStore::bump_revision()` for distributed notification
+	/// and falls back to `tokio::sync::Notify` for in-memory/local-only mode.
+	config_reload_notify: Arc<tokio::sync::Notify>,
+	/// Snapshot of protocol listeners from startup config (YAML); not hot-reloaded.
+	frontends_status: FrontendsStatusDto,
+	/// Admin API credential manager — validates Basic auth and handles password changes.
+	admin_creds: Arc<AdminCredentialsManager>,
+	/// Test a cluster config (build adapter + health_check) without persisting it.
+	test_cluster_fn: TestClusterFn,
+	/// Test a catalogProvider config (build it + smoke-test) without persisting it.
+	test_catalog_provider_fn: TestCatalogProviderFn,
+	/// Query result cache for invalidation endpoints.
+	result_cache: Arc<dyn queryflux_cache::QueryResultCache>,
+	/// Shared proxy state — in-flight queries, adapters, slot release.
+	app: Arc<AppState>,
+	/// The worker API this listener serves, for the fleet view.
+	worker_api: Option<crate::worker_api::WorkerApi>,
 }
 
 // ---------------------------------------------------------------------------
@@ -674,284 +674,284 @@ struct AdminState {
 // ---------------------------------------------------------------------------
 
 pub struct AdminFrontend {
-    prometheus: Arc<PrometheusMetrics>,
-    live: Arc<tokio::sync::RwLock<LiveConfig>>,
-    admin_store: Option<Arc<dyn AdminStore>>,
-    port: u16,
-    security_config: Arc<SecurityConfigDto>,
-    routing_config: Arc<RoutingConfigDto>,
-    catalog_provider_config: Arc<queryflux_core::config::CatalogProviderConfig>,
-    access_control_config: Arc<Option<queryflux_core::access_config::AccessControlConfig>>,
-    engine_registry: Arc<EngineRegistry>,
-    config_reload_notify: Arc<tokio::sync::Notify>,
-    frontends_status: FrontendsStatusDto,
-    admin_creds: Arc<AdminCredentialsManager>,
-    test_cluster_fn: TestClusterFn,
-    test_catalog_provider_fn: TestCatalogProviderFn,
-    cors_allowed_origins: Vec<String>,
-    result_cache: Arc<dyn queryflux_cache::QueryResultCache>,
-    app: Arc<AppState>,
-    worker_api: Option<crate::worker_api::WorkerApi>,
+	prometheus: Arc<PrometheusMetrics>,
+	live: Arc<tokio::sync::RwLock<LiveConfig>>,
+	admin_store: Option<Arc<dyn AdminStore>>,
+	port: u16,
+	security_config: Arc<SecurityConfigDto>,
+	routing_config: Arc<RoutingConfigDto>,
+	catalog_provider_config: Arc<queryflux_core::config::CatalogProviderConfig>,
+	access_control_config: Arc<Option<queryflux_core::access_config::AccessControlConfig>>,
+	engine_registry: Arc<EngineRegistry>,
+	config_reload_notify: Arc<tokio::sync::Notify>,
+	frontends_status: FrontendsStatusDto,
+	admin_creds: Arc<AdminCredentialsManager>,
+	test_cluster_fn: TestClusterFn,
+	test_catalog_provider_fn: TestCatalogProviderFn,
+	cors_allowed_origins: Vec<String>,
+	result_cache: Arc<dyn queryflux_cache::QueryResultCache>,
+	app: Arc<AppState>,
+	worker_api: Option<crate::worker_api::WorkerApi>,
 }
 
 impl AdminFrontend {
-    /// Serve the worker API (`/worker/*`) on this listener (#255).
-    pub fn with_worker_api(mut self, api: crate::worker_api::WorkerApi) -> Self {
-        self.worker_api = Some(api);
-        self
-    }
+	/// Serve the worker API (`/worker/*`) on this listener (#255).
+	pub fn with_worker_api(mut self, api: crate::worker_api::WorkerApi) -> Self {
+		self.worker_api = Some(api);
+		self
+	}
 
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        prometheus: Arc<PrometheusMetrics>,
-        live: Arc<tokio::sync::RwLock<LiveConfig>>,
-        admin_store: Option<Arc<dyn AdminStore>>,
-        port: u16,
-        security_config: Arc<SecurityConfigDto>,
-        routing_config: Arc<RoutingConfigDto>,
-        catalog_provider_config: Arc<queryflux_core::config::CatalogProviderConfig>,
-        access_control_config: Arc<Option<queryflux_core::access_config::AccessControlConfig>>,
-        engine_registry: Arc<EngineRegistry>,
-        config_reload_notify: Arc<tokio::sync::Notify>,
-        frontends_status: FrontendsStatusDto,
-        admin_creds: Arc<AdminCredentialsManager>,
-        test_cluster_fn: TestClusterFn,
-        test_catalog_provider_fn: TestCatalogProviderFn,
-        cors_allowed_origins: Vec<String>,
-        result_cache: Arc<dyn queryflux_cache::QueryResultCache>,
-        app: Arc<AppState>,
-    ) -> Self {
-        Self {
-            prometheus,
-            live,
-            admin_store,
-            port,
-            security_config,
-            routing_config,
-            catalog_provider_config,
-            access_control_config,
-            engine_registry,
-            config_reload_notify,
-            frontends_status,
-            admin_creds,
-            test_cluster_fn,
-            test_catalog_provider_fn,
-            cors_allowed_origins,
-            result_cache,
-            app,
-            worker_api: None,
-        }
-    }
+	#[allow(clippy::too_many_arguments)]
+	pub fn new(
+		prometheus: Arc<PrometheusMetrics>,
+		live: Arc<tokio::sync::RwLock<LiveConfig>>,
+		admin_store: Option<Arc<dyn AdminStore>>,
+		port: u16,
+		security_config: Arc<SecurityConfigDto>,
+		routing_config: Arc<RoutingConfigDto>,
+		catalog_provider_config: Arc<queryflux_core::config::CatalogProviderConfig>,
+		access_control_config: Arc<Option<queryflux_core::access_config::AccessControlConfig>>,
+		engine_registry: Arc<EngineRegistry>,
+		config_reload_notify: Arc<tokio::sync::Notify>,
+		frontends_status: FrontendsStatusDto,
+		admin_creds: Arc<AdminCredentialsManager>,
+		test_cluster_fn: TestClusterFn,
+		test_catalog_provider_fn: TestCatalogProviderFn,
+		cors_allowed_origins: Vec<String>,
+		result_cache: Arc<dyn queryflux_cache::QueryResultCache>,
+		app: Arc<AppState>,
+	) -> Self {
+		Self {
+			prometheus,
+			live,
+			admin_store,
+			port,
+			security_config,
+			routing_config,
+			catalog_provider_config,
+			access_control_config,
+			engine_registry,
+			config_reload_notify,
+			frontends_status,
+			admin_creds,
+			test_cluster_fn,
+			test_catalog_provider_fn,
+			cors_allowed_origins,
+			result_cache,
+			app,
+			worker_api: None,
+		}
+	}
 
-    fn router(&self) -> Router {
-        let state = Arc::new(AdminState {
-            prometheus: self.prometheus.clone(),
-            live: self.live.clone(),
-            admin_store: self.admin_store.clone(),
-            security_config: self.security_config.clone(),
-            routing_config: self.routing_config.clone(),
-            catalog_provider_config: self.catalog_provider_config.clone(),
-            access_control_config: self.access_control_config.clone(),
-            engine_registry: self.engine_registry.clone(),
-            config_reload_notify: self.config_reload_notify.clone(),
-            frontends_status: self.frontends_status.clone(),
-            admin_creds: self.admin_creds.clone(),
-            test_cluster_fn: self.test_cluster_fn.clone(),
-            test_catalog_provider_fn: self.test_catalog_provider_fn.clone(),
-            result_cache: self.result_cache.clone(),
-            app: self.app.clone(),
-            worker_api: self.worker_api.clone(),
-        });
+	fn router(&self) -> Router {
+		let state = Arc::new(AdminState {
+			prometheus: self.prometheus.clone(),
+			live: self.live.clone(),
+			admin_store: self.admin_store.clone(),
+			security_config: self.security_config.clone(),
+			routing_config: self.routing_config.clone(),
+			catalog_provider_config: self.catalog_provider_config.clone(),
+			access_control_config: self.access_control_config.clone(),
+			engine_registry: self.engine_registry.clone(),
+			config_reload_notify: self.config_reload_notify.clone(),
+			frontends_status: self.frontends_status.clone(),
+			admin_creds: self.admin_creds.clone(),
+			test_cluster_fn: self.test_cluster_fn.clone(),
+			test_catalog_provider_fn: self.test_catalog_provider_fn.clone(),
+			result_cache: self.result_cache.clone(),
+			app: self.app.clone(),
+			worker_api: self.worker_api.clone(),
+		});
 
-        let spec_json =
-            serde_json::to_string(&ApiDoc::openapi()).unwrap_or_else(|_| "{}".to_string());
+		let spec_json =
+			serde_json::to_string(&ApiDoc::openapi()).unwrap_or_else(|_| "{}".to_string());
 
-        // Public routes — no authentication required.
-        let public = Router::new()
-            .route("/health", get(health_handler))
-            .route("/readyz", get(readiness_handler))
-            // SECURITY: /metrics should be network-restricted in production (firewall or separate listener)
-            .route("/metrics", get(metrics_handler))
-            .route(
-                "/openapi.json",
-                get({
-                    let spec = spec_json.clone();
-                    move || {
-                        let spec = spec.clone();
-                        async move {
-                            (StatusCode::OK, [("content-type", "application/json")], spec)
-                        }
-                    }
-                }),
-            )
-            .route("/docs", get(swagger_ui_handler));
+		// Public routes — no authentication required.
+		let public = Router::new()
+			.route("/health", get(health_handler))
+			.route("/readyz", get(readiness_handler))
+			// SECURITY: /metrics should be network-restricted in production (firewall or separate listener)
+			.route("/metrics", get(metrics_handler))
+			.route(
+				"/openapi.json",
+				get({
+					let spec = spec_json.clone();
+					move || {
+						let spec = spec.clone();
+						async move {
+							(StatusCode::OK, [("content-type", "application/json")], spec)
+						}
+					}
+				}),
+			)
+			.route("/docs", get(swagger_ui_handler));
 
-        // Protected routes — require valid Basic auth credentials.
-        let protected = Router::new()
-            .route("/admin/clusters", get(clusters_handler))
-            .route("/admin/queries", get(list_queries_handler))
-            .route("/admin/queries/running", get(list_running_queries_handler))
-            .route("/admin/queries/{id}", delete(cancel_query_handler))
-            .route("/admin/agents", get(list_agents_handler))
-            .route("/admin/workers", get(list_workers_handler))
-            .route("/admin/sites", get(list_hub_sites_handler))
-            .route(
-                "/admin/sites/{site}",
-                axum::routing::put(upsert_hub_site_handler).delete(delete_hub_site_handler),
-            )
-            .route(
-                "/admin/sites/{site}/enrollment-tokens",
-                post(create_enrollment_token_handler),
-            )
-            .route("/admin/sites/{site}/hubs/{id}", delete(revoke_hub_handler))
-            .route("/admin/conversations", get(list_conversations_handler))
-            .route("/admin/conversations/{id}", get(get_conversation_handler))
-            .route("/admin/stats", get(get_stats_handler))
-            .route("/admin/engines", get(list_engines_handler))
-            .route("/admin/engine-stats", get(get_engine_stats_handler))
-            .route("/admin/group-stats", get(get_group_stats_handler))
-            .route("/admin/frontends", get(frontends_status_handler))
-            .route(
-                "/admin/clusters/{group}/{cluster}",
-                patch(update_cluster_handler),
-            )
-            .route("/admin/engine-registry", get(engine_registry_handler))
-            // Persisted cluster config CRUD (requires Postgres persistence)
-            .route("/admin/config/clusters", get(list_cluster_configs_handler))
-            .route(
-                "/admin/config/clusters/test",
-                post(test_cluster_config_handler),
-            )
-            .route(
-                "/admin/config/clusters/{name}",
-                get(get_cluster_config_handler)
-                    .put(upsert_cluster_config_handler)
-                    .patch(rename_cluster_config_handler)
-                    .delete(delete_cluster_config_handler),
-            )
-            // Persisted cluster group config CRUD
-            .route("/admin/config/groups", get(list_group_configs_handler))
-            .route(
-                "/admin/config/groups/{name}",
-                get(get_group_config_handler)
-                    .put(upsert_group_config_handler)
-                    .patch(rename_group_config_handler)
-                    .delete(delete_group_config_handler),
-            )
-            .route(
-                "/admin/config/scripts",
-                get(list_user_scripts_handler).post(create_user_script_handler),
-            )
-            .route(
-                "/admin/config/scripts/{id}",
-                get(get_user_script_handler)
-                    .put(update_user_script_handler)
-                    .delete(delete_user_script_handler),
-            )
-            // Security and routing config (read + write)
-            .route(
-                "/admin/config/security",
-                get(get_security_config_handler).put(put_security_config_handler),
-            )
-            .route(
-                "/admin/config/routing",
-                get(get_routing_config_handler).put(put_routing_config_handler),
-            )
-            .route(
-                "/admin/config/guardrails",
-                get(get_guardrails_config_handler).put(put_guardrails_config_handler),
-            )
-            .route(
-                "/admin/config/access-control",
-                get(get_access_control_config_handler).put(put_access_control_config_handler),
-            )
-            .route(
-                "/admin/access-control/dry-run",
-                post(access_control_dry_run_handler),
-            )
-            .route(
-                "/admin/config/catalog",
-                get(get_catalog_config_handler).put(put_catalog_config_handler),
-            )
-            .route(
-                "/admin/config/catalog/test",
-                post(test_catalog_config_handler),
-            )
-            // Cache invalidation endpoints
-            .route("/admin/cache", delete(invalidate_all_cache_handler))
-            .route(
-                "/admin/cache/{group}",
-                delete(invalidate_group_cache_handler),
-            )
-            // Auth management endpoints
-            .route("/admin/auth/status", get(auth_status_handler))
-            .route("/admin/auth/change-password", post(change_password_handler))
-            .layer(middleware::from_fn_with_state(
-                state.clone(),
-                admin_auth_middleware,
-            ));
+		// Protected routes — require valid Basic auth credentials.
+		let protected = Router::new()
+			.route("/admin/clusters", get(clusters_handler))
+			.route("/admin/queries", get(list_queries_handler))
+			.route("/admin/queries/running", get(list_running_queries_handler))
+			.route("/admin/queries/{id}", delete(cancel_query_handler))
+			.route("/admin/agents", get(list_agents_handler))
+			.route("/admin/workers", get(list_workers_handler))
+			.route("/admin/sites", get(list_hub_sites_handler))
+			.route(
+				"/admin/sites/{site}",
+				axum::routing::put(upsert_hub_site_handler).delete(delete_hub_site_handler),
+			)
+			.route(
+				"/admin/sites/{site}/enrollment-tokens",
+				post(create_enrollment_token_handler),
+			)
+			.route("/admin/sites/{site}/hubs/{id}", delete(revoke_hub_handler))
+			.route("/admin/conversations", get(list_conversations_handler))
+			.route("/admin/conversations/{id}", get(get_conversation_handler))
+			.route("/admin/stats", get(get_stats_handler))
+			.route("/admin/engines", get(list_engines_handler))
+			.route("/admin/engine-stats", get(get_engine_stats_handler))
+			.route("/admin/group-stats", get(get_group_stats_handler))
+			.route("/admin/frontends", get(frontends_status_handler))
+			.route(
+				"/admin/clusters/{group}/{cluster}",
+				patch(update_cluster_handler),
+			)
+			.route("/admin/engine-registry", get(engine_registry_handler))
+			// Persisted cluster config CRUD (requires Postgres persistence)
+			.route("/admin/config/clusters", get(list_cluster_configs_handler))
+			.route(
+				"/admin/config/clusters/test",
+				post(test_cluster_config_handler),
+			)
+			.route(
+				"/admin/config/clusters/{name}",
+				get(get_cluster_config_handler)
+					.put(upsert_cluster_config_handler)
+					.patch(rename_cluster_config_handler)
+					.delete(delete_cluster_config_handler),
+			)
+			// Persisted cluster group config CRUD
+			.route("/admin/config/groups", get(list_group_configs_handler))
+			.route(
+				"/admin/config/groups/{name}",
+				get(get_group_config_handler)
+					.put(upsert_group_config_handler)
+					.patch(rename_group_config_handler)
+					.delete(delete_group_config_handler),
+			)
+			.route(
+				"/admin/config/scripts",
+				get(list_user_scripts_handler).post(create_user_script_handler),
+			)
+			.route(
+				"/admin/config/scripts/{id}",
+				get(get_user_script_handler)
+					.put(update_user_script_handler)
+					.delete(delete_user_script_handler),
+			)
+			// Security and routing config (read + write)
+			.route(
+				"/admin/config/security",
+				get(get_security_config_handler).put(put_security_config_handler),
+			)
+			.route(
+				"/admin/config/routing",
+				get(get_routing_config_handler).put(put_routing_config_handler),
+			)
+			.route(
+				"/admin/config/guardrails",
+				get(get_guardrails_config_handler).put(put_guardrails_config_handler),
+			)
+			.route(
+				"/admin/config/access-control",
+				get(get_access_control_config_handler).put(put_access_control_config_handler),
+			)
+			.route(
+				"/admin/access-control/dry-run",
+				post(access_control_dry_run_handler),
+			)
+			.route(
+				"/admin/config/catalog",
+				get(get_catalog_config_handler).put(put_catalog_config_handler),
+			)
+			.route(
+				"/admin/config/catalog/test",
+				post(test_catalog_config_handler),
+			)
+			// Cache invalidation endpoints
+			.route("/admin/cache", delete(invalidate_all_cache_handler))
+			.route(
+				"/admin/cache/{group}",
+				delete(invalidate_group_cache_handler),
+			)
+			// Auth management endpoints
+			.route("/admin/auth/status", get(auth_status_handler))
+			.route("/admin/auth/change-password", post(change_password_handler))
+			.layer(middleware::from_fn_with_state(
+				state.clone(),
+				admin_auth_middleware,
+			));
 
-        let cors = if self.cors_allowed_origins.is_empty() {
-            CorsLayer::new()
-                .allow_origin(Any)
-                .allow_methods([
-                    Method::GET,
-                    Method::PATCH,
-                    Method::PUT,
-                    Method::POST,
-                    Method::DELETE,
-                    Method::OPTIONS,
-                ])
-                .allow_headers(Any)
-        } else {
-            let origins: Vec<axum::http::HeaderValue> = self
-                .cors_allowed_origins
-                .iter()
-                .filter_map(|o| o.parse().ok())
-                .collect();
-            CorsLayer::new()
-                .allow_origin(origins)
-                .allow_methods([
-                    Method::GET,
-                    Method::PATCH,
-                    Method::PUT,
-                    Method::POST,
-                    Method::DELETE,
-                    Method::OPTIONS,
-                ])
-                .allow_headers(Any)
-        };
+		let cors = if self.cors_allowed_origins.is_empty() {
+			CorsLayer::new()
+				.allow_origin(Any)
+				.allow_methods([
+					Method::GET,
+					Method::PATCH,
+					Method::PUT,
+					Method::POST,
+					Method::DELETE,
+					Method::OPTIONS,
+				])
+				.allow_headers(Any)
+		} else {
+			let origins: Vec<axum::http::HeaderValue> = self
+				.cors_allowed_origins
+				.iter()
+				.filter_map(|o| o.parse().ok())
+				.collect();
+			CorsLayer::new()
+				.allow_origin(origins)
+				.allow_methods([
+					Method::GET,
+					Method::PATCH,
+					Method::PUT,
+					Method::POST,
+					Method::DELETE,
+					Method::OPTIONS,
+				])
+				.allow_headers(Any)
+		};
 
-        let router = Router::new()
-            .merge(public)
-            .merge(protected)
-            .with_state(state);
-        let router = match &self.worker_api {
-            Some(api) => router.merge(crate::worker_api::router(api.clone())),
-            None => router,
-        };
-        router.layer(cors)
-    }
+		let router = Router::new()
+			.merge(public)
+			.merge(protected)
+			.with_state(state);
+		let router = match &self.worker_api {
+			Some(api) => router.merge(crate::worker_api::router(api.clone())),
+			None => router,
+		};
+		router.layer(cors)
+	}
 }
 
 #[async_trait::async_trait]
 impl FrontendListenerTrait for AdminFrontend {
-    async fn listen(&self, mut shutdown: ShutdownRx) -> Result<()> {
-        let addr = format!("0.0.0.0:{}", self.port);
-        info!(
+	async fn listen(&self, mut shutdown: ShutdownRx) -> Result<()> {
+		let addr = format!("0.0.0.0:{}", self.port);
+		info!(
             "Admin server listening on {addr}  — Prometheus: {addr}/metrics  Swagger UI: {addr}/docs"
         );
-        let listener = TcpListener::bind(&addr)
-            .await
-            .map_err(|e| queryflux_core::error::QueryFluxError::Engine(e.to_string()))?;
-        axum::serve(listener, self.router())
-            .with_graceful_shutdown(async move {
-                let _ = shutdown.changed().await;
-            })
-            .await
-            .map_err(|e| queryflux_core::error::QueryFluxError::Engine(e.to_string()))?;
-        Ok(())
-    }
+		let listener = TcpListener::bind(&addr)
+			.await
+			.map_err(|e| queryflux_core::error::QueryFluxError::Engine(e.to_string()))?;
+		axum::serve(listener, self.router())
+			.with_graceful_shutdown(async move {
+				let _ = shutdown.changed().await;
+			})
+			.await
+			.map_err(|e| queryflux_core::error::QueryFluxError::Engine(e.to_string()))?;
+		Ok(())
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -959,12 +959,12 @@ impl FrontendListenerTrait for AdminFrontend {
 // ---------------------------------------------------------------------------
 
 async fn metrics_handler(State(state): State<Arc<AdminState>>) -> impl IntoResponse {
-    let body = state.prometheus.gather_text();
-    (
-        StatusCode::OK,
-        [("content-type", "text/plain; version=0.0.4; charset=utf-8")],
-        body,
-    )
+	let body = state.prometheus.gather_text();
+	(
+		StatusCode::OK,
+		[("content-type", "text/plain; version=0.0.4; charset=utf-8")],
+		body,
+	)
 }
 
 // ---------------------------------------------------------------------------
@@ -976,51 +976,51 @@ async fn metrics_handler(State(state): State<Arc<AdminState>>) -> impl IntoRespo
 /// Expects `Authorization: Basic <base64(username:password)>` on every request.
 /// Returns `401 Unauthorized` with a `WWW-Authenticate` challenge on failure.
 async fn admin_auth_middleware(
-    State(state): State<Arc<AdminState>>,
-    req: Request,
-    next: Next,
+	State(state): State<Arc<AdminState>>,
+	req: Request,
+	next: Next,
 ) -> Response {
-    let auth_header = req
-        .headers()
-        .get(AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
+	let auth_header = req
+		.headers()
+		.get(AUTHORIZATION)
+		.and_then(|v| v.to_str().ok())
+		.unwrap_or("");
 
-    if let Some((username, password)) = parse_basic_auth(auth_header) {
-        if state.admin_creds.verify(&username, &password).await {
-            return next.run(req).await;
-        }
-        warn!(username, "Admin API: invalid credentials");
-    } else {
-        warn!("Admin API: missing or malformed Authorization header");
-    }
+	if let Some((username, password)) = parse_basic_auth(auth_header) {
+		if state.admin_creds.verify(&username, &password).await {
+			return next.run(req).await;
+		}
+		warn!(username, "Admin API: invalid credentials");
+	} else {
+		warn!("Admin API: missing or malformed Authorization header");
+	}
 
-    (
-        StatusCode::UNAUTHORIZED,
-        [(
-            "WWW-Authenticate",
-            r#"Basic realm="QueryFlux Admin", charset="UTF-8""#,
-        )],
-        "Unauthorized",
-    )
-        .into_response()
+	(
+		StatusCode::UNAUTHORIZED,
+		[(
+			"WWW-Authenticate",
+			r#"Basic realm="QueryFlux Admin", charset="UTF-8""#,
+		)],
+		"Unauthorized",
+	)
+		.into_response()
 }
 
 /// Parse `Authorization: Basic <base64(user:pass)>` → `(username, password)`.
 fn parse_basic_auth(header: &str) -> Option<(String, String)> {
-    let encoded = header.strip_prefix("Basic ")?;
-    let decoded = base64_decode(encoded)?;
-    let (user, pass) = decoded.split_once(':')?;
-    Some((user.to_string(), pass.to_string()))
+	let encoded = header.strip_prefix("Basic ")?;
+	let decoded = base64_decode(encoded)?;
+	let (user, pass) = decoded.split_once(':')?;
+	Some((user.to_string(), pass.to_string()))
 }
 
 /// Minimal base64 decoder (no extra deps — same approach as Trino HTTP frontend).
 fn base64_decode(encoded: &str) -> Option<String> {
-    use base64::Engine;
-    let bytes = base64::engine::general_purpose::STANDARD
-        .decode(encoded.trim())
-        .ok()?;
-    String::from_utf8(bytes).ok()
+	use base64::Engine;
+	let bytes = base64::engine::general_purpose::STANDARD
+		.decode(encoded.trim())
+		.ok()?;
+	String::from_utf8(bytes).ok()
 }
 
 // ---------------------------------------------------------------------------
@@ -1029,60 +1029,60 @@ fn base64_decode(encoded: &str) -> Option<String> {
 
 #[derive(Serialize)]
 struct AuthStatusResponse {
-    /// `true` once the operator has changed the password via the web UI.
-    /// `false` means bootstrap (YAML/env) credentials are still in use.
-    db_override: bool,
-    /// `true` when settings are backed by Postgres (survive restart).
-    durable_store: bool,
+	/// `true` once the operator has changed the password via the web UI.
+	/// `false` means bootstrap (YAML/env) credentials are still in use.
+	db_override: bool,
+	/// `true` when settings are backed by Postgres (survive restart).
+	durable_store: bool,
 }
 
 async fn auth_status_handler(State(state): State<Arc<AdminState>>) -> impl IntoResponse {
-    let db_override = state.admin_creds.has_db_override().await;
-    let durable_store = state.admin_creds.settings_are_durable();
-    Json(AuthStatusResponse {
-        db_override,
-        durable_store,
-    })
+	let db_override = state.admin_creds.has_db_override().await;
+	let durable_store = state.admin_creds.settings_are_durable();
+	Json(AuthStatusResponse {
+		db_override,
+		durable_store,
+	})
 }
 
 #[derive(Deserialize)]
 struct ChangePasswordRequest {
-    current_password: String,
-    new_password: String,
+	current_password: String,
+	new_password: String,
 }
 
 async fn change_password_handler(
-    State(state): State<Arc<AdminState>>,
-    Json(body): Json<ChangePasswordRequest>,
+	State(state): State<Arc<AdminState>>,
+	Json(body): Json<ChangePasswordRequest>,
 ) -> impl IntoResponse {
-    match state
-        .admin_creds
-        .change_password(&body.current_password, &body.new_password)
-        .await
-    {
-        Ok(()) => (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response(),
-        Err(QueryFluxError::Auth(msg)) => (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": msg})),
-        )
-            .into_response(),
-        Err(QueryFluxError::Persistence(e)) => {
-            tracing::error!(error = %e, "failed to persist admin password change");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": "failed to persist password change"})),
-            )
-                .into_response()
-        }
-        Err(e) => {
-            tracing::error!(error = %e, "unexpected error changing admin password");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": "failed to change password"})),
-            )
-                .into_response()
-        }
-    }
+	match state
+		.admin_creds
+		.change_password(&body.current_password, &body.new_password)
+		.await
+	{
+		Ok(()) => (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response(),
+		Err(QueryFluxError::Auth(msg)) => (
+			StatusCode::BAD_REQUEST,
+			Json(serde_json::json!({"error": msg})),
+		)
+			.into_response(),
+		Err(QueryFluxError::Persistence(e)) => {
+			tracing::error!(error = %e, "failed to persist admin password change");
+			(
+				StatusCode::INTERNAL_SERVER_ERROR,
+				Json(serde_json::json!({"error": "failed to persist password change"})),
+			)
+				.into_response()
+		}
+		Err(e) => {
+			tracing::error!(error = %e, "unexpected error changing admin password");
+			(
+				StatusCode::INTERNAL_SERVER_ERROR,
+				Json(serde_json::json!({"error": "failed to change password"})),
+			)
+				.into_response()
+		}
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -1091,13 +1091,13 @@ async fn change_password_handler(
 
 /// Liveness probe — unconditionally returns 200 to indicate the process is alive.
 #[utoipa::path(
-    get,
-    path = "/health",
-    tag = "admin",
-    responses((status = 200, description = "Service is alive", body = str))
+	get,
+	path = "/health",
+	tag = "admin",
+	responses((status = 200, description = "Service is alive", body = str))
 )]
 async fn health_handler() -> impl IntoResponse {
-    (StatusCode::OK, "ok")
+	(StatusCode::OK, "ok")
 }
 
 /// Readiness probe — returns 200 only when the proxy has at least one configured
@@ -1105,266 +1105,266 @@ async fn health_handler() -> impl IntoResponse {
 /// `readinessProbe` so traffic is not routed to a replica that hasn't finished
 /// loading its config (or whose last reload left it with zero adapters).
 #[utoipa::path(
-    get,
-    path = "/readyz",
-    tag = "admin",
-    responses(
+	get,
+	path = "/readyz",
+	tag = "admin",
+	responses(
         (status = 200, description = "Service is ready to accept traffic", body = str),
         (status = 503, description = "Service is not yet ready", body = str),
-    )
+	)
 )]
 async fn readiness_handler(State(state): State<Arc<AdminState>>) -> impl IntoResponse {
-    readiness(&state.live).await
+	readiness(&state.live).await
 }
 
 /// 200 once at least one cluster group has a built adapter; 503 before (for a worker,
 /// until its first config snapshot is active).
 pub(crate) async fn readiness(live: &tokio::sync::RwLock<LiveConfig>) -> Response {
-    let live = live.read().await;
-    if live.adapters.is_empty() {
-        return (StatusCode::SERVICE_UNAVAILABLE, "no adapters loaded").into_response();
-    }
-    let cm = live.cluster_manager.clone();
-    drop(live);
+	let live = live.read().await;
+	if live.adapters.is_empty() {
+		return (StatusCode::SERVICE_UNAVAILABLE, "no adapters loaded").into_response();
+	}
+	let cm = live.cluster_manager.clone();
+	drop(live);
 
-    match cm.all_cluster_states().await {
-        Ok(states) if states.is_empty() => {
-            (StatusCode::SERVICE_UNAVAILABLE, "no cluster groups").into_response()
-        }
-        Ok(_) => (StatusCode::OK, "ready").into_response(),
-        Err(_) => (StatusCode::SERVICE_UNAVAILABLE, "cluster manager error").into_response(),
-    }
+	match cm.all_cluster_states().await {
+		Ok(states) if states.is_empty() => {
+			(StatusCode::SERVICE_UNAVAILABLE, "no cluster groups").into_response()
+		}
+		Ok(_) => (StatusCode::OK, "ready").into_response(),
+		Err(_) => (StatusCode::SERVICE_UNAVAILABLE, "cluster manager error").into_response(),
+	}
 }
 
 /// Protocol frontends enabled at process start (from YAML). Not hot-reloaded.
 #[utoipa::path(
-    get,
-    path = "/admin/frontends",
-    tag = "admin",
-    responses(
+	get,
+	path = "/admin/frontends",
+	tag = "admin",
+	responses(
         (status = 200, description = "Frontend protocol snapshot", body = FrontendsStatusDto),
-    )
+	)
 )]
 async fn frontends_status_handler(State(state): State<Arc<AdminState>>) -> impl IntoResponse {
-    Json(state.frontends_status.clone())
+	Json(state.frontends_status.clone())
 }
 
 /// Live state of all cluster groups.
 #[utoipa::path(
-    get,
-    path = "/admin/clusters",
-    tag = "admin",
-    responses(
+	get,
+	path = "/admin/clusters",
+	tag = "admin",
+	responses(
         (status = 200, description = "Cluster state snapshots", body = Vec<ClusterStateDto>),
         (status = 500, description = "Internal error", body = str),
-    )
+	)
 )]
 async fn clusters_handler(State(state): State<Arc<AdminState>>) -> impl IntoResponse {
-    let cluster_manager = state.live.read().await.cluster_manager.clone();
-    match cluster_manager.all_cluster_states().await {
-        Ok(snapshots) => {
-            let dtos: Vec<ClusterStateDto> = snapshots.into_iter().map(Into::into).collect();
-            Json(dtos).into_response()
-        }
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-    }
+	let cluster_manager = state.live.read().await.cluster_manager.clone();
+	match cluster_manager.all_cluster_states().await {
+		Ok(snapshots) => {
+			let dtos: Vec<ClusterStateDto> = snapshots.into_iter().map(Into::into).collect();
+			Json(dtos).into_response()
+		}
+		Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+	}
 }
 
 /// Paginated query history. Requires Postgres persistence.
 #[utoipa::path(
-    get,
-    path = "/admin/queries",
-    tag = "admin",
-    params(QueryFilters),
-    responses(
+	get,
+	path = "/admin/queries",
+	tag = "admin",
+	params(QueryFilters),
+	responses(
         (status = 200, description = "Query records (newest first)", body = Vec<QuerySummary>),
         (status = 503, description = "Postgres persistence not configured", body = str),
         (status = 500, description = "Internal error", body = str),
-    )
+	)
 )]
 async fn list_queries_handler(
-    State(state): State<Arc<AdminState>>,
-    Query(filters): Query<QueryFilters>,
+	State(state): State<Arc<AdminState>>,
+	Query(filters): Query<QueryFilters>,
 ) -> impl IntoResponse {
-    let Some(pg) = &state.admin_store else {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "Postgres persistence not configured",
-        )
-            .into_response();
-    };
-    match pg.list_queries(&filters).await {
-        Ok(rows) => Json::<Vec<QuerySummary>>(rows).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-    }
+	let Some(pg) = &state.admin_store else {
+		return (
+			StatusCode::SERVICE_UNAVAILABLE,
+			"Postgres persistence not configured",
+		)
+			.into_response();
+	};
+	match pg.list_queries(&filters).await {
+		Ok(rows) => Json::<Vec<QuerySummary>>(rows).into_response(),
+		Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+	}
 }
 
 #[derive(Debug, Serialize, ToSchema)]
 pub struct RunningQueryDto {
-    pub id: String,
-    pub backend_query_id: Option<String>,
-    pub submitted_by: String,
-    pub group: String,
-    pub cluster: Option<String>,
-    pub sql_preview: String,
-    /// `executing` or `queued`
-    pub state: String,
+	pub id: String,
+	pub backend_query_id: Option<String>,
+	pub submitted_by: String,
+	pub group: String,
+	pub cluster: Option<String>,
+	pub sql_preview: String,
+	/// `executing` or `queued`
+	pub state: String,
 }
 
 fn sql_preview(sql: &str) -> String {
-    let t = sql.split_whitespace().collect::<Vec<_>>().join(" ");
-    if t.chars().count() > 160 {
-        format!("{}…", t.chars().take(159).collect::<String>())
-    } else {
-        t
-    }
+	let t = sql.split_whitespace().collect::<Vec<_>>().join(" ");
+	if t.chars().count() > 160 {
+		format!("{}…", t.chars().take(159).collect::<String>())
+	} else {
+		t
+	}
 }
 
 /// Build the admin "running queries" response from persistence.
 async fn collect_running_queries(
-    persistence: &dyn queryflux_persistence::Persistence,
+	persistence: &dyn queryflux_persistence::Persistence,
 ) -> queryflux_core::error::Result<Vec<RunningQueryDto>> {
-    let mut out = Vec::new();
-    for q in persistence.list_all().await? {
-        out.push(RunningQueryDto {
-            id: q.id.0,
-            backend_query_id: Some(q.backend_query_id.0),
-            submitted_by: q.submitted_by,
-            group: q.cluster_group.0,
-            cluster: Some(q.cluster_name.0),
-            sql_preview: sql_preview(&q.sql),
-            state: "executing".to_string(),
-        });
-    }
-    for q in persistence.list_queued().await? {
-        out.push(RunningQueryDto {
-            id: q.id.0,
-            backend_query_id: None,
-            submitted_by: q.submitted_by,
-            group: q.cluster_group.0,
-            cluster: None,
-            sql_preview: sql_preview(&q.sql),
-            state: "queued".to_string(),
-        });
-    }
-    Ok(out)
+	let mut out = Vec::new();
+	for q in persistence.list_all().await? {
+		out.push(RunningQueryDto {
+			id: q.id.0,
+			backend_query_id: Some(q.backend_query_id.0),
+			submitted_by: q.submitted_by,
+			group: q.cluster_group.0,
+			cluster: Some(q.cluster_name.0),
+			sql_preview: sql_preview(&q.sql),
+			state: "executing".to_string(),
+		});
+	}
+	for q in persistence.list_queued().await? {
+		out.push(RunningQueryDto {
+			id: q.id.0,
+			backend_query_id: None,
+			submitted_by: q.submitted_by,
+			group: q.cluster_group.0,
+			cluster: None,
+			sql_preview: sql_preview(&q.sql),
+			state: "queued".to_string(),
+		});
+	}
+	Ok(out)
 }
 
 /// Admin cancel path for a queued query (claim release handled by caller).
 pub(crate) async fn delete_queued_if_exists(
-    persistence: &dyn queryflux_persistence::Persistence,
-    id: &str,
+	persistence: &dyn queryflux_persistence::Persistence,
+	id: &str,
 ) -> queryflux_core::error::Result<Option<queryflux_core::query::QueuedQuery>> {
-    persistence.take_queued(&ProxyQueryId(id.to_string())).await
+	persistence.take_queued(&ProxyQueryId(id.to_string())).await
 }
 
 pub(crate) async fn find_executing_query(
-    persistence: &dyn queryflux_persistence::Persistence,
-    id: &str,
+	persistence: &dyn queryflux_persistence::Persistence,
+	id: &str,
 ) -> queryflux_core::error::Result<Option<ExecutingQuery>> {
-    if let Some(q) = persistence.get(&BackendQueryId(id.to_string())).await? {
-        return Ok(Some(q));
-    }
-    Ok(persistence
-        .list_all()
-        .await?
-        .into_iter()
-        .find(|q| q.id.0 == id))
+	if let Some(q) = persistence.get(&BackendQueryId(id.to_string())).await? {
+		return Ok(Some(q));
+	}
+	Ok(persistence
+		.list_all()
+		.await?
+		.into_iter()
+		.find(|q| q.id.0 == id))
 }
 
 /// In-flight executing + queued queries (not history).
 #[utoipa::path(
-    get,
-    path = "/admin/queries/running",
-    tag = "admin",
-    responses(
+	get,
+	path = "/admin/queries/running",
+	tag = "admin",
+	responses(
         (status = 200, description = "In-flight queries", body = Vec<RunningQueryDto>),
         (status = 500, description = "Internal error", body = str),
-    )
+	)
 )]
 async fn list_running_queries_handler(State(state): State<Arc<AdminState>>) -> impl IntoResponse {
-    match collect_running_queries(state.app.persistence.as_ref()).await {
-        Ok(out) => Json(out).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-    }
+	match collect_running_queries(state.app.persistence.as_ref()).await {
+		Ok(out) => Json(out).into_response(),
+		Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+	}
 }
 
 /// Cancel any in-flight or queued query. Admin Basic auth is the privilege.
 #[utoipa::path(
-    delete,
-    path = "/admin/queries/{id}",
-    tag = "admin",
-    params(("id" = String, Path, description = "Proxy query id or backend query id")),
-    responses(
+	delete,
+	path = "/admin/queries/{id}",
+	tag = "admin",
+	params(("id" = String, Path, description = "Proxy query id or backend query id")),
+	responses(
         (status = 204, description = "Cancelled"),
         (status = 404, description = "Query not found", body = str),
         (status = 500, description = "Internal error", body = str),
-    )
+	)
 )]
 async fn cancel_query_handler(
-    State(state): State<Arc<AdminState>>,
-    Path(id): Path<String>,
+	State(state): State<Arc<AdminState>>,
+	Path(id): Path<String>,
 ) -> impl IntoResponse {
-    let persistence = &state.app.persistence;
+	let persistence = &state.app.persistence;
 
-    match find_executing_query(persistence.as_ref(), &id).await {
-        Ok(Some(executing)) => return cancel_executing(&state, executing).await,
-        Ok(None) => {}
-        Err(e) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
-        }
-    }
+	match find_executing_query(persistence.as_ref(), &id).await {
+		Ok(Some(executing)) => return cancel_executing(&state, executing).await,
+		Ok(None) => {}
+		Err(e) => {
+			return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+		}
+	}
 
-    let qid = ProxyQueryId(id.clone());
-    match delete_queued_if_exists(persistence.as_ref(), &id).await {
-        Ok(Some(queued)) => {
-            state.app.record_queued_terminal(
-                &queued,
-                queryflux_core::query::QueryStatus::Cancelled,
-                "admin cancelled",
-            );
-            // A worker may have claimed and started executing between the first
-            // lookup and this delete. Cancel that path too.
-            match find_executing_query(persistence.as_ref(), &id).await {
-                Ok(Some(executing)) => return cancel_executing(&state, executing).await,
-                Ok(None) => {}
-                Err(e) => {
-                    return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
-                }
-            }
-            if let Some(qc) = &state.app.queue_coordinator {
-                let _ = qc.release_claim(&qid.0).await;
-            }
-            info!(id = %qid, "Admin cancelled queued query");
-            StatusCode::NO_CONTENT.into_response()
-        }
-        Ok(None) => {
-            // Claimed and moved to executing after the first lookup.
-            match find_executing_query(persistence.as_ref(), &id).await {
-                Ok(Some(executing)) => cancel_executing(&state, executing).await,
-                Ok(None) => (StatusCode::NOT_FOUND, "query not found").into_response(),
-                Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-            }
-        }
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-    }
+	let qid = ProxyQueryId(id.clone());
+	match delete_queued_if_exists(persistence.as_ref(), &id).await {
+		Ok(Some(queued)) => {
+			state.app.record_queued_terminal(
+				&queued,
+				queryflux_core::query::QueryStatus::Cancelled,
+				"admin cancelled",
+			);
+			// A worker may have claimed and started executing between the first
+			// lookup and this delete. Cancel that path too.
+			match find_executing_query(persistence.as_ref(), &id).await {
+				Ok(Some(executing)) => return cancel_executing(&state, executing).await,
+				Ok(None) => {}
+				Err(e) => {
+					return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+				}
+			}
+			if let Some(qc) = &state.app.queue_coordinator {
+				let _ = qc.release_claim(&qid.0).await;
+			}
+			info!(id = %qid, "Admin cancelled queued query");
+			StatusCode::NO_CONTENT.into_response()
+		}
+		Ok(None) => {
+			// Claimed and moved to executing after the first lookup.
+			match find_executing_query(persistence.as_ref(), &id).await {
+				Ok(Some(executing)) => cancel_executing(&state, executing).await,
+				Ok(None) => (StatusCode::NOT_FOUND, "query not found").into_response(),
+				Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+			}
+		}
+		Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+	}
 }
 
 async fn cancel_executing(
-    state: &AdminState,
-    executing: queryflux_core::query::ExecutingQuery,
+	state: &AdminState,
+	executing: queryflux_core::query::ExecutingQuery,
 ) -> Response {
-    match cancel_executing_query(
-        &state.app,
-        queryflux_core::query::FrontendProtocol::TrinoHttp,
-        &executing,
-        "admin cancelled",
-    )
-    .await
-    {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg).into_response(),
-    }
+	match cancel_executing_query(
+		&state.app,
+		queryflux_core::query::FrontendProtocol::TrinoHttp,
+		&executing,
+		"admin cancelled",
+	)
+		.await
+	{
+		Ok(()) => StatusCode::NO_CONTENT.into_response(),
+		Err(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg).into_response(),
+	}
 }
 
 /// Cancel an in-flight executing query on its backend and record the outcome.
@@ -1374,86 +1374,86 @@ async fn cancel_executing(
 /// checks `require_query_owner` before calling this, since MCP callers authenticate as a
 /// regular user, not an admin).
 pub(crate) async fn cancel_executing_query(
-    app: &Arc<AppState>,
-    protocol: queryflux_core::query::FrontendProtocol,
-    executing: &queryflux_core::query::ExecutingQuery,
-    reason: &str,
+	app: &Arc<AppState>,
+	protocol: queryflux_core::query::FrontendProtocol,
+	executing: &queryflux_core::query::ExecutingQuery,
+	reason: &str,
 ) -> std::result::Result<(), String> {
-    let Some(adapter) = app.adapter(&executing.cluster_name.0).await else {
-        warn!(
+	let Some(adapter) = app.adapter(&executing.cluster_name.0).await else {
+		warn!(
             id = %executing.id,
             cluster = %executing.cluster_name,
             "Cancel: no adapter for cluster"
         );
-        return Err("failed to cancel query on backend".to_string());
-    };
-    if let Err(e) = adapter
-        .cancel_query(&executing.backend_query_id, executing.wire_auth.as_ref())
-        .await
-    {
-        warn!(
+		return Err("failed to cancel query on backend".to_string());
+	};
+	if let Err(e) = adapter
+		.cancel_query(&executing.backend_query_id, executing.wire_auth.as_ref())
+		.await
+	{
+		warn!(
             id = %executing.id,
             backend = %executing.backend_query_id,
             "Adapter cancel failed: {e}"
         );
-        return Err("failed to cancel query on backend".to_string());
-    }
-    app.record_executing_cancelled(
-        executing,
-        protocol,
-        adapter.engine_type(),
-        adapter.translation_target_dialect(),
-        reason,
-    );
-    app.release_query_slot(
-        &executing.cluster_group,
-        &executing.cluster_name,
-        &executing.id.0,
-    )
-    .await;
-    if let Err(e) = app.persistence.delete(&executing.backend_query_id).await {
-        return Err(e.to_string());
-    }
-    info!(
+		return Err("failed to cancel query on backend".to_string());
+	}
+	app.record_executing_cancelled(
+		executing,
+		protocol,
+		adapter.engine_type(),
+		adapter.translation_target_dialect(),
+		reason,
+	);
+	app.release_query_slot(
+		&executing.cluster_group,
+		&executing.cluster_name,
+		&executing.id.0,
+	)
+		.await;
+	if let Err(e) = app.persistence.delete(&executing.backend_query_id).await {
+		return Err(e.to_string());
+	}
+	info!(
         id = %executing.id,
         backend = %executing.backend_query_id,
         owner = %executing.submitted_by,
         "Cancelled executing query"
     );
-    Ok(())
+	Ok(())
 }
 
 /// Workers registered with this control plane (#255), with their reported state.
 #[derive(Debug, Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkerFleetDto {
-    /// Whether this process serves workers (`role: controlPlane`).
-    pub enabled: bool,
-    /// The config revision this process serves workers right now.
-    pub control_plane_revision: Option<String>,
-    /// Why the current revision could not be computed, if it could not.
-    pub revision_error: Option<String>,
-    /// Workers seen within the last 7 days, by name.
-    pub workers: Vec<WorkerView>,
+	/// Whether this process serves workers (`role: controlPlane`).
+	pub enabled: bool,
+	/// The config revision this process serves workers right now.
+	pub control_plane_revision: Option<String>,
+	/// Why the current revision could not be computed, if it could not.
+	pub revision_error: Option<String>,
+	/// Workers seen within the last 7 days, by name.
+	pub workers: Vec<WorkerView>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkerView {
-    #[serde(flatten)]
-    pub worker: queryflux_persistence::WorkerRecord,
-    /// `online` when it reported within three heartbeat intervals (at least 30s),
-    /// otherwise `offline`.
-    pub state: String,
-    /// Whether the worker runs the control plane's current revision. `None` when the
-    /// current revision is unknown or the worker has no config yet.
-    pub in_sync: Option<bool>,
-    pub seconds_since_seen: i64,
+	#[serde(flatten)]
+	pub worker: queryflux_persistence::WorkerRecord,
+	/// `online` when it reported within three heartbeat intervals (at least 30s),
+	/// otherwise `offline`.
+	pub state: String,
+	/// Whether the worker runs the control plane's current revision. `None` when the
+	/// current revision is unknown or the worker has no config yet.
+	pub in_sync: Option<bool>,
+	pub seconds_since_seen: i64,
 }
 
 /// The site a hub's record is for.
 fn hub_site(w: &queryflux_persistence::WorkerRecord) -> Option<&str> {
-    w.labels.get("site").map(String::as_str)
+	w.labels.get("site").map(String::as_str)
 }
 
 /// Whether each worker runs the control plane's current revision; `None` when either is
@@ -1462,137 +1462,137 @@ fn hub_site(w: &queryflux_persistence::WorkerRecord) -> Option<&str> {
 /// hub serves, a re-sealed copy of that revision when the hub removed a history
 /// endpoint: it is in sync when an in-sync hub of its site serves what it runs.
 fn in_sync_flags(
-    workers: &[queryflux_persistence::WorkerRecord],
-    control_plane: Option<&str>,
-    per_site: &std::collections::HashMap<String, String>,
+	workers: &[queryflux_persistence::WorkerRecord],
+	control_plane: Option<&str>,
+	per_site: &std::collections::HashMap<String, String>,
 ) -> Vec<Option<bool>> {
-    let expected = |site: Option<&str>| {
-        site.and_then(|s| per_site.get(s))
-            .map(String::as_str)
-            .or(control_plane)
-    };
-    let served_at_site: std::collections::HashSet<(&str, &str)> = workers
-        .iter()
-        .filter(|a| {
-            a.kind == "hub"
-                && a.active_revision.is_some()
-                && a.active_revision.as_deref() == expected(hub_site(a))
-        })
-        .filter_map(|a| Some((hub_site(a)?, a.status.served_revision.as_deref()?)))
-        .collect();
-    workers
-        .iter()
-        .map(|w| {
-            let site = match w.kind.as_str() {
-                "hub" => hub_site(w),
-                _ => w.parent.as_deref(),
-            };
-            let (cp, active) = (expected(site)?, w.active_revision.as_deref()?);
-            Some(
-                cp == active
-                    || w.parent
-                        .as_deref()
-                        .is_some_and(|site| served_at_site.contains(&(site, active))),
-            )
-        })
-        .collect()
+	let expected = |site: Option<&str>| {
+		site.and_then(|s| per_site.get(s))
+			.map(String::as_str)
+			.or(control_plane)
+	};
+	let served_at_site: std::collections::HashSet<(&str, &str)> = workers
+		.iter()
+		.filter(|a| {
+			a.kind == "hub"
+				&& a.active_revision.is_some()
+				&& a.active_revision.as_deref() == expected(hub_site(a))
+		})
+		.filter_map(|a| Some((hub_site(a)?, a.status.served_revision.as_deref()?)))
+		.collect();
+	workers
+		.iter()
+		.map(|w| {
+			let site = match w.kind.as_str() {
+				"hub" => hub_site(w),
+				_ => w.parent.as_deref(),
+			};
+			let (cp, active) = (expected(site)?, w.active_revision.as_deref()?);
+			Some(
+				cp == active
+					|| w.parent
+					.as_deref()
+					.is_some_and(|site| served_at_site.contains(&(site, active))),
+			)
+		})
+		.collect()
 }
 
 /// How long a worker stays listed after its last report.
 const WORKER_LIST_WINDOW_DAYS: i64 = 7;
 
 #[utoipa::path(
-    get,
-    path = "/admin/workers",
-    tag = "admin",
-    responses(
+	get,
+	path = "/admin/workers",
+	tag = "admin",
+	responses(
         (status = 200, description = "Registered workers and their state", body = WorkerFleetDto),
         (status = 500, description = "Internal error", body = str),
-    )
+	)
 )]
 async fn list_workers_handler(State(state): State<Arc<AdminState>>) -> impl IntoResponse {
-    let Some(api) = &state.worker_api else {
-        return Json(WorkerFleetDto {
-            enabled: false,
-            control_plane_revision: None,
-            revision_error: None,
-            workers: vec![],
-        })
-        .into_response();
-    };
-    let mut per_site = std::collections::HashMap::new();
-    let (control_plane_revision, revision_error) = match (api.snapshot)().await {
-        Ok(s) => {
-            if let Some(hubs) = &api.hubs {
-                for (site, clusters) in hubs.limited_sites().await {
-                    per_site.insert(site, s.for_site(&clusters).revision);
-                }
-            }
-            (Some(s.revision), None)
-        }
-        Err(e) => (None, Some(e)),
-    };
-    let workers = match &api.registry {
-        Some(registry) => {
-            let since = chrono::Utc::now() - chrono::Duration::days(WORKER_LIST_WINDOW_DAYS);
-            match registry.list_workers(since).await {
-                Ok(w) => w,
-                Err(e) => {
-                    return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
-                }
-            }
-        }
-        None => vec![],
-    };
-    let in_sync = in_sync_flags(&workers, control_plane_revision.as_deref(), &per_site);
-    let now = chrono::Utc::now();
-    let workers = workers
-        .into_iter()
-        .zip(in_sync)
-        .map(|(worker, in_sync)| {
-            let seconds_since_seen = (now - worker.last_seen).num_seconds().max(0);
-            let interval = worker.status.heartbeat_interval_secs.unwrap_or(10) as i64;
-            let online = seconds_since_seen <= (interval * 3).max(30);
-            WorkerView {
-                worker,
-                state: if online { "online" } else { "offline" }.into(),
-                in_sync,
-                seconds_since_seen,
-            }
-        })
-        .collect();
-    Json(WorkerFleetDto {
-        enabled: true,
-        control_plane_revision,
-        revision_error,
-        workers,
-    })
-    .into_response()
+	let Some(api) = &state.worker_api else {
+		return Json(WorkerFleetDto {
+			enabled: false,
+			control_plane_revision: None,
+			revision_error: None,
+			workers: vec![],
+		})
+			.into_response();
+	};
+	let mut per_site = std::collections::HashMap::new();
+	let (control_plane_revision, revision_error) = match (api.snapshot)().await {
+		Ok(s) => {
+			if let Some(hubs) = &api.hubs {
+				for (site, clusters) in hubs.limited_sites().await {
+					per_site.insert(site, s.for_site(&clusters).revision);
+				}
+			}
+			(Some(s.revision), None)
+		}
+		Err(e) => (None, Some(e)),
+	};
+	let workers = match &api.registry {
+		Some(registry) => {
+			let since = chrono::Utc::now() - chrono::Duration::days(WORKER_LIST_WINDOW_DAYS);
+			match registry.list_workers(since).await {
+				Ok(w) => w,
+				Err(e) => {
+					return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+				}
+			}
+		}
+		None => vec![],
+	};
+	let in_sync = in_sync_flags(&workers, control_plane_revision.as_deref(), &per_site);
+	let now = chrono::Utc::now();
+	let workers = workers
+		.into_iter()
+		.zip(in_sync)
+		.map(|(worker, in_sync)| {
+			let seconds_since_seen = (now - worker.last_seen).num_seconds().max(0);
+			let interval = worker.status.heartbeat_interval_secs.unwrap_or(10) as i64;
+			let online = seconds_since_seen <= (interval * 3).max(30);
+			WorkerView {
+				worker,
+				state: if online { "online" } else { "offline" }.into(),
+				in_sync,
+				seconds_since_seen,
+			}
+		})
+		.collect();
+	Json(WorkerFleetDto {
+		enabled: true,
+		control_plane_revision,
+		revision_error,
+		workers,
+	})
+		.into_response()
 }
 
 /// Sites served through hubs, with each site's enrolled hubs (#255).
 #[derive(Debug, Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct HubSiteView {
-    #[serde(flatten)]
-    pub site: queryflux_persistence::hub_store::HubSite,
-    pub hubs: Vec<queryflux_persistence::hub_store::HubKey>,
+	#[serde(flatten)]
+	pub site: queryflux_persistence::hub_store::HubSite,
+	pub hubs: Vec<queryflux_persistence::hub_store::HubKey>,
 }
 
 #[derive(Debug, Default, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct UpsertHubSite {
-    /// The clusters this site gets; omit or `null` for every cluster.
-    #[serde(default)]
-    pub clusters: Option<Vec<String>>,
+	/// The clusters this site gets; omit or `null` for every cluster.
+	#[serde(default)]
+	pub clusters: Option<Vec<String>>,
 }
 
 #[derive(Debug, Default, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct CreateEnrollmentToken {
-    /// How long the token may be used. Default 3600; between 60 and 604800 (7 days).
-    #[serde(default)]
-    pub ttl_secs: Option<u64>,
+	/// How long the token may be used. Default 3600; between 60 and 604800 (7 days).
+	#[serde(default)]
+	pub ttl_secs: Option<u64>,
 }
 
 /// A one-time enrollment token. It is shown only here: the control plane keeps its
@@ -1600,72 +1600,72 @@ pub struct CreateEnrollmentToken {
 #[derive(Debug, Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct EnrollmentTokenDto {
-    pub token: String,
-    pub site: String,
-    pub expires_at: chrono::DateTime<chrono::Utc>,
+	pub token: String,
+	pub site: String,
+	pub expires_at: chrono::DateTime<chrono::Utc>,
 }
 
 /// The enrolled-hub directory, or the response to send when this process has none.
 #[allow(clippy::result_large_err)]
 fn hub_directory(
-    state: &AdminState,
+	state: &AdminState,
 ) -> std::result::Result<Arc<crate::hub_directory::HubDirectory>, axum::response::Response> {
-    state
-        .worker_api
-        .as_ref()
-        .and_then(|api| api.hubs.clone())
-        .ok_or_else(|| {
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                "hub enrollment needs role: controlPlane with Postgres persistence",
-            )
-                .into_response()
-        })
+	state
+		.worker_api
+		.as_ref()
+		.and_then(|api| api.hubs.clone())
+		.ok_or_else(|| {
+			(
+				StatusCode::SERVICE_UNAVAILABLE,
+				"hub enrollment needs role: controlPlane with Postgres persistence",
+			)
+				.into_response()
+		})
 }
 
 fn valid_site_name(name: &str) -> bool {
-    !name.is_empty()
-        && name.len() <= 128
-        && name
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+	!name.is_empty()
+		&& name.len() <= 128
+		&& name
+		.bytes()
+		.all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
 }
 
 #[utoipa::path(
-    get,
-    path = "/admin/sites",
-    tag = "admin",
-    responses(
+	get,
+	path = "/admin/sites",
+	tag = "admin",
+	responses(
         (status = 200, description = "Sites and their enrolled hubs", body = Vec<HubSiteView>),
         (status = 503, description = "This process does not enroll hubs", body = str),
-    )
+	)
 )]
 async fn list_hub_sites_handler(State(state): State<Arc<AdminState>>) -> impl IntoResponse {
-    let hubs = match hub_directory(&state) {
-        Ok(h) => h,
-        Err(r) => return r,
-    };
-    let (sites, keys) = match (
-        hubs.store().list_hub_sites().await,
-        hubs.store().list_hub_keys().await,
-    ) {
-        (Ok(s), Ok(k)) => (s, k),
-        (Err(e), _) | (_, Err(e)) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
-        }
-    };
-    let views: Vec<HubSiteView> = sites
-        .into_iter()
-        .map(|site| HubSiteView {
-            hubs: keys
-                .iter()
-                .filter(|k| k.site == site.name)
-                .cloned()
-                .collect(),
-            site,
-        })
-        .collect();
-    Json(views).into_response()
+	let hubs = match hub_directory(&state) {
+		Ok(h) => h,
+		Err(r) => return r,
+	};
+	let (sites, keys) = match (
+		hubs.store().list_hub_sites().await,
+		hubs.store().list_hub_keys().await,
+	) {
+		(Ok(s), Ok(k)) => (s, k),
+		(Err(e), _) | (_, Err(e)) => {
+			return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+		}
+	};
+	let views: Vec<HubSiteView> = sites
+		.into_iter()
+		.map(|site| HubSiteView {
+			hubs: keys
+				.iter()
+				.filter(|k| k.site == site.name)
+				.cloned()
+				.collect(),
+			site,
+		})
+		.collect();
+	Json(views).into_response()
 }
 
 #[utoipa::path(
@@ -1681,58 +1681,58 @@ async fn list_hub_sites_handler(State(state): State<Arc<AdminState>>) -> impl In
     )
 )]
 async fn upsert_hub_site_handler(
-    State(state): State<Arc<AdminState>>,
-    Path(site): Path<String>,
-    body: Option<Json<UpsertHubSite>>,
+	State(state): State<Arc<AdminState>>,
+	Path(site): Path<String>,
+	body: Option<Json<UpsertHubSite>>,
 ) -> impl IntoResponse {
-    let hubs = match hub_directory(&state) {
-        Ok(h) => h,
-        Err(r) => return r,
-    };
-    if !valid_site_name(&site) {
-        return (
-            StatusCode::BAD_REQUEST,
-            "site names use letters, digits, '-', '_' and '.' (at most 128)",
-        )
-            .into_response();
-    }
-    let clusters = body.and_then(|Json(b)| b.clusters);
-    match hubs.store().upsert_hub_site(&site, clusters).await {
-        Ok(()) => {
-            hubs.reload().await;
-            StatusCode::NO_CONTENT.into_response()
-        }
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-    }
+	let hubs = match hub_directory(&state) {
+		Ok(h) => h,
+		Err(r) => return r,
+	};
+	if !valid_site_name(&site) {
+		return (
+			StatusCode::BAD_REQUEST,
+			"site names use letters, digits, '-', '_' and '.' (at most 128)",
+		)
+			.into_response();
+	}
+	let clusters = body.and_then(|Json(b)| b.clusters);
+	match hubs.store().upsert_hub_site(&site, clusters).await {
+		Ok(()) => {
+			hubs.reload().await;
+			StatusCode::NO_CONTENT.into_response()
+		}
+		Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+	}
 }
 
 #[utoipa::path(
-    delete,
-    path = "/admin/sites/{site}",
-    tag = "admin",
-    params(("site" = String, Path, description = "Site name")),
-    responses(
+	delete,
+	path = "/admin/sites/{site}",
+	tag = "admin",
+	params(("site" = String, Path, description = "Site name")),
+	responses(
         (status = 204, description = "Site deleted; its hubs and unused tokens are revoked"),
         (status = 404, description = "No such site", body = str),
         (status = 503, description = "This process does not enroll hubs", body = str),
-    )
+	)
 )]
 async fn delete_hub_site_handler(
-    State(state): State<Arc<AdminState>>,
-    Path(site): Path<String>,
+	State(state): State<Arc<AdminState>>,
+	Path(site): Path<String>,
 ) -> impl IntoResponse {
-    let hubs = match hub_directory(&state) {
-        Ok(h) => h,
-        Err(r) => return r,
-    };
-    match hubs.store().delete_hub_site(&site).await {
-        Ok(true) => {
-            hubs.reload().await;
-            StatusCode::NO_CONTENT.into_response()
-        }
-        Ok(false) => (StatusCode::NOT_FOUND, "no such site").into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-    }
+	let hubs = match hub_directory(&state) {
+		Ok(h) => h,
+		Err(r) => return r,
+	};
+	match hubs.store().delete_hub_site(&site).await {
+		Ok(true) => {
+			hubs.reload().await;
+			StatusCode::NO_CONTENT.into_response()
+		}
+		Ok(false) => (StatusCode::NOT_FOUND, "no such site").into_response(),
+		Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+	}
 }
 
 #[utoipa::path(
@@ -1749,316 +1749,316 @@ async fn delete_hub_site_handler(
     )
 )]
 async fn create_enrollment_token_handler(
-    State(state): State<Arc<AdminState>>,
-    Path(site): Path<String>,
-    body: Option<Json<CreateEnrollmentToken>>,
+	State(state): State<Arc<AdminState>>,
+	Path(site): Path<String>,
+	body: Option<Json<CreateEnrollmentToken>>,
 ) -> impl IntoResponse {
-    let hubs = match hub_directory(&state) {
-        Ok(h) => h,
-        Err(r) => return r,
-    };
-    let ttl = body.and_then(|Json(b)| b.ttl_secs).unwrap_or(3600);
-    if !(60..=7 * 24 * 3600).contains(&ttl) {
-        return (
-            StatusCode::BAD_REQUEST,
-            "ttlSecs must be between 60 and 604800",
-        )
-            .into_response();
-    }
-    let token = queryflux_core::hub_token::new_enrollment_token();
-    let expires_at = chrono::Utc::now() + chrono::Duration::seconds(ttl as i64);
-    match hubs
-        .store()
-        .create_enrollment_token(
-            &site,
-            &crate::worker_api::enrollment_token_hash(&token),
-            expires_at,
-        )
-        .await
-    {
-        Ok(true) => (
-            StatusCode::CREATED,
-            Json(EnrollmentTokenDto {
-                token,
-                site,
-                expires_at,
-            }),
-        )
-            .into_response(),
-        Ok(false) => (StatusCode::NOT_FOUND, "no such site").into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-    }
+	let hubs = match hub_directory(&state) {
+		Ok(h) => h,
+		Err(r) => return r,
+	};
+	let ttl = body.and_then(|Json(b)| b.ttl_secs).unwrap_or(3600);
+	if !(60..=7 * 24 * 3600).contains(&ttl) {
+		return (
+			StatusCode::BAD_REQUEST,
+			"ttlSecs must be between 60 and 604800",
+		)
+			.into_response();
+	}
+	let token = queryflux_core::hub_token::new_enrollment_token();
+	let expires_at = chrono::Utc::now() + chrono::Duration::seconds(ttl as i64);
+	match hubs
+		.store()
+		.create_enrollment_token(
+			&site,
+			&crate::worker_api::enrollment_token_hash(&token),
+			expires_at,
+		)
+		.await
+	{
+		Ok(true) => (
+			StatusCode::CREATED,
+			Json(EnrollmentTokenDto {
+				token,
+				site,
+				expires_at,
+			}),
+		)
+			.into_response(),
+		Ok(false) => (StatusCode::NOT_FOUND, "no such site").into_response(),
+		Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+	}
 }
 
 #[utoipa::path(
-    delete,
-    path = "/admin/sites/{site}/hubs/{id}",
-    tag = "admin",
-    params(
+	delete,
+	path = "/admin/sites/{site}/hubs/{id}",
+	tag = "admin",
+	params(
         ("site" = String, Path, description = "Site name"),
         ("id" = String, Path, description = "Hub id"),
-    ),
-    responses(
+	),
+	responses(
         (status = 204, description = "Hub revoked"),
         (status = 404, description = "No such hub", body = str),
         (status = 503, description = "This process does not enroll hubs", body = str),
-    )
+	)
 )]
 async fn revoke_hub_handler(
-    State(state): State<Arc<AdminState>>,
-    Path((site, id)): Path<(String, String)>,
+	State(state): State<Arc<AdminState>>,
+	Path((site, id)): Path<(String, String)>,
 ) -> impl IntoResponse {
-    let hubs = match hub_directory(&state) {
-        Ok(h) => h,
-        Err(r) => return r,
-    };
-    match hubs.store().delete_hub_key(&site, &id).await {
-        Ok(true) => {
-            hubs.reload().await;
-            StatusCode::NO_CONTENT.into_response()
-        }
-        Ok(false) => (StatusCode::NOT_FOUND, "no such hub").into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-    }
+	let hubs = match hub_directory(&state) {
+		Ok(h) => h,
+		Err(r) => return r,
+	};
+	match hubs.store().delete_hub_key(&site, &id).await {
+		Ok(true) => {
+			hubs.reload().await;
+			StatusCode::NO_CONTENT.into_response()
+		}
+		Ok(false) => (StatusCode::NOT_FOUND, "no such hub").into_response(),
+		Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+	}
 }
 
 /// Distinct agents that have run queries, with aggregate stats.
 #[utoipa::path(
-    get,
-    path = "/admin/agents",
-    tag = "admin",
-    params(
+	get,
+	path = "/admin/agents",
+	tag = "admin",
+	params(
         ("limit" = Option<i64>, Query, description = "Page size (default 50)"),
         ("offset" = Option<i64>, Query, description = "Page offset (default 0)"),
-    ),
-    responses(
+	),
+	responses(
         (status = 200, description = "Agent summaries", body = Vec<queryflux_persistence::query_history::AgentSummary>),
         (status = 503, description = "Postgres persistence not configured", body = str),
         (status = 500, description = "Internal error", body = str),
-    )
+	)
 )]
 async fn list_agents_handler(
-    State(state): State<Arc<AdminState>>,
-    Query(params): Query<std::collections::HashMap<String, String>>,
+	State(state): State<Arc<AdminState>>,
+	Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> impl IntoResponse {
-    let Some(pg) = &state.admin_store else {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "Postgres persistence not configured",
-        )
-            .into_response();
-    };
-    let limit = params
-        .get("limit")
-        .and_then(|v| v.parse::<i64>().ok())
-        .unwrap_or(50);
-    let offset = params
-        .get("offset")
-        .and_then(|v| v.parse::<i64>().ok())
-        .unwrap_or(0);
-    match pg.list_agents(limit, offset).await {
-        Ok(rows) => Json::<Vec<AgentSummary>>(rows).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-    }
+	let Some(pg) = &state.admin_store else {
+		return (
+			StatusCode::SERVICE_UNAVAILABLE,
+			"Postgres persistence not configured",
+		)
+			.into_response();
+	};
+	let limit = params
+		.get("limit")
+		.and_then(|v| v.parse::<i64>().ok())
+		.unwrap_or(50);
+	let offset = params
+		.get("offset")
+		.and_then(|v| v.parse::<i64>().ok())
+		.unwrap_or(0);
+	match pg.list_agents(limit, offset).await {
+		Ok(rows) => Json::<Vec<AgentSummary>>(rows).into_response(),
+		Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+	}
 }
 
 /// Conversations grouped by conversation_id. Filter by agent_id via ?agent_id=.
 #[utoipa::path(
-    get,
-    path = "/admin/conversations",
-    tag = "admin",
-    params(
+	get,
+	path = "/admin/conversations",
+	tag = "admin",
+	params(
         ("agent_id" = Option<String>, Query, description = "Filter by agent id"),
         ("limit" = Option<i64>, Query, description = "Page size (default 50)"),
         ("offset" = Option<i64>, Query, description = "Page offset (default 0)"),
-    ),
-    responses(
+	),
+	responses(
         (status = 200, description = "Conversation summaries", body = Vec<queryflux_persistence::query_history::ConversationSummary>),
         (status = 503, description = "Postgres persistence not configured", body = str),
         (status = 500, description = "Internal error", body = str),
-    )
+	)
 )]
 async fn list_conversations_handler(
-    State(state): State<Arc<AdminState>>,
-    Query(params): Query<std::collections::HashMap<String, String>>,
+	State(state): State<Arc<AdminState>>,
+	Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> impl IntoResponse {
-    let Some(pg) = &state.admin_store else {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "Postgres persistence not configured",
-        )
-            .into_response();
-    };
-    let agent_id = params.get("agent_id").map(|s| s.as_str());
-    let limit = params
-        .get("limit")
-        .and_then(|v| v.parse::<i64>().ok())
-        .unwrap_or(50);
-    let offset = params
-        .get("offset")
-        .and_then(|v| v.parse::<i64>().ok())
-        .unwrap_or(0);
-    match pg.list_conversations(agent_id, limit, offset).await {
-        Ok(rows) => Json::<Vec<ConversationSummary>>(rows).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-    }
+	let Some(pg) = &state.admin_store else {
+		return (
+			StatusCode::SERVICE_UNAVAILABLE,
+			"Postgres persistence not configured",
+		)
+			.into_response();
+	};
+	let agent_id = params.get("agent_id").map(|s| s.as_str());
+	let limit = params
+		.get("limit")
+		.and_then(|v| v.parse::<i64>().ok())
+		.unwrap_or(50);
+	let offset = params
+		.get("offset")
+		.and_then(|v| v.parse::<i64>().ok())
+		.unwrap_or(0);
+	match pg.list_conversations(agent_id, limit, offset).await {
+		Ok(rows) => Json::<Vec<ConversationSummary>>(rows).into_response(),
+		Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+	}
 }
 
 /// All query steps for a conversation, ordered by step_index.
 #[utoipa::path(
-    get,
-    path = "/admin/conversations/{id}",
-    tag = "admin",
-    params(("id" = String, Path, description = "Conversation id")),
-    responses(
+	get,
+	path = "/admin/conversations/{id}",
+	tag = "admin",
+	params(("id" = String, Path, description = "Conversation id")),
+	responses(
         (status = 200, description = "Query steps for this conversation", body = Vec<QuerySummary>),
         (status = 503, description = "Postgres persistence not configured", body = str),
         (status = 500, description = "Internal error", body = str),
-    )
+	)
 )]
 async fn get_conversation_handler(
-    State(state): State<Arc<AdminState>>,
-    Path(conversation_id): Path<String>,
+	State(state): State<Arc<AdminState>>,
+	Path(conversation_id): Path<String>,
 ) -> impl IntoResponse {
-    let Some(pg) = &state.admin_store else {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "Postgres persistence not configured",
-        )
-            .into_response();
-    };
-    match pg.get_conversation(&conversation_id).await {
-        Ok(rows) => Json::<Vec<QuerySummary>>(rows).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-    }
+	let Some(pg) = &state.admin_store else {
+		return (
+			StatusCode::SERVICE_UNAVAILABLE,
+			"Postgres persistence not configured",
+		)
+			.into_response();
+	};
+	match pg.get_conversation(&conversation_id).await {
+		Ok(rows) => Json::<Vec<QuerySummary>>(rows).into_response(),
+		Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+	}
 }
 
 /// Dashboard stats for the last hour. Requires Postgres persistence.
 #[utoipa::path(
-    get,
-    path = "/admin/stats",
-    tag = "admin",
-    responses(
+	get,
+	path = "/admin/stats",
+	tag = "admin",
+	responses(
         (status = 200, description = "Aggregated last-hour stats", body = DashboardStats),
         (status = 503, description = "Postgres persistence not configured", body = str),
         (status = 500, description = "Internal error", body = str),
-    )
+	)
 )]
 async fn get_stats_handler(State(state): State<Arc<AdminState>>) -> impl IntoResponse {
-    let Some(pg) = &state.admin_store else {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "Postgres persistence not configured",
-        )
-            .into_response();
-    };
-    match pg.get_dashboard_stats().await {
-        Ok(stats) => Json(stats).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-    }
+	let Some(pg) = &state.admin_store else {
+		return (
+			StatusCode::SERVICE_UNAVAILABLE,
+			"Postgres persistence not configured",
+		)
+			.into_response();
+	};
+	match pg.get_dashboard_stats().await {
+		Ok(stats) => Json(stats).into_response(),
+		Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+	}
 }
 
 /// Distinct engine types that have recorded queries. Requires Postgres persistence.
 #[utoipa::path(
-    get,
-    path = "/admin/engines",
-    tag = "admin",
-    responses(
+	get,
+	path = "/admin/engines",
+	tag = "admin",
+	responses(
         (status = 200, description = "List of engine type strings", body = Vec<String>),
         (status = 503, description = "Postgres persistence not configured", body = str),
         (status = 500, description = "Internal error", body = str),
-    )
+	)
 )]
 async fn list_engines_handler(State(state): State<Arc<AdminState>>) -> impl IntoResponse {
-    let Some(pg) = &state.admin_store else {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "Postgres persistence not configured",
-        )
-            .into_response();
-    };
-    match pg.list_engines().await {
-        Ok(engines) => Json(engines).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-    }
+	let Some(pg) = &state.admin_store else {
+		return (
+			StatusCode::SERVICE_UNAVAILABLE,
+			"Postgres persistence not configured",
+		)
+			.into_response();
+	};
+	match pg.list_engines().await {
+		Ok(engines) => Json(engines).into_response(),
+		Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+	}
 }
 
 /// Per-engine aggregated stats. Optional `?hours=N` window (default 24). Requires Postgres persistence.
 #[utoipa::path(
-    get,
-    path = "/admin/engine-stats",
-    tag = "admin",
-    params(
+	get,
+	path = "/admin/engine-stats",
+	tag = "admin",
+	params(
         ("hours" = Option<i64>, Query, description = "Look-back window in hours (default 24)")
-    ),
-    responses(
+	),
+	responses(
         (status = 200, description = "Per-engine aggregated stats", body = Vec<EngineStatRow>),
         (status = 503, description = "Postgres persistence not configured", body = str),
         (status = 500, description = "Internal error", body = str),
-    )
+	)
 )]
 async fn get_engine_stats_handler(
-    State(state): State<Arc<AdminState>>,
-    Query(params): Query<EngineStatsParams>,
+	State(state): State<Arc<AdminState>>,
+	Query(params): Query<EngineStatsParams>,
 ) -> impl IntoResponse {
-    let Some(pg) = &state.admin_store else {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "Postgres persistence not configured",
-        )
-            .into_response();
-    };
-    let hours = params.hours.unwrap_or(24).clamp(1, 168);
-    match pg.get_engine_stats(hours).await {
-        Ok(rows) => Json::<Vec<EngineStatRow>>(rows).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-    }
+	let Some(pg) = &state.admin_store else {
+		return (
+			StatusCode::SERVICE_UNAVAILABLE,
+			"Postgres persistence not configured",
+		)
+			.into_response();
+	};
+	let hours = params.hours.unwrap_or(24).clamp(1, 168);
+	match pg.get_engine_stats(hours).await {
+		Ok(rows) => Json::<Vec<EngineStatRow>>(rows).into_response(),
+		Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+	}
 }
 
 /// Per-cluster-group aggregated stats. Optional `?hours=N` window (default 24). Requires Postgres persistence.
 #[utoipa::path(
-    get,
-    path = "/admin/group-stats",
-    tag = "admin",
-    params(
+	get,
+	path = "/admin/group-stats",
+	tag = "admin",
+	params(
         ("hours" = Option<i64>, Query, description = "Look-back window in hours (default 24)")
-    ),
-    responses(
+	),
+	responses(
         (status = 200, description = "Per-group aggregated stats", body = Vec<GroupStatRow>),
         (status = 503, description = "Postgres persistence not configured", body = str),
         (status = 500, description = "Internal error", body = str),
-    )
+	)
 )]
 async fn get_group_stats_handler(
-    State(state): State<Arc<AdminState>>,
-    Query(params): Query<EngineStatsParams>,
+	State(state): State<Arc<AdminState>>,
+	Query(params): Query<EngineStatsParams>,
 ) -> impl IntoResponse {
-    let Some(pg) = &state.admin_store else {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "Postgres persistence not configured",
-        )
-            .into_response();
-    };
-    let hours = params.hours.unwrap_or(24).clamp(1, 168);
-    match pg.get_group_stats(hours).await {
-        Ok(rows) => Json::<Vec<GroupStatRow>>(rows).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-    }
+	let Some(pg) = &state.admin_store else {
+		return (
+			StatusCode::SERVICE_UNAVAILABLE,
+			"Postgres persistence not configured",
+		)
+			.into_response();
+	};
+	let hours = params.hours.unwrap_or(24).clamp(1, 168);
+	match pg.get_group_stats(hours).await {
+		Ok(rows) => Json::<Vec<GroupStatRow>>(rows).into_response(),
+		Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+	}
 }
 
 #[derive(Debug, serde::Deserialize)]
 struct EngineStatsParams {
-    hours: Option<i64>,
+	hours: Option<i64>,
 }
 
 /// Request body for `PATCH /admin/clusters/:group/:cluster`.
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct ClusterUpdateRequest {
-    /// Set the administrative enabled state. `null` / absent = no change.
-    pub enabled: Option<bool>,
-    /// Update the maximum concurrent query limit. `null` / absent = no change.
-    pub max_running_queries: Option<u64>,
+	/// Set the administrative enabled state. `null` / absent = no change.
+	pub enabled: Option<bool>,
+	/// Update the maximum concurrent query limit. `null` / absent = no change.
+	pub max_running_queries: Option<u64>,
 }
 
 /// Update mutable runtime config for a cluster (enable/disable, concurrency limit).
@@ -2078,31 +2078,31 @@ pub struct ClusterUpdateRequest {
     )
 )]
 async fn update_cluster_handler(
-    State(state): State<Arc<AdminState>>,
-    Path((group, cluster)): Path<(String, String)>,
-    Json(body): Json<ClusterUpdateRequest>,
+	State(state): State<Arc<AdminState>>,
+	Path((group, cluster)): Path<(String, String)>,
+	Json(body): Json<ClusterUpdateRequest>,
 ) -> impl IntoResponse {
-    let group = ClusterGroupName(group);
-    let cluster_name = ClusterName(cluster);
+	let group = ClusterGroupName(group);
+	let cluster_name = ClusterName(cluster);
 
-    let cluster_manager = state.live.read().await.cluster_manager.clone();
-    match cluster_manager
-        .update_cluster(
-            &group,
-            &cluster_name,
-            body.enabled,
-            body.max_running_queries,
-        )
-        .await
-    {
-        Ok(false) => (StatusCode::NOT_FOUND, "Cluster not found").into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-        Ok(true) => match cluster_manager.cluster_state(&group, &cluster_name).await {
-            Ok(Some(s)) => Json(ClusterStateDto::from(s)).into_response(),
-            Ok(None) => (StatusCode::NOT_FOUND, "Cluster not found after update").into_response(),
-            Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-        },
-    }
+	let cluster_manager = state.live.read().await.cluster_manager.clone();
+	match cluster_manager
+		.update_cluster(
+			&group,
+			&cluster_name,
+			body.enabled,
+			body.max_running_queries,
+		)
+		.await
+	{
+		Ok(false) => (StatusCode::NOT_FOUND, "Cluster not found").into_response(),
+		Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+		Ok(true) => match cluster_manager.cluster_state(&group, &cluster_name).await {
+			Ok(Some(s)) => Json(ClusterStateDto::from(s)).into_response(),
+			Ok(None) => (StatusCode::NOT_FOUND, "Cluster not found after update").into_response(),
+			Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+		},
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -2111,39 +2111,39 @@ async fn update_cluster_handler(
 
 /// Redact sensitive fields from a cluster config JSON value in-place.
 fn redact_cluster_config_secrets(config: &mut serde_json::Value) {
-    if let Some(obj) = config.as_object_mut() {
-        for key in [
-            "authPassword",
-            "password",
-            "authToken",
-            "awsSecretAccessKey",
-            "secretAccessKey",
-            "token",
-        ] {
-            if obj.contains_key(key) {
-                obj.insert(
-                    key.to_string(),
-                    serde_json::Value::String("***REDACTED***".to_string()),
-                );
-            }
-        }
-        for (_, val) in obj.iter_mut() {
-            if val.is_object() {
-                redact_cluster_config_secrets(val);
-            } else if let Some(arr) = val.as_array_mut() {
-                for item in arr.iter_mut() {
-                    redact_cluster_config_secrets(item);
-                }
-            }
-        }
-    }
+	if let Some(obj) = config.as_object_mut() {
+		for key in [
+			"authPassword",
+			"password",
+			"authToken",
+			"awsSecretAccessKey",
+			"secretAccessKey",
+			"token",
+		] {
+			if obj.contains_key(key) {
+				obj.insert(
+					key.to_string(),
+					serde_json::Value::String("***REDACTED***".to_string()),
+				);
+			}
+		}
+		for (_, val) in obj.iter_mut() {
+			if val.is_object() {
+				redact_cluster_config_secrets(val);
+			} else if let Some(arr) = val.as_array_mut() {
+				for item in arr.iter_mut() {
+					redact_cluster_config_secrets(item);
+				}
+			}
+		}
+	}
 }
 
 /// Clone a `ClusterConfigRecord` with secrets redacted from the `config` field.
 fn redacted_cluster_config(record: ClusterConfigRecord) -> ClusterConfigRecord {
-    let mut record = record;
-    redact_cluster_config_secrets(&mut record.config);
-    record
+	let mut record = record;
+	redact_cluster_config_secrets(&mut record.config);
+	record
 }
 
 macro_rules! require_store {
@@ -2168,95 +2168,95 @@ macro_rules! require_store {
 /// to all replicas. Always also wakes the local reload task via `Notify` as a
 /// fast-path for the instance that made the change.
 fn notify_live_config_reload(state: &AdminState) {
-    if let Some(store) = &state.admin_store {
-        let store = store.clone();
-        tokio::spawn(async move {
-            if let Err(e) = store.bump_revision().await {
-                tracing::warn!("Failed to bump config revision: {e}");
-            }
-        });
-    }
-    state.config_reload_notify.notify_one();
+	if let Some(store) = &state.admin_store {
+		let store = store.clone();
+		tokio::spawn(async move {
+			if let Err(e) = store.bump_revision().await {
+				tracing::warn!("Failed to bump config revision: {e}");
+			}
+		});
+	}
+	state.config_reload_notify.notify_one();
 }
 
 fn rename_persistence_error_status(e: &queryflux_core::error::QueryFluxError) -> StatusCode {
-    let msg = e.to_string();
-    if msg.contains("not found") {
-        StatusCode::NOT_FOUND
-    } else if msg.contains("already in use") {
-        StatusCode::CONFLICT
-    } else if msg.contains("must not be empty") {
-        StatusCode::BAD_REQUEST
-    } else {
-        StatusCode::INTERNAL_SERVER_ERROR
-    }
+	let msg = e.to_string();
+	if msg.contains("not found") {
+		StatusCode::NOT_FOUND
+	} else if msg.contains("already in use") {
+		StatusCode::CONFLICT
+	} else if msg.contains("must not be empty") {
+		StatusCode::BAD_REQUEST
+	} else {
+		StatusCode::INTERNAL_SERVER_ERROR
+	}
 }
 
 /// List all persisted cluster configurations.
 #[utoipa::path(
-    get,
-    path = "/admin/config/clusters",
-    tag = "config",
-    responses(
+	get,
+	path = "/admin/config/clusters",
+	tag = "config",
+	responses(
         (status = 200, description = "All cluster config records", body = Vec<queryflux_persistence::cluster_config::ClusterConfigRecord>),
         (status = 503, description = "Postgres persistence not configured", body = str),
         (status = 500, description = "Internal error", body = str),
-    )
+	)
 )]
 async fn list_cluster_configs_handler(State(state): State<Arc<AdminState>>) -> impl IntoResponse {
-    let pg = require_store!(state);
-    match pg.list_cluster_configs().await {
-        Ok(rows) => {
-            let redacted: Vec<ClusterConfigRecord> =
-                rows.into_iter().map(redacted_cluster_config).collect();
-            Json(redacted).into_response()
-        }
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-    }
+	let pg = require_store!(state);
+	match pg.list_cluster_configs().await {
+		Ok(rows) => {
+			let redacted: Vec<ClusterConfigRecord> =
+				rows.into_iter().map(redacted_cluster_config).collect();
+			Json(redacted).into_response()
+		}
+		Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+	}
 }
 
 /// Get a single cluster configuration by name.
 #[utoipa::path(
-    get,
-    path = "/admin/config/clusters/{name}",
-    tag = "config",
-    params(("name" = String, Path, description = "Cluster name")),
-    responses(
+	get,
+	path = "/admin/config/clusters/{name}",
+	tag = "config",
+	params(("name" = String, Path, description = "Cluster name")),
+	responses(
         (status = 200, description = "Cluster config record", body = queryflux_persistence::cluster_config::ClusterConfigRecord),
         (status = 404, description = "Not found", body = str),
         (status = 503, description = "Postgres persistence not configured", body = str),
         (status = 500, description = "Internal error", body = str),
-    )
+	)
 )]
 async fn get_cluster_config_handler(
-    State(state): State<Arc<AdminState>>,
-    Path(name): Path<String>,
+	State(state): State<Arc<AdminState>>,
+	Path(name): Path<String>,
 ) -> impl IntoResponse {
-    let pg = require_store!(state);
-    match pg.get_cluster_config(&name).await {
-        Ok(Some(r)) => Json(redacted_cluster_config(r)).into_response(),
-        Ok(None) => (StatusCode::NOT_FOUND, "Cluster config not found").into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-    }
+	let pg = require_store!(state);
+	match pg.get_cluster_config(&name).await {
+		Ok(Some(r)) => Json(redacted_cluster_config(r)).into_response(),
+		Ok(None) => (StatusCode::NOT_FOUND, "Cluster config not found").into_response(),
+		Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+	}
 }
 
 /// Mirrors the startup validation in `main.rs` for clusters loaded from YAML — the
 /// engine × `queryAuth` matrix must reject the same combinations here, at the moment an
 /// operator saves them through Studio, not only at the next process restart.
 fn validate_query_auth_for_upsert(body: &UpsertClusterConfig) -> std::result::Result<(), String> {
-    let engine = queryflux_core::engine_registry::parse_engine_key(&body.engine_key)
-        .map_err(|e| e.to_string())?;
-    let query_auth =
-        queryflux_core::engine_registry::parse_query_auth_from_config_json(&body.config)
-            .map_err(|e| e.to_string())?;
-    if let Some(mode) = &query_auth {
-        // ADBC's `driver` key lives in the raw config JSON, not on `EngineConfig` itself —
-        // `query_auth_supported` needs it to tell an OAuth-capable driver (e.g. snowflake)
-        // apart from one that isn't.
-        let driver = body.config.get("driver").and_then(|v| v.as_str());
-        queryflux_core::config::query_auth_supported(Some(&engine), driver, mode)?;
-    }
-    Ok(())
+	let engine = queryflux_core::engine_registry::parse_engine_key(&body.engine_key)
+		.map_err(|e| e.to_string())?;
+	let query_auth =
+		queryflux_core::engine_registry::parse_query_auth_from_config_json(&body.config)
+			.map_err(|e| e.to_string())?;
+	if let Some(mode) = &query_auth {
+		// ADBC's `driver` key lives in the raw config JSON, not on `EngineConfig` itself —
+		// `query_auth_supported` needs it to tell an OAuth-capable driver (e.g. snowflake)
+		// apart from one that isn't.
+		let driver = body.config.get("driver").and_then(|v| v.as_str());
+		queryflux_core::config::query_auth_supported(Some(&engine), driver, mode)?;
+	}
+	Ok(())
 }
 
 /// Create or fully replace a cluster configuration.
@@ -2273,21 +2273,21 @@ fn validate_query_auth_for_upsert(body: &UpsertClusterConfig) -> std::result::Re
     )
 )]
 async fn upsert_cluster_config_handler(
-    State(state): State<Arc<AdminState>>,
-    Path(name): Path<String>,
-    Json(body): Json<UpsertClusterConfig>,
+	State(state): State<Arc<AdminState>>,
+	Path(name): Path<String>,
+	Json(body): Json<UpsertClusterConfig>,
 ) -> impl IntoResponse {
-    let pg = require_store!(state);
-    if let Err(e) = validate_query_auth_for_upsert(&body) {
-        return (StatusCode::BAD_REQUEST, e).into_response();
-    }
-    match pg.upsert_cluster_config(&name, &body).await {
-        Ok(r) => {
-            notify_live_config_reload(&state);
-            Json(redacted_cluster_config(r)).into_response()
-        }
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-    }
+	let pg = require_store!(state);
+	if let Err(e) = validate_query_auth_for_upsert(&body) {
+		return (StatusCode::BAD_REQUEST, e).into_response();
+	}
+	match pg.upsert_cluster_config(&name, &body).await {
+		Ok(r) => {
+			notify_live_config_reload(&state);
+			Json(redacted_cluster_config(r)).into_response()
+		}
+		Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+	}
 }
 
 /// Rename a cluster configuration.
@@ -2305,58 +2305,58 @@ async fn upsert_cluster_config_handler(
     )
 )]
 async fn rename_cluster_config_handler(
-    State(state): State<Arc<AdminState>>,
-    Path(name): Path<String>,
-    Json(body): Json<RenameConfigRequest>,
+	State(state): State<Arc<AdminState>>,
+	Path(name): Path<String>,
+	Json(body): Json<RenameConfigRequest>,
 ) -> impl IntoResponse {
-    let pg = require_store!(state);
-    match pg.rename_cluster_config(&name, &body.new_name).await {
-        Ok(r) => {
-            notify_live_config_reload(&state);
-            Json(redacted_cluster_config(r)).into_response()
-        }
-        Err(e) => (rename_persistence_error_status(&e), e.to_string()).into_response(),
-    }
+	let pg = require_store!(state);
+	match pg.rename_cluster_config(&name, &body.new_name).await {
+		Ok(r) => {
+			notify_live_config_reload(&state);
+			Json(redacted_cluster_config(r)).into_response()
+		}
+		Err(e) => (rename_persistence_error_status(&e), e.to_string()).into_response(),
+	}
 }
 
 /// Delete a cluster configuration.
 #[utoipa::path(
-    delete,
-    path = "/admin/config/clusters/{name}",
-    tag = "config",
-    params(("name" = String, Path, description = "Cluster name")),
-    responses(
+	delete,
+	path = "/admin/config/clusters/{name}",
+	tag = "config",
+	params(("name" = String, Path, description = "Cluster name")),
+	responses(
         (status = 204, description = "Deleted"),
         (status = 404, description = "Not found", body = str),
         (status = 503, description = "Postgres persistence not configured", body = str),
         (status = 500, description = "Internal error", body = str),
-    )
+	)
 )]
 async fn delete_cluster_config_handler(
-    State(state): State<Arc<AdminState>>,
-    Path(name): Path<String>,
+	State(state): State<Arc<AdminState>>,
+	Path(name): Path<String>,
 ) -> impl IntoResponse {
-    let pg = require_store!(state);
-    match pg.delete_cluster_config(&name).await {
-        Ok(true) => {
-            notify_live_config_reload(&state);
-            StatusCode::NO_CONTENT.into_response()
-        }
-        Ok(false) => (StatusCode::NOT_FOUND, "Cluster config not found").into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-    }
+	let pg = require_store!(state);
+	match pg.delete_cluster_config(&name).await {
+		Ok(true) => {
+			notify_live_config_reload(&state);
+			StatusCode::NO_CONTENT.into_response()
+		}
+		Ok(false) => (StatusCode::NOT_FOUND, "Cluster config not found").into_response(),
+		Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+	}
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
 struct TestClusterConfigRequest {
-    engine_key: String,
-    config: serde_json::Value,
+	engine_key: String,
+	config: serde_json::Value,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
 struct TestClusterConfigResponse {
-    ok: bool,
-    message: String,
+	ok: bool,
+	message: String,
 }
 
 /// Test a cluster connection without persisting it.
@@ -2371,27 +2371,27 @@ struct TestClusterConfigResponse {
     )
 )]
 async fn test_cluster_config_handler(
-    State(state): State<Arc<AdminState>>,
-    Json(body): Json<TestClusterConfigRequest>,
+	State(state): State<Arc<AdminState>>,
+	Json(body): Json<TestClusterConfigRequest>,
 ) -> impl IntoResponse {
-    match (state.test_cluster_fn)(body.engine_key, body.config).await {
-        Ok(true) => Json(TestClusterConfigResponse {
-            ok: true,
-            message: "Connection successful".to_string(),
-        })
-        .into_response(),
-        Ok(false) => Json(TestClusterConfigResponse {
-            ok: false,
-            message: "Adapter built but health check failed — check credentials and connectivity"
-                .to_string(),
-        })
-        .into_response(),
-        Err(e) => Json(TestClusterConfigResponse {
-            ok: false,
-            message: e.to_string(),
-        })
-        .into_response(),
-    }
+	match (state.test_cluster_fn)(body.engine_key, body.config).await {
+		Ok(true) => Json(TestClusterConfigResponse {
+			ok: true,
+			message: "Connection successful".to_string(),
+		})
+			.into_response(),
+		Ok(false) => Json(TestClusterConfigResponse {
+			ok: false,
+			message: "Adapter built but health check failed — check credentials and connectivity"
+				.to_string(),
+		})
+			.into_response(),
+		Err(e) => Json(TestClusterConfigResponse {
+			ok: false,
+			message: e.to_string(),
+		})
+			.into_response(),
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -2400,46 +2400,46 @@ async fn test_cluster_config_handler(
 
 /// List all persisted cluster group configurations.
 #[utoipa::path(
-    get,
-    path = "/admin/config/groups",
-    tag = "config",
-    responses(
+	get,
+	path = "/admin/config/groups",
+	tag = "config",
+	responses(
         (status = 200, description = "All cluster group config records", body = Vec<queryflux_persistence::cluster_config::ClusterGroupConfigRecord>),
         (status = 503, description = "Postgres persistence not configured", body = str),
         (status = 500, description = "Internal error", body = str),
-    )
+	)
 )]
 async fn list_group_configs_handler(State(state): State<Arc<AdminState>>) -> impl IntoResponse {
-    let pg = require_store!(state);
-    match pg.list_group_configs().await {
-        Ok(rows) => Json(rows).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-    }
+	let pg = require_store!(state);
+	match pg.list_group_configs().await {
+		Ok(rows) => Json(rows).into_response(),
+		Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+	}
 }
 
 /// Get a single cluster group configuration by name.
 #[utoipa::path(
-    get,
-    path = "/admin/config/groups/{name}",
-    tag = "config",
-    params(("name" = String, Path, description = "Group name")),
-    responses(
+	get,
+	path = "/admin/config/groups/{name}",
+	tag = "config",
+	params(("name" = String, Path, description = "Group name")),
+	responses(
         (status = 200, description = "Cluster group config record", body = queryflux_persistence::cluster_config::ClusterGroupConfigRecord),
         (status = 404, description = "Not found", body = str),
         (status = 503, description = "Postgres persistence not configured", body = str),
         (status = 500, description = "Internal error", body = str),
-    )
+	)
 )]
 async fn get_group_config_handler(
-    State(state): State<Arc<AdminState>>,
-    Path(name): Path<String>,
+	State(state): State<Arc<AdminState>>,
+	Path(name): Path<String>,
 ) -> impl IntoResponse {
-    let pg = require_store!(state);
-    match pg.get_group_config(&name).await {
-        Ok(Some(r)) => Json(r).into_response(),
-        Ok(None) => (StatusCode::NOT_FOUND, "Group config not found").into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-    }
+	let pg = require_store!(state);
+	match pg.get_group_config(&name).await {
+		Ok(Some(r)) => Json(r).into_response(),
+		Ok(None) => (StatusCode::NOT_FOUND, "Group config not found").into_response(),
+		Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+	}
 }
 
 /// Create or fully replace a cluster group configuration.
@@ -2456,18 +2456,18 @@ async fn get_group_config_handler(
     )
 )]
 async fn upsert_group_config_handler(
-    State(state): State<Arc<AdminState>>,
-    Path(name): Path<String>,
-    Json(body): Json<UpsertClusterGroupConfig>,
+	State(state): State<Arc<AdminState>>,
+	Path(name): Path<String>,
+	Json(body): Json<UpsertClusterGroupConfig>,
 ) -> impl IntoResponse {
-    let pg = require_store!(state);
-    match pg.upsert_group_config(&name, &body).await {
-        Ok(r) => {
-            notify_live_config_reload(&state);
-            Json(r).into_response()
-        }
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-    }
+	let pg = require_store!(state);
+	match pg.upsert_group_config(&name, &body).await {
+		Ok(r) => {
+			notify_live_config_reload(&state);
+			Json(r).into_response()
+		}
+		Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+	}
 }
 
 /// Rename a cluster group configuration.
@@ -2485,55 +2485,55 @@ async fn upsert_group_config_handler(
     )
 )]
 async fn rename_group_config_handler(
-    State(state): State<Arc<AdminState>>,
-    Path(name): Path<String>,
-    Json(body): Json<RenameConfigRequest>,
+	State(state): State<Arc<AdminState>>,
+	Path(name): Path<String>,
+	Json(body): Json<RenameConfigRequest>,
 ) -> impl IntoResponse {
-    let pg = require_store!(state);
-    match pg.rename_group_config(&name, &body.new_name).await {
-        Ok(r) => {
-            notify_live_config_reload(&state);
-            Json(r).into_response()
-        }
-        Err(e) => (rename_persistence_error_status(&e), e.to_string()).into_response(),
-    }
+	let pg = require_store!(state);
+	match pg.rename_group_config(&name, &body.new_name).await {
+		Ok(r) => {
+			notify_live_config_reload(&state);
+			Json(r).into_response()
+		}
+		Err(e) => (rename_persistence_error_status(&e), e.to_string()).into_response(),
+	}
 }
 
 /// Delete a cluster group configuration.
 #[utoipa::path(
-    delete,
-    path = "/admin/config/groups/{name}",
-    tag = "config",
-    params(("name" = String, Path, description = "Group name")),
-    responses(
+	delete,
+	path = "/admin/config/groups/{name}",
+	tag = "config",
+	params(("name" = String, Path, description = "Group name")),
+	responses(
         (status = 204, description = "Deleted"),
         (status = 404, description = "Not found", body = str),
         (status = 409, description = "Still referenced by routing rules", body = str),
         (status = 503, description = "Postgres persistence not configured", body = str),
         (status = 500, description = "Internal error", body = str),
-    )
+	)
 )]
 async fn delete_group_config_handler(
-    State(state): State<Arc<AdminState>>,
-    Path(name): Path<String>,
+	State(state): State<Arc<AdminState>>,
+	Path(name): Path<String>,
 ) -> impl IntoResponse {
-    let pg = require_store!(state);
-    match pg.delete_group_config(&name).await {
-        Ok(true) => {
-            notify_live_config_reload(&state);
-            StatusCode::NO_CONTENT.into_response()
-        }
-        Ok(false) => (StatusCode::NOT_FOUND, "Group config not found").into_response(),
-        Err(e) => {
-            let msg = e.to_string();
-            let code = if msg.contains("still referenced by routing") {
-                StatusCode::CONFLICT
-            } else {
-                StatusCode::INTERNAL_SERVER_ERROR
-            };
-            (code, msg).into_response()
-        }
-    }
+	let pg = require_store!(state);
+	match pg.delete_group_config(&name).await {
+		Ok(true) => {
+			notify_live_config_reload(&state);
+			StatusCode::NO_CONTENT.into_response()
+		}
+		Ok(false) => (StatusCode::NOT_FOUND, "Group config not found").into_response(),
+		Err(e) => {
+			let msg = e.to_string();
+			let code = if msg.contains("still referenced by routing") {
+				StatusCode::CONFLICT
+			} else {
+				StatusCode::INTERNAL_SERVER_ERROR
+			};
+			(code, msg).into_response()
+		}
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -2542,33 +2542,33 @@ async fn delete_group_config_handler(
 
 #[derive(Debug, Deserialize)]
 struct UserScriptListQuery {
-    kind: Option<String>,
+	kind: Option<String>,
 }
 
 /// List user scripts. Optional `?kind=translation_fixup` or `?kind=guard` filter.
 #[utoipa::path(
-    get,
-    path = "/admin/config/scripts",
-    tag = "config",
-    params(
+	get,
+	path = "/admin/config/scripts",
+	tag = "config",
+	params(
         ("kind" = Option<String>, Query, description = "Filter by kind: `translation_fixup` or `guard`")
-    ),
-    responses(
+	),
+	responses(
         (status = 200, description = "Script records", body = Vec<UserScriptRecord>),
         (status = 503, description = "Postgres persistence not configured", body = str),
         (status = 500, description = "Internal error", body = str),
-    )
+	)
 )]
 async fn list_user_scripts_handler(
-    State(state): State<Arc<AdminState>>,
-    Query(q): Query<UserScriptListQuery>,
+	State(state): State<Arc<AdminState>>,
+	Query(q): Query<UserScriptListQuery>,
 ) -> impl IntoResponse {
-    let pg = require_store!(state);
-    let kind = q.kind.as_deref().filter(|s| !s.is_empty());
-    match pg.list_user_scripts(kind).await {
-        Ok(rows) => Json(rows).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-    }
+	let pg = require_store!(state);
+	let kind = q.kind.as_deref().filter(|s| !s.is_empty());
+	match pg.list_user_scripts(kind).await {
+		Ok(rows) => Json(rows).into_response(),
+		Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+	}
 }
 
 /// Create a new user script.
@@ -2584,42 +2584,42 @@ async fn list_user_scripts_handler(
     )
 )]
 async fn create_user_script_handler(
-    State(state): State<Arc<AdminState>>,
-    Json(body): Json<UpsertUserScript>,
+	State(state): State<Arc<AdminState>>,
+	Json(body): Json<UpsertUserScript>,
 ) -> impl IntoResponse {
-    let pg = require_store!(state);
-    match pg.create_user_script(&body).await {
-        Ok(r) => {
-            notify_live_config_reload(&state);
-            (StatusCode::CREATED, Json(r)).into_response()
-        }
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-    }
+	let pg = require_store!(state);
+	match pg.create_user_script(&body).await {
+		Ok(r) => {
+			notify_live_config_reload(&state);
+			(StatusCode::CREATED, Json(r)).into_response()
+		}
+		Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+	}
 }
 
 /// Get a user script by id.
 #[utoipa::path(
-    get,
-    path = "/admin/config/scripts/{id}",
-    tag = "config",
-    params(("id" = i64, Path, description = "Script id")),
-    responses(
+	get,
+	path = "/admin/config/scripts/{id}",
+	tag = "config",
+	params(("id" = i64, Path, description = "Script id")),
+	responses(
         (status = 200, description = "Script record", body = UserScriptRecord),
         (status = 404, description = "Not found", body = str),
         (status = 503, description = "Postgres persistence not configured", body = str),
         (status = 500, description = "Internal error", body = str),
-    )
+	)
 )]
 async fn get_user_script_handler(
-    State(state): State<Arc<AdminState>>,
-    Path(id): Path<i64>,
+	State(state): State<Arc<AdminState>>,
+	Path(id): Path<i64>,
 ) -> impl IntoResponse {
-    let pg = require_store!(state);
-    match pg.get_user_script(id).await {
-        Ok(Some(r)) => Json(r).into_response(),
-        Ok(None) => (StatusCode::NOT_FOUND, "Script not found").into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-    }
+	let pg = require_store!(state);
+	match pg.get_user_script(id).await {
+		Ok(Some(r)) => Json(r).into_response(),
+		Ok(None) => (StatusCode::NOT_FOUND, "Script not found").into_response(),
+		Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+	}
 }
 
 /// Replace a user script by id.
@@ -2636,46 +2636,46 @@ async fn get_user_script_handler(
     )
 )]
 async fn update_user_script_handler(
-    State(state): State<Arc<AdminState>>,
-    Path(id): Path<i64>,
-    Json(body): Json<UpsertUserScript>,
+	State(state): State<Arc<AdminState>>,
+	Path(id): Path<i64>,
+	Json(body): Json<UpsertUserScript>,
 ) -> impl IntoResponse {
-    let pg = require_store!(state);
-    match pg.update_user_script(id, &body).await {
-        Ok(r) => {
-            notify_live_config_reload(&state);
-            Json(r).into_response()
-        }
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-    }
+	let pg = require_store!(state);
+	match pg.update_user_script(id, &body).await {
+		Ok(r) => {
+			notify_live_config_reload(&state);
+			Json(r).into_response()
+		}
+		Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+	}
 }
 
 /// Delete a user script by id.
 #[utoipa::path(
-    delete,
-    path = "/admin/config/scripts/{id}",
-    tag = "config",
-    params(("id" = i64, Path, description = "Script id")),
-    responses(
+	delete,
+	path = "/admin/config/scripts/{id}",
+	tag = "config",
+	params(("id" = i64, Path, description = "Script id")),
+	responses(
         (status = 204, description = "Deleted"),
         (status = 404, description = "Not found", body = str),
         (status = 503, description = "Postgres persistence not configured", body = str),
         (status = 500, description = "Internal error", body = str),
-    )
+	)
 )]
 async fn delete_user_script_handler(
-    State(state): State<Arc<AdminState>>,
-    Path(id): Path<i64>,
+	State(state): State<Arc<AdminState>>,
+	Path(id): Path<i64>,
 ) -> impl IntoResponse {
-    let pg = require_store!(state);
-    match pg.delete_user_script(id).await {
-        Ok(true) => {
-            notify_live_config_reload(&state);
-            StatusCode::NO_CONTENT.into_response()
-        }
-        Ok(false) => (StatusCode::NOT_FOUND, "Script not found").into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-    }
+	let pg = require_store!(state);
+	match pg.delete_user_script(id).await {
+		Ok(true) => {
+			notify_live_config_reload(&state);
+			StatusCode::NO_CONTENT.into_response()
+		}
+		Ok(false) => (StatusCode::NOT_FOUND, "Script not found").into_response(),
+		Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -2684,100 +2684,100 @@ async fn delete_user_script_handler(
 
 /// Get the current security configuration.
 #[utoipa::path(
-    get,
-    path = "/admin/config/security",
-    tag = "config",
-    responses(
+	get,
+	path = "/admin/config/security",
+	tag = "config",
+	responses(
         (status = 200, description = "Security config JSON", body = serde_json::Value),
-    )
+	)
 )]
 async fn get_security_config_handler(State(state): State<Arc<AdminState>>) -> impl IntoResponse {
-    if let Some(store) = &state.admin_store {
-        if let Ok(Some(v)) = store.get_proxy_setting("security_config").await {
-            if !queryflux_core::security_setting::is_blank_security_setting(&v) {
-                return Json(security_dto_from_stored(&v, &state.security_config)).into_response();
-            }
-        }
-    }
-    Json(state.security_config.as_ref()).into_response()
+	if let Some(store) = &state.admin_store {
+		if let Ok(Some(v)) = store.get_proxy_setting("security_config").await {
+			if !queryflux_core::security_setting::is_blank_security_setting(&v) {
+				return Json(security_dto_from_stored(&v, &state.security_config)).into_response();
+			}
+		}
+	}
+	Json(state.security_config.as_ref()).into_response()
 }
 
 /// Sanitized view of a stored security blob. Never returns raw passwords.
 fn security_dto_from_stored(
-    v: &serde_json::Value,
-    fallback: &SecurityConfigDto,
+	v: &serde_json::Value,
+	fallback: &SecurityConfigDto,
 ) -> SecurityConfigDto {
-    let (auth, authz) = queryflux_core::security_setting::parse_security_setting(v);
-    let mut dto = fallback.clone();
-    if let Some(auth) = auth.as_ref() {
-        let tmp =
-            SecurityConfigDto::from_config(auth, &AuthorizationConfig::default(), &HashMap::new());
-        dto.auth_provider = tmp.auth_provider;
-        dto.auth_required = tmp.auth_required;
-        dto.oidc = tmp.oidc;
-        dto.ldap = tmp.ldap;
-        dto.static_user_count = tmp.static_user_count;
-        dto.static_user_summaries = tmp.static_user_summaries;
-    }
-    if let Some(authz) = authz.as_ref() {
-        let tmp = SecurityConfigDto::from_config(&AuthConfig::default(), authz, &HashMap::new());
-        dto.authorization_provider = tmp.authorization_provider;
-        dto.openfga = tmp.openfga;
-    }
-    dto
+	let (auth, authz) = queryflux_core::security_setting::parse_security_setting(v);
+	let mut dto = fallback.clone();
+	if let Some(auth) = auth.as_ref() {
+		let tmp =
+			SecurityConfigDto::from_config(auth, &AuthorizationConfig::default(), &HashMap::new());
+		dto.auth_provider = tmp.auth_provider;
+		dto.auth_required = tmp.auth_required;
+		dto.oidc = tmp.oidc;
+		dto.ldap = tmp.ldap;
+		dto.static_user_count = tmp.static_user_count;
+		dto.static_user_summaries = tmp.static_user_summaries;
+	}
+	if let Some(authz) = authz.as_ref() {
+		let tmp = SecurityConfigDto::from_config(&AuthConfig::default(), authz, &HashMap::new());
+		dto.authorization_provider = tmp.authorization_provider;
+		dto.openfga = tmp.openfga;
+	}
+	dto
 }
 
 fn group_id_maps(
-    groups: &[ClusterGroupConfigRecord],
+	groups: &[ClusterGroupConfigRecord],
 ) -> (HashMap<String, i64>, HashMap<i64, String>) {
-    let mut name_to_id = HashMap::with_capacity(groups.len());
-    let mut id_to_name = HashMap::with_capacity(groups.len());
-    for g in groups {
-        name_to_id.insert(g.name.clone(), g.id);
-        id_to_name.insert(g.id, g.name.clone());
-    }
-    (name_to_id, id_to_name)
+	let mut name_to_id = HashMap::with_capacity(groups.len());
+	let mut id_to_name = HashMap::with_capacity(groups.len());
+	for g in groups {
+		name_to_id.insert(g.name.clone(), g.id);
+		id_to_name.insert(g.id, g.name.clone());
+	}
+	(name_to_id, id_to_name)
 }
 
 /// Get the current routing configuration.
 #[utoipa::path(
-    get,
-    path = "/admin/config/routing",
-    tag = "config",
-    responses(
+	get,
+	path = "/admin/config/routing",
+	tag = "config",
+	responses(
         (status = 200, description = "Routing config JSON", body = serde_json::Value),
         (status = 500, description = "Internal error", body = str),
-    )
+	)
 )]
 async fn get_routing_config_handler(State(state): State<Arc<AdminState>>) -> impl IntoResponse {
-    if let Some(store) = &state.admin_store {
-        match store.load_routing_config().await {
-            Ok(Some(loaded)) => {
-                let enriched = match store.list_group_configs().await {
-                    Ok(groups) => {
-                        let (name_to_id, _) = group_id_maps(&groups);
-                        enrich_routers_for_api(&loaded.routers, &name_to_id)
-                    }
-                    Err(_) => loaded.routers.clone(),
-                };
-                return Json(RoutingConfigDto {
-                    routing_fallback: loaded.routing_fallback,
-                    routing_fallback_group_id: loaded.routing_fallback_group_id,
-                    routers: enriched,
-                })
-                .into_response();
-            }
-            Ok(None) => {}
-            Err(e) => {
-                return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
-            }
-        }
-        // Legacy monolithic blob (only if migration has not run yet).
-        if let Ok(Some(v)) = store.get_proxy_setting("routing_config").await {
-            return Json(v).into_response();
-        }
-    }
-    Json(state.routing_config.as_ref()).into_response()
+	if let Some(store) = &state.admin_store {
+		match store.load_routing_config().await {
+			Ok(Some(loaded)) => {
+				let enriched = match store.list_group_configs().await {
+					Ok(groups) => {
+						let (name_to_id, _) = group_id_maps(&groups);
+						enrich_routers_for_api(&loaded.routers, &name_to_id)
+					}
+					Err(_) => loaded.routers.clone(),
+				};
+				return Json(RoutingConfigDto {
+					routing_fallback: loaded.routing_fallback,
+					routing_fallback_group_id: loaded.routing_fallback_group_id,
+					routers: enriched,
+				})
+					.into_response();
+			}
+			Ok(None) => {}
+			Err(e) => {
+				return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+			}
+		}
+		// Legacy monolithic blob (only if migration has not run yet).
+		if let Ok(Some(v)) = store.get_proxy_setting("routing_config").await {
+			return Json(v).into_response();
+		}
+	}
+	Json(state.routing_config.as_ref()).into_response()
 }
 
 /// Replace the security configuration.
@@ -2793,97 +2793,97 @@ async fn get_routing_config_handler(State(state): State<Arc<AdminState>>) -> imp
     )
 )]
 async fn put_security_config_handler(
-    State(state): State<Arc<AdminState>>,
-    Json(body): Json<UpsertSecurityConfig>,
+	State(state): State<Arc<AdminState>>,
+	Json(body): Json<UpsertSecurityConfig>,
 ) -> impl IntoResponse {
-    let Some(store) = &state.admin_store else {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "Postgres persistence not configured",
-        )
-            .into_response();
-    };
-    let incoming = serde_json::to_value(&body).unwrap_or(serde_json::Value::Null);
-    let existing = store
-        .get_proxy_setting("security_config")
-        .await
-        .ok()
-        .flatten();
-    let value =
-        queryflux_core::security_setting::merge_security_setting(existing.as_ref(), incoming);
+	let Some(store) = &state.admin_store else {
+		return (
+			StatusCode::SERVICE_UNAVAILABLE,
+			"Postgres persistence not configured",
+		)
+			.into_response();
+	};
+	let incoming = serde_json::to_value(&body).unwrap_or(serde_json::Value::Null);
+	let existing = store
+		.get_proxy_setting("security_config")
+		.await
+		.ok()
+		.flatten();
+	let value =
+		queryflux_core::security_setting::merge_security_setting(existing.as_ref(), incoming);
 
-    let (auth, _) = queryflux_core::security_setting::parse_security_setting(&value);
-    match auth {
-        None if body.auth_provider != "none" => {
-            return (
-                StatusCode::BAD_REQUEST,
-                format!(
-                    "could not parse auth.provider = {} (check static users / OIDC / LDAP fields)",
-                    body.auth_provider
-                ),
-            )
-                .into_response();
-        }
-        Some(cfg)
-            if matches!(cfg.provider, AuthProviderConfig::Static)
-                && cfg
-                    .static_users
-                    .as_ref()
-                    .map(|s| s.users.is_empty())
-                    .unwrap_or(true) =>
-        {
-            return (
-                StatusCode::BAD_REQUEST,
-                "auth.provider = static requires at least one user",
-            )
-                .into_response();
-        }
-        Some(cfg) if matches!(cfg.provider, AuthProviderConfig::Oidc) && cfg.oidc.is_none() => {
-            return (
-                StatusCode::BAD_REQUEST,
-                "auth.provider = oidc requires oidc issuer and jwks_uri",
-            )
-                .into_response();
-        }
-        Some(cfg) if matches!(cfg.provider, AuthProviderConfig::Ldap) && cfg.ldap.is_none() => {
-            return (
-                StatusCode::BAD_REQUEST,
-                "auth.provider = ldap requires ldap url and user_search_base",
-            )
-                .into_response();
-        }
-        _ => {}
-    }
+	let (auth, _) = queryflux_core::security_setting::parse_security_setting(&value);
+	match auth {
+		None if body.auth_provider != "none" => {
+			return (
+				StatusCode::BAD_REQUEST,
+				format!(
+					"could not parse auth.provider = {} (check static users / OIDC / LDAP fields)",
+					body.auth_provider
+				),
+			)
+				.into_response();
+		}
+		Some(cfg)
+		if matches!(cfg.provider, AuthProviderConfig::Static)
+			&& cfg
+			.static_users
+			.as_ref()
+			.map(|s| s.users.is_empty())
+			.unwrap_or(true) =>
+			{
+				return (
+					StatusCode::BAD_REQUEST,
+					"auth.provider = static requires at least one user",
+				)
+					.into_response();
+			}
+		Some(cfg) if matches!(cfg.provider, AuthProviderConfig::Oidc) && cfg.oidc.is_none() => {
+			return (
+				StatusCode::BAD_REQUEST,
+				"auth.provider = oidc requires oidc issuer and jwks_uri",
+			)
+				.into_response();
+		}
+		Some(cfg) if matches!(cfg.provider, AuthProviderConfig::Ldap) && cfg.ldap.is_none() => {
+			return (
+				StatusCode::BAD_REQUEST,
+				"auth.provider = ldap requires ldap url and user_search_base",
+			)
+				.into_response();
+		}
+		_ => {}
+	}
 
-    match store.set_proxy_setting("security_config", value).await {
-        Ok(()) => {
-            notify_live_config_reload(&state);
-            StatusCode::NO_CONTENT.into_response()
-        }
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-    }
+	match store.set_proxy_setting("security_config", value).await {
+		Ok(()) => {
+			notify_live_config_reload(&state);
+			StatusCode::NO_CONTENT.into_response()
+		}
+		Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+	}
 }
 
 /// Reject invalid query-regex patterns before persisting routing config.
 fn validate_query_regex_patterns(routers: &[serde_json::Value]) -> std::result::Result<(), String> {
-    use queryflux_routing::implementations::query_regex::QueryRegexRouter;
+	use queryflux_routing::implementations::query_regex::QueryRegexRouter;
 
-    for router in routers {
-        if router.get("type").and_then(|t| t.as_str()) != Some("queryRegex") {
-            continue;
-        }
-        let Some(rules) = router.get("rules").and_then(|r| r.as_array()) else {
-            continue;
-        };
-        for rule in rules {
-            if let Some(regex) = rule.get("regex").and_then(|r| r.as_str()) {
-                if !regex.is_empty() {
-                    QueryRegexRouter::validate_pattern(regex)?;
-                }
-            }
-        }
-    }
-    Ok(())
+	for router in routers {
+		if router.get("type").and_then(|t| t.as_str()) != Some("queryRegex") {
+			continue;
+		}
+		let Some(rules) = router.get("rules").and_then(|r| r.as_array()) else {
+			continue;
+		};
+		for rule in rules {
+			if let Some(regex) = rule.get("regex").and_then(|r| r.as_str()) {
+				if !regex.is_empty() {
+					QueryRegexRouter::validate_pattern(regex)?;
+				}
+			}
+		}
+	}
+	Ok(())
 }
 
 /// Replace the routing configuration.
@@ -2900,102 +2900,102 @@ fn validate_query_regex_patterns(routers: &[serde_json::Value]) -> std::result::
     )
 )]
 async fn put_routing_config_handler(
-    State(state): State<Arc<AdminState>>,
-    Json(body): Json<UpsertRoutingConfig>,
+	State(state): State<Arc<AdminState>>,
+	Json(body): Json<UpsertRoutingConfig>,
 ) -> impl IntoResponse {
-    let Some(store) = &state.admin_store else {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "Postgres persistence not configured",
-        )
-            .into_response();
-    };
-    let groups = match store.list_group_configs().await {
-        Ok(g) => g,
-        Err(e) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
-        }
-    };
-    let (name_to_id, id_to_name) = group_id_maps(&groups);
+	let Some(store) = &state.admin_store else {
+		return (
+			StatusCode::SERVICE_UNAVAILABLE,
+			"Postgres persistence not configured",
+		)
+			.into_response();
+	};
+	let groups = match store.list_group_configs().await {
+		Ok(g) => g,
+		Err(e) => {
+			return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+		}
+	};
+	let (name_to_id, id_to_name) = group_id_maps(&groups);
 
-    let fallback_name = if let Some(id) = body.routing_fallback_group_id {
-        match id_to_name.get(&id) {
-            Some(n) => n.clone(),
-            None => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    format!("routingFallbackGroupId {id} is not a known cluster group"),
-                )
-                    .into_response();
-            }
-        }
-    } else {
-        body.routing_fallback.clone()
-    };
+	let fallback_name = if let Some(id) = body.routing_fallback_group_id {
+		match id_to_name.get(&id) {
+			Some(n) => n.clone(),
+			None => {
+				return (
+					StatusCode::BAD_REQUEST,
+					format!("routingFallbackGroupId {id} is not a known cluster group"),
+				)
+					.into_response();
+			}
+		}
+	} else {
+		body.routing_fallback.clone()
+	};
 
-    if !fallback_name.is_empty() && !name_to_id.contains_key(&fallback_name) {
-        return (
-            StatusCode::BAD_REQUEST,
-            format!("routingFallback '{fallback_name}' is not a known cluster group"),
-        )
-            .into_response();
-    }
+	if !fallback_name.is_empty() && !name_to_id.contains_key(&fallback_name) {
+		return (
+			StatusCode::BAD_REQUEST,
+			format!("routingFallback '{fallback_name}' is not a known cluster group"),
+		)
+			.into_response();
+	}
 
-    if let Err(msg) = validate_query_regex_patterns(&body.routers) {
-        return (StatusCode::BAD_REQUEST, msg).into_response();
-    }
+	if let Err(msg) = validate_query_regex_patterns(&body.routers) {
+		return (StatusCode::BAD_REQUEST, msg).into_response();
+	}
 
-    let fallback_gid = body.routing_fallback_group_id.or_else(|| {
-        if fallback_name.is_empty() {
-            None
-        } else {
-            name_to_id.get(&fallback_name).copied()
-        }
-    });
+	let fallback_gid = body.routing_fallback_group_id.or_else(|| {
+		if fallback_name.is_empty() {
+			None
+		} else {
+			name_to_id.get(&fallback_name).copied()
+		}
+	});
 
-    let resolved = match resolve_routers_for_storage(&body.routers, &id_to_name) {
-        Ok(v) => v,
-        Err(e) => {
-            return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
-        }
-    };
+	let resolved = match resolve_routers_for_storage(&body.routers, &id_to_name) {
+		Ok(v) => v,
+		Err(e) => {
+			return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
+		}
+	};
 
-    match store
-        .replace_routing_config(&fallback_name, fallback_gid, &resolved)
-        .await
-    {
-        Ok(()) => {
-            notify_live_config_reload(&state);
-            StatusCode::NO_CONTENT.into_response()
-        }
-        Err(e) => {
-            let msg = e.to_string();
-            let code = if msg.contains("unknown cluster group") {
-                StatusCode::BAD_REQUEST
-            } else {
-                StatusCode::INTERNAL_SERVER_ERROR
-            };
-            (code, msg).into_response()
-        }
-    }
+	match store
+		.replace_routing_config(&fallback_name, fallback_gid, &resolved)
+		.await
+	{
+		Ok(()) => {
+			notify_live_config_reload(&state);
+			StatusCode::NO_CONTENT.into_response()
+		}
+		Err(e) => {
+			let msg = e.to_string();
+			let code = if msg.contains("unknown cluster group") {
+				StatusCode::BAD_REQUEST
+			} else {
+				StatusCode::INTERNAL_SERVER_ERROR
+			};
+			(code, msg).into_response()
+		}
+	}
 }
 
 /// Static engine registry — metadata and config schema for every supported engine.
 #[utoipa::path(
-    get,
-    path = "/admin/engine-registry",
-    tag = "admin",
-    responses(
+	get,
+	path = "/admin/engine-registry",
+	tag = "admin",
+	responses(
         (status = 200, description = "List of engine descriptors", body = str),
-    )
+	)
 )]
 async fn engine_registry_handler(State(state): State<Arc<AdminState>>) -> impl IntoResponse {
-    Json(state.engine_registry.all().to_vec())
+	Json(state.engine_registry.all().to_vec())
 }
 
 /// Swagger UI — interactive API explorer (loads spec from /openapi.json via CDN).
 async fn swagger_ui_handler() -> impl IntoResponse {
-    const HTML: &str = r##"<!DOCTYPE html>
+	const HTML: &str = r##"<!DOCTYPE html>
 <html>
 <head>
   <title>QueryFlux Admin API</title>
@@ -3011,25 +3011,25 @@ async fn swagger_ui_handler() -> impl IntoResponse {
 </script>
 </body>
 </html>"##;
-    (StatusCode::OK, [("content-type", "text/html")], HTML)
+	(StatusCode::OK, [("content-type", "text/html")], HTML)
 }
 
 /// Get the current guardrails configuration.
 #[utoipa::path(
-    get,
-    path = "/admin/config/guardrails",
-    tag = "config",
-    responses(
+	get,
+	path = "/admin/config/guardrails",
+	tag = "config",
+	responses(
         (status = 200, description = "Guardrails config JSON (`{ global: [...], groups: {...} }`)", body = serde_json::Value),
-    )
+	)
 )]
 async fn get_guardrails_config_handler(State(state): State<Arc<AdminState>>) -> impl IntoResponse {
-    if let Some(store) = &state.admin_store {
-        if let Ok(Some(v)) = store.get_proxy_setting("guardrails_config").await {
-            return Json(v).into_response();
-        }
-    }
-    Json(serde_json::json!({ "global": [], "groups": {} })).into_response()
+	if let Some(store) = &state.admin_store {
+		if let Ok(Some(v)) = store.get_proxy_setting("guardrails_config").await {
+			return Json(v).into_response();
+		}
+	}
+	Json(serde_json::json!({ "global": [], "groups": {} })).into_response()
 }
 
 /// Validates that the body matches the guardrails wire format used by Studio and the DB:
@@ -3039,253 +3039,253 @@ async fn get_guardrails_config_handler(State(state): State<Arc<AdminState>>) -> 
 #[derive(Deserialize)]
 #[allow(dead_code)]
 struct GuardrailsConfigDto {
-    #[serde(default)]
-    global: Vec<GuardSpecDto>,
-    #[serde(default)]
-    groups: HashMap<String, Vec<GuardSpecDto>>,
+	#[serde(default)]
+	global: Vec<GuardSpecDto>,
+	#[serde(default)]
+	groups: HashMap<String, Vec<GuardSpecDto>>,
 }
 
 impl GuardrailsConfigDto {
-    fn validate(&self) -> std::result::Result<(), String> {
-        for (idx, spec) in self.global.iter().enumerate() {
-            spec.validate().map_err(|e| format!("global[{idx}]: {e}"))?;
-        }
-        for (group, specs) in &self.groups {
-            for (idx, spec) in specs.iter().enumerate() {
-                spec.validate()
-                    .map_err(|e| format!("groups.{group}[{idx}]: {e}"))?;
-            }
-        }
-        Ok(())
-    }
+	fn validate(&self) -> std::result::Result<(), String> {
+		for (idx, spec) in self.global.iter().enumerate() {
+			spec.validate().map_err(|e| format!("global[{idx}]: {e}"))?;
+		}
+		for (group, specs) in &self.groups {
+			for (idx, spec) in specs.iter().enumerate() {
+				spec.validate()
+					.map_err(|e| format!("groups.{group}[{idx}]: {e}"))?;
+			}
+		}
+		Ok(())
+	}
 
-    fn referenced_script_ids(&self) -> Vec<i64> {
-        let mut ids: Vec<i64> = self
-            .global
-            .iter()
-            .chain(self.groups.values().flatten())
-            .filter_map(GuardSpecDto::script_id)
-            .collect();
-        ids.sort_unstable();
-        ids.dedup();
-        ids
-    }
+	fn referenced_script_ids(&self) -> Vec<i64> {
+		let mut ids: Vec<i64> = self
+			.global
+			.iter()
+			.chain(self.groups.values().flatten())
+			.filter_map(GuardSpecDto::script_id)
+			.collect();
+		ids.sort_unstable();
+		ids.dedup();
+		ids
+	}
 }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum WebhookFailBehavior {
-    Deny,
-    Allow,
+	Deny,
+	Allow,
 }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "snake_case", tag = "kind")]
 #[allow(dead_code)]
 enum GuardSpecDto {
-    BuiltIn {
-        name: Option<String>,
-        #[serde(default)]
-        max_rows: Option<u64>,
-        #[serde(default)]
-        applies_to: Option<Vec<String>>,
-    },
-    PythonScript {
-        script_id: Option<i64>,
-        #[serde(default)]
-        script: Option<String>,
-        #[serde(default)]
-        timeout_ms: Option<u64>,
-    },
-    HttpWebhook {
-        url: Option<String>,
-        #[serde(default)]
-        timeout_ms: Option<u64>,
-        #[serde(default)]
-        retry_count: Option<u32>,
-        #[serde(default)]
-        fail_behavior: Option<WebhookFailBehavior>,
-        #[serde(default)]
-        headers: Option<HashMap<String, String>>,
-    },
+	BuiltIn {
+		name: Option<String>,
+		#[serde(default)]
+		max_rows: Option<u64>,
+		#[serde(default)]
+		applies_to: Option<Vec<String>>,
+	},
+	PythonScript {
+		script_id: Option<i64>,
+		#[serde(default)]
+		script: Option<String>,
+		#[serde(default)]
+		timeout_ms: Option<u64>,
+	},
+	HttpWebhook {
+		url: Option<String>,
+		#[serde(default)]
+		timeout_ms: Option<u64>,
+		#[serde(default)]
+		retry_count: Option<u32>,
+		#[serde(default)]
+		fail_behavior: Option<WebhookFailBehavior>,
+		#[serde(default)]
+		headers: Option<HashMap<String, String>>,
+	},
 }
 
 impl GuardSpecDto {
-    fn validate(&self) -> std::result::Result<(), String> {
-        match self {
-            GuardSpecDto::BuiltIn { name, .. } => match name.as_deref() {
-                Some("read_only" | "row_limit" | "require_predicate") => Ok(()),
-                Some(other) => Err(format!("unsupported built_in guard name \"{other}\"")),
-                None => Err("built_in guard is missing required field \"name\"".to_string()),
-            },
-            GuardSpecDto::PythonScript {
-                script_id, script, ..
-            } => {
-                let has_script = script.as_ref().is_some_and(|s| !s.trim().is_empty());
-                let has_id = script_id.is_some();
-                if has_script && has_id {
-                    return Err(
-                        "python_script guard must set either \"script\" or \"script_id\", not both"
-                            .to_string(),
-                    );
-                }
-                if !has_script && !has_id {
-                    return Err(
-                        "python_script guard requires either \"script\" or \"script_id\""
-                            .to_string(),
-                    );
-                }
-                Ok(())
-            }
-            GuardSpecDto::HttpWebhook { url, .. } => {
-                let raw = url.as_deref().unwrap_or_default().trim();
-                if raw.is_empty() {
-                    return Err("http_webhook guard is missing required field \"url\"".to_string());
-                }
-                match url::Url::parse(raw) {
-                    Ok(parsed) => match parsed.scheme() {
-                        "http" | "https" => Ok(()),
-                        other => Err(format!(
-                            "http_webhook url must use http or https scheme, got \"{other}\""
-                        )),
-                    },
-                    Err(e) => Err(format!("http_webhook url is not a valid URL: {e}")),
-                }
-            }
-        }
-    }
+	fn validate(&self) -> std::result::Result<(), String> {
+		match self {
+			GuardSpecDto::BuiltIn { name, .. } => match name.as_deref() {
+				Some("read_only" | "row_limit" | "require_predicate") => Ok(()),
+				Some(other) => Err(format!("unsupported built_in guard name \"{other}\"")),
+				None => Err("built_in guard is missing required field \"name\"".to_string()),
+			},
+			GuardSpecDto::PythonScript {
+				script_id, script, ..
+			} => {
+				let has_script = script.as_ref().is_some_and(|s| !s.trim().is_empty());
+				let has_id = script_id.is_some();
+				if has_script && has_id {
+					return Err(
+						"python_script guard must set either \"script\" or \"script_id\", not both"
+							.to_string(),
+					);
+				}
+				if !has_script && !has_id {
+					return Err(
+						"python_script guard requires either \"script\" or \"script_id\""
+							.to_string(),
+					);
+				}
+				Ok(())
+			}
+			GuardSpecDto::HttpWebhook { url, .. } => {
+				let raw = url.as_deref().unwrap_or_default().trim();
+				if raw.is_empty() {
+					return Err("http_webhook guard is missing required field \"url\"".to_string());
+				}
+				match url::Url::parse(raw) {
+					Ok(parsed) => match parsed.scheme() {
+						"http" | "https" => Ok(()),
+						other => Err(format!(
+							"http_webhook url must use http or https scheme, got \"{other}\""
+						)),
+					},
+					Err(e) => Err(format!("http_webhook url is not a valid URL: {e}")),
+				}
+			}
+		}
+	}
 
-    fn script_id(&self) -> Option<i64> {
-        match self {
-            GuardSpecDto::PythonScript { script_id, .. } => *script_id,
-            _ => None,
-        }
-    }
+	fn script_id(&self) -> Option<i64> {
+		match self {
+			GuardSpecDto::PythonScript { script_id, .. } => *script_id,
+			_ => None,
+		}
+	}
 }
 
 /// Replace the guardrails configuration.
 #[utoipa::path(
-    put,
-    path = "/admin/config/guardrails",
-    tag = "config",
-    responses(
+	put,
+	path = "/admin/config/guardrails",
+	tag = "config",
+	responses(
         (status = 204, description = "Saved"),
         (status = 400, description = "Invalid guardrails format", body = str),
         (status = 503, description = "Persistence not configured", body = str),
         (status = 500, description = "Internal error", body = str),
-    )
+	)
 )]
 async fn put_guardrails_config_handler(
-    State(state): State<Arc<AdminState>>,
-    Json(body): Json<serde_json::Value>,
+	State(state): State<Arc<AdminState>>,
+	Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
-    let Some(store) = &state.admin_store else {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "Persistence not configured",
-        )
-            .into_response();
-    };
-    let dto = match serde_json::from_value::<GuardrailsConfigDto>(body.clone()) {
-        Ok(dto) => dto,
-        Err(e) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                format!("invalid guardrails config: {e}"),
-            )
-                .into_response();
-        }
-    };
-    if let Err(e) = dto.validate() {
-        return (
-            StatusCode::BAD_REQUEST,
-            format!("invalid guardrails config: {e}"),
-        )
-            .into_response();
-    }
-    for script_id in dto.referenced_script_ids() {
-        match store.get_user_script(script_id).await {
-            Ok(Some(script)) if script.kind == KIND_GUARD => {}
-            Ok(Some(script)) => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    format!(
-                        "invalid guardrails config: python_script guard references script id {script_id} with kind \"{}\", expected \"guard\"",
-                        script.kind
-                    ),
-                )
-                    .into_response();
-            }
-            Ok(None) => {
-                tracing::warn!(
+	let Some(store) = &state.admin_store else {
+		return (
+			StatusCode::SERVICE_UNAVAILABLE,
+			"Persistence not configured",
+		)
+			.into_response();
+	};
+	let dto = match serde_json::from_value::<GuardrailsConfigDto>(body.clone()) {
+		Ok(dto) => dto,
+		Err(e) => {
+			return (
+				StatusCode::BAD_REQUEST,
+				format!("invalid guardrails config: {e}"),
+			)
+				.into_response();
+		}
+	};
+	if let Err(e) = dto.validate() {
+		return (
+			StatusCode::BAD_REQUEST,
+			format!("invalid guardrails config: {e}"),
+		)
+			.into_response();
+	}
+	for script_id in dto.referenced_script_ids() {
+		match store.get_user_script(script_id).await {
+			Ok(Some(script)) if script.kind == KIND_GUARD => {}
+			Ok(Some(script)) => {
+				return (
+					StatusCode::BAD_REQUEST,
+					format!(
+						"invalid guardrails config: python_script guard references script id {script_id} with kind \"{}\", expected \"guard\"",
+						script.kind
+					),
+				)
+					.into_response();
+			}
+			Ok(None) => {
+				tracing::warn!(
                     script_id,
                     "python_script guard references missing script id; \
                      saving config but guard will DENY all queries at runtime via MisconfiguredGuard"
                 );
-            }
-            Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-        }
-    }
-    match store.set_proxy_setting("guardrails_config", body).await {
-        Ok(()) => {
-            notify_live_config_reload(&state);
-            StatusCode::NO_CONTENT.into_response()
-        }
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-    }
+			}
+			Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+		}
+	}
+	match store.set_proxy_setting("guardrails_config", body).await {
+		Ok(()) => {
+			notify_live_config_reload(&state);
+			StatusCode::NO_CONTENT.into_response()
+		}
+		Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+	}
 }
 
 const ACCESS_CONTROL_SETTING_KEY: &str = "access_control_config";
 
 fn access_control_admin_json(
-    cfg: Option<&queryflux_core::access_config::AccessControlConfig>,
+	cfg: Option<&queryflux_core::access_config::AccessControlConfig>,
 ) -> serde_json::Value {
-    match cfg {
-        None => serde_json::json!({ "enabled": false }),
-        Some(cfg) => {
-            let mut v = serde_json::to_value(cfg).unwrap_or_else(|_| serde_json::json!({}));
-            redact_access_control_secrets(&mut v);
-            v
-        }
-    }
+	match cfg {
+		None => serde_json::json!({ "enabled": false }),
+		Some(cfg) => {
+			let mut v = serde_json::to_value(cfg).unwrap_or_else(|_| serde_json::json!({}));
+			redact_access_control_secrets(&mut v);
+			v
+		}
+	}
 }
 
 /// Redact OPA secrets in every entry of `connections` (one `opa.bearerToken` /
 /// `opa.clientCredentials.clientSecret` per named connection), replacing each with a
 /// `*Set` boolean flag. A no-op if `connections` isn't an object (e.g. a malformed body).
 fn redact_access_control_secrets(v: &mut serde_json::Value) {
-    let Some(conns) = v.get_mut("connections").and_then(|c| c.as_object_mut()) else {
-        return;
-    };
-    for conn in conns.values_mut() {
-        if let Some(opa) = conn.get_mut("opa").and_then(|o| o.as_object_mut()) {
-            let token_set = opa
-                .get("bearerToken")
-                .and_then(|t| t.as_str())
-                .is_some_and(|s| !s.is_empty());
-            opa.insert("bearerTokenSet".into(), serde_json::json!(token_set));
-            opa.remove("bearerToken");
-            if let Some(cc) = opa
-                .get_mut("clientCredentials")
-                .and_then(|c| c.as_object_mut())
-            {
-                let secret_set = cc
-                    .get("clientSecret")
-                    .and_then(|s| s.as_str())
-                    .is_some_and(|s| !s.is_empty());
-                cc.insert("clientSecretSet".into(), serde_json::json!(secret_set));
-                cc.remove("clientSecret");
-            }
-        }
-        if let Some(cerbos) = conn.get_mut("cerbos").and_then(|c| c.as_object_mut()) {
-            let token_set = cerbos
-                .get("bearerToken")
-                .and_then(|t| t.as_str())
-                .is_some_and(|s| !s.is_empty());
-            cerbos.insert("bearerTokenSet".into(), serde_json::json!(token_set));
-            cerbos.remove("bearerToken");
-        }
-    }
+	let Some(conns) = v.get_mut("connections").and_then(|c| c.as_object_mut()) else {
+		return;
+	};
+	for conn in conns.values_mut() {
+		if let Some(opa) = conn.get_mut("opa").and_then(|o| o.as_object_mut()) {
+			let token_set = opa
+				.get("bearerToken")
+				.and_then(|t| t.as_str())
+				.is_some_and(|s| !s.is_empty());
+			opa.insert("bearerTokenSet".into(), serde_json::json!(token_set));
+			opa.remove("bearerToken");
+			if let Some(cc) = opa
+				.get_mut("clientCredentials")
+				.and_then(|c| c.as_object_mut())
+			{
+				let secret_set = cc
+					.get("clientSecret")
+					.and_then(|s| s.as_str())
+					.is_some_and(|s| !s.is_empty());
+				cc.insert("clientSecretSet".into(), serde_json::json!(secret_set));
+				cc.remove("clientSecret");
+			}
+		}
+		if let Some(cerbos) = conn.get_mut("cerbos").and_then(|c| c.as_object_mut()) {
+			let token_set = cerbos
+				.get("bearerToken")
+				.and_then(|t| t.as_str())
+				.is_some_and(|s| !s.is_empty());
+			cerbos.insert("bearerTokenSet".into(), serde_json::json!(token_set));
+			cerbos.remove("bearerToken");
+		}
+	}
 }
 
 /// For each named connection in `incoming`, fill in a blank `opa.bearerToken` /
@@ -3296,98 +3296,98 @@ fn redact_access_control_secrets(v: &mut serde_json::Value) {
 /// as strings (missing == absent, not equal to `""`) so an actual endpoint change — the only
 /// thing that matters here — is never masked by a JSON-shape difference.
 fn same_endpoint(
-    incoming: &serde_json::Map<String, serde_json::Value>,
-    prev: &serde_json::Value,
-    key: &str,
+	incoming: &serde_json::Map<String, serde_json::Value>,
+	prev: &serde_json::Value,
+	key: &str,
 ) -> bool {
-    incoming.get(key).and_then(|v| v.as_str()) == prev.get(key).and_then(|v| v.as_str())
+	incoming.get(key).and_then(|v| v.as_str()) == prev.get(key).and_then(|v| v.as_str())
 }
 
 fn merge_access_control_secrets(incoming: &mut serde_json::Value, previous: &serde_json::Value) {
-    let Some(prev_conns) = previous.get("connections").and_then(|c| c.as_object()) else {
-        return;
-    };
-    let Some(conns) = incoming
-        .get_mut("connections")
-        .and_then(|c| c.as_object_mut())
-    else {
-        return;
-    };
-    for (name, conn) in conns.iter_mut() {
-        if let Some(prev_opa) = prev_conns.get(name).and_then(|c| c.get("opa")) {
-            if let Some(opa) = conn.get_mut("opa").and_then(|o| o.as_object_mut()) {
-                let incoming_token_empty = opa
-                    .get("bearerToken")
-                    .and_then(|t| t.as_str())
-                    .is_none_or(|s| s.is_empty());
-                // The bearer token authenticates `opa.url` specifically — carrying it over
-                // to a caller-supplied URL would send this deployment's secret to wherever
-                // they named, not to the server it was ever meant for.
-                if incoming_token_empty && same_endpoint(opa, prev_opa, "url") {
-                    if let Some(prev) = prev_opa.get("bearerToken") {
-                        opa.insert("bearerToken".into(), prev.clone());
-                    }
-                }
-                if let Some(prev_cc) = prev_opa.get("clientCredentials") {
-                    if let Some(cc) = opa
-                        .get_mut("clientCredentials")
-                        .and_then(|c| c.as_object_mut())
-                    {
-                        let incoming_secret_empty = cc
-                            .get("clientSecret")
-                            .and_then(|s| s.as_str())
-                            .is_none_or(|s| s.is_empty());
-                        // Same reasoning for the OAuth2 client secret and its token endpoint.
-                        if incoming_secret_empty && same_endpoint(cc, prev_cc, "tokenEndpoint") {
-                            if let Some(prev) = prev_cc.get("clientSecret") {
-                                cc.insert("clientSecret".into(), prev.clone());
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        if let Some(prev_cerbos) = prev_conns.get(name).and_then(|c| c.get("cerbos")) {
-            if let Some(cerbos) = conn.get_mut("cerbos").and_then(|c| c.as_object_mut()) {
-                let incoming_token_empty = cerbos
-                    .get("bearerToken")
-                    .and_then(|t| t.as_str())
-                    .is_none_or(|s| s.is_empty());
-                // Same reasoning as opa.bearerToken above: only retain it for the same url.
-                if incoming_token_empty && same_endpoint(cerbos, prev_cerbos, "url") {
-                    if let Some(prev) = prev_cerbos.get("bearerToken") {
-                        cerbos.insert("bearerToken".into(), prev.clone());
-                    }
-                }
-            }
-        }
-    }
+	let Some(prev_conns) = previous.get("connections").and_then(|c| c.as_object()) else {
+		return;
+	};
+	let Some(conns) = incoming
+		.get_mut("connections")
+		.and_then(|c| c.as_object_mut())
+	else {
+		return;
+	};
+	for (name, conn) in conns.iter_mut() {
+		if let Some(prev_opa) = prev_conns.get(name).and_then(|c| c.get("opa")) {
+			if let Some(opa) = conn.get_mut("opa").and_then(|o| o.as_object_mut()) {
+				let incoming_token_empty = opa
+					.get("bearerToken")
+					.and_then(|t| t.as_str())
+					.is_none_or(|s| s.is_empty());
+				// The bearer token authenticates `opa.url` specifically — carrying it over
+				// to a caller-supplied URL would send this deployment's secret to wherever
+				// they named, not to the server it was ever meant for.
+				if incoming_token_empty && same_endpoint(opa, prev_opa, "url") {
+					if let Some(prev) = prev_opa.get("bearerToken") {
+						opa.insert("bearerToken".into(), prev.clone());
+					}
+				}
+				if let Some(prev_cc) = prev_opa.get("clientCredentials") {
+					if let Some(cc) = opa
+						.get_mut("clientCredentials")
+						.and_then(|c| c.as_object_mut())
+					{
+						let incoming_secret_empty = cc
+							.get("clientSecret")
+							.and_then(|s| s.as_str())
+							.is_none_or(|s| s.is_empty());
+						// Same reasoning for the OAuth2 client secret and its token endpoint.
+						if incoming_secret_empty && same_endpoint(cc, prev_cc, "tokenEndpoint") {
+							if let Some(prev) = prev_cc.get("clientSecret") {
+								cc.insert("clientSecret".into(), prev.clone());
+							}
+						}
+					}
+				}
+			}
+		}
+		if let Some(prev_cerbos) = prev_conns.get(name).and_then(|c| c.get("cerbos")) {
+			if let Some(cerbos) = conn.get_mut("cerbos").and_then(|c| c.as_object_mut()) {
+				let incoming_token_empty = cerbos
+					.get("bearerToken")
+					.and_then(|t| t.as_str())
+					.is_none_or(|s| s.is_empty());
+				// Same reasoning as opa.bearerToken above: only retain it for the same url.
+				if incoming_token_empty && same_endpoint(cerbos, prev_cerbos, "url") {
+					if let Some(prev) = prev_cerbos.get("bearerToken") {
+						cerbos.insert("bearerToken".into(), prev.clone());
+					}
+				}
+			}
+		}
+	}
 }
 
 /// Get the current access-control configuration. Falls back to startup YAML when
 /// nothing has been persisted via this API yet. Secrets are never returned — only
 /// `bearerTokenSet` / `clientSecretSet` flags.
 #[utoipa::path(
-    get,
-    path = "/admin/config/access-control",
-    tag = "config",
-    responses(
+	get,
+	path = "/admin/config/access-control",
+	tag = "config",
+	responses(
         (status = 200, description = "Access-control config JSON (`{ provider, opa, … }`)", body = serde_json::Value),
-    )
+	)
 )]
 async fn get_access_control_config_handler(
-    State(state): State<Arc<AdminState>>,
+	State(state): State<Arc<AdminState>>,
 ) -> impl IntoResponse {
-    if let Some(store) = &state.admin_store {
-        if let Ok(Some(mut v)) = store.get_proxy_setting(ACCESS_CONTROL_SETTING_KEY).await {
-            redact_access_control_secrets(&mut v);
-            return Json(v).into_response();
-        }
-    }
-    Json(access_control_admin_json(
-        state.access_control_config.as_ref().as_ref(),
-    ))
-    .into_response()
+	if let Some(store) = &state.admin_store {
+		if let Ok(Some(mut v)) = store.get_proxy_setting(ACCESS_CONTROL_SETTING_KEY).await {
+			redact_access_control_secrets(&mut v);
+			return Json(v).into_response();
+		}
+	}
+	Json(access_control_admin_json(
+		state.access_control_config.as_ref().as_ref(),
+	))
+		.into_response()
 }
 
 /// Replace the access-control configuration. `{ "enabled": false }` with no `connections`
@@ -3408,44 +3408,44 @@ async fn get_access_control_config_handler(
     )
 )]
 async fn put_access_control_config_handler(
-    State(state): State<Arc<AdminState>>,
-    Json(mut body): Json<serde_json::Value>,
+	State(state): State<Arc<AdminState>>,
+	Json(mut body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
-    let Some(store) = &state.admin_store else {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "Persistence not configured",
-        )
-            .into_response();
-    };
-    let previous = match store.get_proxy_setting(ACCESS_CONTROL_SETTING_KEY).await {
-        Ok(Some(v)) => v,
-        Ok(None) => state
-            .access_control_config
-            .as_ref()
-            .as_ref()
-            .map(|c| serde_json::to_value(c).unwrap_or(serde_json::json!({})))
-            .unwrap_or(serde_json::json!({})),
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-    };
-    merge_access_control_secrets(&mut body, &previous);
-    if let Err(e) = queryflux_core::access_config::AccessControlConfig::from_admin_value(&body) {
-        return (
-            StatusCode::BAD_REQUEST,
-            format!("invalid accessControl config: {e}"),
-        )
-            .into_response();
-    }
-    match store
-        .set_proxy_setting(ACCESS_CONTROL_SETTING_KEY, body)
-        .await
-    {
-        Ok(()) => {
-            notify_live_config_reload(&state);
-            StatusCode::NO_CONTENT.into_response()
-        }
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-    }
+	let Some(store) = &state.admin_store else {
+		return (
+			StatusCode::SERVICE_UNAVAILABLE,
+			"Persistence not configured",
+		)
+			.into_response();
+	};
+	let previous = match store.get_proxy_setting(ACCESS_CONTROL_SETTING_KEY).await {
+		Ok(Some(v)) => v,
+		Ok(None) => state
+			.access_control_config
+			.as_ref()
+			.as_ref()
+			.map(|c| serde_json::to_value(c).unwrap_or(serde_json::json!({})))
+			.unwrap_or(serde_json::json!({})),
+		Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+	};
+	merge_access_control_secrets(&mut body, &previous);
+	if let Err(e) = queryflux_core::access_config::AccessControlConfig::from_admin_value(&body) {
+		return (
+			StatusCode::BAD_REQUEST,
+			format!("invalid accessControl config: {e}"),
+		)
+			.into_response();
+	}
+	match store
+		.set_proxy_setting(ACCESS_CONTROL_SETTING_KEY, body)
+		.await
+	{
+		Ok(()) => {
+			notify_live_config_reload(&state);
+			StatusCode::NO_CONTENT.into_response()
+		}
+		Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -3456,54 +3456,54 @@ async fn put_access_control_config_handler(
 #[derive(Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 struct AccessControlDryRunRequest {
-    sql: String,
-    /// Cluster group name — carried through as `context.clusterGroup` for the policy
-    /// engine; not used to resolve a real cluster (this endpoint never dispatches).
-    #[serde(default = "default_dry_run_group")]
-    cluster_group: String,
-    /// sqlglot dialect name the SQL should be parsed as (e.g. `"trino"`, `"postgres"`,
-    /// `"duckdb"`). Defaults to `"trino"`.
-    #[serde(default = "default_dry_run_dialect")]
-    dialect: String,
-    /// Engine the query is headed to, as it appears in `context.engine` (for example
-    /// `"trino"`, `"duckDb"`, `"starRocks"`). Defaults to `"trino"`.
-    #[serde(default)]
-    engine: Option<String>,
-    identity: DryRunIdentity,
-    /// Optional table → { column → type } map used to apply column masks. Columns are taken
-    /// in name order. When omitted, resolved from the live catalog (same as a real query).
-    #[serde(default)]
-    schema: Option<HashMap<String, HashMap<String, String>>>,
+	sql: String,
+	/// Cluster group name — carried through as `context.clusterGroup` for the policy
+	/// engine; not used to resolve a real cluster (this endpoint never dispatches).
+	#[serde(default = "default_dry_run_group")]
+	cluster_group: String,
+	/// sqlglot dialect name the SQL should be parsed as (e.g. `"trino"`, `"postgres"`,
+	/// `"duckdb"`). Defaults to `"trino"`.
+	#[serde(default = "default_dry_run_dialect")]
+	dialect: String,
+	/// Engine the query is headed to, as it appears in `context.engine` (for example
+	/// `"trino"`, `"duckDb"`, `"starRocks"`). Defaults to `"trino"`.
+	#[serde(default)]
+	engine: Option<String>,
+	identity: DryRunIdentity,
+	/// Optional table → { column → type } map used to apply column masks. Columns are taken
+	/// in name order. When omitted, resolved from the live catalog (same as a real query).
+	#[serde(default)]
+	schema: Option<HashMap<String, HashMap<String, String>>>,
 }
 
 /// `engine` as sent in a dry-run request → the engine the policy sees. Absent means Trino.
 fn parse_dry_run_engine(
-    name: Option<&str>,
+	name: Option<&str>,
 ) -> std::result::Result<queryflux_core::query::EngineType, String> {
-    match name {
-        None => Ok(queryflux_core::query::EngineType::Trino),
-        Some(name) => serde_json::from_value(serde_json::Value::String(name.to_string()))
-            .map_err(|_| format!("unknown engine {name:?}")),
-    }
+	match name {
+		None => Ok(queryflux_core::query::EngineType::Trino),
+		Some(name) => serde_json::from_value(serde_json::Value::String(name.to_string()))
+			.map_err(|_| format!("unknown engine {name:?}")),
+	}
 }
 
 fn default_dry_run_group() -> String {
-    "dry-run".to_string()
+	"dry-run".to_string()
 }
 fn default_dry_run_dialect() -> String {
-    "trino".to_string()
+	"trino".to_string()
 }
 
 #[derive(Deserialize, Default, ToSchema)]
 struct DryRunIdentity {
-    #[serde(default)]
-    user: String,
-    #[serde(default)]
-    groups: Vec<String>,
-    #[serde(default)]
-    roles: Vec<String>,
-    #[serde(default)]
-    attributes: std::collections::BTreeMap<String, serde_json::Value>,
+	#[serde(default)]
+	user: String,
+	#[serde(default)]
+	groups: Vec<String>,
+	#[serde(default)]
+	roles: Vec<String>,
+	#[serde(default)]
+	attributes: std::collections::BTreeMap<String, serde_json::Value>,
 }
 
 /// Preview the access-control decision for a query without acquiring a slot or executing
@@ -3520,118 +3520,116 @@ struct DryRunIdentity {
 /// answer up to `cacheTtlMs` old, and an allowed decision it computes can be reused by an
 /// identical live request. Set `cacheTtlMs: 0` while editing policy to always see a fresh one.
 #[utoipa::path(
-    post,
-    path = "/admin/access-control/dry-run",
-    tag = "config",
-    responses(
+	post,
+	path = "/admin/access-control/dry-run",
+	tag = "config",
+	responses(
         (status = 200, description = "Decision computed", body = str),
         (status = 400, description = "Invalid request body", body = str),
         (status = 503, description = "No access_control provider configured", body = str),
-    )
+	)
 )]
 async fn access_control_dry_run_handler(
-    State(state): State<Arc<AdminState>>,
-    Json(body): Json<AccessControlDryRunRequest>,
+	State(state): State<Arc<AdminState>>,
+	Json(body): Json<AccessControlDryRunRequest>,
 ) -> impl IntoResponse {
-    let Some(guard) = state.live.read().await.access_control_guard.clone() else {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "no access_control provider is configured",
-        )
-            .into_response();
-    };
+	let Some(guard) = state.live.read().await.access_control_guard.clone() else {
+		return (
+			StatusCode::SERVICE_UNAVAILABLE,
+			"no access_control provider is configured",
+		)
+			.into_response();
+	};
 
-    if !guard.enabled_for_group(&body.cluster_group) {
-        return Json(serde_json::json!({
+	if !guard.enabled_for_group(&body.cluster_group) {
+		return Json(serde_json::json!({
             "outcome": "skip",
             "reason": "access control is disabled for this cluster group"
         }))
-        .into_response();
-    }
-    let Some(connection) = guard.connection_name_for_group(&body.cluster_group) else {
-        return Json(serde_json::json!({
+			.into_response();
+	}
+	let Some(connection) = guard.connection_name_for_group(&body.cluster_group) else {
+		return Json(serde_json::json!({
             "outcome": "skip",
             "reason": "this cluster group has no resolvable connection (no groups.<name>.connection override and no defaultConnection configured)"
         }))
-        .into_response();
-    };
-    let connection = connection.to_string();
+			.into_response();
+	};
+	let connection = connection.to_string();
 
-    let dialect = queryflux_core::query::SqlDialect::Sqlglot(body.dialect.clone());
-    let cluster_group = queryflux_core::query::ClusterGroupName(body.cluster_group.clone());
-    let engine_type = match parse_dry_run_engine(body.engine.as_deref()) {
-        Ok(engine) => engine,
-        Err(e) => return (StatusCode::BAD_REQUEST, e).into_response(),
-    };
-    let query_tags = queryflux_core::tags::QueryTags::new();
-    let session_extra = std::collections::HashMap::new();
-    //let sql_parse = queryflux_sql::classify::SqlParseCache::new(body.sql.clone(), dialect.clone());
-    let sql_parse = Arc::new(queryflux_sql::classify::SqlParseCache::new(body.sql.to_string(), dialect.clone()));
+	let dialect = queryflux_core::query::SqlDialect::Sqlglot(body.dialect.clone());
+	let cluster_group = queryflux_core::query::ClusterGroupName(body.cluster_group.clone());
+	let engine_type = match parse_dry_run_engine(body.engine.as_deref()) {
+		Ok(engine) => engine,
+		Err(e) => return (StatusCode::BAD_REQUEST, e).into_response(),
+	};
+	let query_tags = queryflux_core::tags::QueryTags::new();
+	let session_extra = std::collections::HashMap::new();
+	let sql_parse = Arc::new(queryflux_sql::classify::SqlParseCache::new(body.sql.to_string(), dialect.clone()));
 
-    let catalog = state.live.read().await.catalog.clone();
-    let schema_ctx = if let Some(tables) = body.schema.filter(|t| !t.is_empty()) {
-        SchemaContext {
-            catalog: None,
-            database: None,
-            // A JSON object read into a `HashMap` has no stable order, so sort columns by
-            // name to keep the rewrite (and the decision-cache key) deterministic.
-            tables: tables
-                .into_iter()
-                .map(|(table, cols)| {
-                    let mut cols: Vec<_> = cols.into_iter().collect();
-                    cols.sort();
-                    (table, cols.into_iter().collect())
-                })
-                .collect(),
-        }
-    } else {
-        state
-            .app
-            .translation
-            .resolve_schema_context(&body.sql, &dialect, &catalog, None, None)
-            .await
-    };
+	let catalog = state.live.read().await.catalog.clone();
+	let schema_ctx = if let Some(tables) = body.schema.filter(|t| !t.is_empty()) {
+		SchemaContext {
+			catalog: None,
+			database: None,
+			// A JSON object read into a `HashMap` has no stable order, so sort columns by
+			// name to keep the rewrite (and the decision-cache key) deterministic.
+			tables: tables
+				.into_iter()
+				.map(|(table, cols)| {
+					let mut cols: Vec<_> = cols.into_iter().collect();
+					cols.sort();
+					(table, cols.into_iter().collect())
+				})
+				.collect(),
+		}
+	} else {
+		state
+			.app
+			.translation
+			.resolve_schema_context(&body.sql, &dialect, &catalog, None, None)
+			.await
+	};
 
-    let ctx = queryflux_guardrails::context::GuardContext {
-        sql: &body.sql,
-        original_sql: None,
-        dialect: &dialect,
-        engine_type: &engine_type,
-        cluster_group: &cluster_group,
-        user: Some(body.identity.user.as_str()),
-        groups: &body.identity.groups,
-        roles: &body.identity.roles,
-        attributes: &body.identity.attributes,
-        agent_context: None,
-        query_tags: &query_tags,
-        session_extra: &session_extra,
-        schema: Some(&schema_ctx),
-        //sql_parse: Some(&sql_parse),
-        sql_parse: Some(Arc::clone(&sql_parse))
-    };
+	let ctx = queryflux_guardrails::context::GuardContext {
+		sql: &body.sql,
+		original_sql: None,
+		dialect: &dialect,
+		engine_type: &engine_type,
+		cluster_group: &cluster_group,
+		user: Some(body.identity.user.as_str()),
+		groups: &body.identity.groups,
+		roles: &body.identity.roles,
+		attributes: &body.identity.attributes,
+		agent_context: None,
+		query_tags: &query_tags,
+		session_extra: &session_extra,
+		schema: Some(&schema_ctx),
+		sql_parse: Some(Arc::clone(&sql_parse))
+	};
 
-    let result = {
-        use queryflux_guardrails::built_in::Guard as _;
-        guard.check(&ctx).await
-    };
-    let mut response = match result {
-        queryflux_guardrails::context::GuardResult::Deny { reason, code } => {
-            serde_json::json!({ "outcome": "deny", "reason": reason, "code": code })
-        }
-        queryflux_guardrails::context::GuardResult::Rewrite { sql, metadata } => {
-            serde_json::json!({ "outcome": "rewrite", "rewrittenSql": sql, "metadata": metadata })
-        }
-        queryflux_guardrails::context::GuardResult::Allow { metadata } => {
-            serde_json::json!({ "outcome": "allow", "metadata": metadata })
-        }
-        queryflux_guardrails::context::GuardResult::Warn { reason } => {
-            serde_json::json!({ "outcome": "warn", "reason": reason })
-        }
-    };
-    if let Some(obj) = response.as_object_mut() {
-        obj.insert("connection".to_string(), serde_json::json!(connection));
-    }
-    Json(response).into_response()
+	let result = {
+		use queryflux_guardrails::built_in::Guard as _;
+		guard.check(&ctx).await
+	};
+	let mut response = match result {
+		queryflux_guardrails::context::GuardResult::Deny { reason, code } => {
+			serde_json::json!({ "outcome": "deny", "reason": reason, "code": code })
+		}
+		queryflux_guardrails::context::GuardResult::Rewrite { sql, metadata } => {
+			serde_json::json!({ "outcome": "rewrite", "rewrittenSql": sql, "metadata": metadata })
+		}
+		queryflux_guardrails::context::GuardResult::Allow { metadata } => {
+			serde_json::json!({ "outcome": "allow", "metadata": metadata })
+		}
+		queryflux_guardrails::context::GuardResult::Warn { reason } => {
+			serde_json::json!({ "outcome": "warn", "reason": reason })
+		}
+	};
+	if let Some(obj) = response.as_object_mut() {
+		obj.insert("connection".to_string(), serde_json::json!(connection));
+	}
+	Json(response).into_response()
 }
 
 // ---------------------------------------------------------------------------
@@ -3641,20 +3639,20 @@ async fn access_control_dry_run_handler(
 /// Get the current `catalogProvider` configuration. Falls back to the
 /// startup (YAML) value when nothing has been persisted via this API yet.
 #[utoipa::path(
-    get,
-    path = "/admin/config/catalog",
-    tag = "config",
-    responses(
+	get,
+	path = "/admin/config/catalog",
+	tag = "config",
+	responses(
         (status = 200, description = "CatalogProviderConfig JSON (tagged by `type`)", body = serde_json::Value),
-    )
+	)
 )]
 async fn get_catalog_config_handler(State(state): State<Arc<AdminState>>) -> impl IntoResponse {
-    if let Some(store) = &state.admin_store {
-        if let Ok(Some(v)) = store.get_proxy_setting("catalog_config").await {
-            return Json(v).into_response();
-        }
-    }
-    Json(state.catalog_provider_config.as_ref()).into_response()
+	if let Some(store) = &state.admin_store {
+		if let Ok(Some(v)) = store.get_proxy_setting("catalog_config").await {
+			return Json(v).into_response();
+		}
+	}
+	Json(state.catalog_provider_config.as_ref()).into_response()
 }
 
 /// Replace the `catalogProvider` configuration. Structurally validated against
@@ -3676,43 +3674,43 @@ async fn get_catalog_config_handler(State(state): State<Arc<AdminState>>) -> imp
     )
 )]
 async fn put_catalog_config_handler(
-    State(state): State<Arc<AdminState>>,
-    Json(body): Json<serde_json::Value>,
+	State(state): State<Arc<AdminState>>,
+	Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
-    let Some(store) = &state.admin_store else {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "Persistence not configured",
-        )
-            .into_response();
-    };
-    if let Err(e) =
-        serde_json::from_value::<queryflux_core::config::CatalogProviderConfig>(body.clone())
-    {
-        return (
-            StatusCode::BAD_REQUEST,
-            format!("invalid catalogProvider config: {e}"),
-        )
-            .into_response();
-    }
-    match store.set_proxy_setting("catalog_config", body).await {
-        Ok(()) => {
-            notify_live_config_reload(&state);
-            StatusCode::NO_CONTENT.into_response()
-        }
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-    }
+	let Some(store) = &state.admin_store else {
+		return (
+			StatusCode::SERVICE_UNAVAILABLE,
+			"Persistence not configured",
+		)
+			.into_response();
+	};
+	if let Err(e) =
+		serde_json::from_value::<queryflux_core::config::CatalogProviderConfig>(body.clone())
+	{
+		return (
+			StatusCode::BAD_REQUEST,
+			format!("invalid catalogProvider config: {e}"),
+		)
+			.into_response();
+	}
+	match store.set_proxy_setting("catalog_config", body).await {
+		Ok(()) => {
+			notify_live_config_reload(&state);
+			StatusCode::NO_CONTENT.into_response()
+		}
+		Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+	}
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
 struct TestCatalogProviderRequest {
-    config: serde_json::Value,
+	config: serde_json::Value,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
 struct TestCatalogProviderResponse {
-    ok: bool,
-    message: String,
+	ok: bool,
+	message: String,
 }
 
 /// Build a `catalogProvider` config and smoke-test it, without persisting it.
@@ -3727,17 +3725,17 @@ struct TestCatalogProviderResponse {
     )
 )]
 async fn test_catalog_config_handler(
-    State(state): State<Arc<AdminState>>,
-    Json(body): Json<TestCatalogProviderRequest>,
+	State(state): State<Arc<AdminState>>,
+	Json(body): Json<TestCatalogProviderRequest>,
 ) -> impl IntoResponse {
-    match (state.test_catalog_provider_fn)(body.config).await {
-        Ok((ok, message)) => Json(TestCatalogProviderResponse { ok, message }).into_response(),
-        Err(e) => Json(TestCatalogProviderResponse {
-            ok: false,
-            message: e.to_string(),
-        })
-        .into_response(),
-    }
+	match (state.test_catalog_provider_fn)(body.config).await {
+		Ok((ok, message)) => Json(TestCatalogProviderResponse { ok, message }).into_response(),
+		Err(e) => Json(TestCatalogProviderResponse {
+			ok: false,
+			message: e.to_string(),
+		})
+			.into_response(),
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -3745,127 +3743,127 @@ async fn test_catalog_config_handler(
 // ---------------------------------------------------------------------------
 
 async fn invalidate_all_cache_handler(State(state): State<Arc<AdminState>>) -> impl IntoResponse {
-    match state.result_cache.invalidate_all().await {
-        Ok(count) => Json(serde_json::json!({ "deleted": count })).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-    }
+	match state.result_cache.invalidate_all().await {
+		Ok(count) => Json(serde_json::json!({ "deleted": count })).into_response(),
+		Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+	}
 }
 
 async fn invalidate_group_cache_handler(
-    State(state): State<Arc<AdminState>>,
-    Path(group): Path<String>,
+	State(state): State<Arc<AdminState>>,
+	Path(group): Path<String>,
 ) -> impl IntoResponse {
-    match state.result_cache.invalidate_group(&group).await {
-        Ok(count) => Json(serde_json::json!({ "deleted": count })).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-    }
+	match state.result_cache.invalidate_group(&group).await {
+		Ok(count) => Json(serde_json::json!({ "deleted": count })).into_response(),
+		Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+	}
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        collect_running_queries, delete_queued_if_exists, sql_preview, AccessControlDryRunRequest,
-        GuardrailsConfigDto, SecurityConfigDto,
-    };
-    use chrono::Utc;
-    use queryflux_core::config::{
-        AuthConfig, AuthProviderConfig, AuthorizationConfig, StaticUserEntry, StaticUsersConfig,
-    };
-    use queryflux_core::query::{
-        BackendQueryId, ClusterGroupName, ClusterName, ExecutingQuery, FrontendProtocol,
-        ProxyQueryId, QueuedQuery,
-    };
-    use queryflux_core::session::SessionContext;
-    use queryflux_persistence::{in_memory::InMemoryPersistence, Persistence};
-    use serde_json::json;
-    use std::collections::HashMap;
-    use std::sync::Arc;
+	use super::{
+		collect_running_queries, delete_queued_if_exists, sql_preview, AccessControlDryRunRequest,
+		GuardrailsConfigDto, SecurityConfigDto,
+	};
+	use chrono::Utc;
+	use queryflux_core::config::{
+		AuthConfig, AuthProviderConfig, AuthorizationConfig, StaticUserEntry, StaticUsersConfig,
+	};
+	use queryflux_core::query::{
+		BackendQueryId, ClusterGroupName, ClusterName, ExecutingQuery, FrontendProtocol,
+		ProxyQueryId, QueuedQuery,
+	};
+	use queryflux_core::session::SessionContext;
+	use queryflux_persistence::{in_memory::InMemoryPersistence, Persistence};
+	use serde_json::json;
+	use std::collections::HashMap;
+	use std::sync::Arc;
 
-    #[test]
-    fn security_config_dto_omits_static_user_passwords() {
-        let mut users = HashMap::new();
-        users.insert(
-            "alice".into(),
-            StaticUserEntry {
-                password: "s3cret".into(),
-                groups: vec!["analytics".into()],
-                roles: vec!["reader".into()],
-            },
-        );
-        let auth = AuthConfig {
-            provider: AuthProviderConfig::Static,
-            required: true,
-            static_users: Some(StaticUsersConfig { users }),
-            ..AuthConfig::default()
-        };
-        let dto =
-            SecurityConfigDto::from_config(&auth, &AuthorizationConfig::default(), &HashMap::new());
-        let serialized = serde_json::to_value(&dto).unwrap().to_string();
-        assert!(!serialized.contains("s3cret"));
-        assert!(!serialized.contains("\"password\""));
-        assert_eq!(dto.static_user_summaries.len(), 1);
-        assert_eq!(dto.static_user_summaries[0].username, "alice");
-        assert_eq!(dto.static_user_summaries[0].groups, vec!["analytics"]);
-    }
+	#[test]
+	fn security_config_dto_omits_static_user_passwords() {
+		let mut users = HashMap::new();
+		users.insert(
+			"alice".into(),
+			StaticUserEntry {
+				password: "s3cret".into(),
+				groups: vec!["analytics".into()],
+				roles: vec!["reader".into()],
+			},
+		);
+		let auth = AuthConfig {
+			provider: AuthProviderConfig::Static,
+			required: true,
+			static_users: Some(StaticUsersConfig { users }),
+			..AuthConfig::default()
+		};
+		let dto =
+			SecurityConfigDto::from_config(&auth, &AuthorizationConfig::default(), &HashMap::new());
+		let serialized = serde_json::to_value(&dto).unwrap().to_string();
+		assert!(!serialized.contains("s3cret"));
+		assert!(!serialized.contains("\"password\""));
+		assert_eq!(dto.static_user_summaries.len(), 1);
+		assert_eq!(dto.static_user_summaries[0].username, "alice");
+		assert_eq!(dto.static_user_summaries[0].groups, vec!["analytics"]);
+	}
 
-    #[test]
-    fn sql_preview_truncates_to_160_chars() {
-        let long = "word ".repeat(50);
-        let preview = sql_preview(&long);
-        assert!(preview.chars().count() <= 160);
-        assert!(preview.ends_with('…'));
-    }
+	#[test]
+	fn sql_preview_truncates_to_160_chars() {
+		let long = "word ".repeat(50);
+		let preview = sql_preview(&long);
+		assert!(preview.chars().count() <= 160);
+		assert!(preview.ends_with('…'));
+	}
 
-    #[test]
-    fn sql_preview_collapses_whitespace() {
-        assert_eq!(sql_preview("SELECT   1\nFROM  t"), "SELECT 1 FROM t");
-    }
+	#[test]
+	fn sql_preview_collapses_whitespace() {
+		assert_eq!(sql_preview("SELECT   1\nFROM  t"), "SELECT 1 FROM t");
+	}
 
-    #[test]
-    fn access_control_dry_run_request_defaults() {
-        let req: AccessControlDryRunRequest = serde_json::from_value(json!({
+	#[test]
+	fn access_control_dry_run_request_defaults() {
+		let req: AccessControlDryRunRequest = serde_json::from_value(json!({
             "sql": "SELECT * FROM orders",
             "identity": { "user": "alice", "groups": ["analysts"] }
         }))
-        .expect("minimal dry-run body should deserialize");
-        assert_eq!(req.sql, "SELECT * FROM orders");
-        assert_eq!(req.dialect, "trino");
-        assert_eq!(req.engine, None);
-        assert_eq!(req.cluster_group, "dry-run");
-        assert_eq!(req.identity.user, "alice");
-        assert_eq!(req.identity.groups, vec!["analysts"]);
-        assert!(req.identity.roles.is_empty());
-        assert!(req.identity.attributes.is_empty());
-        assert!(req.schema.is_none());
-    }
+			.expect("minimal dry-run body should deserialize");
+		assert_eq!(req.sql, "SELECT * FROM orders");
+		assert_eq!(req.dialect, "trino");
+		assert_eq!(req.engine, None);
+		assert_eq!(req.cluster_group, "dry-run");
+		assert_eq!(req.identity.user, "alice");
+		assert_eq!(req.identity.groups, vec!["analysts"]);
+		assert!(req.identity.roles.is_empty());
+		assert!(req.identity.attributes.is_empty());
+		assert!(req.schema.is_none());
+	}
 
-    /// The engine reaches the policy as `context.engine`, so it must be settable — and an
-    /// unknown name must be rejected rather than silently treated as Trino.
-    #[test]
-    fn dry_run_engine_is_parsed_and_defaults_to_trino() {
-        use queryflux_core::query::EngineType;
-        assert_eq!(super::parse_dry_run_engine(None), Ok(EngineType::Trino));
-        assert_eq!(
-            super::parse_dry_run_engine(Some("duckDb")),
-            Ok(EngineType::DuckDb)
-        );
-        assert_eq!(
-            super::parse_dry_run_engine(Some("starRocks")),
-            Ok(EngineType::StarRocks)
-        );
-        assert!(super::parse_dry_run_engine(Some("mystery"))
-            .unwrap_err()
-            .contains("mystery"));
-        let req: AccessControlDryRunRequest = serde_json::from_value(json!({
+	/// The engine reaches the policy as `context.engine`, so it must be settable — and an
+	/// unknown name must be rejected rather than silently treated as Trino.
+	#[test]
+	fn dry_run_engine_is_parsed_and_defaults_to_trino() {
+		use queryflux_core::query::EngineType;
+		assert_eq!(super::parse_dry_run_engine(None), Ok(EngineType::Trino));
+		assert_eq!(
+			super::parse_dry_run_engine(Some("duckDb")),
+			Ok(EngineType::DuckDb)
+		);
+		assert_eq!(
+			super::parse_dry_run_engine(Some("starRocks")),
+			Ok(EngineType::StarRocks)
+		);
+		assert!(super::parse_dry_run_engine(Some("mystery"))
+			.unwrap_err()
+			.contains("mystery"));
+		let req: AccessControlDryRunRequest = serde_json::from_value(json!({
             "sql": "SELECT 1", "engine": "duckDb", "identity": { "user": "u" }
         }))
-        .unwrap();
-        assert_eq!(req.engine.as_deref(), Some("duckDb"));
-    }
+			.unwrap();
+		assert_eq!(req.engine.as_deref(), Some("duckDb"));
+	}
 
-    #[test]
-    fn access_control_dry_run_request_honors_overrides() {
-        let req: AccessControlDryRunRequest = serde_json::from_value(json!({
+	#[test]
+	fn access_control_dry_run_request_honors_overrides() {
+		let req: AccessControlDryRunRequest = serde_json::from_value(json!({
             "sql": "SELECT 1",
             "clusterGroup": "trino-prod",
             "dialect": "postgres",
@@ -3875,113 +3873,113 @@ mod tests {
                 "attributes": { "department": "finance" }
             }
         }))
-        .expect("dry-run body with overrides should deserialize");
-        assert_eq!(req.cluster_group, "trino-prod");
-        assert_eq!(req.dialect, "postgres");
-        assert_eq!(req.identity.roles, vec!["reader"]);
-        assert_eq!(
-            req.identity
-                .attributes
-                .get("department")
-                .and_then(|v| v.as_str()),
-            Some("finance")
-        );
-    }
+			.expect("dry-run body with overrides should deserialize");
+		assert_eq!(req.cluster_group, "trino-prod");
+		assert_eq!(req.dialect, "postgres");
+		assert_eq!(req.identity.roles, vec!["reader"]);
+		assert_eq!(
+			req.identity
+				.attributes
+				.get("department")
+				.and_then(|v| v.as_str()),
+			Some("finance")
+		);
+	}
 
-    #[tokio::test]
-    async fn collect_running_queries_includes_executing_and_queued() {
-        let store = Arc::new(InMemoryPersistence::new());
-        let now = Utc::now();
-        store
-            .upsert(ExecutingQuery {
-                id: ProxyQueryId("exec-1".into()),
-                sql: "SELECT 1".into(),
-                translation: None,
-                client_sql: None,
-                rewritten_sql: None,
-                was_dialect_translated: false,
-                translated_sql: None,
-                cluster_group: ClusterGroupName("analytics".into()),
-                cluster_name: ClusterName("trino".into()),
-                cluster_group_config_id: None,
-                cluster_config_id: None,
-                backend_query_id: BackendQueryId("backend-1".into()),
-                poll_base_url: None,
-                creation_time: now,
-                last_accessed: now,
-                query_tags: Default::default(),
-                agent_context: None,
-                submitted_guard_actions: vec![],
-                was_guard_blocked: false,
-                submitted_by: "alice".into(),
-                wire_auth: None,
-                queue_duration_ms: 0,
-            })
-            .await
-            .unwrap();
-        store
-            .upsert_queued(QueuedQuery {
-                id: ProxyQueryId("queued-1".into()),
-                sql: "SELECT 2".into(),
-                session: SessionContext::default(),
-                frontend_protocol: FrontendProtocol::TrinoHttp,
-                cluster_group: ClusterGroupName("analytics".into()),
-                creation_time: now,
-                last_accessed: now,
-                sequence: 0,
-                submitted_by: "bob".into(),
-            })
-            .await
-            .unwrap();
+	#[tokio::test]
+	async fn collect_running_queries_includes_executing_and_queued() {
+		let store = Arc::new(InMemoryPersistence::new());
+		let now = Utc::now();
+		store
+			.upsert(ExecutingQuery {
+				id: ProxyQueryId("exec-1".into()),
+				sql: "SELECT 1".into(),
+				translation: None,
+				client_sql: None,
+				rewritten_sql: None,
+				was_dialect_translated: false,
+				translated_sql: None,
+				cluster_group: ClusterGroupName("analytics".into()),
+				cluster_name: ClusterName("trino".into()),
+				cluster_group_config_id: None,
+				cluster_config_id: None,
+				backend_query_id: BackendQueryId("backend-1".into()),
+				poll_base_url: None,
+				creation_time: now,
+				last_accessed: now,
+				query_tags: Default::default(),
+				agent_context: None,
+				submitted_guard_actions: vec![],
+				was_guard_blocked: false,
+				submitted_by: "alice".into(),
+				wire_auth: None,
+				queue_duration_ms: 0,
+			})
+			.await
+			.unwrap();
+		store
+			.upsert_queued(QueuedQuery {
+				id: ProxyQueryId("queued-1".into()),
+				sql: "SELECT 2".into(),
+				session: SessionContext::default(),
+				frontend_protocol: FrontendProtocol::TrinoHttp,
+				cluster_group: ClusterGroupName("analytics".into()),
+				creation_time: now,
+				last_accessed: now,
+				sequence: 0,
+				submitted_by: "bob".into(),
+			})
+			.await
+			.unwrap();
 
-        let rows = collect_running_queries(store.as_ref()).await.unwrap();
-        assert_eq!(rows.len(), 2);
-        let exec = rows.iter().find(|r| r.id == "exec-1").unwrap();
-        assert_eq!(exec.state, "executing");
-        assert_eq!(exec.submitted_by, "alice");
-        assert_eq!(exec.backend_query_id.as_deref(), Some("backend-1"));
-        let queued = rows.iter().find(|r| r.id == "queued-1").unwrap();
-        assert_eq!(queued.state, "queued");
-        assert_eq!(queued.submitted_by, "bob");
-        assert!(queued.backend_query_id.is_none());
-    }
+		let rows = collect_running_queries(store.as_ref()).await.unwrap();
+		assert_eq!(rows.len(), 2);
+		let exec = rows.iter().find(|r| r.id == "exec-1").unwrap();
+		assert_eq!(exec.state, "executing");
+		assert_eq!(exec.submitted_by, "alice");
+		assert_eq!(exec.backend_query_id.as_deref(), Some("backend-1"));
+		let queued = rows.iter().find(|r| r.id == "queued-1").unwrap();
+		assert_eq!(queued.state, "queued");
+		assert_eq!(queued.submitted_by, "bob");
+		assert!(queued.backend_query_id.is_none());
+	}
 
-    #[tokio::test]
-    async fn delete_queued_if_exists_removes_row() {
-        let store = Arc::new(InMemoryPersistence::new());
-        store
-            .upsert_queued(QueuedQuery {
-                id: ProxyQueryId("q-cancel".into()),
-                sql: "SELECT 1".into(),
-                session: SessionContext::default(),
-                frontend_protocol: FrontendProtocol::TrinoHttp,
-                cluster_group: ClusterGroupName("g".into()),
-                creation_time: Utc::now(),
-                last_accessed: Utc::now(),
-                sequence: 0,
-                submitted_by: "alice".into(),
-            })
-            .await
-            .unwrap();
+	#[tokio::test]
+	async fn delete_queued_if_exists_removes_row() {
+		let store = Arc::new(InMemoryPersistence::new());
+		store
+			.upsert_queued(QueuedQuery {
+				id: ProxyQueryId("q-cancel".into()),
+				sql: "SELECT 1".into(),
+				session: SessionContext::default(),
+				frontend_protocol: FrontendProtocol::TrinoHttp,
+				cluster_group: ClusterGroupName("g".into()),
+				creation_time: Utc::now(),
+				last_accessed: Utc::now(),
+				sequence: 0,
+				submitted_by: "alice".into(),
+			})
+			.await
+			.unwrap();
 
-        assert!(delete_queued_if_exists(store.as_ref(), "q-cancel")
-            .await
-            .unwrap()
-            .is_some());
-        assert!(store
-            .get_queued(&ProxyQueryId("q-cancel".into()))
-            .await
-            .unwrap()
-            .is_none());
-        assert!(delete_queued_if_exists(store.as_ref(), "missing")
-            .await
-            .unwrap()
-            .is_none());
-    }
+		assert!(delete_queued_if_exists(store.as_ref(), "q-cancel")
+			.await
+			.unwrap()
+			.is_some());
+		assert!(store
+			.get_queued(&ProxyQueryId("q-cancel".into()))
+			.await
+			.unwrap()
+			.is_none());
+		assert!(delete_queued_if_exists(store.as_ref(), "missing")
+			.await
+			.unwrap()
+			.is_none());
+	}
 
-    #[test]
-    fn guardrails_dto_allows_supported_built_in_guards() {
-        let dto: GuardrailsConfigDto = serde_json::from_value(json!({
+	#[test]
+	fn guardrails_dto_allows_supported_built_in_guards() {
+		let dto: GuardrailsConfigDto = serde_json::from_value(json!({
             "global": [
                 { "kind": "built_in", "name": "read_only" },
                 { "kind": "built_in", "name": "row_limit", "max_rows": 1000 }
@@ -3992,92 +3990,92 @@ mod tests {
                 ]
             }
         }))
-        .expect("valid dto");
+			.expect("valid dto");
 
-        dto.validate().expect("supported built-ins should validate");
-    }
+		dto.validate().expect("supported built-ins should validate");
+	}
 
-    #[test]
-    fn guardrails_dto_allows_external_guard_kinds() {
-        let python: GuardrailsConfigDto = serde_json::from_value(json!({
+	#[test]
+	fn guardrails_dto_allows_external_guard_kinds() {
+		let python: GuardrailsConfigDto = serde_json::from_value(json!({
             "global": [{ "kind": "python_script", "script_id": 42, "timeout_ms": 250 }]
         }))
-        .expect("shape should parse");
-        python
-            .validate()
-            .expect("python script guard should validate");
+			.expect("shape should parse");
+		python
+			.validate()
+			.expect("python script guard should validate");
 
-        let webhook: GuardrailsConfigDto = serde_json::from_value(json!({
+		let webhook: GuardrailsConfigDto = serde_json::from_value(json!({
             "global": [{ "kind": "http_webhook", "url": "https://policy.example/guard" }]
         }))
-        .expect("shape should parse");
-        webhook
-            .validate()
-            .expect("http webhook guard should validate");
-    }
+			.expect("shape should parse");
+		webhook
+			.validate()
+			.expect("http webhook guard should validate");
+	}
 
-    #[test]
-    fn guardrails_dto_requires_external_guard_fields() {
-        let python: GuardrailsConfigDto = serde_json::from_value(json!({
+	#[test]
+	fn guardrails_dto_requires_external_guard_fields() {
+		let python: GuardrailsConfigDto = serde_json::from_value(json!({
             "global": [{ "kind": "python_script" }]
         }))
-        .expect("shape should parse");
-        assert!(python.validate().unwrap_err().contains("script_id"));
+			.expect("shape should parse");
+		assert!(python.validate().unwrap_err().contains("script_id"));
 
-        let webhook: GuardrailsConfigDto = serde_json::from_value(json!({
+		let webhook: GuardrailsConfigDto = serde_json::from_value(json!({
             "global": [{ "kind": "http_webhook" }]
         }))
-        .expect("shape should parse");
-        assert!(webhook.validate().unwrap_err().contains("url"));
-    }
+			.expect("shape should parse");
+		assert!(webhook.validate().unwrap_err().contains("url"));
+	}
 
-    #[test]
-    fn guardrails_dto_rejects_blank_inline_script() {
-        let dto: GuardrailsConfigDto = serde_json::from_value(json!({
+	#[test]
+	fn guardrails_dto_rejects_blank_inline_script() {
+		let dto: GuardrailsConfigDto = serde_json::from_value(json!({
             "global": [{ "kind": "python_script", "script": "  " }]
         }))
-        .expect("shape should parse");
-        assert!(dto.validate().unwrap_err().contains("script"));
-    }
+			.expect("shape should parse");
+		assert!(dto.validate().unwrap_err().contains("script"));
+	}
 
-    #[test]
-    fn guardrails_dto_rejects_both_script_and_id() {
-        let dto: GuardrailsConfigDto = serde_json::from_value(json!({
+	#[test]
+	fn guardrails_dto_rejects_both_script_and_id() {
+		let dto: GuardrailsConfigDto = serde_json::from_value(json!({
             "global": [{ "kind": "python_script", "script_id": 1, "script": "def check(ctx): pass" }]
         }))
-        .expect("shape should parse");
-        assert!(dto.validate().unwrap_err().contains("not both"));
-    }
+			.expect("shape should parse");
+		assert!(dto.validate().unwrap_err().contains("not both"));
+	}
 
-    #[test]
-    fn guardrails_dto_rejects_invalid_fail_behavior() {
-        let result = serde_json::from_value::<GuardrailsConfigDto>(json!({
+	#[test]
+	fn guardrails_dto_rejects_invalid_fail_behavior() {
+		let result = serde_json::from_value::<GuardrailsConfigDto>(json!({
             "global": [{ "kind": "http_webhook", "url": "https://x.co/g", "fail_behavior": "typo" }]
         }));
-        assert!(
-            result.is_err(),
-            "typo in fail_behavior should be rejected by serde"
-        );
-    }
+		assert!(
+			result.is_err(),
+			"typo in fail_behavior should be rejected by serde"
+		);
+	}
 
-    #[test]
-    fn guardrails_dto_rejects_non_http_url_scheme() {
-        let file_url: GuardrailsConfigDto = serde_json::from_value(json!({
+	#[test]
+	fn guardrails_dto_rejects_non_http_url_scheme() {
+		let file_url: GuardrailsConfigDto = serde_json::from_value(json!({
             "global": [{ "kind": "http_webhook", "url": "file:///etc/passwd" }]
         }))
-        .expect("shape should parse");
-        assert!(file_url.validate().unwrap_err().contains("http or https"));
+			.expect("shape should parse");
+		assert!(file_url.validate().unwrap_err().contains("http or https"));
 
-        let ftp_url: GuardrailsConfigDto = serde_json::from_value(json!({
+		let ftp_url: GuardrailsConfigDto = serde_json::from_value(json!({
             "global": [{ "kind": "http_webhook", "url": "ftp://evil.example" }]
         }))
-        .expect("shape should parse");
-        assert!(ftp_url.validate().unwrap_err().contains("http or https"));
-    }
+			.expect("shape should parse");
+		assert!(ftp_url.validate().unwrap_err().contains("http or https"));
+	}
 
-    #[test]
-    fn redact_access_control_secrets_strips_tokens() {
-        let mut v = json!({
+	#[test]
+	fn redact_access_control_secrets_strips_tokens() {
+		let mut v = json!({
             "enabled": true,
             "connections": {
                 "default": {
@@ -4093,19 +4091,19 @@ mod tests {
                 }
             }
         });
-        super::redact_access_control_secrets(&mut v);
-        let opa = v["connections"]["default"]["opa"].as_object().unwrap();
-        assert_eq!(opa.get("bearerToken"), None);
-        assert_eq!(opa["bearerTokenSet"], true);
-        let cc = opa["clientCredentials"].as_object().unwrap();
-        assert_eq!(cc.get("clientSecret"), None);
-        assert_eq!(cc["clientSecretSet"], true);
-        assert_eq!(cc["clientId"], "qf");
-    }
+		super::redact_access_control_secrets(&mut v);
+		let opa = v["connections"]["default"]["opa"].as_object().unwrap();
+		assert_eq!(opa.get("bearerToken"), None);
+		assert_eq!(opa["bearerTokenSet"], true);
+		let cc = opa["clientCredentials"].as_object().unwrap();
+		assert_eq!(cc.get("clientSecret"), None);
+		assert_eq!(cc["clientSecretSet"], true);
+		assert_eq!(cc["clientId"], "qf");
+	}
 
-    #[test]
-    fn redact_access_control_secrets_strips_cerbos_token() {
-        let mut v = json!({
+	#[test]
+	fn redact_access_control_secrets_strips_cerbos_token() {
+		let mut v = json!({
             "enabled": true,
             "connections": {
                 "default": {
@@ -4117,16 +4115,16 @@ mod tests {
                 }
             }
         });
-        super::redact_access_control_secrets(&mut v);
-        let cerbos = v["connections"]["default"]["cerbos"].as_object().unwrap();
-        assert_eq!(cerbos.get("bearerToken"), None);
-        assert_eq!(cerbos["bearerTokenSet"], true);
-    }
+		super::redact_access_control_secrets(&mut v);
+		let cerbos = v["connections"]["default"]["cerbos"].as_object().unwrap();
+		assert_eq!(cerbos.get("bearerToken"), None);
+		assert_eq!(cerbos["bearerTokenSet"], true);
+	}
 
-    #[test]
-    fn merge_access_control_secrets_keeps_previous_cerbos_token_when_blank_and_endpoint_unchanged()
-    {
-        let previous = json!({
+	#[test]
+	fn merge_access_control_secrets_keeps_previous_cerbos_token_when_blank_and_endpoint_unchanged()
+	{
+		let previous = json!({
             "connections": {
                 "default": {
                     "provider": "cerbos",
@@ -4134,7 +4132,7 @@ mod tests {
                 }
             }
         });
-        let mut incoming = json!({
+		let mut incoming = json!({
             "enabled": true,
             "connections": {
                 "default": {
@@ -4143,18 +4141,18 @@ mod tests {
                 }
             }
         });
-        super::merge_access_control_secrets(&mut incoming, &previous);
-        assert_eq!(
-            incoming["connections"]["default"]["cerbos"]["bearerToken"],
-            "keep-me"
-        );
-    }
+		super::merge_access_control_secrets(&mut incoming, &previous);
+		assert_eq!(
+			incoming["connections"]["default"]["cerbos"]["bearerToken"],
+			"keep-me"
+		);
+	}
 
-    /// Regression, mirroring the opa/clientCredentials case: a retained Cerbos bearer
-    /// token must not follow `cerbos.url` to a different, caller-redirected endpoint.
-    #[test]
-    fn merge_access_control_secrets_drops_cerbos_token_when_its_endpoint_changed() {
-        let previous = json!({
+	/// Regression, mirroring the opa/clientCredentials case: a retained Cerbos bearer
+	/// token must not follow `cerbos.url` to a different, caller-redirected endpoint.
+	#[test]
+	fn merge_access_control_secrets_drops_cerbos_token_when_its_endpoint_changed() {
+		let previous = json!({
             "connections": {
                 "default": {
                     "provider": "cerbos",
@@ -4162,7 +4160,7 @@ mod tests {
                 }
             }
         });
-        let mut incoming = json!({
+		let mut incoming = json!({
             "enabled": true,
             "connections": {
                 "default": {
@@ -4171,16 +4169,16 @@ mod tests {
                 }
             }
         });
-        super::merge_access_control_secrets(&mut incoming, &previous);
-        assert_eq!(
-            incoming["connections"]["default"]["cerbos"]["bearerToken"], "",
-            "bearerToken must not follow cerbos.url to a different endpoint"
-        );
-    }
+		super::merge_access_control_secrets(&mut incoming, &previous);
+		assert_eq!(
+			incoming["connections"]["default"]["cerbos"]["bearerToken"], "",
+			"bearerToken must not follow cerbos.url to a different endpoint"
+		);
+	}
 
-    #[test]
-    fn merge_access_control_secrets_keeps_previous_when_blank_and_endpoint_unchanged() {
-        let previous = json!({
+	#[test]
+	fn merge_access_control_secrets_keeps_previous_when_blank_and_endpoint_unchanged() {
+		let previous = json!({
             "connections": {
                 "default": {
                     "opa": {
@@ -4194,7 +4192,7 @@ mod tests {
                 }
             }
         });
-        let mut incoming = json!({
+		let mut incoming = json!({
             "enabled": true,
             "connections": {
                 "default": {
@@ -4206,25 +4204,25 @@ mod tests {
                 }
             }
         });
-        super::merge_access_control_secrets(&mut incoming, &previous);
-        assert_eq!(
-            incoming["connections"]["default"]["opa"]["bearerToken"],
-            "keep-me"
-        );
-        assert_eq!(
-            incoming["connections"]["default"]["opa"]["clientCredentials"]["clientSecret"],
-            "keep-secret"
-        );
-    }
+		super::merge_access_control_secrets(&mut incoming, &previous);
+		assert_eq!(
+			incoming["connections"]["default"]["opa"]["bearerToken"],
+			"keep-me"
+		);
+		assert_eq!(
+			incoming["connections"]["default"]["opa"]["clientCredentials"]["clientSecret"],
+			"keep-secret"
+		);
+	}
 
-    /// Regression: a retained secret is only ever POSTed to the endpoint it was set for.
-    /// Blanking the secret field while *also* redirecting `opa.url` /
-    /// `clientCredentials.tokenEndpoint` to a caller-controlled server must not carry the
-    /// old secret along to it — that would exfiltrate a deployment's OPA bearer token / OAuth2
-    /// client secret to wherever the caller named.
-    #[test]
-    fn merge_access_control_secrets_drops_secret_when_its_endpoint_changed() {
-        let previous = json!({
+	/// Regression: a retained secret is only ever POSTed to the endpoint it was set for.
+	/// Blanking the secret field while *also* redirecting `opa.url` /
+	/// `clientCredentials.tokenEndpoint` to a caller-controlled server must not carry the
+	/// old secret along to it — that would exfiltrate a deployment's OPA bearer token / OAuth2
+	/// client secret to wherever the caller named.
+	#[test]
+	fn merge_access_control_secrets_drops_secret_when_its_endpoint_changed() {
+		let previous = json!({
             "connections": {
                 "default": {
                     "opa": {
@@ -4238,7 +4236,7 @@ mod tests {
                 }
             }
         });
-        let mut incoming = json!({
+		let mut incoming = json!({
             "enabled": true,
             "connections": {
                 "default": {
@@ -4254,98 +4252,98 @@ mod tests {
                 }
             }
         });
-        super::merge_access_control_secrets(&mut incoming, &previous);
-        assert_eq!(
-            incoming["connections"]["default"]["opa"]["bearerToken"], "",
-            "bearerToken must not follow opa.url to a different endpoint"
-        );
-        assert_eq!(
-            incoming["connections"]["default"]["opa"]["clientCredentials"]["clientSecret"], "",
-            "clientSecret must not follow tokenEndpoint to a different endpoint"
-        );
-    }
+		super::merge_access_control_secrets(&mut incoming, &previous);
+		assert_eq!(
+			incoming["connections"]["default"]["opa"]["bearerToken"], "",
+			"bearerToken must not follow opa.url to a different endpoint"
+		);
+		assert_eq!(
+			incoming["connections"]["default"]["opa"]["clientCredentials"]["clientSecret"], "",
+			"clientSecret must not follow tokenEndpoint to a different endpoint"
+		);
+	}
 
-    #[test]
-    fn merge_access_control_secrets_leaves_new_connection_alone() {
-        // A brand-new connection (not present in `previous`) has nothing to merge from;
-        // its blank secret fields must be left as-is rather than panicking.
-        let previous = json!({
+	#[test]
+	fn merge_access_control_secrets_leaves_new_connection_alone() {
+		// A brand-new connection (not present in `previous`) has nothing to merge from;
+		// its blank secret fields must be left as-is rather than panicking.
+		let previous = json!({
             "connections": {
                 "default": { "opa": { "url": "https://opa", "bearerToken": "keep-me" } }
             }
         });
-        let mut incoming = json!({
+		let mut incoming = json!({
             "connections": {
                 "default": { "opa": { "url": "https://opa", "bearerToken": "" } },
                 "eu": { "opa": { "url": "https://eu-opa", "bearerToken": "" } }
             }
         });
-        super::merge_access_control_secrets(&mut incoming, &previous);
-        assert_eq!(
-            incoming["connections"]["default"]["opa"]["bearerToken"],
-            "keep-me"
-        );
-        assert_eq!(incoming["connections"]["eu"]["opa"]["bearerToken"], "");
-    }
+		super::merge_access_control_secrets(&mut incoming, &previous);
+		assert_eq!(
+			incoming["connections"]["default"]["opa"]["bearerToken"],
+			"keep-me"
+		);
+		assert_eq!(incoming["connections"]["eu"]["opa"]["bearerToken"], "");
+	}
 
-    #[test]
-    fn workers_behind_a_hub_are_in_sync_with_what_it_serves() {
-        let record = |v: serde_json::Value| -> queryflux_persistence::WorkerRecord {
-            serde_json::from_value(v).unwrap()
-        };
-        let workers = vec![
-            // Upstream named a history endpoint: the hub serves a re-sealed "cp-local".
-            record(serde_json::json!({
+	#[test]
+	fn workers_behind_a_hub_are_in_sync_with_what_it_serves() {
+		let record = |v: serde_json::Value| -> queryflux_persistence::WorkerRecord {
+			serde_json::from_value(v).unwrap()
+		};
+		let workers = vec![
+			// Upstream named a history endpoint: the hub serves a re-sealed "cp-local".
+			record(serde_json::json!({
                 "name": "dc1/hub", "kind": "hub", "labels": { "site": "dc1" },
                 "activeRevision": "cp", "status": { "servedRevision": "cp-local" }
             })),
-            record(serde_json::json!({
+			record(serde_json::json!({
                 "name": "dc1/w", "parent": "dc1", "activeRevision": "cp-local"
             })),
-            record(serde_json::json!({
+			record(serde_json::json!({
                 "name": "dc1/old", "parent": "dc1", "activeRevision": "older"
             })),
-            // Another site's hub doesn't vouch for this worker.
-            record(serde_json::json!({
+			// Another site's hub doesn't vouch for this worker.
+			record(serde_json::json!({
                 "name": "dc2/w", "parent": "dc2", "activeRevision": "cp-local"
             })),
-            record(serde_json::json!({ "name": "direct", "activeRevision": "cp" })),
-            record(serde_json::json!({ "name": "new" })),
-        ];
-        let none = std::collections::HashMap::new();
-        assert_eq!(
-            super::in_sync_flags(&workers, Some("cp"), &none),
-            vec![
-                Some(true),
-                Some(true),
-                Some(false),
-                Some(false),
-                Some(true),
-                None
-            ]
-        );
-        assert_eq!(super::in_sync_flags(&workers, None, &none), vec![None; 6]);
+			record(serde_json::json!({ "name": "direct", "activeRevision": "cp" })),
+			record(serde_json::json!({ "name": "new" })),
+		];
+		let none = std::collections::HashMap::new();
+		assert_eq!(
+			super::in_sync_flags(&workers, Some("cp"), &none),
+			vec![
+				Some(true),
+				Some(true),
+				Some(false),
+				Some(false),
+				Some(true),
+				None
+			]
+		);
+		assert_eq!(super::in_sync_flags(&workers, None, &none), vec![None; 6]);
 
-        // dc1 is limited to some clusters: its hub runs dc1's own revision.
-        let mut workers = workers;
-        workers[0].active_revision = Some("cp-dc1".into());
-        let per_site = std::collections::HashMap::from([("dc1".to_string(), "cp-dc1".to_string())]);
-        assert_eq!(
-            super::in_sync_flags(&workers, Some("cp"), &per_site),
-            vec![
-                Some(true),
-                Some(true),
-                Some(false),
-                Some(false),
-                Some(true),
-                None
-            ]
-        );
-        // Running the full revision is behind for a limited site.
-        workers[0].active_revision = Some("cp".into());
-        assert_eq!(
-            super::in_sync_flags(&workers, Some("cp"), &per_site)[..2],
-            [Some(false), Some(false)]
-        );
-    }
+		// dc1 is limited to some clusters: its hub runs dc1's own revision.
+		let mut workers = workers;
+		workers[0].active_revision = Some("cp-dc1".into());
+		let per_site = std::collections::HashMap::from([("dc1".to_string(), "cp-dc1".to_string())]);
+		assert_eq!(
+			super::in_sync_flags(&workers, Some("cp"), &per_site),
+			vec![
+				Some(true),
+				Some(true),
+				Some(false),
+				Some(false),
+				Some(true),
+				None
+			]
+		);
+		// Running the full revision is behind for a limited site.
+		workers[0].active_revision = Some("cp".into());
+		assert_eq!(
+			super::in_sync_flags(&workers, Some("cp"), &per_site)[..2],
+			[Some(false), Some(false)]
+		);
+	}
 }

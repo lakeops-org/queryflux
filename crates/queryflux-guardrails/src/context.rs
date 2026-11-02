@@ -59,7 +59,6 @@ pub struct GuardContext<'a> {
     pub schema: Option<&'a SchemaContext>,
     /// Shared parse cache from dispatch, built from `sql` + `dialect` above. When set,
     /// guards must not re-parse SQL.
-    //pub sql_parse: Option<&'a SqlParseCache>,
     pub sql_parse: Option<Arc<SqlParseCache>>,
 }
 
