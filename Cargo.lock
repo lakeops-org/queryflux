@@ -5642,6 +5642,7 @@ dependencies = [
  "futures",
  "polyglot-sql",
  "prost 0.14.3",
+ "pyo3",
  "queryflux-access-control",
  "queryflux-auth",
  "queryflux-cache",

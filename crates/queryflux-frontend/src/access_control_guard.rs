@@ -62,7 +62,7 @@ pub enum AccessStageOutcome {
 pub async fn run_access_control_stage(
     guard: &OpaAccessGuard,
     // The source SQL and its parse, shared with the caller's other checks.
-    parse: &queryflux_sql::classify::SqlParseCache,
+    parse: &Arc<queryflux_sql::classify::SqlParseCache>,
     engine_type: &EngineType,
     group: &ClusterGroupName,
     auth_ctx: &AuthContext,
@@ -227,10 +227,10 @@ impl Guard for OpaAccessGuard {
             ExplainSplit::NotExplain => {}
             ExplainSplit::Inner(offset) => {
                 let inner = &ctx.sql[offset..];
-                let cache = queryflux_sql::classify::SqlParseCache::new(
+                let cache = Arc::new(queryflux_sql::classify::SqlParseCache::new(
                     inner.to_string(),
                     ctx.dialect.clone(),
-                );
+                ));
                 let inner_ctx = GuardContext {
                     sql: inner,
                     sql_parse: Some(&cache),
@@ -306,19 +306,19 @@ impl Guard for OpaAccessGuard {
         let schema = ctx.schema.unwrap_or(&empty_schema);
         // The query's shared parse, whose sqlglot tree the extraction and the rewrite below
         // both read.
-        let own_parse;
         let parse = match ctx.sql_parse {
-            Some(p) => p,
-            None => {
-                own_parse =
-                    queryflux_sql::classify::SqlParseCache::new(ctx.sql, ctx.dialect.clone());
-                &own_parse
-            }
+            Some(p) => Arc::clone(p),
+            None => Arc::new(queryflux_sql::classify::SqlParseCache::new(
+                ctx.sql,
+                ctx.dialect.clone(),
+            )),
         };
 
         // Only the parse is cached (keyed on the exact SQL, dialect and schema); every
         // decision below is still made for this query.
-        let statement = match queryflux_sql::extract_resources_cached(parse, schema) {
+        // A cache miss runs sqlglot on the blocking pool, so waiting for the GIL doesn't park
+        // an async worker.
+        let statement = match queryflux_sql::extract_resources_cached_async(&parse, schema).await {
             Ok(r) => r,
             // A query that can't be analyzed has no resources to put in a request, so it can't
             // be judged at all. `onMissingSchema` is about unresolved *columns* of tables that
@@ -600,13 +600,25 @@ impl Guard for OpaAccessGuard {
                 .join(","),
         );
 
-        let rewritten =
-            rewrite_table_scans_parsed(parse, schema, &policies).and_then(
-                |sql| match &write_scope {
-                    Some((_, filters)) => apply_write_filters(&sql, ctx.dialect, filters),
-                    None => Ok(sql),
-                },
-            );
+        // The rewrite takes the GIL too, so it runs on the blocking pool like the extraction.
+        let rewritten = {
+            let (schema, dialect) = (schema.clone(), ctx.dialect.clone());
+            let write_filters = write_scope.map(|(_, filters)| filters);
+            tokio::task::spawn_blocking(move || {
+                rewrite_table_scans_parsed(&parse, &schema, &policies).and_then(|sql| {
+                    match &write_filters {
+                        Some(filters) => apply_write_filters(&sql, &dialect, filters),
+                        None => Ok(sql),
+                    }
+                })
+            })
+            .await
+            .unwrap_or_else(|e| {
+                Err(queryflux_core::error::QueryFluxError::Translation(format!(
+                    "spawn_blocking error: {e}"
+                )))
+            })
+        };
         match rewritten {
             Ok(sql) => GuardResult::Rewrite {
                 sql,
@@ -1094,7 +1106,7 @@ mod tests {
         attributes: &'a BTreeMap<String, serde_json::Value>,
         query_tags: &'a QueryTags,
         session_extra: &'a HashMap<String, String>,
-        sql_parse: &'a SqlParseCache,
+        sql_parse: &'a Arc<SqlParseCache>,
         roles: &'a [String],
     ) -> GuardContext<'a> {
         GuardContext {
@@ -1172,7 +1184,7 @@ mod tests {
             let (attributes, query_tags, session_extra) =
                 (&attributes, &query_tags, &session_extra);
             async move {
-                let parse = SqlParseCache::new(sql.to_string(), dialect.clone());
+                let parse = Arc::new(SqlParseCache::new(sql.to_string(), dialect.clone()));
                 let ctx = GuardContext {
                     sql,
                     original_sql: None,
@@ -1266,7 +1278,7 @@ mod tests {
         let dialect = SqlDialect::Postgres;
         let engine_type = EngineType::Trino;
         let sql = "SELECT id FROM orders";
-        let sql_parse = SqlParseCache::new(sql.to_string(), dialect.clone());
+        let sql_parse = Arc::new(SqlParseCache::new(sql.to_string(), dialect.clone()));
         let attributes = BTreeMap::new();
         let query_tags = QueryTags::new();
         let session_extra = HashMap::new();
@@ -1339,7 +1351,7 @@ mod tests {
         let dialect = SqlDialect::Postgres;
         let engine_type = EngineType::Trino;
         let sql = "SELECT id FROM orders";
-        let sql_parse = SqlParseCache::new(sql.to_string(), dialect.clone());
+        let sql_parse = Arc::new(SqlParseCache::new(sql.to_string(), dialect.clone()));
         let attributes = BTreeMap::new();
         let query_tags = QueryTags::new();
         let session_extra = HashMap::new();
@@ -1398,7 +1410,7 @@ mod tests {
         let dialect = SqlDialect::Postgres;
         let engine_type = EngineType::Trino;
         let sql = "SELECT id FROM orders";
-        let sql_parse = SqlParseCache::new(sql.to_string(), dialect.clone());
+        let sql_parse = Arc::new(SqlParseCache::new(sql.to_string(), dialect.clone()));
         let attributes = BTreeMap::new();
         let query_tags = QueryTags::new();
         let session_extra = HashMap::new();
@@ -1452,7 +1464,7 @@ mod tests {
         let dialect = SqlDialect::Postgres;
         let engine_type = EngineType::Trino;
         let sql = "SELECT id FROM orders";
-        let sql_parse = SqlParseCache::new(sql.to_string(), dialect.clone());
+        let sql_parse = Arc::new(SqlParseCache::new(sql.to_string(), dialect.clone()));
         let attributes = BTreeMap::new();
         let query_tags = QueryTags::new();
         let session_extra = HashMap::new();
@@ -1512,7 +1524,7 @@ mod tests {
 
         let dialect = SqlDialect::Postgres;
         let engine_type = EngineType::Trino;
-        let sql_parse = SqlParseCache::new(sql.to_string(), dialect.clone());
+        let sql_parse = Arc::new(SqlParseCache::new(sql.to_string(), dialect.clone()));
         let attributes = BTreeMap::new();
         let query_tags = QueryTags::new();
         let session_extra = HashMap::new();
@@ -1585,6 +1597,134 @@ mod tests {
         }
     }
 
+    /// How long [`hold_gil`] keeps the GIL, standing in for a long translation or script.
+    const GIL_HOLD: std::time::Duration = std::time::Duration::from_millis(300);
+
+    /// Take the GIL on a plain thread and keep it for [`GIL_HOLD`]. Returns once it is held.
+    fn hold_gil() -> std::thread::JoinHandle<()> {
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            pyo3::Python::attach(|_py| {
+                held_tx.send(()).expect("signal held");
+                std::thread::sleep(GIL_HOLD);
+            })
+        });
+        held_rx.recv().expect("GIL taken");
+        holder
+    }
+
+    /// Both GIL users in the guard, the sqlglot extraction (on a cache miss) and the
+    /// row-filter rewrite, must wait for the GIL off the async worker. On a one-worker runtime
+    /// a ticker task has to keep firing while another thread holds the GIL through each step.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn waiting_for_the_gil_does_not_stall_the_async_worker() {
+        // Allows the table with a row filter, so the rewrite runs. Before answering, it has
+        // another thread take the GIL, so the rewrite has to wait for it.
+        async fn allow_with_filter(
+            Json(_body): Json<serde_json::Value>,
+        ) -> Json<serde_json::Value> {
+            tokio::task::spawn_blocking(|| drop(hold_gil()))
+                .await
+                .expect("hold GIL");
+            Json(serde_json::json!({
+                "result": {
+                    "resources": [{
+                        "table": "gil_wait_orders",
+                        "allow": true,
+                        "rowFilters": [{ "expression": "region = 'EU'" }],
+                    }]
+                }
+            }))
+        }
+        let app = Router::new().route("/v1/data/queryflux/access", post(allow_with_filter));
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind stub");
+        let url = format!("http://{}", listener.local_addr().expect("stub addr"));
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+        let cfg = AccessControlConfig {
+            enabled: true,
+            default_connection: Some("default".to_string()),
+            connections: HashMap::from([("default".to_string(), opa_connection(&url))]),
+            groups: HashMap::new(),
+        };
+        let guard = OpaAccessGuard::try_from_config(&cfg).expect("build guard");
+        // Load Python and sqlglot first, so the waits below are for the GIL, not the import.
+        let warm = SqlParseCache::new("SELECT 1 FROM gil_wait_warm".to_string(), SqlDialect::Trino);
+        let _ = queryflux_sql::extract_resources_cached(&warm, &SchemaContext::default());
+
+        // A statement nothing has extracted yet, so the extraction is a cache miss.
+        let sql = "SELECT id FROM gil_wait_orders";
+        let parse = Arc::new(SqlParseCache::new(sql.to_string(), SqlDialect::Trino));
+        parse.ensure_parsed().await;
+
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ticker = {
+            let stop = stop.clone();
+            tokio::spawn(async move {
+                let mut worst = std::time::Duration::ZERO;
+                let mut last = std::time::Instant::now();
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                    worst = worst.max(last.elapsed());
+                    last = std::time::Instant::now();
+                }
+                worst
+            })
+        };
+
+        let holder = tokio::task::spawn_blocking(hold_gil)
+            .await
+            .expect("hold GIL");
+        // Spawned, so the check runs on the runtime's only worker (the test body itself runs
+        // on the test thread) and any stall in it would starve the ticker.
+        let (result, check_took) = tokio::spawn(async move {
+            let (dialect, engine_type) = (SqlDialect::Trino, EngineType::Trino);
+            let group = ClusterGroupName("g".to_string());
+            let (attributes, query_tags, session_extra) =
+                (BTreeMap::new(), QueryTags::new(), HashMap::new());
+            let ctx = GuardContext {
+                sql,
+                original_sql: None,
+                dialect: &dialect,
+                engine_type: &engine_type,
+                cluster_group: &group,
+                user: Some("alice"),
+                groups: &[],
+                roles: &[],
+                attributes: &attributes,
+                agent_context: None,
+                query_tags: &query_tags,
+                session_extra: &session_extra,
+                schema: None,
+                sql_parse: Some(&parse),
+            };
+            let started = std::time::Instant::now();
+            let result = guard.check(&ctx).await;
+            (result, started.elapsed())
+        })
+        .await
+        .expect("check task");
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let worst = ticker.await.unwrap();
+        holder.join().expect("GIL holder");
+
+        assert!(
+            matches!(&result, GuardResult::Rewrite { sql, .. } if sql.contains("region")),
+            "{result:?}"
+        );
+        // The check really waited for the GIL twice (extraction, then rewrite) ...
+        assert!(
+            check_took >= GIL_HOLD * 3 / 2,
+            "the check took {check_took:?}, so it did not wait for the GIL"
+        );
+        // ... and the worker kept running other tasks the whole time.
+        assert!(
+            worst < GIL_HOLD / 2,
+            "the async worker was blocked for {worst:?} (check took {check_took:?})"
+        );
+    }
+
     /// An OPA stub that denies every table it is asked about.
     async fn start_deny_all_stub() -> String {
         async fn deny_all(Json(body): Json<serde_json::Value>) -> Json<serde_json::Value> {
@@ -1624,7 +1764,7 @@ mod tests {
         let group = ClusterGroupName("g".to_string());
         let (attributes, query_tags, session_extra) =
             (BTreeMap::new(), QueryTags::new(), HashMap::new());
-        let parse = SqlParseCache::new(sql.to_string(), dialect.clone());
+        let parse = Arc::new(SqlParseCache::new(sql.to_string(), dialect.clone()));
         let ctx = GuardContext {
             sql,
             original_sql: None,

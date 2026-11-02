@@ -232,6 +232,33 @@ impl ExtractionCache {
         self.extract_with(sql, src_dialect, schema, extract_resources)
     }
 
+    fn key(sql: &str, src_dialect: &SqlDialect, schema: &SchemaContext) -> ExtractionKey {
+        ExtractionKey {
+            sql: sql.to_string(),
+            dialect: dialect_kwarg(src_dialect),
+            schema: schema.content_hash(),
+        }
+    }
+
+    fn cacheable(&self, sql: &str) -> bool {
+        self.cache.is_enabled() && sql.len() <= MAX_CACHED_SQL_BYTES
+    }
+
+    /// The cached result for this key, if any. Takes no GIL.
+    fn lookup(
+        &self,
+        sql: &str,
+        src_dialect: &SqlDialect,
+        schema: &SchemaContext,
+    ) -> Option<ExtractedStatement> {
+        if !self.cacheable(sql) {
+            return None;
+        }
+        self.cache
+            .get(&Self::key(sql, src_dialect, schema))
+            .map(|hit| (*hit).clone())
+    }
+
     fn extract_with(
         &self,
         sql: &str,
@@ -239,12 +266,9 @@ impl ExtractionCache {
         schema: &SchemaContext,
         extract: impl FnOnce(&str, &SqlDialect, &SchemaContext) -> Result<ExtractedStatement>,
     ) -> Result<ExtractedStatement> {
-        let key =
-            (self.cache.is_enabled() && sql.len() <= MAX_CACHED_SQL_BYTES).then(|| ExtractionKey {
-                sql: sql.to_string(),
-                dialect: dialect_kwarg(src_dialect),
-                schema: schema.content_hash(),
-            });
+        let key = self
+            .cacheable(sql)
+            .then(|| Self::key(sql, src_dialect, schema));
         if let Some(hit) = key.as_ref().and_then(|k| self.cache.get(k)) {
             return Ok((*hit).clone());
         }
@@ -274,6 +298,22 @@ pub fn extract_resources_cached(
     EXTRACTION_CACHE.extract_with(parse.sql(), parse.dialect(), schema, |_, _, schema| {
         extract_resources_parsed(parse, schema)
     })
+}
+
+/// [`extract_resources_cached`] for async callers. A cache hit is answered on the calling
+/// task, since it takes no GIL; only a miss moves to the blocking pool, so waiting for the GIL
+/// (held by translation or a script) never parks an async worker.
+pub async fn extract_resources_cached_async(
+    parse: &Arc<SqlParseCache>,
+    schema: &SchemaContext,
+) -> Result<ExtractedStatement> {
+    if let Some(hit) = EXTRACTION_CACHE.lookup(parse.sql(), parse.dialect(), schema) {
+        return Ok(hit);
+    }
+    let (parse, schema) = (Arc::clone(parse), schema.clone());
+    tokio::task::spawn_blocking(move || extract_resources_cached(&parse, &schema))
+        .await
+        .map_err(|e| QueryFluxError::Translation(format!("spawn_blocking error: {e}")))?
 }
 
 /// Apply row filters and (pre-rendered, source-dialect) column-mask expressions at every
