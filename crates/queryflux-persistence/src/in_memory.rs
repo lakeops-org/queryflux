@@ -19,7 +19,7 @@ use crate::{
     metrics_store::{ClusterSnapshot, MetricsStore, QueryRecord},
     query_history::{
         AgentSummary, ConversationSummary, DashboardStats, EngineStatRow, GroupStatRow,
-        QueryFilters, QuerySummary,
+        HistogramBy, HistogramRow, QueryFilters, QuerySummary, TimeRange,
     },
     script_library::{
         is_valid_script_kind, UpsertUserScript, UserScriptRecord, KIND_TRANSLATION_FIXUP,
@@ -287,47 +287,43 @@ impl MetricsStore for InMemoryPersistence {
 impl QueryHistoryStore for InMemoryPersistence {
     async fn list_queries(&self, filters: &QueryFilters) -> Result<Vec<QuerySummary>> {
         let records = self.query_records.read().unwrap();
-        let mut results: Vec<&QuerySummary> = records
-            .iter()
-            .filter(|r| {
-                if let Some(s) = &filters.status {
-                    if !r.status.eq_ignore_ascii_case(s) {
-                        return false;
-                    }
-                }
-                if let Some(g) = &filters.cluster_group {
-                    if !r.cluster_group.eq_ignore_ascii_case(g) {
-                        return false;
-                    }
-                }
-                if let Some(w) = &filters.worker {
-                    if r.worker.as_deref() != Some(w.as_str()) {
-                        return false;
-                    }
-                }
-                if let Some(e) = &filters.engine {
-                    if !r.engine_type.eq_ignore_ascii_case(e) {
-                        return false;
-                    }
-                }
-                if let Some(search) = &filters.search {
-                    let needle = search.to_lowercase();
-                    if !r.sql_preview.to_lowercase().contains(&needle) {
-                        return false;
-                    }
-                }
-                true
-            })
-            .collect();
-
-        // Newest first
-        results.sort_by(|a, b| b.created_at.cmp(&a.created_at));
-
+        let mut results: Vec<&QuerySummary> =
+            records.iter().filter(|r| filters.matches(r)).collect();
+        // Newest first, ties by id: the order the keyset cursor pages through.
+        results.sort_by(|a, b| (b.created_at, b.id).cmp(&(a.created_at, a.id)));
         Ok(results
             .into_iter()
-            .skip(filters.offset as usize)
-            .take(filters.limit as usize)
+            .skip(filters.offset.max(0) as usize)
+            .take(filters.limit.max(0) as usize)
             .cloned()
+            .collect())
+    }
+
+    async fn query_histogram(
+        &self,
+        filters: &QueryFilters,
+        bucket_secs: i64,
+        by: HistogramBy,
+    ) -> Result<Vec<HistogramRow>> {
+        let records = self.query_records.read().unwrap();
+        let mut counts: std::collections::BTreeMap<(i64, String), i64> = Default::default();
+        for r in records.iter().filter(|r| filters.matches(r)) {
+            let t = r.created_at.timestamp();
+            let key = match by {
+                HistogramBy::Status => r.status.clone(),
+                HistogramBy::ClusterGroup => r.cluster_group.clone(),
+            };
+            *counts
+                .entry((t - t.rem_euclid(bucket_secs), key))
+                .or_default() += 1;
+        }
+        Ok(counts
+            .into_iter()
+            .map(|((bucket, key), count)| HistogramRow {
+                bucket: DateTime::from_timestamp(bucket, 0).unwrap_or_default(),
+                key,
+                count,
+            })
             .collect())
     }
 
@@ -360,13 +356,12 @@ impl QueryHistoryStore for InMemoryPersistence {
         })
     }
 
-    async fn get_engine_stats(&self, hours: i64) -> Result<Vec<EngineStatRow>> {
-        let cutoff = Utc::now() - chrono::Duration::hours(hours);
+    async fn get_engine_stats(&self, range: TimeRange) -> Result<Vec<EngineStatRow>> {
         let records = self.query_records.read().unwrap();
 
         let mut map: std::collections::HashMap<String, Vec<&QuerySummary>> =
             std::collections::HashMap::new();
-        for r in records.iter().filter(|r| r.created_at >= cutoff) {
+        for r in records.iter().filter(|r| range.contains(r.created_at)) {
             map.entry(r.engine_type.clone()).or_default().push(r);
         }
 
@@ -376,13 +371,12 @@ impl QueryHistoryStore for InMemoryPersistence {
             .collect())
     }
 
-    async fn get_group_stats(&self, hours: i64) -> Result<Vec<GroupStatRow>> {
-        let cutoff = Utc::now() - chrono::Duration::hours(hours);
+    async fn get_group_stats(&self, range: TimeRange) -> Result<Vec<GroupStatRow>> {
         let records = self.query_records.read().unwrap();
 
         let mut map: std::collections::HashMap<(String, String), Vec<&QuerySummary>> =
             std::collections::HashMap::new();
-        for r in records.iter().filter(|r| r.created_at >= cutoff) {
+        for r in records.iter().filter(|r| range.contains(r.created_at)) {
             map.entry((r.cluster_group.clone(), r.engine_type.clone()))
                 .or_default()
                 .push(r);
@@ -1753,5 +1747,177 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].proxy_query_id, "proxy-dedup");
         assert!(rows[0].status.contains("Failed"));
+    }
+
+    /// Time ranges, multi-value filters, the keyset cursor and the histogram agree.
+    #[tokio::test]
+    async fn history_filters_by_time_and_values_and_pages_by_cursor() {
+        use crate::query_history::{HistogramBy, QueryFilters};
+        use queryflux_core::query::{
+            ClusterGroupName, ClusterName, EngineType, FrontendProtocol, QueryStatus, SqlDialect,
+        };
+
+        let store = InMemoryPersistence::new();
+        let t0 = DateTime::parse_from_rfc3339("2026-10-27T10:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        // (minute, worker, user, status, cluster)
+        let rows = [
+            (
+                0,
+                "us-east-dc1/w0",
+                "alice",
+                QueryStatus::Success,
+                "trino::analytics",
+            ),
+            (
+                1,
+                "us-east-dc1/w1",
+                "bob",
+                QueryStatus::Failed,
+                "trino::etl",
+            ),
+            (1, "eu-west-vpc/w2", "alice", QueryStatus::Success, "duckdb"),
+            (2, "gw-0", "carol", QueryStatus::Cancelled, "trino-other"),
+            (
+                3,
+                "us-east-dc1/w0",
+                "bob",
+                QueryStatus::Success,
+                "trino::analytics",
+            ),
+        ];
+        for (i, (min, worker, user, status, cluster)) in rows.into_iter().enumerate() {
+            store
+                .record_query(QueryRecord {
+                    proxy_query_id: format!("q{i}"),
+                    backend_query_id: None,
+                    cluster_group: ClusterGroupName("g".into()),
+                    cluster_name: ClusterName(cluster.into()),
+                    cluster_group_config_id: None,
+                    cluster_config_id: None,
+                    engine_type: EngineType::Undispatched,
+                    frontend_protocol: FrontendProtocol::TrinoHttp,
+                    source_dialect: SqlDialect::Trino,
+                    target_dialect: SqlDialect::Generic,
+                    was_rewritten: false,
+                    rewritten_sql: None,
+                    was_translated: false,
+                    translation: None,
+                    translated_sql: None,
+                    user: Some(user.into()),
+                    catalog: None,
+                    database: None,
+                    sql_preview: format!("SELECT {i}"),
+                    status,
+                    routing_trace: None,
+                    queue_duration_ms: 0,
+                    execution_duration_ms: 1,
+                    rows_returned: None,
+                    error_message: None,
+                    created_at: t0 + chrono::Duration::minutes(min),
+                    engine_stats: None,
+                    query_tags: Default::default(),
+                    query_hash: None,
+                    query_parameterized_hash: None,
+                    fast_hash: None,
+                    translated_query_hash: None,
+                    digest_text: None,
+                    translated_digest_text: None,
+                    agent_id: None,
+                    conversation_id: None,
+                    step_index: None,
+                    tool_call_id: None,
+                    query_intent: None,
+                    guard_actions: vec![],
+                    was_guard_blocked: false,
+                    cache_hit: false,
+                    worker: Some(worker.into()),
+                })
+                .await
+                .unwrap();
+        }
+        let ids = |f: &QueryFilters| {
+            let store = &store;
+            let f = f.clone();
+            async move {
+                store
+                    .list_queries(&f)
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .map(|r| r.proxy_query_id)
+                    .collect::<Vec<_>>()
+            }
+        };
+        let base = QueryFilters {
+            limit: 50,
+            ..Default::default()
+        };
+
+        // [10:01, 10:03): newest first, ties by id.
+        let range = QueryFilters {
+            from: Some(t0 + chrono::Duration::minutes(1)),
+            to: Some(t0 + chrono::Duration::minutes(3)),
+            ..base.clone()
+        };
+        assert_eq!(ids(&range).await, ["q3", "q2", "q1"]);
+
+        // Any value of a filter; all filters. A `site/` worker means everything behind that hub,
+        // and a cluster matches its variants.
+        let f = QueryFilters {
+            worker: vec!["us-east-dc1/".into()],
+            ..base.clone()
+        };
+        assert_eq!(ids(&f).await, ["q4", "q1", "q0"]);
+        let f = QueryFilters {
+            status: vec!["failed".into(), "CANCELLED".into()],
+            ..base.clone()
+        };
+        assert_eq!(ids(&f).await, ["q3", "q1"]);
+        let f = QueryFilters {
+            cluster: vec!["trino".into()],
+            user: vec!["bob".into()],
+            ..base.clone()
+        };
+        assert_eq!(
+            ids(&f).await,
+            ["q4", "q1"],
+            "trino-other is not a variant of trino"
+        );
+
+        // Paging with the cursor visits every row once.
+        let mut seen = vec![];
+        let mut page = QueryFilters {
+            limit: 2,
+            ..base.clone()
+        };
+        loop {
+            let rows = store.list_queries(&page).await.unwrap();
+            let Some(last) = rows.last() else { break };
+            page.before = Some(last.created_at);
+            page.before_id = Some(last.id);
+            seen.extend(rows.into_iter().map(|r| r.proxy_query_id));
+        }
+        assert_eq!(seen, ["q4", "q3", "q2", "q1", "q0"]);
+
+        // Per minute, by status.
+        let hist = store
+            .query_histogram(&base, 60, HistogramBy::Status)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| ((r.bucket - t0).num_minutes(), r.key, r.count))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            hist,
+            [
+                (0, "Success".into(), 1),
+                (1, "Failed".into(), 1),
+                (1, "Success".into(), 1),
+                (2, "Cancelled".into(), 1),
+                (3, "Success".into(), 1),
+            ]
+        );
     }
 }

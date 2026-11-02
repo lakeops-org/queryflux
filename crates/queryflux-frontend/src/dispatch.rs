@@ -477,6 +477,11 @@ pub async fn dispatch_query(
     // Access control: runs on the SOURCE SQL, before dialect translation — every guard
     // decision (including row filters / column masks) is intent-level and answerable from
     // what the client actually sent. See `access_control_guard::run_access_control_stage`.
+    if let Some(guard) = &access_control_guard {
+        if guard.applies_to_group(&group.0) {
+            crate::access_control_guard::drop_unchecked_session_sql(&mut session);
+        }
+    }
     let mut all_guard_actions: Vec<queryflux_persistence::GuardAction> = Vec::new();
     let mut access_control_rewrote = false;
     let access_controlled_sql = if let Some(guard) = &access_control_guard {
@@ -1847,6 +1852,11 @@ async fn setup_sync_query(
     // Access control: runs on the SOURCE SQL, before dialect translation (see the async
     // dispatch path for the full rationale). On deny: record the query, release the slot,
     // propagate. On rewrite: `access_controlled_sql` replaces `sql` for translation below.
+    if let Some(guard) = &access_control_guard {
+        if guard.applies_to_group(&group.0) {
+            crate::access_control_guard::drop_unchecked_session_sql(&mut session);
+        }
+    }
     let mut pre_guard_actions: Vec<queryflux_persistence::GuardAction> = Vec::new();
     let mut access_control_rewrote = false;
     let access_controlled_sql = if let Some(guard) = &access_control_guard {
