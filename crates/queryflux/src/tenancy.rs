@@ -346,6 +346,9 @@ async fn platform_dispatch(State(gw): State<Arc<Gateway>>, req: Request) -> Resp
     else {
         return (StatusCode::BAD_REQUEST, "X-QueryFlux-Tenant is required").into_response();
     };
+    let mut req = req;
+    req.extensions_mut()
+        .insert(queryflux_frontend::admin_access::PlatformCaller);
     // A tenant added through another replica may not be running here yet.
     if !gw.running.read().await.contains_key(&id) && valid_tenant_id(&id) {
         if let Err(e) = gw.reconcile().await {

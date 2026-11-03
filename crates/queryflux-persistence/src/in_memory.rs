@@ -70,6 +70,10 @@ pub struct InMemoryPersistence {
 
     // --- workers registered with this control plane ---
     workers: DashMap<String, crate::WorkerRecord>,
+
+    // --- admin API tokens and audit log ---
+    pub(crate) admin_tokens: std::sync::Mutex<Vec<crate::admin_access::AdminToken>>,
+    pub(crate) admin_audit: std::sync::Mutex<Vec<crate::admin_access::AdminAuditEntry>>,
 }
 
 impl Default for InMemoryPersistence {
@@ -91,6 +95,8 @@ impl Default for InMemoryPersistence {
             published_running_counts: DashMap::default(),
             cache_entries: DashMap::default(),
             workers: DashMap::default(),
+            admin_tokens: Default::default(),
+            admin_audit: Default::default(),
         }
     }
 }

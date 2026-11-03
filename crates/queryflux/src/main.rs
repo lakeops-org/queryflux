@@ -921,6 +921,7 @@ pub(crate) async fn run(
         app_state.result_cache.clone(),
         app_state.clone(),
     );
+    let admin = admin.with_basic_auth(config.queryflux.admin_api.basic_auth);
     let admin = match worker_api {
         Some(api) => admin.with_worker_api(api),
         None => admin,
@@ -1121,9 +1122,9 @@ pub(crate) async fn run(
             async move { ops.listen(rx).await }
         });
     } else if let Some(router) = tenant_router {
-        // The gateway authenticates platform callers, and serves only `/worker/*` (hub
-        // and worker auth) on its public listener.
-        let _ = router.send(admin.router_behind_gateway());
+        // The gateway marks the platform callers it authenticated, and serves only
+        // `/worker/*` (hub and worker auth) on its public listener.
+        let _ = router.send(admin.router());
     } else {
         frontend_tasks.spawn("Admin", {
             let rx = shutdown_rx.clone();

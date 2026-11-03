@@ -1708,6 +1708,10 @@ pub struct AdminApiConfig {
     /// is a security risk in production).
     #[serde(default)]
     pub cors_allowed_origins: Vec<String>,
+    /// Accept the admin user's basic auth. Turn it off once admin tokens
+    /// (`POST /admin/tokens`) or a platform gateway are in place.
+    #[serde(default = "default_true")]
+    pub basic_auth: bool,
 }
 
 fn default_admin_port() -> u16 {
@@ -1729,6 +1733,7 @@ impl Default for AdminApiConfig {
             username: default_admin_username(),
             password: default_admin_password(),
             cors_allowed_origins: Vec::new(),
+            basic_auth: true,
         }
     }
 }
