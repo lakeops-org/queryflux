@@ -124,6 +124,9 @@ pub(crate) fn health_targets_from_groups(
 /// Returns a list of human-readable issue strings (empty = valid). Callers should
 /// treat any non-empty return as a fatal config error and keep the previous LiveConfig.
 ///
+/// `has_configured_groups` is true when any group exists in config (including disabled);
+/// `group_members` lists enabled groups only — routers and the fallback may only target those.
+///
 /// Checks:
 ///  - `routing_fallback` names a group that exists in `group_members`.
 ///  - Every static `target_group` reference in `routers_cfg` names a group in `group_members`.
@@ -132,15 +135,13 @@ pub(crate) fn health_targets_from_groups(
 pub(crate) fn validate_live_config_refs(
     routers_cfg: &[queryflux_core::config::RouterConfig],
     routing_fallback: &str,
+    has_configured_groups: bool,
     group_members: &HashMap<String, Vec<String>>,
     adapters: &HashMap<String, queryflux_engine_adapters::AdapterKind>,
 ) -> Vec<String> {
-    let mut issues = router_ref_issues(
-        routers_cfg,
-        routing_fallback,
-        !group_members.is_empty(),
-        |g| group_members.contains_key(g),
-    );
+    let mut issues = router_ref_issues(routers_cfg, routing_fallback, has_configured_groups, |g| {
+        group_members.contains_key(g)
+    });
     for (group, members) in group_members {
         for member in members {
             if !adapters.contains_key(member.as_str()) {
@@ -1210,6 +1211,7 @@ pub(crate) async fn compile_live_config(
     let issues = validate_live_config_refs(
         &inputs.routers,
         &inputs.routing_fallback,
+        !inputs.groups.is_empty(),
         &group_members,
         &cache.adapters,
     );

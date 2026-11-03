@@ -37,7 +37,16 @@ impl TenantRegistry {
         )
         .await?;
         // ponytail: one table, created in place rather than through the migration set
-        // that every tenant schema runs.
+        // that every tenant schema runs. Concurrent replicas race CREATE TABLE IF NOT
+        // EXISTS (duplicate pg_type), so serialize with a transaction-scoped advisory lock.
+        let mut tx = pool.begin().await.map_err(err)?;
+        sqlx::query(
+            "SELECT pg_advisory_xact_lock(\
+             hashtext(current_schema() || ':queryflux_tenants')::bigint)",
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(err)?;
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS queryflux_tenants (
                 id TEXT PRIMARY KEY,
@@ -45,9 +54,10 @@ impl TenantRegistry {
                 created_at TIMESTAMPTZ NOT NULL DEFAULT now()
             )",
         )
-        .execute(&pool)
+        .execute(&mut *tx)
         .await
         .map_err(err)?;
+        tx.commit().await.map_err(err)?;
         Ok(Self { pool })
     }
 

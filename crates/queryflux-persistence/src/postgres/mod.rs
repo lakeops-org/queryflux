@@ -2277,13 +2277,18 @@ impl PostgresStore {
     /// their query a slot. One extra connection, opened the first time a query waits.
     async fn ensure_grant_listener(&self) {
         let url = self.database_url.clone();
-        let waiters = self.grant_waiters.clone();
+        // Weak so this task does not keep grant_waiters (and thus the store) alive after
+        // the owning PostgresStore is dropped — e.g. a tenant that stops.
+        let waiters = Arc::downgrade(&self.grant_waiters);
         self.grant_listener
             .get_or_init(|| async move {
                 tokio::spawn(async move {
                     const MAX_BACKOFF: std::time::Duration = std::time::Duration::from_secs(30);
                     let mut backoff = std::time::Duration::from_secs(1);
                     loop {
+                        if waiters.strong_count() == 0 {
+                            return;
+                        }
                         let mut listener = match sqlx::postgres::PgListener::connect(&url).await {
                             Ok(l) => l,
                             Err(e) => {
@@ -2304,10 +2309,23 @@ impl PostgresStore {
                         backoff = std::time::Duration::from_secs(1);
                         // A notification missed while reconnecting only delays its waiter
                         // until its timeout, when it retries the acquire and claims the slot.
-                        while let Ok(n) = listener.recv().await {
-                            for id in n.payload().split(' ') {
-                                if let Some(w) = waiters.get(id) {
-                                    w.notify_one();
+                        // Poll the Weak while waiting: recv alone would hold the task open
+                        // after the store is gone until the next notification or disconnect.
+                        loop {
+                            tokio::select! {
+                                result = listener.recv() => {
+                                    let Ok(n) = result else { break };
+                                    let Some(waiters) = waiters.upgrade() else { return };
+                                    for id in n.payload().split(' ') {
+                                        if let Some(w) = waiters.get(id) {
+                                            w.notify_one();
+                                        }
+                                    }
+                                }
+                                _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {
+                                    if waiters.strong_count() == 0 {
+                                        return;
+                                    }
                                 }
                             }
                         }

@@ -242,15 +242,10 @@ jobs:
             | xargs -r -n1 rustup toolchain uninstall
           rustup toolchain list
 
-      # Only main saves: a PR cache is ~1.3 GB, and per-PR saves push the repo past the
-      # 10 GB Actions cache limit, evicting main's cache that every PR restores from.
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: queryflux
-          cache-on-failure: true
-          cache-all-crates: true
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-
+      # Python before rust-cache: pyo3 embeds the interpreter's LIBDIR in build output.
+      # A patch bump (3.14.9 → 3.14.10) leaves cached artifacts linking against a removed
+      # path, and mold fails with "library not found: python3.14". Key the cache on the
+      # full version and always pass the live LIBDIR on the link line.
       - uses: actions/setup-python@v5
         with:
           python-version: "3.14"
@@ -265,6 +260,19 @@ jobs:
           .venv/bin/python3 -m pip install -r requirements.txt
           echo "PYO3_PYTHON=${GITHUB_WORKSPACE}/.venv/bin/python3" >> "$GITHUB_ENV"
           echo "PYTHONPATH=$(.venv/bin/python3 -c 'import site; print(site.getsitepackages()[0])')" >> "$GITHUB_ENV"
+          PY_VER=$(.venv/bin/python3 -c 'import sys; print("%d.%d.%d" % sys.version_info[:3])')
+          PY_LIB=$(.venv/bin/python3 -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR"))')
+          echo "PYTHON_VERSION_FULL=${PY_VER}" >> "$GITHUB_ENV"
+          echo "RUSTFLAGS=${RUSTFLAGS} -L native=${PY_LIB}" >> "$GITHUB_ENV"
+
+      # Only main saves: a PR cache is ~1.3 GB, and per-PR saves push the repo past the
+      # 10 GB Actions cache limit, evicting main's cache that every PR restores from.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: queryflux-py${{ env.PYTHON_VERSION_FULL }}
+          cache-on-failure: true
+          cache-all-crates: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       # Clippy first — fail fast before tests or E2E. --all-targets compiles test crates once for later steps.
       # Exclude queryflux-bench: duplicate link of main stack; bench.yml builds it weekly.

@@ -115,10 +115,18 @@ with its hub's `site`:
 ```
 
 Another service that receives what hubs send, such as a query-history receiver, can
-verify their tokens with any JWT library: check the signature, `aud: queryflux-worker-api`
-and `exp`. It then knows which hub and site sent each request, without reading the
-control plane's tables. A revoked hub drops out of the set within 10 seconds, so cache it
-for no longer than its `Cache-Control` allows.
+verify their tokens with any JWT library. Require:
+
+- signature (EdDSA against the JWKS key whose `kid` matches the token header)
+- `aud: queryflux-worker-api`
+- `sub` equals `kid` (the hub id)
+- `exp - iat` at most 600 seconds
+- `iat` not more than 60 seconds in the future
+- `exp` not in the past (allow ~60 seconds of clock skew)
+
+It then knows which hub and site sent each request, without reading the control plane's
+tables. A revoked hub drops out of the set within 10 seconds, so cache it for no longer
+than its `Cache-Control` allows.
 
 On a [multi-tenant control plane](./worker-mode.md#one-control-plane-for-many-tenants),
 each tenant has its own set. It is served on the platform listener

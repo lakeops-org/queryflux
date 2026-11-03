@@ -239,6 +239,8 @@ impl<F: std::future::Future> InstrumentTenant for F {}
 /// plane with no query listeners (the gateway serves its API).
 fn tenant_config(template: &ProxyConfig, schema: &str) -> ProxyConfig {
     let mut config = template.clone();
+    // A shared secret would let one tenant's workers into every other tenant.
+    config.queryflux.worker_secret = None;
     if let PersistenceConfig::Postgres { conn } = &mut config.queryflux.persistence {
         conn.schema = Some(schema.to_string());
     }
@@ -415,9 +417,20 @@ async fn put_tenant(
             .into_response();
     }
     let body = body.map(|Json(b)| b).unwrap_or_default();
-    let schema = body
-        .schema
-        .unwrap_or_else(|| format!("tenant_{}", id.replace('-', "_")));
+    // Default schema is `tenant_<id>` (7-char prefix); ids longer than 56 make it exceed
+    // Postgres' 63-char identifier limit in `pinned_schema`.
+    let schema = match body.schema {
+        Some(s) => s,
+        None if id.len() > 56 => {
+            return (
+                StatusCode::BAD_REQUEST,
+                "tenant id must be at most 56 characters when no schema is given \
+                 (default schema is tenant_<id>)",
+            )
+                .into_response();
+        }
+        None => format!("tenant_{}", id.replace('-', "_")),
+    };
     let check = queryflux_core::config::PostgresPersistenceConfig {
         schema: Some(schema.clone()),
         ..Default::default()
@@ -490,7 +503,7 @@ mod tests {
     #[test]
     fn a_tenant_runs_as_a_plain_control_plane_in_its_schema() {
         let template: ProxyConfig = serde_yaml::from_str(
-            "queryflux:\n  role: controlPlane\n  frontends:\n    trinoHttp: { enabled: true, port: 8080 }\n  persistence: { type: postgres, url: postgres://x/y }\n  controlPlane:\n    tenancy: { hostSuffix: .cp.example.com }\n",
+            "queryflux:\n  role: controlPlane\n  workerSecret: shared\n  frontends:\n    trinoHttp: { enabled: true, port: 8080 }\n  persistence: { type: postgres, url: postgres://x/y }\n  controlPlane:\n    tenancy: { hostSuffix: .cp.example.com }\n",
         )
         .unwrap();
         let c = tenant_config(&template, "tenant_acme");
@@ -498,6 +511,7 @@ mod tests {
             panic!("postgres")
         };
         assert_eq!(conn.schema.as_deref(), Some("tenant_acme"));
+        assert!(c.queryflux.worker_secret.is_none());
         assert!(c.queryflux.control_plane.unwrap().tenancy.is_none());
         assert!(!crate::startup::tasks::serves_queries(
             &c.queryflux.frontends
