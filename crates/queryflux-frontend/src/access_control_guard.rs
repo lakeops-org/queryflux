@@ -27,6 +27,21 @@ use queryflux_sql::{
 
 use queryflux_auth::AuthContext;
 
+/// Client header carrying the text of Trino prepared statements, as `name=sql` pairs.
+const TRINO_PREPARED_STATEMENT_HEADER: &str = "x-trino-prepared-statement";
+
+/// Drop session data that would let the engine run SQL the guard never saw. A Trino client
+/// sends the text of its prepared statements in `X-Trino-Prepared-Statement`, and Trino
+/// resolves `EXECUTE q`, `DESCRIBE INPUT q`, `DESCRIBE OUTPUT q` and the like against it,
+/// while the guard only sees the statement body. Without the header those statements fail on
+/// the engine instead of running unchecked SQL. Call this whenever
+/// [`OpaAccessGuard::applies_to_group`] holds, before the session reaches an adapter.
+pub fn drop_unchecked_session_sql(session: &mut SessionContext) {
+    session
+        .extra
+        .retain(|k, _| !k.eq_ignore_ascii_case(TRINO_PREPARED_STATEMENT_HEADER));
+}
+
 /// Outcome of the pre-translation access-control stage.
 pub enum AccessStageOutcome {
     /// Query may proceed unchanged. `action` is recorded for audit.
@@ -47,7 +62,7 @@ pub enum AccessStageOutcome {
 pub async fn run_access_control_stage(
     guard: &OpaAccessGuard,
     // The source SQL and its parse, shared with the caller's other checks.
-    parse: &queryflux_sql::classify::SqlParseCache,
+    parse: &Arc<queryflux_sql::classify::SqlParseCache>,
     engine_type: &EngineType,
     group: &ClusterGroupName,
     auth_ctx: &AuthContext,
@@ -138,6 +153,15 @@ impl OpaAccessGuard {
         self.config.connection_name_for_group(group)
     }
 
+    /// Whether this guard judges queries for `group`: enabled, a connection resolves, and
+    /// that connection evaluates at least one operation.
+    pub fn applies_to_group(&self, group: &str) -> bool {
+        self.enabled_for_group(group)
+            && self
+                .connection_for_group(group)
+                .is_some_and(|c| evaluates_anything(&c.controller))
+    }
+
     fn connection_for_group(&self, group: &str) -> Option<&ConnectionRuntime> {
         self.connection_name_for_group(group)
             .and_then(|name| self.connections.get(name))
@@ -203,10 +227,10 @@ impl Guard for OpaAccessGuard {
             ExplainSplit::NotExplain => {}
             ExplainSplit::Inner(offset) => {
                 let inner = &ctx.sql[offset..];
-                let cache = queryflux_sql::classify::SqlParseCache::new(
+                let cache = Arc::new(queryflux_sql::classify::SqlParseCache::new(
                     inner.to_string(),
                     ctx.dialect.clone(),
-                );
+                ));
                 let inner_ctx = GuardContext {
                     sql: inner,
                     sql_parse: Some(&cache),
@@ -229,6 +253,20 @@ impl Guard for OpaAccessGuard {
                 } else {
                     GuardResult::allow()
                 };
+            }
+        }
+
+        // Statements that run SQL other than their own text: `EXECUTE` (a prepared statement
+        // or `EXECUTE IMMEDIATE '<sql>'`), `PREPARE`, PostgreSQL `DO`, procedural blocks, and
+        // `CALL`. The tables that SQL touches are never in front of us, so none of them can
+        // be judged. `CALL` is left to the policy when `procedure.call` is evaluated, since
+        // the policy then decides which procedures may run.
+        if let Some(kind) = runs_sql_it_does_not_show(ctx.sql, &conn.controller) {
+            if evaluates_anything(&conn.controller) {
+                return GuardResult::deny(
+                    format!("access control: {kind} statements are not supported"),
+                    "ACCESS_UNSUPPORTED_STATEMENT",
+                );
             }
         }
 
@@ -268,19 +306,19 @@ impl Guard for OpaAccessGuard {
         let schema = ctx.schema.unwrap_or(&empty_schema);
         // The query's shared parse, whose sqlglot tree the extraction and the rewrite below
         // both read.
-        let own_parse;
         let parse = match ctx.sql_parse {
-            Some(p) => p,
-            None => {
-                own_parse =
-                    queryflux_sql::classify::SqlParseCache::new(ctx.sql, ctx.dialect.clone());
-                &own_parse
-            }
+            Some(p) => Arc::clone(p),
+            None => Arc::new(queryflux_sql::classify::SqlParseCache::new(
+                ctx.sql,
+                ctx.dialect.clone(),
+            )),
         };
 
         // Only the parse is cached (keyed on the exact SQL, dialect and schema); every
         // decision below is still made for this query.
-        let statement = match queryflux_sql::extract_resources_cached(parse, schema) {
+        // A cache miss runs sqlglot on the blocking pool, so waiting for the GIL doesn't park
+        // an async worker.
+        let statement = match queryflux_sql::extract_resources_cached_async(&parse, schema).await {
             Ok(r) => r,
             // A query that can't be analyzed has no resources to put in a request, so it can't
             // be judged at all. `onMissingSchema` is about unresolved *columns* of tables that
@@ -562,13 +600,25 @@ impl Guard for OpaAccessGuard {
                 .join(","),
         );
 
-        let rewritten =
-            rewrite_table_scans_parsed(parse, schema, &policies).and_then(
-                |sql| match &write_scope {
-                    Some((_, filters)) => apply_write_filters(&sql, ctx.dialect, filters),
-                    None => Ok(sql),
-                },
-            );
+        // The rewrite takes the GIL too, so it runs on the blocking pool like the extraction.
+        let rewritten = {
+            let (schema, dialect) = (schema.clone(), ctx.dialect.clone());
+            let write_filters = write_scope.map(|(_, filters)| filters);
+            tokio::task::spawn_blocking(move || {
+                rewrite_table_scans_parsed(&parse, &schema, &policies).and_then(|sql| {
+                    match &write_filters {
+                        Some(filters) => apply_write_filters(&sql, &dialect, filters),
+                        None => Ok(sql),
+                    }
+                })
+            })
+            .await
+            .unwrap_or_else(|e| {
+                Err(queryflux_core::error::QueryFluxError::Translation(format!(
+                    "spawn_blocking error: {e}"
+                )))
+            })
+        };
         match rewritten {
             Ok(sql) => GuardResult::Rewrite {
                 sql,
@@ -630,6 +680,49 @@ fn classify_operation(stmts: Option<&[Expression]>, sql: &str) -> Operation {
         Some(_) => Operation("statement.other".to_string()),
         None if queryflux_sql::classify::is_read_like_fallback(sql) => Operation::table_select(),
         None => Operation("statement.other".to_string()),
+    }
+}
+
+/// Words that may follow `BEGIN` when it starts a transaction rather than a procedural block
+/// (PostgreSQL, MySQL, Snowflake, SQL Server, SQLite forms).
+const BEGIN_TRANSACTION_WORDS: &[&str] = &[
+    "transaction",
+    "work",
+    "tran",
+    "isolation",
+    "read",
+    "deferrable",
+    "not",
+    "name",
+    "deferred",
+    "immediate",
+    "exclusive",
+    "distributed",
+];
+
+/// The kind of statement, if `sql` runs SQL that is not its own text: `EXECUTE …`,
+/// `PREPARE …`, `DO …`, a procedural block (`BEGIN … END`, `DECLARE …`), or `CALL …` when
+/// the connection does not evaluate `procedure.call`.
+fn runs_sql_it_does_not_show(sql: &str, controller: &AccessController) -> Option<&'static str> {
+    let s = queryflux_sql::classify::strip_leading_sql_comments(sql);
+    let head = word_at(s).to_ascii_lowercase();
+    match head.as_str() {
+        // `EXEC` is SQL Server's spelling.
+        "execute" | "exec" => Some("EXECUTE"),
+        "prepare" => Some("PREPARE"),
+        "do" => Some("DO"),
+        "declare" => Some("procedural block"),
+        "begin" => {
+            let rest = queryflux_sql::classify::strip_leading_sql_comments(&s[head.len()..]);
+            let next = word_at(rest).to_ascii_lowercase();
+            let rest_is_empty =
+                queryflux_sql::classify::strip_leading_sql_comments(rest.trim_start_matches(';'))
+                    .is_empty();
+            (!rest_is_empty && !BEGIN_TRANSACTION_WORDS.contains(&next.as_str()))
+                .then_some("procedural block")
+        }
+        "call" if !controller.evaluates(&Operation("procedure.call".to_string())) => Some("CALL"),
+        _ => None,
     }
 }
 
@@ -1013,7 +1106,7 @@ mod tests {
         attributes: &'a BTreeMap<String, serde_json::Value>,
         query_tags: &'a QueryTags,
         session_extra: &'a HashMap<String, String>,
-        sql_parse: &'a SqlParseCache,
+        sql_parse: &'a Arc<SqlParseCache>,
         roles: &'a [String],
     ) -> GuardContext<'a> {
         GuardContext {
@@ -1091,7 +1184,7 @@ mod tests {
             let (attributes, query_tags, session_extra) =
                 (&attributes, &query_tags, &session_extra);
             async move {
-                let parse = SqlParseCache::new(sql.to_string(), dialect.clone());
+                let parse = Arc::new(SqlParseCache::new(sql.to_string(), dialect.clone()));
                 let ctx = GuardContext {
                     sql,
                     original_sql: None,
@@ -1185,7 +1278,7 @@ mod tests {
         let dialect = SqlDialect::Postgres;
         let engine_type = EngineType::Trino;
         let sql = "SELECT id FROM orders";
-        let sql_parse = SqlParseCache::new(sql.to_string(), dialect.clone());
+        let sql_parse = Arc::new(SqlParseCache::new(sql.to_string(), dialect.clone()));
         let attributes = BTreeMap::new();
         let query_tags = QueryTags::new();
         let session_extra = HashMap::new();
@@ -1258,7 +1351,7 @@ mod tests {
         let dialect = SqlDialect::Postgres;
         let engine_type = EngineType::Trino;
         let sql = "SELECT id FROM orders";
-        let sql_parse = SqlParseCache::new(sql.to_string(), dialect.clone());
+        let sql_parse = Arc::new(SqlParseCache::new(sql.to_string(), dialect.clone()));
         let attributes = BTreeMap::new();
         let query_tags = QueryTags::new();
         let session_extra = HashMap::new();
@@ -1317,7 +1410,7 @@ mod tests {
         let dialect = SqlDialect::Postgres;
         let engine_type = EngineType::Trino;
         let sql = "SELECT id FROM orders";
-        let sql_parse = SqlParseCache::new(sql.to_string(), dialect.clone());
+        let sql_parse = Arc::new(SqlParseCache::new(sql.to_string(), dialect.clone()));
         let attributes = BTreeMap::new();
         let query_tags = QueryTags::new();
         let session_extra = HashMap::new();
@@ -1371,7 +1464,7 @@ mod tests {
         let dialect = SqlDialect::Postgres;
         let engine_type = EngineType::Trino;
         let sql = "SELECT id FROM orders";
-        let sql_parse = SqlParseCache::new(sql.to_string(), dialect.clone());
+        let sql_parse = Arc::new(SqlParseCache::new(sql.to_string(), dialect.clone()));
         let attributes = BTreeMap::new();
         let query_tags = QueryTags::new();
         let session_extra = HashMap::new();
@@ -1431,7 +1524,7 @@ mod tests {
 
         let dialect = SqlDialect::Postgres;
         let engine_type = EngineType::Trino;
-        let sql_parse = SqlParseCache::new(sql.to_string(), dialect.clone());
+        let sql_parse = Arc::new(SqlParseCache::new(sql.to_string(), dialect.clone()));
         let attributes = BTreeMap::new();
         let query_tags = QueryTags::new();
         let session_extra = HashMap::new();
@@ -1502,5 +1595,278 @@ mod tests {
             }
             other => panic!("expected a rewrite with filter + mask, got {other:?}"),
         }
+    }
+
+    /// How long [`hold_gil`] keeps the GIL, standing in for a long translation or script.
+    const GIL_HOLD: std::time::Duration = std::time::Duration::from_millis(300);
+
+    /// Take the GIL on a plain thread and keep it for [`GIL_HOLD`]. Returns once it is held.
+    fn hold_gil() -> std::thread::JoinHandle<()> {
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            pyo3::Python::attach(|_py| {
+                held_tx.send(()).expect("signal held");
+                std::thread::sleep(GIL_HOLD);
+            })
+        });
+        held_rx.recv().expect("GIL taken");
+        holder
+    }
+
+    /// Both GIL users in the guard, the sqlglot extraction (on a cache miss) and the
+    /// row-filter rewrite, must wait for the GIL off the async worker. On a one-worker runtime
+    /// a ticker task has to keep firing while another thread holds the GIL through each step.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn waiting_for_the_gil_does_not_stall_the_async_worker() {
+        // Allows the table with a row filter, so the rewrite runs. Before answering, it has
+        // another thread take the GIL, so the rewrite has to wait for it.
+        async fn allow_with_filter(
+            Json(_body): Json<serde_json::Value>,
+        ) -> Json<serde_json::Value> {
+            tokio::task::spawn_blocking(|| drop(hold_gil()))
+                .await
+                .expect("hold GIL");
+            Json(serde_json::json!({
+                "result": {
+                    "resources": [{
+                        "table": "gil_wait_orders",
+                        "allow": true,
+                        "rowFilters": [{ "expression": "region = 'EU'" }],
+                    }]
+                }
+            }))
+        }
+        let app = Router::new().route("/v1/data/queryflux/access", post(allow_with_filter));
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind stub");
+        let url = format!("http://{}", listener.local_addr().expect("stub addr"));
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+        let cfg = AccessControlConfig {
+            enabled: true,
+            default_connection: Some("default".to_string()),
+            connections: HashMap::from([("default".to_string(), opa_connection(&url))]),
+            groups: HashMap::new(),
+        };
+        let guard = OpaAccessGuard::try_from_config(&cfg).expect("build guard");
+        // Load Python and sqlglot first, so the waits below are for the GIL, not the import.
+        let warm = SqlParseCache::new("SELECT 1 FROM gil_wait_warm".to_string(), SqlDialect::Trino);
+        let _ = queryflux_sql::extract_resources_cached(&warm, &SchemaContext::default());
+
+        // A statement nothing has extracted yet, so the extraction is a cache miss.
+        let sql = "SELECT id FROM gil_wait_orders";
+        let parse = Arc::new(SqlParseCache::new(sql.to_string(), SqlDialect::Trino));
+        parse.ensure_parsed().await;
+
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ticker = {
+            let stop = stop.clone();
+            tokio::spawn(async move {
+                let mut worst = std::time::Duration::ZERO;
+                let mut last = std::time::Instant::now();
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                    worst = worst.max(last.elapsed());
+                    last = std::time::Instant::now();
+                }
+                worst
+            })
+        };
+
+        let holder = tokio::task::spawn_blocking(hold_gil)
+            .await
+            .expect("hold GIL");
+        // Spawned, so the check runs on the runtime's only worker (the test body itself runs
+        // on the test thread) and any stall in it would starve the ticker.
+        let (result, check_took) = tokio::spawn(async move {
+            let (dialect, engine_type) = (SqlDialect::Trino, EngineType::Trino);
+            let group = ClusterGroupName("g".to_string());
+            let (attributes, query_tags, session_extra) =
+                (BTreeMap::new(), QueryTags::new(), HashMap::new());
+            let ctx = GuardContext {
+                sql,
+                original_sql: None,
+                dialect: &dialect,
+                engine_type: &engine_type,
+                cluster_group: &group,
+                user: Some("alice"),
+                groups: &[],
+                roles: &[],
+                attributes: &attributes,
+                agent_context: None,
+                query_tags: &query_tags,
+                session_extra: &session_extra,
+                schema: None,
+                sql_parse: Some(&parse),
+            };
+            let started = std::time::Instant::now();
+            let result = guard.check(&ctx).await;
+            (result, started.elapsed())
+        })
+        .await
+        .expect("check task");
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let worst = ticker.await.unwrap();
+        holder.join().expect("GIL holder");
+
+        assert!(
+            matches!(&result, GuardResult::Rewrite { sql, .. } if sql.contains("region")),
+            "{result:?}"
+        );
+        // The check really waited for the GIL twice (extraction, then rewrite) ...
+        assert!(
+            check_took >= GIL_HOLD * 3 / 2,
+            "the check took {check_took:?}, so it did not wait for the GIL"
+        );
+        // ... and the worker kept running other tasks the whole time.
+        assert!(
+            worst < GIL_HOLD / 2,
+            "the async worker was blocked for {worst:?} (check took {check_took:?})"
+        );
+    }
+
+    /// An OPA stub that denies every table it is asked about.
+    async fn start_deny_all_stub() -> String {
+        async fn deny_all(Json(body): Json<serde_json::Value>) -> Json<serde_json::Value> {
+            let resources: Vec<serde_json::Value> = body["input"]["action"]["resources"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|r| serde_json::json!({ "table": r["table"], "allow": false }))
+                .collect();
+            Json(serde_json::json!({ "result": { "resources": resources } }))
+        }
+        let app = Router::new().route("/v1/data/queryflux/access", post(deny_all));
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind stub");
+        let url = format!("http://{}", listener.local_addr().expect("stub addr"));
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+        url
+    }
+
+    fn guard_for(url: &str, operations: Option<&[&str]>) -> Arc<OpaAccessGuard> {
+        let mut conn = opa_connection(url);
+        if let Some(ops) = operations {
+            conn.operations = ops.iter().map(|o| o.to_string()).collect();
+        }
+        let cfg = AccessControlConfig {
+            enabled: true,
+            default_connection: Some("default".to_string()),
+            connections: HashMap::from([("default".to_string(), conn)]),
+            groups: HashMap::new(),
+        };
+        OpaAccessGuard::try_from_config(&cfg).expect("build guard")
+    }
+
+    async fn check_trino(guard: &OpaAccessGuard, sql: &str) -> GuardResult {
+        let (dialect, engine_type) = (SqlDialect::Trino, EngineType::Trino);
+        let group = ClusterGroupName("g".to_string());
+        let (attributes, query_tags, session_extra) =
+            (BTreeMap::new(), QueryTags::new(), HashMap::new());
+        let parse = Arc::new(SqlParseCache::new(sql.to_string(), dialect.clone()));
+        let ctx = GuardContext {
+            sql,
+            original_sql: None,
+            dialect: &dialect,
+            engine_type: &engine_type,
+            cluster_group: &group,
+            user: Some("bob"),
+            groups: &[],
+            roles: &[],
+            attributes: &attributes,
+            agent_context: None,
+            query_tags: &query_tags,
+            session_extra: &session_extra,
+            schema: None,
+            sql_parse: Some(&parse),
+        };
+        guard.check(&ctx).await
+    }
+
+    fn deny_code(result: &GuardResult) -> Option<&str> {
+        match result {
+            GuardResult::Deny { code, .. } => code.as_deref(),
+            _ => None,
+        }
+    }
+
+    /// Statements that run SQL other than their own text (a prepared statement, a string,
+    /// a `DO` body, a procedural block, a procedure) can't have their tables checked, so
+    /// the guard refuses them by kind rather than letting them through with no tables.
+    #[tokio::test]
+    async fn statements_that_run_unseen_sql_are_refused() {
+        let url = start_deny_all_stub().await;
+        let guard = guard_for(&url, None);
+
+        // Control: the table itself is denied by the policy.
+        assert_eq!(
+            deny_code(&check_trino(&guard, "SELECT * FROM salaries").await),
+            Some("ACCESS_DENIED")
+        );
+        for sql in [
+            "EXECUTE q",
+            "execute q USING 1",
+            "EXEC build_report",
+            "/* x */ EXECUTE q",
+            "-- run it\nEXECUTE q",
+            "PREPARE q FROM SELECT * FROM salaries",
+            "EXECUTE IMMEDIATE 'SELECT * FROM salaries'",
+            "DO $$ BEGIN EXECUTE 'INSERT INTO x SELECT * FROM payroll'; END $$",
+            "BEGIN EXECUTE IMMEDIATE 'SELECT * FROM payroll'; END",
+            "DECLARE c CURSOR FOR SELECT 1; BEGIN OPEN c; END",
+            "CALL build_report()",
+        ] {
+            assert_eq!(
+                deny_code(&check_trino(&guard, sql).await),
+                Some("ACCESS_UNSUPPORTED_STATEMENT"),
+                "{sql} must be refused as unsupported"
+            );
+        }
+        // Transaction control and table-free statements are unaffected.
+        for sql in [
+            "BEGIN",
+            "BEGIN;",
+            "BEGIN; -- start",
+            "BEGIN /* x */;",
+            "BEGIN TRANSACTION",
+            "begin work",
+            "SELECT 1",
+        ] {
+            assert!(
+                matches!(check_trino(&guard, sql).await, GuardResult::Allow { .. }),
+                "{sql} must be allowed"
+            );
+        }
+    }
+
+    /// With `procedure.call` evaluated, the policy decides which procedures may run, so
+    /// `CALL` is judged on its procedure instead of refused outright.
+    #[tokio::test]
+    async fn call_goes_to_the_policy_when_procedure_call_is_evaluated() {
+        let url = start_deny_all_stub().await;
+        let guard = guard_for(&url, Some(&["table.select", "procedure.call"]));
+        let result = check_trino(&guard, "CALL build_report()").await;
+        assert_eq!(deny_code(&result), Some("ACCESS_DENIED"));
+    }
+
+    #[test]
+    fn prepared_statement_text_is_dropped_from_the_session() {
+        let mut session = SessionContext::default();
+        session.extra.insert(
+            "x-trino-prepared-statement".to_string(),
+            "q=SELECT+*+FROM+payroll".to_string(),
+        );
+        session
+            .extra
+            .insert("X-Trino-Prepared-Statement".to_string(), "r=x".to_string());
+        session
+            .extra
+            .insert("x-trino-catalog".to_string(), "hive".to_string());
+        drop_unchecked_session_sql(&mut session);
+        assert_eq!(
+            session.extra.keys().collect::<Vec<_>>(),
+            vec!["x-trino-catalog"]
+        );
     }
 }

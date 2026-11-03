@@ -29,7 +29,10 @@ use crate::{
         ClusterConfigRecord, ClusterGroupConfigRecord, UpsertClusterConfig,
         UpsertClusterGroupConfig,
     },
-    query_history::{DashboardStats, EngineStatRow, GroupStatRow, QueryFilters},
+    query_history::{
+        DashboardStats, EngineStatRow, GroupStatRow, HistogramBy, HistogramRow, QueryFilters,
+        TimeRange,
+    },
 };
 
 // Re-export so callers can do `queryflux_persistence::MetricsStore` etc.
@@ -58,8 +61,17 @@ pub trait Persistence: Send + Sync {
     // --- Executing queries (submitted to an engine backend) ---
     async fn upsert(&self, query: ExecutingQuery) -> Result<()>;
     async fn get(&self, id: &BackendQueryId) -> Result<Option<ExecutingQuery>>;
-    async fn delete(&self, id: &BackendQueryId) -> Result<()>;
+    /// Remove an executing query. `true` when this call removed it, `false` when it was
+    /// already gone, so concurrent callers can tell which of them ended the query.
+    async fn delete(&self, id: &BackendQueryId) -> Result<bool>;
     async fn list_all(&self) -> Result<Vec<ExecutingQuery>>;
+    /// Set `last_accessed` of an executing query, if it is still recorded. Update-only: a
+    /// poll that refreshes a query a cancel just ended must not bring its record back.
+    async fn touch_executing_last_accessed(
+        &self,
+        id: &BackendQueryId,
+        at: DateTime<Utc>,
+    ) -> Result<()>;
 
     // --- Queued queries (waiting for cluster capacity) ---
     async fn upsert_queued(&self, query: QueuedQuery) -> Result<()>;
@@ -113,17 +125,27 @@ pub trait Persistence: Send + Sync {
 /// history page, dashboard stats, engine/group breakdowns) must implement this.
 #[async_trait]
 pub trait QueryHistoryStore: Send + Sync {
-    /// Paginated, filterable list of past queries — newest first.
+    /// Paginated, filterable list of past queries — newest first (`created_at`, then `id`).
     async fn list_queries(&self, filters: &QueryFilters) -> Result<Vec<QuerySummary>>;
+
+    /// Query counts per `bucket_secs` bucket, split by `by`, for the queries `filters`
+    /// matches (paging fields are ignored). Buckets are aligned to the Unix epoch and only
+    /// non-empty ones are returned.
+    async fn query_histogram(
+        &self,
+        filters: &QueryFilters,
+        bucket_secs: i64,
+        by: HistogramBy,
+    ) -> Result<Vec<HistogramRow>>;
 
     /// Aggregated stats for the last hour (used by the dashboard).
     async fn get_dashboard_stats(&self) -> Result<DashboardStats>;
 
-    /// Per-engine aggregated stats over the last `hours` hours.
-    async fn get_engine_stats(&self, hours: i64) -> Result<Vec<EngineStatRow>>;
+    /// Per-engine aggregated stats over `range`.
+    async fn get_engine_stats(&self, range: TimeRange) -> Result<Vec<EngineStatRow>>;
 
-    /// Per-cluster-group aggregated stats over the last `hours` hours.
-    async fn get_group_stats(&self, hours: i64) -> Result<Vec<GroupStatRow>>;
+    /// Per-cluster-group aggregated stats over `range`.
+    async fn get_group_stats(&self, range: TimeRange) -> Result<Vec<GroupStatRow>>;
 
     /// Distinct engine type strings that appear in the query log.
     async fn list_engines(&self) -> Result<Vec<String>>;
