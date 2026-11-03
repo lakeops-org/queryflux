@@ -30,6 +30,7 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
 axum = { workspace = true }
+tower = { version = "0.5", features = ["util"] }
 chrono = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }
