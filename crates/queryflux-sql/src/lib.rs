@@ -15,9 +15,10 @@ pub use eligibility::is_cacheable;
 use queryflux_core::bounded_cache::{BoundedCache, ContentHasher, MAX_CACHED_SQL_BYTES};
 
 pub use access::{
-    apply_write_filters, extract_resources, extract_resources_cached, extraction_cache,
-    render_mask, rewrite_table_scans, rewrite_table_scans_parsed, ExtractedResource,
-    ExtractedStatement, MaskRenderError, TablePolicy,
+    apply_write_filters, extract_resources, extract_resources_cached,
+    extract_resources_cached_async, extraction_cache, render_mask, rewrite_table_scans,
+    rewrite_table_scans_parsed, ExtractedResource, ExtractedStatement, MaskRenderError,
+    TablePolicy,
 };
 
 use std::collections::HashMap;

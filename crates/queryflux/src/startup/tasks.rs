@@ -277,6 +277,11 @@ pub(crate) fn spawn_zombie_sweep(
                             "Evicting zombie executing query — not polled for >5 min"
                         );
 
+                        // A poll or cancel may have ended it meanwhile; then it's done.
+                        if !state.end_executing_query(&q).await {
+                            continue;
+                        }
+
                         // Best-effort cancel on the backend with cluster credentials
                         // (same path as client/admin cancel). The previous unauthenticated
                         // DELETE on `/v1/statement/executing/...` did not stop secured Trino.
@@ -313,11 +318,6 @@ pub(crate) fn spawn_zombie_sweep(
                                 "No adapter available for zombie cancel"
                             );
                         }
-
-                        state
-                            .release_query_slot(&q.cluster_group, &q.cluster_name, &q.id.0)
-                            .await;
-                        let _ = state.persistence.delete(&q.backend_query_id).await;
                     }
                 }
 

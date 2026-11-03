@@ -477,6 +477,11 @@ pub async fn dispatch_query(
     // Access control: runs on the SOURCE SQL, before dialect translation — every guard
     // decision (including row filters / column masks) is intent-level and answerable from
     // what the client actually sent. See `access_control_guard::run_access_control_stage`.
+    if let Some(guard) = &access_control_guard {
+        if guard.applies_to_group(&group.0) {
+            crate::access_control_guard::drop_unchecked_session_sql(&mut session);
+        }
+    }
     let mut all_guard_actions: Vec<queryflux_persistence::GuardAction> = Vec::new();
     let mut access_control_rewrote = false;
     let access_controlled_sql = if let Some(guard) = &access_control_guard {
@@ -696,7 +701,7 @@ pub async fn dispatch_query(
 
     // Guard chain: runs after translation (SQL is final), before engine submission.
     // Global guards run first; per-group guards are appended after.
-    let sql_parse = engine_parse;
+    let sql_parse = Arc::new(engine_parse);
 
     let guard_ctx = GuardContext {
         sql: &engine_sql,
@@ -1589,7 +1594,7 @@ struct SyncQuerySetup {
     /// Guard actions collected by the guard chain (allow/warn). Merged into QueryOutcome.
     guard_actions: Vec<queryflux_persistence::GuardAction>,
     /// Shared SQL parse cache — used by guardrails and execution hints.
-    sql_parse: queryflux_sql::classify::SqlParseCache,
+    sql_parse: Arc<queryflux_sql::classify::SqlParseCache>,
     /// The wire auth resolved at submit time — reused by `SyncCancelGuard` so a client
     /// disconnect cancels with the same identity the query was submitted under.
     wire_auth: Option<StoredWireAuth>,
@@ -1847,6 +1852,11 @@ async fn setup_sync_query(
     // Access control: runs on the SOURCE SQL, before dialect translation (see the async
     // dispatch path for the full rationale). On deny: record the query, release the slot,
     // propagate. On rewrite: `access_controlled_sql` replaces `sql` for translation below.
+    if let Some(guard) = &access_control_guard {
+        if guard.applies_to_group(&group.0) {
+            crate::access_control_guard::drop_unchecked_session_sql(&mut session);
+        }
+    }
     let mut pre_guard_actions: Vec<queryflux_persistence::GuardAction> = Vec::new();
     let mut access_control_rewrote = false;
     let access_controlled_sql = if let Some(guard) = &access_control_guard {
@@ -2117,7 +2127,7 @@ async fn setup_sync_query(
     Ok(SyncQuerySetup {
         adapter,
         translated: engine_parse.sql().to_string(),
-        sql_parse: engine_parse,
+        sql_parse: Arc::new(engine_parse),
         start,
         slot,
         ctx,
@@ -2430,10 +2440,10 @@ async fn run_plan_guards(
 ) -> std::result::Result<Vec<queryflux_persistence::GuardAction>, String> {
     let engine_type = queryflux_core::query::EngineType::Cache;
     let resolved_agent_ctx = session.resolved_agent_context();
-    let sql_parse = queryflux_sql::classify::SqlParseCache::new(
+    let sql_parse = Arc::new(queryflux_sql::classify::SqlParseCache::new(
         sql.to_string(),
         queryflux_core::query::SqlDialect::Generic,
-    );
+    ));
     let guard_ctx = GuardContext {
         sql,
         original_sql: None,

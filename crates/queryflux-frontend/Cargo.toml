@@ -47,3 +47,7 @@ anyhow = { workspace = true }
 rmcp = { version = "3", features = ["server", "transport-streamable-http-server", "transport-streamable-http-server-session"] }
 schemars = "1"
 tokio-util = "0.7"
+
+[dev-dependencies]
+# Tests hold the GIL from a plain thread to check that sqlglot work never parks a worker.
+pyo3 = { workspace = true }
