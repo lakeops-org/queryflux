@@ -43,8 +43,8 @@ curl -X POST http://localhost:8080/v1/statement \
   -d "SELECT 42"
 ```
 
-:::tip Server-only image
-The default image tag includes **Studio** on port `3000`. For a server-only deployment, set `image.tag` to a tag ending in `-slim`.
+:::tip Studio sidecar
+The chart runs **Studio** as a sidecar (`studio.enabled`, default `true`) from `ghcr.io/lakeops-org/queryflux-studio`. The server image is server-only. Set `studio.enabled: false` (and turn off `service.ports.studio`) for a server-only deployment.
 :::
 
 ## Configure QueryFlux

@@ -3,7 +3,7 @@
 # Canonical QueryFlux Docker build. Edit this file only.
 #
 # Builds the QueryFlux server image (runtime-server): Rust server + Python venv + DuckDB + dbc CLI.
-# Published as ghcr.io/lakeops-org/queryflux:<version> / :latest (also :<version>-slim / :latest-slim).
+# Published as ghcr.io/lakeops-org/queryflux:<version> / :latest.
 #
 # Studio is not part of this image: run ghcr.io/lakeops-org/queryflux-studio next to it
 # (a separate compose service, or the Helm chart's `studio` sidecar) with ADMIN_API_URL
