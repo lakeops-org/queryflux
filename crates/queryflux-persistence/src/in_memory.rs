@@ -70,6 +70,10 @@ pub struct InMemoryPersistence {
 
     // --- workers registered with this control plane ---
     workers: DashMap<String, crate::WorkerRecord>,
+
+    // --- admin API tokens and audit log ---
+    pub(crate) admin_tokens: std::sync::Mutex<Vec<crate::admin_access::AdminToken>>,
+    pub(crate) admin_audit: std::sync::Mutex<Vec<crate::admin_access::AdminAuditEntry>>,
 }
 
 impl Default for InMemoryPersistence {
@@ -91,6 +95,8 @@ impl Default for InMemoryPersistence {
             published_running_counts: DashMap::default(),
             cache_entries: DashMap::default(),
             workers: DashMap::default(),
+            admin_tokens: Default::default(),
+            admin_audit: Default::default(),
         }
     }
 }
@@ -972,6 +978,14 @@ impl ConfigRevisionStore for InMemoryPersistence {
 
     async fn bump_revision(&self) -> Result<u64> {
         Ok(self.config_revision.fetch_add(1, Ordering::Relaxed) + 1)
+    }
+
+    async fn bump_revision_if(&self, expected: u64) -> Result<Option<u64>> {
+        Ok(self
+            .config_revision
+            .compare_exchange(expected, expected + 1, Ordering::SeqCst, Ordering::SeqCst)
+            .ok()
+            .map(|r| r + 1))
     }
 
     async fn subscribe_revisions(&self) -> Result<Option<tokio::sync::mpsc::Receiver<u64>>> {

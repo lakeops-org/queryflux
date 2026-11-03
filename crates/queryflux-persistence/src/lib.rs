@@ -1,3 +1,4 @@
+pub mod admin_access;
 pub mod batched_release;
 pub mod cache_store;
 pub mod cluster_config;
@@ -326,6 +327,11 @@ pub trait ConfigRevisionStore: Send + Sync {
     /// Must be called inside (or immediately after) every admin write.
     async fn bump_revision(&self) -> Result<u64>;
 
+    /// Increment the revision only if it is still `expected`: the new revision, or `None`
+    /// when it moved. A conditional write claims its revision with this before writing,
+    /// so of two writers that read the same revision only one proceeds.
+    async fn bump_revision_if(&self, expected: u64) -> Result<Option<u64>>;
+
     /// Return a receiver that yields the new revision each time it changes.
     /// `None` means push is not supported; callers should poll
     /// [`Self::current_revision`] on a timer instead.
@@ -520,7 +526,8 @@ pub trait BackendCapabilities: Send + Sync {
 /// supertrait here means `AdminFrontend` only needs one `Arc<dyn AdminStore>`
 /// and the compiler enforces that every method group is present.
 pub trait AdminStore:
-    QueryHistoryStore
+    admin_access::AdminAccessStore
+    + QueryHistoryStore
     + ClusterConfigStore
     + ScriptLibraryStore
     + ProxySettingsStore
@@ -534,7 +541,8 @@ pub trait AdminStore:
 /// Blanket implementation: any type that satisfies all component traits
 /// automatically satisfies `AdminStore`, so implementors only need the components.
 impl<
-        T: QueryHistoryStore
+        T: admin_access::AdminAccessStore
+            + QueryHistoryStore
             + ClusterConfigStore
             + ScriptLibraryStore
             + ProxySettingsStore

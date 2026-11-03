@@ -888,6 +888,7 @@ async fn main() -> Result<()> {
         app_state.result_cache.clone(),
         app_state.clone(),
     );
+    let admin = admin.with_basic_auth(config.queryflux.admin_api.basic_auth);
     let admin = match worker_api {
         Some(api) => admin.with_worker_api(api),
         None => admin,
