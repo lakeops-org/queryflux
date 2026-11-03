@@ -157,7 +157,7 @@ These callers can authenticate to the admin API (the Studio UI and `/admin/*`):
 |---|---|---|
 | The admin user | Basic auth: `adminApi.username`/`password`, or the password changed in Studio. Set `adminApi.basicAuth: false` to turn it off. | All |
 | Automation | `Authorization: Bearer qfa_…`, a token from `POST /admin/tokens` | The ones it was created with |
-| A platform gateway | An in-process gateway that already authenticated the caller and marked the request with `PlatformCaller` | All, or only those listed in `X-QueryFlux-Scopes` |
+| A platform gateway | A [multi-tenant control plane](./operations/worker-mode.md#one-control-plane-for-many-tenants)'s platform listener, for the callers it authenticated | All, or only those listed in `X-QueryFlux-Scopes` |
 
 **Scopes**
 | Scope | Allows |

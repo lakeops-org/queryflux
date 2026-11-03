@@ -5,9 +5,9 @@
 //!   changed through the API). It has every scope. Off with `adminApi.basicAuth: false`.
 //! - **A bearer token** from `POST /admin/tokens`, with the scopes it was created with.
 //! - **The platform**: a gateway in this process that has already authenticated the
-//!   caller marks the request with [`PlatformCaller`]. It has every scope unless
-//!   `X-QueryFlux-Scopes` narrows them, and may name who it acts for in
-//!   `X-QueryFlux-Actor`. Nobody else can set either.
+//!   caller marks the request with [`PlatformCaller`] (a multi-tenant control plane's
+//!   platform listener). It has every scope unless `X-QueryFlux-Scopes` narrows them, and
+//!   may name who it acts for in `X-QueryFlux-Actor`. Nobody else can set either.
 //!
 //! Every route needs one [`Scope`] ([`required_scope`]). Every write is recorded in the
 //! audit log (`GET /admin/audit`).
