@@ -2309,23 +2309,28 @@ impl PostgresStore {
                         backoff = std::time::Duration::from_secs(1);
                         // A notification missed while reconnecting only delays its waiter
                         // until its timeout, when it retries the acquire and claims the slot.
-                        // Poll the Weak while waiting: recv alone would hold the task open
-                        // after the store is gone until the next notification or disconnect.
+                        // Keep each recv future pinned across cleanup ticks: sqlx may
+                        // reconnect inside it, and cancelling that every second would miss
+                        // handovers. Exit when the store is gone (Weak hits zero).
                         loop {
-                            tokio::select! {
-                                result = listener.recv() => {
-                                    let Ok(n) = result else { break };
-                                    let Some(waiters) = waiters.upgrade() else { return };
-                                    for id in n.payload().split(' ') {
-                                        if let Some(w) = waiters.get(id) {
-                                            w.notify_one();
+                            let result = {
+                                let mut recv = std::pin::pin!(listener.recv());
+                                loop {
+                                    tokio::select! {
+                                        result = &mut recv => break result,
+                                        _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {
+                                            if waiters.strong_count() == 0 {
+                                                return;
+                                            }
                                         }
                                     }
                                 }
-                                _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {
-                                    if waiters.strong_count() == 0 {
-                                        return;
-                                    }
+                            };
+                            let Ok(n) = result else { break };
+                            let Some(waiters) = waiters.upgrade() else { return };
+                            for id in n.payload().split(' ') {
+                                if let Some(w) = waiters.get(id) {
+                                    w.notify_one();
                                 }
                             }
                         }
