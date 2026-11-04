@@ -1,0 +1,67 @@
+# A site's workers, next to the hub from site-hub-values.yaml and using its Secret:
+#
+#   helm install queryflux-workers ./charts/queryflux -n queryflux \
+#     -f ./charts/queryflux/examples/site-workers-values.yaml
+#
+# Applications send queries to queryflux-workers:8080 (Trino HTTP). Workers get their
+# config, capacity and history path through the hub, which is the only thing that
+# talks to the control plane.
+
+replicaCount: 2
+
+env:
+  - name: QUERYFLUX_WORKER_SECRET
+    valueFrom:
+      secretKeyRef: { name: queryflux-site, key: workerSecret }
+
+config:
+  data:
+    queryflux:
+      role: worker
+      # Clients need a reachable nextUri; the chart Service DNS (not localhost).
+      externalAddress: 'http://{{ include "queryflux.fullname" . }}:8080'
+      persistence: null
+      worker:
+        upstream:
+          # Hub snapshots embed engine credentials. Prefer HTTPS to the hub (terminate TLS
+          # on its Service/Ingress). Plain HTTP is only for a service mesh with mTLS
+          # (Istio, Linkerd) that encrypts pod traffic — never across an open network.
+          url: http://queryflux-hub:9000
+          allowInsecureHttp: true # only with mesh mTLS; otherwise use https:// and drop this
+          pollTimeoutSecs: 30
+          heartbeatIntervalSecs: 10
+          peerBootstrap:
+            address: queryflux-workers-headless:9000
+            afterSecs: 10
+            maxAgeSecs: 86400
+        coordination:
+          mode: controlPlane
+    # Workers get every routing and cluster setting from upstream.
+    clusterGroups: null
+    translation: null
+    routers: null
+    routingFallback: null
+
+studio:
+  enabled: false
+
+service:
+  # A running query lives in the worker that started it.
+  sessionAffinity: ClientIP
+  headless:
+    enabled: true
+  ports:
+    studio:
+      enabled: false
+
+startupProbe:
+  httpGet:
+    path: /readyz
+    port: admin
+  periodSeconds: 2
+  timeoutSeconds: 2
+  failureThreshold: 150
+
+pdb:
+  enabled: true
+  maxUnavailable: 1

@@ -3,14 +3,22 @@
 # query frontend, no Studio sidecar and small requests. Run from the repository root:
 #
 #   1. kubectl create namespace tenant-acme
-#   2. Create the tenant's database on a shared Postgres cluster (one database per tenant,
-#      not one schema: QueryFlux's advisory locks and LISTEN/NOTIFY channels are scoped to
-#      the database):
+#   2. Give the tenant a role and a schema in the shared database (persistence.schema).
+#      The role can access only its own schema's objects. Advisory locks are database-scoped;
+#      a client with this credential can acquire another cell's predictable migration lock
+#      and block that cell's startup. Use separate databases for mutually untrusted tenants
+#      if availability isolation is required:
 #        CREATE ROLE tenant_acme LOGIN PASSWORD '<password>';
-#        CREATE DATABASE tenant_acme OWNER tenant_acme;
-#   3. Fill in ./charts/queryflux/examples/hosted-cell-config.yaml and create its Secret:
+#        CREATE SCHEMA tenant_acme AUTHORIZATION tenant_acme;
+#   3. Fill in ./charts/queryflux/examples/hosted-cell-config.yaml and create its Secret,
+#      plus the tenant's secrets (read from the environment, see `env` below):
 #        kubectl -n tenant-acme create secret generic queryflux-cell-config \
 #          --from-file=config.yaml=./charts/queryflux/examples/hosted-cell-config.yaml
+#        kubectl -n tenant-acme create secret generic queryflux-cell \
+#          --from-literal=persistenceUrl=postgres://tenant_acme:<password>@postgres.example.internal:5432/queryflux \
+#          --from-literal=workerSecret=$(openssl rand -hex 32)
+#      The chart generates the admin password in the Secret `<release>-admin`
+#      (e.g. `queryflux-cell-admin` for release `queryflux-cell`).
 #   4. Provide the Ingress certificate for the host below, as the Secret `acme-cp-tls`:
 #      either let cert-manager issue it (add a `cert-manager.io/cluster-issuer` annotation
 #      under `ingress.annotations`), or create it from an existing certificate:
@@ -32,6 +40,15 @@ replicaCount: 1
 
 config:
   existingSecret: queryflux-cell-config
+
+# Override the config file's database URL and hub secret.
+env:
+  - name: QUERYFLUX_PERSISTENCE_URL
+    valueFrom:
+      secretKeyRef: { name: queryflux-cell, key: persistenceUrl }
+  - name: QUERYFLUX_WORKER_SECRET
+    valueFrom:
+      secretKeyRef: { name: queryflux-cell, key: workerSecret }
 
 # The tenant's UI reaches the admin API from inside the cluster.
 studio:

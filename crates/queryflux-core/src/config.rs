@@ -148,7 +148,31 @@ pub struct ProxyConfig {
     pub access_control: Option<crate::access_config::AccessControlConfig>,
 }
 
+/// Environment variables that override secrets in the config file, so the file can be a
+/// plain ConfigMap and the secrets come from a Kubernetes Secret.
+pub const ENV_WORKER_SECRET: &str = "QUERYFLUX_WORKER_SECRET";
+pub const ENV_HUB_ENROLL_TOKEN: &str = "QUERYFLUX_HUB_ENROLL_TOKEN";
+pub const ENV_PERSISTENCE_URL: &str = "QUERYFLUX_PERSISTENCE_URL";
+
 impl ProxyConfig {
+    /// Apply [`ENV_WORKER_SECRET`], [`ENV_HUB_ENROLL_TOKEN`] (when `hub` is configured)
+    /// and [`ENV_PERSISTENCE_URL`] (when persistence is Postgres) over the file's values.
+    /// Empty variables are ignored.
+    pub fn apply_env_overrides(&mut self, var: impl Fn(&str) -> Option<String>) {
+        let var = |name: &str| var(name).filter(|v| !v.trim().is_empty());
+        if let Some(secret) = var(ENV_WORKER_SECRET) {
+            self.queryflux.worker_secret = Some(secret);
+        }
+        if let (Some(token), Some(hub)) = (var(ENV_HUB_ENROLL_TOKEN), self.queryflux.hub.as_mut()) {
+            hub.upstream.enroll_token = Some(token);
+        }
+        if let (Some(url), PersistenceConfig::Postgres { conn }) =
+            (var(ENV_PERSISTENCE_URL), &mut self.queryflux.persistence)
+        {
+            conn.url = Some(url);
+        }
+    }
+
     /// Check the settings that depend on `queryflux.role`. Returns every problem found.
     ///
     /// A worker owns no config: it rejects settings that the control plane provides
@@ -325,6 +349,13 @@ impl ProxyConfig {
                 if let Err(e) = q.capacity.validate() {
                     issues.push(e);
                 }
+            }
+        }
+        // After env overrides (QUERYFLUX_PERSISTENCE_URL), an empty Postgres url/host
+        // must fail validation rather than only at pool connect.
+        if let PersistenceConfig::Postgres { conn } = &q.persistence {
+            if let Err(e) = conn.connection_url() {
+                issues.push(e);
             }
         }
         if issues.is_empty() {
@@ -1573,6 +1604,21 @@ impl PostgresPersistenceConfig {
         if let Some(ref u) = self.url {
             let u = u.trim();
             if !u.is_empty() {
+                // Reject syntactically invalid URLs early (e.g. QUERYFLUX_PERSISTENCE_URL).
+                // Errors must not echo the string — it may contain a password.
+                let parsed = url::Url::parse(u).map_err(|_| {
+                    "postgres persistence: url is not a valid postgres:// (or postgresql://) URL"
+                        .to_string()
+                })?;
+                match parsed.scheme() {
+                    "postgres" | "postgresql" => {}
+                    scheme => {
+                        return Err(format!(
+                            "postgres persistence: url scheme must be postgres:// or postgresql:// \
+                             (got '{scheme}')"
+                        ));
+                    }
+                }
                 return Ok(u.to_string());
             }
         }
@@ -4728,5 +4774,100 @@ queryflux:
         assert!(issues
             .iter()
             .any(|i| i.contains("only applies to role: hub")));
+    }
+    #[test]
+    fn secrets_can_come_from_the_environment() {
+        let mut c = parse(HUB);
+        let env: std::collections::HashMap<&str, &str> = [
+            (ENV_WORKER_SECRET, "ws-env"),
+            (ENV_HUB_ENROLL_TOKEN, "qfe_env"),
+            (ENV_PERSISTENCE_URL, "postgres://env/db"),
+        ]
+        .into();
+        c.apply_env_overrides(|k| env.get(k).map(|v| v.to_string()));
+        assert_eq!(c.queryflux.worker_secret.as_deref(), Some("ws-env"));
+        assert_eq!(
+            c.queryflux.hub.unwrap().upstream.enroll_token.as_deref(),
+            Some("qfe_env")
+        );
+        // Not Postgres: the URL is not applied. Empty variables change nothing.
+        let mut pg = parse(
+            "queryflux:\n  workerSecret: file\n  persistence: { type: postgres, url: postgres://file/db }\n",
+        );
+        pg.apply_env_overrides(|k| match k {
+            ENV_PERSISTENCE_URL => Some("postgres://env/db".into()),
+            _ => Some("  ".into()),
+        });
+        assert_eq!(pg.queryflux.worker_secret.as_deref(), Some("file"));
+        let PersistenceConfig::Postgres { conn } = &pg.queryflux.persistence else {
+            panic!()
+        };
+        assert_eq!(conn.url.as_deref(), Some("postgres://env/db"));
+    }
+
+    #[test]
+    fn empty_postgres_url_fails_role_validation_until_env_sets_it() {
+        let yaml = r#"
+queryflux:
+  role: controlPlane
+  workerSecret: secret
+  persistence: { type: postgres, url: "", schema: tenant_acme }
+  frontends:
+    trinoHttp: { enabled: false, port: 8080 }
+clusterGroups:
+  g: { members: [c], maxRunningQueries: 1 }
+clusters:
+  c: { engine: trino, endpoint: http://localhost:8080 }
+routingFallback: g
+"#;
+        let mut c = parse(yaml);
+        let issues = c.validate_role().unwrap_err();
+        assert!(
+            issues.iter().any(|i| i.contains("postgres persistence")),
+            "{issues:?}"
+        );
+        c.apply_env_overrides(|k| match k {
+            ENV_PERSISTENCE_URL => Some("postgres://tenant/queryflux".into()),
+            _ => None,
+        });
+        assert_eq!(c.validate_role(), Ok(()));
+    }
+
+    #[test]
+    fn invalid_postgres_url_is_rejected_without_echoing_the_secret() {
+        let mut c = parse(
+            "queryflux:\n  workerSecret: s\n  persistence: { type: postgres, url: postgres://ok/db }\n",
+        );
+        // No scheme / not a URL → Url::parse fails; message must not echo the raw value.
+        c.apply_env_overrides(|k| match k {
+            ENV_PERSISTENCE_URL => Some("not a url with sekrit".into()),
+            _ => None,
+        });
+        let issues = c.validate_role().unwrap_err();
+        let msg = issues.join("; ");
+        assert!(
+            msg.contains("postgres persistence") && msg.contains("not a valid"),
+            "{msg}"
+        );
+        assert!(
+            !msg.contains("sekrit"),
+            "error must not echo credentials: {msg}"
+        );
+
+        // Wrong scheme is rejected without echoing the password.
+        c.apply_env_overrides(|k| match k {
+            ENV_PERSISTENCE_URL => Some("http://user:sekrit@db.example/qf".into()),
+            _ => None,
+        });
+        let issues = c.validate_role().unwrap_err();
+        let msg = issues.join("; ");
+        assert!(
+            msg.contains("postgres://") || msg.contains("postgresql://"),
+            "{msg}"
+        );
+        assert!(
+            !msg.contains("sekrit"),
+            "error must not echo credentials: {msg}"
+        );
     }
 }
