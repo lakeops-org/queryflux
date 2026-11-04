@@ -351,6 +351,13 @@ impl ProxyConfig {
                 }
             }
         }
+        // After env overrides (QUERYFLUX_PERSISTENCE_URL), an empty Postgres url/host
+        // must fail validation rather than only at pool connect.
+        if let PersistenceConfig::Postgres { conn } = &q.persistence {
+            if let Err(e) = conn.connection_url() {
+                issues.push(e);
+            }
+        }
         if issues.is_empty() {
             Ok(())
         } else {
@@ -4781,5 +4788,33 @@ queryflux:
             panic!()
         };
         assert_eq!(conn.url.as_deref(), Some("postgres://env/db"));
+    }
+
+    #[test]
+    fn empty_postgres_url_fails_role_validation_until_env_sets_it() {
+        let yaml = r#"
+queryflux:
+  role: controlPlane
+  workerSecret: secret
+  persistence: { type: postgres, url: "", schema: tenant_acme }
+  frontends:
+    trinoHttp: { enabled: false, port: 8080 }
+clusterGroups:
+  g: { members: [c], maxRunningQueries: 1 }
+clusters:
+  c: { engine: trino, endpoint: http://localhost:8080 }
+routingFallback: g
+"#;
+        let mut c = parse(yaml);
+        let issues = c.validate_role().unwrap_err();
+        assert!(
+            issues.iter().any(|i| i.contains("postgres persistence")),
+            "{issues:?}"
+        );
+        c.apply_env_overrides(|k| match k {
+            ENV_PERSISTENCE_URL => Some("postgres://tenant/queryflux".into()),
+            _ => None,
+        });
+        assert_eq!(c.validate_role(), Ok(()));
     }
 }

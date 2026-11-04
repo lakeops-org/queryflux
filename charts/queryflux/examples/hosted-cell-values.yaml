@@ -4,7 +4,10 @@
 #
 #   1. kubectl create namespace tenant-acme
 #   2. Give the tenant a role and a schema in the shared database (persistence.schema).
-#      The role can only reach its own schema:
+#      The role can access only its own schema's objects. Advisory locks are database-scoped;
+#      a client with this credential can acquire another cell's predictable migration lock
+#      and block that cell's startup. Use separate databases for mutually untrusted tenants
+#      if availability isolation is required:
 #        CREATE ROLE tenant_acme LOGIN PASSWORD '<password>';
 #        CREATE SCHEMA tenant_acme AUTHORIZATION tenant_acme;
 #   3. Fill in ./charts/queryflux/examples/hosted-cell-config.yaml and create its Secret,
@@ -14,7 +17,8 @@
 #        kubectl -n tenant-acme create secret generic queryflux-cell \
 #          --from-literal=persistenceUrl=postgres://tenant_acme:<password>@postgres.example.internal:5432/queryflux \
 #          --from-literal=workerSecret=$(openssl rand -hex 32)
-#      The chart generates the admin password in the Secret `<release>-queryflux-admin`.
+#      The chart generates the admin password in the Secret `<release>-admin`
+#      (e.g. `queryflux-cell-admin` for release `queryflux-cell`).
 #   4. Provide the Ingress certificate for the host below, as the Secret `acme-cp-tls`:
 #      either let cert-manager issue it (add a `cert-manager.io/cluster-issuer` annotation
 #      under `ingress.annotations`), or create it from an existing certificate:

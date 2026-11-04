@@ -18,12 +18,13 @@ config:
   data:
     queryflux:
       role: worker
-      externalAddress: null
+      # Clients need a reachable nextUri; the chart Service DNS (not localhost).
+      externalAddress: 'http://{{ include "queryflux.fullname" . }}:8080'
       persistence: null
       worker:
         upstream:
-          # The hub's Service. Plain HTTP inside the cluster: the hub serves engine
-          # credentials to workers, so keep it to the site's own network (or a mesh with mTLS).
+          # The hub's Service. Plain HTTP is for traffic that stays on the site's
+          # cluster network (or a mesh that adds mTLS). Do not expose this URL off-site.
           url: http://queryflux-hub:9000
           allowInsecureHttp: true
           pollTimeoutSecs: 30

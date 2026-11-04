@@ -1,8 +1,9 @@
 # A site's hub, installed with one command: the config is rendered by the chart and the
 # two secrets come from a Secret, so nothing has to be hand-written into a config file.
 #
+#   # enrollToken from POST /admin/sites/{site}/enrollment-tokens
 #   kubectl -n queryflux create secret generic queryflux-site \
-#     --from-literal=enrollToken=qfe_...      # POST /admin/sites/{site}/enrollment-tokens
+#     --from-literal=enrollToken=qfe_... \
 #     --from-literal=workerSecret=$(openssl rand -hex 32)
 #   helm install queryflux-hub ./charts/queryflux -n queryflux \
 #     -f ./charts/queryflux/examples/site-hub-values.yaml \
