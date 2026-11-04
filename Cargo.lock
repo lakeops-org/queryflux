@@ -5363,6 +5363,7 @@ dependencies = [
  "async-trait",
  "axum",
  "chrono",
+ "flate2",
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",

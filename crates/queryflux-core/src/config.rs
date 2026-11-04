@@ -299,6 +299,13 @@ impl ProxyConfig {
                         issues
                             .push("controlPlane.tenancy requires Postgres persistence".to_string());
                     }
+                    if worker_secret {
+                        issues.push(
+                            "controlPlane.tenancy: workerSecret would be shared by every tenant; \
+                             remove it and enroll hubs per tenant"
+                                .to_string(),
+                        );
+                    }
                     if !t.host_suffix.starts_with('.') || t.host_suffix.len() < 2 {
                         issues.push(
                             "controlPlane.tenancy.hostSuffix must start with '.', \
@@ -4624,6 +4631,24 @@ auth: { provider: static, required: true }
             "queryflux:\n  role: controlPlane\n  persistence: { type: postgres, url: postgres://x/y }\n",
         );
         assert_eq!(c.validate_role(), Ok(()));
+    }
+
+    #[test]
+    fn multi_tenant_control_plane_rejects_a_shared_worker_secret() {
+        let c = parse(
+            "queryflux:\n  role: controlPlane\n  workerSecret: shared\n  persistence: { type: postgres, url: postgres://x/y }\n  controlPlane:\n    tenancy: { hostSuffix: .cp.example.com, platformPort: 9100 }\n",
+        );
+        let issues = c.validate_role().unwrap_err();
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.contains("workerSecret would be shared")),
+            "{issues:?}"
+        );
+        let ok = parse(
+            "queryflux:\n  role: controlPlane\n  persistence: { type: postgres, url: postgres://x/y }\n  controlPlane:\n    tenancy: { hostSuffix: .cp.example.com, platformPort: 9100 }\n",
+        );
+        assert_eq!(ok.validate_role(), Ok(()));
     }
 
     const HUB: &str = r#"

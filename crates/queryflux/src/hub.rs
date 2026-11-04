@@ -1230,6 +1230,66 @@ mod tests {
         assert_eq!(spool.status().files, 2, "a failed upload keeps its file");
     }
 
+    /// History goes upstream gzipped; an upstream that cannot read gzip (an older control
+    /// plane parses the bytes as JSON and answers 400) gets it uncompressed.
+    #[tokio::test]
+    async fn history_falls_back_to_plain_json_for_an_upstream_without_gzip() {
+        let seen: Arc<std::sync::Mutex<Vec<(bool, usize)>>> = Arc::default();
+        let app = axum::Router::new().route(
+            "/worker/query-records",
+            axum::routing::post({
+                let seen = seen.clone();
+                move |headers: axum::http::HeaderMap, body: axum::body::Bytes| {
+                    let seen = seen.clone();
+                    async move {
+                        let gzip = headers.contains_key(axum::http::header::CONTENT_ENCODING);
+                        match serde_json::from_slice::<serde_json::Value>(&body) {
+                            Ok(batch) => {
+                                let n = batch["records"].as_array().map_or(0, |r| r.len());
+                                seen.lock().unwrap().push((gzip, n));
+                                axum::http::StatusCode::ACCEPTED
+                            }
+                            Err(_) => {
+                                seen.lock().unwrap().push((gzip, 0));
+                                axum::http::StatusCode::BAD_REQUEST
+                            }
+                        }
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await });
+
+        let dir = tempfile::tempdir().unwrap();
+        let upstream: UpstreamConfig = serde_json::from_value(serde_json::json!({
+            "url": url, "allowInsecureHttp": true
+        }))
+        .unwrap();
+        let spool = HistorySpool::open(
+            dir.path().to_path_buf(),
+            1 << 20,
+            "dc1/hub".into(),
+            "dc1".into(),
+            &upstream,
+            Bearer::secret("s"),
+            Arc::new(|| None),
+        )
+        .unwrap();
+        use queryflux_persistence::MetricsStore;
+        spool.record_queries(vec![record("q0", "w")]).await.unwrap();
+        spool.flush().await.unwrap();
+        spool.record_queries(vec![record("q1", "w")]).await.unwrap();
+        spool.flush().await.unwrap();
+        assert_eq!(
+            *seen.lock().unwrap(),
+            [(true, 0), (false, 1), (false, 1)],
+            "gzip refused once, then plain from then on"
+        );
+        assert_eq!(spool.status().sent, 2);
+    }
+
     /// A real worker config source pointed at the hub activates upstream's config, and
     /// its capacity calls reach upstream.
     #[tokio::test]
