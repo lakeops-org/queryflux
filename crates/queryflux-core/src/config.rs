@@ -1604,6 +1604,21 @@ impl PostgresPersistenceConfig {
         if let Some(ref u) = self.url {
             let u = u.trim();
             if !u.is_empty() {
+                // Reject syntactically invalid URLs early (e.g. QUERYFLUX_PERSISTENCE_URL).
+                // Errors must not echo the string — it may contain a password.
+                let parsed = url::Url::parse(u).map_err(|_| {
+                    "postgres persistence: url is not a valid postgres:// (or postgresql://) URL"
+                        .to_string()
+                })?;
+                match parsed.scheme() {
+                    "postgres" | "postgresql" => {}
+                    scheme => {
+                        return Err(format!(
+                            "postgres persistence: url scheme must be postgres:// or postgresql:// \
+                             (got '{scheme}')"
+                        ));
+                    }
+                }
                 return Ok(u.to_string());
             }
         }
@@ -4816,5 +4831,43 @@ routingFallback: g
             _ => None,
         });
         assert_eq!(c.validate_role(), Ok(()));
+    }
+
+    #[test]
+    fn invalid_postgres_url_is_rejected_without_echoing_the_secret() {
+        let mut c = parse(
+            "queryflux:\n  workerSecret: s\n  persistence: { type: postgres, url: postgres://ok/db }\n",
+        );
+        // No scheme / not a URL → Url::parse fails; message must not echo the raw value.
+        c.apply_env_overrides(|k| match k {
+            ENV_PERSISTENCE_URL => Some("not a url with sekrit".into()),
+            _ => None,
+        });
+        let issues = c.validate_role().unwrap_err();
+        let msg = issues.join("; ");
+        assert!(
+            msg.contains("postgres persistence") && msg.contains("not a valid"),
+            "{msg}"
+        );
+        assert!(
+            !msg.contains("sekrit"),
+            "error must not echo credentials: {msg}"
+        );
+
+        // Wrong scheme is rejected without echoing the password.
+        c.apply_env_overrides(|k| match k {
+            ENV_PERSISTENCE_URL => Some("http://user:sekrit@db.example/qf".into()),
+            _ => None,
+        });
+        let issues = c.validate_role().unwrap_err();
+        let msg = issues.join("; ");
+        assert!(
+            msg.contains("postgres://") || msg.contains("postgresql://"),
+            "{msg}"
+        );
+        assert!(
+            !msg.contains("sekrit"),
+            "error must not echo credentials: {msg}"
+        );
     }
 }

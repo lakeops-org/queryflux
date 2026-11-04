@@ -343,6 +343,8 @@ async fn handle_validation(config_path: &str) -> anyhow::Result<()> {
     };
 
     // As at startup: secrets may come from the environment.
+    // `validate_role` also checks Postgres `connection_url()` after these overrides
+    // (empty or invalid QUERYFLUX_PERSISTENCE_URL fails here, not only at pool connect).
     config.apply_env_overrides(|k| std::env::var(k).ok());
     if let Err(issues) = config.validate_role() {
         for issue in &issues {

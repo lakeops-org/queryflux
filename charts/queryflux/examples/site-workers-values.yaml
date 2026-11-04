@@ -23,10 +23,11 @@ config:
       persistence: null
       worker:
         upstream:
-          # The hub's Service. Plain HTTP is for traffic that stays on the site's
-          # cluster network (or a mesh that adds mTLS). Do not expose this URL off-site.
+          # Hub snapshots embed engine credentials. Prefer HTTPS to the hub (terminate TLS
+          # on its Service/Ingress). Plain HTTP is only for a service mesh with mTLS
+          # (Istio, Linkerd) that encrypts pod traffic — never across an open network.
           url: http://queryflux-hub:9000
-          allowInsecureHttp: true
+          allowInsecureHttp: true # only with mesh mTLS; otherwise use https:// and drop this
           pollTimeoutSecs: 30
           heartbeatIntervalSecs: 10
           peerBootstrap:
