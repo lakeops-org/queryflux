@@ -850,16 +850,13 @@ pub(crate) fn spawn_worker_heartbeat(
                 break;
             }
             let st = sync_state.lock().unwrap_or_else(|e| e.into_inner()).clone();
-            let clusters = live
-                .read()
-                .await
-                .health_check_targets
-                .iter()
-                .map(|(_, c)| queryflux_persistence::ClusterHealthStatus {
-                    name: c.cluster_name.0.clone(),
-                    healthy: c.is_healthy(),
-                })
-                .collect();
+            let clusters = cluster_health_report(
+                live.read()
+                    .await
+                    .health_check_targets
+                    .iter()
+                    .map(|(_, c)| (c.cluster_name.0.as_str(), c.is_healthy())),
+            );
             let report = queryflux_persistence::WorkerRecord {
                 name: name.clone(),
                 version: env!("CARGO_PKG_VERSION").to_string(),
@@ -923,6 +920,23 @@ pub(crate) fn spawn_worker_heartbeat(
     });
 }
 
+/// Collapse per-group probe rows into one fleet-report entry per cluster name.
+/// A backend in several groups has an independent breaker per membership; unhealthy
+/// in any group → report unhealthy. Order is by cluster name.
+fn cluster_health_report<'a>(
+    targets: impl IntoIterator<Item = (&'a str, bool)>,
+) -> Vec<queryflux_persistence::ClusterHealthStatus> {
+    let mut by_name = std::collections::BTreeMap::<String, bool>::new();
+    for (name, healthy) in targets {
+        let entry = by_name.entry(name.to_string()).or_insert(true);
+        *entry = *entry && healthy;
+    }
+    by_name
+        .into_iter()
+        .map(|(name, healthy)| queryflux_persistence::ClusterHealthStatus { name, healthy })
+        .collect()
+}
+
 #[cfg(test)]
 mod serves_queries_tests {
     use super::*;
@@ -940,5 +954,28 @@ mod serves_queries_tests {
         assert!(!serves_queries(&f), "clickhouseHttp has no listener");
         f.trino_http.enabled = true;
         assert!(serves_queries(&f));
+    }
+
+    #[test]
+    fn cluster_health_report_dedupes_and_ands_across_groups() {
+        let report = cluster_health_report([
+            ("trino-a", true),
+            ("trino-b", true),
+            ("trino-a", false),
+            ("trino-b", true),
+        ]);
+        assert_eq!(
+            report,
+            vec![
+                queryflux_persistence::ClusterHealthStatus {
+                    name: "trino-a".into(),
+                    healthy: false,
+                },
+                queryflux_persistence::ClusterHealthStatus {
+                    name: "trino-b".into(),
+                    healthy: true,
+                },
+            ]
+        );
     }
 }

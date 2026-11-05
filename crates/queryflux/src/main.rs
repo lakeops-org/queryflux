@@ -826,8 +826,8 @@ pub(crate) async fn run(
             if !reaches_engines {
                 anyhow::bail!(
                     "This control plane does not connect to engines; the site's workers do. \
-                     Save the cluster, then check its health in each worker's \
-                     status.clusters (GET /admin/workers)."
+                     Save the cluster, add it to an enabled group (workers only probe group \
+                     members), then check status.clusters on GET /admin/workers."
                 );
             }
             let adapter = registered_engines::build_adapter_from_record(
