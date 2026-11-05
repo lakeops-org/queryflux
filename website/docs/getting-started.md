@@ -13,6 +13,7 @@ import {DocCards, DocCard} from '@site/src/components/DocCards';
 Each quickstart is a complete scenario you can run end to end on a laptop, built on a Docker Compose stack from the repository's [`examples/`](https://github.com/lakeops-org/queryflux/tree/main/examples) directory. Pick the one closest to what you want to do.
 
 <DocCards>
+  <DocCard title="Connect a client" to="/docs/clients">Trino, Postgres, MySQL, Snowflake, and Flight SQL — ports, auth, and copy-paste examples.</DocCard>
   <DocCard title="Route your first query" to="/docs/quickstart/first-query">Postgres + Trino + QueryFlux + Studio. Send a query through the proxy and find it in query history.</DocCard>
   <DocCard title="Run locally without Docker" to="/docs/quickstart/local-duckdb">Install the binary and query the embedded DuckDB engine — no containers, no other services.</DocCard>
   <DocCard title="Build a multi-engine lakehouse" to="/docs/quickstart/multi-engine">Trino and StarRocks over Iceberg. Route Trino HTTP and MySQL wire clients to different engines.</DocCard>

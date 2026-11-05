@@ -46,7 +46,7 @@ const sidebars: SidebarsConfig = {
       type: 'category',
       label: 'Guides',
       collapsed: true,
-      items: ['studio', 'authentication'],
+      items: ['clients', 'studio', 'authentication'],
     },
     {
       type: 'category',

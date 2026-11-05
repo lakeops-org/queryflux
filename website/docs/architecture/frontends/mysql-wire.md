@@ -126,6 +126,7 @@ print(cur.fetchone())
 
 ## Related
 
+- [Connect a SQL client](../../clients) — `mysql` CLI, JDBC, and Python connection examples
 - [Frontends overview](overview.md) — shared dispatch and session model
 - [Routing and clusters](/docs/architecture/routing-and-clusters) — `protocolBased` router with `mysqlWire`
 - [Query tags](/docs/architecture/query-tags) — setting tags via `SET query_tags`

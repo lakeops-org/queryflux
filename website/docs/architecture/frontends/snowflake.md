@@ -177,6 +177,7 @@ curl -X POST http://localhost:8443/api/v2/statements \
 
 ## Related
 
+- [Connect a SQL client](../../clients) — SnowSQL, Python connector, and SQL API v2 curl examples
 - [Blog: Offload Snowflake queries without changing clients](/blog/offload-snowflake-queries) — route Snowflake sessions to Trino or StarRocks
 - [Frontends overview](overview.md) — shared dispatch and session model
 - [Routing and clusters](/docs/architecture/routing-and-clusters) — `protocolBased` router with `snowflakeHttp` / `snowflakeSqlApi`

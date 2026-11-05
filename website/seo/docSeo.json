@@ -13,6 +13,10 @@
       "title": "QueryFlux Studio",
       "description": "Web UI for clusters, query history, routing, and admin security. Connects to the QueryFlux Admin API on port 9000."
     },
+    "clients": {
+      "title": "Connect a SQL client",
+      "description": "Connection cookbook for Trino HTTP, PostgreSQL wire, MySQL wire, Snowflake HTTP, and Arrow Flight SQL — ports, auth, and client gotchas."
+    },
     "configuration": {
       "title": "YAML Configuration Reference",
       "description": "Complete config.yaml reference — frontends, cluster groups, routing rules, persistence, translation, and admin API settings."
