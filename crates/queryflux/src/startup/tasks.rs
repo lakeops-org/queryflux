@@ -812,8 +812,10 @@ pub(crate) fn serves_queries(f: &queryflux_core::config::FrontendsConfig) -> boo
 pub(crate) fn spawn_worker_heartbeat(
     config: &ProxyConfig,
     sync_state: &Arc<std::sync::Mutex<crate::config_source::WorkerSyncState>>,
+    live: &Arc<tokio::sync::RwLock<queryflux_frontend::state::LiveConfig>>,
     shutdown_rx: &watch::Receiver<bool>,
 ) {
+    let live = live.clone();
     let Some(worker) = config.queryflux.worker.clone() else {
         return;
     };
@@ -848,6 +850,15 @@ pub(crate) fn spawn_worker_heartbeat(
                 break;
             }
             let st = sync_state.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            let clusters = cluster_health_report(
+                live.read().await.health_check_targets.iter().map(|(_, c)| {
+                    (
+                        c.cluster_name.0.as_str(),
+                        c.is_healthy(),
+                        c.has_been_health_probed(),
+                    )
+                }),
+            );
             let report = queryflux_persistence::WorkerRecord {
                 name: name.clone(),
                 version: env!("CARGO_PKG_VERSION").to_string(),
@@ -885,6 +896,7 @@ pub(crate) fn spawn_worker_heartbeat(
                     }),
                     frontends: frontends.clone(),
                     served_revision: None,
+                    clusters,
                 },
                 kind: "worker".to_string(),
                 parent: None,
@@ -910,6 +922,26 @@ pub(crate) fn spawn_worker_heartbeat(
     });
 }
 
+/// Collapse per-group probe rows into one fleet-report entry per cluster name.
+/// Unprobed memberships are omitted (optimistic `is_healthy` default is not a probe).
+/// Among probed memberships, unhealthy in any group → report unhealthy. Order by name.
+fn cluster_health_report<'a>(
+    targets: impl IntoIterator<Item = (&'a str, bool, bool)>,
+) -> Vec<queryflux_persistence::ClusterHealthStatus> {
+    let mut by_name = std::collections::BTreeMap::<String, bool>::new();
+    for (name, healthy, probed) in targets {
+        if !probed {
+            continue;
+        }
+        let entry = by_name.entry(name.to_string()).or_insert(true);
+        *entry = *entry && healthy;
+    }
+    by_name
+        .into_iter()
+        .map(|(name, healthy)| queryflux_persistence::ClusterHealthStatus { name, healthy })
+        .collect()
+}
+
 #[cfg(test)]
 mod serves_queries_tests {
     use super::*;
@@ -927,5 +959,44 @@ mod serves_queries_tests {
         assert!(!serves_queries(&f), "clickhouseHttp has no listener");
         f.trino_http.enabled = true;
         assert!(serves_queries(&f));
+    }
+
+    #[test]
+    fn cluster_health_report_dedupes_and_ands_across_groups() {
+        let report = cluster_health_report([
+            ("trino-a", true, true),
+            ("trino-b", true, true),
+            ("trino-a", false, true),
+            ("trino-b", true, true),
+        ]);
+        assert_eq!(
+            report,
+            vec![
+                queryflux_persistence::ClusterHealthStatus {
+                    name: "trino-a".into(),
+                    healthy: false,
+                },
+                queryflux_persistence::ClusterHealthStatus {
+                    name: "trino-b".into(),
+                    healthy: true,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn cluster_health_report_omits_unprobed_clusters() {
+        assert!(cluster_health_report([("trino-a", true, false)]).is_empty());
+        assert_eq!(
+            cluster_health_report([
+                ("trino-a", true, false),
+                ("trino-a", false, true),
+                ("trino-b", true, false),
+            ]),
+            vec![queryflux_persistence::ClusterHealthStatus {
+                name: "trino-a".into(),
+                healthy: false,
+            }]
+        );
     }
 }

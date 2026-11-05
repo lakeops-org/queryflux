@@ -26,8 +26,13 @@ pub struct ClusterState {
     running_queries: Arc<AtomicU64>,
     queued_queries: Arc<AtomicU64>,
     /// Set to `false` by the background health-check loop when the cluster
-    /// fails its health check. Starts as `true` (optimistic).
+    /// fails its health check. Starts as `true` (optimistic) so routing can
+    /// admit until the first probe — do not treat this as a completed probe.
     is_healthy: Arc<AtomicBool>,
+    /// True after the health-check loop has called [`Self::set_healthy`] at least
+    /// once (or a reload restored a previously probed status). Fleet reports omit
+    /// clusters while this is false so they are not advertised as healthy by default.
+    health_probed: Arc<AtomicBool>,
     breaker: Option<Arc<CircuitBreaker>>,
 }
 
@@ -56,6 +61,7 @@ impl ClusterState {
             running_queries: Arc::new(AtomicU64::new(0)),
             queued_queries: Arc::new(AtomicU64::new(0)),
             is_healthy: Arc::new(AtomicBool::new(true)),
+            health_probed: Arc::new(AtomicBool::new(false)),
             breaker: None,
         }
     }
@@ -149,9 +155,24 @@ impl ClusterState {
         self.is_healthy.load(Ordering::Relaxed)
     }
 
-    /// Called by the background health-check loop.
+    /// Whether a health probe has completed (or a probed status was restored on reload).
+    pub fn has_been_health_probed(&self) -> bool {
+        self.health_probed.load(Ordering::Relaxed)
+    }
+
+    /// Called by the background health-check loop after a real probe.
     pub fn set_healthy(&self, healthy: bool) {
         self.is_healthy.store(healthy, Ordering::Relaxed);
+        self.health_probed.store(true, Ordering::Relaxed);
+    }
+
+    /// Copy health + probe-completion across a live-config rebuild without treating
+    /// the optimistic default as a completed probe.
+    pub fn restore_health_from(&self, previous: &ClusterState) {
+        self.is_healthy
+            .store(previous.is_healthy(), Ordering::Relaxed);
+        self.health_probed
+            .store(previous.has_been_health_probed(), Ordering::Relaxed);
     }
 
     /// Overwrite the running query counter with a ground-truth value from the engine.
@@ -439,5 +460,48 @@ mod reload_counter_tests {
         assert!(state.try_increment_running());
         assert_eq!(state.reconcile_running(5, 0), 0, "never underflows");
         assert_eq!(state.reconcile_running(0, 50), 10, "never exceeds max");
+    }
+}
+
+#[cfg(test)]
+mod health_probe_tests {
+    use super::*;
+
+    fn state() -> ClusterState {
+        ClusterState::new(
+            ClusterName("c".into()),
+            ClusterGroupName("g".into()),
+            None,
+            None,
+            EngineType::Trino,
+            None,
+            1,
+            true,
+        )
+    }
+
+    #[test]
+    fn starts_healthy_but_unprobed_and_set_healthy_marks_probed() {
+        let s = state();
+        assert!(s.is_healthy());
+        assert!(!s.has_been_health_probed());
+        s.set_healthy(false);
+        assert!(!s.is_healthy());
+        assert!(s.has_been_health_probed());
+    }
+
+    #[test]
+    fn restore_health_from_preserves_unprobed_and_probed() {
+        let unprobed = state();
+        let next = state();
+        next.restore_health_from(&unprobed);
+        assert!(next.is_healthy());
+        assert!(!next.has_been_health_probed());
+
+        unprobed.set_healthy(false);
+        let restored = state();
+        restored.restore_health_from(&unprobed);
+        assert!(!restored.is_healthy());
+        assert!(restored.has_been_health_probed());
     }
 }

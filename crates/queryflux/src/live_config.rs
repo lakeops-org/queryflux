@@ -1111,7 +1111,7 @@ pub(crate) async fn compile_live_config(
                 .with_shared_load_counters(previous.map(Arc::as_ref)),
             );
             if let Some(prev) = previous {
-                state.set_healthy(prev.is_healthy());
+                state.restore_health_from(prev);
             }
             states.push(state);
         }
