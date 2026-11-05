@@ -14,7 +14,7 @@ existingSecret:
   passwordKey: QUERYFLUX_ADMIN_PASSWORD
 
 image:
-  tag: latest-slim
+  tag: latest
 
 service:
   ports:

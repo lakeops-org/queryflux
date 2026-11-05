@@ -1,4 +1,4 @@
-# QueryFlux + Studio (unified image) + Postgres — no external query engine required.
+# QueryFlux + Studio + Postgres — no external query engine required.
 # DuckDB is embedded in the image and used as the default query engine.
 #
 # From this directory:
