@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 
 use queryflux_core::config::CircuitBreakerConfig;
@@ -6,6 +6,12 @@ use queryflux_core::query::{ClusterGroupName, ClusterName, EngineType};
 use serde::{Deserialize, Serialize};
 
 use crate::circuit_breaker::{BackendOutcome, CircuitBreaker, CircuitState};
+
+/// [`ClusterState::health`] bit: the cluster may be routed to.
+const HEALTH_OK: u8 = 0b01;
+/// [`ClusterState::health`] bit: `HEALTH_OK` is the result of a probe of this cluster's
+/// current config, not the optimistic default or a result inherited across a config change.
+const HEALTH_PROBED: u8 = 0b10;
 
 /// Live mutable state for a single cluster instance.
 /// Shared across threads via `Arc`; counters are atomic.
@@ -25,9 +31,10 @@ pub struct ClusterState {
     enabled: Arc<AtomicBool>,
     running_queries: Arc<AtomicU64>,
     queued_queries: Arc<AtomicU64>,
-    /// Set to `false` by the background health-check loop when the cluster
-    /// fails its health check. Starts as `true` (optimistic).
-    is_healthy: Arc<AtomicBool>,
+    /// Updated by the background health-check loop. Starts as `HEALTH_OK` without
+    /// `HEALTH_PROBED`, so routing admits until the first probe while fleet reports omit
+    /// the cluster. One atomic, so a reader never pairs a probe's flag with an older result.
+    health: AtomicU8,
     breaker: Option<Arc<CircuitBreaker>>,
 }
 
@@ -55,7 +62,7 @@ impl ClusterState {
             enabled: Arc::new(AtomicBool::new(enabled)),
             running_queries: Arc::new(AtomicU64::new(0)),
             queued_queries: Arc::new(AtomicU64::new(0)),
-            is_healthy: Arc::new(AtomicBool::new(true)),
+            health: AtomicU8::new(HEALTH_OK),
             breaker: None,
         }
     }
@@ -146,12 +153,36 @@ impl ClusterState {
     }
 
     pub fn is_healthy(&self) -> bool {
-        self.is_healthy.load(Ordering::Relaxed)
+        self.health.load(Ordering::Relaxed) & HEALTH_OK != 0
     }
 
-    /// Called by the background health-check loop.
+    /// The last probe's result, or `None` if this cluster's current config has not been
+    /// probed yet. Use this, not [`Self::is_healthy`], to report health to anyone else.
+    pub fn probed_health(&self) -> Option<bool> {
+        let health = self.health.load(Ordering::Relaxed);
+        (health & HEALTH_PROBED != 0).then_some(health & HEALTH_OK != 0)
+    }
+
+    /// Called by the background health-check loop after a real probe.
     pub fn set_healthy(&self, healthy: bool) {
-        self.is_healthy.store(healthy, Ordering::Relaxed);
+        let ok = if healthy { HEALTH_OK } else { 0 };
+        self.health.store(HEALTH_PROBED | ok, Ordering::Relaxed);
+    }
+
+    /// Carry health across a config reload that left this cluster's config unchanged.
+    pub fn restore_health_from(&self, previous: &ClusterState) {
+        self.health
+            .store(previous.health.load(Ordering::Relaxed), Ordering::Relaxed);
+    }
+
+    /// Carry routing health across a reload that changed this cluster's config. The old
+    /// result says nothing about the new endpoint or credentials, so it is not reported
+    /// until a probe of the new config completes.
+    pub fn inherit_routing_health_from(&self, previous: &ClusterState) {
+        self.health.store(
+            previous.health.load(Ordering::Relaxed) & !HEALTH_PROBED,
+            Ordering::Relaxed,
+        );
     }
 
     /// Overwrite the running query counter with a ground-truth value from the engine.
@@ -439,5 +470,69 @@ mod reload_counter_tests {
         assert!(state.try_increment_running());
         assert_eq!(state.reconcile_running(5, 0), 0, "never underflows");
         assert_eq!(state.reconcile_running(0, 50), 10, "never exceeds max");
+    }
+}
+
+#[cfg(test)]
+mod health_probe_tests {
+    use super::*;
+
+    fn state() -> ClusterState {
+        ClusterState::new(
+            ClusterName("c".into()),
+            ClusterGroupName("g".into()),
+            None,
+            None,
+            EngineType::Trino,
+            None,
+            1,
+            true,
+        )
+    }
+
+    #[test]
+    fn starts_healthy_but_unprobed_and_set_healthy_marks_probed() {
+        let s = state();
+        assert!(s.is_healthy());
+        assert_eq!(s.probed_health(), None);
+        s.set_healthy(false);
+        assert!(!s.is_healthy());
+        assert_eq!(s.probed_health(), Some(false));
+        s.set_healthy(true);
+        assert!(s.is_healthy());
+        assert_eq!(s.probed_health(), Some(true));
+    }
+
+    #[test]
+    fn restore_health_from_preserves_unprobed_and_probed() {
+        let previous = state();
+        let next = state();
+        next.restore_health_from(&previous);
+        assert!(next.is_healthy());
+        assert_eq!(next.probed_health(), None);
+
+        previous.set_healthy(false);
+        let restored = state();
+        restored.restore_health_from(&previous);
+        assert!(!restored.is_healthy());
+        assert_eq!(restored.probed_health(), Some(false));
+    }
+
+    #[test]
+    fn inherit_routing_health_from_keeps_routing_but_not_the_probe_result() {
+        let previous = state();
+        previous.set_healthy(false);
+        let next = state();
+        next.inherit_routing_health_from(&previous);
+        assert!(!next.is_healthy(), "still not routed to until probed");
+        assert_eq!(next.probed_health(), None);
+        next.set_healthy(true);
+        assert_eq!(next.probed_health(), Some(true));
+
+        previous.set_healthy(true);
+        let next = state();
+        next.inherit_routing_health_from(&previous);
+        assert!(next.is_healthy());
+        assert_eq!(next.probed_health(), None);
     }
 }

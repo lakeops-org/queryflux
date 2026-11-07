@@ -242,6 +242,7 @@ seconds.
   request may do, and `X-QueryFlux-Actor` records whom it acts for in the tenant's audit
   log.
 - A tenant starts with no clusters; add them through its admin API.
+- A control plane with no query listener does not connect to engines, because they run at the customer's site. On such a control plane, "Test connection" (`POST /admin/config/clusters/test`) says so instead of failing to connect. A control plane with a query listener connects to the engine and runs the test. Each worker reports health for clusters that are members of enabled groups (the same set it probes) in its heartbeat, as `status.clusters` in `GET /admin/workers`, and workers behind a hub report through the hub. A cluster appears there only after a probe of its current config has completed, so it is omitted at first and again after its config changes. Workers with no query frontend do not probe, so their `status.clusters` stays empty.
 
 ## Operating workers
 
