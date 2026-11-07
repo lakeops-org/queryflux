@@ -2168,6 +2168,19 @@ fn restore_redacted_secrets(
     }
 }
 
+/// Config keys that, with the engine, decide where a cluster's credentials are sent.
+const CLUSTER_DESTINATION_KEYS: [&str; 4] = ["endpoint", "uri", "driver", "account"];
+
+/// Whether `body` sends credentials to the same place as `stored`. A stored secret is
+/// restored only then: carrying it to a caller-supplied endpoint would hand it to
+/// whoever that endpoint names, a caller who could only ever read it redacted.
+fn same_cluster_destination(body: &UpsertClusterConfig, stored: &ClusterConfigRecord) -> bool {
+    body.engine_key == stored.engine_key
+        && CLUSTER_DESTINATION_KEYS
+            .iter()
+            .all(|k| body.config.get(k) == stored.config.get(k))
+}
+
 /// Clone a `ClusterConfigRecord` with secrets redacted from the `config` field.
 fn redacted_cluster_config(record: ClusterConfigRecord) -> ClusterConfigRecord {
     let mut record = record;
@@ -2308,13 +2321,25 @@ async fn upsert_cluster_config_handler(
 ) -> impl IntoResponse {
     let pg = require_store!(state);
     let stored = match pg.get_cluster_config(&name).await {
-        Ok(r) => r.map(|r| r.config),
+        Ok(r) => r,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     };
-    if let Err(path) = restore_redacted_secrets(&mut body.config, stored.as_ref(), "config") {
+    let moved = stored
+        .as_ref()
+        .is_some_and(|r| !same_cluster_destination(&body, r));
+    let restore_from = stored.as_ref().filter(|_| !moved).map(|r| &r.config);
+    if let Err(path) = restore_redacted_secrets(&mut body.config, restore_from, "config") {
+        let why = if moved {
+            format!(
+                "the engine or {} changed, so the stored value is not reused",
+                CLUSTER_DESTINATION_KEYS.join("/")
+            )
+        } else {
+            "no value is stored for it".to_string()
+        };
         return (
             StatusCode::BAD_REQUEST,
-            format!("{path} is {REDACTED} but no value is stored for it: send the secret"),
+            format!("{path} is {REDACTED} but {why}: send the secret"),
         )
             .into_response();
     }
@@ -3803,8 +3828,8 @@ async fn invalidate_group_cache_handler(
 mod tests {
     use super::{
         collect_running_queries, delete_queued_if_exists, redact_cluster_config_secrets,
-        restore_redacted_secrets, sql_preview, AccessControlDryRunRequest, GuardrailsConfigDto,
-        SecurityConfigDto, REDACTED,
+        restore_redacted_secrets, same_cluster_destination, sql_preview,
+        AccessControlDryRunRequest, GuardrailsConfigDto, SecurityConfigDto, REDACTED,
     };
     use chrono::Utc;
     use queryflux_core::config::{
@@ -3829,10 +3854,10 @@ mod tests {
         assert_eq!(read["auth"]["password"], REDACTED);
 
         // Round trip with an edit elsewhere: the password survives.
-        read["endpoint"] = json!("https://t2:8443");
+        read["maxConnections"] = json!(5);
         restore_redacted_secrets(&mut read, Some(&stored), "config").unwrap();
         assert_eq!(read["auth"]["password"], "s3cret");
-        assert_eq!(read["endpoint"], "https://t2:8443");
+        assert_eq!(read["maxConnections"], 5);
 
         // A new value replaces it.
         let mut replaced = json!({"auth": {"password": "n3w"}});
@@ -3845,6 +3870,59 @@ mod tests {
             restore_redacted_secrets(&mut new_cluster, None, "config"),
             Err("config.auth.password".to_string())
         );
+    }
+
+    /// A stored secret is only reused for the endpoint it was saved for: the handler
+    /// restores nothing when the destination moved, so the placeholder is refused.
+    #[test]
+    fn a_redacted_secret_is_not_carried_to_a_new_destination() {
+        let record = |config: serde_json::Value| {
+            queryflux_persistence::cluster_config::ClusterConfigRecord {
+                id: 1,
+                name: "t".into(),
+                engine_key: "trino".into(),
+                enabled: true,
+                max_running_queries: None,
+                config,
+                variants: json!([]),
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            }
+        };
+        let upsert = |engine_key: &str, config: serde_json::Value| {
+            queryflux_persistence::cluster_config::UpsertClusterConfig {
+                engine_key: engine_key.into(),
+                enabled: true,
+                max_running_queries: None,
+                config,
+                variants: json!([]),
+            }
+        };
+        let stored = record(json!({"endpoint": "https://t:8443", "password": "s3cret"}));
+
+        let same = upsert(
+            "trino",
+            json!({"endpoint": "https://t:8443", "password": REDACTED, "x": 1}),
+        );
+        assert!(same_cluster_destination(&same, &stored));
+
+        let moved = upsert(
+            "trino",
+            json!({"endpoint": "https://evil:8443", "password": REDACTED}),
+        );
+        assert!(!same_cluster_destination(&moved, &stored));
+        let mut config = moved.config.clone();
+        assert_eq!(
+            restore_redacted_secrets(&mut config, None, "config"),
+            Err("config.password".to_string()),
+            "the handler passes no stored config when the destination moved"
+        );
+
+        let other_engine = upsert(
+            "starRocks",
+            json!({"endpoint": "https://t:8443", "password": REDACTED}),
+        );
+        assert!(!same_cluster_destination(&other_engine, &stored));
     }
 
     #[test]
