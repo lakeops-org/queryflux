@@ -960,10 +960,10 @@ async fn build_adapter(
 /// Compile plain config inputs into a `LiveConfig`.
 ///
 /// `cache` carries state from the previous generation: adapters are reused while a
-/// cluster's fingerprint is unchanged, cluster load counters are shared, health and
-/// (for unchanged clusters) breaker state carry over, and each group's last good
-/// strategy is kept. Settings that `LiveConfig` gets from outside this function
-/// (auth, authorization, guard chains, access control, catalog) are set to
+/// cluster's fingerprint is unchanged, cluster load counters are shared, routing health
+/// carries over, probe results and breaker state carry over for unchanged clusters, and
+/// each group's last good strategy is kept. Settings that `LiveConfig` gets from outside
+/// this function (auth, authorization, guard chains, access control, catalog) are set to
 /// placeholders; callers fill them in.
 pub(crate) async fn compile_live_config(
     inputs: &LiveConfigInputs,
@@ -1110,8 +1110,10 @@ pub(crate) async fn compile_live_config(
                 .with_circuit_breaker(group_config.circuit_breaker.clone(), previous_unchanged)
                 .with_shared_load_counters(previous.map(Arc::as_ref)),
             );
-            if let Some(prev) = previous {
-                state.restore_health_from(prev);
+            match previous {
+                Some(prev) if config_unchanged => state.restore_health_from(prev),
+                Some(prev) => state.inherit_routing_health_from(prev),
+                None => {}
             }
             states.push(state);
         }
@@ -2148,6 +2150,45 @@ catalogProvider: { type: "null" }
         assert!(
             !Arc::ptr_eq(&live.auth_provider, &before),
             "auth came from YAML"
+        );
+    }
+
+    /// A probe result survives a reload only while the cluster's config is unchanged: it
+    /// says nothing about a new endpoint or credentials. Routing health carries over either way.
+    #[tokio::test]
+    async fn reload_keeps_probe_result_only_for_unchanged_config() {
+        let spec = |health_query: &str| {
+            inputs(
+                vec![persisted(
+                    "duck",
+                    serde_json::json!({ "healthCheckQuery": health_query }),
+                    serde_json::json!([]),
+                )],
+                vec![("g", group(serde_json::json!({ "members": ["duck"] })))],
+            )
+        };
+        let state_of = |live: &LiveConfig| live.health_check_targets[0].1.clone();
+        let ids = ConfigIds::default();
+        let mut cache = empty_cache();
+
+        let first = compile_live_config(&spec("SELECT 1"), &ids, &mut cache, CompileMode::Strict)
+            .await
+            .expect("compiles");
+        state_of(&first).set_healthy(false);
+
+        let unchanged =
+            compile_live_config(&spec("SELECT 1"), &ids, &mut cache, CompileMode::Strict)
+                .await
+                .expect("compiles");
+        assert_eq!(state_of(&unchanged).probed_health(), Some(false));
+
+        let changed = compile_live_config(&spec("SELECT 2"), &ids, &mut cache, CompileMode::Strict)
+            .await
+            .expect("compiles");
+        assert_eq!(state_of(&changed).probed_health(), None);
+        assert!(
+            !state_of(&changed).is_healthy(),
+            "routing health carries over"
         );
     }
 

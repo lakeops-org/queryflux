@@ -851,13 +851,11 @@ pub(crate) fn spawn_worker_heartbeat(
             }
             let st = sync_state.lock().unwrap_or_else(|e| e.into_inner()).clone();
             let clusters = cluster_health_report(
-                live.read().await.health_check_targets.iter().map(|(_, c)| {
-                    (
-                        c.cluster_name.0.as_str(),
-                        c.is_healthy(),
-                        c.has_been_health_probed(),
-                    )
-                }),
+                live.read()
+                    .await
+                    .health_check_targets
+                    .iter()
+                    .map(|(_, c)| (c.cluster_name.0.as_str(), c.probed_health())),
             );
             let report = queryflux_persistence::WorkerRecord {
                 name: name.clone(),
@@ -926,13 +924,13 @@ pub(crate) fn spawn_worker_heartbeat(
 /// Unprobed memberships are omitted (optimistic `is_healthy` default is not a probe).
 /// Among probed memberships, unhealthy in any group → report unhealthy. Order by name.
 fn cluster_health_report<'a>(
-    targets: impl IntoIterator<Item = (&'a str, bool, bool)>,
+    targets: impl IntoIterator<Item = (&'a str, Option<bool>)>,
 ) -> Vec<queryflux_persistence::ClusterHealthStatus> {
     let mut by_name = std::collections::BTreeMap::<String, bool>::new();
-    for (name, healthy, probed) in targets {
-        if !probed {
+    for (name, probed_health) in targets {
+        let Some(healthy) = probed_health else {
             continue;
-        }
+        };
         let entry = by_name.entry(name.to_string()).or_insert(true);
         *entry = *entry && healthy;
     }
@@ -964,10 +962,10 @@ mod serves_queries_tests {
     #[test]
     fn cluster_health_report_dedupes_and_ands_across_groups() {
         let report = cluster_health_report([
-            ("trino-a", true, true),
-            ("trino-b", true, true),
-            ("trino-a", false, true),
-            ("trino-b", true, true),
+            ("trino-a", Some(true)),
+            ("trino-b", Some(true)),
+            ("trino-a", Some(false)),
+            ("trino-b", Some(true)),
         ]);
         assert_eq!(
             report,
@@ -986,12 +984,12 @@ mod serves_queries_tests {
 
     #[test]
     fn cluster_health_report_omits_unprobed_clusters() {
-        assert!(cluster_health_report([("trino-a", true, false)]).is_empty());
+        assert!(cluster_health_report([("trino-a", None)]).is_empty());
         assert_eq!(
             cluster_health_report([
-                ("trino-a", true, false),
-                ("trino-a", false, true),
-                ("trino-b", true, false),
+                ("trino-a", None),
+                ("trino-a", Some(false)),
+                ("trino-b", None),
             ]),
             vec![queryflux_persistence::ClusterHealthStatus {
                 name: "trino-a".into(),
