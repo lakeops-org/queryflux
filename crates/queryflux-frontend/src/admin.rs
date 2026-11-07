@@ -2171,14 +2171,40 @@ fn restore_redacted_secrets(
 /// Config keys that, with the engine, decide where a cluster's credentials are sent.
 const CLUSTER_DESTINATION_KEYS: [&str; 4] = ["endpoint", "uri", "driver", "account"];
 
-/// Whether `body` sends credentials to the same place as `stored`. A stored secret is
-/// restored only then: carrying it to a caller-supplied endpoint would hand it to
-/// whoever that endpoint names, a caller who could only ever read it redacted.
-fn same_cluster_destination(body: &UpsertClusterConfig, stored: &ClusterConfigRecord) -> bool {
-    body.engine_key == stored.engine_key
-        && CLUSTER_DESTINATION_KEYS
+/// Where a cluster sends its credentials: the base config's destination and each
+/// variant's, with the variant's overrides applied. Variants inherit the base config's
+/// secrets, and destination keys are top level, where an override replaces the base value.
+fn cluster_destinations<'a>(
+    config: &'a serde_json::Value,
+    variants: &'a serde_json::Value,
+) -> Vec<Vec<Option<&'a serde_json::Value>>> {
+    let destination = |overrides: Option<&'a serde_json::Value>| {
+        CLUSTER_DESTINATION_KEYS
             .iter()
-            .all(|k| body.config.get(k) == stored.config.get(k))
+            .map(|k| overrides.and_then(|o| o.get(k)).or_else(|| config.get(k)))
+            .collect()
+    };
+    std::iter::once(destination(None))
+        .chain(
+            variants
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|v| destination(v.get("overrides"))),
+        )
+        .collect()
+}
+
+/// Whether `body` sends credentials only where `stored` already does, for the base config
+/// and every variant. A stored secret is restored only then: carrying it to a
+/// caller-supplied endpoint would hand it to whoever that endpoint names, a caller who
+/// could only ever read it redacted.
+fn same_cluster_destination(body: &UpsertClusterConfig, stored: &ClusterConfigRecord) -> bool {
+    let known = cluster_destinations(&stored.config, &stored.variants);
+    body.engine_key == stored.engine_key
+        && cluster_destinations(&body.config, &body.variants)
+            .iter()
+            .all(|d| known.contains(d))
 }
 
 /// Clone a `ClusterConfigRecord` with secrets redacted from the `config` field.
@@ -2331,7 +2357,8 @@ async fn upsert_cluster_config_handler(
     if let Err(path) = restore_redacted_secrets(&mut body.config, restore_from, "config") {
         let why = if moved {
             format!(
-                "the engine or {} changed, so the stored value is not reused",
+                "the engine or an {} of the cluster or a variant changed, so the stored \
+                 value is not reused",
                 CLUSTER_DESTINATION_KEYS.join("/")
             )
         } else {
@@ -3923,6 +3950,61 @@ mod tests {
             json!({"endpoint": "https://t:8443", "password": REDACTED}),
         );
         assert!(!same_cluster_destination(&other_engine, &stored));
+    }
+
+    /// Variants inherit the base config's secrets, so a variant that points somewhere
+    /// new must not get the stored secret either, even with the base endpoint unchanged.
+    #[test]
+    fn a_redacted_secret_is_not_carried_to_a_new_variant_destination() {
+        let base = json!({"endpoint": "https://t:8443", "password": "s3cret"});
+        let stored = queryflux_persistence::cluster_config::ClusterConfigRecord {
+            id: 1,
+            name: "t".into(),
+            engine_key: "trino".into(),
+            enabled: true,
+            max_running_queries: None,
+            config: base.clone(),
+            variants: json!([
+                { "name": "a" },
+                { "name": "b", "overrides": { "endpoint": "https://b:8443" } }
+            ]),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        let upsert = |variants: serde_json::Value| {
+            queryflux_persistence::cluster_config::UpsertClusterConfig {
+                engine_key: "trino".into(),
+                enabled: true,
+                max_running_queries: None,
+                config: json!({"endpoint": "https://t:8443", "password": REDACTED}),
+                variants,
+            }
+        };
+
+        assert!(same_cluster_destination(
+            &upsert(stored.variants.clone()),
+            &stored
+        ));
+        // Reordered, renamed, or another variant at an existing destination: no new host.
+        assert!(same_cluster_destination(
+            &upsert(json!([
+                { "name": "b2", "overrides": { "endpoint": "https://b:8443", "x": 1 } },
+                { "name": "c" }
+            ])),
+            &stored
+        ));
+        // A variant moved, or added, to a new endpoint would inherit the stored password.
+        assert!(!same_cluster_destination(
+            &upsert(json!([
+                { "name": "a" },
+                { "name": "b", "overrides": { "endpoint": "https://evil:8443" } }
+            ])),
+            &stored
+        ));
+        assert!(!same_cluster_destination(
+            &upsert(json!([{ "name": "c", "overrides": { "endpoint": "https://evil:8443" } }])),
+            &stored
+        ));
     }
 
     #[test]
