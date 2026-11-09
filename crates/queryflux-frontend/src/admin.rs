@@ -2169,7 +2169,8 @@ fn restore_redacted_secrets(
 }
 
 /// Config keys that, with the engine, decide where a cluster's credentials are sent.
-const CLUSTER_DESTINATION_KEYS: [&str; 4] = ["endpoint", "uri", "driver", "account"];
+/// `region` picks the AWS endpoints (Athena, STS) that receive a cluster's AWS credentials.
+const CLUSTER_DESTINATION_KEYS: [&str; 5] = ["endpoint", "uri", "driver", "account", "region"];
 
 /// Where a cluster sends its credentials: the base config's destination and each
 /// variant's, with the variant's overrides applied. Variants inherit the base config's
@@ -3950,6 +3951,47 @@ mod tests {
             json!({"endpoint": "https://t:8443", "password": REDACTED}),
         );
         assert!(!same_cluster_destination(&other_engine, &stored));
+    }
+
+    /// An Athena cluster's region picks the AWS endpoints its credentials go to.
+    #[test]
+    fn a_redacted_secret_is_not_carried_to_a_new_region() {
+        let stored = queryflux_persistence::cluster_config::ClusterConfigRecord {
+            id: 1,
+            name: "a".into(),
+            engine_key: "athena".into(),
+            enabled: true,
+            max_running_queries: None,
+            config: json!({"region": "us-east-1", "authToken": "s3cret"}),
+            variants: json!([{ "name": "eu", "overrides": { "region": "eu-west-1" } }]),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        let upsert = |region: &str, variants: serde_json::Value| {
+            queryflux_persistence::cluster_config::UpsertClusterConfig {
+                engine_key: "athena".into(),
+                enabled: true,
+                max_running_queries: None,
+                config: json!({"region": region, "authToken": REDACTED}),
+                variants,
+            }
+        };
+
+        assert!(same_cluster_destination(
+            &upsert("us-east-1", stored.variants.clone()),
+            &stored
+        ));
+        assert!(!same_cluster_destination(
+            &upsert("ap-south-1", stored.variants.clone()),
+            &stored
+        ));
+        assert!(!same_cluster_destination(
+            &upsert(
+                "us-east-1",
+                json!([{ "name": "eu", "overrides": { "region": "ap-south-1" } }])
+            ),
+            &stored
+        ));
     }
 
     /// Variants inherit the base config's secrets, so a variant that points somewhere
