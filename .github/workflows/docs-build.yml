@@ -43,3 +43,6 @@ jobs:
 
       - name: Build docs site
         run: npm run build
+
+      - name: Check SEO (robots, sitemap, llms.txt, page metadata)
+        run: npm run seo:check

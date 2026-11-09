@@ -96,6 +96,8 @@ QueryFlux sits in front of engines you already run. Clients keep their drivers (
 
 ## Blog
 
+- [Teach agents your metrics, not your joins](https://queryflux.dev/blog/apache-ossie-semantic-layer): Agent SQL can run, look right and be off by 2x. How ossiec compiles Apache Ossie metrics into correct SQL on six engines, and why QueryFlux is where they run.
+- [Revenue has three definitions. Your agent picked a fourth.](https://queryflux.dev/blog/apache-ossie-why-metrics-need-a-standard): Apache Ossie is an open specification for metric definitions. Why BI tools, semantic layers and AI agents need it, and how it fits with Iceberg and QueryFlux.
 - [Put the row filter above the engines](https://queryflux.dev/blog/row-filters-above-the-engines): Guardrails shape SQL. Row filters and column masks decide what leaves the warehouse — once, in the proxy, for every client and every engine behind QueryFlux.
 - [Offload Snowflake queries without changing clients](https://queryflux.dev/blog/offload-snowflake-queries): Point Snowflake clients at QueryFlux, keep heavy work on Snowflake, and offload the rest to Trino or StarRocks — no dashboard or notebook rewrites.
 - [One endpoint for Iceberg on Trino and StarRocks](https://queryflux.dev/blog/iceberg-trino-starrocks-one-endpoint): Run Trino and StarRocks on the same Iceberg tables behind one QueryFlux SQL endpoint — route BI and notebooks without client rewrites.

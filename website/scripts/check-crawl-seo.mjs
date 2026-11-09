@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /**
- * Checks robots.txt allows indexable URLs and blocks drafts, thin blog pages,
- * and GitHub Pages *.html duplicates. Also checks llms.txt links those URLs.
+ * Checks robots.txt lets crawlers reach every page, including noindex ones, and that
+ * llms.txt links the indexable URLs. Page-level checks are in check-build-seo.mjs.
  */
 import fs from 'node:fs';
 import path from 'node:path';
@@ -34,44 +34,26 @@ if (staticLlms !== llms) {
   ok('static/llms.txt matches generator');
 }
 
-const allowed = [
+// Noindex pages must stay crawlable: Google reports a blocked page as
+// "Blocked by robots.txt" and never reads its noindex tag.
+const crawlable = [
   '/',
   '/llms.txt',
-  '/docs/architecture/frontends/overview',
-  '/docs/architecture/query-translation',
-  '/docs/architecture/auth-authz-design',
   '/docs/getting-started',
-  '/docs/architecture/overview',
+  '/docs/architecture/frontends/overview',
   '/blog/why-queryflux',
   '/community',
-  '/docs/0.3.0/intro',
-];
-const blocked = [
-  '/docs/next',
-  '/docs/next/',
-  '/docs/next/architecture/frontends/overview',
+  '/docs/next/intro',
   '/docs/next/architecture/query-translation',
-  '/docs/next/architecture/auth-authz-design',
-  '/blog/tags',
-  '/blog/tags/',
+  '/docs/0.1.2/architecture/frontends/overview',
   '/blog/tags/guides',
   '/blog/archive',
   '/blog/authors',
-  '/index.html',
-  '/community.html',
-  '/docs/architecture/frontends/overview.html',
-  '/docs/architecture/query-translation.html',
-  '/docs/architecture/auth-authz-design.html',
-  '/blog/why-queryflux.html',
 ];
 
-for (const pathname of allowed) {
+for (const pathname of crawlable) {
   if (!robotsAllows(pathname, robots)) fail(`robots blocks ${pathname}`);
-  else ok(`allow ${pathname}`);
-}
-for (const pathname of blocked) {
-  if (robotsAllows(pathname, robots)) fail(`robots allows ${pathname}`);
-  else ok(`disallow ${pathname}`);
+  else ok(`crawlable ${pathname}`);
 }
 
 for (const pathname of [

@@ -70,31 +70,13 @@ export function buildRobotsTxt(siteUrl = SITE_URL) {
   const sitemapUrl = `${siteUrl.replace(/\/$/, '')}/sitemap.xml`;
   return `# Generated at build time — do not edit build/robots.txt by hand.
 # https://docusaurus.io/docs/seo#robots-file
-# Latest docs are /docs/. Drafts are /docs/next/ and carry noindex.
-# Allow lines are longer than the draft Disallow, so indexable docs stay crawlable.
-# GitHub Pages also serves each page at a .html URL; those duplicates are disallowed.
+# Nothing is disallowed. Pages kept out of search (/docs/next/, older doc
+# versions, blog tags/archive/authors) carry a noindex meta tag, and Google
+# only sees that tag on pages it is allowed to crawl.
 # LLM index: ${siteUrl.replace(/\/$/, '')}/llms.txt
 
 User-agent: *
-Allow: /llms.txt$
-Allow: /docs/architecture/frontends/overview$
-Allow: /docs/architecture/query-translation$
-Allow: /docs/architecture/auth-authz-design$
-Allow: /docs/
-Allow: /blog/
 Allow: /
-Disallow: /docs/next$
-Disallow: /docs/next/
-Disallow: /blog/tags$
-Disallow: /blog/tags/
-Disallow: /blog/archive$
-Disallow: /blog/archive/
-Disallow: /blog/authors$
-Disallow: /blog/authors/
-Disallow: /index.html$
-Disallow: /community.html$
-Disallow: /docs/*.html$
-Disallow: /blog/*.html$
 
 Sitemap: ${sitemapUrl}
 `;

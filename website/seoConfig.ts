@@ -14,11 +14,6 @@ type DocsVersionsConfig = NonNullable<
   NonNullable<Preset.Options['docs']>['versions']
 >;
 
-/** UTC calendar date (YYYY-MM-DD) — used as sitemap lastmod on each build/deploy. */
-export function sitemapLastModDate(): string {
-  return new Date().toISOString().slice(0, 10);
-}
-
 /**
  * Reads versions.json and returns Docusaurus docs version metadata.
  *
@@ -112,10 +107,11 @@ function sitemapPriority(pathname: string): number {
   return 0.5;
 }
 
-/** Sitemap tuned for SEO; lastmod refreshes on every build (schedule deploy daily at midnight UTC). */
+/**
+ * Sitemap tuned for SEO. lastmod is each page's last git commit date (docs and blog
+ * enable showLastUpdateTime); Google ignores lastmod values that change on every build.
+ */
 export function buildSitemapConfig(): Partial<SitemapPluginOptions> {
-  const lastmod = sitemapLastModDate();
-
   return {
     lastmod: 'date',
     changefreq: 'weekly',
@@ -135,7 +131,6 @@ export function buildSitemapConfig(): Partial<SitemapPluginOptions> {
         .filter(({pathname}) => !shouldOmitFromSitemap(pathname))
         .map(({item, pathname}) => ({
           ...item,
-          lastmod,
           changefreq: 'weekly' as const,
           priority: sitemapPriority(pathname),
         }));
