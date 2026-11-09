@@ -1,9 +1,10 @@
 ---
 sidebar_label: Internal analysts
-title: Internal analysts — group grants, region filters, column masks
-description: Humans connect as themselves (OIDC or static). Policy grants tables by group, adds region row filters, and masks PII columns — no session params, no service account.
+title: Analyst grants, region filters, masks
+description: Humans connect as themselves with OIDC or a static user. Policy grants tables by group, adds region row filters, and masks PII columns.
 image: img/queryflux-hero-banner.png
 ---
+
 # Internal analysts — group grants, region filters, column masks
 
 Data teams often put **humans** in front of QueryFlux — analysts in a BI tool, engineers in a SQL IDE — and need different table grants, region scopes, and PII visibility per group. Authenticate each person as themselves; let the policy provider decide from their groups (or roles) what they may see.

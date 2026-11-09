@@ -1,4 +1,5 @@
 import type {ReactNode} from 'react';
+import Head from '@docusaurus/Head';
 import Header from '@theme-original/BlogPostItem/Header';
 import type HeaderType from '@theme/BlogPostItem/Header';
 import type {WrapperProps} from '@docusaurus/types';
@@ -18,7 +19,14 @@ export default function HeaderWrapper(props: Props): ReactNode {
     <>
       <Header {...props} />
       {isBlogPostPage && image && (
-        <img className="blog-post-hero" src={src} alt={metadata.title} width={1200} height={675} />
+        <>
+          <Head>
+            <meta property="og:image:type" content="image/jpeg" />
+            <meta property="og:image:width" content="1280" />
+            <meta property="og:image:height" content="720" />
+          </Head>
+          <img className="blog-post-hero" src={src} alt={metadata.title} width={1280} height={720} />
+        </>
       )}
     </>
   );

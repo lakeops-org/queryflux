@@ -1,7 +1,7 @@
 ---
 slug: apache-ossie-why-metrics-need-a-standard
 title: "Revenue has three definitions. Your agent picked a fourth."
-description: Apache Ossie is an open specification for metric definitions. Why BI tools, semantic layers and AI agents need it, and where it fits next to Iceberg and QueryFlux.
+description: Apache Ossie is an open specification for metric definitions. Why BI tools, semantic layers and AI agents need it, and how it fits with Iceberg and QueryFlux.
 authors: [amit]
 tags: [Vision]
 keywords:
