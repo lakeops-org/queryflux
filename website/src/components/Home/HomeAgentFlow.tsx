@@ -168,8 +168,8 @@ export default function HomeAgentFlow(): ReactNode {
   const duckLogo = useBaseUrl('/img/engines/duckdb.png');
   const trinoLogo = useBaseUrl('/img/engines/trino.png');
   const starrocksLogo = useBaseUrl('/img/engines/starrocks.svg');
-  const agentBot = useBaseUrl('/img/ai-agent-avatar.jpg');
-  const queryfluxCrab = useBaseUrl('/img/queryflux-mascot.png');
+  const agentBot = useBaseUrl('/img/ai-agent-avatar-face.jpg');
+  const queryfluxCrab = useBaseUrl('/img/queryflux-mascot-crop.png');
   const engines: Engine[] = [
     {...ENGINE_DEFS[0], logo: duckLogo},
     {...ENGINE_DEFS[1], logo: trinoLogo},
@@ -290,15 +290,18 @@ export default function HomeAgentFlow(): ReactNode {
               styles.diagramAgent,
               agentLit && styles.diagramNodeLit,
             )}>
-            <img
-              className={styles.diagramAgentAvatar}
-              src={agentBot}
-              alt=""
-              width={48}
-              height={48}
-            />
+            <span className={styles.diagramAgentRing} aria-hidden>
+              <img
+                className={styles.diagramAgentAvatar}
+                src={agentBot}
+                alt=""
+                width={72}
+                height={72}
+              />
+              <span className={styles.diagramAgentStatus} />
+            </span>
             <strong>AI agent</strong>
-            <span className={styles.diagramNodeHint}>asks over MCP</span>
+            <span className={styles.diagramNodeChip}>MCP client</span>
           </div>
 
           <div
@@ -337,17 +340,18 @@ export default function HomeAgentFlow(): ReactNode {
                 styles.diagramNodePulse,
             )}>
             <div className={styles.diagramProxyHead}>
-              <img
-                className={styles.diagramProxyMascot}
-                src={queryfluxCrab}
-                alt=""
-                width={52}
-                height={36}
-              />
+              <span className={styles.diagramProxyStage} aria-hidden>
+                <img
+                  className={styles.diagramProxyMascot}
+                  src={queryfluxCrab}
+                  alt=""
+                  width={176}
+                  height={76}
+                />
+              </span>
               <div className={styles.diagramProxyTitles}>
                 <span className={styles.diagramNodeEyebrow}>Control plane</span>
                 <strong>QueryFlux</strong>
-                <span className={styles.diagramNodeHint}>guard · translate · route · cache</span>
               </div>
             </div>
             <div className={styles.diagramProxyTags}>

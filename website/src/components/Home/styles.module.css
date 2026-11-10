@@ -453,15 +453,22 @@
 }
 
 .diagramNode {
+  position: relative;
   display: flex;
   flex-direction: column;
   gap: 0.2rem;
   justify-content: center;
   min-height: 100%;
-  padding: 1rem 1.05rem;
-  border-radius: 14px;
+  padding: 1.1rem 1.05rem;
+  border-radius: 16px;
   border: 1px solid var(--h-line);
-  background: rgba(255, 255, 255, 0.03);
+  background: linear-gradient(
+    180deg,
+    rgba(255, 255, 255, 0.055),
+    rgba(255, 255, 255, 0.015) 55%,
+    rgba(255, 255, 255, 0.01)
+  );
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.06);
   transition:
     border-color 0.3s var(--h-ease),
     background 0.3s var(--h-ease),
@@ -470,16 +477,16 @@
 
 .diagramNode strong {
   color: var(--h-ink);
-  font-size: 1.05rem;
+  font-size: 1.1rem;
   font-weight: 750;
   letter-spacing: -0.02em;
 }
 
 .diagramNodeEyebrow {
   font-family: var(--qf-font-mono);
-  font-size: 0.68rem;
+  font-size: 0.66rem;
   font-weight: 700;
-  letter-spacing: 0.08em;
+  letter-spacing: 0.12em;
   text-transform: uppercase;
   color: var(--h-muted);
 }
@@ -489,74 +496,220 @@
   font-size: 0.78rem;
 }
 
+.diagramNodeChip {
+  margin-top: 0.1rem;
+  padding: 2px 9px;
+  border-radius: 999px;
+  border: 1px solid var(--h-line);
+  background: rgba(255, 255, 255, 0.03);
+  font-family: var(--qf-font-mono);
+  font-size: 0.62rem;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--h-muted);
+  transition: color 0.3s, border-color 0.3s, background 0.3s;
+}
+
 .diagramNodeLit {
   border-color: rgba(167, 139, 250, 0.45);
-  background: rgba(139, 92, 246, 0.12);
-  box-shadow: 0 0 0 1px rgba(139, 92, 246, 0.15), 0 14px 36px -18px rgba(139, 92, 246, 0.7);
+  background:
+    radial-gradient(120% 80% at 50% 0%, rgba(139, 92, 246, 0.22), transparent 70%),
+    linear-gradient(180deg, rgba(139, 92, 246, 0.14), rgba(139, 92, 246, 0.05));
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.08),
+    0 0 0 1px rgba(139, 92, 246, 0.15),
+    0 18px 40px -20px rgba(139, 92, 246, 0.75);
 }
+
+/* ——— Agent card: bot in a gradient ring with a status light ——— */
 
 .diagramAgent {
   align-items: center;
   text-align: center;
-  gap: 0.35rem;
+  gap: 0.45rem;
+}
+
+.diagramAgentRing {
+  position: relative;
+  display: grid;
+  place-items: center;
+  width: 84px;
+  height: 84px;
+  margin-bottom: 0.3rem;
+  border-radius: 50%;
+}
+
+/* The ring itself: a conic gradient masked down to a 2px band. */
+.diagramAgentRing::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  padding: 2px;
+  border-radius: 50%;
+  background: conic-gradient(
+    from 0deg,
+    rgba(167, 139, 250, 0.6),
+    rgba(255, 118, 25, 0.6),
+    rgba(167, 139, 250, 0.6)
+  );
+  -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+  -webkit-mask-composite: xor;
+  mask: linear-gradient(#000 0 0) content-box exclude, linear-gradient(#000 0 0);
+  opacity: 0.5;
+  transition: opacity 0.35s var(--h-ease);
+}
+
+/* Soft glow behind the bot when the agent is active. */
+.diagramAgentRing::after {
+  content: '';
+  position: absolute;
+  inset: -16px;
+  z-index: 0;
+  border-radius: 50%;
+  background: radial-gradient(circle, rgba(255, 118, 25, 0.3), rgba(124, 58, 237, 0.12) 50%, transparent 70%);
+  opacity: 0;
+  transition: opacity 0.35s var(--h-ease);
 }
 
 .diagramAgentAvatar {
-  width: 48px;
-  height: 48px;
-  border-radius: 14px;
+  position: relative;
+  z-index: 1;
+  width: 72px;
+  height: 72px;
+  border-radius: 50%;
   object-fit: cover;
-  object-position: center;
   background: #000;
-  box-shadow: 0 0 0 1px rgba(167, 139, 250, 0.28);
+  box-shadow: 0 10px 24px -10px rgba(0, 0, 0, 0.9);
+}
+
+.diagramAgentStatus {
+  position: absolute;
+  right: 5px;
+  bottom: 5px;
+  z-index: 2;
+  width: 13px;
+  height: 13px;
+  border-radius: 50%;
+  border: 2px solid #150e23;
+  background: #52525b;
+  transition: background 0.3s, box-shadow 0.3s;
 }
 
 .diagramAgent.diagramNodeLit {
   border-color: rgba(255, 118, 25, 0.45);
-  background: rgba(255, 118, 25, 0.1);
-  box-shadow: 0 0 0 1px rgba(255, 118, 25, 0.12), 0 14px 36px -18px rgba(255, 118, 25, 0.55);
+  background:
+    radial-gradient(120% 80% at 50% 0%, rgba(255, 118, 25, 0.2), transparent 70%),
+    linear-gradient(180deg, rgba(255, 118, 25, 0.11), rgba(255, 118, 25, 0.04));
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.08),
+    0 0 0 1px rgba(255, 118, 25, 0.12),
+    0 18px 40px -20px rgba(255, 118, 25, 0.6);
 }
 
-.diagramAgent.diagramNodeLit .diagramAgentAvatar {
-  box-shadow: 0 0 0 1px rgba(255, 118, 25, 0.45), 0 0 18px rgba(255, 118, 25, 0.25);
+.diagramAgent.diagramNodeLit .diagramAgentRing::before {
+  opacity: 1;
+  background: conic-gradient(from 0deg, #ff7619, #a78bfa, #a3e635, #ff7619);
+  animation: ringSpin 3.2s linear infinite;
 }
+
+.diagramAgent.diagramNodeLit .diagramAgentRing::after {
+  opacity: 1;
+}
+
+.diagramAgent.diagramNodeLit .diagramAgentStatus {
+  background: #a3e635;
+  box-shadow: 0 0 0 3px rgba(163, 230, 53, 0.18), 0 0 10px rgba(163, 230, 53, 0.65);
+}
+
+.diagramAgent.diagramNodeLit .diagramNodeChip {
+  color: #ffedd5;
+  border-color: rgba(255, 118, 25, 0.45);
+  background: rgba(255, 118, 25, 0.14);
+}
+
+@keyframes ringSpin {
+  to { transform: rotate(1turn); }
+}
+
+/* ——— QueryFlux card: the mascot as the centerpiece ——— */
 
 .diagramProxy {
-  gap: 0.55rem;
+  align-items: center;
+  text-align: center;
+  gap: 0.5rem;
 }
 
 .diagramProxyHead {
   display: flex;
+  flex-direction: column;
   align-items: center;
-  gap: 0.7rem;
+  gap: 0.35rem;
+  width: 100%;
   min-width: 0;
 }
 
+.diagramProxyStage {
+  position: relative;
+  display: grid;
+  place-items: center;
+  width: 100%;
+  max-width: 11.5rem;
+  padding: 0.25rem 0 0.15rem;
+}
+
+.diagramProxyStage::before {
+  content: '';
+  position: absolute;
+  left: 50%;
+  top: 55%;
+  width: 82%;
+  height: 78%;
+  transform: translate(-50%, -50%);
+  border-radius: 50%;
+  background: radial-gradient(
+    closest-side,
+    rgba(255, 118, 25, 0.26),
+    rgba(124, 58, 237, 0.2) 55%,
+    transparent
+  );
+  filter: blur(6px);
+  opacity: 0.55;
+  transition: opacity 0.35s var(--h-ease);
+}
+
 .diagramProxyMascot {
-  flex: 0 0 auto;
-  width: 52px;
-  height: 36px;
+  position: relative;
+  width: 100%;
+  height: auto;
   object-fit: contain;
-  object-position: center;
-  border-radius: 10px;
-  background: rgba(0, 0, 0, 0.35);
-  box-shadow: 0 0 0 1px rgba(167, 139, 250, 0.22);
+  filter: drop-shadow(0 10px 14px rgba(0, 0, 0, 0.55));
 }
 
 .diagramProxyTitles {
   display: flex;
   flex-direction: column;
-  gap: 0.15rem;
+  align-items: center;
+  gap: 0.1rem;
   min-width: 0;
-  text-align: left;
 }
 
 .diagramProxy.diagramNodeLit {
   border-color: rgba(196, 181, 253, 0.5);
 }
 
-.diagramProxy.diagramNodeLit .diagramProxyMascot {
-  box-shadow: 0 0 0 1px rgba(167, 139, 250, 0.4), 0 0 16px rgba(139, 92, 246, 0.28);
+.diagramProxy.diagramNodeLit .diagramProxyStage::before {
+  opacity: 1;
+}
+
+.diagramNodePulse .diagramProxyMascot {
+  animation: crabBob 1.1s ease-in-out infinite;
+}
+
+@keyframes crabBob {
+  0%, 100% { transform: translateY(0); }
+  50% { transform: translateY(-3px); }
 }
 
 .diagramNodePulse {
@@ -571,8 +724,9 @@
 .diagramProxyTags {
   display: flex;
   flex-wrap: wrap;
+  justify-content: center;
   gap: 0.3rem;
-  margin-top: 0.55rem;
+  margin-top: 0.35rem;
 }
 
 .diagramTag {
@@ -1256,6 +1410,8 @@
   .diagramWireProcess .diagramWireLine,
   .diagramWirePulse,
   .diagramNodePulse,
+  .diagramNodePulse .diagramProxyMascot,
+  .diagramAgentRing::before,
   .diagramEngineRunning,
   .diagramCaptionCopy,
   .diagramSqlText code,
