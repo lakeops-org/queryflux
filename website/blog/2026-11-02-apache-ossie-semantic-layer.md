@@ -70,13 +70,15 @@ But Ossie is a definition, not a query engine. It says what `total_stock` means,
 
 ## ossiec: from metric to correct SQL
 
-So we built [**ossiec**](https://github.com/lakeops-org/ossiec), an open-source (Apache-2.0) compiler for Ossie models, written in Rust. An agent no longer writes joins. It sends a request:
+So we built [**ossiec**](https://github.com/lakeops-org/ossiec), an open-source (Apache-2.0) compiler for Ossie models, written in Rust. It takes the two kinds of query the spec defines, and handles this one carefully either way.
+
+Asked as a list of metrics and dimensions (the spec's Layer 3), the question is refused:
 
 ```json
 {"metrics": ["total_stock"], "dimensions": ["customers.region"]}
 ```
 
-and ossiec returns one SQL statement for the target engine, with the correctness rules built in:
+Stock belongs to products, and there's no many-to-one path from products to customers, so there's no safe answer. ossiec returns `E_NO_PATH` instead of guessing. Written as SQL with the joins spelled out and the measure wrapped in `AGG(...)` (the spec's Layer 2), it compiles, and ossiec returns one SQL statement for the target engine with the correctness rules built in:
 
 - **No double counting.** When a metric reads the "one" side of a join, like stock from products while grouping through orders, ossiec first reduces it to one row per product, then sums. That's how 350 becomes 150.
 - **Separate facts stay separate.** Store sales and web sales are computed on their own and combined, never joined to each other.

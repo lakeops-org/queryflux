@@ -114,8 +114,10 @@ The important part is that `change` runs on the *fresh* copy each time. Retrying
 
 Two things about the ETag that surprised us:
 
-- **It's one revision for all of config.** We had the access agent read the routing config at `r8`, then let the capacity agent edit the group. The access agent's `PUT` of the routing config it had read, completely unchanged, got a `412` at `r10`, even though it touched something different. You'll see more retries than real conflicts, but you'll never get a silent merge.
+- **It's one revision for all of config.** We had the access agent read the routing config at `r8`, then let the capacity agent edit the group. The access agent's `PUT` of the routing config it had read, completely unchanged, got a `412` at `r10`, even though it touched something different. You'll see more retries than real conflicts, but you won't get a merge.
 - **It can go up by more than one per write.** A conditional write claims the revision and then writes, so we saw `r4` jump to `r6`. Never work out the next ETag yourself. Use the one the response gives you.
+
+`If-Match` narrows the race, but it doesn't close it yet. From reading the code: QueryFlux claims the new revision before it writes the group, so a read that lands between the two gets the new ETag with the old config. A write based on that read passes `If-Match`, and the lost update comes back. The window is short, and our run didn't hit it, but until the check and the write happen together, an agent that must never lose a change should also serialize its writes, for example by running one config agent at a time.
 
 `If-Match` is optional. A write without it behaves as before, unconditionally. The server can't make your agents use it, so build it into whatever tool or client library they write through.
 
@@ -141,9 +143,10 @@ The log was also missing some requests: the three `403`s from step 1 and both `4
 | What we found | Evidence | What to do for now |
 | --- | --- | --- |
 | **Refused admin requests aren't audited.** `403` and `412` responses return before the audit write. | 3 denials and 2 conflicts, none in `GET /admin/audit`. | Log refused requests in the agent's own tooling, or at a gateway in front of the admin port. |
-| **The audit log has no diff.** | The write that reverted `maxRunningQueries` looks like any other `200`. | Have the agent tooling record the before and after bodies alongside the response. |
+| **The audit log has no diff.** | The write that reverted `maxRunningQueries` looks like any other `200`. | Have the agent tooling record a redacted diff and the response status, not full bodies: cluster configs can carry passwords and tokens. |
 | **Rows name the token by id.** | `token:025a7004-…`. Turning an id into a name needs `GET /admin/tokens`, which needs `credentials`. | Keep a list of token ids and agent names when you create tokens. |
 | **`If-Match` is opt-in.** | Writes without it are unconditional. | Send it from every agent tool, and treat a write without it as a bug. |
+| **`If-Match` has a gap.** The revision is claimed before the group is written. | From the code, not our run: a read in between gets the new ETag with the old config. | Serialize writes from agents that must not lose a change. |
 
 ## Before an agent gets an admin token
 

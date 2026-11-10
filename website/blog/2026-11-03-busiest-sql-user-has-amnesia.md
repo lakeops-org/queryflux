@@ -153,7 +153,7 @@ Now the agent guesses. Here's what came back, and this is the part of the sessio
 
 By any ordinary dashboard, this session looks fine. All five queries succeeded and returned one row each, so an error-rate panel won't show this.
 
-Query history can, because every record carries a `fast_hash` that ignores values, comments, whitespace and case. Those five queries all share one, so you can look for one shape retried with different literals in one session:
+Query history can, because every record carries a `fast_hash`. It replaces literal values with a placeholder, skips comments, lowercases everything and collapses runs of whitespace. Those five queries all share one, so you can look for one shape retried with different literals in one session:
 
 ```sql
 SELECT conversation_id,
@@ -162,6 +162,7 @@ SELECT conversation_id,
        min(sql_preview) AS example
 FROM query_records
 WHERE conversation_id IS NOT NULL
+  AND fast_hash IS NOT NULL
   AND NOT was_guard_blocked
 GROUP BY conversation_id, fast_hash
 HAVING count(DISTINCT sql_preview) >= 3
@@ -176,7 +177,9 @@ ORDER BY attempts DESC;
  conv-3          |        5 |        5 | SELECT count(*) AS late FROM fct_shipments WHERE status = 'DELAYED' AND ship_date >= ...
 ```
 
-Read this report with some care. An agent deliberately comparing carriers also produces many variants, so a hit is a reason to look, not a verdict. `sql_preview` holds the first 500 characters, so queries that differ only after that count as one variant. Non-MCP clients only appear if they send `X-Agent-Id` and `X-Conversation-Id`.
+Read this report with some care. An agent deliberately comparing carriers also produces many variants, so a hit is a reason to look, not a verdict. `sql_preview` holds the first 500 characters, so queries that differ only after that count as one variant. Non-MCP clients only appear if they identify themselves: `X-Agent-Id` and `X-Conversation-Id` headers over HTTP, or `agent_id` and `conversation_id` session parameters on the PostgreSQL and MySQL wire protocols.
+
+The hash is coarse in two ways. Double-quoted identifiers become a placeholder too, so `"orders"` and `"users"` hash the same. Spacing around operators still counts, so `status='late'` and `status = 'late'` don't. Look at the SQL before treating a group as one query shape.
 
 Finding `DELAYED` doesn't settle the question either. Whether it's what the person meant by "late" is a matter of definition, and [our Ossie posts](/blog/apache-ossie-why-metrics-need-a-standard) cover that problem and our planned tools for looking up real values. This post is about the path to the SQL.
 
@@ -200,6 +203,7 @@ SELECT fast_hash,
        count(DISTINCT sql_preview) AS texts
 FROM query_records
 WHERE conversation_id IS NOT NULL
+  AND fast_hash IS NOT NULL
   AND NOT was_guard_blocked
 GROUP BY fast_hash
 HAVING count(DISTINCT conversation_id) > 1
@@ -275,8 +279,8 @@ Following one question also turned up places where QueryFlux doesn't do what we 
 
 | What we found | Evidence from the run | What to do for now |
 | --- | --- | --- |
-| **Denials can leave no audit record when the group has the cache on.** A deny from the guard pass before the cache lookup isn't written to history. | 39 calls ran 42 statements and produced 30 history rows. Twelve of 15 denials are missing. With the cache off, the same denials are recorded. | If you need every denial on record, keep the cache off on that group. |
-| **Guards run twice on a cache miss**, once before the lookup and once before execution. | With the cache on, our budget of 4 ran out after 2 queries. The webhook got 8 calls for 6 queries. | Run counting guards on groups with the cache off. |
+| **Denials can leave no audit record when the group has the cache on.** A deny from the guard pass before the cache lookup isn't written to history. | 39 calls ran 42 statements and produced 30 history rows. Twelve of 15 denials are missing. With the cache off, the same denials are recorded. | Keep the cache off on that group. That isn't a guarantee: a client can still turn the cache on for one query, with the `X-QueryFlux-Cache` header, a query tag or a `/* queryflux:cache */` comment, and that query's denial goes unrecorded. |
+| **Guards run twice on a cache miss**, once before the lookup and once before execution. | With the cache on, our budget of 4 ran out after 2 queries. The webhook got 8 calls for 6 queries. | Run counting guards on groups with the cache off, with the same per-query caveat. |
 | **`require_predicate` blocks the sample inside `describe_table`.** | The tool reports success, with an error in place of the sample. | Give agents the values another way, such as in a guard's `reason`. |
 | **`query_intent` isn't inferred.** The heuristic exists but nothing calls it. | Every row in the run says `unknown`, including plain aggregations. | Have clients send `query_intent` themselves. |
 | **The guard `code` doesn't reach an MCP agent.** It's stored in `guard_actions`, but only `reason` goes back. | Every denial above arrived with no code. | Put anything the agent needs into `reason`. |

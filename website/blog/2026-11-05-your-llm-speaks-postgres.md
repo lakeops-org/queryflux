@@ -145,7 +145,7 @@ None of this is a reason to stop translating. Going from 33 right answers to 65 
 
 1. **Choose one dialect for your agents, and say it twice.** Name it in the system prompt ("write PostgreSQL") and pass the same value as `dialect` on every `execute_query`. A declaration the model doesn't actually follow is worse than none.
 2. **Configure a catalog.** Types are what turn `/` into the right kind of division. Without them, translation only works on syntax.
-3. **Watch for fallbacks.** Query history records `translation.status` and `reason` on every query. A sudden increase in `fallback` means the agents are writing something your setup can't fully translate.
+3. **Watch for fallbacks.** Query history records `translation.status` and `reason` on every query that reaches translation. Cache hits, and queries stopped before translation, have no translation outcome, so a missing value isn't a failure. A sudden increase in `fallback` means the agents are writing something your setup can't fully translate.
 4. **Turn known silent failures into loud ones.** A [fixup script](/docs/architecture/query-translation#python-transform-scripts) that raises an exception sends the original SQL through in best-effort mode, where Trino rejects `TO_VARCHAR`, and rejects the query outright in strict mode. Both outcomes beat `YYYY-MM | 24`:
 
    ```python

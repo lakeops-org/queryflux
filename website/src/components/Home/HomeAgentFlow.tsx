@@ -128,6 +128,7 @@ const PHASES: PhaseMeta[] = [
 
 const STEP_BOXES = PHASES.filter((p) => p.id !== 'hold');
 
+/** True once the animation has reached `id` (or any later phase). */
 function phaseAtOrAfter(id: Phase, current: Phase): boolean {
   return PHASE_ORDER.indexOf(current) >= PHASE_ORDER.indexOf(id);
 }
@@ -197,6 +198,7 @@ function AgentBot(): ReactNode {
   );
 }
 
+/** Tracks the visitor's reduced-motion preference, updating if it changes. */
 function usePrefersReducedMotion(): boolean {
   const [reduced, setReduced] = useState(false);
   useEffect(() => {
@@ -209,6 +211,7 @@ function usePrefersReducedMotion(): boolean {
   return reduced;
 }
 
+/** Wraps the first occurrence of `needle` in `sql` in a highlight mark. */
 function highlightDiff(sql: string, needle: string, kind: 'from' | 'to'): ReactNode {
   const i = sql.indexOf(needle);
   if (i < 0) {
@@ -223,6 +226,7 @@ function highlightDiff(sql: string, needle: string, kind: 'from' | 'to'): ReactN
   );
 }
 
+/** Looping diagram of one agent query: guardrails, translation, routing, the engine and back. */
 export default function HomeAgentFlow(): ReactNode {
   const reduced = usePrefersReducedMotion();
   const [phaseIndex, setPhaseIndex] = useState(reduced ? PHASES.length - 2 : 0);

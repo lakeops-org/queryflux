@@ -74,8 +74,8 @@ If Iceberg had shipped this way, it would have been a format you convert into De
 Here's what "behavior" means for a metric. Take one Ossie model with `orders`, `customers` and `products`, and ask for units in stock by customer region:
 
 - A tool that joins the tables and sums `stock` returns **350** for EU, because each product is counted once per order.
-- A tool that follows the relationships and primary keys in the model returns **150**.
-- A tool that follows the spec's query interface refuses: stock belongs to products, and there's no many-to-one path from products to customers.
+- A tool that takes the joins as written and counts each product once, using the model's primary keys, returns **150**. In the spec, that's a Layer 2 query: SQL with `AGG(measure)`.
+- A tool that takes the question as a list of metrics and dimensions, the spec's Layer 3 interface, refuses: stock belongs to products, and there's no many-to-one path from products to customers.
 
 All three read the same YAML file, and all three can say they support Ossie. [Part two](/blog/apache-ossie-semantic-layer) walks through this case in detail. Underneath that, engines differ in smaller ways too. ClickHouse's `lag` returns `0` where Postgres returns `NULL`, and MySQL has no `NULLS LAST`. So the same SQL can return different rows on different engines.
 
@@ -89,7 +89,7 @@ But adopting a standard means running it. We needed something that takes an Ossi
 
 **Follow the spec, not our own ideas.** ossiec reads Ossie models as the spec defines them, and every Ossie example and compliance fixture loads. It supports both query interfaces: Layer 3 requests that list metrics and dimensions, and Layer 2 SQL with `AGG(measure)`. When the spec says a request must be rejected, ossiec rejects it with the spec's own error code, such as `E_NO_PATH`, rather than guessing. A wrong number that looks plausible is the worst thing a metric tool can return.
 
-**The same answer on every engine.** This is Iceberg's main promise, applied to metrics. Every correctness test in ossiec runs on six real engines (DuckDB, Postgres, Trino, StarRocks, ClickHouse and MySQL), and they must all return the same rows. When an engine differs, a small dialect rule fixes it, and a test fails if the rule stops working. The same model and request always produce the same SQL, byte for byte.
+**The same answer on every engine.** This is Iceberg's main promise, applied to metrics. Every correctness test in ossiec runs on six real engines (DuckDB, Postgres, Trino, StarRocks, ClickHouse and MySQL), and they must all return the same rows. When an engine differs, a small dialect rule fixes it, and a test fails if the rule stops working. The same model, request and options always produce the same SQL, byte for byte. Two limits remain. Snowflake, BigQuery and Redshift are only compile-checked so far, not run. And truncating a time zone-aware timestamp uses each engine's session time zone, so sessions set to different zones can put rows in different groups.
 
 **A library anyone can embed.** iceberg-rust lets an engine read Iceberg without running a service. ossiec does the same for Ossie. It's a Rust crate and a CLI with five dependencies, no runtime and no Python. QueryFlux is one place to embed it. An engine, a BI tool or an agent framework could embed it too.
 
