@@ -132,6 +132,71 @@ function phaseAtOrAfter(id: Phase, current: Phase): boolean {
   return PHASE_ORDER.indexOf(current) >= PHASE_ORDER.indexOf(id);
 }
 
+/** The AI agent, drawn as SVG so it stays sharp at any size and needs no backdrop. */
+function AgentBot(): ReactNode {
+  return (
+    <svg className={styles.agentBot} viewBox="0 0 96 96" aria-hidden focusable="false">
+      <defs>
+        <linearGradient id="qfBotShell" x1="13" y1="44" x2="83" y2="66" gradientUnits="userSpaceOnUse">
+          <stop offset="0" stopColor="#9b4dff" />
+          <stop offset="0.5" stopColor="#e5609e" />
+          <stop offset="1" stopColor="#ff7a1a" />
+        </linearGradient>
+        <linearGradient id="qfBotShade" x1="48" y1="24" x2="48" y2="86" gradientUnits="userSpaceOnUse">
+          <stop offset="0" stopColor="#fff" stopOpacity="0.12" />
+          <stop offset="0.35" stopColor="#fff" stopOpacity="0" />
+          <stop offset="1" stopColor="#1a0630" stopOpacity="0.45" />
+        </linearGradient>
+        <linearGradient id="qfBotVisor" x1="48" y1="40" x2="48" y2="72" gradientUnits="userSpaceOnUse">
+          <stop offset="0" stopColor="#1d1533" />
+          <stop offset="1" stopColor="#0a0714" />
+        </linearGradient>
+        <radialGradient id="qfBotBulb" cx="0.38" cy="0.35" r="0.7">
+          <stop offset="0" stopColor="#ffd2a8" />
+          <stop offset="0.5" stopColor="#ff8a2a" />
+          <stop offset="1" stopColor="#e2580b" />
+        </radialGradient>
+        <filter id="qfBotGlow" x="-50%" y="-50%" width="200%" height="200%">
+          <feGaussianBlur stdDeviation="1.6" result="b" />
+          <feMerge>
+            <feMergeNode in="b" />
+            <feMergeNode in="SourceGraphic" />
+          </feMerge>
+        </filter>
+      </defs>
+      <path d="M48 26 V15" stroke="#160b26" strokeWidth="5.5" strokeLinecap="round" />
+      <path d="M48 26 V15" stroke="#8b5cf6" strokeWidth="3" strokeLinecap="round" />
+      <circle className={styles.agentBotBulb} cx="48" cy="12" r="5" fill="url(#qfBotBulb)" stroke="#160b26" strokeWidth="2.5" />
+      <circle cx="46.4" cy="10.4" r="1.4" fill="#fff" opacity="0.8" />
+      <rect x="8" y="46" width="8" height="18" rx="4" fill="#8b3df5" stroke="#160b26" strokeWidth="2.5" />
+      <rect x="80" y="46" width="8" height="18" rx="4" fill="#ff7a1a" stroke="#160b26" strokeWidth="2.5" />
+      <rect x="13" y="25" width="70" height="60" rx="27" fill="url(#qfBotShell)" />
+      <rect x="13" y="25" width="70" height="60" rx="27" fill="url(#qfBotShade)" />
+      <rect x="13" y="25" width="70" height="60" rx="27" fill="none" stroke="#160b26" strokeWidth="2.5" />
+      <ellipse cx="30" cy="34.5" rx="8" ry="3.6" transform="rotate(-26 30 34.5)" fill="#fff" opacity="0.5" />
+      <circle cx="22.5" cy="42" r="1.6" fill="#fff" opacity="0.45" />
+      <rect x="21" y="39" width="54" height="33" rx="16.5" fill="url(#qfBotVisor)" />
+      <rect x="21.75" y="39.75" width="52.5" height="31.5" rx="15.75" fill="none" stroke="#fff" strokeOpacity="0.08" strokeWidth="1.5" />
+      <g className={styles.agentBotEyes}>
+        <g filter="url(#qfBotGlow)" fill="#a3e635">
+          <ellipse cx="38" cy="54" rx="5" ry="6" />
+          <ellipse cx="58" cy="54" rx="5" ry="6" />
+        </g>
+        <circle cx="36.3" cy="51.2" r="1.9" fill="#fff" opacity="0.9" />
+        <circle cx="56.3" cy="51.2" r="1.9" fill="#fff" opacity="0.9" />
+      </g>
+      <path
+        d="M42.5 62.5 Q48 67 53.5 62.5"
+        fill="none"
+        stroke="#a3e635"
+        strokeWidth="2.6"
+        strokeLinecap="round"
+        filter="url(#qfBotGlow)"
+      />
+    </svg>
+  );
+}
+
 function usePrefersReducedMotion(): boolean {
   const [reduced, setReduced] = useState(false);
   useEffect(() => {
@@ -168,7 +233,6 @@ export default function HomeAgentFlow(): ReactNode {
   const duckLogo = useBaseUrl('/img/engines/duckdb.png');
   const trinoLogo = useBaseUrl('/img/engines/trino.png');
   const starrocksLogo = useBaseUrl('/img/engines/starrocks.svg');
-  const agentBot = useBaseUrl('/img/ai-agent-avatar-face.jpg');
   const queryfluxCrab = useBaseUrl('/img/queryflux-crab.png');
   const engines: Engine[] = [
     {...ENGINE_DEFS[0], logo: duckLogo},
@@ -291,13 +355,9 @@ export default function HomeAgentFlow(): ReactNode {
               agentLit && styles.diagramNodeLit,
             )}>
             <span className={styles.diagramAgentRing} aria-hidden>
-              <img
-                className={styles.diagramAgentAvatar}
-                src={agentBot}
-                alt=""
-                width={72}
-                height={72}
-              />
+              <span className={styles.diagramAgentAvatar}>
+                <AgentBot />
+              </span>
               <span className={styles.diagramAgentStatus} />
             </span>
             <strong>AI agent</strong>
