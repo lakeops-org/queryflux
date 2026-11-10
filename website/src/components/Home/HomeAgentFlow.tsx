@@ -169,7 +169,7 @@ export default function HomeAgentFlow(): ReactNode {
   const trinoLogo = useBaseUrl('/img/engines/trino.png');
   const starrocksLogo = useBaseUrl('/img/engines/starrocks.svg');
   const agentBot = useBaseUrl('/img/ai-agent-avatar-face.jpg');
-  const queryfluxCrab = useBaseUrl('/img/queryflux-mascot-crop.png');
+  const queryfluxCrab = useBaseUrl('/img/queryflux-crab.png');
   const engines: Engine[] = [
     {...ENGINE_DEFS[0], logo: duckLogo},
     {...ENGINE_DEFS[1], logo: trinoLogo},
