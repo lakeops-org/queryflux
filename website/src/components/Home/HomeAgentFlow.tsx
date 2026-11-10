@@ -1,4 +1,4 @@
-import {useEffect, useState, type ReactNode} from 'react';
+import {useEffect, useRef, useState, type ReactNode} from 'react';
 import clsx from 'clsx';
 import useBaseUrl from '@docusaurus/useBaseUrl';
 import styles from './styles.module.css';
@@ -264,6 +264,64 @@ export default function HomeAgentFlow(): ReactNode {
     return () => window.clearInterval(id);
   }, [phase.id, reduced]);
 
+  const fanPathRefs = useRef<(SVGPathElement | null)[]>([]);
+  const fanPacketRef = useRef<SVGGElement | null>(null);
+
+  /**
+   * Engine phase: SQL travels from QueryFlux along the chosen path to the engine, waits
+   * while it runs, then the rows travel back. Drawn with getPointAtLength so the packet
+   * follows the real curve at whatever size the SVG is rendered.
+   */
+  useEffect(() => {
+    const g = fanPacketRef.current;
+    const path = fanPathRefs.current[pickIndex];
+    if (!g || !path) {
+      return;
+    }
+    if (reduced || phase.id !== 'engine') {
+      g.style.display = 'none';
+      return;
+    }
+    const text = g.querySelector('text');
+    const total = path.getTotalLength();
+    const duration = phase.ms * 0.92;
+    const ease = (x: number) => (x < 0.5 ? 2 * x * x : 1 - (-2 * x + 2) ** 2 / 2);
+    const OUT = 0.4; // share of the phase spent travelling to the engine
+    const HOLD = 0.18; // share spent waiting at the engine
+    let raf = 0;
+    const start = performance.now();
+    const frame = (now: number) => {
+      const p = Math.min((now - start) / duration, 1);
+      let along: number;
+      let kind: 'sql' | 'rows';
+      if (p < OUT) {
+        along = ease(p / OUT);
+        kind = 'sql';
+      } else if (p < OUT + HOLD) {
+        along = 1;
+        kind = 'sql';
+      } else {
+        along = 1 - ease((p - OUT - HOLD) / (1 - OUT - HOLD));
+        kind = 'rows';
+      }
+      const pt = path.getPointAtLength(along * total);
+      g.setAttribute('transform', `translate(${pt.x} ${pt.y})`);
+      g.setAttribute('data-kind', kind);
+      if (text) {
+        text.textContent = kind === 'sql' ? 'SQL' : 'ROWS';
+      }
+      g.style.display = '';
+      if (p < 1) {
+        raf = requestAnimationFrame(frame);
+      }
+    };
+    raf = requestAnimationFrame(frame);
+    return () => {
+      cancelAnimationFrame(raf);
+      g.style.display = 'none';
+    };
+  }, [phase.id, phase.ms, pickIndex, reduced]);
+
   const routingSettled =
     reduced ||
     phaseAtOrAfter('cache', phase.id) ||
@@ -453,6 +511,9 @@ export default function HomeAgentFlow(): ReactNode {
                 return (
                   <path
                     key={engine.id}
+                    ref={(el) => {
+                      fanPathRefs.current[i] = el;
+                    }}
                     d={FAN_PATHS[i]}
                     className={clsx(
                       styles.diagramFanPath,
@@ -465,6 +526,12 @@ export default function HomeAgentFlow(): ReactNode {
                   />
                 );
               })}
+              <g ref={fanPacketRef} className={styles.fanPacket} style={{display: 'none'}}>
+                <rect x={-17} y={-7.5} width={34} height={15} rx={7.5} />
+                <text x={0} y={0.5} textAnchor="middle" dominantBaseline="middle">
+                  SQL
+                </text>
+              </g>
             </svg>
 
             <ul className={styles.diagramEngineList}>

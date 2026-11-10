@@ -918,6 +918,38 @@
   100% { top: 0; opacity: 1; transform: translate(-50%, -10%) scale(1); }
 }
 
+/* Packet that rides the chosen fan path: SQL out to the engine, rows back. */
+.fanPacket {
+  filter: drop-shadow(0 0 3px rgba(255, 118, 25, 0.55));
+}
+
+.fanPacket rect {
+  fill: rgba(255, 118, 25, 0.92);
+  stroke: rgba(253, 186, 116, 0.85);
+  stroke-width: 0.7;
+}
+
+.fanPacket text {
+  fill: #fff7ed;
+  font-family: var(--qf-font-mono);
+  font-size: 7.6px;
+  font-weight: 700;
+  letter-spacing: 0.4px;
+}
+
+.fanPacket[data-kind='rows'] {
+  filter: drop-shadow(0 0 3px rgba(163, 230, 53, 0.5));
+}
+
+.fanPacket[data-kind='rows'] rect {
+  fill: rgba(163, 230, 53, 0.92);
+  stroke: rgba(190, 242, 100, 0.85);
+}
+
+.fanPacket[data-kind='rows'] text {
+  fill: #052e16;
+}
+
 .diagramFan {
   display: grid;
   grid-template-columns: minmax(4rem, 0.65fr) minmax(9rem, 1fr);
