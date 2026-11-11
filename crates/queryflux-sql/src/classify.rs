@@ -407,9 +407,16 @@ pub fn is_read_sql(sql: &str, dialect: &SqlDialect) -> bool {
 /// rewrite turning `VALUES (1)` into `DELETE FROM orders` is exactly the
 /// transition they must catch, so it classifies as a read there even though
 /// [`is_read_stmt`] (the read_only guard's predicate) keeps denying it.
-/// Opaque commands and modifying-CTE carriers stay rejected.
+/// Parenthesized queries parse as [`Expression::Subquery`], so the wrapper is
+/// looked through before that check — otherwise a fixup that only adds
+/// parentheses (`VALUES (1)` → `(VALUES (1))`) fails the invariant and the
+/// reverse rewrite slips past it. Opaque commands and (wrapped) modifying-CTE
+/// carriers stay rejected.
 fn is_invariant_read_stmt(expr: &Expression) -> bool {
-    is_read_stmt(expr) || matches!(expr, Expression::Values(_))
+    match expr {
+        Expression::Subquery(inner) => is_invariant_read_stmt(&inner.this),
+        _ => is_read_stmt(expr) || matches!(expr, Expression::Values(_)),
+    }
 }
 
 /// Fallback classifier for statements `polyglot_sql` cannot parse.
@@ -598,6 +605,32 @@ mod tests {
             &SqlDialect::Postgres,
         ));
         assert!(is_read_sql("SELECT 1", &SqlDialect::Postgres));
+    }
+
+    /// Parenthesized queries parse as [`Expression::Subquery`], and the
+    /// invariant-read side must look through the wrapper: a rewrite that only
+    /// adds parentheses (`VALUES (1)` → `(VALUES (1))`) must not fail the
+    /// read→write invariant, and the reverse rewrite must not slip past it.
+    /// Parentheses must not hide a modifying CTE either.
+    #[test]
+    fn is_read_sql_looks_through_parenthesized_values() {
+        let bare = SqlParseCache::new("VALUES (1)", SqlDialect::Postgres);
+        assert!(bare.is_read_sql());
+
+        let paren = SqlParseCache::new("(VALUES (1))", SqlDialect::Postgres);
+        assert!(
+            paren.is_read_sql(),
+            "adding parentheses keeps inert VALUES invariant-read"
+        );
+
+        let wrapped = SqlParseCache::new(
+            "(WITH del AS (DELETE FROM orders RETURNING *) SELECT 1)",
+            SqlDialect::Postgres,
+        );
+        assert!(
+            !wrapped.is_read_sql(),
+            "parentheses must not hide a modifying CTE"
+        );
     }
 
     #[test]

@@ -636,9 +636,7 @@ SELECT 3 AS n
     async fn row_limit_leaves_values_excluded() {
         let sql = "VALUES (1), (2)";
         let tc = TestCtx::new(sql);
-        let g = RowLimitGuard {
-            max_rows: Some(1),
-        };
+        let g = RowLimitGuard { max_rows: Some(1) };
         let r = g.check(&tc.ctx()).await;
         assert!(!r.is_deny(), "Values must stay outside row_limit: {sql}");
     }
