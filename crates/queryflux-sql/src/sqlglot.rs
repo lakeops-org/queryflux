@@ -665,6 +665,28 @@ def transform(sql, src, dst):
         assert!(err.to_string().contains("read to non-read"), "got: {err}");
     }
 
+    /// Inert row constructors count as invariant-read inputs: `is_read_stmt`
+    /// (the guard's stricter predicate) denies a bare `VALUES`, but the
+    /// invariant must still fire when a script turns one into a write —
+    /// otherwise `VALUES (1)` → `DELETE FROM orders` slips through unchecked.
+    #[tokio::test]
+    async fn script_rewriting_values_into_a_delete_is_rejected() {
+        let translator = SqlglotTranslator::new(
+            SqlDialect::Postgres,
+            SqlDialect::Postgres,
+            vec![r#"
+def transform(sql, src, dst):
+    return "DELETE FROM orders"
+"#
+            .to_string()],
+        );
+        let err = translator
+            .translate("VALUES (1)", &SchemaContext::default())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("read to non-read"), "got: {err}");
+    }
+
     /// A script that keeps the statement a read (even while rewriting it) is unaffected.
     #[tokio::test]
     async fn script_keeping_statement_a_read_is_allowed() {

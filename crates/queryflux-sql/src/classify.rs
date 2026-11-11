@@ -204,18 +204,23 @@ impl SqlParseCache {
         self.is_read_like()
     }
 
-    /// [`is_read_stmt`] over every parsed statement — the safety classification
-    /// ("may this run under read_only") behind the read→write invariant checks
-    /// in fixup scripts and access-control rewriting. Deliberately stricter than
+    /// [`is_invariant_read_stmt`] over every parsed statement — the safety
+    /// classification ("did this text stop being safe to treat as a read")
+    /// behind the read→write invariant checks in fixup scripts and
+    /// access-control rewriting. Deliberately stricter than
     /// [`Self::is_read_like`]: a `SELECT` whose `WITH` clause carries a
     /// `DELETE ... RETURNING` still streams rows for routing, but comparing it
     /// as read-like would let a rewrite swap a read for exactly that shape
-    /// without tripping the "must not turn a read into a write" check. The
+    /// without tripping the "must not turn a read into a write" check.
+    /// Top-level inert `VALUES` count as reads here — they produce rows and
+    /// mutate nothing, so a rewrite turning `VALUES (1)` into a `DELETE` is
+    /// exactly the transition the invariants exist to catch — while the
+    /// read_only guard's [`is_read_stmt`] keeps denying them. The
     /// unparseable-SQL fallback matches [`Self::is_read_like`] so the
     /// invariants' parse-failure behavior stays what it always was.
     pub fn is_read_sql(&self) -> bool {
         match self.statements() {
-            Some(stmts) => !stmts.is_empty() && stmts.iter().all(is_read_stmt),
+            Some(stmts) => !stmts.is_empty() && stmts.iter().all(is_invariant_read_stmt),
             None => is_read_like_fallback(&self.sql),
         }
     }
@@ -386,13 +391,25 @@ pub fn is_read_like_sql(sql: &str, dialect: &SqlDialect) -> bool {
 }
 
 /// Safety-aware counterpart of [`is_read_like_sql`] for read→write invariant
-/// checks — every statement must classify as a read under [`is_read_stmt`]
-/// (modifying CTE bodies are writes, opaque `Command`s fail closed). Routing
+/// checks — every statement must classify as a read under
+/// [`is_invariant_read_stmt`] ([`is_read_stmt`] plus inert top-level `VALUES`;
+/// modifying CTE bodies are writes, opaque `Command`s fail closed). Routing
 /// keeps [`is_read_like_sql`]; this answers "did this text stop being safe to
 /// treat as a read", where a `SELECT` wrapping a `DELETE ... RETURNING` CTE
 /// counts as stopped even though both sides stream rows.
 pub fn is_read_sql(sql: &str, dialect: &SqlDialect) -> bool {
     SqlParseCache::new(sql, dialect.clone()).is_read_sql()
+}
+
+/// Invariant-side counterpart of [`is_read_stmt`]: the read→write invariants
+/// ask "did this text stop being safe to treat as a read", and a top-level
+/// inert `VALUES` row constructor produces rows without touching data — a
+/// rewrite turning `VALUES (1)` into `DELETE FROM orders` is exactly the
+/// transition they must catch, so it classifies as a read there even though
+/// [`is_read_stmt`] (the read_only guard's predicate) keeps denying it.
+/// Opaque commands and modifying-CTE carriers stay rejected.
+fn is_invariant_read_stmt(expr: &Expression) -> bool {
+    is_read_stmt(expr) || matches!(expr, Expression::Values(_))
 }
 
 /// Fallback classifier for statements `polyglot_sql` cannot parse.
@@ -565,15 +582,21 @@ mod tests {
         );
         assert!(inert.is_read_sql(), "inert CTE bodies stay reads");
 
+        let values = SqlParseCache::new("VALUES (1)", SqlDialect::Postgres);
+        assert!(
+            values.is_read_sql(),
+            "inert top-level VALUES count as invariant-read inputs"
+        );
+
         // Unparseable SQL keeps the same string fallback as is_read_like, so
         // the invariants' parse-failure behavior is unchanged.
         let junk = SqlParseCache::new("SELECT {invalid", SqlDialect::Postgres);
         assert_eq!(junk.is_read_like(), junk.is_read_sql());
-        assert_eq!(
-            junk.is_read_sql(),
-            is_read_like_fallback("SELECT {invalid"),
-        );
-        assert!(is_read_sql("WITH del AS (DELETE FROM orders RETURNING *) SELECT 1", &SqlDialect::Postgres) == false);
+        assert_eq!(junk.is_read_sql(), is_read_like_fallback("SELECT {invalid"),);
+        assert!(!is_read_sql(
+            "WITH del AS (DELETE FROM orders RETURNING *) SELECT 1",
+            &SqlDialect::Postgres,
+        ));
         assert!(is_read_sql("SELECT 1", &SqlDialect::Postgres));
     }
 
