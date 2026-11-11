@@ -32,7 +32,7 @@ Create chart name and version as used by the chart label.
 The server image: image.tag, or the release this chart ships with.
 */}}
 {{- define "queryflux.image" -}}
-{{ .Values.image.repository }}:{{ .Values.image.tag | default (printf "v%s-slim" .Chart.AppVersion) }}
+{{ .Values.image.repository }}:{{ .Values.image.tag | default (printf "v%s" .Chart.AppVersion) }}
 {{- end -}}
 
 {{/*
