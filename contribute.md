@@ -55,8 +55,9 @@ Release images are built for **linux/amd64** and **linux/arm64** only.
 
 | Trigger | Workflow | Tags |
 |---------|----------|------|
-| Push to `main` or `rel-*` without a release | [release.yml](.github/workflows/release.yml) | `:<branch>` (`:main`, `:rel-0.4`) |
-| Release Please release | [release.yml](.github/workflows/release.yml) | `:vX.Y.Z`, plus `:latest` when released from `main` |
+| Push to `main` | [release.yml](.github/workflows/release.yml) | `:latest` |
+| Push to `rel-*` | [release.yml](.github/workflows/release.yml) | `:<branch>` (`:rel-0.4`) |
+| Release Please release | [release.yml](.github/workflows/release.yml) | `:vX.Y.Z` |
 | Manual, any ref | [docker-publish-tag.yml](.github/workflows/docker-publish-tag.yml) | `:<image_tag>` |
 
 The image is server-only. Studio is **`ghcr.io/lakeops-org/queryflux-studio`**. Tags up to `v0.4.0` still mean the old server + Studio image; do not republish them.
