@@ -4,7 +4,6 @@ on:
   push:
     branches:
       - main
-      - "rel-*"
     paths-ignore:
       - "website/**"
       - "docs/**"
@@ -221,13 +220,11 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          # A release (merging the Release Please PR) is published under its version only.
-          # Every other push to main moves :latest, the newest build of main. Pushes to rel-*
-          # without a release use the branch name (:rel-0.4) so an older line never moves :latest.
+          # A release (merging the Release Please PR) is published under its version only;
+          # every other push to main moves :latest, the newest build of main.
           tags: |
             type=raw,value=${{ needs.docker_tag_base.outputs.base }},enable=${{ needs.release_please.outputs.releases_created == 'true' }}
-            type=raw,value=latest,enable=${{ needs.release_please.outputs.releases_created != 'true' && github.ref == 'refs/heads/main' }}
-            type=ref,event=branch,enable=${{ needs.release_please.outputs.releases_created != 'true' && github.ref != 'refs/heads/main' }}
+            type=raw,value=latest,enable=${{ needs.release_please.outputs.releases_created != 'true' }}
 
       - name: Create and push manifest
         working-directory: /tmp/digests

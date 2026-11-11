@@ -56,7 +56,6 @@ Release images are built for **linux/amd64** and **linux/arm64** only.
 | Trigger | Workflow | Tags |
 |---------|----------|------|
 | Push to `main` | [release.yml](.github/workflows/release.yml) | `:latest` |
-| Push to `rel-*` | [release.yml](.github/workflows/release.yml) | `:<branch>` (`:rel-0.4`) |
 | Release Please release | [release.yml](.github/workflows/release.yml) | `:vX.Y.Z` |
 | Manual, any ref | [docker-publish-tag.yml](.github/workflows/docker-publish-tag.yml) | `:<image_tag>` |
 
