@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - main
+      - "rel-*"
     paths-ignore:
       - "website/**"
       - "docs/**"
@@ -220,11 +221,9 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          # A release (merging the Release Please PR) is published under its version only;
-          # every other push to main moves :latest, the newest build of main.
           tags: |
+            type=raw,value=latest
             type=raw,value=${{ needs.docker_tag_base.outputs.base }},enable=${{ needs.release_please.outputs.releases_created == 'true' }}
-            type=raw,value=latest,enable=${{ needs.release_please.outputs.releases_created != 'true' }}
 
       - name: Create and push manifest
         working-directory: /tmp/digests
@@ -245,4 +244,4 @@ jobs:
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "| Image | Tags |" >> "$GITHUB_STEP_SUMMARY"
           echo "|-------|------|" >> "$GITHUB_STEP_SUMMARY"
-          echo "| queryflux | \`:${{ needs.docker_tag_base.outputs.base }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| queryflux | \`:${{ needs.docker_tag_base.outputs.base }}\`, \`:latest\` |" >> "$GITHUB_STEP_SUMMARY"

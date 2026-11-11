@@ -15,7 +15,7 @@ QueryFlux publishes the server image to GitHub Container Registry:
 | `ghcr.io/lakeops-org/queryflux:<version>` | Server | `8080`, `9000` (plus any frontends you enable) |
 | `ghcr.io/lakeops-org/queryflux-studio:<version>` | QueryFlux Studio (optional) | `3000` |
 
-Each release is published under its version tag (for example `v0.5.0`). `latest` is the newest build of `main` and can include unreleased changes, so pin a version tag for anything long-lived. Studio is built in its own repo and run next to the server (Compose service or Helm sidecar).
+`latest` follows the newest release. Pin a version tag for anything long-lived. Studio is built in its own repo and run next to the server (Compose service or Helm sidecar).
 
 ## Run a container
 
