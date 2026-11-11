@@ -5,7 +5,7 @@
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::OnceLock;
 
-use polyglot_sql::expressions::Expression;
+use polyglot_sql::expressions::{Expression, With};
 use polyglot_sql::DialectType;
 
 use queryflux_core::query::SqlDialect;
@@ -182,22 +182,17 @@ impl SqlParseCache {
     /// Whether the statement should use a result-set execution path (`execute`) vs
     /// an update path (`execute_update`).
     ///
-    /// Deliberately stricter than [`is_read_stmt`]: `Expression::Command` (`BEGIN`,
-    /// `COMMIT`, `ROLLBACK`, and any future catch-all the parser recognizes but
-    /// doesn't model precisely) is treated as "read" by `is_read_stmt` so guardrails
-    /// don't block it, but that's a permissive default for a different question
-    /// ("is this safe to allow?"). Here we're deciding which ADBC API to call, and a
-    /// `Command` produces no result set — routing it through `execute()` risks the
+    /// Same predicate as [`is_result_set_stmt`] (opaque `Command` statements
+    /// produce no result set, #403), kept as a method because the unparseable-SQL
+    /// fallback applies here. A `Command` routed through `execute()` risks the
     /// same empty-stream misframing this cache exists to avoid (#97). Route it
-    /// through `execute_update()` like DDL/DML instead.
+    /// through `execute_update()` like DDL/DML instead. Deliberately stricter
+    /// than routing alone would demand is the guard's job ([`is_read_stmt`]) —
+    /// this answers "which ADBC API to call", not "may this run under
+    /// read_only".
     pub fn is_read_like(&self) -> bool {
         match self.statements() {
-            Some(stmts) => {
-                !stmts.is_empty()
-                    && stmts
-                        .iter()
-                        .all(|s| is_read_stmt(s) && !matches!(s, Expression::Command(_)))
-            }
+            Some(stmts) => !stmts.is_empty() && stmts.iter().all(is_result_set_stmt),
             None => is_read_like_fallback(&self.sql),
         }
     }
@@ -207,6 +202,34 @@ impl SqlParseCache {
     pub async fn is_read_like_async(&self) -> bool {
         self.ensure_parsed().await;
         self.is_read_like()
+    }
+
+    /// [`is_invariant_read_stmt`] over every parsed statement — the safety
+    /// classification ("did this text stop being safe to treat as a read")
+    /// behind the read→write invariant checks in fixup scripts and
+    /// access-control rewriting. Deliberately stricter than
+    /// [`Self::is_read_like`]: a `SELECT` whose `WITH` clause carries a
+    /// `DELETE ... RETURNING` still streams rows for routing, but comparing it
+    /// as read-like would let a rewrite swap a read for exactly that shape
+    /// without tripping the "must not turn a read into a write" check.
+    /// Top-level inert `VALUES` count as reads here — they produce rows and
+    /// mutate nothing, so a rewrite turning `VALUES (1)` into a `DELETE` is
+    /// exactly the transition the invariants exist to catch — while the
+    /// read_only guard's [`is_read_stmt`] keeps denying them. The
+    /// unparseable-SQL fallback matches [`Self::is_read_like`] so the
+    /// invariants' parse-failure behavior stays what it always was.
+    pub fn is_read_sql(&self) -> bool {
+        match self.statements() {
+            Some(stmts) => !stmts.is_empty() && stmts.iter().all(is_invariant_read_stmt),
+            None => is_read_like_fallback(&self.sql),
+        }
+    }
+
+    /// Async equivalent of [`Self::is_read_sql`] — never blocks the calling
+    /// task's worker thread. Prefer this on any async request path.
+    pub async fn is_read_sql_async(&self) -> bool {
+        self.ensure_parsed().await;
+        self.is_read_sql()
     }
 
     /// [`crate::is_cacheable`] for this SQL. Uses this cache's parse when it parses with the
@@ -275,23 +298,125 @@ pub fn to_polyglot_dialect(dialect: &SqlDialect) -> DialectType {
 }
 
 /// Returns true when an AST node represents a read-like statement.
+///
+/// `Expression::Command` is the parser's catch-all for statements it leaves
+/// opaque (`CALL ...`, procedural `BEGIN ...` blocks, `LOCK TABLES`, ...) and an
+/// opaque statement can carry writes — on Trino, `CALL` runs connector procedures
+/// like `system.rollback_to_snapshot` that mutate data. read_only must fail
+/// closed, so a `Command` is not classified as a read (#403). Statements the
+/// parser models precisely keep their classification — `EXPLAIN` parses as
+/// `Describe` — and explicit transaction control (`BEGIN`/`COMMIT`/`ROLLBACK`)
+/// parses into its own precisely-modeled variants, none of which are reads.
+///
+/// A read-shaped statement can still hide a write in its `WITH` clause:
+/// PostgreSQL executes data-modifying CTEs even when the top-level statement
+/// is a SELECT (`WITH del AS (DELETE FROM orders RETURNING *) SELECT * FROM
+/// del`), so every CTE body (and nested set-operation arm) must classify as a
+/// read — or as an inert expression that cannot carry a write (see
+/// [`with_is_read`]) — before the statement counts as one.
 pub fn is_read_stmt(expr: &Expression) -> bool {
+    match expr {
+        Expression::Select(select) => with_is_read(select.with.as_ref()),
+        Expression::Union(u) => {
+            with_is_read(u.with.as_ref()) && is_read_stmt(&u.left) && is_read_stmt(&u.right)
+        }
+        Expression::Intersect(i) => {
+            with_is_read(i.with.as_ref()) && is_read_stmt(&i.left) && is_read_stmt(&i.right)
+        }
+        Expression::Except(e) => {
+            with_is_read(e.with.as_ref()) && is_read_stmt(&e.left) && is_read_stmt(&e.right)
+        }
+        Expression::Subquery(inner) => is_read_stmt(&inner.this),
+        Expression::Describe(_) | Expression::Show(_) => true,
+        _ => false,
+    }
+}
+
+/// Whether executing this statement produces a result set — the routing
+/// question behind [`SqlParseCache::is_read_like`] ("`execute()` vs
+/// `execute_update()`"), deliberately not the read_only question
+/// ([`is_read_stmt`]). A `Select` always streams rows even when its `WITH`
+/// clause carries data-modifying CTEs — PostgreSQL runs the writes and still
+/// returns the `SELECT`'s rows, so routing one through `execute_update()`
+/// silently discards the results. CTE contents therefore don't matter here.
+/// Opaque `Command` statements keep the #97/#403 behavior: no modeled result
+/// set, route through `execute_update()` like DDL/DML.
+pub fn is_result_set_stmt(expr: &Expression) -> bool {
     matches!(
         expr,
         Expression::Select(_)
             | Expression::Union(_)
             | Expression::Intersect(_)
             | Expression::Except(_)
+            | Expression::Values(_)
             | Expression::Subquery(_)
             | Expression::Describe(_)
             | Expression::Show(_)
-            | Expression::Command(_)
+    )
+}
+
+/// All CTE bodies must classify as reads — or as inert expressions that cannot
+/// carry a statement of their own — for the surrounding statement to be one. A
+/// CTE body can itself be a read-shaped statement with its own `WITH` clause,
+/// so the classification recurses through [`is_read_stmt`]. Bare expressions
+/// like ClickHouse's expression-first items (`WITH 1 AS x`, parsed as a
+/// literal) and row constructors (`WITH t AS (VALUES (1))`) cannot hide a
+/// write; treating them as non-reads denied legitimate reads.
+fn with_is_read(with: Option<&With>) -> bool {
+    with.map(|w| {
+        w.ctes
+            .iter()
+            .all(|cte| is_read_stmt(&cte.this) || is_inert_cte_body(&cte.this))
+    })
+    .unwrap_or(true)
+}
+
+/// CTE bodies the parser models as bare expressions — a row constructor or a
+/// scalar literal — carry no statement and cannot mutate. Anything else stays
+/// with [`is_read_stmt`]'s fail-closed classification, so compound scalar forms
+/// (`WITH a + 1 AS x`) keep being denied until their shape is modeled.
+fn is_inert_cte_body(expr: &Expression) -> bool {
+    matches!(
+        expr,
+        Expression::Values(_)
+            | Expression::Literal(_)
+            | Expression::Boolean(_)
+            | Expression::Null(_)
     )
 }
 
 /// Classify SQL without retaining a parse cache. Prefer [`SqlParseCache`] on hot paths.
 pub fn is_read_like_sql(sql: &str, dialect: &SqlDialect) -> bool {
     SqlParseCache::new(sql, dialect.clone()).is_read_like()
+}
+
+/// Safety-aware counterpart of [`is_read_like_sql`] for read→write invariant
+/// checks — every statement must classify as a read under
+/// [`is_invariant_read_stmt`] ([`is_read_stmt`] plus inert top-level `VALUES`;
+/// modifying CTE bodies are writes, opaque `Command`s fail closed). Routing
+/// keeps [`is_read_like_sql`]; this answers "did this text stop being safe to
+/// treat as a read", where a `SELECT` wrapping a `DELETE ... RETURNING` CTE
+/// counts as stopped even though both sides stream rows.
+pub fn is_read_sql(sql: &str, dialect: &SqlDialect) -> bool {
+    SqlParseCache::new(sql, dialect.clone()).is_read_sql()
+}
+
+/// Invariant-side counterpart of [`is_read_stmt`]: the read→write invariants
+/// ask "did this text stop being safe to treat as a read", and a top-level
+/// inert `VALUES` row constructor produces rows without touching data — a
+/// rewrite turning `VALUES (1)` into `DELETE FROM orders` is exactly the
+/// transition they must catch, so it classifies as a read there even though
+/// [`is_read_stmt`] (the read_only guard's predicate) keeps denying it.
+/// Parenthesized queries parse as [`Expression::Subquery`], so the wrapper is
+/// looked through before that check — otherwise a fixup that only adds
+/// parentheses (`VALUES (1)` → `(VALUES (1))`) fails the invariant and the
+/// reverse rewrite slips past it. Opaque commands and (wrapped) modifying-CTE
+/// carriers stay rejected.
+fn is_invariant_read_stmt(expr: &Expression) -> bool {
+    match expr {
+        Expression::Subquery(inner) => is_invariant_read_stmt(&inner.this),
+        _ => is_read_stmt(expr) || matches!(expr, Expression::Values(_)),
+    }
 }
 
 /// Fallback classifier for statements `polyglot_sql` cannot parse.
@@ -442,6 +567,72 @@ mod tests {
         ));
     }
 
+    /// The read→write invariant classifiers must disagree exactly where a
+    /// `SELECT` wraps a data-modifying CTE: routing (`is_read_like`) streams
+    /// rows either way, safety (`is_read_sql`) denies the CTE carrier.
+    #[test]
+    fn is_read_sql_rejects_modifying_cte_carriers() {
+        let plain = SqlParseCache::new("SELECT 1", SqlDialect::Postgres);
+        assert!(plain.is_read_like());
+        assert!(plain.is_read_sql());
+
+        let carrier = SqlParseCache::new(
+            "WITH del AS (DELETE FROM orders RETURNING *) SELECT 1",
+            SqlDialect::Postgres,
+        );
+        assert!(carrier.is_read_like(), "routing still streams rows");
+        assert!(!carrier.is_read_sql(), "safety sees the hidden write");
+
+        let inert = SqlParseCache::new(
+            "WITH t AS (VALUES (1)) SELECT * FROM t",
+            SqlDialect::Postgres,
+        );
+        assert!(inert.is_read_sql(), "inert CTE bodies stay reads");
+
+        let values = SqlParseCache::new("VALUES (1)", SqlDialect::Postgres);
+        assert!(
+            values.is_read_sql(),
+            "inert top-level VALUES count as invariant-read inputs"
+        );
+
+        // Unparseable SQL keeps the same string fallback as is_read_like, so
+        // the invariants' parse-failure behavior is unchanged.
+        let junk = SqlParseCache::new("SELECT {invalid", SqlDialect::Postgres);
+        assert_eq!(junk.is_read_like(), junk.is_read_sql());
+        assert_eq!(junk.is_read_sql(), is_read_like_fallback("SELECT {invalid"),);
+        assert!(!is_read_sql(
+            "WITH del AS (DELETE FROM orders RETURNING *) SELECT 1",
+            &SqlDialect::Postgres,
+        ));
+        assert!(is_read_sql("SELECT 1", &SqlDialect::Postgres));
+    }
+
+    /// Parenthesized queries parse as [`Expression::Subquery`], and the
+    /// invariant-read side must look through the wrapper: a rewrite that only
+    /// adds parentheses (`VALUES (1)` → `(VALUES (1))`) must not fail the
+    /// read→write invariant, and the reverse rewrite must not slip past it.
+    /// Parentheses must not hide a modifying CTE either.
+    #[test]
+    fn is_read_sql_looks_through_parenthesized_values() {
+        let bare = SqlParseCache::new("VALUES (1)", SqlDialect::Postgres);
+        assert!(bare.is_read_sql());
+
+        let paren = SqlParseCache::new("(VALUES (1))", SqlDialect::Postgres);
+        assert!(
+            paren.is_read_sql(),
+            "adding parentheses keeps inert VALUES invariant-read"
+        );
+
+        let wrapped = SqlParseCache::new(
+            "(WITH del AS (DELETE FROM orders RETURNING *) SELECT 1)",
+            SqlDialect::Postgres,
+        );
+        assert!(
+            !wrapped.is_read_sql(),
+            "parentheses must not hide a modifying CTE"
+        );
+    }
+
     #[test]
     fn select_with_show_describe_explain_are_read() {
         assert!(is_read_like_sql("SELECT 1", &SqlDialect::Generic));
@@ -452,6 +643,80 @@ mod tests {
         assert!(is_read_like_sql("SHOW TABLES", &SqlDialect::Generic));
         assert!(is_read_like_sql("DESCRIBE my_table", &SqlDialect::Generic));
         assert!(is_read_like_sql("EXPLAIN SELECT 1", &SqlDialect::Generic));
+    }
+
+    /// A data-modifying CTE under a read-shaped top level still executes its
+    /// write (PostgreSQL runs `WITH del AS (DELETE ... RETURNING *) SELECT ...`
+    /// as a write), so the read_only guard must look into `WITH` bodies — and
+    /// the arms of set operations and subqueries — before calling a statement a
+    /// read. Routing asks a different question: a `SELECT`-topped statement
+    /// streams rows either way, so it must keep the `execute()` path or the
+    /// results are silently discarded.
+    #[test]
+    fn data_modifying_ctes_are_not_reads() {
+        for sql in [
+            "WITH del AS (DELETE FROM orders RETURNING *) SELECT * FROM del",
+            "WITH up AS (UPDATE orders SET total = 0 RETURNING *) SELECT * FROM up",
+            "WITH ins AS (INSERT INTO audit VALUES (1) RETURNING *) SELECT * FROM ins",
+            "WITH outer_cte AS (WITH inner_cte AS (DELETE FROM orders RETURNING *) SELECT * FROM inner_cte) SELECT * FROM outer_cte",
+            "WITH del AS (DELETE FROM orders RETURNING *) SELECT 1 UNION SELECT 2",
+        ] {
+            let cache = SqlParseCache::new(sql, SqlDialect::Generic);
+            let stmts = cache
+                .statements()
+                .unwrap_or_else(|| panic!("expected polyglot_sql to parse {sql:?}"));
+            assert!(
+                stmts.iter().all(|s| !is_read_stmt(s)),
+                "read_only guard must deny write-carrying CTEs for: {sql}"
+            );
+            assert!(
+                cache.is_read_like(),
+                "SELECT-topped statement must keep the result-set path for: {sql}"
+            );
+        }
+        // Plain reads through a CTE must stay reads.
+        assert!(is_read_like_sql(
+            "WITH recent AS (SELECT * FROM orders) SELECT * FROM recent",
+            &SqlDialect::Generic
+        ));
+    }
+
+    /// CTE bodies the parser models as bare expressions — row constructors and
+    /// scalar literals (ClickHouse's expression-first `WITH 1 AS x`) — cannot
+    /// hide a write; denying them locked legitimate reads out of read_only.
+    #[test]
+    fn inert_cte_bodies_stay_reads() {
+        for (sql, dialect) in [
+            (
+                "WITH t(n) AS (VALUES (1)) SELECT * FROM t",
+                SqlDialect::Generic,
+            ),
+            (
+                "WITH recent AS (VALUES (1), (2)) SELECT * FROM recent",
+                SqlDialect::Generic,
+            ),
+            ("WITH 1 AS x SELECT 1", SqlDialect::ClickHouse),
+        ] {
+            let cache = SqlParseCache::new(sql, dialect.clone());
+            let stmts = cache
+                .statements()
+                .unwrap_or_else(|| panic!("expected polyglot_sql to parse {sql:?}"));
+            assert!(
+                stmts.iter().all(is_read_stmt),
+                "guard must allow inert CTE body for: {sql}"
+            );
+            assert!(cache.is_read_like(), "expected result-set path for: {sql}");
+        }
+        // Compound scalar expressions have no modeled statement inside — the
+        // fail-closed side keeps denying them until their shape is modeled.
+        let strict = SqlParseCache::new("WITH a + 1 AS x SELECT 1", SqlDialect::ClickHouse);
+        let stmts = strict
+            .statements()
+            .unwrap_or_else(|| panic!("expected polyglot_sql to parse WITH a + 1 AS x SELECT 1"));
+        assert!(
+            stmts.iter().all(|s| !is_read_stmt(s)),
+            "compound scalar CTE body stays fail-closed"
+        );
     }
 
     #[test]
@@ -471,13 +736,13 @@ mod tests {
         }
     }
 
-    /// `Command` (e.g. bare `END` in a non-Postgres dialect) is "read" for
-    /// `is_read_stmt` (guardrails' permissive default) but must NOT be read-like
-    /// for ADBC routing — it produces no result set, so it belongs on the
-    /// execute_update path like DDL/DML.
+    /// `Command` is the parser's opaque catch-all (`CALL`, bare `END`, procedural
+    /// `BEGIN` blocks, ...) and opaque statements can carry writes — read_only
+    /// must fail closed (#403), so it is not a read. It still produces no result
+    /// set for ADBC routing (#97), so it is not read-like either.
     #[test]
-    fn command_statements_are_read_for_guardrails_but_not_for_execution_routing() {
-        let sql = "END";
+    fn command_statements_are_not_reads() {
+        let sql = "CALL pragma_version()";
         let cache = SqlParseCache::new(sql, SqlDialect::Generic);
         let stmts = cache
             .statements()
@@ -489,13 +754,37 @@ mod tests {
             stmts[0]
         );
         assert!(
-            is_read_stmt(&stmts[0]),
-            "is_read_stmt should still treat Command as read (guardrails default): {sql}"
+            !is_read_stmt(&stmts[0]),
+            "is_read_stmt must fail closed for opaque Command statements: {sql}"
         );
         assert!(
             !cache.is_read_like(),
             "is_read_like must route Command through execute_update, not execute: {sql}"
         );
+        let bare_end = SqlParseCache::new("END", SqlDialect::Generic);
+        assert!(!bare_end.is_read_like(), "END is not read-like");
+    }
+
+    /// `BEGIN`/`COMMIT`/`ROLLBACK` parse into their own precisely-modeled
+    /// variants (`Transaction`, `Commit`, ...), not the opaque `Command`
+    /// catch-all — they were not reads before the #403 fail-closed change and
+    /// must stay so; this pins the AST shape the Command reclassification
+    /// relies on without coupling to one parser's exact variant names.
+    #[test]
+    fn transaction_statements_remain_non_reads() {
+        for sql in ["BEGIN", "COMMIT", "ROLLBACK"] {
+            let cache = SqlParseCache::new(sql, SqlDialect::Generic);
+            let stmts = cache
+                .statements()
+                .unwrap_or_else(|| panic!("expected polyglot_sql to parse {sql:?}"));
+            assert_eq!(stmts.len(), 1, "{sql}");
+            assert!(
+                !matches!(stmts[0], Expression::Command(_)),
+                "{sql:?} must not parse as the opaque Command catch-all, got: {:?}",
+                stmts[0]
+            );
+            assert!(!is_read_stmt(&stmts[0]), "{sql} is not a read");
+        }
     }
 
     #[test]

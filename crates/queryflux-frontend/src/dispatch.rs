@@ -629,9 +629,13 @@ pub async fn dispatch_query(
     let engine_parse =
         queryflux_sql::classify::SqlParseCache::new(engine_sql.clone(), tgt_dialect.clone());
     if access_control_rewrote {
-        let src_read_like = src_parse.is_read_like_async().await;
-        let final_read_like = engine_parse.is_read_like_async().await;
-        if src_read_like && !final_read_like {
+        // Safety classification (is_read_stmt), not the routing classifier: a
+        // rewrite turning `SELECT 1` into a `SELECT` wrapping a data-modifying
+        // CTE leaves both sides result-set statements, so only the strict
+        // predicate catches the read→write swap.
+        let src_read_safe = src_parse.is_read_sql_async().await;
+        let final_read_safe = engine_parse.is_read_sql_async().await;
+        if src_read_safe && !final_read_safe {
             let reason = "access-control invariant violated: statement kind changed from read to non-read after rewrite/translation".to_string();
             warn!(id = %query_id, "{reason}");
             let pipeline = crate::sql_pipeline::SqlPipelineMeta::compute(
@@ -2004,9 +2008,13 @@ async fn setup_sync_query(
     let engine_parse =
         queryflux_sql::classify::SqlParseCache::new(translated.clone(), tgt_dialect.clone());
     if access_control_rewrote {
-        let src_read_like = src_parse.is_read_like_async().await;
-        let final_read_like = engine_parse.is_read_like_async().await;
-        if src_read_like && !final_read_like {
+        // Safety classification (is_read_stmt), not the routing classifier: a
+        // rewrite turning `SELECT 1` into a `SELECT` wrapping a data-modifying
+        // CTE leaves both sides result-set statements, so only the strict
+        // predicate catches the read→write swap.
+        let src_read_safe = src_parse.is_read_sql_async().await;
+        let final_read_safe = engine_parse.is_read_sql_async().await;
+        if src_read_safe && !final_read_safe {
             let reason = "access-control invariant violated: statement kind changed from read to non-read after rewrite/translation".to_string();
             warn!(id = %query_id, "{reason}");
             let pipeline = crate::sql_pipeline::SqlPipelineMeta::compute(
