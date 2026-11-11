@@ -34,6 +34,8 @@ required_files=(
   "examples/hub-config.yaml"
   "examples/hosted-cell-values.yaml"
   "examples/hosted-cell-config.yaml"
+  "examples/site-hub-values.yaml"
+  "examples/site-workers-values.yaml"
   "values.yaml"
   "values.schema.json"
   "templates/_helpers.tpl"

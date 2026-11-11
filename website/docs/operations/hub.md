@@ -1,6 +1,6 @@
 ---
-title: Hub
-description: Run one QueryFlux hub per site, so workers in a remote network reach the control plane through a single outbound connection, keep running during outages, and never need a route to it.
+title: Site hub for remote workers
+description: One QueryFlux hub per site. Remote workers reach the control plane through one outbound connection and keep running if that link drops.
 image: img/queryflux-hero-banner.png
 ---
 
@@ -103,6 +103,35 @@ The site can also act only on those clusters. Capacity calls (acquire, release, 
 
 With no `workerSecret` on the control plane, only enrolled hubs can connect: the setting for a hosted control plane, where nothing at a customer site should reach it except its hub.
 
+### Checking hub tokens elsewhere
+
+A hub's token is an EdDSA JWT whose `kid` is the hub's id. The control plane publishes
+the enrolled hubs' public keys as a JWKS at `GET /.well-known/hub-keys.json`, each key
+with its hub's `site`:
+
+```json
+{"keys": [{"kty": "OKP", "crv": "Ed25519", "alg": "EdDSA", "use": "sig",
+           "kid": "7e5e9919-…", "x": "RikW6mUi…", "site": "eu1"}]}
+```
+
+Another service that receives what hubs send, such as a query-history receiver, can
+verify their tokens with any JWT library. Require:
+
+- signature (EdDSA against the JWKS key whose `kid` matches the token header)
+- `aud: queryflux-worker-api`
+- `sub` equals `kid` (the hub id)
+- `exp - iat` at most 600 seconds
+- `iat` not more than 60 seconds in the future
+- `exp` not in the past (allow ~60 seconds of clock skew)
+
+It then knows which hub and site sent each request, without reading the control plane's
+tables. A revoked hub drops out of the set within 10 seconds, so cache it for no longer
+than its `Cache-Control` allows.
+
+On a [multi-tenant control plane](./worker-mode.md#one-control-plane-for-many-tenants),
+each tenant has its own set. It is served on the platform listener
+(`X-QueryFlux-Tenant`), not on the public one.
+
 ### Workers
 
 A worker behind a hub is an ordinary worker whose `worker.upstream.url` points at the hub:
@@ -136,6 +165,22 @@ helm install queryflux-hub ./charts/queryflux -n queryflux \
 
 `examples/hub-values.yaml` sets `workload.kind: StatefulSet`, a `volumeClaimTemplates` entry mounted at `stateDir`, two replicas and a PodDisruptionBudget, and turns off Studio and the query ports. Then point the workers' `worker.upstream.url` at `http://queryflux-hub.<namespace>.svc:9000`.
 
+**A site in two commands.** Instead of writing a config file, keep the two secrets in a Secret. The chart renders the rest:
+
+```bash
+kubectl -n queryflux create secret generic queryflux-site \
+  --from-literal=enrollToken=qfe_... \
+  --from-literal=workerSecret=$(openssl rand -hex 32)
+helm install queryflux-hub ./charts/queryflux -n queryflux \
+  -f ./charts/queryflux/examples/site-hub-values.yaml \
+  --set config.data.queryflux.hub.site=us-east-dc1 \
+  --set config.data.queryflux.hub.upstream.url=https://cp.example.com
+helm install queryflux-workers ./charts/queryflux -n queryflux \
+  -f ./charts/queryflux/examples/site-workers-values.yaml
+```
+
+QueryFlux reads `QUERYFLUX_HUB_ENROLL_TOKEN` and `QUERYFLUX_WORKER_SECRET` from the environment over the config file's `hub.upstream.enrollToken` and `workerSecret`, and `QUERYFLUX_PERSISTENCE_URL` over a Postgres `persistence.url`. `queryflux validate` reads them too.
+
 **Docker Compose.** [`examples/hub`](https://github.com/lakeops-org/queryflux/tree/main/examples/hub) runs a control plane, a hub and two workers on a site network with no route to the control plane.
 
 **High availability.** Run two or more replicas behind one Service. Replicas don't coordinate with each other:
@@ -158,7 +203,8 @@ Only queries above a worker's share take a forwarded per-query lease.
 
 - **Redaction at the hub.** The hub applies the served snapshot's `history.redaction` to each batch before writing it to disk. Workers already redact with the same policy, and masking is idempotent, so a worker on an older policy or version is still covered. No unredacted SQL is stored at the site or leaves it.
 - **Durability.** A batch is acknowledged to the worker only after it is on disk (temp file, fsync, rename), so it survives a hub restart. Delivery upstream is at least once; the control plane ignores repeats.
-- **A full spool** (`historySpool.maxBytes`) drops the oldest batches. Drops are counted in `queryflux_hub_history_dropped_total` and `/hub/status`. Queries are never blocked.
+- **A full spool** (`historySpool.maxBytes`) drops the oldest batches. Drops are counted in `queryflux_hub_history_dropped_total` and `/hub/status`, and reported upstream in the hub's heartbeat (`history.dropped` in the control plane's fleet view). Queries are never blocked.
+- **Compression.** Batches go upstream gzipped (`Content-Encoding: gzip`). If the receiver can't read gzip, it answers `400` or `415`, and the hub sends that batch and every later one uncompressed. An older control plane is one such receiver. A history receiver of your own should accept gzip, and limit the decompressed size.
 - **A history endpoint named upstream** (`controlPlane.history.endpoint`): workers behind a hub always send to the hub, and the hub sends to that endpoint. To do this, the hub removes the endpoint from the snapshot it serves and re-seals it. In that one case the revision workers report differs from upstream's; `/hub/status` shows both.
 
 ## When upstream is unreachable

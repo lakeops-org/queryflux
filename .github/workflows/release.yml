@@ -74,18 +74,29 @@ jobs:
           git commit -m "chore(release): sync Cargo.lock with the workspace version"
           git push
 
-  # Release Please uses tags like queryflux-v0.1.2; Docker uses v0.1.2 (unified) and v0.1.2-slim (server-only).
+  # Release Please uses tags like queryflux-v0.1.2; Docker uses v0.1.2 / latest.
   docker_tag_base:
     name: Docker image version base
     needs: [release_please]
     runs-on: ubuntu-latest
     outputs:
       base: ${{ steps.compute.outputs.base }}
+      latest: ${{ steps.compute.outputs.latest }}
     steps:
+      # A release builds from its tag. If Release Please created it on a later push, the tag is
+      # behind this push and its image must not move :latest backward.
       - id: compute
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           raw="${{ needs.release_please.outputs.tag_name }}"
           echo "base=${raw#queryflux-}" >> "$GITHUB_OUTPUT"
+          latest=true
+          if [ -n "$raw" ]; then
+            tag_sha="$(gh api "repos/${{ github.repository }}/commits/$raw" --jq .sha)"
+            [ "$tag_sha" = "${{ github.sha }}" ] || latest=false
+          fi
+          echo "latest=$latest" >> "$GITHUB_OUTPUT"
 
   # Snapshot website/docs into a new Docusaurus version so the published site tracks
   # releases instead of drifting (docs stayed pinned at 0.1.2 while the crate moved past
@@ -140,8 +151,8 @@ jobs:
           git commit -m "docs: cut versioned docs snapshot for ${version}"
           git push origin HEAD:main
 
-  build-slim:
-    name: Build server image (${{ matrix.suffix }})
+  build:
+    name: Build queryflux image (${{ matrix.suffix }})
     needs: [release_please]
     strategy:
       fail-fast: false
@@ -180,8 +191,8 @@ jobs:
           outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
           build-args: |
             CARGO_BUILD_JOBS=4
-          cache-from: type=gha,scope=queryflux-slim-${{ matrix.suffix }}
-          cache-to: type=gha,mode=max,scope=queryflux-slim-${{ matrix.suffix }}
+          cache-from: type=gha,scope=queryflux-${{ matrix.suffix }}
+          cache-to: type=gha,mode=max,scope=queryflux-${{ matrix.suffix }}
 
       - name: Export digest
         run: |
@@ -192,21 +203,21 @@ jobs:
       - name: Upload digest
         uses: actions/upload-artifact@v4
         with:
-          name: digests-slim-${{ matrix.suffix }}
+          name: digests-queryflux-${{ matrix.suffix }}
           path: /tmp/digests/*
           if-no-files-found: error
           retention-days: 1
 
-  manifest-slim:
-    name: Manifest server image
-    needs: [release_please, build-slim, docker_tag_base]
+  manifest:
+    name: Manifest queryflux image
+    needs: [release_please, build, docker_tag_base]
     runs-on: ubuntu-latest
     steps:
       - name: Download digests
         uses: actions/download-artifact@v4
         with:
           path: /tmp/digests
-          pattern: digests-slim-*
+          pattern: digests-queryflux-*
           merge-multiple: true
 
       - name: Set up Docker Buildx
@@ -225,10 +236,8 @@ jobs:
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
-            type=raw,value=latest
-            type=raw,value=latest-slim
+            type=raw,value=latest,enable=${{ needs.docker_tag_base.outputs.latest == 'true' }}
             type=raw,value=${{ needs.docker_tag_base.outputs.base }},enable=${{ needs.release_please.outputs.releases_created == 'true' }}
-            type=raw,value=${{ needs.docker_tag_base.outputs.base }}-slim,enable=${{ needs.release_please.outputs.releases_created == 'true' }}
 
       - name: Create and push manifest
         working-directory: /tmp/digests
@@ -241,7 +250,7 @@ jobs:
   # it's pushed only once the image is.
   helm_chart:
     name: Publish Helm chart
-    needs: [release_please, manifest-slim]
+    needs: [release_please, manifest]
     if: ${{ needs.release_please.outputs.releases_created == 'true' }}
     runs-on: ubuntu-latest
     steps:
@@ -261,7 +270,7 @@ jobs:
 
   publish:
     name: GitHub Release summary
-    needs: [release_please, manifest-slim, docker_tag_base]
+    needs: [release_please, manifest, docker_tag_base]
     if: ${{ needs.release_please.outputs.releases_created == 'true' }}
     runs-on: ubuntu-latest
     steps:
@@ -269,6 +278,6 @@ jobs:
         run: |
           echo "## Release ${{ needs.release_please.outputs.tag_name }} (multi-arch, GHCR)" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Variant | Tags |" >> "$GITHUB_STEP_SUMMARY"
-          echo "|---------|------|" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Server | \`:${{ needs.docker_tag_base.outputs.base }}\`, \`:latest\` (aliases \`:${{ needs.docker_tag_base.outputs.base }}-slim\`, \`:latest-slim\`) |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Image | Tags |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|-------|------|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| queryflux | \`:${{ needs.docker_tag_base.outputs.base }}\`, \`:latest\` |" >> "$GITHUB_STEP_SUMMARY"

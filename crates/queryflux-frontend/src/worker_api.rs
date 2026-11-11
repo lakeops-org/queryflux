@@ -148,6 +148,7 @@ pub fn router_with_ingest_limit(
             post(ingest_records)
                 .layer(axum::extract::DefaultBodyLimit::max(MAX_RECORD_BATCH_BYTES)),
         )
+        .route("/.well-known/hub-keys.json", get(hub_keys))
         .route("/worker/sweep-lock/{name}", post(sweep_lock_acquire))
         .route(
             "/worker/sweep-lock/{name}/{token}",
@@ -181,7 +182,7 @@ struct WorkerApiState {
 
 /// Constant-time comparison, so response timing does not leak how much of the
 /// secret matched.
-fn secret_matches(given: &str, expected: &str) -> bool {
+pub fn secret_matches(given: &str, expected: &str) -> bool {
     let (a, b) = (given.as_bytes(), expected.as_bytes());
     if a.len() != b.len() {
         return false;
@@ -398,6 +399,76 @@ fn unauthorized() -> Response {
         .into_response()
 }
 
+/// A query-record batch, plain or gzipped (hubs send gzip). Decompressed into at most
+/// [`MAX_RECORD_BATCH_BYTES`], so a small body can't expand without limit.
+fn decode_batch(headers: &HeaderMap, body: &[u8]) -> Result<QueryRecordBatchV1, Box<Response>> {
+    let encoding = headers
+        .get(header::CONTENT_ENCODING)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.trim().to_ascii_lowercase());
+    let refuse = |status: StatusCode, why: String| Box::new((status, why).into_response());
+    let json: std::borrow::Cow<[u8]> = match encoding.as_deref() {
+        None | Some("identity") => body.into(),
+        Some("gzip") => {
+            use std::io::Read;
+            let mut out = Vec::new();
+            let read = flate2::read::GzDecoder::new(body)
+                .take(MAX_RECORD_BATCH_BYTES as u64 + 1)
+                .read_to_end(&mut out);
+            match read {
+                Ok(n) if n > MAX_RECORD_BATCH_BYTES => {
+                    return Err(refuse(
+                        StatusCode::PAYLOAD_TOO_LARGE,
+                        "batch too large once decompressed".into(),
+                    ))
+                }
+                Ok(_) => out.into(),
+                Err(e) => return Err(refuse(StatusCode::BAD_REQUEST, format!("bad gzip: {e}"))),
+            }
+        }
+        Some(other) => {
+            return Err(refuse(
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                format!("unsupported Content-Encoding '{other}'"),
+            ))
+        }
+    };
+    serde_json::from_slice(&json)
+        .map_err(|e| refuse(StatusCode::BAD_REQUEST, format!("bad batch: {e}")))
+}
+
+/// The enrolled hubs' public keys as a JWKS (RFC 7517/8037), so a service that receives
+/// what hubs send (query history, say) can check their tokens and attribute each request
+/// to a hub and site without reading this control plane's tables. A hub token is an
+/// EdDSA JWT whose `kid` is the hub id; each key carries its hub's `site`. A revoked hub
+/// drops out within the hub directory's reload interval (10 s).
+async fn hub_keys(State(st): State<Arc<WorkerApiState>>) -> Response {
+    let Some(hubs) = &st.api.hubs else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let keys: Vec<_> = hubs
+        .keys()
+        .await
+        .into_iter()
+        .map(|(id, site, x)| {
+            serde_json::json!({
+                "kty": "OKP",
+                "crv": "Ed25519",
+                "alg": "EdDSA",
+                "use": "sig",
+                "kid": id,
+                "x": x,
+                "site": site,
+            })
+        })
+        .collect();
+    (
+        [(header::CACHE_CONTROL, "max-age=10")],
+        Json(serde_json::json!({ "keys": keys })),
+    )
+        .into_response()
+}
+
 async fn get_config(State(st): State<Arc<WorkerApiState>>, headers: HeaderMap) -> Response {
     let Some(who) = caller(&st.api, &headers).await else {
         return unauthorized();
@@ -569,10 +640,14 @@ async fn warn_on_unshared_capacity(st: &WorkerApiState, registry: &dyn WorkerReg
 async fn ingest_records(
     State(st): State<Arc<WorkerApiState>>,
     headers: HeaderMap,
-    Json(mut batch): Json<QueryRecordBatchV1>,
+    body: axum::body::Bytes,
 ) -> Response {
     let Some(who) = caller(&st.api, &headers).await else {
         return unauthorized();
+    };
+    let mut batch = match decode_batch(&headers, &body) {
+        Ok(batch) => batch,
+        Err(response) => return *response,
     };
     // A site token's records are its site's, whatever the batch says.
     if let Caller::Site(own) = who {
@@ -1334,23 +1409,26 @@ mod tests {
             quotas: None,
             hubs: None,
         });
-        let record = serde_json::json!({
-            "proxyQueryId": "q-1",
-            "clusterGroup": "g",
-            "clusterName": "c",
-            "engineType": "duckDb",
-            "frontendProtocol": "trinoHttp",
-            "sourceDialect": "trino",
-            "targetDialect": "duckDb",
-            "wasRewritten": false,
-            "wasTranslated": false,
-            "sqlPreview": "SELECT 1",
-            "status": "success",
-            "queueDurationMs": 0,
-            "executionDurationMs": 3,
-            "createdAt": "2026-10-14T00:00:00Z",
-            "worker": "spoofed"
-        });
+        let record_json = |id: &str| {
+            serde_json::json!({
+                "proxyQueryId": id,
+                "clusterGroup": "g",
+                "clusterName": "c",
+                "engineType": "duckDb",
+                "frontendProtocol": "trinoHttp",
+                "sourceDialect": "trino",
+                "targetDialect": "duckDb",
+                "wasRewritten": false,
+                "wasTranslated": false,
+                "sqlPreview": "SELECT 1",
+                "status": "success",
+                "queueDurationMs": 0,
+                "executionDurationMs": 3,
+                "createdAt": "2026-10-14T00:00:00Z",
+                "worker": "spoofed"
+            })
+        };
+        let record = record_json("q-1");
         let post = |body: serde_json::Value| {
             Request::post("/worker/query-records")
                 .header(header::AUTHORIZATION, "Bearer s3cret")
@@ -1376,8 +1454,48 @@ mod tests {
         assert_eq!(page[0].worker.as_deref(), Some("worker-a"));
 
         let future = serde_json::json!({ "schemaVersion": 2, "worker": "w", "records": [] });
-        let resp = app.oneshot(post(future)).await.unwrap();
+        let resp = app.clone().oneshot(post(future)).await.unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        // Gzipped batches are read too, but never decompressed past the batch limit.
+        let gzip = |data: &[u8]| {
+            use std::io::Write;
+            let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
+            enc.write_all(data).unwrap();
+            enc.finish().unwrap()
+        };
+        let post_gzip = |body: Vec<u8>, encoding: &str| {
+            Request::post("/worker/query-records")
+                .header(header::AUTHORIZATION, "Bearer s3cret")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::CONTENT_ENCODING, encoding)
+                .body(Body::from(body))
+                .unwrap()
+        };
+        let mut other = record_json("q-2");
+        other["worker"] = "x".into();
+        let batch =
+            serde_json::json!({ "schemaVersion": 1, "worker": "worker-b", "records": [other] });
+        let resp = app
+            .clone()
+            .oneshot(post_gzip(gzip(batch.to_string().as_bytes()), "gzip"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        let bomb = gzip(&vec![b' '; MAX_RECORD_BATCH_BYTES + 1]);
+        assert!(bomb.len() < 64 * 1024);
+        let resp = app.clone().oneshot(post_gzip(bomb, "gzip")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let resp = app.oneshot(post_gzip(vec![1, 2, 3], "br")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        let page = store
+            .list_queries(&queryflux_persistence::query_history::QueryFilters {
+                limit: 10,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(page.len(), 2);
     }
 
     /// A hub whose site is limited to some clusters takes capacity and publishes running
@@ -1625,6 +1743,36 @@ mod tests {
         let now = chrono::Utc::now().timestamp();
         let t1 = hub_token::sign(&k1, &id1, now);
         let t2 = hub_token::sign(&k2, &id2, now);
+
+        // The key set lists both hubs with their sites, and is enough to check a hub's
+        // token without anything else from this control plane.
+        let res = app
+            .clone()
+            .oneshot(
+                Request::get("/.well-known/hub-keys.json")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let set: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(res.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let keys = set["keys"].as_array().unwrap();
+        assert_eq!(keys.len(), 2);
+        let jwk = keys.iter().find(|k| k["kid"] == id1.as_str()).unwrap();
+        assert_eq!(
+            (jwk["kty"].as_str(), jwk["crv"].as_str()),
+            (Some("OKP"), Some("Ed25519"))
+        );
+        assert_eq!(jwk["site"], "dc1");
+        let published = hub_token::decode_public_key(jwk["x"].as_str().unwrap()).unwrap();
+        assert!(hub_token::verify(&t1, &published, now).is_ok());
+        assert!(hub_token::verify(&t2, &published, now).is_err());
 
         // Without a shared secret, an empty or unknown token is no one, and so is a token
         // signed with another hub's key.

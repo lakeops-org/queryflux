@@ -277,6 +277,11 @@ pub(crate) fn spawn_zombie_sweep(
                             "Evicting zombie executing query — not polled for >5 min"
                         );
 
+                        // A poll or cancel may have ended it meanwhile; then it's done.
+                        if !state.end_executing_query(&q).await {
+                            continue;
+                        }
+
                         // Best-effort cancel on the backend with cluster credentials
                         // (same path as client/admin cancel). The previous unauthenticated
                         // DELETE on `/v1/statement/executing/...` did not stop secured Trino.
@@ -313,11 +318,6 @@ pub(crate) fn spawn_zombie_sweep(
                                 "No adapter available for zombie cancel"
                             );
                         }
-
-                        state
-                            .release_query_slot(&q.cluster_group, &q.cluster_name, &q.id.0)
-                            .await;
-                        let _ = state.persistence.delete(&q.backend_query_id).await;
                     }
                 }
 
@@ -812,8 +812,10 @@ pub(crate) fn serves_queries(f: &queryflux_core::config::FrontendsConfig) -> boo
 pub(crate) fn spawn_worker_heartbeat(
     config: &ProxyConfig,
     sync_state: &Arc<std::sync::Mutex<crate::config_source::WorkerSyncState>>,
+    live: &Arc<tokio::sync::RwLock<queryflux_frontend::state::LiveConfig>>,
     shutdown_rx: &watch::Receiver<bool>,
 ) {
+    let live = live.clone();
     let Some(worker) = config.queryflux.worker.clone() else {
         return;
     };
@@ -848,6 +850,13 @@ pub(crate) fn spawn_worker_heartbeat(
                 break;
             }
             let st = sync_state.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            let clusters = cluster_health_report(
+                live.read()
+                    .await
+                    .health_check_targets
+                    .iter()
+                    .map(|(_, c)| (c.cluster_name.0.as_str(), c.probed_health())),
+            );
             let report = queryflux_persistence::WorkerRecord {
                 name: name.clone(),
                 version: env!("CARGO_PKG_VERSION").to_string(),
@@ -885,6 +894,7 @@ pub(crate) fn spawn_worker_heartbeat(
                     }),
                     frontends: frontends.clone(),
                     served_revision: None,
+                    clusters,
                 },
                 kind: "worker".to_string(),
                 parent: None,
@@ -910,6 +920,26 @@ pub(crate) fn spawn_worker_heartbeat(
     });
 }
 
+/// Collapse per-group probe rows into one fleet-report entry per cluster name.
+/// Unprobed memberships are omitted (optimistic `is_healthy` default is not a probe).
+/// Among probed memberships, unhealthy in any group → report unhealthy. Order by name.
+fn cluster_health_report<'a>(
+    targets: impl IntoIterator<Item = (&'a str, Option<bool>)>,
+) -> Vec<queryflux_persistence::ClusterHealthStatus> {
+    let mut by_name = std::collections::BTreeMap::<String, bool>::new();
+    for (name, probed_health) in targets {
+        let Some(healthy) = probed_health else {
+            continue;
+        };
+        let entry = by_name.entry(name.to_string()).or_insert(true);
+        *entry = *entry && healthy;
+    }
+    by_name
+        .into_iter()
+        .map(|(name, healthy)| queryflux_persistence::ClusterHealthStatus { name, healthy })
+        .collect()
+}
+
 #[cfg(test)]
 mod serves_queries_tests {
     use super::*;
@@ -927,5 +957,44 @@ mod serves_queries_tests {
         assert!(!serves_queries(&f), "clickhouseHttp has no listener");
         f.trino_http.enabled = true;
         assert!(serves_queries(&f));
+    }
+
+    #[test]
+    fn cluster_health_report_dedupes_and_ands_across_groups() {
+        let report = cluster_health_report([
+            ("trino-a", Some(true)),
+            ("trino-b", Some(true)),
+            ("trino-a", Some(false)),
+            ("trino-b", Some(true)),
+        ]);
+        assert_eq!(
+            report,
+            vec![
+                queryflux_persistence::ClusterHealthStatus {
+                    name: "trino-a".into(),
+                    healthy: false,
+                },
+                queryflux_persistence::ClusterHealthStatus {
+                    name: "trino-b".into(),
+                    healthy: true,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn cluster_health_report_omits_unprobed_clusters() {
+        assert!(cluster_health_report([("trino-a", None)]).is_empty());
+        assert_eq!(
+            cluster_health_report([
+                ("trino-a", None),
+                ("trino-a", Some(false)),
+                ("trino-b", None),
+            ]),
+            vec![queryflux_persistence::ClusterHealthStatus {
+                name: "trino-a".into(),
+                healthy: false,
+            }]
+        );
     }
 }

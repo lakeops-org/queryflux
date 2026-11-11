@@ -1,0 +1,64 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="430" viewBox="0 0 960 430" role="img" aria-label="80 runs per mode. As written: 33 right, 38 errors, 9 wrong answers. Translated without a catalog: 59 right, 3 with order lost, 5 errors, 13 wrong answers. Translated with schema: 65 right, 3 order lost, 5 errors, 7 wrong. Strict: 61 right, 3 order lost, 5 errors, 7 rejected, 4 wrong.">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1"><stop offset="0%" stop-color="#0b0614"/><stop offset="100%" stop-color="#050508"/></linearGradient>
+    <radialGradient id="glow" cx="50%" cy="45%" r="55%"><stop offset="0%" stop-color="#7c3aed" stop-opacity="0.22"/><stop offset="100%" stop-color="#7c3aed" stop-opacity="0"/></radialGradient>
+    <pattern id="dots" width="22" height="22" patternUnits="userSpaceOnUse"><circle cx="1" cy="1" r="0.8" fill="rgba(255,255,255,0.05)"/></pattern>
+  </defs>
+  <rect width="960" height="430" rx="20" fill="url(#bg)"/><rect width="960" height="430" rx="20" fill="url(#glow)"/><rect width="960" height="430" rx="20" fill="url(#dots)"/>
+  <rect x="1" y="1" width="958" height="428" rx="19" fill="none" stroke="rgba(255,255,255,0.08)"/>
+  <g font-family="ui-sans-serif, system-ui, sans-serif">
+    <text x="40" y="42" fill="#fafafa" font-size="18" font-weight="650">20 LLM-style queries × 4 engines, four ways</text>
+    <text x="40" y="66" fill="#a1a1aa" font-size="13">80 runs per row, each checked against the answer the source dialect gives. Red is the dangerous part.</text>
+    <text x="40" y="124" fill="#fafafa" font-size="14.5" font-weight="650">As written</text>
+    <text x="40" y="143" fill="#a1a1aa" font-size="12">no dialect declared</text>
+    <rect x="251.0" y="104" width="274.4" height="46" rx="6" fill="#052e16" stroke="#4ade80" stroke-width="1.4"/>
+    <text x="388.2" y="133" fill="#bbf7d0" font-size="14" font-weight="650" text-anchor="middle">33</text>
+    <rect x="527.4" y="104" width="316.2" height="46" rx="6" fill="#431407" stroke="#fb923c" stroke-width="1.4"/>
+    <text x="685.5" y="133" fill="#fed7aa" font-size="14" font-weight="650" text-anchor="middle">38</text>
+    <rect x="845.6" y="104" width="73.4" height="46" rx="6" fill="#450a0a" stroke="#f87171" stroke-width="1.4"/>
+    <text x="882.3" y="133" fill="#fca5a5" font-size="14" font-weight="650" text-anchor="middle">9</text>
+    <text x="40" y="190" fill="#fafafa" font-size="14.5" font-weight="650">Translated</text>
+    <text x="40" y="209" fill="#a1a1aa" font-size="12">dialect declared, no catalog</text>
+    <rect x="251.0" y="170" width="492.1" height="46" rx="6" fill="#052e16" stroke="#4ade80" stroke-width="1.4"/>
+    <text x="497.1" y="199" fill="#bbf7d0" font-size="14" font-weight="650" text-anchor="middle">59</text>
+    <rect x="745.1" y="170" width="23.1" height="46" rx="6" fill="#2e1065" stroke="#a78bfa" stroke-width="1.4"/>
+    <text x="756.7" y="199" fill="#ede9fe" font-size="14" font-weight="650" text-anchor="middle">3</text>
+    <rect x="770.2" y="170" width="39.9" height="46" rx="6" fill="#431407" stroke="#fb923c" stroke-width="1.4"/>
+    <text x="790.2" y="199" fill="#fed7aa" font-size="14" font-weight="650" text-anchor="middle">5</text>
+    <rect x="812.1" y="170" width="106.9" height="46" rx="6" fill="#450a0a" stroke="#f87171" stroke-width="1.4"/>
+    <text x="865.6" y="199" fill="#fca5a5" font-size="14" font-weight="650" text-anchor="middle">13</text>
+    <text x="40" y="256" fill="#fafafa" font-size="14.5" font-weight="650">Translated with schema</text>
+    <text x="40" y="275" fill="#a1a1aa" font-size="12">dialect + catalog</text>
+    <rect x="251.0" y="236" width="542.4" height="46" rx="6" fill="#052e16" stroke="#4ade80" stroke-width="1.4"/>
+    <text x="522.2" y="265" fill="#bbf7d0" font-size="14" font-weight="650" text-anchor="middle">65</text>
+    <rect x="795.4" y="236" width="23.1" height="46" rx="6" fill="#2e1065" stroke="#a78bfa" stroke-width="1.4"/>
+    <text x="806.9" y="265" fill="#ede9fe" font-size="14" font-weight="650" text-anchor="middle">3</text>
+    <rect x="820.5" y="236" width="39.9" height="46" rx="6" fill="#431407" stroke="#fb923c" stroke-width="1.4"/>
+    <text x="840.4" y="265" fill="#fed7aa" font-size="14" font-weight="650" text-anchor="middle">5</text>
+    <rect x="862.4" y="236" width="56.6" height="46" rx="6" fill="#450a0a" stroke="#f87171" stroke-width="1.4"/>
+    <text x="890.7" y="265" fill="#fca5a5" font-size="14" font-weight="650" text-anchor="middle">7</text>
+    <text x="40" y="322" fill="#fafafa" font-size="14.5" font-weight="650">Strict</text>
+    <text x="40" y="341" fill="#a1a1aa" font-size="12">dialect + catalog + strict</text>
+    <rect x="251.0" y="302" width="508.9" height="46" rx="6" fill="#052e16" stroke="#4ade80" stroke-width="1.4"/>
+    <text x="505.4" y="331" fill="#bbf7d0" font-size="14" font-weight="650" text-anchor="middle">61</text>
+    <rect x="761.9" y="302" width="23.1" height="46" rx="6" fill="#2e1065" stroke="#a78bfa" stroke-width="1.4"/>
+    <text x="773.4" y="331" fill="#ede9fe" font-size="14" font-weight="650" text-anchor="middle">3</text>
+    <rect x="787.0" y="302" width="39.9" height="46" rx="6" fill="#431407" stroke="#fb923c" stroke-width="1.4"/>
+    <text x="806.9" y="331" fill="#fed7aa" font-size="14" font-weight="650" text-anchor="middle">5</text>
+    <rect x="828.9" y="302" width="56.6" height="46" rx="6" fill="#1c1917" stroke="#a8a29e" stroke-width="1.4"/>
+    <text x="857.2" y="331" fill="#e7e5e4" font-size="14" font-weight="650" text-anchor="middle">7</text>
+    <rect x="887.5" y="302" width="31.5" height="46" rx="6" fill="#450a0a" stroke="#f87171" stroke-width="1.4"/>
+    <text x="903.2" y="331" fill="#fca5a5" font-size="14" font-weight="650" text-anchor="middle">4</text>
+    <rect x="40" y="380" width="16" height="16" rx="4" fill="#052e16" stroke="#4ade80" stroke-width="1.4"/>
+    <text x="64" y="393" fill="#d4d4d8" font-size="12.5">right answer</text>
+    <rect x="172.0" y="380" width="16" height="16" rx="4" fill="#2e1065" stroke="#a78bfa" stroke-width="1.4"/>
+    <text x="196.0" y="393" fill="#d4d4d8" font-size="12.5">right rows, order lost</text>
+    <rect x="369.0" y="380" width="16" height="16" rx="4" fill="#431407" stroke="#fb923c" stroke-width="1.4"/>
+    <text x="393.0" y="393" fill="#d4d4d8" font-size="12.5">error</text>
+    <rect x="455.5" y="380" width="16" height="16" rx="4" fill="#1c1917" stroke="#a8a29e" stroke-width="1.4"/>
+    <text x="479.5" y="393" fill="#d4d4d8" font-size="12.5">rejected by strict</text>
+    <rect x="626.5" y="380" width="16" height="16" rx="4" fill="#450a0a" stroke="#f87171" stroke-width="1.4"/>
+    <text x="650.5" y="393" fill="#d4d4d8" font-size="12.5">wrong answer, no error</text>
+  </g>
+</svg>

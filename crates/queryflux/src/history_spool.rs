@@ -12,7 +12,7 @@
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -61,6 +61,8 @@ pub(crate) struct HistorySpool {
     status: Mutex<SpoolStatus>,
     wake: Notify,
     client: reqwest::Client,
+    /// Set once the endpoint refused a gzip body (an older control plane): send plain.
+    plain_only: AtomicBool,
     /// Name the hub reports upstream; `site` qualifies each record's worker.
     hub: String,
     site: String,
@@ -168,6 +170,7 @@ impl HistorySpool {
                 .timeout(Duration::from_secs(30))
                 .build()
                 .expect("reqwest client"),
+            plain_only: AtomicBool::new(false),
             hub,
             site,
             upstream: upstream.url.trim_end_matches('/').to_string(),
@@ -324,12 +327,23 @@ impl HistorySpool {
             records,
             site: Some(self.site.clone()),
         };
-        let mut req = self.client.post(endpoint).json(&batch);
-        // Upstream's secret goes only to upstream's origin.
-        if same_origin(endpoint, &self.upstream) {
-            req = req.bearer_auth(self.bearer.get());
+        let json = serde_json::to_vec(&batch)
+            .map_err(|e| UploadError::new(format!("encode history batch: {e}"), None))?;
+        let gzip = !self.plain_only.load(Ordering::Relaxed);
+        let mut sent = self.post(endpoint, &json, gzip).await;
+        // A receiver that can't read gzip parses the compressed bytes as JSON (400) or
+        // refuses the encoding (415): send this batch and the rest uncompressed.
+        if gzip
+            && matches!(&sent, Ok(r) if matches!(
+                r.status(),
+                reqwest::StatusCode::BAD_REQUEST | reqwest::StatusCode::UNSUPPORTED_MEDIA_TYPE
+            ))
+        {
+            self.plain_only.store(true, Ordering::Relaxed);
+            tracing::info!("History endpoint does not accept gzip; sending uncompressed");
+            sent = self.post(endpoint, &json, false).await;
         }
-        match req.send().await {
+        match sent {
             Ok(resp) if resp.status().is_success() => Ok(()),
             Ok(resp) => {
                 let status = resp.status();
@@ -345,6 +359,29 @@ impl HistorySpool {
                 None,
             )),
         }
+    }
+
+    async fn post(
+        &self,
+        endpoint: &str,
+        json: &[u8],
+        gzip: bool,
+    ) -> reqwest::Result<reqwest::Response> {
+        let mut req = self
+            .client
+            .post(endpoint)
+            .header(reqwest::header::CONTENT_TYPE, "application/json");
+        // Upstream's secret goes only to upstream's origin.
+        if same_origin(endpoint, &self.upstream) {
+            req = req.bearer_auth(self.bearer.get());
+        }
+        req = if gzip {
+            req.header(reqwest::header::CONTENT_ENCODING, "gzip")
+                .body(gzip_bytes(json))
+        } else {
+            req.body(json.to_vec())
+        };
+        req.send().await
     }
 
     /// Deliver until shutdown.
@@ -393,6 +430,14 @@ impl MetricsStore for HistorySpool {
     async fn record_cluster_snapshot(&self, _snapshot: ClusterSnapshot) -> Result<()> {
         Ok(())
     }
+}
+
+fn gzip_bytes(data: &[u8]) -> Vec<u8> {
+    use std::io::Write;
+    let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+    // Writing to a Vec cannot fail.
+    enc.write_all(data).expect("gzip to memory");
+    enc.finish().expect("gzip to memory")
 }
 
 #[cfg(test)]

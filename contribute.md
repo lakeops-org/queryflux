@@ -55,15 +55,15 @@ Release images are built for **linux/amd64** and **linux/arm64** only.
 
 | Trigger | Workflow | Tags |
 |---------|----------|------|
-| Push to `main` | [release.yml](.github/workflows/release.yml) | `:latest` (alias `:latest-slim`) |
-| Release Please release | [release.yml](.github/workflows/release.yml) | `:vX.Y.Z` (alias `:vX.Y.Z-slim`), plus `:latest` |
-| Manual, any ref | [docker-publish-tag.yml](.github/workflows/docker-publish-tag.yml) | `:<image_tag>` (alias `:<image_tag>-slim`) |
+| Push to `main` | [release.yml](.github/workflows/release.yml) | `:latest` |
+| Release Please release | [release.yml](.github/workflows/release.yml) | `:vX.Y.Z`, plus `:latest` |
+| Manual, any ref | [docker-publish-tag.yml](.github/workflows/docker-publish-tag.yml) | `:<image_tag>` |
 
-The `-slim` aliases exist because `:latest` / `:vX.Y.Z` used to be a server + Studio image and `-slim` the server-only one. They point at the same image now, so existing `-slim` pins keep working. Images up to `v0.4.0` still have the old meaning.
+The image is server-only. Studio is **`ghcr.io/lakeops-org/queryflux-studio`**. Tags up to `v0.4.0` still mean the old server + Studio image; do not republish them.
 
 **How builds run:** **linux/amd64** images build on **`ubuntu-latest`**; **linux/arm64** on **`ubuntu-24.04-arm`** (native ARM, so no QEMU for compiles). A manifest job then merges the two digests with `docker buildx imagetools create`, similar to [lakekeeper/lakekeeper’s release workflow](https://github.com/lakekeeper/lakekeeper/blob/main/.github/workflows/release.yml).
 
-Release workflows use **`GITHUB_TOKEN`** with **`packages: write`** (push + manifests), **`actions: write`** (BuildKit **GHA cache**, per-arch scopes `queryflux-slim-amd64` / `queryflux-slim-arm64`), and **`contents: write`** on the publish job. Optional **`GHCR_IMAGE_NAME`**. PRs verify Dockerfiles in [docker-verify.yml](.github/workflows/docker-verify.yml).
+Release workflows use **`GITHUB_TOKEN`** with **`packages: write`** (push + manifests), **`actions: write`** (BuildKit **GHA cache**, per-arch scopes `queryflux-amd64` / `queryflux-arm64`), and **`contents: write`** on the publish job. Optional **`GHCR_IMAGE_NAME`**. PRs verify Dockerfiles in [docker-verify.yml](.github/workflows/docker-verify.yml).
 
 **Cold or slow runs:** First push after dependency changes may still be heavy (Rust + PyO3 + DuckDB on both arches). Caches speed repeat runs. ARM64 requires **GitHub-hosted ARM runners** available for the repo (public repos typically have `ubuntu-24.04-arm64`).
 

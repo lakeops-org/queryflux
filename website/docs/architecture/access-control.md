@@ -1,10 +1,18 @@
 ---
 sidebar_label: Access control (moved)
 title: Data access control
-description: Data access control docs moved to the Access Control section.
+description: "These docs moved to Access Control: overview, OPA, and Cerbos. Enforcement is the opa_access guard in the query path."
+image: img/queryflux-hero-banner.png
 draft: false
 unlisted: true
 ---
+
+import Head from '@docusaurus/Head';
+
+<Head>
+  <meta name="robots" content="noindex, follow" />
+</Head>
+
 # Data access control
 
 This page has moved into its own section:

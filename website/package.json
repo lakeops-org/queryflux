@@ -16,7 +16,11 @@
     "write-heading-ids": "docusaurus write-heading-ids",
     "docs:version": "docusaurus docs:version",
     "seo:apply-doc-meta": "node scripts/apply-doc-seo.mjs",
-    "seo:check-blog": "node scripts/check-blog-seo.mjs"
+    "seo:check-blog": "node scripts/check-blog-seo.mjs",
+    "seo:files": "node seo/siteFiles.mjs",
+    "seo:check-crawl": "node scripts/check-crawl-seo.mjs",
+    "seo:check-build": "node scripts/check-build-seo.mjs",
+    "seo:check": "npm run seo:check-crawl && npm run seo:check-blog && npm run seo:check-build"
   },
   "dependencies": {
     "@cmfcmf/docusaurus-search-local": "^2.0.1",

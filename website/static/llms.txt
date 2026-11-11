@@ -1,0 +1,114 @@
+# QueryFlux
+
+> Open-source SQL proxy and router. One endpoint for tools and AI agents across Trino, DuckDB, StarRocks, ClickHouse, Snowflake, and more — with routing, dialect translation, guardrails, access control, and a record of every query.
+
+QueryFlux sits in front of engines you already run. Clients keep their drivers (Trino HTTP, PostgreSQL wire, MySQL wire, Snowflake HTTP, Arrow Flight SQL, MCP). QueryFlux chooses the engine, translates the dialect, applies guardrails and row filters, and records the query. The canonical site is https://queryflux.dev/ — use that host, not www.
+
+- [Home](https://queryflux.dev/): product overview
+- [Blog](https://queryflux.dev/blog): essays and how-to posts
+- [Community](https://queryflux.dev/community): Slack and GitHub Discussions
+- [Source](https://github.com/lakeops-org/queryflux): Apache-2.0 repository
+
+## Start here
+
+- [Authentication, Authorization & Backend Identity](https://queryflux.dev/docs/authentication): Configure who can reach QueryFlux, what they can do, and which identity your queries run as on Trino, ClickHouse, StarRocks, and Snowflake.
+- [Documentation Overview](https://queryflux.dev/docs/intro): QueryFlux docs — multi-engine SQL proxy for Trino, PostgreSQL, MySQL, Snowflake, and Flight. Routing, dialect translation, and observability in one place.
+- [QueryFlux Studio](https://queryflux.dev/docs/studio): Web UI for clusters, query history, routing, and admin security. Connects to the QueryFlux Admin API on port 9000.
+- [Quickstarts](https://queryflux.dev/docs/getting-started): Hands-on QueryFlux tutorials — route your first query, run locally, build a multi-engine lakehouse, add monitoring, connect AI agents, and secure with OIDC.
+- [YAML Configuration Reference](https://queryflux.dev/docs/configuration): Complete config.yaml reference — frontends, cluster groups, routing rules, persistence, translation, and admin API settings.
+
+## Quickstarts
+
+- [Build a multi-engine lakehouse](https://queryflux.dev/docs/quickstart/multi-engine): Run Trino and StarRocks over one Iceberg catalog behind QueryFlux, and route queries to each engine by client protocol.
+- [Monitor with Prometheus & Grafana](https://queryflux.dev/docs/quickstart/observability): Scrape QueryFlux metrics with Prometheus and watch query rate, latency, and errors on the bundled Grafana dashboard.
+- [Query from an AI agent (MCP)](https://queryflux.dev/docs/quickstart/ai-agent-mcp): Point Claude Code, Cursor, or MCP Inspector at the QueryFlux MCP frontend and run SQL on embedded DuckDB through an AI agent.
+- [Route your first query](https://queryflux.dev/docs/quickstart/first-query): Start QueryFlux, Trino, Postgres, and Studio with Docker Compose, send SQL through the proxy, and find the query in Studio.
+- [Run locally without Docker](https://queryflux.dev/docs/quickstart/local-duckdb): Build the QueryFlux binary, run it with the embedded DuckDB engine, and query it over the Trino protocol with no containers or databases.
+- [Secure QueryFlux with Keycloak (OIDC)](https://queryflux.dev/docs/quickstart/oidc): Require Keycloak-issued JWTs on QueryFlux, restrict cluster groups by IdP group, and choose which identity your queries run as on Trino.
+
+## Install
+
+- [Install on Kubernetes with Helm](https://queryflux.dev/docs/installation/kubernetes): Install QueryFlux with the Helm chart — starter release, configuration, secrets, Postgres persistence, production values, and ADBC drivers.
+- [Install the QueryFlux binary](https://queryflux.dev/docs/installation/binary): Build QueryFlux from source with Cargo, install the sqlglot Python dependency, validate a config, and run the server natively.
+- [Installation & Deployment](https://queryflux.dev/docs/installation/overview): QueryFlux deployment building blocks — server, Studio, Postgres, engines, and optional add-ons — and how to deploy them locally, with Docker, or on Kubernetes.
+- [Run QueryFlux with Docker](https://queryflux.dev/docs/installation/docker): Run the QueryFlux container image — Studio-included or server-only -slim — with your config.yaml, ports, Postgres persistence, and Docker Compose.
+
+## Agents
+
+- [Agentic AI](https://queryflux.dev/docs/agentic/overview): How QueryFlux supports AI agent workloads — attaching agent identity to queries, replaying sessions, and applying guardrails to agent traffic.
+- [Session replay and guardrails](https://queryflux.dev/docs/agentic/session-replay): What QueryFlux stores for each agent query, how to replay a full session from history, and where guardrail decisions show up.
+- [Set agent context](https://queryflux.dev/docs/agentic/agent-context): Attach agent id, conversation, and step to every query with HTTP headers, SQL session parameters, or MCP tool arguments.
+
+## Access control
+
+- [Access Control Overview](https://queryflux.dev/docs/access-control/overview): Data-level access control in QueryFlux — table allow/deny, row filters, and column masks via OPA or Cerbos, enforced before dialect translation.
+- [Analyst grants, region filters, masks](https://queryflux.dev/docs/access-control/internal-analysts): Humans connect as themselves with OIDC or a static user. Policy grants tables by group, adds region row filters, and masks PII columns.
+- [Cerbos Access Control](https://queryflux.dev/docs/access-control/cerbos): Configure Cerbos with QueryFlux — CEL policies that return the same allow/deny, row filter, and column mask model as OPA.
+- [Customer API Row Filters](https://queryflux.dev/docs/access-control/customer-api-row-filters): Per-tenant row filters for a customer API — service-account identity, session params, and OPA/Cerbos predicates in the QueryFlux path.
+- [OPA Access Control](https://queryflux.dev/docs/access-control/opa): Configure Open Policy Agent with QueryFlux — Rego decisions for allow/deny, row-filter expressions, and column mask types.
+- [Support — query on behalf of an account](https://queryflux.dev/docs/access-control/support-on-behalf-of): A support agent authenticates as themselves, passes a verified account_id, and policy returns a row filter plus masked payment fields.
+
+## Architecture
+
+- [Adding Engine Support](https://queryflux.dev/docs/architecture/adding-engine-support): Extend QueryFlux with new backend engines or client protocol frontends — overview and links to detailed guides.
+- [Architecture Overview](https://queryflux.dev/docs/architecture/overview): Index of QueryFlux architecture docs — system design, SQL translation, routing, observability, and extending engine support.
+- [Auth & Authorization Design](https://queryflux.dev/docs/architecture/auth-authz-design): Authentication providers, authorization policies, backend identity resolution, and the two-credential security model.
+- [Catalog provider](https://queryflux.dev/docs/architecture/catalog-integration): Load table and column metadata from a catalog so schema-aware translation can qualify columns and types, not only SQL syntax.
+- [Cluster Variants, Health Checks & Reconciliation](https://queryflux.dev/docs/architecture/cluster-variants-and-health): Multi-warehouse cluster expansion, built-in ADBC introspection, optional custom health/reconcile SQL, and distributed capacity reconciliation.
+- [Guardrails](https://queryflux.dev/docs/architecture/guardrails): SQL-shape safety in the query path — read-only, row limits, require_predicate, custom guards, and the opa_access rewrite for row filters and column masks.
+- [Motivation & Goals](https://queryflux.dev/docs/architecture/motivation-and-goals): Why QueryFlux exists — fragmented engines, cost-aware routing, queueing at the proxy, and compute interoperability for lakehouses.
+- [Observability](https://queryflux.dev/docs/architecture/observability): Prometheus metrics, Grafana dashboards, QueryFlux Studio, and the Admin REST API for operational visibility.
+- [Query Parameters](https://queryflux.dev/docs/architecture/query-params): Typed positional ? placeholders from Snowflake and other frontends through dispatch to native backend binding.
+- [Query result cache](https://queryflux.dev/docs/architecture/caching): Cache deterministic query results and replay them from storage on a hit, keyed by SQL, user, parameters, and catalog.
+- [Query Tags](https://queryflux.dev/docs/architecture/query-tags): Attach key/value metadata to queries for routing, Prometheus metrics, observability, and backend forwarding.
+- [Query Translation](https://queryflux.dev/docs/architecture/query-translation): How QueryFlux converts SQL between dialects with sqlglot — when translation runs, supported dialects, and bypass rules.
+- [Routing & Cluster Groups](https://queryflux.dev/docs/architecture/routing-and-clusters): Router chain, routingFallback, cluster groups, load-balancing strategies, concurrency limits, and proxy-side queueing.
+- [System Map](https://queryflux.dev/docs/architecture/system-map): End-to-end QueryFlux architecture — frontends, router chain, cluster manager, translation, engine adapters, and persistence.
+
+## Frontends
+
+- [Arrow Flight SQL Frontend](https://queryflux.dev/docs/architecture/frontends/flight-sql): Arrow Flight SQL gRPC frontend — implemented RPCs, metadata passthrough, and Flight SQL client examples.
+- [Frontends Overview](https://queryflux.dev/docs/architecture/frontends/overview): QueryFlux client protocols — Trino HTTP, PostgreSQL wire, MySQL wire, Flight SQL, and Snowflake on a shared dispatch path.
+- [MCP frontend for agents](https://queryflux.dev/docs/architecture/frontends/mcp): MCP frontend for AI agents over streamable HTTP. Same routing, auth, guardrails, and query history as every other QueryFlux client.
+- [MySQL Wire Frontend](https://queryflux.dev/docs/architecture/frontends/mysql-wire): MySQL wire protocol frontend — handshake, COM_QUERY, session variables, schema switching, and mysql client support.
+- [PostgreSQL Wire Frontend](https://queryflux.dev/docs/architecture/frontends/postgres-wire): PostgreSQL v3 wire protocol frontend — startup, simple query flow, session context, and psql compatibility.
+- [Snowflake Frontend](https://queryflux.dev/docs/architecture/frontends/snowflake): Snowflake HTTP wire and SQL API v2 on one port — SnowSQL, Python connector, and JDBC without a Snowflake account.
+- [Trino HTTP Frontend](https://queryflux.dev/docs/architecture/frontends/trino-http): Trino-compatible HTTP frontend — async polling, nextUri rewriting, session headers, tags, and mixed-engine groups.
+
+## Extending QueryFlux
+
+- [Add a Backend Engine](https://queryflux.dev/docs/architecture/adding-support/backend): Step-by-step guide to adding a query backend — Rust adapter, engine registration, persistence, and Studio UI.
+- [Add a Frontend Protocol](https://queryflux.dev/docs/architecture/adding-support/frontend): Step-by-step guide to adding a new client protocol listener, dispatch integration, and routing in QueryFlux.
+- [Extending QueryFlux Overview](https://queryflux.dev/docs/architecture/adding-support/overview): Add a backend engine adapter or a new client protocol — Rust crates, Studio UI, and documentation checklist.
+
+## Operations
+
+- [ADBC drivers](https://queryflux.dev/docs/operations/adbc-drivers): Declare the ADBC drivers QueryFlux installs when the container starts — with an environment variable, a dbc.toml file, or your own driver files.
+- [Multi-replica operations](https://queryflux.dev/docs/operations/multi-replica): When and how to run QueryFlux across multiple replicas — Postgres coordination, capacity leases, queue claims, session affinity, and crash recovery.
+
+## Reference
+
+- [Contributing](https://queryflux.dev/docs/contribute): Contribution guidelines for QueryFlux — PR conventions, code style, tests, documentation updates, and Apache 2.0 license.
+- [Development Guide](https://queryflux.dev/docs/development): Set up the Rust workspace, Python/sqlglot sidecar, Docker dependencies, and Makefile commands for QueryFlux development.
+- [Project Structure](https://queryflux.dev/docs/project-structure): QueryFlux repository layout — Rust workspace crates, Studio UI, Docker examples, and documentation directories.
+- [Proxy Benchmarks](https://queryflux.dev/docs/benchmarks): QueryFlux proxy overhead benchmarks — mock-backend latency for Trino HTTP and MySQL wire paths (~0.35 ms p50).
+- [Roadmap](https://queryflux.dev/docs/roadmap): QueryFlux project roadmap — shipped features, near-term priorities, and planned additions for routing and engine support.
+
+## Blog
+
+- [Iceberg didn't win because it was a file format](https://queryflux.dev/blog/ossie-iceberg-playbook): Apache Ossie is retracing Iceberg's path to an open standard. Iceberg won on defined behavior and many implementations. Here's why we built ossiec.
+- [Two agents edited the same config. Both got a 200.](https://queryflux.dev/blog/two-agents-one-config): Agents now operate the data stack too. We gave two of them QueryFlux admin tokens, let them edit the same group, and watched one quietly undo the other.
+- [Your LLM speaks Postgres. Your engines don't.](https://queryflux.dev/blog/your-llm-speaks-postgres): We ran 20 SQL idioms models love on Trino, DuckDB, ClickHouse and StarRocks. Translation fixed most errors and added new wrong answers that raise no error.
+- [Your busiest SQL user has amnesia](https://queryflux.dev/blog/busiest-sql-user-has-amnesia): One question, 13 tool calls, and four confident zeros. We followed an agent-shaped session through QueryFlux to see what really happens after someone asks.
+- [Teach agents your metrics, not your joins](https://queryflux.dev/blog/apache-ossie-semantic-layer): Agent SQL can run, look right and be off by 2x. How ossiec compiles Apache Ossie metrics into correct SQL on six engines, and why QueryFlux is where they run.
+- [Revenue has three definitions. Your agent picked a fourth.](https://queryflux.dev/blog/apache-ossie-why-metrics-need-a-standard): Apache Ossie is an open specification for metric definitions. Why BI tools, semantic layers and AI agents need it, and how it fits with Iceberg and QueryFlux.
+- [Put the row filter above the engines](https://queryflux.dev/blog/row-filters-above-the-engines): Guardrails shape SQL. Row filters and column masks decide what leaves the warehouse — once, in the proxy, for every client and every engine behind QueryFlux.
+- [Offload Snowflake queries without changing clients](https://queryflux.dev/blog/offload-snowflake-queries): Point Snowflake clients at QueryFlux, keep heavy work on Snowflake, and offload the rest to Trino or StarRocks — no dashboard or notebook rewrites.
+- [One endpoint for Iceberg on Trino and StarRocks](https://queryflux.dev/blog/iceberg-trino-starrocks-one-endpoint): Run Trino and StarRocks on the same Iceberg tables behind one QueryFlux SQL endpoint — route BI and notebooks without client rewrites.
+- [Give agents SQL, not the keys to every engine](https://queryflux.dev/blog/agents-sql-not-keys): Put AI agents behind QueryFlux — one MCP or SQL endpoint with routing, guardrails, impersonation, and a record of every query.
+- [Why QueryFlux: the missing layer above query engines](https://queryflux.dev/blog/why-queryflux): Open table formats made data interoperable. Query engines are still islands. Why QueryFlux exists as a neutral SQL layer above the engines.
+
+## Optional
+
+- Draft and older doc snapshots are noindex. Prefer the `/docs/` links above.
+- Thin blog indexes (`/blog/tags`, `/blog/archive`, `/blog/authors`) are not useful as citations.

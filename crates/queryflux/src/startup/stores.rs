@@ -77,6 +77,9 @@ pub(crate) async fn build_stores(config: &ProxyConfig) -> Result<Stores> {
                      (apply with `queryflux migrate` or a Job)"
                 );
             }
+            pg.verify_schema()
+                .await
+                .context("Postgres schema check failed")?;
             let buffered = Arc::new(BufferedMetricsStore::new(
                 pg.clone() as Arc<dyn MetricsStore>,
                 100,

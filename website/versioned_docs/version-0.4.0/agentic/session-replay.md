@@ -1,6 +1,8 @@
 ---
 sidebar_label: Session replay & guardrails
-description: What agentic context QueryFlux persists per query, how to replay an agent's full session from query history, and how guardrails integrate with agent traffic.
+title: Session replay and guardrails
+description: What QueryFlux stores for each agent query, how to replay a full session from history, and where guardrail decisions show up.
+image: img/queryflux-hero-banner.png
 ---
 
 # Session replay and guardrails

@@ -1,6 +1,6 @@
 ---
 title: Sizing for high query rates
-description: How many control-plane replicas, connections and how much Postgres a QueryFlux fleet needs for a given query rate, which capacity mode to pick, and which metrics show you are running out.
+description: Size control-plane replicas, connection pools, and Postgres for a target query rate, and the metrics that show a fleet running out of headroom.
 image: img/queryflux-hero-banner.png
 ---
 

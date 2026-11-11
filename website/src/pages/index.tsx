@@ -16,7 +16,7 @@ import styles from '@site/src/components/Home/styles.module.css';
 
 /** Homepage meta description; keep concise for search-result snippets (~155 chars / ~1000px). */
 const HOME_DESCRIPTION =
-  'Open-source SQL control plane for tools and AI agents: one endpoint over the engines you run, with routing, dialect translation, guardrails, and a record of every query.';
+  'Open-source SQL control plane for tools and AI agents: one endpoint over the engines you run, with routing, dialect translation, guardrails and query history.';
 
 /**
  * Page title before Docusaurus appends ` | QueryFlux` (~12 chars). Keep the *final*

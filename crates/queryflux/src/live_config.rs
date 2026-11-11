@@ -124,6 +124,9 @@ pub(crate) fn health_targets_from_groups(
 /// Returns a list of human-readable issue strings (empty = valid). Callers should
 /// treat any non-empty return as a fatal config error and keep the previous LiveConfig.
 ///
+/// `has_configured_groups` is true when any group exists in config (including disabled);
+/// `group_members` lists enabled groups only — routers and the fallback may only target those.
+///
 /// Checks:
 ///  - `routing_fallback` names a group that exists in `group_members`.
 ///  - Every static `target_group` reference in `routers_cfg` names a group in `group_members`.
@@ -132,10 +135,11 @@ pub(crate) fn health_targets_from_groups(
 pub(crate) fn validate_live_config_refs(
     routers_cfg: &[queryflux_core::config::RouterConfig],
     routing_fallback: &str,
+    has_configured_groups: bool,
     group_members: &HashMap<String, Vec<String>>,
     adapters: &HashMap<String, queryflux_engine_adapters::AdapterKind>,
 ) -> Vec<String> {
-    let mut issues = router_ref_issues(routers_cfg, routing_fallback, |g| {
+    let mut issues = router_ref_issues(routers_cfg, routing_fallback, has_configured_groups, |g| {
         group_members.contains_key(g)
     });
     for (group, members) in group_members {
@@ -151,16 +155,21 @@ pub(crate) fn validate_live_config_refs(
 }
 
 /// Routers and the fallback must target groups that exist (`group_exists`).
+///
+/// A config with no groups, routers or fallback yet is accepted: a new control plane whose
+/// clusters are added through the admin API routes nothing, but nothing in it dangles.
 fn router_ref_issues(
     routers_cfg: &[queryflux_core::config::RouterConfig],
     routing_fallback: &str,
+    has_groups: bool,
     group_exists: impl Fn(&str) -> bool,
 ) -> Vec<String> {
     use queryflux_core::config::RouterConfig;
 
     let mut issues: Vec<String> = Vec::new();
+    let unconfigured = routing_fallback.is_empty() && routers_cfg.is_empty() && !has_groups;
 
-    if !group_exists(routing_fallback) {
+    if !unconfigured && !group_exists(routing_fallback) {
         issues.push(format!(
             "routing_fallback references unknown group '{routing_fallback}'"
         ));
@@ -600,9 +609,12 @@ pub(crate) fn validate_snapshot_inputs(inputs: &LiveConfigInputs) -> Vec<String>
         .filter(|(_, g)| g.enabled)
         .map(|(n, _)| n.as_str())
         .collect();
-    let mut issues = router_ref_issues(&inputs.routers, &inputs.routing_fallback, |g| {
-        enabled_groups.contains(g)
-    });
+    let mut issues = router_ref_issues(
+        &inputs.routers,
+        &inputs.routing_fallback,
+        !inputs.groups.is_empty(),
+        |g| enabled_groups.contains(g),
+    );
     let clusters = match runtime_clusters(&inputs.clusters) {
         Ok(c) => c,
         Err(e) => {
@@ -948,10 +960,10 @@ async fn build_adapter(
 /// Compile plain config inputs into a `LiveConfig`.
 ///
 /// `cache` carries state from the previous generation: adapters are reused while a
-/// cluster's fingerprint is unchanged, cluster load counters are shared, health and
-/// (for unchanged clusters) breaker state carry over, and each group's last good
-/// strategy is kept. Settings that `LiveConfig` gets from outside this function
-/// (auth, authorization, guard chains, access control, catalog) are set to
+/// cluster's fingerprint is unchanged, cluster load counters are shared, routing health
+/// carries over, probe results and breaker state carry over for unchanged clusters, and
+/// each group's last good strategy is kept. Settings that `LiveConfig` gets from outside
+/// this function (auth, authorization, guard chains, access control, catalog) are set to
 /// placeholders; callers fill them in.
 pub(crate) async fn compile_live_config(
     inputs: &LiveConfigInputs,
@@ -1098,8 +1110,10 @@ pub(crate) async fn compile_live_config(
                 .with_circuit_breaker(group_config.circuit_breaker.clone(), previous_unchanged)
                 .with_shared_load_counters(previous.map(Arc::as_ref)),
             );
-            if let Some(prev) = previous {
-                state.set_healthy(prev.is_healthy());
+            match previous {
+                Some(prev) if config_unchanged => state.restore_health_from(prev),
+                Some(prev) => state.inherit_routing_health_from(prev),
+                None => {}
             }
             states.push(state);
         }
@@ -1199,6 +1213,7 @@ pub(crate) async fn compile_live_config(
     let issues = validate_live_config_refs(
         &inputs.routers,
         &inputs.routing_fallback,
+        !inputs.groups.is_empty(),
         &group_members,
         &cache.adapters,
     );
@@ -1986,6 +2001,26 @@ mod tests {
     }
 
     #[test]
+    fn an_empty_config_is_valid_but_a_missing_fallback_is_not() {
+        let mut empty = inputs(vec![], vec![]);
+        empty.routing_fallback = String::new();
+        assert!(validate_snapshot_inputs(&empty).is_empty());
+        let mut grouped = inputs(
+            vec![persisted(
+                "duck",
+                serde_json::json!({}),
+                serde_json::json!([]),
+            )],
+            vec![("g", group(serde_json::json!({ "members": ["duck"] })))],
+        );
+        grouped.routing_fallback = String::new();
+        assert_eq!(
+            validate_snapshot_inputs(&grouped),
+            vec!["routing_fallback references unknown group ''".to_string()]
+        );
+    }
+
+    #[test]
     fn script_files_are_inlined_for_workers() {
         let dir = std::env::temp_dir().join(format!("qf-inline-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -2115,6 +2150,45 @@ catalogProvider: { type: "null" }
         assert!(
             !Arc::ptr_eq(&live.auth_provider, &before),
             "auth came from YAML"
+        );
+    }
+
+    /// A probe result survives a reload only while the cluster's config is unchanged: it
+    /// says nothing about a new endpoint or credentials. Routing health carries over either way.
+    #[tokio::test]
+    async fn reload_keeps_probe_result_only_for_unchanged_config() {
+        let spec = |health_query: &str| {
+            inputs(
+                vec![persisted(
+                    "duck",
+                    serde_json::json!({ "healthCheckQuery": health_query }),
+                    serde_json::json!([]),
+                )],
+                vec![("g", group(serde_json::json!({ "members": ["duck"] })))],
+            )
+        };
+        let state_of = |live: &LiveConfig| live.health_check_targets[0].1.clone();
+        let ids = ConfigIds::default();
+        let mut cache = empty_cache();
+
+        let first = compile_live_config(&spec("SELECT 1"), &ids, &mut cache, CompileMode::Strict)
+            .await
+            .expect("compiles");
+        state_of(&first).set_healthy(false);
+
+        let unchanged =
+            compile_live_config(&spec("SELECT 1"), &ids, &mut cache, CompileMode::Strict)
+                .await
+                .expect("compiles");
+        assert_eq!(state_of(&unchanged).probed_health(), Some(false));
+
+        let changed = compile_live_config(&spec("SELECT 2"), &ids, &mut cache, CompileMode::Strict)
+            .await
+            .expect("compiles");
+        assert_eq!(state_of(&changed).probed_health(), None);
+        assert!(
+            !state_of(&changed).is_healthy(),
+            "routing health carries over"
         );
     }
 

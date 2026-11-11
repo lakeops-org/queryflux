@@ -1,3 +1,9 @@
+---
+title: Query result cache
+description: Cache deterministic query results and replay them from storage on a hit, keyed by SQL, user, parameters, and catalog.
+image: img/queryflux-hero-banner.png
+---
+
 # Query Cache
 
 QueryFlux can transparently cache deterministic query results in a pluggable storage backend, eliminating repeated backend roundtrips for identical queries.

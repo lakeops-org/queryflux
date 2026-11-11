@@ -1,4 +1,4 @@
-import {useEffect, useState, type ReactNode} from 'react';
+import {useEffect, useRef, useState, type ReactNode} from 'react';
 import clsx from 'clsx';
 import useBaseUrl from '@docusaurus/useBaseUrl';
 import styles from './styles.module.css';
@@ -128,10 +128,77 @@ const PHASES: PhaseMeta[] = [
 
 const STEP_BOXES = PHASES.filter((p) => p.id !== 'hold');
 
+/** True once the animation has reached `id` (or any later phase). */
 function phaseAtOrAfter(id: Phase, current: Phase): boolean {
   return PHASE_ORDER.indexOf(current) >= PHASE_ORDER.indexOf(id);
 }
 
+/** The AI agent, drawn as SVG so it stays sharp at any size and needs no backdrop. */
+function AgentBot(): ReactNode {
+  return (
+    <svg className={styles.agentBot} viewBox="0 0 96 96" aria-hidden focusable="false">
+      <defs>
+        <linearGradient id="qfBotShell" x1="13" y1="44" x2="83" y2="66" gradientUnits="userSpaceOnUse">
+          <stop offset="0" stopColor="#9b4dff" />
+          <stop offset="0.5" stopColor="#e5609e" />
+          <stop offset="1" stopColor="#ff7a1a" />
+        </linearGradient>
+        <linearGradient id="qfBotShade" x1="48" y1="24" x2="48" y2="86" gradientUnits="userSpaceOnUse">
+          <stop offset="0" stopColor="#fff" stopOpacity="0.12" />
+          <stop offset="0.35" stopColor="#fff" stopOpacity="0" />
+          <stop offset="1" stopColor="#1a0630" stopOpacity="0.45" />
+        </linearGradient>
+        <linearGradient id="qfBotVisor" x1="48" y1="40" x2="48" y2="72" gradientUnits="userSpaceOnUse">
+          <stop offset="0" stopColor="#1d1533" />
+          <stop offset="1" stopColor="#0a0714" />
+        </linearGradient>
+        <radialGradient id="qfBotBulb" cx="0.38" cy="0.35" r="0.7">
+          <stop offset="0" stopColor="#ffd2a8" />
+          <stop offset="0.5" stopColor="#ff8a2a" />
+          <stop offset="1" stopColor="#e2580b" />
+        </radialGradient>
+        <filter id="qfBotGlow" x="-50%" y="-50%" width="200%" height="200%">
+          <feGaussianBlur stdDeviation="1.6" result="b" />
+          <feMerge>
+            <feMergeNode in="b" />
+            <feMergeNode in="SourceGraphic" />
+          </feMerge>
+        </filter>
+      </defs>
+      <path d="M48 26 V15" stroke="#160b26" strokeWidth="5.5" strokeLinecap="round" />
+      <path d="M48 26 V15" stroke="#8b5cf6" strokeWidth="3" strokeLinecap="round" />
+      <circle className={styles.agentBotBulb} cx="48" cy="12" r="5" fill="url(#qfBotBulb)" stroke="#160b26" strokeWidth="2.5" />
+      <circle cx="46.4" cy="10.4" r="1.4" fill="#fff" opacity="0.8" />
+      <rect x="8" y="46" width="8" height="18" rx="4" fill="#8b3df5" stroke="#160b26" strokeWidth="2.5" />
+      <rect x="80" y="46" width="8" height="18" rx="4" fill="#ff7a1a" stroke="#160b26" strokeWidth="2.5" />
+      <rect x="13" y="25" width="70" height="60" rx="27" fill="url(#qfBotShell)" />
+      <rect x="13" y="25" width="70" height="60" rx="27" fill="url(#qfBotShade)" />
+      <rect x="13" y="25" width="70" height="60" rx="27" fill="none" stroke="#160b26" strokeWidth="2.5" />
+      <ellipse cx="30" cy="34.5" rx="8" ry="3.6" transform="rotate(-26 30 34.5)" fill="#fff" opacity="0.5" />
+      <circle cx="22.5" cy="42" r="1.6" fill="#fff" opacity="0.45" />
+      <rect x="21" y="39" width="54" height="33" rx="16.5" fill="url(#qfBotVisor)" />
+      <rect x="21.75" y="39.75" width="52.5" height="31.5" rx="15.75" fill="none" stroke="#fff" strokeOpacity="0.08" strokeWidth="1.5" />
+      <g className={styles.agentBotEyes}>
+        <g filter="url(#qfBotGlow)" fill="#a3e635">
+          <ellipse cx="38" cy="54" rx="5" ry="6" />
+          <ellipse cx="58" cy="54" rx="5" ry="6" />
+        </g>
+        <circle cx="36.3" cy="51.2" r="1.9" fill="#fff" opacity="0.9" />
+        <circle cx="56.3" cy="51.2" r="1.9" fill="#fff" opacity="0.9" />
+      </g>
+      <path
+        d="M42.5 62.5 Q48 67 53.5 62.5"
+        fill="none"
+        stroke="#a3e635"
+        strokeWidth="2.6"
+        strokeLinecap="round"
+        filter="url(#qfBotGlow)"
+      />
+    </svg>
+  );
+}
+
+/** Tracks the visitor's reduced-motion preference, updating if it changes. */
 function usePrefersReducedMotion(): boolean {
   const [reduced, setReduced] = useState(false);
   useEffect(() => {
@@ -144,6 +211,7 @@ function usePrefersReducedMotion(): boolean {
   return reduced;
 }
 
+/** Wraps the first occurrence of `needle` in `sql` in a highlight mark. */
 function highlightDiff(sql: string, needle: string, kind: 'from' | 'to'): ReactNode {
   const i = sql.indexOf(needle);
   if (i < 0) {
@@ -158,6 +226,7 @@ function highlightDiff(sql: string, needle: string, kind: 'from' | 'to'): ReactN
   );
 }
 
+/** Looping diagram of one agent query: guardrails, translation, routing, the engine and back. */
 export default function HomeAgentFlow(): ReactNode {
   const reduced = usePrefersReducedMotion();
   const [phaseIndex, setPhaseIndex] = useState(reduced ? PHASES.length - 2 : 0);
@@ -168,8 +237,7 @@ export default function HomeAgentFlow(): ReactNode {
   const duckLogo = useBaseUrl('/img/engines/duckdb.png');
   const trinoLogo = useBaseUrl('/img/engines/trino.png');
   const starrocksLogo = useBaseUrl('/img/engines/starrocks.svg');
-  const agentBot = useBaseUrl('/img/ai-agent-avatar.jpg');
-  const queryfluxCrab = useBaseUrl('/img/queryflux-mascot.png');
+  const queryfluxCrab = useBaseUrl('/img/queryflux-crab.png');
   const engines: Engine[] = [
     {...ENGINE_DEFS[0], logo: duckLogo},
     {...ENGINE_DEFS[1], logo: trinoLogo},
@@ -199,6 +267,64 @@ export default function HomeAgentFlow(): ReactNode {
     }, 240);
     return () => window.clearInterval(id);
   }, [phase.id, reduced]);
+
+  const fanPathRefs = useRef<(SVGPathElement | null)[]>([]);
+  const fanPacketRef = useRef<SVGGElement | null>(null);
+
+  /**
+   * Engine phase: SQL travels from QueryFlux along the chosen path to the engine, waits
+   * while it runs, then the rows travel back. Drawn with getPointAtLength so the packet
+   * follows the real curve at whatever size the SVG is rendered.
+   */
+  useEffect(() => {
+    const g = fanPacketRef.current;
+    const path = fanPathRefs.current[pickIndex];
+    if (!g || !path) {
+      return;
+    }
+    if (reduced || phase.id !== 'engine') {
+      g.style.display = 'none';
+      return;
+    }
+    const text = g.querySelector('text');
+    const total = path.getTotalLength();
+    const duration = phase.ms * 0.92;
+    const ease = (x: number) => (x < 0.5 ? 2 * x * x : 1 - (-2 * x + 2) ** 2 / 2);
+    const OUT = 0.4; // share of the phase spent travelling to the engine
+    const HOLD = 0.18; // share spent waiting at the engine
+    let raf = 0;
+    const start = performance.now();
+    const frame = (now: number) => {
+      const p = Math.min((now - start) / duration, 1);
+      let along: number;
+      let kind: 'sql' | 'rows';
+      if (p < OUT) {
+        along = ease(p / OUT);
+        kind = 'sql';
+      } else if (p < OUT + HOLD) {
+        along = 1;
+        kind = 'sql';
+      } else {
+        along = 1 - ease((p - OUT - HOLD) / (1 - OUT - HOLD));
+        kind = 'rows';
+      }
+      const pt = path.getPointAtLength(along * total);
+      g.setAttribute('transform', `translate(${pt.x} ${pt.y})`);
+      g.setAttribute('data-kind', kind);
+      if (text) {
+        text.textContent = kind === 'sql' ? 'SQL' : 'ROWS';
+      }
+      g.style.display = '';
+      if (p < 1) {
+        raf = requestAnimationFrame(frame);
+      }
+    };
+    raf = requestAnimationFrame(frame);
+    return () => {
+      cancelAnimationFrame(raf);
+      g.style.display = 'none';
+    };
+  }, [phase.id, phase.ms, pickIndex, reduced]);
 
   const routingSettled =
     reduced ||
@@ -290,15 +416,14 @@ export default function HomeAgentFlow(): ReactNode {
               styles.diagramAgent,
               agentLit && styles.diagramNodeLit,
             )}>
-            <img
-              className={styles.diagramAgentAvatar}
-              src={agentBot}
-              alt=""
-              width={48}
-              height={48}
-            />
+            <span className={styles.diagramAgentRing} aria-hidden>
+              <span className={styles.diagramAgentAvatar}>
+                <AgentBot />
+              </span>
+              <span className={styles.diagramAgentStatus} />
+            </span>
             <strong>AI agent</strong>
-            <span className={styles.diagramNodeHint}>asks over MCP</span>
+            <span className={styles.diagramNodeChip}>MCP client</span>
           </div>
 
           <div
@@ -337,17 +462,18 @@ export default function HomeAgentFlow(): ReactNode {
                 styles.diagramNodePulse,
             )}>
             <div className={styles.diagramProxyHead}>
-              <img
-                className={styles.diagramProxyMascot}
-                src={queryfluxCrab}
-                alt=""
-                width={52}
-                height={36}
-              />
+              <span className={styles.diagramProxyStage} aria-hidden>
+                <img
+                  className={styles.diagramProxyMascot}
+                  src={queryfluxCrab}
+                  alt=""
+                  width={176}
+                  height={76}
+                />
+              </span>
               <div className={styles.diagramProxyTitles}>
                 <span className={styles.diagramNodeEyebrow}>Control plane</span>
                 <strong>QueryFlux</strong>
-                <span className={styles.diagramNodeHint}>guard · translate · route · cache</span>
               </div>
             </div>
             <div className={styles.diagramProxyTags}>
@@ -389,6 +515,9 @@ export default function HomeAgentFlow(): ReactNode {
                 return (
                   <path
                     key={engine.id}
+                    ref={(el) => {
+                      fanPathRefs.current[i] = el;
+                    }}
                     d={FAN_PATHS[i]}
                     className={clsx(
                       styles.diagramFanPath,
@@ -401,6 +530,12 @@ export default function HomeAgentFlow(): ReactNode {
                   />
                 );
               })}
+              <g ref={fanPacketRef} className={styles.fanPacket} style={{display: 'none'}}>
+                <rect x={-17} y={-7.5} width={34} height={15} rx={7.5} />
+                <text x={0} y={0.5} textAnchor="middle" dominantBaseline="middle">
+                  SQL
+                </text>
+              </g>
             </svg>
 
             <ul className={styles.diagramEngineList}>

@@ -1,0 +1,67 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="520" viewBox="0 0 960 520" role="img" aria-label="Two agents edit the same cluster group. Without If-Match both writes return 200 and the second silently reverts maxRunningQueries from 8 to 4. With If-Match the second write gets 412, the agent re-reads and reapplies, and both changes survive.">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1"><stop offset="0%" stop-color="#0b0614"/><stop offset="100%" stop-color="#050508"/></linearGradient>
+    <radialGradient id="glow" cx="50%" cy="45%" r="55%"><stop offset="0%" stop-color="#7c3aed" stop-opacity="0.22"/><stop offset="100%" stop-color="#7c3aed" stop-opacity="0"/></radialGradient>
+    <pattern id="dots" width="22" height="22" patternUnits="userSpaceOnUse"><circle cx="1" cy="1" r="0.8" fill="rgba(255,255,255,0.05)"/></pattern>
+  </defs>
+  <rect width="960" height="520" rx="20" fill="url(#bg)"/><rect width="960" height="520" rx="20" fill="url(#glow)"/><rect width="960" height="520" rx="20" fill="url(#dots)"/>
+  <rect x="1" y="1" width="958" height="518" rx="19" fill="none" stroke="rgba(255,255,255,0.08)"/>
+  <g font-family="ui-sans-serif, system-ui, sans-serif">
+    <text x="40" y="42" fill="#fafafa" font-size="18" font-weight="650">Two agents, one cluster group, the same two edits</text>
+    <text x="40" y="66" fill="#a1a1aa" font-size="13">Real responses from the QueryFlux admin API. Both agents start from the group at maxRunningQueries 4.</text>
+    <text x="40" y="108" fill="#fafafa" font-size="15" font-weight="650">Without If-Match</text>
+    <text x="40" y="128" fill="#a1a1aa" font-size="12.5">Both writes succeed. The second one puts back the value the first one changed.</text>
+    <text x="40" y="173" fill="#d4d4d8" font-size="12.5" font-family="ui-monospace, Menlo, monospace">capacity-agent</text>
+    <path d="M170 168 H770" stroke="rgba(255,255,255,0.12)" stroke-width="1" stroke-dasharray="3 4"/>
+    <rect x="180" y="146" width="110" height="44" rx="8" fill="#18181b" stroke="#71717a" stroke-width="1.4"/>
+    <text x="235.0" y="165" fill="#d4d4d8" font-size="12.5" font-weight="650" text-anchor="middle" font-family="ui-monospace, Menlo, monospace">GET</text>
+    <text x="235.0" y="181" fill="#d4d4d8" font-size="11.5" text-anchor="middle" opacity="0.85">r1, max 4</text>
+    <rect x="310" y="146" width="150" height="44" rx="8" fill="#052e16" stroke="#4ade80" stroke-width="1.4"/>
+    <text x="385.0" y="165" fill="#bbf7d0" font-size="12.5" font-weight="650" text-anchor="middle" font-family="ui-monospace, Menlo, monospace">PUT max=8</text>
+    <text x="385.0" y="181" fill="#bbf7d0" font-size="11.5" text-anchor="middle" opacity="0.85">200 → r2</text>
+    <text x="40" y="231" fill="#d4d4d8" font-size="12.5" font-family="ui-monospace, Menlo, monospace">access-agent</text>
+    <path d="M170 226 H770" stroke="rgba(255,255,255,0.12)" stroke-width="1" stroke-dasharray="3 4"/>
+    <rect x="180" y="204" width="110" height="44" rx="8" fill="#18181b" stroke="#71717a" stroke-width="1.4"/>
+    <text x="235.0" y="223" fill="#d4d4d8" font-size="12.5" font-weight="650" text-anchor="middle" font-family="ui-monospace, Menlo, monospace">GET</text>
+    <text x="235.0" y="239" fill="#d4d4d8" font-size="11.5" text-anchor="middle" opacity="0.85">r1, max 4</text>
+    <rect x="480" y="204" width="200" height="44" rx="8" fill="#450a0a" stroke="#f87171" stroke-width="1.4"/>
+    <text x="580.0" y="223" fill="#fca5a5" font-size="12.5" font-weight="650" text-anchor="middle" font-family="ui-monospace, Menlo, monospace">PUT allowGroups</text>
+    <text x="580.0" y="239" fill="#fca5a5" font-size="11.5" text-anchor="middle" opacity="0.85">200 → r3, max back to 4</text>
+    <rect x="790" y="146" width="130" height="102" rx="10" fill="#450a0a" stroke="#f87171" stroke-width="1.6"/>
+    <text x="855" y="172" fill="#fca5a5" font-size="12" text-anchor="middle" opacity="0.85">final group</text>
+    <text x="855" y="198" fill="#fca5a5" font-size="13" font-weight="650" text-anchor="middle" font-family="ui-monospace, Menlo, monospace">max 4</text>
+    <text x="855" y="220" fill="#fca5a5" font-size="13" font-weight="650" text-anchor="middle" font-family="ui-monospace, Menlo, monospace">+ oncall</text>
+    <text x="855" y="238" fill="#fca5a5" font-size="11" text-anchor="middle" opacity="0.85">8 → 4, nobody told</text>
+    <path d="M40 290 H920" stroke="rgba(255,255,255,0.08)"/>
+    <text x="40" y="322" fill="#fafafa" font-size="15" font-weight="650">With If-Match</text>
+    <text x="40" y="342" fill="#a1a1aa" font-size="12.5">The stale write is refused. The agent reads again and reapplies its own change.</text>
+    <text x="40" y="387" fill="#d4d4d8" font-size="12.5" font-family="ui-monospace, Menlo, monospace">capacity-agent</text>
+    <path d="M170 382 H770" stroke="rgba(255,255,255,0.12)" stroke-width="1" stroke-dasharray="3 4"/>
+    <rect x="180" y="360" width="110" height="44" rx="8" fill="#18181b" stroke="#71717a" stroke-width="1.4"/>
+    <text x="235.0" y="379" fill="#d4d4d8" font-size="12.5" font-weight="650" text-anchor="middle" font-family="ui-monospace, Menlo, monospace">GET</text>
+    <text x="235.0" y="395" fill="#d4d4d8" font-size="11.5" text-anchor="middle" opacity="0.85">r4, max 4</text>
+    <rect x="310" y="360" width="150" height="44" rx="8" fill="#052e16" stroke="#4ade80" stroke-width="1.4"/>
+    <text x="385.0" y="379" fill="#bbf7d0" font-size="12.5" font-weight="650" text-anchor="middle" font-family="ui-monospace, Menlo, monospace">PUT If-Match r4</text>
+    <text x="385.0" y="395" fill="#bbf7d0" font-size="11.5" text-anchor="middle" opacity="0.85">200 → r6</text>
+    <text x="40" y="445" fill="#d4d4d8" font-size="12.5" font-family="ui-monospace, Menlo, monospace">access-agent</text>
+    <path d="M170 440 H770" stroke="rgba(255,255,255,0.12)" stroke-width="1" stroke-dasharray="3 4"/>
+    <rect x="180" y="418" width="110" height="44" rx="8" fill="#18181b" stroke="#71717a" stroke-width="1.4"/>
+    <text x="235.0" y="437" fill="#d4d4d8" font-size="12.5" font-weight="650" text-anchor="middle" font-family="ui-monospace, Menlo, monospace">GET</text>
+    <text x="235.0" y="453" fill="#d4d4d8" font-size="11.5" text-anchor="middle" opacity="0.85">r4, max 4</text>
+    <rect x="310" y="418" width="150" height="44" rx="8" fill="#431407" stroke="#fb923c" stroke-width="1.4"/>
+    <text x="385.0" y="437" fill="#fed7aa" font-size="12.5" font-weight="650" text-anchor="middle" font-family="ui-monospace, Menlo, monospace">PUT If-Match r4</text>
+    <text x="385.0" y="453" fill="#fed7aa" font-size="11.5" text-anchor="middle" opacity="0.85">412, ETag r6</text>
+    <rect x="476" y="418" width="96" height="44" rx="8" fill="#18181b" stroke="#71717a" stroke-width="1.4"/>
+    <text x="524.0" y="437" fill="#d4d4d8" font-size="12.5" font-weight="650" text-anchor="middle" font-family="ui-monospace, Menlo, monospace">GET</text>
+    <text x="524.0" y="453" fill="#d4d4d8" font-size="11.5" text-anchor="middle" opacity="0.85">r6, max 8</text>
+    <rect x="588" y="418" width="170" height="44" rx="8" fill="#052e16" stroke="#4ade80" stroke-width="1.4"/>
+    <text x="673.0" y="437" fill="#bbf7d0" font-size="12.5" font-weight="650" text-anchor="middle" font-family="ui-monospace, Menlo, monospace">PUT If-Match r6</text>
+    <text x="673.0" y="453" fill="#bbf7d0" font-size="11.5" text-anchor="middle" opacity="0.85">200 → r8</text>
+    <rect x="790" y="360" width="130" height="102" rx="10" fill="#052e16" stroke="#4ade80" stroke-width="1.6"/>
+    <text x="855" y="386" fill="#bbf7d0" font-size="12" text-anchor="middle" opacity="0.85">final group</text>
+    <text x="855" y="412" fill="#bbf7d0" font-size="13" font-weight="650" text-anchor="middle" font-family="ui-monospace, Menlo, monospace">max 8</text>
+    <text x="855" y="434" fill="#bbf7d0" font-size="13" font-weight="650" text-anchor="middle" font-family="ui-monospace, Menlo, monospace">+ oncall</text>
+    <text x="855" y="452" fill="#bbf7d0" font-size="11" text-anchor="middle" opacity="0.85">both changes kept</text>
+  </g>
+</svg>

@@ -1,9 +1,10 @@
 ---
 sidebar_label: Support on-behalf-of
 title: Support — query on behalf of an account
-description: A support agent or desk service authenticates as themselves, attaches an account_id they already verified, and policy returns a row filter plus masked payment fields.
+description: A support agent authenticates as themselves, passes a verified account_id, and policy returns a row filter plus masked payment fields.
 image: img/queryflux-hero-banner.png
 ---
+
 # Support — query on behalf of an account
 
 Support tools need to inspect a customer's billing and subscription history **without** logging in as that customer and **without** embedding `WHERE account_id = …` in every handler. Authenticate the **agent** (or a support-desk service account), put the **account** they selected into session context, and let the policy provider return the filter.

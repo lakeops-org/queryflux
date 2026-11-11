@@ -11,7 +11,7 @@ use crate::{
     metrics_store::{ClusterSnapshot, MetricsStore, QueryRecord},
     query_history::{
         AgentSummary, ConversationSummary, DashboardStats, EngineStatRow, GroupStatRow,
-        QueryFilters, QuerySummary,
+        HistogramBy, HistogramRow, QueryFilters, QuerySummary, TimeRange,
     },
     routing_slices::{
         collapse_rows_to_routers, expand_router_for_persistence, RoutingRulePersistRow,
@@ -31,8 +31,10 @@ use queryflux_core::{
 };
 use sqlx::PgPool;
 
+mod admin_access;
 mod history_batch;
 mod hub_store;
+pub mod tenants;
 
 /// Select group rows with `members` as cluster **names** (joined from `cluster_configs` by id).
 const CLUSTER_GROUP_CONFIG_SELECT: &str = r#"
@@ -73,6 +75,8 @@ pub struct PostgresStore {
     coordination_pool: PgPool,
     admin_pool: PgPool,
     database_url: String,
+    /// `persistence.schema`, already in `database_url` as the `search_path`.
+    schema: Option<String>,
     /// `capacity.quotaLeaseSecs` and `capacity.reportIntervalMs`, returned to holders with
     /// their grants.
     quota_lease_secs: std::sync::atomic::AtomicU64,
@@ -146,6 +150,10 @@ impl PostgresStore {
             coordination_pool,
             admin_pool,
             database_url: database_url.to_string(),
+            schema: conn
+                .pinned_schema()
+                .map_err(QueryFluxError::Persistence)?
+                .map(String::from),
             quota_lease_secs: std::sync::atomic::AtomicU64::new(15),
             quota_report_interval_ms: std::sync::atomic::AtomicU64::new(1000),
             grant_waiters: Arc::default(),
@@ -158,7 +166,30 @@ impl PostgresStore {
     /// Prefer [`crate::SchemaMigrator`] / [`crate::run_persistence_migrations`] from CLI and
     /// other callers so non-Postgres backends can plug in the same interface later.
     pub async fn migrate(&self) -> Result<()> {
-        crate::migrate::run_postgres_refinery_migrations(&self.database_url).await
+        crate::migrate::run_postgres_refinery_migrations(&self.database_url, self.schema.as_deref())
+            .await
+    }
+
+    /// With a pinned schema, check that connections resolve to it: a missing schema, or a
+    /// role whose own `search_path` setting wins, would otherwise read and write another
+    /// schema's tables. Call after migrations (which create the schema).
+    pub async fn verify_schema(&self) -> Result<()> {
+        let Some(expected) = self.schema.as_deref() else {
+            return Ok(());
+        };
+        let current: Option<String> = sqlx::query_scalar("SELECT current_schema()")
+            .fetch_one(&self.admin_pool)
+            .await
+            .map_err(|e| QueryFluxError::Persistence(format!("schema check: {e}")))?;
+        match current.as_deref() {
+            Some(c) if c == expected => Ok(()),
+            Some(c) => Err(QueryFluxError::Persistence(format!(
+                "persistence.schema is '{expected}' but connections resolve to '{c}'"
+            ))),
+            None => Err(QueryFluxError::Persistence(format!(
+                "persistence.schema '{expected}' does not exist (run migrations, or create it)"
+            ))),
+        }
     }
 }
 
@@ -184,6 +215,20 @@ async fn build_pg_pool(
     opts.connect(database_url)
         .await
         .map_err(|e| QueryFluxError::Persistence(format!("Failed to connect to Postgres: {e}")))
+}
+
+/// LISTEN on `base`'s channel in this connection's schema (`queryflux_channel`, V27): the
+/// plain name in `public`, a schema-specific one otherwise, so deployments sharing a
+/// database never wake each other.
+async fn listen_scoped(
+    listener: &mut sqlx::postgres::PgListener,
+    base: &str,
+) -> std::result::Result<(), sqlx::Error> {
+    let channel: String = sqlx::query_scalar("SELECT queryflux_channel($1)")
+        .bind(base)
+        .fetch_one(&mut *listener)
+        .await?;
+    listener.listen(&channel).await
 }
 
 /// Rows deleted per statement by the history purge.
@@ -236,7 +281,7 @@ impl SweepCoordinator for PostgresStore {
             .map_err(|e| QueryFluxError::Persistence(format!("sweep lock connect: {e}")))?;
 
         let got: bool =
-            sqlx::query_scalar("SELECT pg_try_advisory_lock(hashtext('sweep:' || $1)::bigint)")
+            sqlx::query_scalar("SELECT pg_try_advisory_lock(queryflux_lock_key('sweep:' || $1))")
                 .bind(name)
                 .fetch_one(&mut conn)
                 .await
@@ -271,7 +316,7 @@ pub struct SweepLock {
 
 impl SweepLock {
     async fn unlock(mut conn: sqlx::PgConnection, name: &str) {
-        let res = sqlx::query("SELECT pg_advisory_unlock(hashtext('sweep:' || $1)::bigint)")
+        let res = sqlx::query("SELECT pg_advisory_unlock(queryflux_lock_key('sweep:' || $1))")
             .bind(name)
             .execute(&mut conn)
             .await;
@@ -316,10 +361,43 @@ impl Drop for SweepLock {
 // QueryHistoryStore
 // ---------------------------------------------------------------------------
 
+/// `QueryFilters::matches` in SQL, on `query_records qr` joined to `cluster_group_configs cg`
+/// and `cluster_configs cc`. Binds `$1`..`$9` (see `bind_query_filters`).
+const QUERY_FILTERS: &str = r#"($1::text IS NULL OR qr.sql_preview ILIKE '%' || $1 || '%')
+                 AND (cardinality($2::text[]) = 0 OR lower(qr.status) = ANY($2))
+                 AND (cardinality($3::text[]) = 0 OR COALESCE(cg.name, qr.cluster_group) = ANY($3))
+                 AND (cardinality($4::text[]) = 0 OR EXISTS (
+                      SELECT 1 FROM unnest($4::text[]) c
+                      WHERE COALESCE(cc.name, qr.cluster_name) = c
+                         OR starts_with(COALESCE(cc.name, qr.cluster_name), c || '::')))
+                 AND (cardinality($5::text[]) = 0 OR lower(qr.engine_type) = ANY($5))
+                 AND (cardinality($6::text[]) = 0 OR EXISTS (
+                      SELECT 1 FROM unnest($6::text[]) w
+                      WHERE qr.worker = w OR (right(w, 1) = '/' AND starts_with(qr.worker, w))))
+                 AND (cardinality($7::text[]) = 0 OR qr.username = ANY($7))
+                 AND ($8::timestamptz IS NULL OR qr.created_at >= $8)
+                 AND ($9::timestamptz IS NULL OR qr.created_at < $9)"#;
+
+fn bind_query_filters<'q, O>(
+    q: sqlx::query::QueryAs<'q, sqlx::Postgres, O, sqlx::postgres::PgArguments>,
+    f: &'q QueryFilters,
+) -> sqlx::query::QueryAs<'q, sqlx::Postgres, O, sqlx::postgres::PgArguments> {
+    let lower = |vs: &[String]| vs.iter().map(|v| v.to_lowercase()).collect::<Vec<_>>();
+    q.bind(&f.search)
+        .bind(lower(&f.status))
+        .bind(&f.cluster_group)
+        .bind(&f.cluster)
+        .bind(lower(&f.engine))
+        .bind(&f.worker)
+        .bind(&f.user)
+        .bind(f.from)
+        .bind(f.to)
+}
+
 #[async_trait]
 impl QueryHistoryStore for PostgresStore {
     async fn list_queries(&self, filters: &QueryFilters) -> Result<Vec<QuerySummary>> {
-        sqlx::query_as::<_, QuerySummary>(
+        let sql = format!(
             r#"SELECT qr.id, qr.proxy_query_id, qr.backend_query_id,
                       COALESCE(cg.name, qr.cluster_group) AS cluster_group,
                       COALESCE(cc.name, qr.cluster_name) AS cluster_name,
@@ -337,24 +415,49 @@ impl QueryHistoryStore for PostgresStore {
                FROM query_records qr
                LEFT JOIN cluster_group_configs cg ON cg.id = qr.cluster_group_id
                LEFT JOIN cluster_configs cc ON cc.id = qr.cluster_id
-               WHERE ($1::text IS NULL OR qr.sql_preview ILIKE '%' || $1 || '%')
-                 AND ($2::text IS NULL OR qr.status = $2)
-                 AND ($3::text IS NULL OR COALESCE(cg.name, qr.cluster_group) = $3)
-                 AND ($4::text IS NULL OR qr.engine_type = $4)
-                 AND ($7::text IS NULL OR qr.worker = $7)
-               ORDER BY qr.created_at DESC
-               LIMIT $5 OFFSET $6"#,
-        )
-        .bind(&filters.search)
-        .bind(&filters.status)
-        .bind(&filters.cluster_group)
-        .bind(&filters.engine)
-        .bind(filters.limit)
-        .bind(filters.offset)
-        .bind(&filters.worker)
-        .fetch_all(&self.admin_pool)
-        .await
-        .map_err(|e| QueryFluxError::Persistence(format!("list_queries: {e}")))
+               WHERE {QUERY_FILTERS}
+                 AND ($10::timestamptz IS NULL
+                      OR (qr.created_at, qr.id) < ($10, COALESCE($11, 9223372036854775807)))
+               ORDER BY qr.created_at DESC, qr.id DESC
+               LIMIT $12 OFFSET $13"#
+        );
+        bind_query_filters(sqlx::query_as::<_, QuerySummary>(&sql), filters)
+            .bind(filters.before)
+            .bind(filters.before_id)
+            .bind(filters.limit)
+            .bind(filters.offset)
+            .fetch_all(&self.admin_pool)
+            .await
+            .map_err(|e| QueryFluxError::Persistence(format!("list_queries: {e}")))
+    }
+
+    async fn query_histogram(
+        &self,
+        filters: &QueryFilters,
+        bucket_secs: i64,
+        by: HistogramBy,
+    ) -> Result<Vec<HistogramRow>> {
+        let key = match by {
+            HistogramBy::Status => "qr.status",
+            HistogramBy::ClusterGroup => "COALESCE(cg.name, qr.cluster_group)",
+        };
+        let sql = format!(
+            r#"SELECT to_timestamp((floor(extract(epoch FROM qr.created_at) / $10) * $10)::float8)
+                          AS bucket,
+                      {key} AS key,
+                      COUNT(*)::bigint AS count
+               FROM query_records qr
+               LEFT JOIN cluster_group_configs cg ON cg.id = qr.cluster_group_id
+               LEFT JOIN cluster_configs cc ON cc.id = qr.cluster_id
+               WHERE {QUERY_FILTERS}
+               GROUP BY 1, 2
+               ORDER BY 1, 2"#
+        );
+        bind_query_filters(sqlx::query_as::<_, HistogramRow>(&sql), filters)
+            .bind(bucket_secs)
+            .fetch_all(&self.admin_pool)
+            .await
+            .map_err(|e| QueryFluxError::Persistence(format!("query_histogram: {e}")))
     }
 
     async fn get_dashboard_stats(&self) -> Result<DashboardStats> {
@@ -394,7 +497,7 @@ impl QueryHistoryStore for PostgresStore {
         })
     }
 
-    async fn get_engine_stats(&self, hours: i64) -> Result<Vec<EngineStatRow>> {
+    async fn get_engine_stats(&self, range: TimeRange) -> Result<Vec<EngineStatRow>> {
         sqlx::query_as::<_, EngineStatRow>(
             r#"SELECT
                 engine_type,
@@ -410,17 +513,18 @@ impl QueryHistoryStore for PostgresStore {
                 COUNT(*) FILTER (WHERE was_rewritten)::bigint                  AS rewritten_queries,
                 COALESCE(SUM(rows_returned), 0)::bigint                        AS total_rows_returned
                FROM query_records
-               WHERE created_at > NOW() - ($1 * INTERVAL '1 hour')
+               WHERE created_at >= $1 AND ($2::timestamptz IS NULL OR created_at < $2)
                GROUP BY engine_type
                ORDER BY total_queries DESC"#,
         )
-        .bind(hours)
+        .bind(range.from)
+        .bind(range.to)
         .fetch_all(&self.admin_pool)
         .await
         .map_err(|e| QueryFluxError::Persistence(format!("get_engine_stats: {e}")))
     }
 
-    async fn get_group_stats(&self, hours: i64) -> Result<Vec<GroupStatRow>> {
+    async fn get_group_stats(&self, range: TimeRange) -> Result<Vec<GroupStatRow>> {
         // Group by stable id when present so renamed groups don't split into two buckets (denormalized
         // `cluster_group` text vs joined current name). Legacy rows without `cluster_group_id` still
         // group by stored name only.
@@ -441,7 +545,7 @@ impl QueryHistoryStore for PostgresStore {
                 COALESCE(SUM(qr.rows_returned), 0)::bigint                         AS total_rows_returned
                FROM query_records qr
                LEFT JOIN cluster_group_configs cg ON cg.id = qr.cluster_group_id
-               WHERE qr.created_at > NOW() - ($1 * INTERVAL '1 hour')
+               WHERE qr.created_at >= $1 AND ($2::timestamptz IS NULL OR qr.created_at < $2)
                GROUP BY
                    CASE
                        WHEN qr.cluster_group_id IS NOT NULL
@@ -450,7 +554,8 @@ impl QueryHistoryStore for PostgresStore {
                    END
                ORDER BY total_queries DESC"#,
         )
-        .bind(hours)
+        .bind(range.from)
+        .bind(range.to)
         .fetch_all(&self.admin_pool)
         .await
         .map_err(|e| QueryFluxError::Persistence(format!("get_group_stats: {e}")))
@@ -1766,12 +1871,32 @@ impl Persistence for PostgresStore {
         }
     }
 
-    async fn delete(&self, id: &BackendQueryId) -> Result<()> {
-        sqlx::query("DELETE FROM executing_queries WHERE id = $1")
+    async fn delete(&self, id: &BackendQueryId) -> Result<bool> {
+        let result = sqlx::query("DELETE FROM executing_queries WHERE id = $1")
             .bind(&id.0)
             .execute(&self.query_pool)
             .await
             .map_err(|e| QueryFluxError::Persistence(format!("Delete executing_queries: {e}")))?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    async fn touch_executing_last_accessed(
+        &self,
+        id: &BackendQueryId,
+        at: DateTime<Utc>,
+    ) -> Result<()> {
+        // Same JSON encoding `upsert` writes for the field.
+        let at = serde_json::to_value(at)
+            .map_err(|e| QueryFluxError::Persistence(format!("Serialize error: {e}")))?;
+        sqlx::query(
+            "UPDATE executing_queries SET data = jsonb_set(data, '{last_accessed}', $2)
+             WHERE id = $1",
+        )
+        .bind(&id.0)
+        .bind(at)
+        .execute(&self.query_pool)
+        .await
+        .map_err(|e| QueryFluxError::Persistence(format!("touch_executing_last_accessed: {e}")))?;
         Ok(())
     }
 
@@ -1996,6 +2121,18 @@ impl ConfigRevisionStore for PostgresStore {
         Ok(row.0 as u64)
     }
 
+    async fn bump_revision_if(&self, expected: u64) -> Result<Option<u64>> {
+        let row: Option<(i64,)> = sqlx::query_as(
+            "UPDATE config_revision SET revision = revision + 1, updated_at = now()
+             WHERE id = TRUE AND revision = $1 RETURNING revision",
+        )
+        .bind(expected as i64)
+        .fetch_optional(&self.admin_pool)
+        .await
+        .map_err(|e| QueryFluxError::Persistence(format!("bump_revision_if: {e}")))?;
+        Ok(row.map(|(r,)| r as u64))
+    }
+
     async fn subscribe_revisions(&self) -> Result<Option<tokio::sync::mpsc::Receiver<u64>>> {
         let database_url = self.database_url.clone();
         let (tx, rx) = tokio::sync::mpsc::channel::<u64>(16);
@@ -2015,7 +2152,7 @@ impl ConfigRevisionStore for PostgresStore {
                     }
                 };
 
-                if let Err(e) = listener.listen("config_revision_changed").await {
+                if let Err(e) = listen_scoped(&mut listener, "config_revision_changed").await {
                     tracing::warn!("PgListener LISTEN failed, retrying in {backoff:?}: {e}");
                     tokio::time::sleep(backoff).await;
                     backoff = (backoff * 2).min(MAX_BACKOFF);
@@ -2140,13 +2277,18 @@ impl PostgresStore {
     /// their query a slot. One extra connection, opened the first time a query waits.
     async fn ensure_grant_listener(&self) {
         let url = self.database_url.clone();
-        let waiters = self.grant_waiters.clone();
+        // Weak so this task does not keep grant_waiters (and thus the store) alive after
+        // the owning PostgresStore is dropped — e.g. a tenant that stops.
+        let waiters = Arc::downgrade(&self.grant_waiters);
         self.grant_listener
             .get_or_init(|| async move {
                 tokio::spawn(async move {
                     const MAX_BACKOFF: std::time::Duration = std::time::Duration::from_secs(30);
                     let mut backoff = std::time::Duration::from_secs(1);
                     loop {
+                        if waiters.strong_count() == 0 {
+                            return;
+                        }
                         let mut listener = match sqlx::postgres::PgListener::connect(&url).await {
                             Ok(l) => l,
                             Err(e) => {
@@ -2156,7 +2298,9 @@ impl PostgresStore {
                                 continue;
                             }
                         };
-                        if let Err(e) = listener.listen("queryflux_capacity_granted").await {
+                        if let Err(e) =
+                            listen_scoped(&mut listener, "queryflux_capacity_granted").await
+                        {
                             tracing::warn!("Capacity grant LISTEN failed: {e}");
                             tokio::time::sleep(backoff).await;
                             backoff = (backoff * 2).min(MAX_BACKOFF);
@@ -2165,7 +2309,25 @@ impl PostgresStore {
                         backoff = std::time::Duration::from_secs(1);
                         // A notification missed while reconnecting only delays its waiter
                         // until its timeout, when it retries the acquire and claims the slot.
-                        while let Ok(n) = listener.recv().await {
+                        // Keep each recv future pinned across cleanup ticks: sqlx may
+                        // reconnect inside it, and cancelling that every second would miss
+                        // handovers. Exit when the store is gone (Weak hits zero).
+                        loop {
+                            let result = {
+                                let mut recv = std::pin::pin!(listener.recv());
+                                loop {
+                                    tokio::select! {
+                                        result = &mut recv => break result,
+                                        _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {
+                                            if waiters.strong_count() == 0 {
+                                                return;
+                                            }
+                                        }
+                                    }
+                                }
+                            };
+                            let Ok(n) = result else { break };
+                            let Some(waiters) = waiters.upgrade() else { return };
                             for id in n.payload().split(' ') {
                                 if let Some(w) = waiters.get(id) {
                                     w.notify_one();
@@ -2237,7 +2399,7 @@ impl crate::quota::QuotaAllocator for PostgresStore {
         }
 
         sqlx::query(
-            "SELECT pg_advisory_xact_lock(hashtext('capacity:' || c)::bigint) FROM UNNEST($1::text[]) AS c ORDER BY c",
+            "SELECT pg_advisory_xact_lock(queryflux_lock_key('capacity:' || c)) FROM UNNEST($1::text[]) AS c ORDER BY c",
         )
         .bind(&clusters)
         .execute(&mut *tx)
@@ -2489,8 +2651,14 @@ impl CapacityStore for PostgresStore {
     }
 
     async fn heartbeat(&self, instance_id: &str) -> Result<u64> {
+        // Also renews the leases of queries still recorded as executing, whichever replica
+        // took them: a Trino HTTP query outlives the replica that submitted it (any replica
+        // serves its polls), and its lease must stay until a poll, cancel or the zombie sweep
+        // ends it.
         let result = sqlx::query(
-            "UPDATE cluster_capacity_leases SET heartbeat_at = now() WHERE instance_id = $1",
+            "UPDATE cluster_capacity_leases SET heartbeat_at = now()
+             WHERE instance_id = $1
+                OR query_id IN (SELECT data->>'id' FROM executing_queries)",
         )
         .bind(instance_id)
         .execute(&self.coordination_pool)
@@ -2585,11 +2753,17 @@ impl CapacityStore for PostgresStore {
     }
 
     async fn release_all_for_instance(&self, instance_id: &str) -> Result<u64> {
-        let result = sqlx::query("DELETE FROM cluster_capacity_leases WHERE instance_id = $1")
-            .bind(instance_id)
-            .execute(&self.coordination_pool)
-            .await
-            .map_err(|e| QueryFluxError::Persistence(format!("release_all_for_instance: {e}")))?;
+        // Keep the leases of queries still recorded as executing: they keep running on the
+        // engine after this replica goes, and are ended (and released) through another one.
+        let result = sqlx::query(
+            "DELETE FROM cluster_capacity_leases
+             WHERE instance_id = $1
+               AND query_id NOT IN (SELECT data->>'id' FROM executing_queries)",
+        )
+        .bind(instance_id)
+        .execute(&self.coordination_pool)
+        .await
+        .map_err(|e| QueryFluxError::Persistence(format!("release_all_for_instance: {e}")))?;
         Ok(result.rows_affected())
     }
 }
@@ -3199,6 +3373,194 @@ mod tests {
         let far_future = chrono::Utc::now() + chrono::Duration::hours(1);
         store.expire_stale(far_future).await.unwrap();
         assert_eq!(store.active_lease_count(&cluster).await.unwrap(), 0);
+    }
+
+    async fn schema_store(schema: &str) -> PostgresStore {
+        let url = std::env::var("DATABASE_URL").unwrap();
+        let conn = queryflux_core::config::PostgresPersistenceConfig {
+            url: Some(url),
+            schema: Some(schema.to_string()),
+            ..Default::default()
+        };
+        let store = PostgresStore::connect_from_config(&conn.connection_url().unwrap(), &conn)
+            .await
+            .unwrap();
+        store.migrate().await.unwrap();
+        store.verify_schema().await.unwrap();
+        store
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DATABASE_URL"]
+    async fn pg_a_revision_is_claimed_once() {
+        let store = schema_store("qf_revision_claim_test").await;
+        let now = store.current_revision().await.unwrap();
+        assert_eq!(store.bump_revision_if(now).await.unwrap(), Some(now + 1));
+        assert_eq!(store.bump_revision_if(now).await.unwrap(), None);
+        assert_eq!(store.current_revision().await.unwrap(), now + 1);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DATABASE_URL"]
+    async fn pg_admin_tokens_and_audit() {
+        use crate::admin_access::{AdminAccessStore, AdminAuditEntry, AdminToken};
+        let store = schema_store("qf_admin_access_test").await;
+        sqlx::query("TRUNCATE admin_tokens, admin_audit")
+            .execute(&store.admin_pool)
+            .await
+            .unwrap();
+        let token = AdminToken {
+            id: "t1".into(),
+            name: "ci".into(),
+            token_hash: "h1".into(),
+            scopes: vec!["read".into()],
+            created_by: "basic:admin".into(),
+            created_at: chrono::Utc::now(),
+            last_used_at: None,
+            revoked_at: None,
+        };
+        store.create_admin_token(&token).await.unwrap();
+        let used = store.use_admin_token("h1").await.unwrap().unwrap();
+        assert_eq!(used.scopes, vec!["read".to_string()]);
+        assert!(used.last_used_at.is_some());
+        assert!(store.use_admin_token("nope").await.unwrap().is_none());
+        assert!(store.revoke_admin_token("t1").await.unwrap());
+        assert!(!store.revoke_admin_token("t1").await.unwrap());
+        assert!(store.use_admin_token("h1").await.unwrap().is_none());
+        assert!(store.list_admin_tokens().await.unwrap()[0]
+            .revoked_at
+            .is_some());
+
+        for path in ["/a", "/b", "/c"] {
+            let entry = AdminAuditEntry {
+                id: 0,
+                at: chrono::Utc::now(),
+                principal: "platform".into(),
+                actor: Some("user:alice".into()),
+                method: "PUT".into(),
+                path: path.into(),
+                status: 204,
+            };
+            store.record_admin_audit(&entry).await.unwrap();
+        }
+        let page = store.list_admin_audit(2, None).await.unwrap();
+        let paths: Vec<_> = page.iter().map(|e| e.path.as_str()).collect();
+        assert_eq!(paths, ["/c", "/b"]);
+        let rest = store.list_admin_audit(2, Some(page[1].id)).await.unwrap();
+        assert_eq!(rest.len(), 1);
+        assert_eq!(rest[0].path, "/a");
+        assert_eq!(rest[0].actor.as_deref(), Some("user:alice"));
+    }
+
+    /// Two deployments pinned to two schemas of one database: each migrates into its own
+    /// schema with its own ledger, and their locks and channels never collide with each
+    /// other or with `public`, which keeps its names.
+    #[tokio::test]
+    #[ignore]
+    async fn pg_pinned_schemas_share_a_database_without_interfering() {
+        let suffix = unique_id("").trim_start_matches('-').to_string();
+        let (a, b) = (format!("qf_a_{suffix}"), format!("qf_b_{suffix}"));
+        let (sa, sb) = (schema_store(&a).await, schema_store(&b).await);
+        let public = test_store().await;
+
+        let tables_in = |schema: String| {
+            let pool = public.admin_pool.clone();
+            async move {
+                sqlx::query_scalar::<_, i64>(
+                    "SELECT count(*) FROM information_schema.tables WHERE table_schema = $1 \
+                     AND table_name IN ('query_records', 'refinery_schema_history')",
+                )
+                .bind(schema)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+            }
+        };
+        assert_eq!(tables_in(a.clone()).await, 2);
+        assert_eq!(tables_in(b.clone()).await, 2);
+        // Migrating again is a no-op: the ledger is per schema.
+        sa.migrate().await.unwrap();
+
+        // Sweep locks: one holder per schema, and each schema's own holders still exclude
+        // each other.
+        let held_a = sa.try_sweep_lock("zombie-eviction").await.unwrap();
+        assert!(held_a.is_some());
+        let held_b = sb.try_sweep_lock("zombie-eviction").await.unwrap();
+        assert!(held_b.is_some(), "schema b must not wait on schema a");
+        assert!(sa
+            .try_sweep_lock("zombie-eviction")
+            .await
+            .unwrap()
+            .is_none());
+        drop((held_a, held_b));
+
+        // Channels and lock keys: plain in public, distinct per schema.
+        let channel = |pool: PgPool| async move {
+            sqlx::query_scalar::<_, String>("SELECT queryflux_channel('config_revision_changed')")
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+        };
+        let (ca, cb, cp) = (
+            channel(sa.admin_pool.clone()).await,
+            channel(sb.admin_pool.clone()).await,
+            channel(public.admin_pool.clone()).await,
+        );
+        assert_eq!(cp, "config_revision_changed");
+        assert_ne!(ca, cb);
+        assert!(ca.len() < 64 && cb.len() < 64);
+        let key = |pool: PgPool| async move {
+            sqlx::query_scalar::<_, i64>("SELECT queryflux_lock_key('capacity:trino')")
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+        };
+        let public_key: i64 = sqlx::query_scalar("SELECT hashtext('capacity:trino')::bigint")
+            .fetch_one(&public.admin_pool)
+            .await
+            .unwrap();
+        assert_eq!(key(public.admin_pool.clone()).await, public_key);
+        assert_ne!(
+            key(sa.admin_pool.clone()).await,
+            key(sb.admin_pool.clone()).await
+        );
+
+        // Capacity works inside a pinned schema.
+        let cluster = unique_id("pinned");
+        assert!(sa.try_acquire(&cluster, 1, "w1", "q1").await.unwrap());
+        assert!(!sa.try_acquire(&cluster, 1, "w1", "q2").await.unwrap());
+        assert!(
+            sb.try_acquire(&cluster, 1, "w1", "q1").await.unwrap(),
+            "separate tables"
+        );
+
+        for s in [&a, &b] {
+            sqlx::query(&format!("DROP SCHEMA {s} CASCADE"))
+                .execute(&public.admin_pool)
+                .await
+                .unwrap();
+        }
+    }
+
+    /// Without migrations, a pinned schema that doesn't exist is refused at startup rather
+    /// than silently resolving to another schema.
+    #[tokio::test]
+    #[ignore]
+    async fn pg_a_missing_pinned_schema_is_refused() {
+        let url = std::env::var("DATABASE_URL").unwrap();
+        let conn = queryflux_core::config::PostgresPersistenceConfig {
+            url: Some(url),
+            schema: Some(format!(
+                "qf_missing_{}",
+                unique_id("").trim_start_matches('-')
+            )),
+            ..Default::default()
+        };
+        let store = PostgresStore::connect_from_config(&conn.connection_url().unwrap(), &conn)
+            .await
+            .unwrap();
+        let err = store.verify_schema().await.unwrap_err().to_string();
+        assert!(err.contains("does not exist"), "{err}");
     }
 
     #[tokio::test]
@@ -4435,7 +4797,7 @@ mod tests {
 
         let rows = store
             .list_queries(&QueryFilters {
-                cluster_group: Some(group.clone()),
+                cluster_group: vec![group.clone()],
                 limit: 50,
                 ..Default::default()
             })
@@ -4542,5 +4904,206 @@ mod tests {
             .unwrap()
             .iter()
             .any(|k| k.site == site));
+    }
+
+    /// The SQL behind `GET /admin/queries` and its histogram applies the same rules as
+    /// `QueryFilters::matches`: time range, multi-value filters, hub prefixes, cluster
+    /// variants, the keyset cursor and epoch-aligned buckets.
+    #[tokio::test]
+    #[ignore]
+    async fn history_filters_by_time_and_values_and_pages_by_cursor() {
+        use crate::query_history::{HistogramBy, TimeRange};
+        use queryflux_core::query::{
+            ClusterGroupName, ClusterName, EngineType, FrontendProtocol, QueryStatus, SqlDialect,
+        };
+
+        let store = test_store().await;
+        // Other tests share the database: everything here is scoped to one group and site.
+        let group = unique_id("range-g");
+        let site = unique_id("site");
+        let t0 = DateTime::parse_from_rfc3339("2026-10-27T10:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let rows = [
+            (
+                0,
+                format!("{site}/w0"),
+                "alice",
+                QueryStatus::Success,
+                "trino::analytics",
+            ),
+            (
+                1,
+                format!("{site}/w1"),
+                "bob",
+                QueryStatus::Failed,
+                "trino::etl",
+            ),
+            (
+                1,
+                "eu-west-vpc/w2".to_string(),
+                "alice",
+                QueryStatus::Success,
+                "duckdb",
+            ),
+            (
+                2,
+                "gw-0".to_string(),
+                "carol",
+                QueryStatus::Cancelled,
+                "trino-other",
+            ),
+            (
+                3,
+                format!("{site}/w0"),
+                "bob",
+                QueryStatus::Success,
+                "trino::analytics",
+            ),
+        ];
+        let ids: Vec<String> = (0..rows.len())
+            .map(|i| unique_id(&format!("q{i}")))
+            .collect();
+        for (i, (min, worker, user, status, cluster)) in rows.into_iter().enumerate() {
+            store
+                .record_query(QueryRecord {
+                    proxy_query_id: ids[i].clone(),
+                    backend_query_id: None,
+                    cluster_group: ClusterGroupName(group.clone()),
+                    cluster_name: ClusterName(cluster.into()),
+                    cluster_group_config_id: None,
+                    cluster_config_id: None,
+                    engine_type: EngineType::Undispatched,
+                    frontend_protocol: FrontendProtocol::TrinoHttp,
+                    source_dialect: SqlDialect::Trino,
+                    target_dialect: SqlDialect::Generic,
+                    was_rewritten: false,
+                    rewritten_sql: None,
+                    was_translated: false,
+                    translation: None,
+                    translated_sql: None,
+                    user: Some(user.into()),
+                    catalog: None,
+                    database: None,
+                    sql_preview: format!("SELECT {i}"),
+                    status,
+                    routing_trace: None,
+                    queue_duration_ms: 0,
+                    execution_duration_ms: 1,
+                    rows_returned: None,
+                    error_message: None,
+                    created_at: t0 + chrono::Duration::minutes(min),
+                    engine_stats: None,
+                    query_tags: Default::default(),
+                    query_hash: None,
+                    query_parameterized_hash: None,
+                    fast_hash: None,
+                    translated_query_hash: None,
+                    digest_text: None,
+                    translated_digest_text: None,
+                    agent_id: None,
+                    conversation_id: None,
+                    step_index: None,
+                    tool_call_id: None,
+                    query_intent: None,
+                    guard_actions: vec![],
+                    was_guard_blocked: false,
+                    cache_hit: false,
+                    worker: Some(worker),
+                })
+                .await
+                .unwrap();
+        }
+        let base = QueryFilters {
+            cluster_group: vec![group.clone()],
+            limit: 50,
+            ..Default::default()
+        };
+        let list = |f: QueryFilters| {
+            let store = &store;
+            let ids = &ids;
+            async move {
+                store
+                    .list_queries(&f)
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .map(|r| ids.iter().position(|id| *id == r.proxy_query_id).unwrap())
+                    .collect::<Vec<_>>()
+            }
+        };
+
+        let range = QueryFilters {
+            from: Some(t0 + chrono::Duration::minutes(1)),
+            to: Some(t0 + chrono::Duration::minutes(3)),
+            ..base.clone()
+        };
+        assert_eq!(list(range).await, [3, 2, 1]);
+        let hub = QueryFilters {
+            worker: vec![format!("{site}/")],
+            ..base.clone()
+        };
+        assert_eq!(list(hub).await, [4, 1, 0]);
+        let status = QueryFilters {
+            status: vec!["failed".into(), "CANCELLED".into()],
+            ..base.clone()
+        };
+        assert_eq!(list(status).await, [3, 1]);
+        let cluster = QueryFilters {
+            cluster: vec!["trino".into()],
+            user: vec!["bob".into()],
+            ..base.clone()
+        };
+        assert_eq!(
+            list(cluster).await,
+            [4, 1],
+            "trino-other is not a variant of trino"
+        );
+
+        let mut seen = vec![];
+        let mut page = QueryFilters {
+            limit: 2,
+            ..base.clone()
+        };
+        loop {
+            let rows = store.list_queries(&page).await.unwrap();
+            let Some(last) = rows.last() else { break };
+            page.before = Some(last.created_at);
+            page.before_id = Some(last.id);
+            seen.extend(
+                rows.iter()
+                    .map(|r| ids.iter().position(|id| *id == r.proxy_query_id).unwrap()),
+            );
+        }
+        assert_eq!(seen, [4, 3, 2, 1, 0]);
+
+        let hist: Vec<_> = store
+            .query_histogram(&base, 60, HistogramBy::Status)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| ((r.bucket - t0).num_minutes(), r.key, r.count))
+            .collect();
+        assert_eq!(
+            hist,
+            [
+                (0, "Success".to_string(), 1),
+                (1, "Failed".to_string(), 1),
+                (1, "Success".to_string(), 1),
+                (2, "Cancelled".to_string(), 1),
+                (3, "Success".to_string(), 1),
+            ]
+        );
+
+        // Stats over [10:01, 10:03) see only those three rows of the group.
+        let stats = store
+            .get_group_stats(TimeRange {
+                from: t0 + chrono::Duration::minutes(1),
+                to: Some(t0 + chrono::Duration::minutes(3)),
+            })
+            .await
+            .unwrap();
+        let mine = stats.iter().find(|s| s.cluster_group == group).unwrap();
+        assert_eq!(mine.total_queries, 3);
     }
 }
