@@ -217,8 +217,13 @@ jobs:
             echo $? > "$0/pull.exit"
           ' "$prep" > "$prep/pull.log" 2>&1 &
 
+      # From mold's GitHub release, not apt: the job then doesn't fail when the runner can't reach
+      # the Ubuntu mirrors. RUSTFLAGS selects it (-fuse-ld=mold), so the system ld stays as is.
       - name: Install mold linker
-        run: sudo apt-get update && sudo apt-get install -y mold
+        uses: rui314/setup-mold@339e96b4ff1f3bd865856ba4cbbe8818a7acb038 # v1
+        with:
+          mold-version: 2.40.4
+          make-default: false
 
       - name: Install libduckdb
         run: bash scripts/install-libduckdb.sh
