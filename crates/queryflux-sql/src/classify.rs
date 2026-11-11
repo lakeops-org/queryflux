@@ -182,22 +182,15 @@ impl SqlParseCache {
     /// Whether the statement should use a result-set execution path (`execute`) vs
     /// an update path (`execute_update`).
     ///
-    /// Deliberately stricter than [`is_read_stmt`]: `Expression::Command` (`BEGIN`,
-    /// `COMMIT`, `ROLLBACK`, and any future catch-all the parser recognizes but
-    /// doesn't model precisely) is treated as "read" by `is_read_stmt` so guardrails
-    /// don't block it, but that's a permissive default for a different question
-    /// ("is this safe to allow?"). Here we're deciding which ADBC API to call, and a
+    /// Same classification as [`is_read_stmt`] (opaque `Command` statements are
+    /// not reads, #403), kept as a separate method because the question differs
+    /// ("which ADBC API to call") and the unparseable-SQL fallback applies here. A
     /// `Command` produces no result set — routing it through `execute()` risks the
     /// same empty-stream misframing this cache exists to avoid (#97). Route it
     /// through `execute_update()` like DDL/DML instead.
     pub fn is_read_like(&self) -> bool {
         match self.statements() {
-            Some(stmts) => {
-                !stmts.is_empty()
-                    && stmts
-                        .iter()
-                        .all(|s| is_read_stmt(s) && !matches!(s, Expression::Command(_)))
-            }
+            Some(stmts) => !stmts.is_empty() && stmts.iter().all(is_read_stmt),
             None => is_read_like_fallback(&self.sql),
         }
     }
@@ -275,6 +268,15 @@ pub fn to_polyglot_dialect(dialect: &SqlDialect) -> DialectType {
 }
 
 /// Returns true when an AST node represents a read-like statement.
+///
+/// `Expression::Command` is the parser's catch-all for statements it leaves
+/// opaque (`CALL ...`, procedural `BEGIN ...` blocks, `LOCK TABLES`, ...) and an
+/// opaque statement can carry writes — on Trino, `CALL` runs connector procedures
+/// like `system.rollback_to_snapshot` that mutate data. read_only must fail
+/// closed, so a `Command` is not classified as a read (#403). Statements the
+/// parser models precisely keep their classification — `EXPLAIN` parses as
+/// `Describe` — and explicit transaction control (`BEGIN`/`COMMIT`/`ROLLBACK`)
+/// parses into its own precisely-modeled variants, none of which are reads.
 pub fn is_read_stmt(expr: &Expression) -> bool {
     matches!(
         expr,
@@ -285,7 +287,6 @@ pub fn is_read_stmt(expr: &Expression) -> bool {
             | Expression::Subquery(_)
             | Expression::Describe(_)
             | Expression::Show(_)
-            | Expression::Command(_)
     )
 }
 
@@ -471,13 +472,13 @@ mod tests {
         }
     }
 
-    /// `Command` (e.g. bare `END` in a non-Postgres dialect) is "read" for
-    /// `is_read_stmt` (guardrails' permissive default) but must NOT be read-like
-    /// for ADBC routing — it produces no result set, so it belongs on the
-    /// execute_update path like DDL/DML.
+    /// `Command` is the parser's opaque catch-all (`CALL`, bare `END`, procedural
+    /// `BEGIN` blocks, ...) and opaque statements can carry writes — read_only
+    /// must fail closed (#403), so it is not a read. It still produces no result
+    /// set for ADBC routing (#97), so it is not read-like either.
     #[test]
-    fn command_statements_are_read_for_guardrails_but_not_for_execution_routing() {
-        let sql = "END";
+    fn command_statements_are_not_reads() {
+        let sql = "CALL pragma_version()";
         let cache = SqlParseCache::new(sql, SqlDialect::Generic);
         let stmts = cache
             .statements()
@@ -489,13 +490,37 @@ mod tests {
             stmts[0]
         );
         assert!(
-            is_read_stmt(&stmts[0]),
-            "is_read_stmt should still treat Command as read (guardrails default): {sql}"
+            !is_read_stmt(&stmts[0]),
+            "is_read_stmt must fail closed for opaque Command statements: {sql}"
         );
         assert!(
             !cache.is_read_like(),
             "is_read_like must route Command through execute_update, not execute: {sql}"
         );
+        let bare_end = SqlParseCache::new("END", SqlDialect::Generic);
+        assert!(!bare_end.is_read_like(), "END is not read-like");
+    }
+
+    /// `BEGIN`/`COMMIT`/`ROLLBACK` parse into their own precisely-modeled
+    /// variants (`Transaction`, `Commit`, ...), not the opaque `Command`
+    /// catch-all — they were not reads before the #403 fail-closed change and
+    /// must stay so; this pins the AST shape the Command reclassification
+    /// relies on without coupling to one parser's exact variant names.
+    #[test]
+    fn transaction_statements_remain_non_reads() {
+        for sql in ["BEGIN", "COMMIT", "ROLLBACK"] {
+            let cache = SqlParseCache::new(sql, SqlDialect::Generic);
+            let stmts = cache
+                .statements()
+                .unwrap_or_else(|| panic!("expected polyglot_sql to parse {sql:?}"));
+            assert_eq!(stmts.len(), 1, "{sql}");
+            assert!(
+                !matches!(stmts[0], Expression::Command(_)),
+                "{sql:?} must not parse as the opaque Command catch-all, got: {:?}",
+                stmts[0]
+            );
+            assert!(!is_read_stmt(&stmts[0]), "{sql} is not a read");
+        }
     }
 
     #[test]

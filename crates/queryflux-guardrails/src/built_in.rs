@@ -443,6 +443,27 @@ mod tests {
         assert!(r.is_deny());
     }
 
+    /// #403: `CALL` parses as the parser's opaque `Command` catch-all and can
+    /// carry writes (Trino connector procedures like
+    /// `system.rollback_to_snapshot`) — read_only must fail closed.
+    #[tokio::test]
+    async fn read_only_blocks_call() {
+        let sql = "CALL pragma_version()";
+        let tc = TestCtx::new(sql);
+        let r = ReadOnlyGuard.check(&tc.ctx()).await;
+        assert!(r.is_deny());
+    }
+
+    /// One opaque `Command` in a batch denies the whole batch, like any other
+    /// non-read statement (#403).
+    #[tokio::test]
+    async fn read_only_blocks_batch_mixing_select_and_call() {
+        let sql = "SELECT 1; CALL pragma_version()";
+        let tc = TestCtx::new(sql);
+        let r = ReadOnlyGuard.check(&tc.ctx()).await;
+        assert!(r.is_deny());
+    }
+
     #[tokio::test]
     async fn read_only_blocks_second_statement_insert() {
         let sql = "SELECT 1; INSERT INTO t VALUES (42)";
