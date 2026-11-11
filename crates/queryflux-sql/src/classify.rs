@@ -5,7 +5,7 @@
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::OnceLock;
 
-use polyglot_sql::expressions::Expression;
+use polyglot_sql::expressions::{Expression, With};
 use polyglot_sql::DialectType;
 
 use queryflux_core::query::SqlDialect;
@@ -277,17 +277,36 @@ pub fn to_polyglot_dialect(dialect: &SqlDialect) -> DialectType {
 /// parser models precisely keep their classification — `EXPLAIN` parses as
 /// `Describe` — and explicit transaction control (`BEGIN`/`COMMIT`/`ROLLBACK`)
 /// parses into its own precisely-modeled variants, none of which are reads.
+///
+/// A read-shaped statement can still hide a write in its `WITH` clause:
+/// PostgreSQL executes data-modifying CTEs even when the top-level statement
+/// is a SELECT (`WITH del AS (DELETE FROM orders RETURNING *) SELECT * FROM
+/// del`), so every CTE body (and nested set-operation arm) must classify as a
+/// read before the statement counts as one.
 pub fn is_read_stmt(expr: &Expression) -> bool {
-    matches!(
-        expr,
-        Expression::Select(_)
-            | Expression::Union(_)
-            | Expression::Intersect(_)
-            | Expression::Except(_)
-            | Expression::Subquery(_)
-            | Expression::Describe(_)
-            | Expression::Show(_)
-    )
+    match expr {
+        Expression::Select(select) => with_is_read(select.with.as_ref()),
+        Expression::Union(u) => {
+            with_is_read(u.with.as_ref()) && is_read_stmt(&u.left) && is_read_stmt(&u.right)
+        }
+        Expression::Intersect(i) => {
+            with_is_read(i.with.as_ref()) && is_read_stmt(&i.left) && is_read_stmt(&i.right)
+        }
+        Expression::Except(e) => {
+            with_is_read(e.with.as_ref()) && is_read_stmt(&e.left) && is_read_stmt(&e.right)
+        }
+        Expression::Subquery(inner) => is_read_stmt(&inner.this),
+        Expression::Describe(_) | Expression::Show(_) => true,
+        _ => false,
+    }
+}
+
+/// All CTE bodies must classify as reads for the surrounding statement to be
+/// one. A CTE body can itself be a read-shaped statement with its own `WITH`
+/// clause, so the classification recurses through [`is_read_stmt`].
+fn with_is_read(with: Option<&With>) -> bool {
+    with.map(|w| w.ctes.iter().all(|cte| is_read_stmt(&cte.this)))
+        .unwrap_or(true)
 }
 
 /// Classify SQL without retaining a parse cache. Prefer [`SqlParseCache`] on hot paths.
@@ -453,6 +472,31 @@ mod tests {
         assert!(is_read_like_sql("SHOW TABLES", &SqlDialect::Generic));
         assert!(is_read_like_sql("DESCRIBE my_table", &SqlDialect::Generic));
         assert!(is_read_like_sql("EXPLAIN SELECT 1", &SqlDialect::Generic));
+    }
+
+    /// A data-modifying CTE under a read-shaped top level still executes its
+    /// write (PostgreSQL runs `WITH del AS (DELETE ... RETURNING *) SELECT ...`
+    /// as a write), so the guard must look into `WITH` bodies — and the arms of
+    /// set operations and subqueries — before calling a statement a read.
+    #[test]
+    fn data_modifying_ctes_are_not_reads() {
+        for sql in [
+            "WITH del AS (DELETE FROM orders RETURNING *) SELECT * FROM del",
+            "WITH up AS (UPDATE orders SET total = 0 RETURNING *) SELECT * FROM up",
+            "WITH ins AS (INSERT INTO audit VALUES (1) RETURNING *) SELECT * FROM ins",
+            "WITH outer_cte AS (WITH inner_cte AS (DELETE FROM orders RETURNING *) SELECT * FROM inner_cte) SELECT * FROM outer_cte",
+            "WITH del AS (DELETE FROM orders RETURNING *) SELECT 1 UNION SELECT 2",
+        ] {
+            assert!(
+                !is_read_like_sql(sql, &SqlDialect::Generic),
+                "expected non-read for: {sql}"
+            );
+        }
+        // Plain reads through a CTE must stay reads.
+        assert!(is_read_like_sql(
+            "WITH recent AS (SELECT * FROM orders) SELECT * FROM recent",
+            &SqlDialect::Generic
+        ));
     }
 
     #[test]
