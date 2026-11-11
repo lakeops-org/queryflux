@@ -26,7 +26,7 @@ One QueryFlux server sits between your clients and your engines. Everything arou
 | **QueryFlux server** | Accepts client protocols, routes each query to a cluster group, enforces concurrency limits, translates SQL, and dispatches to an engine. One Rust binary. | Yes | [Binary](./binary.md) · [Docker](./docker.md) · [Helm](./kubernetes.md) |
 | **Python + sqlglot** | Dialect translation and `pythonScript` routers. | For translation | Bundled in the Docker image; `queryflux --install-deps` for the binary |
 | **Admin API** | Health, readiness, `/metrics`, and the API behind Studio. Runs inside the server on port `9000`. | Yes | — |
-| **QueryFlux Studio** | Web UI for clusters, routing, query history, and access control. | No | Included in the default image; omitted in `-slim` |
+| **QueryFlux Studio** | Web UI for clusters, routing, query history, and access control. | No | Separate image (`queryflux-studio`); Compose service or Helm sidecar |
 | **Postgres** | Persistence for config, query history, the shared queue, and capacity limits. Required for more than one replica. | Production | Any Postgres; see [Multi-replica operations](../operations/multi-replica.md) |
 | **Query engines** | Where queries actually run. | Yes | Trino, StarRocks, DuckDB (embedded), Athena, ClickHouse, MySQL, ADBC ([Snowflake, Databricks, BigQuery, Redshift](../operations/adbc-drivers.md)) |
 | **Identity provider** | Authenticates clients. | No | Static users, OIDC, LDAP — see [Authentication](../authentication.md) |
@@ -37,14 +37,14 @@ One QueryFlux server sits between your clients and your engines. Everything arou
 
 <DocCards>
   <DocCard title="Local (binary)" to="/docs/installation/binary">Build with Cargo and run natively on a laptop, VM, or bare-metal host.</DocCard>
-  <DocCard title="Docker" to="/docs/installation/docker">Run the <code>ghcr.io/lakeops-org/queryflux</code> image, with or without Studio, standalone or in Compose.</DocCard>
+  <DocCard title="Docker" to="/docs/installation/docker">Run the <code>ghcr.io/lakeops-org/queryflux</code> server image, optionally with Studio beside it, standalone or in Compose.</DocCard>
   <DocCard title="Kubernetes (Helm)" to="/docs/installation/kubernetes">The <code>charts/queryflux</code> chart — starter install through a production-ready release.</DocCard>
 </DocCards>
 
 | | Local (binary) | Docker | Kubernetes (Helm) |
 | --- | --- | --- | --- |
 | Best for | Development, single VM | Single host, Compose stacks | Production |
-| Studio | Run separately | Default image | Default image |
+| Studio | Run separately | Separate `queryflux-studio` service | Helm `studio` sidecar |
 | Replicas | One | One per container (Postgres for more) | Many, with Postgres |
 | Autoscaling / PDB / ingress | — | — | Built into the chart |
 
@@ -58,7 +58,7 @@ Every install method uses the same default ports. Only the frontends you enable 
 | `5432` | PostgreSQL wire frontend | `psql`, Postgres drivers |
 | `3306` | MySQL wire frontend | `mysql`, BI tools |
 | `9000` | Admin API | `/health`, `/readyz`, `/metrics`, Studio backend |
-| `3000` | QueryFlux Studio | Default image only, not `-slim` |
+| `3000` | QueryFlux Studio | Separate `queryflux-studio` image / Helm sidecar |
 
 Snowflake HTTP, Arrow Flight SQL, and MCP ports are set per frontend; see the **[YAML reference](../configuration.md)**.
 

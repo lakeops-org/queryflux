@@ -2,20 +2,20 @@
 sidebar_position: 3
 sidebar_label: Docker
 title: Run QueryFlux with Docker
-description: Run the QueryFlux container image — Studio-included or server-only -slim — with your config.yaml, ports, Postgres persistence, and Docker Compose.
+description: Run the QueryFlux server image with your config.yaml, ports, Postgres persistence, and Docker Compose — Studio is a separate image.
 image: img/queryflux-hero-banner.png
 ---
 
 # Docker
 
-QueryFlux publishes one image to GitHub Container Registry in two flavours:
+QueryFlux publishes the server image to GitHub Container Registry:
 
 | Image | Contains | Ports |
 | --- | --- | --- |
-| `ghcr.io/lakeops-org/queryflux:<version>` | Server **and** QueryFlux Studio | `8080`, `9000`, `3000` |
-| `ghcr.io/lakeops-org/queryflux:<version>-slim` | Server only | `8080`, `9000` |
+| `ghcr.io/lakeops-org/queryflux:<version>` | Server | `8080`, `9000` (plus any frontends you enable) |
+| `ghcr.io/lakeops-org/queryflux-studio:<version>` | QueryFlux Studio (optional) | `3000` |
 
-`latest` and `latest-slim` follow the newest release. Pin a version tag (for example `v0.4.0`) for anything long-lived.
+`latest` follows the newest release. Pin a version tag for anything long-lived. Studio is built in its own repo and run next to the server (Compose service or Helm sidecar).
 
 ## Run a container
 
@@ -30,7 +30,7 @@ The image reads its config from `/etc/queryflux/config.yaml`. Mount yours there:
 
 ```bash
 docker run -d --name queryflux --network queryflux \
-  -p 8080:8080 -p 9000:9000 -p 3000:3000 \
+  -p 8080:8080 -p 9000:9000 \
   -v "$PWD/config.yaml:/etc/queryflux/config.yaml:ro" \
   -e QUERYFLUX_ADMIN_USER=admin \
   -e QUERYFLUX_ADMIN_PASSWORD='<strong-password>' \
@@ -78,7 +78,7 @@ curl -s http://localhost:9000/health
 curl -X POST http://localhost:8080/v1/statement -H "X-Trino-User: dev" -d "SELECT 42"
 ```
 
-Studio is at http://localhost:3000 when you run the non-slim image.
+To run Studio beside the server, start `ghcr.io/lakeops-org/queryflux-studio` with `ADMIN_API_URL` pointing at the admin port (see the Compose examples under [`examples/`](https://github.com/lakeops-org/queryflux/tree/main/examples)).
 
 ## Environment variables
 
@@ -117,7 +117,6 @@ services:
     ports:
       - "8080:8080"
       - "9000:9000"
-      - "3000:3000"
     volumes:
       - ./config.yaml:/etc/queryflux/config.yaml:ro
     environment:
@@ -125,6 +124,16 @@ services:
       QUERYFLUX_ADMIN_USER: admin
       # Required: compose refuses to start until you export a password
       QUERYFLUX_ADMIN_PASSWORD: ${QUERYFLUX_ADMIN_PASSWORD:?set QUERYFLUX_ADMIN_PASSWORD}
+    restart: unless-stopped
+
+  queryflux-studio:
+    image: ghcr.io/lakeops-org/queryflux-studio:latest
+    ports:
+      - "3000:3000"
+    environment:
+      ADMIN_API_URL: http://queryflux:9000
+    depends_on:
+      - queryflux
     restart: unless-stopped
 ```
 
