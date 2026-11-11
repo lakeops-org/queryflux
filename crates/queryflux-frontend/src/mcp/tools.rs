@@ -358,16 +358,37 @@ async fn run_query(
 /// already run arbitrary SQL via `execute_query`, so this isn't a privilege boundary,
 /// just correctness. QueryFlux's translation layer (sqlglot) re-quotes per target engine
 /// dialect (backticks for MySQL-family, etc.), so ANSI double-quoting on the way in is
-/// the right canonical form regardless of the final backend.
+/// the right canonical form regardless of the final backend. That only happens when the
+/// session declares a source dialect, see [`describe_session_for`].
 fn quote_ident(ident: &str) -> String {
     format!("\"{}\"", ident.replace('"', "\"\""))
 }
 
+/// Without `schema`, a dotted `table` (`db.tbl`, `catalog.db.tbl`) is split and each part
+/// quoted, as the `table` parameter docs allow. Quoting it whole would make it one
+/// identifier with a dot in its name.
 fn qualify_table(schema: Option<&str>, table: &str) -> String {
     match schema {
         Some(s) if !s.is_empty() => format!("{}.{}", quote_ident(s), quote_ident(table)),
-        _ => quote_ident(table),
+        _ => table
+            .split('.')
+            .map(quote_ident)
+            .collect::<Vec<_>>()
+            .join("."),
     }
+}
+
+/// `describe_table` writes its own SQL with ANSI-quoted identifiers, so unlike
+/// `execute_query` it knows the source dialect. Declaring it lets translation re-quote
+/// for the target engine; Athena's DDL parser, for one, rejects double quotes. Postgres
+/// rather than Trino: schema-aware optimization lowercases quoted identifiers under a
+/// case-insensitive dialect, which breaks case-sensitive targets such as Snowflake.
+fn describe_session_for(auth: &AuthContext, agent_context: AgentContext) -> SessionContext {
+    let mut session = session_for(auth, agent_context);
+    session
+        .extra
+        .insert("dialect".to_string(), "postgres".to_string());
+    session
 }
 
 // ---------------------------------------------------------------------------
@@ -499,7 +520,7 @@ impl QueryFluxMcpServer {
         let conversation_id = agent_context.conversation_id.clone();
         let qualified = qualify_table(schema.as_deref(), &table);
 
-        let describe_session = session_for(&auth, agent_context.clone());
+        let describe_session = describe_session_for(&auth, agent_context.clone());
         let describe_sql = format!("DESCRIBE {qualified}");
         let group = resolve_group(
             &live,
@@ -535,7 +556,7 @@ impl QueryFluxMcpServer {
 
         let sample_rows = sample_rows.unwrap_or(0);
         let sample = if sample_rows > 0 {
-            let sample_session = session_for(&auth, agent_context);
+            let sample_session = describe_session_for(&auth, agent_context);
             let sample_sql = format!("SELECT * FROM {qualified} LIMIT {sample_rows}");
             let mut sample_sink = JsonResultSink::new(sample_rows);
             let sample_start = Instant::now();
@@ -811,5 +832,31 @@ mod resolve_dialect_override_tests {
         let msg = format!("{err:?}");
         assert!(msg.contains("not-a-real-dialect"));
         assert!(msg.contains("trino"));
+    }
+}
+
+#[cfg(test)]
+mod qualify_table_tests {
+    use super::qualify_table;
+
+    #[test]
+    fn schema_and_table_are_quoted_separately() {
+        assert_eq!(qualify_table(Some("db"), "tbl"), r#""db"."tbl""#);
+    }
+
+    #[test]
+    fn dotted_table_without_schema_is_split() {
+        assert_eq!(qualify_table(None, "db.tbl"), r#""db"."tbl""#);
+        assert_eq!(qualify_table(Some(""), "cat.db.tbl"), r#""cat"."db"."tbl""#);
+    }
+
+    #[test]
+    fn bare_table_is_quoted() {
+        assert_eq!(qualify_table(None, "tbl"), r#""tbl""#);
+    }
+
+    #[test]
+    fn embedded_quotes_are_escaped() {
+        assert_eq!(qualify_table(Some("db"), r#"a"b"#), r#""db"."a""b""#);
     }
 }
