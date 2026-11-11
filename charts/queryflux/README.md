@@ -9,6 +9,12 @@ helm install queryflux ./charts/queryflux
 kubectl port-forward svc/queryflux 3000:3000 8080:8080 9000:9000
 ```
 
+Each QueryFlux release from 0.5.0 on publishes the chart to GHCR. Its version is the release, and it installs that release's server image (`ghcr.io/lakeops-org/queryflux:v<version>`), so you never set the image yourself. Without `--version` you get the latest release; pass `--version <release>` to pin one:
+
+```bash
+helm install queryflux oci://ghcr.io/lakeops-org/charts/queryflux
+```
+
 With `studio.enabled=false` the Service has no port 3000, so forward only the server ports:
 
 ```bash

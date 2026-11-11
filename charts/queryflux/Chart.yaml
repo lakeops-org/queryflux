@@ -2,11 +2,12 @@ apiVersion: v2
 name: queryflux
 description: Universal SQL multi-engine query router and proxy.
 type: application
-version: 0.3.0
-# Default server image tag (image.tag overrides it). Studio runs as a separate sidecar
-# (studio.enabled). Tags up to v0.4.0 bundled Studio in the same image — pin a later tag
-# or :latest for server-only.
-appVersion: "latest"
+# Both follow the QueryFlux release (Release Please bumps them with Cargo.toml), so a chart
+# version installs the server image of the same release: ghcr.io/lakeops-org/queryflux:v<appVersion>.
+# Charts are published from 0.5.0. Bare tags up to v0.4.0 also start Studio, so a local chart at
+# 0.4.0 defaults to v0.4.0-slim instead (templates/_helpers.tpl).
+version: 0.4.0
+appVersion: "0.4.0"
 home: https://queryflux.dev/
 sources:
   - https://github.com/lakeops-org/queryflux

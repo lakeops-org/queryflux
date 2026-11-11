@@ -24,6 +24,16 @@
           "type": "toml",
           "path": "Cargo.toml",
           "jsonpath": "$.workspace.package.version"
+        },
+        {
+          "type": "yaml",
+          "path": "charts/queryflux/Chart.yaml",
+          "jsonpath": "$.version"
+        },
+        {
+          "type": "yaml",
+          "path": "charts/queryflux/Chart.yaml",
+          "jsonpath": "$.appVersion"
         }
       ]
     }

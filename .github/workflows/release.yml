@@ -81,11 +81,22 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       base: ${{ steps.compute.outputs.base }}
+      latest: ${{ steps.compute.outputs.latest }}
     steps:
+      # A release builds from its tag. If Release Please created it on a later push, the tag is
+      # behind this push and its image must not move :latest backward.
       - id: compute
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           raw="${{ needs.release_please.outputs.tag_name }}"
           echo "base=${raw#queryflux-}" >> "$GITHUB_OUTPUT"
+          latest=true
+          if [ -n "$raw" ]; then
+            tag_sha="$(gh api "repos/${{ github.repository }}/commits/$raw" --jq .sha)"
+            [ "$tag_sha" = "${{ github.sha }}" ] || latest=false
+          fi
+          echo "latest=$latest" >> "$GITHUB_OUTPUT"
 
   # Snapshot website/docs into a new Docusaurus version so the published site tracks
   # releases instead of drifting (docs stayed pinned at 0.1.2 while the crate moved past
@@ -155,7 +166,10 @@ jobs:
             suffix: arm64
     runs-on: ${{ matrix.runs-on }}
     steps:
+      # A release builds from its tag; other pushes to main build the pushed commit.
       - uses: actions/checkout@44c2b7a8a4ea60a981eaca3cf939b5f4305c123b # v4.1.5
+        with:
+          ref: ${{ needs.release_please.outputs.tag_name || github.sha }}
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -222,7 +236,7 @@ jobs:
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
-            type=raw,value=latest
+            type=raw,value=latest,enable=${{ needs.docker_tag_base.outputs.latest == 'true' }}
             type=raw,value=${{ needs.docker_tag_base.outputs.base }},enable=${{ needs.release_please.outputs.releases_created == 'true' }}
 
       - name: Create and push manifest
@@ -231,6 +245,28 @@ jobs:
           docker buildx imagetools create \
             $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
             $(printf '${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@sha256:%s ' *)
+
+  # The chart of a release installs that release's server image (Chart.yaml appVersion), so
+  # it's pushed only once the image is.
+  helm_chart:
+    name: Publish Helm chart
+    needs: [release_please, manifest]
+    if: ${{ needs.release_please.outputs.releases_created == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@44c2b7a8a4ea60a981eaca3cf939b5f4305c123b # v4.1.5
+        with:
+          ref: ${{ needs.release_please.outputs.tag_name }}
+
+      - uses: azure/setup-helm@v4
+
+      - name: Package and push to GHCR
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "$GITHUB_TOKEN" | helm registry login ${{ env.REGISTRY }} -u ${{ github.actor }} --password-stdin
+          helm package charts/queryflux --destination /tmp/chart
+          helm push /tmp/chart/queryflux-*.tgz oci://${{ env.REGISTRY }}/${{ github.repository_owner }}/charts
 
   publish:
     name: GitHub Release summary

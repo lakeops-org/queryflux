@@ -29,6 +29,15 @@ Create chart name and version as used by the chart label.
 {{- end -}}
 
 {{/*
+The server image: image.tag, or the release this chart ships with. Bare tags up to v0.4.0 also
+start Studio (which the studio sidecar already runs on port 3000), so 0.4.0 uses its -slim tag.
+*/}}
+{{- define "queryflux.image" -}}
+{{- $suffix := ternary "-slim" "" (eq .Chart.AppVersion "0.4.0") -}}
+{{ .Values.image.repository }}:{{ .Values.image.tag | default (printf "v%s%s" .Chart.AppVersion $suffix) }}
+{{- end -}}
+
+{{/*
 Common labels.
 */}}
 {{- define "queryflux.labels" -}}
