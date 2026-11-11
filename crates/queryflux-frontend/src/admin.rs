@@ -2,9 +2,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::{
-    extract::{Path, Query, Request, State},
-    http::{header::AUTHORIZATION, Method, StatusCode},
-    middleware::{self, Next},
+    extract::{Path, Query, State},
+    http::{Method, StatusCode},
+    middleware,
     response::{IntoResponse, Response},
     routing::{delete, get, patch, post},
     Json, Router,
@@ -696,9 +696,17 @@ pub struct AdminFrontend {
     result_cache: Arc<dyn queryflux_cache::QueryResultCache>,
     app: Arc<AppState>,
     worker_api: Option<crate::worker_api::WorkerApi>,
+    basic_auth: bool,
 }
 
 impl AdminFrontend {
+    /// Whether the admin user's basic auth is accepted (`adminApi.basicAuth`). On by
+    /// default; with it off, only admin tokens and the platform get in.
+    pub fn with_basic_auth(mut self, enabled: bool) -> Self {
+        self.basic_auth = enabled;
+        self
+    }
+
     /// Serve the worker API (`/worker/*`) on this listener (#255).
     pub fn with_worker_api(mut self, api: crate::worker_api::WorkerApi) -> Self {
         self.worker_api = Some(api);
@@ -744,10 +752,14 @@ impl AdminFrontend {
             result_cache,
             app,
             worker_api: None,
+            basic_auth: true,
         }
     }
 
-    fn router(&self) -> Router {
+    /// The admin and worker API. A gateway in this process can serve it without a
+    /// listener of its own, marking callers it authenticated with
+    /// [`crate::admin_access::PlatformCaller`].
+    pub fn router(&self) -> Router {
         let state = Arc::new(AdminState {
             prometheus: self.prometheus.clone(),
             live: self.live.clone(),
@@ -890,11 +902,7 @@ impl AdminFrontend {
             )
             // Auth management endpoints
             .route("/admin/auth/status", get(auth_status_handler))
-            .route("/admin/auth/change-password", post(change_password_handler))
-            .layer(middleware::from_fn_with_state(
-                state.clone(),
-                admin_auth_middleware,
-            ));
+            .route("/admin/auth/change-password", post(change_password_handler));
 
         let cors = if self.cors_allowed_origins.is_empty() {
             CorsLayer::new()
@@ -927,10 +935,21 @@ impl AdminFrontend {
                 .allow_headers(Any)
         };
 
+        let access = Arc::new(crate::admin_access::AccessState {
+            store: self.admin_store.clone(),
+            creds: self.admin_creds.clone(),
+            basic_auth: self.basic_auth,
+        });
+        let protected = protected
+            .with_state(state.clone())
+            .merge(crate::admin_access::routes().with_state(access.clone()))
+            .layer(middleware::from_fn_with_state(
+                access,
+                crate::admin_access::authorize,
+            ));
         let router = Router::new()
-            .merge(public)
-            .merge(protected)
-            .with_state(state);
+            .merge(public.with_state(state))
+            .merge(protected);
         let router = match &self.worker_api {
             Some(api) => router.merge(crate::worker_api::router(api.clone())),
             None => router,
@@ -975,58 +994,6 @@ async fn metrics_handler(State(state): State<Arc<AdminState>>) -> impl IntoRespo
 // ---------------------------------------------------------------------------
 // Auth middleware
 // ---------------------------------------------------------------------------
-
-/// Axum middleware that enforces HTTP Basic authentication on all protected routes.
-///
-/// Expects `Authorization: Basic <base64(username:password)>` on every request.
-/// Returns `401 Unauthorized` with a `WWW-Authenticate` challenge on failure.
-async fn admin_auth_middleware(
-    State(state): State<Arc<AdminState>>,
-    req: Request,
-    next: Next,
-) -> Response {
-    let auth_header = req
-        .headers()
-        .get(AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-
-    if let Some((username, password)) = parse_basic_auth(auth_header) {
-        if state.admin_creds.verify(&username, &password).await {
-            return next.run(req).await;
-        }
-        warn!(username, "Admin API: invalid credentials");
-    } else {
-        warn!("Admin API: missing or malformed Authorization header");
-    }
-
-    (
-        StatusCode::UNAUTHORIZED,
-        [(
-            "WWW-Authenticate",
-            r#"Basic realm="QueryFlux Admin", charset="UTF-8""#,
-        )],
-        "Unauthorized",
-    )
-        .into_response()
-}
-
-/// Parse `Authorization: Basic <base64(user:pass)>` → `(username, password)`.
-fn parse_basic_auth(header: &str) -> Option<(String, String)> {
-    let encoded = header.strip_prefix("Basic ")?;
-    let decoded = base64_decode(encoded)?;
-    let (user, pass) = decoded.split_once(':')?;
-    Some((user.to_string(), pass.to_string()))
-}
-
-/// Minimal base64 decoder (no extra deps — same approach as Trino HTTP frontend).
-fn base64_decode(encoded: &str) -> Option<String> {
-    use base64::Engine;
-    let bytes = base64::engine::general_purpose::STANDARD
-        .decode(encoded.trim())
-        .ok()?;
-    String::from_utf8(bytes).ok()
-}
 
 // ---------------------------------------------------------------------------
 // Auth management handlers
@@ -2250,6 +2217,9 @@ async fn update_cluster_handler(
 // Persisted cluster config CRUD
 // ---------------------------------------------------------------------------
 
+/// What a redacted secret reads as. Sent back on a write, it keeps the stored value.
+const REDACTED: &str = "***REDACTED***";
+
 /// Redact sensitive fields from a cluster config JSON value in-place.
 fn redact_cluster_config_secrets(config: &mut serde_json::Value) {
     if let Some(obj) = config.as_object_mut() {
@@ -2264,7 +2234,7 @@ fn redact_cluster_config_secrets(config: &mut serde_json::Value) {
             if obj.contains_key(key) {
                 obj.insert(
                     key.to_string(),
-                    serde_json::Value::String("***REDACTED***".to_string()),
+                    serde_json::Value::String(REDACTED.to_string()),
                 );
             }
         }
@@ -2278,6 +2248,72 @@ fn redact_cluster_config_secrets(config: &mut serde_json::Value) {
             }
         }
     }
+}
+
+/// Replace each [`REDACTED`] value in `incoming` with the value at the same path in
+/// `stored`, so a client can send back a config it read without knowing its secrets.
+/// Returns the path of a placeholder that has no stored value.
+fn restore_redacted_secrets(
+    incoming: &mut serde_json::Value,
+    stored: Option<&serde_json::Value>,
+    path: &str,
+) -> std::result::Result<(), String> {
+    match incoming {
+        serde_json::Value::String(s) if s == REDACTED => match stored {
+            Some(v) if v.is_string() => {
+                *incoming = v.clone();
+                Ok(())
+            }
+            _ => Err(path.to_string()),
+        },
+        serde_json::Value::Object(obj) => obj.iter_mut().try_for_each(|(k, v)| {
+            restore_redacted_secrets(v, stored.and_then(|s| s.get(k)), &format!("{path}.{k}"))
+        }),
+        serde_json::Value::Array(items) => items.iter_mut().enumerate().try_for_each(|(i, v)| {
+            restore_redacted_secrets(v, stored.and_then(|s| s.get(i)), &format!("{path}[{i}]"))
+        }),
+        _ => Ok(()),
+    }
+}
+
+/// Config keys that, with the engine, decide where a cluster's credentials are sent.
+/// `region` picks the AWS endpoints (Athena, STS) that receive a cluster's AWS credentials.
+const CLUSTER_DESTINATION_KEYS: [&str; 5] = ["endpoint", "uri", "driver", "account", "region"];
+
+/// Where a cluster sends its credentials: the base config's destination and each
+/// variant's, with the variant's overrides applied. Variants inherit the base config's
+/// secrets, and destination keys are top level, where an override replaces the base value.
+fn cluster_destinations<'a>(
+    config: &'a serde_json::Value,
+    variants: &'a serde_json::Value,
+) -> Vec<Vec<Option<&'a serde_json::Value>>> {
+    let destination = |overrides: Option<&'a serde_json::Value>| {
+        CLUSTER_DESTINATION_KEYS
+            .iter()
+            .map(|k| overrides.and_then(|o| o.get(k)).or_else(|| config.get(k)))
+            .collect()
+    };
+    std::iter::once(destination(None))
+        .chain(
+            variants
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|v| destination(v.get("overrides"))),
+        )
+        .collect()
+}
+
+/// Whether `body` sends credentials only where `stored` already does, for the base config
+/// and every variant. A stored secret is restored only then: carrying it to a
+/// caller-supplied endpoint would hand it to whoever that endpoint names, a caller who
+/// could only ever read it redacted.
+fn same_cluster_destination(body: &UpsertClusterConfig, stored: &ClusterConfigRecord) -> bool {
+    let known = cluster_destinations(&stored.config, &stored.variants);
+    body.engine_key == stored.engine_key
+        && cluster_destinations(&body.config, &body.variants)
+            .iter()
+            .all(|d| known.contains(d))
 }
 
 /// Clone a `ClusterConfigRecord` with secrets redacted from the `config` field.
@@ -2307,15 +2343,13 @@ macro_rules! require_store {
 /// When a persistence backend with `ConfigRevisionStore` is available (e.g.
 /// Postgres), bumps the shared revision counter which triggers `LISTEN/NOTIFY`
 /// to all replicas. Always also wakes the local reload task via `Notify` as a
-/// fast-path for the instance that made the change.
-fn notify_live_config_reload(state: &AdminState) {
+/// fast-path for the instance that made the change. The bump is awaited, so the
+/// response's `ETag` and any read after it already carry the new revision.
+async fn notify_live_config_reload(state: &AdminState) {
     if let Some(store) = &state.admin_store {
-        let store = store.clone();
-        tokio::spawn(async move {
-            if let Err(e) = store.bump_revision().await {
-                tracing::warn!("Failed to bump config revision: {e}");
-            }
-        });
+        if let Err(e) = store.bump_revision().await {
+            tracing::warn!("Failed to bump config revision: {e}");
+        }
     }
     state.config_reload_notify.notify_one();
 }
@@ -2416,15 +2450,39 @@ fn validate_query_auth_for_upsert(body: &UpsertClusterConfig) -> std::result::Re
 async fn upsert_cluster_config_handler(
     State(state): State<Arc<AdminState>>,
     Path(name): Path<String>,
-    Json(body): Json<UpsertClusterConfig>,
+    Json(mut body): Json<UpsertClusterConfig>,
 ) -> impl IntoResponse {
     let pg = require_store!(state);
+    let stored = match pg.get_cluster_config(&name).await {
+        Ok(r) => r,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    };
+    let moved = stored
+        .as_ref()
+        .is_some_and(|r| !same_cluster_destination(&body, r));
+    let restore_from = stored.as_ref().filter(|_| !moved).map(|r| &r.config);
+    if let Err(path) = restore_redacted_secrets(&mut body.config, restore_from, "config") {
+        let why = if moved {
+            format!(
+                "the engine or an {} of the cluster or a variant changed, so the stored \
+                 value is not reused",
+                CLUSTER_DESTINATION_KEYS.join("/")
+            )
+        } else {
+            "no value is stored for it".to_string()
+        };
+        return (
+            StatusCode::BAD_REQUEST,
+            format!("{path} is {REDACTED} but {why}: send the secret"),
+        )
+            .into_response();
+    }
     if let Err(e) = validate_query_auth_for_upsert(&body) {
         return (StatusCode::BAD_REQUEST, e).into_response();
     }
     match pg.upsert_cluster_config(&name, &body).await {
         Ok(r) => {
-            notify_live_config_reload(&state);
+            notify_live_config_reload(&state).await;
             Json(redacted_cluster_config(r)).into_response()
         }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
@@ -2453,7 +2511,7 @@ async fn rename_cluster_config_handler(
     let pg = require_store!(state);
     match pg.rename_cluster_config(&name, &body.new_name).await {
         Ok(r) => {
-            notify_live_config_reload(&state);
+            notify_live_config_reload(&state).await;
             Json(redacted_cluster_config(r)).into_response()
         }
         Err(e) => (rename_persistence_error_status(&e), e.to_string()).into_response(),
@@ -2480,7 +2538,7 @@ async fn delete_cluster_config_handler(
     let pg = require_store!(state);
     match pg.delete_cluster_config(&name).await {
         Ok(true) => {
-            notify_live_config_reload(&state);
+            notify_live_config_reload(&state).await;
             StatusCode::NO_CONTENT.into_response()
         }
         Ok(false) => (StatusCode::NOT_FOUND, "Cluster config not found").into_response(),
@@ -2604,7 +2662,7 @@ async fn upsert_group_config_handler(
     let pg = require_store!(state);
     match pg.upsert_group_config(&name, &body).await {
         Ok(r) => {
-            notify_live_config_reload(&state);
+            notify_live_config_reload(&state).await;
             Json(r).into_response()
         }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
@@ -2633,7 +2691,7 @@ async fn rename_group_config_handler(
     let pg = require_store!(state);
     match pg.rename_group_config(&name, &body.new_name).await {
         Ok(r) => {
-            notify_live_config_reload(&state);
+            notify_live_config_reload(&state).await;
             Json(r).into_response()
         }
         Err(e) => (rename_persistence_error_status(&e), e.to_string()).into_response(),
@@ -2661,7 +2719,7 @@ async fn delete_group_config_handler(
     let pg = require_store!(state);
     match pg.delete_group_config(&name).await {
         Ok(true) => {
-            notify_live_config_reload(&state);
+            notify_live_config_reload(&state).await;
             StatusCode::NO_CONTENT.into_response()
         }
         Ok(false) => (StatusCode::NOT_FOUND, "Group config not found").into_response(),
@@ -2731,7 +2789,7 @@ async fn create_user_script_handler(
     let pg = require_store!(state);
     match pg.create_user_script(&body).await {
         Ok(r) => {
-            notify_live_config_reload(&state);
+            notify_live_config_reload(&state).await;
             (StatusCode::CREATED, Json(r)).into_response()
         }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
@@ -2784,7 +2842,7 @@ async fn update_user_script_handler(
     let pg = require_store!(state);
     match pg.update_user_script(id, &body).await {
         Ok(r) => {
-            notify_live_config_reload(&state);
+            notify_live_config_reload(&state).await;
             Json(r).into_response()
         }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
@@ -2811,7 +2869,7 @@ async fn delete_user_script_handler(
     let pg = require_store!(state);
     match pg.delete_user_script(id).await {
         Ok(true) => {
-            notify_live_config_reload(&state);
+            notify_live_config_reload(&state).await;
             StatusCode::NO_CONTENT.into_response()
         }
         Ok(false) => (StatusCode::NOT_FOUND, "Script not found").into_response(),
@@ -2998,7 +3056,7 @@ async fn put_security_config_handler(
 
     match store.set_proxy_setting("security_config", value).await {
         Ok(()) => {
-            notify_live_config_reload(&state);
+            notify_live_config_reload(&state).await;
             StatusCode::NO_CONTENT.into_response()
         }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
@@ -3106,7 +3164,7 @@ async fn put_routing_config_handler(
         .await
     {
         Ok(()) => {
-            notify_live_config_reload(&state);
+            notify_live_config_reload(&state).await;
             StatusCode::NO_CONTENT.into_response()
         }
         Err(e) => {
@@ -3369,7 +3427,7 @@ async fn put_guardrails_config_handler(
     }
     match store.set_proxy_setting("guardrails_config", body).await {
         Ok(()) => {
-            notify_live_config_reload(&state);
+            notify_live_config_reload(&state).await;
             StatusCode::NO_CONTENT.into_response()
         }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
@@ -3582,7 +3640,7 @@ async fn put_access_control_config_handler(
         .await
     {
         Ok(()) => {
-            notify_live_config_reload(&state);
+            notify_live_config_reload(&state).await;
             StatusCode::NO_CONTENT.into_response()
         }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
@@ -3839,7 +3897,7 @@ async fn put_catalog_config_handler(
     }
     match store.set_proxy_setting("catalog_config", body).await {
         Ok(()) => {
-            notify_live_config_reload(&state);
+            notify_live_config_reload(&state).await;
             StatusCode::NO_CONTENT.into_response()
         }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
@@ -3906,8 +3964,9 @@ async fn invalidate_group_cache_handler(
 #[cfg(test)]
 mod tests {
     use super::{
-        collect_running_queries, delete_queued_if_exists, sql_preview, AccessControlDryRunRequest,
-        GuardrailsConfigDto, SecurityConfigDto,
+        collect_running_queries, delete_queued_if_exists, redact_cluster_config_secrets,
+        restore_redacted_secrets, same_cluster_destination, sql_preview,
+        AccessControlDryRunRequest, GuardrailsConfigDto, SecurityConfigDto, REDACTED,
     };
     use chrono::Utc;
     use queryflux_core::config::{
@@ -3922,6 +3981,182 @@ mod tests {
     use serde_json::json;
     use std::collections::HashMap;
     use std::sync::Arc;
+
+    #[test]
+    fn a_redacted_secret_sent_back_keeps_the_stored_value() {
+        let stored =
+            json!({"endpoint": "https://t:8443", "auth": {"type": "basic", "password": "s3cret"}});
+        let mut read = stored.clone();
+        redact_cluster_config_secrets(&mut read);
+        assert_eq!(read["auth"]["password"], REDACTED);
+
+        // Round trip with an edit elsewhere: the password survives.
+        read["maxConnections"] = json!(5);
+        restore_redacted_secrets(&mut read, Some(&stored), "config").unwrap();
+        assert_eq!(read["auth"]["password"], "s3cret");
+        assert_eq!(read["maxConnections"], 5);
+
+        // A new value replaces it.
+        let mut replaced = json!({"auth": {"password": "n3w"}});
+        restore_redacted_secrets(&mut replaced, Some(&stored), "config").unwrap();
+        assert_eq!(replaced["auth"]["password"], "n3w");
+
+        // A placeholder with nothing stored behind it is refused, never saved.
+        let mut new_cluster = json!({"auth": {"password": REDACTED}});
+        assert_eq!(
+            restore_redacted_secrets(&mut new_cluster, None, "config"),
+            Err("config.auth.password".to_string())
+        );
+    }
+
+    /// A stored secret is only reused for the endpoint it was saved for: the handler
+    /// restores nothing when the destination moved, so the placeholder is refused.
+    #[test]
+    fn a_redacted_secret_is_not_carried_to_a_new_destination() {
+        let record = |config: serde_json::Value| {
+            queryflux_persistence::cluster_config::ClusterConfigRecord {
+                id: 1,
+                name: "t".into(),
+                engine_key: "trino".into(),
+                enabled: true,
+                max_running_queries: None,
+                config,
+                variants: json!([]),
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            }
+        };
+        let upsert = |engine_key: &str, config: serde_json::Value| {
+            queryflux_persistence::cluster_config::UpsertClusterConfig {
+                engine_key: engine_key.into(),
+                enabled: true,
+                max_running_queries: None,
+                config,
+                variants: json!([]),
+            }
+        };
+        let stored = record(json!({"endpoint": "https://t:8443", "password": "s3cret"}));
+
+        let same = upsert(
+            "trino",
+            json!({"endpoint": "https://t:8443", "password": REDACTED, "x": 1}),
+        );
+        assert!(same_cluster_destination(&same, &stored));
+
+        let moved = upsert(
+            "trino",
+            json!({"endpoint": "https://evil:8443", "password": REDACTED}),
+        );
+        assert!(!same_cluster_destination(&moved, &stored));
+        let mut config = moved.config.clone();
+        assert_eq!(
+            restore_redacted_secrets(&mut config, None, "config"),
+            Err("config.password".to_string()),
+            "the handler passes no stored config when the destination moved"
+        );
+
+        let other_engine = upsert(
+            "starRocks",
+            json!({"endpoint": "https://t:8443", "password": REDACTED}),
+        );
+        assert!(!same_cluster_destination(&other_engine, &stored));
+    }
+
+    /// An Athena cluster's region picks the AWS endpoints its credentials go to.
+    #[test]
+    fn a_redacted_secret_is_not_carried_to_a_new_region() {
+        let stored = queryflux_persistence::cluster_config::ClusterConfigRecord {
+            id: 1,
+            name: "a".into(),
+            engine_key: "athena".into(),
+            enabled: true,
+            max_running_queries: None,
+            config: json!({"region": "us-east-1", "authToken": "s3cret"}),
+            variants: json!([{ "name": "eu", "overrides": { "region": "eu-west-1" } }]),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        let upsert = |region: &str, variants: serde_json::Value| {
+            queryflux_persistence::cluster_config::UpsertClusterConfig {
+                engine_key: "athena".into(),
+                enabled: true,
+                max_running_queries: None,
+                config: json!({"region": region, "authToken": REDACTED}),
+                variants,
+            }
+        };
+
+        assert!(same_cluster_destination(
+            &upsert("us-east-1", stored.variants.clone()),
+            &stored
+        ));
+        assert!(!same_cluster_destination(
+            &upsert("ap-south-1", stored.variants.clone()),
+            &stored
+        ));
+        assert!(!same_cluster_destination(
+            &upsert(
+                "us-east-1",
+                json!([{ "name": "eu", "overrides": { "region": "ap-south-1" } }])
+            ),
+            &stored
+        ));
+    }
+
+    /// Variants inherit the base config's secrets, so a variant that points somewhere
+    /// new must not get the stored secret either, even with the base endpoint unchanged.
+    #[test]
+    fn a_redacted_secret_is_not_carried_to_a_new_variant_destination() {
+        let base = json!({"endpoint": "https://t:8443", "password": "s3cret"});
+        let stored = queryflux_persistence::cluster_config::ClusterConfigRecord {
+            id: 1,
+            name: "t".into(),
+            engine_key: "trino".into(),
+            enabled: true,
+            max_running_queries: None,
+            config: base.clone(),
+            variants: json!([
+                { "name": "a" },
+                { "name": "b", "overrides": { "endpoint": "https://b:8443" } }
+            ]),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        let upsert = |variants: serde_json::Value| {
+            queryflux_persistence::cluster_config::UpsertClusterConfig {
+                engine_key: "trino".into(),
+                enabled: true,
+                max_running_queries: None,
+                config: json!({"endpoint": "https://t:8443", "password": REDACTED}),
+                variants,
+            }
+        };
+
+        assert!(same_cluster_destination(
+            &upsert(stored.variants.clone()),
+            &stored
+        ));
+        // Reordered, renamed, or another variant at an existing destination: no new host.
+        assert!(same_cluster_destination(
+            &upsert(json!([
+                { "name": "b2", "overrides": { "endpoint": "https://b:8443", "x": 1 } },
+                { "name": "c" }
+            ])),
+            &stored
+        ));
+        // A variant moved, or added, to a new endpoint would inherit the stored password.
+        assert!(!same_cluster_destination(
+            &upsert(json!([
+                { "name": "a" },
+                { "name": "b", "overrides": { "endpoint": "https://evil:8443" } }
+            ])),
+            &stored
+        ));
+        assert!(!same_cluster_destination(
+            &upsert(json!([{ "name": "c", "overrides": { "endpoint": "https://evil:8443" } }])),
+            &stored
+        ));
+    }
 
     #[test]
     fn security_config_dto_omits_static_user_passwords() {

@@ -5,7 +5,8 @@ on:
     branches: [main]
     paths:
       - 'website/**'
-  # Rebuild nightly so sitemap lastmod stays fresh (seoConfig.ts sets lastmod to build date).
+  # Nightly rebuild. Sitemap lastmod comes from git history (needs fetch-depth: 0 below),
+  # so it changes only when a page does.
   schedule:
     - cron: '0 0 * * *'
 
@@ -49,6 +50,9 @@ jobs:
           # Optional GA4 (G-XXXXXXXX). Set repo/org variable GA_MEASUREMENT_ID to enable.
           GA_MEASUREMENT_ID: ${{ vars.GA_MEASUREMENT_ID }}
         run: npm run build
+
+      - name: Check SEO (robots, sitemap, llms.txt, page metadata)
+        run: npm run seo:check
 
       - name: Upload Build Artifact
         uses: actions/upload-pages-artifact@v3

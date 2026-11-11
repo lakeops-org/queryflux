@@ -1,3 +1,9 @@
+---
+title: Catalog provider
+description: Load table and column metadata from a catalog so schema-aware translation can qualify columns and types, not only SQL syntax.
+image: img/queryflux-hero-banner.png
+---
+
 # Catalog Provider
 
 QueryFlux can discover table and column metadata from a pluggable catalog provider, feeding [schema-aware SQL translation](./query-translation) so `sqlglot`'s optimizer can qualify columns and types instead of just transpiling syntax.

@@ -1,6 +1,6 @@
 ---
 title: Capacity and throughput
-description: How QueryFlux enforces maxRunningQueries across replicas and workers, what each admission costs, and the design that keeps the shared limit from becoming the bottleneck at thousands of queries per second.
+description: How maxRunningQueries holds across replicas and workers, what each admission costs, and how the shared limit stays cheap at high rates.
 image: img/queryflux-hero-banner.png
 ---
 

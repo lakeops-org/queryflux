@@ -1,6 +1,8 @@
 ---
 sidebar_label: Setting agent context
-description: How to attach agent identity and conversation state to queries — via HTTP headers, SQL session params, or MCP tool parameters, depending on the frontend.
+title: Set agent context
+description: Attach agent id, conversation, and step to every query with HTTP headers, SQL session parameters, or MCP tool arguments.
+image: img/queryflux-hero-banner.png
 ---
 
 # Setting agent context

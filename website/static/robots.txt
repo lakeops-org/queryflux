@@ -1,12 +1,11 @@
-# Dev/fallback copy — production build overwrites build/robots.txt via seoConfig.ts
+# Generated at build time — do not edit build/robots.txt by hand.
 # https://docusaurus.io/docs/seo#robots-file
+# Nothing is disallowed. Pages kept out of search (/docs/next/, older doc
+# versions, blog tags/archive/authors) carry a noindex meta tag, and Google
+# only sees that tag on pages it is allowed to crawl.
+# LLM index: https://queryflux.dev/llms.txt
+
 User-agent: *
 Allow: /
-Disallow: /docs/next
-Disallow: /docs/next/
-Disallow: /blog/tags
-Disallow: /blog/tags/
-Disallow: /blog/archive
-Disallow: /blog/authors
 
 Sitemap: https://queryflux.dev/sitemap.xml

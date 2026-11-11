@@ -1,9 +1,10 @@
 ---
 sidebar_position: 4
-title: Benchmarks
+title: Proxy and capacity benchmarks
 description: QueryFlux benchmarks — proxy overhead against mock backends (~0.1 ms p50) and per feature, and the capacity admission benchmark for shared maxRunningQueries leases.
 image: img/queryflux-hero-banner.png
 ---
+
 # Benchmarks
 
 ## Proxy overhead

@@ -196,6 +196,54 @@ Workers keep no durable history. Each finished query's record goes upstream:
 
 Cluster snapshots are not sent upstream. With shared capacity, the control plane's own snapshots already count every worker's running queries.
 
+## One control plane for many tenants
+
+A provider hosting control planes for many customers can run them in one process.
+Every tenant is a complete control plane with its own Postgres schema
+([`persistence.schema`](../configuration.md)), so tenants share nothing but the database
+and the process.
+
+```yaml
+queryflux:
+  role: controlPlane
+  adminApi: { port: 8080 }        # public: hubs and workers
+  persistence:
+    type: postgres
+    url: postgres://qf:secret@db:5432/queryflux
+    poolSize: 4                   # per tenant
+  controlPlane:
+    tenancy:
+      hostSuffix: .cp.example.com # acme.cp.example.com → tenant acme
+      platformPort: 9100          # internal: tenant lifecycle and admin APIs
+```
+
+Set `QUERYFLUX_PLATFORM_TOKEN` (at least 16 characters). Every request to the platform
+listener must carry it as `Authorization: Bearer <token>`.
+
+**Adding and removing tenants** is done on the platform listener:
+
+| Call | Effect |
+|---|---|
+| `PUT /platform/tenants/{id}` | Registers the tenant and starts it, after creating and migrating its schema. The body `{"schema": "..."}` is optional; the default is `tenant_<id>`. Returns `201`, `200` if it was already registered, or `409` if the id or schema belongs to another tenant. |
+| `GET /platform/tenants[/{id}]` | Shows each tenant's schema, host, whether it is running, and any startup error. |
+| `DELETE /platform/tenants/{id}` | Stops the tenant and unregisters it. Its schema and data are kept; drop them yourself. |
+
+A tenant id is a lowercase DNS label, because it is the first label of the tenant's host.
+Each replica starts the tenants that are registered and follows changes within 10
+seconds.
+
+**Serving tenants.**
+- The public port serves only `/worker/*`, for the tenant named by the host. Hubs and
+  workers authenticate against that tenant's enrolled hubs, so one tenant's hub is
+  refused by every other tenant.
+- The platform port serves every tenant's admin API, `/metrics` and worker API. Choose the
+  tenant with `X-QueryFlux-Tenant: <id>`. These callers act as the
+  [platform](../authentication.md#admin-api-access): `X-QueryFlux-Scopes` narrows what a
+  request may do, and `X-QueryFlux-Actor` records whom it acts for in the tenant's audit
+  log.
+- A tenant starts with no clusters; add them through its admin API.
+- A control plane with no query listener does not connect to engines, because they run at the customer's site. On such a control plane, "Test connection" (`POST /admin/config/clusters/test`) says so instead of failing to connect. A control plane with a query listener connects to the engine and runs the test. Each worker reports health for clusters that are members of enabled groups (the same set it probes) in its heartbeat, as `status.clusters` in `GET /admin/workers`, and workers behind a hub report through the hub. A cluster appears there only after a probe of its current config has completed, so it is omitted at first and again after its config changes. Workers with no query frontend do not probe, so their `status.clusters` stays empty.
+
 ## Operating workers
 
 **Ops listener** (the worker's `adminApi.port`):
@@ -231,7 +279,8 @@ The migrations are forward-only: once they've run, an older QueryFlux won't star
 - **Helm, shared-service workers:** `charts/queryflux/examples/control-plane-values.yaml` and `worker-values.yaml`, one release each. Add `worker-autoscaling-values.yaml` to scale workers on load. Adding workers never raises a limit: with shared capacity, `maxRunningQueries` holds across the fleet.
 - **Native sidecar** (Kubernetes 1.29+): one worker inside each application pod. Step by step: [Add a worker as a sidecar](./worker-sidecar). The example manifest is `charts/queryflux/examples/worker-sidecar-manifest.yaml`.
 - **One worker per node:** `charts/queryflux/examples/worker-daemonset-values.yaml` runs workers as a DaemonSet. With `service.internalTrafficPolicy: Local`, apps keep one Service address, and each connection goes to the worker on the app's own node. There's no fallback while a node's worker restarts, so rollouts replace one node's worker at a time.
-- **A control plane that runs no queries** (one per tenant, serving remote sites): `charts/queryflux/examples/hosted-cell-values.yaml` and `hosted-cell-config.yaml`. With no query frontend enabled, it doesn't health-check engines, which may be unreachable from where it runs. Its ingress exposes only `/worker`, and it uses one Postgres database per instance (not one schema: QueryFlux's advisory locks and LISTEN/NOTIFY channels are scoped to the database).
+- **A control plane that runs no queries** (one per tenant, serving remote sites): `charts/queryflux/examples/hosted-cell-values.yaml` and `hosted-cell-config.yaml`. With no query frontend enabled, it doesn't health-check engines, which may be unreachable from where it runs. Its ingress exposes only `/worker`. Pin each instance to its own schema with [`persistence.schema`](../configuration.md) so several can share one Postgres database (locks and LISTEN/NOTIFY channels are schema-scoped). Or give each instance its own database. Put the database URL and worker secret in a Secret and override them with `QUERYFLUX_PERSISTENCE_URL` / `QUERYFLUX_WORKER_SECRET` (see the example's `env`).
+- **A site's hub and workers** (customer cluster, outbound to a hosted control plane): `charts/queryflux/examples/site-hub-values.yaml` and `site-workers-values.yaml`. One Secret holds the enrollment token and worker secret; the chart renders the rest of the config.
 
 See the [Helm chart README](https://github.com/lakeops-org/queryflux/blob/main/charts/queryflux/README.md#worker-mode).
 

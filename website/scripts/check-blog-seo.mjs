@@ -14,7 +14,7 @@ const sitemapPath = path.join(websiteDir, 'build', 'sitemap.xml');
 const staticImgDir = path.join(websiteDir, 'static');
 
 const MAX_TITLE = 60; // without " | QueryFlux"
-const MAX_DESC = 165;
+const MAX_DESC = 160;
 const MIN_DESC = 70;
 
 function parseFrontmatter(content) {

@@ -77,11 +77,6 @@ jobs:
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN_VERSION }}
 
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          shared-key: queryflux-bench
-          cache-on-failure: true
-
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: "3.14"
@@ -94,6 +89,20 @@ jobs:
           .venv/bin/python3 -m pip install -r requirements.txt
           echo "PYO3_PYTHON=${GITHUB_WORKSPACE}/.venv/bin/python3" >> "$GITHUB_ENV"
           echo "PYTHONPATH=$(.venv/bin/python3 -c 'import site; print(site.getsitepackages()[0])')" >> "$GITHUB_ENV"
+          # See ci.yml: key cache on the full Python version and pass its LIBDIR to the linker.
+          PY_VER=$(.venv/bin/python3 -c 'import sys; print("%d.%d.%d" % sys.version_info[:3])')
+          PY_LIB=$(.venv/bin/python3 -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR"))')
+          echo "PYTHON_VERSION_FULL=${PY_VER}" >> "$GITHUB_ENV"
+          if [ -n "${RUSTFLAGS:-}" ]; then
+            echo "RUSTFLAGS=${RUSTFLAGS} -L native=${PY_LIB}" >> "$GITHUB_ENV"
+          else
+            echo "RUSTFLAGS=-L native=${PY_LIB}" >> "$GITHUB_ENV"
+          fi
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: queryflux-bench-py${{ env.PYTHON_VERSION_FULL }}
+          cache-on-failure: true
 
       - name: Build
         run: cargo build --release -p queryflux-bench

@@ -10,7 +10,7 @@ import {
 const siteUrl = 'https://queryflux.dev';
 const siteCanonicalUrl = siteUrl;
 const siteDescription =
-  'Open-source SQL proxy and router in Rust. One endpoint for tools and AI agents across Trino, DuckDB, StarRocks, and more — with routing, dialect translation, guardrails, and observability.';
+  'Open-source SQL proxy and router in Rust: one endpoint for tools and AI agents across Trino, DuckDB, StarRocks and more, with routing and guardrails.';
 
 /** GA4 measurement ID (G-…). Optional — omit locally; set in deploy via vars.GA_MEASUREMENT_ID. */
 const gaMeasurementId = process.env.GA_MEASUREMENT_ID;
@@ -18,7 +18,8 @@ const gaMeasurementId = process.env.GA_MEASUREMENT_ID;
 const config: Config = {
   title: 'QueryFlux',
   tagline: 'Universal SQL query proxy and router in Rust',
-  favicon: 'img/queryflux-hero-banner.png',
+  // Google shows the favicon in results only if it is square (at least 48×48).
+  favicon: 'img/queryflux-tab-icon.png',
 
   url: siteUrl,
   baseUrl: '/',
@@ -106,7 +107,7 @@ const config: Config = {
         '@type': 'Organization',
         name: 'QueryFlux',
         url: siteCanonicalUrl,
-        logo: `${siteCanonicalUrl}/img/queryflux-hero-banner.png`,
+        logo: `${siteCanonicalUrl}/img/queryflux-tab-icon.png`,
         sameAs: [
           'https://github.com/lakeops-org/queryflux',
           'https://twitter.com/lakeops',
@@ -144,6 +145,8 @@ const config: Config = {
           // https://docusaurus.io/docs/versioning — latest = first entry in versions.json
           // SEO: only latest is indexable; see seoConfig.ts (reads versions.json each build)
           versions: buildDocsVersionConfig(),
+          // Also feeds sitemap <lastmod> from each file's last git commit.
+          showLastUpdateTime: true,
         },
         blog: {
           showReadingTime: true,
@@ -153,6 +156,7 @@ const config: Config = {
           postsPerPage: 'ALL',
           editUrl: 'https://github.com/lakeops-org/queryflux/tree/main/website/',
           onUntruncatedBlogPosts: 'throw',
+          showLastUpdateTime: true,
         },
         // https://docusaurus.io/docs/api/plugins/@docusaurus/plugin-google-gtag
         // Bundled with preset-classic; inactive in development, active in production builds.
@@ -289,12 +293,10 @@ const config: Config = {
         name: 'description',
         content: siteDescription,
       },
+      // Pages marked noindex replace this tag. Don't add a googlebot tag: it would
+      // survive on those pages and contradict their noindex.
       {
         name: 'robots',
-        content: 'index, follow, max-image-preview:large, max-snippet:-1, max-video-preview:-1',
-      },
-      {
-        name: 'googlebot',
         content: 'index, follow, max-image-preview:large, max-snippet:-1, max-video-preview:-1',
       },
       {property: 'og:site_name', content: 'QueryFlux'},
@@ -304,8 +306,9 @@ const config: Config = {
       {name: 'twitter:card', content: 'summary_large_image'},
       {name: 'twitter:site', content: '@lakeops'},
       {name: 'twitter:image:alt', content: 'QueryFlux multi-engine query routing overview'},
-      {property: 'og:image:width', content: '1024'},
-      {property: 'og:image:height', content: '682'},
+      {property: 'og:image:type', content: 'image/png'},
+      {property: 'og:image:width', content: '1200'},
+      {property: 'og:image:height', content: '799'},
     ],
   } satisfies Preset.ThemeConfig,
 };

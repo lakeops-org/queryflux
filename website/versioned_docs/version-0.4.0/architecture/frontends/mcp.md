@@ -1,8 +1,9 @@
 ---
-title: MCP Frontend
-description: Model Context Protocol tool-call frontend — streamable HTTP, six tools for AI agents, and how it reuses QueryFlux's existing routing, auth, guardrails, and agent-context features.
+title: MCP frontend for agents
+description: MCP frontend for AI agents over streamable HTTP. Same routing, auth, guardrails, and query history as every other QueryFlux client.
 image: img/queryflux-hero-banner.png
 ---
+
 # MCP Frontend
 
 The MCP frontend lets any [Model Context Protocol](https://modelcontextprotocol.io/) client — Claude, GPT-based agents, LangChain, or a custom framework — query QueryFlux without writing custom integration code. It is implemented as a submodule of `queryflux-frontend`, the same crate every other frontend (Trino HTTP, PostgreSQL wire, MySQL wire, Flight SQL, Snowflake) lives in, and it dispatches every tool call through the exact same `execute_to_sink` pipeline: routing, SQL translation, guardrails, and query-history persistence are identical to every other frontend. There is no separate MCP-specific execution path and no MCP-specific safety policy layered on top — what you already have configured applies here too.

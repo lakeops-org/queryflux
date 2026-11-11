@@ -27,6 +27,7 @@ mod live_config;
 mod registered_engines;
 mod remote_coordination;
 mod startup;
+mod tenancy;
 mod worker_labels;
 
 use crate::config_source::{
@@ -54,10 +55,11 @@ async fn main() -> Result<()> {
                         .unwrap_or_else(|_| "queryflux=info".into()),
                 )
                 .init();
-            let config = YamlFileConfigProvider::new(&config)
+            let mut config = YamlFileConfigProvider::new(&config)
                 .load()
                 .await
                 .context("Failed to load config")?;
+            config.apply_env_overrides(|k| std::env::var(k).ok());
             queryflux_persistence::run_persistence_migrations(&config.queryflux.persistence)
                 .await
                 .context("Migration failed")?;
@@ -73,6 +75,7 @@ async fn main() -> Result<()> {
         .load()
         .await
         .context("Failed to load config")?;
+    config.apply_env_overrides(|k| std::env::var(k).ok());
 
     // Initialize tracing subscriber — with OTel if configured.
     {
@@ -133,6 +136,38 @@ async fn main() -> Result<()> {
     if config.queryflux.role == queryflux_core::config::Role::Hub {
         return hub::run(config).await;
     }
+    if config
+        .queryflux
+        .control_plane
+        .as_ref()
+        .is_some_and(|c| c.tenancy.is_some())
+    {
+        return tenancy::run(config).await;
+    }
+    run(config, RunMode::Process).await
+}
+
+/// How [`run`] serves what it builds.
+pub(crate) enum RunMode {
+    /// This process is the deployment: it listens on its ports until SIGINT or SIGTERM.
+    Process,
+    /// One tenant of a multi-tenant control plane: hand the admin and worker API to the
+    /// gateway as a router (`router`), open no listener, and stop when `stop` turns true.
+    Tenant {
+        router: tokio::sync::oneshot::Sender<axum::Router>,
+        stop: tokio::sync::watch::Receiver<bool>,
+    },
+}
+
+/// Build and serve one deployment from `config`, until shutdown.
+pub(crate) async fn run(
+    mut config: queryflux_core::config::ProxyConfig,
+    mode: RunMode,
+) -> Result<()> {
+    let (tenant_router, tenant_stop) = match mode {
+        RunMode::Process => (None, None),
+        RunMode::Tenant { router, stop } => (Some(router), Some(stop)),
+    };
     // A worker owns no config: it starts empty and pulls its config from the control
     // plane (`RemoteConfigSource`), serves an ops-only listener instead of the admin API,
     // and skips the config-loading and security checks below, which describe config it
@@ -782,8 +817,19 @@ async fn main() -> Result<()> {
         backend.is_some(),
     ));
 
-    let test_cluster_fn: TestClusterFn = Arc::new(|engine_key, config_json| {
+    // A control plane with no query listener runs away from the engines (hosted): it
+    // cannot reach them, and their health comes from the workers at the site.
+    let reaches_engines = config.queryflux.role != queryflux_core::config::Role::ControlPlane
+        || startup::tasks::serves_queries(&config.queryflux.frontends);
+    let test_cluster_fn: TestClusterFn = Arc::new(move |engine_key, config_json| {
         Box::pin(async move {
+            if !reaches_engines {
+                anyhow::bail!(
+                    "This control plane does not connect to engines; the site's workers do. \
+                     Save the cluster, add it to an enabled group (workers only probe group \
+                     members), then check status.clusters on GET /admin/workers."
+                );
+            }
             let adapter = registered_engines::build_adapter_from_record(
                 ClusterName("__test__".to_string()),
                 ClusterGroupName("__test__".to_string()),
@@ -888,6 +934,7 @@ async fn main() -> Result<()> {
         app_state.result_cache.clone(),
         app_state.clone(),
     );
+    let admin = admin.with_basic_auth(config.queryflux.admin_api.basic_auth);
     let admin = match worker_api {
         Some(api) => admin.with_worker_api(api),
         None => admin,
@@ -1026,7 +1073,12 @@ async fn main() -> Result<()> {
         };
         tokio::spawn(run_reload_loop(source, handles, shutdown_rx.clone()));
         if is_worker {
-            startup::tasks::spawn_worker_heartbeat(&config, &worker_sync_state, &shutdown_rx);
+            startup::tasks::spawn_worker_heartbeat(
+                &config,
+                &worker_sync_state,
+                &live,
+                &shutdown_rx,
+            );
             if let Some(uplink) = &history_uplink {
                 uplink.spawn_flusher(shutdown_rx.clone());
             }
@@ -1087,6 +1139,10 @@ async fn main() -> Result<()> {
             let rx = shutdown_rx.clone();
             async move { ops.listen(rx).await }
         });
+    } else if let Some(router) = tenant_router {
+        // The gateway marks the platform callers it authenticated, and serves only
+        // `/worker/*` (hub and worker auth) on its public listener.
+        let _ = router.send(admin.router());
     } else {
         frontend_tasks.spawn("Admin", {
             let rx = shutdown_rx.clone();
@@ -1101,7 +1157,12 @@ async fn main() -> Result<()> {
         &shutdown_rx,
     );
 
-    startup::shutdown::wait_for_shutdown(&mut frontend_tasks).await;
+    match tenant_stop {
+        Some(mut stop) => {
+            let _ = stop.wait_for(|stop| *stop).await;
+        }
+        None => startup::shutdown::wait_for_shutdown(&mut frontend_tasks).await,
+    }
     startup::shutdown::graceful_shutdown(
         &shutdown_tx,
         &mut frontend_tasks,

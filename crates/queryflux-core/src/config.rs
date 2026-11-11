@@ -148,7 +148,31 @@ pub struct ProxyConfig {
     pub access_control: Option<crate::access_config::AccessControlConfig>,
 }
 
+/// Environment variables that override secrets in the config file, so the file can be a
+/// plain ConfigMap and the secrets come from a Kubernetes Secret.
+pub const ENV_WORKER_SECRET: &str = "QUERYFLUX_WORKER_SECRET";
+pub const ENV_HUB_ENROLL_TOKEN: &str = "QUERYFLUX_HUB_ENROLL_TOKEN";
+pub const ENV_PERSISTENCE_URL: &str = "QUERYFLUX_PERSISTENCE_URL";
+
 impl ProxyConfig {
+    /// Apply [`ENV_WORKER_SECRET`], [`ENV_HUB_ENROLL_TOKEN`] (when `hub` is configured)
+    /// and [`ENV_PERSISTENCE_URL`] (when persistence is Postgres) over the file's values.
+    /// Empty variables are ignored.
+    pub fn apply_env_overrides(&mut self, var: impl Fn(&str) -> Option<String>) {
+        let var = |name: &str| var(name).filter(|v| !v.trim().is_empty());
+        if let Some(secret) = var(ENV_WORKER_SECRET) {
+            self.queryflux.worker_secret = Some(secret);
+        }
+        if let (Some(token), Some(hub)) = (var(ENV_HUB_ENROLL_TOKEN), self.queryflux.hub.as_mut()) {
+            hub.upstream.enroll_token = Some(token);
+        }
+        if let (Some(url), PersistenceConfig::Postgres { conn }) =
+            (var(ENV_PERSISTENCE_URL), &mut self.queryflux.persistence)
+        {
+            conn.url = Some(url);
+        }
+    }
+
     /// Check the settings that depend on `queryflux.role`. Returns every problem found.
     ///
     /// A worker owns no config: it rejects settings that the control plane provides
@@ -293,11 +317,45 @@ impl ProxyConfig {
                             .to_string(),
                     );
                 }
+                let tenancy = q.control_plane.as_ref().and_then(|c| c.tenancy.as_ref());
+                if let Some(t) = tenancy {
+                    if !enrolls_hubs {
+                        issues
+                            .push("controlPlane.tenancy requires Postgres persistence".to_string());
+                    }
+                    if worker_secret {
+                        issues.push(
+                            "controlPlane.tenancy: workerSecret would be shared by every tenant; \
+                             remove it and enroll hubs per tenant"
+                                .to_string(),
+                        );
+                    }
+                    if !t.host_suffix.starts_with('.') || t.host_suffix.len() < 2 {
+                        issues.push(
+                            "controlPlane.tenancy.hostSuffix must start with '.', \
+                             e.g. .cp.example.com"
+                                .to_string(),
+                        );
+                    }
+                    if t.platform_port == q.admin_api.port {
+                        issues.push(
+                            "controlPlane.tenancy.platformPort must differ from adminApi.port"
+                                .to_string(),
+                        );
+                    }
+                }
             }
             Role::Standalone => {
                 if let Err(e) = q.capacity.validate() {
                     issues.push(e);
                 }
+            }
+        }
+        // After env overrides (QUERYFLUX_PERSISTENCE_URL), an empty Postgres url/host
+        // must fail validation rather than only at pool connect.
+        if let PersistenceConfig::Postgres { conn } = &q.persistence {
+            if let Err(e) = conn.connection_url() {
+                issues.push(e);
             }
         }
         if issues.is_empty() {
@@ -1235,6 +1293,30 @@ pub struct ControlPlaneConfig {
     /// Sent to workers in the snapshot: where they send query history and its redaction.
     #[serde(default)]
     pub history: Option<crate::worker_snapshot::HistoryPolicy>,
+    /// Host many tenants in this one control plane. Omitted: the process is one deployment.
+    #[serde(default)]
+    pub tenancy: Option<TenancyConfig>,
+}
+
+/// `queryflux.controlPlane.tenancy`: one control plane for many tenants. Each tenant is a
+/// full control-plane deployment in its own Postgres schema (`persistence.schema`), run
+/// inside this process. Tenants are added and removed through the platform listener.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TenancyConfig {
+    /// A request for host `<tenant><hostSuffix>` on the admin port reaches that tenant's
+    /// worker API (`/worker/*`), for example `.cp.example.com`. Nothing else is served
+    /// there.
+    pub host_suffix: String,
+    /// The platform listener: the tenant lifecycle API (`/platform/tenants`) and every
+    /// tenant's admin API, chosen with `X-QueryFlux-Tenant`. Callers present
+    /// `Authorization: Bearer $QUERYFLUX_PLATFORM_TOKEN`. Keep it on an internal network.
+    #[serde(default = "default_platform_port")]
+    pub platform_port: u16,
+}
+
+fn default_platform_port() -> u16 {
+    9100
 }
 
 impl QueryFluxConfig {
@@ -1370,6 +1452,13 @@ pub struct PostgresPersistenceConfig {
     /// Full `postgres://` connection string. When non-empty, `host` / `user` / … are ignored.
     #[serde(default)]
     pub url: Option<String>,
+    /// Keep every table, migration and coordination primitive in this schema (a lowercase
+    /// identifier), so several deployments can share one database with a schema each.
+    /// Every connection gets it as its `search_path`; migrations create it when missing;
+    /// startup refuses to run if the connection resolves to another schema. Unset: the
+    /// database's default (`public`), unchanged.
+    #[serde(default)]
+    pub schema: Option<String>,
     #[serde(default)]
     pub host: Option<String>,
     #[serde(default)]
@@ -1418,6 +1507,7 @@ impl Default for PostgresPersistenceConfig {
     fn default() -> Self {
         Self {
             url: None,
+            schema: None,
             host: None,
             port: None,
             user: None,
@@ -1434,12 +1524,101 @@ impl Default for PostgresPersistenceConfig {
     }
 }
 
+/// `url` with `-c search_path=<schema>` added to its `options` parameter, which every
+/// Postgres connection QueryFlux opens (pools, listeners, locks, migrations) applies.
+fn with_search_path(url: &str, schema: &str) -> Result<String, String> {
+    let mut u =
+        url::Url::parse(url).map_err(|e| format!("postgres persistence: invalid url: {e}"))?;
+    let mut options = None;
+    let rest: Vec<(String, String)> = u
+        .query_pairs()
+        .filter_map(|(k, v)| {
+            if k == "options" {
+                options = Some(v.into_owned());
+                None
+            } else {
+                Some((k.into_owned(), v.into_owned()))
+            }
+        })
+        .collect();
+    let search_path = format!("-c search_path={schema}");
+    let options = match options {
+        Some(o) if o.contains("search_path") => {
+            return Err(
+                "postgres persistence: set the schema with `schema`, not a search_path in the url options"
+                    .into(),
+            )
+        }
+        Some(o) => format!("{o} {search_path}"),
+        None => search_path,
+    };
+    {
+        let mut q = u.query_pairs_mut();
+        q.clear();
+        for (k, v) in &rest {
+            q.append_pair(k, v);
+        }
+        q.append_pair("options", &options);
+    }
+    Ok(u.to_string())
+}
+
 impl PostgresPersistenceConfig {
     /// Connection URL for sqlx / `PgPool` (includes password encoding for special characters).
     pub fn connection_url(&self) -> Result<String, String> {
+        let base = self.base_connection_url()?;
+        match self.pinned_schema()? {
+            Some(schema) => with_search_path(&base, schema),
+            None => Ok(base),
+        }
+    }
+
+    /// `schema`, validated: a lowercase SQL identifier, so it never needs quoting.
+    pub fn pinned_schema(&self) -> Result<Option<&str>, String> {
+        let Some(schema) = self
+            .schema
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        else {
+            return Ok(None);
+        };
+        let valid = schema.len() <= 63
+            && schema
+                .bytes()
+                .next()
+                .is_some_and(|b| b.is_ascii_lowercase() || b == b'_')
+            && schema
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_');
+        if !valid {
+            return Err(format!(
+                "postgres persistence: schema '{schema}' must be a lowercase identifier \
+                 (a-z, 0-9, _; at most 63 characters; not starting with a digit)"
+            ));
+        }
+        Ok(Some(schema))
+    }
+
+    fn base_connection_url(&self) -> Result<String, String> {
         if let Some(ref u) = self.url {
             let u = u.trim();
             if !u.is_empty() {
+                // Reject syntactically invalid URLs early (e.g. QUERYFLUX_PERSISTENCE_URL).
+                // Errors must not echo the string — it may contain a password.
+                let parsed = url::Url::parse(u).map_err(|_| {
+                    "postgres persistence: url is not a valid postgres:// (or postgresql://) URL"
+                        .to_string()
+                })?;
+                match parsed.scheme() {
+                    "postgres" | "postgresql" => {}
+                    scheme => {
+                        return Err(format!(
+                            "postgres persistence: url scheme must be postgres:// or postgresql:// \
+                             (got '{scheme}')"
+                        ));
+                    }
+                }
                 return Ok(u.to_string());
             }
         }
@@ -1582,6 +1761,10 @@ pub struct AdminApiConfig {
     /// is a security risk in production).
     #[serde(default)]
     pub cors_allowed_origins: Vec<String>,
+    /// Accept the admin user's basic auth. Turn it off once admin tokens
+    /// (`POST /admin/tokens`) or a platform gateway are in place.
+    #[serde(default = "default_true")]
+    pub basic_auth: bool,
 }
 
 fn default_admin_port() -> u16 {
@@ -1603,6 +1786,7 @@ impl Default for AdminApiConfig {
             username: default_admin_username(),
             password: default_admin_password(),
             cors_allowed_origins: Vec::new(),
+            basic_auth: true,
         }
     }
 }
@@ -3339,6 +3523,69 @@ guardrails:
     }
 
     #[test]
+    fn a_pinned_schema_becomes_every_connection_search_path() {
+        let c = PostgresPersistenceConfig {
+            url: Some("postgres://u:p@h:5432/db?sslmode=require".into()),
+            schema: Some("tenant_abc".into()),
+            ..Default::default()
+        };
+        let u = url::Url::parse(&c.connection_url().unwrap()).unwrap();
+        let pairs: std::collections::HashMap<_, _> = u.query_pairs().into_owned().collect();
+        assert_eq!(pairs["options"], "-c search_path=tenant_abc");
+        assert_eq!(pairs["sslmode"], "require", "other parameters are kept");
+
+        // Existing options are extended, not replaced.
+        let c = PostgresPersistenceConfig {
+            url: Some("postgres://u@h/db?options=-c%20statement_timeout%3D5000".into()),
+            schema: Some("t1".into()),
+            ..Default::default()
+        };
+        let u = url::Url::parse(&c.connection_url().unwrap()).unwrap();
+        let options: String = u
+            .query_pairs()
+            .find(|(k, _)| k == "options")
+            .unwrap()
+            .1
+            .into_owned();
+        assert_eq!(options, "-c statement_timeout=5000 -c search_path=t1");
+
+        // Unset schema: the url is untouched.
+        let c = PostgresPersistenceConfig {
+            url: Some("postgres://u:p@h:5432/db".into()),
+            ..Default::default()
+        };
+        assert_eq!(c.connection_url().unwrap(), "postgres://u:p@h:5432/db");
+    }
+
+    #[test]
+    fn a_schema_must_be_a_plain_lowercase_identifier() {
+        for bad in [
+            "Tenant",
+            "1tenant",
+            "a-b",
+            "a;drop",
+            "x\"y",
+            &"a".repeat(64),
+        ] {
+            let c = PostgresPersistenceConfig {
+                url: Some("postgres://u@h/db".into()),
+                schema: Some(bad.to_string()),
+                ..Default::default()
+            };
+            assert!(c.connection_url().is_err(), "{bad} must be refused");
+        }
+        let c = PostgresPersistenceConfig {
+            url: Some("postgres://u@h/db?options=-c%20search_path%3Dx".into()),
+            schema: Some("t1".into()),
+            ..Default::default()
+        };
+        assert!(
+            c.connection_url().is_err(),
+            "two search paths are ambiguous"
+        );
+    }
+
+    #[test]
     fn postgres_persistence_prefers_url() {
         let c = PostgresPersistenceConfig {
             url: Some("postgres://u:p@h:5432/db".into()),
@@ -4432,6 +4679,24 @@ auth: { provider: static, required: true }
         assert_eq!(c.validate_role(), Ok(()));
     }
 
+    #[test]
+    fn multi_tenant_control_plane_rejects_a_shared_worker_secret() {
+        let c = parse(
+            "queryflux:\n  role: controlPlane\n  workerSecret: shared\n  persistence: { type: postgres, url: postgres://x/y }\n  controlPlane:\n    tenancy: { hostSuffix: .cp.example.com, platformPort: 9100 }\n",
+        );
+        let issues = c.validate_role().unwrap_err();
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.contains("workerSecret would be shared")),
+            "{issues:?}"
+        );
+        let ok = parse(
+            "queryflux:\n  role: controlPlane\n  persistence: { type: postgres, url: postgres://x/y }\n  controlPlane:\n    tenancy: { hostSuffix: .cp.example.com, platformPort: 9100 }\n",
+        );
+        assert_eq!(ok.validate_role(), Ok(()));
+    }
+
     const HUB: &str = r#"
 queryflux:
   role: hub
@@ -4509,5 +4774,100 @@ queryflux:
         assert!(issues
             .iter()
             .any(|i| i.contains("only applies to role: hub")));
+    }
+    #[test]
+    fn secrets_can_come_from_the_environment() {
+        let mut c = parse(HUB);
+        let env: std::collections::HashMap<&str, &str> = [
+            (ENV_WORKER_SECRET, "ws-env"),
+            (ENV_HUB_ENROLL_TOKEN, "qfe_env"),
+            (ENV_PERSISTENCE_URL, "postgres://env/db"),
+        ]
+        .into();
+        c.apply_env_overrides(|k| env.get(k).map(|v| v.to_string()));
+        assert_eq!(c.queryflux.worker_secret.as_deref(), Some("ws-env"));
+        assert_eq!(
+            c.queryflux.hub.unwrap().upstream.enroll_token.as_deref(),
+            Some("qfe_env")
+        );
+        // Not Postgres: the URL is not applied. Empty variables change nothing.
+        let mut pg = parse(
+            "queryflux:\n  workerSecret: file\n  persistence: { type: postgres, url: postgres://file/db }\n",
+        );
+        pg.apply_env_overrides(|k| match k {
+            ENV_PERSISTENCE_URL => Some("postgres://env/db".into()),
+            _ => Some("  ".into()),
+        });
+        assert_eq!(pg.queryflux.worker_secret.as_deref(), Some("file"));
+        let PersistenceConfig::Postgres { conn } = &pg.queryflux.persistence else {
+            panic!()
+        };
+        assert_eq!(conn.url.as_deref(), Some("postgres://env/db"));
+    }
+
+    #[test]
+    fn empty_postgres_url_fails_role_validation_until_env_sets_it() {
+        let yaml = r#"
+queryflux:
+  role: controlPlane
+  workerSecret: secret
+  persistence: { type: postgres, url: "", schema: tenant_acme }
+  frontends:
+    trinoHttp: { enabled: false, port: 8080 }
+clusterGroups:
+  g: { members: [c], maxRunningQueries: 1 }
+clusters:
+  c: { engine: trino, endpoint: http://localhost:8080 }
+routingFallback: g
+"#;
+        let mut c = parse(yaml);
+        let issues = c.validate_role().unwrap_err();
+        assert!(
+            issues.iter().any(|i| i.contains("postgres persistence")),
+            "{issues:?}"
+        );
+        c.apply_env_overrides(|k| match k {
+            ENV_PERSISTENCE_URL => Some("postgres://tenant/queryflux".into()),
+            _ => None,
+        });
+        assert_eq!(c.validate_role(), Ok(()));
+    }
+
+    #[test]
+    fn invalid_postgres_url_is_rejected_without_echoing_the_secret() {
+        let mut c = parse(
+            "queryflux:\n  workerSecret: s\n  persistence: { type: postgres, url: postgres://ok/db }\n",
+        );
+        // No scheme / not a URL → Url::parse fails; message must not echo the raw value.
+        c.apply_env_overrides(|k| match k {
+            ENV_PERSISTENCE_URL => Some("not a url with sekrit".into()),
+            _ => None,
+        });
+        let issues = c.validate_role().unwrap_err();
+        let msg = issues.join("; ");
+        assert!(
+            msg.contains("postgres persistence") && msg.contains("not a valid"),
+            "{msg}"
+        );
+        assert!(
+            !msg.contains("sekrit"),
+            "error must not echo credentials: {msg}"
+        );
+
+        // Wrong scheme is rejected without echoing the password.
+        c.apply_env_overrides(|k| match k {
+            ENV_PERSISTENCE_URL => Some("http://user:sekrit@db.example/qf".into()),
+            _ => None,
+        });
+        let issues = c.validate_role().unwrap_err();
+        let msg = issues.join("; ");
+        assert!(
+            msg.contains("postgres://") || msg.contains("postgresql://"),
+            "{msg}"
+        );
+        assert!(
+            !msg.contains("sekrit"),
+            "error must not echo credentials: {msg}"
+        );
     }
 }

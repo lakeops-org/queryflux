@@ -1,8 +1,9 @@
 ---
 title: Adapters, proxies, and the ecosystem
-description: Why QueryFlux is a purpose-built SQL adapter rather than a fork of Nginx/Envoy/ProxySQL, how it can compose with existing gateways, and how it relates to tools like Hoop.dev.
+description: Why QueryFlux is a SQL adapter rather than a fork of Nginx, Envoy, or ProxySQL, and how it composes with existing gateways.
 image: img/queryflux-hero-banner.png
 ---
+
 # Adapters, proxies, and the ecosystem
 
 This page answers common architecture questions about QueryFlux’s place in the stack: why it is not built as an extension of a generic proxy/gateway, whether it can be bridged with tools like ProxySQL or Envoy, and how it relates to adjacent projects such as Hoop.dev.
