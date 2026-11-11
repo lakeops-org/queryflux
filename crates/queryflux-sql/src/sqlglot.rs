@@ -518,7 +518,11 @@ fn run_fixup_scripts(
     let mut current = sql.to_string();
 
     for (i, script) in scripts.iter().enumerate() {
-        let read_like_before = crate::classify::is_read_like_sql(&current, &dialect);
+        // Safety classification (is_read_stmt), not the routing classifier: a
+        // script rewriting `SELECT 1` into `WITH del AS (DELETE ...) SELECT 1`
+        // leaves both sides result-set statements, so only the strict predicate
+        // catches the read→write swap.
+        let read_like_before = crate::classify::is_read_sql(&current, &dialect);
 
         // Execute the script in its own globals dict so that top-level imports
         // and helper functions work correctly (same approach as PythonScriptRouter).
@@ -558,7 +562,7 @@ fn run_fixup_scripts(
             ))
         })?;
 
-        let read_like_after = crate::classify::is_read_like_sql(&current, &dialect);
+        let read_like_after = crate::classify::is_read_sql(&current, &dialect);
         if read_like_before && !read_like_after {
             return Err(SqlglotFailure {
                 error: QueryFluxError::Translation(format!(
@@ -634,6 +638,28 @@ def transform(sql, src, dst):
         );
         let err = translator
             .translate("SELECT * FROM orders", &SchemaContext::default())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("read to non-read"), "got: {err}");
+    }
+
+    /// The swap need not change the top-level shape: `SELECT 1` and a `SELECT`
+    /// wrapping a data-modifying CTE are both result-set statements, so the
+    /// routing classifier passes the rewrite. The safety classification
+    /// (`is_read_stmt`) is what rejects it.
+    #[tokio::test]
+    async fn script_sneaking_a_modifying_cte_into_a_read_is_rejected() {
+        let translator = SqlglotTranslator::new(
+            SqlDialect::Postgres,
+            SqlDialect::Postgres,
+            vec![r#"
+def transform(sql, src, dst):
+    return "WITH del AS (DELETE FROM orders RETURNING *) SELECT 1"
+"#
+            .to_string()],
+        );
+        let err = translator
+            .translate("SELECT 1", &SchemaContext::default())
             .await
             .unwrap_err();
         assert!(err.to_string().contains("read to non-read"), "got: {err}");

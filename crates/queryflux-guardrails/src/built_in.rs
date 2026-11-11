@@ -1,6 +1,8 @@
 use async_trait::async_trait;
 use polyglot_sql::expressions::{Expression, Literal};
-use queryflux_sql::classify::{is_read_like_fallback, is_read_stmt, to_polyglot_dialect};
+use queryflux_sql::classify::{
+    is_read_like_fallback, is_read_stmt, is_result_set_stmt, to_polyglot_dialect,
+};
 
 use crate::context::{GuardContext, GuardLayer, GuardResult};
 
@@ -94,7 +96,14 @@ impl Guard for RowLimitGuard {
         match guard_statements(ctx).await {
             Ok(stmts) => {
                 for stmt in stmts.iter() {
-                    if !is_read_stmt(stmt) {
+                    // Row limits protect result-set consumers, so anything that
+                    // streams rows gets its outer LIMIT checked — including a
+                    // `SELECT` whose `WITH` carries a data-modifying CTE
+                    // (`is_read_stmt` denies it under read_only, but it can
+                    // still run when read_only is off, and its outer LIMIT must
+                    // not silently stop being enforced). `Values` never had a
+                    // LIMIT here and stays excluded.
+                    if !is_result_set_stmt(stmt) || matches!(stmt, Expression::Values(_)) {
                         continue;
                     }
                     match top_level_limit(stmt) {
@@ -551,6 +560,31 @@ SELECT 3 AS n
         assert!(r.is_deny());
     }
 
+    /// PostgreSQL parses data-modifying CTEs natively, so the guard must deny
+    /// through the parsed path — not merely because an unparseable `WITH ...`
+    /// fails the string fallback. The inert-body control keeps legitimate
+    /// reads (row-constructor CTEs) allowed under the same dialect.
+    #[tokio::test]
+    async fn read_only_blocks_postgres_modifying_ctes() {
+        for sql in [
+            "WITH del AS (DELETE FROM orders RETURNING *) SELECT * FROM del",
+            "WITH up AS (UPDATE orders SET total = 0 RETURNING *) SELECT * FROM up",
+            "WITH ins AS (INSERT INTO audit VALUES (1) RETURNING *) SELECT * FROM ins",
+        ] {
+            let tc = TestCtx::new(sql).with_engine(EngineType::Postgres);
+            let r = ReadOnlyGuard.check(&tc.ctx()).await;
+            assert!(r.is_deny(), "expected denial for: {sql}");
+        }
+    }
+
+    #[tokio::test]
+    async fn read_only_allows_postgres_inert_cte_bodies() {
+        let sql = "WITH t AS (VALUES (1)) SELECT * FROM t";
+        let tc = TestCtx::new(sql).with_engine(EngineType::Postgres);
+        let r = ReadOnlyGuard.check(&tc.ctx()).await;
+        assert!(!r.is_deny(), "expected allowance for: {sql}");
+    }
+
     #[tokio::test]
     async fn row_limit_warns_on_missing_limit() {
         let tc = TestCtx::new("SELECT * FROM t");
@@ -581,6 +615,32 @@ SELECT 3 AS n
         };
         let r = g.check(&tc.ctx()).await;
         assert!(r.is_deny());
+    }
+
+    /// A `SELECT` wrapping a data-modifying CTE streams rows, so its outer
+    /// LIMIT stays enforced even though `is_read_stmt` (read_only's predicate)
+    /// denies the statement as a whole.
+    #[tokio::test]
+    async fn row_limit_checks_select_with_modifying_cte() {
+        let sql = "WITH del AS (DELETE FROM orders RETURNING *) SELECT * FROM orders LIMIT 5000";
+        let tc = TestCtx::new(sql);
+        let g = RowLimitGuard {
+            max_rows: Some(1000),
+        };
+        let r = g.check(&tc.ctx()).await;
+        assert!(r.is_deny(), "expected ROW_LIMIT_EXCEEDED for: {sql}");
+    }
+
+    /// `Values` has no LIMIT and was never row-limit checked — keep it out.
+    #[tokio::test]
+    async fn row_limit_leaves_values_excluded() {
+        let sql = "VALUES (1), (2)";
+        let tc = TestCtx::new(sql);
+        let g = RowLimitGuard {
+            max_rows: Some(1),
+        };
+        let r = g.check(&tc.ctx()).await;
+        assert!(!r.is_deny(), "Values must stay outside row_limit: {sql}");
     }
 
     #[tokio::test]
