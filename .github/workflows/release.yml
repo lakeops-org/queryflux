@@ -221,9 +221,13 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          # latest is the newest release from main, never an unreleased build or a rel-* patch
+          # of an older line. Pushes without a release are published under their branch name
+          # (:main, :rel-0.4) so they can still be pulled for testing.
           tags: |
-            type=raw,value=latest
+            type=raw,value=latest,enable=${{ needs.release_please.outputs.releases_created == 'true' && github.ref == 'refs/heads/main' }}
             type=raw,value=${{ needs.docker_tag_base.outputs.base }},enable=${{ needs.release_please.outputs.releases_created == 'true' }}
+            type=ref,event=branch,enable=${{ needs.release_please.outputs.releases_created != 'true' }}
 
       - name: Create and push manifest
         working-directory: /tmp/digests
