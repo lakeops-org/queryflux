@@ -130,8 +130,8 @@ Routing (group selection) happens at **login time**, not at query time. The clus
 ## Client examples
 
 ```bash
-# SnowSQL CLI
-snowsql -a <account-placeholder> -u dev -h localhost -p 8443 --protocol https --insecure
+# SnowSQL CLI — named connection with host/port; see clients guide for TLS terminator + trustStore
+snowsql -c queryflux -q "SELECT 42 AS answer"
 ```
 
 ```python

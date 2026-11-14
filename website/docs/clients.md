@@ -57,13 +57,14 @@ curl -X POST http://localhost:8080/v1/statement \
 Poll when the response includes `nextUri` (requires `jq`):
 
 ```bash
-NEXT=$(curl -s -X POST http://localhost:8080/v1/statement \
+RESP=$(curl -s -X POST http://localhost:8080/v1/statement \
   -H "X-Trino-User: dev" \
-  -d "SELECT current_date" | jq -r '.nextUri // empty')
-while [ -n "$NEXT" ]; do
-  RESP=$(curl -s -H "X-Trino-User: dev" "$NEXT")
+  -d "SELECT current_date")
+while :; do
   echo "$RESP"
   NEXT=$(echo "$RESP" | jq -r '.nextUri // empty')
+  [ -n "$NEXT" ] || break
+  RESP=$(curl -s -H "X-Trino-User: dev" "$NEXT")
 done
 ```
 
@@ -170,11 +171,21 @@ Both Snowflake wire and REST API v2 listen on the **same port** you configure. Q
 
 **SnowSQL**
 
-SnowSQL connects over HTTPS. Terminate TLS on the port SnowSQL uses (for example **8443**), forwarding plain HTTP to QueryFlux. For dev/test with a self-signed terminator certificate, pass `-o insecure_mode=True` (SnowSQL option, not a CLI flag named `--insecure`):
+SnowSQL speaks HTTPS to a **TLS terminator** in front of QueryFlux (not plaintext to QueryFlux). Modern SnowSQL builds treat `-h` / `-p` on the command line as deprecated; use a named connection in `~/.snowsql/config` with `host` and `port`, and point SnowSQL at the terminator's certificate (for example via `[options] trustStore` / `trustStorePassword` in the same file — `insecure_mode` only disables OCSP checks and does **not** trust a self-signed cert). See [SnowSQL configuration](https://docs.snowflake.com/en/user-guide/snowsql-config).
+
+```ini
+[connections.queryflux]
+accountname = queryflux
+username = dev
+host = localhost
+port = 8443
+```
 
 ```bash
-snowsql -a queryflux -u dev -h localhost -p 8443 -o insecure_mode=True -q "SELECT 42 AS answer"
+snowsql -c queryflux -q "SELECT 42 AS answer"
 ```
+
+For a quick local test without SnowSQL TLS setup, use the Python connector below with `protocol="http"`.
 
 **Python (`snowflake-connector-python`)**
 
