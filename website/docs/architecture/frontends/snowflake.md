@@ -130,8 +130,8 @@ Routing (group selection) happens at **login time**, not at query time. The clus
 ## Client examples
 
 ```bash
-# SnowSQL CLI
-snowsql -a <account-placeholder> -u dev -h localhost -p 8443 --protocol https --insecure
+# SnowSQL CLI — named connection with host/port; see clients guide for TLS terminator + trustStore
+snowsql -c queryflux -q "SELECT 42 AS answer"
 ```
 
 ```python
@@ -177,6 +177,7 @@ curl -X POST http://localhost:8443/api/v2/statements \
 
 ## Related
 
+- [Connect a SQL client](../../clients) — SnowSQL, Python connector, and SQL API v2 curl examples
 - [Blog: Offload Snowflake queries without changing clients](/blog/offload-snowflake-queries) — route Snowflake sessions to Trino or StarRocks
 - [Frontends overview](overview.md) — shared dispatch and session model
 - [Routing and clusters](/docs/architecture/routing-and-clusters) — `protocolBased` router with `snowflakeHttp` / `snowflakeSqlApi`

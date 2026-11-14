@@ -81,5 +81,6 @@ SELECT * FROM qf.my_catalog.my_schema.my_table LIMIT 10;
 
 ## Related
 
+- [Connect a SQL client](../../clients) — ADBC Python and DuckDB `ATTACH` examples
 - [Frontends overview](overview.md) — shared dispatch and session model
 - [Routing and clusters](/docs/architecture/routing-and-clusters) — `protocolBased` router with `flightSql`
